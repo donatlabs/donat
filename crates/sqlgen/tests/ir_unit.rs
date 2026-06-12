@@ -266,3 +266,30 @@ fn quote_helpers_double_embedded_quotes() {
     assert_eq!(quote_lit("plain"), "'plain'");
     assert_eq!(quote_lit("O'Brien"), "'O''Brien'");
 }
+
+#[test]
+fn st_dwithin_renders_2d_and_3d_functions() {
+    // The only upstream 3D fixture is admin-bound (out of conformance
+    // scope), so the SQL rendering of both variants is pinned here.
+    let st = |three_d: bool| BoolExp::Compare {
+        column: "geom_col".to_string(),
+        pg_type: "geometry".to_string(),
+        op: CompareOp::StDWithin {
+            distance: Scalar::Json(json!(5)),
+            from: Scalar::Json(json!({"type": "Point", "coordinates": [1.0, 2.0]})),
+            three_d,
+        },
+    };
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "rows".to_string(),
+        query: select(vec![column("id", "id", "integer")], Some(st(false)), false),
+    }]);
+    assert!(sql.contains("ST_DWithin("), "missing 2D function: {sql}");
+    assert!(!sql.contains("ST_3DDWithin("), "unexpected 3D function: {sql}");
+
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "rows".to_string(),
+        query: select(vec![column("id", "id", "integer")], Some(st(true)), false),
+    }]);
+    assert!(sql.contains("ST_3DDWithin("), "missing 3D function: {sql}");
+}

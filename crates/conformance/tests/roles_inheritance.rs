@@ -9,13 +9,13 @@
 //! `pytestmark = [admin_secret, hge_env(ENABLE_REMOTE_SCHEMA_PERMISSIONS=true)]`,
 //! so every class from that module would get `.admin_secret()` + that env var.
 //!
-//! NOTE(harness): `.admin_secret()` cannot be used today — `Suite::start()`
-//! performs its postgis init POST to /v1/query without auth headers
-//! (lib.rs), so any suite started with an admin secret fails before the
-//! first case ("invalid x-hasura-admin-secret"). The admin_secret mark is
-//! purely environmental for these classes (no fixture asserts on the
-//! secret itself), so the suites below run without it; the hge_env marks
-//! are still replicated via `.env()`.
+//! NOTE: the admin_secret mark is purely environmental for these classes —
+//! tests-py sends the secret alongside explicit X-Hasura-Role headers,
+//! which yields the same trusted-role session a secretless engine
+//! produces, and no fixture asserts on the secret itself. The suites below
+//! therefore run without it; the hge_env marks are still replicated via
+//! `.env()`. (Suite::start() authenticates its bootstrap calls when
+//! `.admin_secret()` is set, so using it here would also work.)
 
 use dist_conformance::{Running, Suite, Transport};
 use serde_json::json;

@@ -7,12 +7,11 @@
 //! The unauthorized-role/cookie classes are marked `@pytest.mark.admin_secret`
 //! AND their tests run with `add_auth=False`: the engine must have the secret
 //! configured (so plain X-Hasura-* headers are untrusted) while the checked
-//! request carries no secret. `Suite::start()` cannot run with
-//! HASURA_GRAPHQL_ADMIN_SECRET set (its postgis init POST carries no auth
-//! headers — same limitation recorded in roles_inheritance.rs), so those
+//! request carries no secret. `Suite` always attaches the configured secret
+//! to checked requests (tests-py `add_auth=True` semantics), so these
 //! suites spawn the engine directly via `EnvEngine` below, authenticating
 //! setup/teardown with the secret header manually and sending the checked
-//! requests with the fixture headers only.
+//! requests with the fixture headers only (`add_auth=False` semantics).
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -334,11 +333,10 @@ const FUNC_PERMS: &str = "queries/graphql_query/functions/permissions";
 /// hge_env(HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false).
 /// Every check_query_f call omits the transport argument -> http only.
 /// per_method_tests_db_state -> setup/teardown wrap EACH test method.
-/// NOTE(harness): the admin_secret mark is purely environmental here —
-/// tests-py sends the secret alongside the X-Hasura-Role headers, which
-/// yields the same trusted-role session a secretless engine produces, and
-/// Suite::start() cannot run with a secret configured (see
-/// roles_inheritance.rs) — so the suite runs without it.
+/// NOTE: the admin_secret mark is purely environmental here — tests-py
+/// sends the secret alongside the X-Hasura-Role headers, which yields the
+/// same trusted-role session a secretless engine produces, and no fixture
+/// asserts on the secret itself — so the suite runs without it.
 #[test]
 fn graphql_query_function_permissions() {
     let s = Suite::new("function_perms")

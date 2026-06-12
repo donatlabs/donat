@@ -675,3 +675,31 @@ fn v1_select_distinguishes_hidden_and_unknown_columns() {
     assert_eq!(err.path, "$");
     assert_eq!(err.message, "column \"nope\" not found");
 }
+
+#[test]
+fn st_d_within_parses_2d_and_3d_variants() {
+    // Upstream's only 3D fixture (boolexp/postgis/query_geometry_3d_spatial_ops.yaml)
+    // is a no-role (admin) request — out of conformance scope — so the
+    // 2D/3D split is pinned here at the parse level.
+    let pred = article_where(
+        json!({ "id": { "_st_d_within": { "distance": 5, "from": "POINT(1 2)" } } }),
+        &user(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        pred,
+        BoolExp::Compare { op: CompareOp::StDWithin { three_d: false, .. }, .. }
+    ));
+
+    let pred = article_where(
+        json!({ "id": { "_st_3d_d_within": { "distance": 5, "from": "POINT(1 2 3)" } } }),
+        &user(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        pred,
+        BoolExp::Compare { op: CompareOp::StDWithin { three_d: true, .. }, .. }
+    ));
+}
