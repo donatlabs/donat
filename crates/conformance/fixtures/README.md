@@ -1,0 +1,12 @@
+# Conformance fixtures
+
+YAML fixtures derived from Hasura's `server/tests-py` test suite
+(https://github.com/hasura/graphql-engine, commit
+`371d744e8a063fe348e291cc306f37973b11d1b8`), licensed under the Apache
+License 2.0 — see LICENSE.hasura. Local modifications are marked with
+`# dist-api:` comments (currently: HTTP status corrections documented in
+the conformance notes; admin-only fixtures are excluded from execution by
+the test modules, not edited).
+
+Executed by `crates/conformance/tests/*` via the harness in
+`crates/conformance/src/lib.rs`. See ../PORTING.md for conventions.

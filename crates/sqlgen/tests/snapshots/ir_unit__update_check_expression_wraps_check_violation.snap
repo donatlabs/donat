@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/ir_unit.rs
+expression: sql
+---
+WITH "upd" AS (UPDATE "public"."author" AS "_upd_target" SET "name" = ('eve')::"text" WHERE "_upd_target"."id" = (1)::"int4" RETURNING *) SELECT CASE WHEN (SELECT count(*) FROM "upd" WHERE NOT ("upd"."name" <> ('admin')::"text")) > 0 THEN dist_api.check_violation('{"path":"$","message":"check constraint of an insert/update permission has failed"}') ELSE json_build_object('affected_rows', (SELECT count(*) FROM "upd")) END AS root

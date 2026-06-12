@@ -1,3 +1,13 @@
+> **SUPERSEDED (2026-06-13):** conformance now lives in the native Rust
+> harness — `crates/conformance` (fixtures + per-suite test modules,
+> `make conformance`). This pytest harness remains only as an optional
+> cross-check and is safe to delete together with the whole `tests/hasura`
+> directory. Admin-bound tests were intentionally NOT ported (no-admin-role
+> design rule); three status-only known-diff fixtures are carried as
+> patched copies with `# dist-api:` comments. Note: pytest only WARNED on
+> error-body mismatches, so counts below overstated exactness — the native
+> harness compares strictly and the engine was aligned where they diverged.
+
 # Conformance coverage status
 
 Last full run: 2026-06-12, Postgres 16 (postgis/postgis:16-3.4), http AND

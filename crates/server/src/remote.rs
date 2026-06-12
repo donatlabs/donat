@@ -576,9 +576,7 @@ fn apply_presets(
                                         path: "$".to_string(),
                                         code: "coercion-error",
                                         message: format!(
-                                            "expecting an integer for the session variable \"{}\", but found {:?}",
-                                            s.to_ascii_lowercase(),
-                                            found
+                                            "{found:?} cannot be coerced into an Int value"
                                         ),
                                     });
                                 }
@@ -710,5 +708,151 @@ pub async fn forward(
                 }]
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(vars: &[(&str, &str)]) -> Session {
+        Session {
+            role: "user".to_string(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            backend_request: false,
+        }
+    }
+
+    fn parse_sdl(sdl: &str) -> SDoc<'static, String> {
+        graphql_parser::parse_schema::<String>(sdl)
+            .unwrap()
+            .into_static()
+    }
+
+    fn parse_op(q: &str) -> QDoc<'static, String> {
+        graphql_parser::parse_query::<String>(q)
+            .unwrap()
+            .into_static()
+    }
+
+    const PRESET_SDL: &str = r#"
+        type Query {
+            user(id: Int! @preset(value: "x-hasura-user-id")): User
+            items(limit: Int @preset(value: 5)): String
+            search(where: Filter): String
+        }
+        type User { name: String }
+        input Filter {
+            tenant: String @preset(value: "acme")
+            name: String
+        }
+    "#;
+
+    #[test]
+    fn url_template_passthrough_and_substitution() {
+        assert_eq!(resolve_url_template("http://x/v1"), "http://x/v1");
+        unsafe { std::env::set_var("DIST_API_TEST_REMOTE_URL", "http://remote:4000") };
+        assert_eq!(
+            resolve_url_template("{{DIST_API_TEST_REMOTE_URL}}/graphql"),
+            "http://remote:4000/graphql"
+        );
+        // Unset variables substitute as empty.
+        assert_eq!(resolve_url_template("{{DIST_API_TEST_UNSET_VAR}}/graphql"), "/graphql");
+    }
+
+    #[test]
+    fn presets_inject_session_variable_and_literal_args() {
+        let sdl = parse_sdl(PRESET_SDL);
+        let types = type_map(&sdl);
+        let mut doc = parse_op("{ user { name } items }");
+        let mut vars = serde_json::Map::new();
+        let session = session(&[("x-hasura-user-id", "42")]);
+        let changed = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap();
+        assert!(changed);
+        let rendered = format!("{doc}");
+        assert!(rendered.contains("user(id: 42)"), "{rendered}");
+        assert!(rendered.contains("items(limit: 5)"), "{rendered}");
+    }
+
+    #[test]
+    fn preset_session_variable_must_exist() {
+        let sdl = parse_sdl(PRESET_SDL);
+        let types = type_map(&sdl);
+        let mut doc = parse_op("{ user { name } }");
+        let mut vars = serde_json::Map::new();
+        let e = apply_presets(&mut doc, &types, "Query", &session(&[]), &mut vars).unwrap_err();
+        assert_eq!(e.code, "not-found");
+        assert_eq!(
+            e.message,
+            "\"x-hasura-user-id\" session variable expected, but not found"
+        );
+    }
+
+    #[test]
+    fn preset_int_coercion_error_message() {
+        let sdl = parse_sdl(PRESET_SDL);
+        let types = type_map(&sdl);
+        let mut doc = parse_op("{ user { name } }");
+        let mut vars = serde_json::Map::new();
+        let session = session(&[("x-hasura-user-id", "x")]);
+        let e = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap_err();
+        assert_eq!(e.code, "coercion-error");
+        assert_eq!(e.message, "\"x\" cannot be coerced into an Int value");
+    }
+
+    #[test]
+    fn input_object_presets_patch_variables() {
+        let sdl = parse_sdl(PRESET_SDL);
+        let types = type_map(&sdl);
+        let mut doc = parse_op("query Q($w: Filter) { search(where: $w) }");
+        let mut vars = serde_json::Map::new();
+        vars.insert("w".to_string(), json!({ "name": "bob" }));
+        let changed = apply_presets(&mut doc, &types, "Query", &session(&[]), &mut vars).unwrap();
+        assert!(changed);
+        // Declared preset fields are merged in; client values are kept.
+        assert_eq!(vars["w"], json!({ "name": "bob", "tenant": "acme" }));
+    }
+
+    #[test]
+    fn decustomize_unwraps_namespace_and_strips_prefixes() {
+        let c = dist_metadata::RemoteSchemaCustomization {
+            root_fields_namespace: Some("my_remote".to_string()),
+            type_names: Some(dist_metadata::NameCustomization {
+                prefix: Some("Pre".to_string()),
+                suffix: None,
+            }),
+            field_names: vec![dist_metadata::FieldNameCustomization {
+                parent_type: "Query".to_string(),
+                prefix: Some("foo_".to_string()),
+                suffix: None,
+            }],
+        };
+        let doc = parse_op("{ my_remote { foo_user { name } } }");
+        let (out, ns) = decustomize(&doc, &c).unwrap();
+        assert_eq!(ns.as_deref(), Some("my_remote"));
+        let rendered = format!("{out}");
+        // Namespace unwrapped, prefix stripped, customized name kept as alias.
+        assert!(rendered.contains("foo_user: user"), "{rendered}");
+        assert!(!rendered.contains("my_remote"), "{rendered}");
+
+        // A document not rooted at the namespace does not match.
+        let other = parse_op("{ other { x } }");
+        assert!(decustomize(&other, &c).is_none());
+    }
+
+    #[test]
+    fn strip_and_keep_introspection_roots() {
+        let doc = parse_op("{ __schema { queryType { name } } user { id } __typename }");
+        let mut stripped = doc.clone();
+        strip_introspection_roots(&mut stripped);
+        let r = format!("{stripped}");
+        assert!(!r.contains("__schema") && !r.contains("__typename") && r.contains("user"), "{r}");
+        let mut kept = doc.clone();
+        keep_introspection_roots(&mut kept);
+        let r = format!("{kept}");
+        assert!(r.contains("__schema") && r.contains("__typename") && !r.contains("user"), "{r}");
     }
 }

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests (unit + conformance)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Conformance harness: admin connection for per-suite databases.
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build the engine binary first: conformance suites spawn it.
+      - name: Build engine
+        run: cargo build --workspace --bins
+      - name: Unit and snapshot tests
+        run: cargo test --workspace --exclude dist-conformance
+      - name: Conformance suite
+        run: cargo test -p dist-conformance
+        env:
+          RUST_BACKTRACE: "1"
+
+  artifacts:
+    name: Build artifact (${{ matrix.target.name }})
+    needs: test
+    strategy:
+      matrix:
+        target:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+          - name: macos-aarch64
+            runner: macos-latest
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --bin dist-api
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-api-${{ matrix.target.name }}
+          path: target/release/dist-api
+          if-no-files-found: error

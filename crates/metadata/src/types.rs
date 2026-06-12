@@ -30,6 +30,8 @@ pub struct Metadata {
 pub struct RemoteSchema {
     pub name: String,
     pub definition: RemoteSchemaDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<RemoteSchemaPermission>,
 }

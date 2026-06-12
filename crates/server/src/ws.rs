@@ -230,3 +230,32 @@ fn is_subscription(payload: &Json) -> bool {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_operations_detected() {
+        assert!(is_subscription(&json!({ "query": "subscription { user { id } }" })));
+        assert!(is_subscription(&json!({
+            "query": "query Q { a } subscription S { b }"
+        })));
+    }
+
+    #[test]
+    fn queries_and_mutations_are_not_subscriptions() {
+        assert!(!is_subscription(&json!({ "query": "query { user { id } }" })));
+        assert!(!is_subscription(&json!({ "query": "{ user { id } }" })));
+        assert!(!is_subscription(&json!({
+            "query": "mutation { delete_user { affected_rows } }"
+        })));
+    }
+
+    #[test]
+    fn malformed_payloads_are_not_subscriptions() {
+        assert!(!is_subscription(&json!({})));
+        assert!(!is_subscription(&json!({ "query": 5 })));
+        assert!(!is_subscription(&json!({ "query": "not graphql {" })));
+    }
+}

@@ -1,13 +1,13 @@
 # dist-api
 
 A GraphQL engine over Postgres, compatible with the Hasura v2 surface
-(metadata format, API shape), developed TDD-style against Hasura's own
-black-box test suite (`tests/hasura/tests-py`).
+(metadata format, API shape), developed TDD-style against a native
+conformance harness with Hasura-derived fixtures (`crates/conformance`).
 
 ## Tech Stack
 
-Rust workspace (axum, tokio, serde, insta), Postgres 16 (postgis), vendored
-pytest conformance suite.
+Rust workspace (axum, tokio, serde, insta), Postgres 16 (postgis), native
+conformance harness (`crates/conformance`).
 
 ## Layout
 
@@ -19,7 +19,8 @@ pytest conformance suite.
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
 | `crates/server` | axum server: `/v1/graphql`, `/v1/query`, ws, auth |
-| `tests/hasura` | Vendored conformance suite + `run_suite.sh` + `triage.py` |
+| `crates/conformance` | Native conformance harness + Hasura-derived fixtures (the conformance source of truth) |
+| `tests/hasura` | Legacy pytest harness (optional cross-check; safe to delete) |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 
@@ -30,36 +31,44 @@ pytest conformance suite.
 | Build | `make build` |
 | Unit/snapshot tests | `make test` (or `cargo test -p <crate>`) |
 | Run with fixture metadata | `make run` (serves :8080) |
-| Conformance suite | `tests/hasura/run_suite.sh <pytest selector>` |
-| Triage one fixture dir | `tests/hasura/triage.py queries/<dir> [test ...]` |
+| Conformance suite | `make conformance` (or `cargo test -p dist-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
+| Legacy pytest cross-check | `tests/hasura/run_suite.sh <selector>` (optional) |
 
-Conformance harness expects the server on `HGE_URL` (default
-`http://127.0.0.1:18080`) and Postgres on `PG_URL` (default `:15432`).
-Some suites need hge-bin mode (env-marked classes) — see COVERAGE.md notes.
+The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
+`PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
+It builds/spawns the engine itself — REBUILD `cargo build -p dist-server
+--bin dist-api` after engine changes before re-running conformance, the
+harness uses the existing binary. One database per suite (`conf_<name>`),
+parallel-safe. Conventions: `crates/conformance/PORTING.md`.
 
 ## The TDD Loop (how all engine work is done)
 
-1. Pick a failing tests-py suite/fixture (COVERAGE.md is the live status —
-   PLAN.md milestones can lag behind it).
-2. `triage.py` the fixture dir → read expected/actual diffs.
-3. Implement; add/adjust unit + insta tests in the touched crate.
-4. `run_suite.sh` the suite until green; then re-run neighbor suites you
-   might have broken.
-5. Update `tests/hasura/COVERAGE.md` with the new counts and notes.
+1. Engine-behavior changes start from a failing conformance case: a fixture
+   in `crates/conformance/fixtures` + a call in `crates/conformance/tests/`.
+2. Implement; add/adjust unit + insta tests in the touched crate.
+3. `cargo build -p dist-server --bin dist-api && cargo test -p
+   dist-conformance --test <module>` until green; then run the full
+   conformance crate — suites share engine semantics and regress together.
+4. Fixtures are ground truth (exact bodies, error codes, paths, status).
+   Local fixture edits are allowed ONLY for documented known-diffs and must
+   carry a `# dist-api:` comment (see fixtures/README.md).
 
-Harness quirks to remember: some fixtures `!include` files as strings;
-legacy `$op` permission spellings are valid input; a few fixtures expect
-HTTP status codes inconsistent with their bodies (status diff with exactly
-matching body = known-diff, record it in COVERAGE.md, don't chase it).
+Quirks to remember: some fixtures `!include` files as quoted strings;
+legacy `$op` permission spellings are valid input; three insert fixtures
+expect status 400 with bodies identical to our deliberate 200 — they are
+patched copies with comments, do not "fix" the engine to 400. The legacy
+pytest harness only WARNED on error-body mismatches; the native harness is
+strict — pytest greenness is not evidence of exact conformance.
 
 ## BLOCKING RULE: No Admin Role
 
 **This engine has no admin role — by design, forever.** Never implement
 Hasura's implicit admin permission bypass. All data access goes through
-explicit role permissions; admin-secret is API-level auth only. Conformance
-fixtures that rely on implicit admin are out of scope (marked in
-COVERAGE.md). Any diff that adds an admin bypass must be rejected.
+explicit role permissions; admin-secret is API-level auth only. Admin-bound
+tests-py fixtures were excluded from the port (commented per module in
+crates/conformance/tests/). Any diff that adds an admin bypass must be
+rejected.
 
 ## BLOCKING RULE: Knowledgebase First
 
@@ -91,18 +100,21 @@ REJECT fix the issues first.
 - **One SQL statement per operation** (M4 invariant): response JSON is
   assembled in Postgres (`json_build_object`/`json_agg`, correlated
   subqueries). Don't add row-by-row post-processing in Rust.
-- **Always parameterized SQL.** Variables and session vars bind as
-  parameters, never interpolate into SQL text.
+- **SQL injection safety.** sqlgen currently renders literals inline with
+  strict quote-escaping helpers (parameterized execution is a planned
+  refactor — see crates/sqlgen/src/lib.rs header). Never format user input
+  into SQL except through those helpers.
 - **insta snapshots are reviewed, never blind-accepted.** `cargo insta
   review` and read every diff; an unexplained snapshot change is a bug.
 - **Full v2 metadata format** — metadata exported from existing Hasura
   projects must load without conversion.
-- **Every change needs tests**: unit/insta in the crate AND the relevant
-  conformance suite green via `run_suite.sh`.
+- **Every change needs tests**: unit/insta in the touched crate AND the
+  conformance crate green (`make conformance`) after rebuilding the engine
+  binary.
 
 ## Agents
 
 - `.claude/agents/judge.md` — two-stage quality gate (spec compliance →
   code quality → fresh verification). Mandatory after every commit.
-- `.claude/agents/spec-writer.md` — researches the codebase + tests-py
+- `.claude/agents/spec-writer.md` — researches the codebase + conformance
   fixtures and writes specs to `specs/NNN-<slug>.md`.

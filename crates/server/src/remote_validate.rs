@@ -345,6 +345,12 @@ pub fn validate(sdl_text: &str, upstream: &Upstream) -> Result<(), String> {
         }
     }
 
+    // The same defect can be discovered by more than one rule (e.g. a
+    // missing interface, reported both at its definition and at an object
+    // implementing it); Hasura reports each reason once.
+    let mut seen = std::collections::HashSet::new();
+    reasons.retain(|r| seen.insert(r.clone()));
+
     match reasons.len() {
         0 => Ok(()),
         1 => Err(format!(
@@ -403,5 +409,187 @@ fn validate_preset(
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ty(kind: &str) -> UpstreamType {
+        UpstreamType {
+            kind: kind.to_string(),
+            fields: HashMap::new(),
+            enum_values: vec![],
+            input_fields: HashMap::new(),
+            union_members: vec![],
+            interfaces: vec![],
+        }
+    }
+
+    /// Upstream: Query { user(id: Int!): User, name: String },
+    /// User { id: ID!, name: String }, enum Color { RED GREEN },
+    /// input Filter { limit: Int }.
+    fn upstream() -> Upstream {
+        let mut up = Upstream::default();
+        let mut query = ty("OBJECT");
+        let mut user_args = HashMap::new();
+        user_args.insert("id".to_string(), ("Int!".to_string(), true));
+        query
+            .fields
+            .insert("user".to_string(), ("User".to_string(), user_args));
+        query
+            .fields
+            .insert("name".to_string(), ("String".to_string(), HashMap::new()));
+        up.types.insert("Query".to_string(), query);
+
+        let mut user = ty("OBJECT");
+        user.fields
+            .insert("id".to_string(), ("ID!".to_string(), HashMap::new()));
+        user.fields
+            .insert("name".to_string(), ("String".to_string(), HashMap::new()));
+        up.types.insert("User".to_string(), user);
+
+        let mut color = ty("ENUM");
+        color.enum_values = vec!["RED".to_string(), "GREEN".to_string()];
+        up.types.insert("Color".to_string(), color);
+
+        let mut filter = ty("INPUT_OBJECT");
+        filter.input_fields.insert("limit".to_string(), "Int".to_string());
+        up.types.insert("Filter".to_string(), filter);
+        up
+    }
+
+    #[test]
+    fn valid_subset_passes() {
+        let up = upstream();
+        assert_eq!(
+            validate(
+                "type Query { user(id: Int!): User } type User { id: ID! } scalar Int",
+                &up
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unknown_scalar_single_reason_format() {
+        let e = validate("scalar Odd", &upstream()).unwrap_err();
+        assert_eq!(
+            e,
+            "validation for the given role-based schema failed because \"Scalar\": \"Odd\" does not exist in the upstream remote schema"
+        );
+    }
+
+    #[test]
+    fn enum_value_mismatches() {
+        let e = validate("enum Color { RED BLUE BLUE }", &upstream()).unwrap_err();
+        assert!(
+            e.starts_with("validation for the given role-based schema failed for the following reasons:\n"),
+            "{e}"
+        );
+        assert!(
+            e.contains(" • enum \"Color\" contains the following enum values that do not exist in the corresponding upstream remote enum: \"BLUE\"\n"),
+            "{e}"
+        );
+        assert!(
+            e.contains(" • duplicate enum values: \"BLUE\" found in the \"Color\" enum\n"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn object_field_type_mismatch_message() {
+        let e = validate("type User { id: ID }", &upstream()).unwrap_err();
+        assert_eq!(
+            e,
+            "validation for the given role-based schema failed because expected type of \"id\"(\"Object field\") to be ID! but received ID"
+        );
+    }
+
+    #[test]
+    fn object_unknown_field_message() {
+        let e = validate("type User { nope: String }", &upstream()).unwrap_err();
+        assert_eq!(
+            e,
+            "validation for the given role-based schema failed because field \"nope\" does not exist in the \"Object\": \"User\""
+        );
+    }
+
+    #[test]
+    fn missing_non_nullable_argument() {
+        let e = validate("type Query { user: User } type User { id: ID! }", &upstream())
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "validation for the given role-based schema failed because field: \"user\" expects the following non nullable arguments to be present: \"id\""
+        );
+    }
+
+    #[test]
+    fn dangling_interface_reported_once() {
+        // The missing interface is discovered both at its definition and
+        // at the object implementing it; the report carries it once.
+        let sdl = "interface Node { id: ID! } type User implements Node { id: ID! }";
+        let e = validate(sdl, &upstream()).unwrap_err();
+        assert_eq!(
+            e.matches("\"Interface\": \"Node\" does not exist in the upstream remote schema")
+                .count(),
+            1,
+            "{e}"
+        );
+        assert!(
+            e.contains("custom interfaces are not supported. Object\"User\" implements the following custom interfaces: \"Node\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn preset_only_on_arguments_or_input_fields() {
+        let e = validate("type Query { name: String @preset(value: 5) }", &upstream())
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "validation for the given role-based schema failed because Preset directives can be defined only on INPUT_FIELD_DEFINITION or ARGUMENT_DEFINITION"
+        );
+    }
+
+    #[test]
+    fn input_object_field_mismatches() {
+        let e = validate("input Filter { limit: String nope: Int }", &upstream()).unwrap_err();
+        assert!(
+            e.contains(" • expected type of \"limit\"(\"Input object argument\") to be Int but received String"),
+            "{e}"
+        );
+        assert!(
+            e.contains(" • \"nope\" does not exist in the input object \"Filter\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn parse_upstream_renders_wrapped_types_and_required_args() {
+        let intro = json!({ "data": { "__schema": { "types": [
+            { "kind": "OBJECT", "name": "Query", "fields": [
+                { "name": "users",
+                  "args": [
+                    { "name": "limit", "defaultValue": "10",
+                      "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "Int" } } },
+                    { "name": "id", "defaultValue": null,
+                      "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "Int" } } }
+                  ],
+                  "type": { "kind": "NON_NULL", "ofType": {
+                      "kind": "LIST", "ofType": { "kind": "OBJECT", "name": "User" } } } }
+            ] },
+            { "kind": "ENUM", "name": "Color", "enumValues": [ { "name": "RED" } ] }
+        ] } } });
+        let up = parse_upstream(&intro);
+        let (rendered, args) = &up.types["Query"].fields["users"];
+        assert_eq!(rendered, "[User]!");
+        assert_eq!(args["id"], ("Int!".to_string(), true));
+        // A default value makes a non-null argument optional.
+        assert_eq!(args["limit"], ("Int!".to_string(), false));
+        assert_eq!(up.types["Color"].enum_values, vec!["RED"]);
     }
 }

@@ -341,8 +341,12 @@ pub enum CompareOp {
     ContainedIn(Scalar),
     /// PostGIS `ST_<fn>(col, geom)` returning bool.
     StOp { function: String, value: Scalar },
-    /// PostGIS `ST_DWithin(col, geom, distance)`.
-    StDWithin { distance: Scalar, from: Scalar },
+    /// PostGIS `ST_DWithin(col, geom, distance)` (or the 3D variant).
+    StDWithin {
+        distance: Scalar,
+        from: Scalar,
+        three_d: bool,
+    },
 }
 
 // ---------------------------------------------------------------------

@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/ir_unit.rs
+expression: sql
+---
+SELECT json_build_object('author_aggregate', (SELECT json_build_object('aggregate', json_build_object('max', json_build_object('id', max(CASE WHEN "_t1"."id" = (2)::"int4" THEN "_t1"."id" ELSE NULL END)))) FROM (SELECT * FROM "public"."author" AS "_t0") AS "_t1")) AS root

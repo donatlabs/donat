@@ -220,6 +220,20 @@ async fn run_one(state: &SharedState, sql: &str) -> Result<Json, OpError> {
     let client = pool.get().await.map_err(internal)?;
     tracing::debug!(%sql, "executing v1 data op");
     let row = client.query_one(sql, &[]).await.map_err(|e| {
+        // dist_api.check_violation() raises 23514 with a JSON payload; the
+        // v1 data API reports it as Hasura's permission-error shape.
+        if let Some(db) = e.as_db_error()
+            && db.code().code() == "23514"
+        {
+            let message = serde_json::from_str::<Json>(db.message())
+                .ok()
+                .and_then(|p| p.get("message").and_then(Json::as_str).map(str::to_string))
+                .unwrap_or_else(|| db.message().to_string());
+            return OpError {
+                status: 400,
+                body: json!({ "code": "permission-error", "error": message, "path": "$.args" }),
+            };
+        }
         let message = e
             .as_db_error()
             .map(|db| db.message().to_string())
@@ -866,12 +880,16 @@ async fn remote_schema(state: &SharedState, args: &Json, add: bool) -> Result<Js
         .ok_or_else(|| OpError::bad_request("parse-failed", "expected a name"))?
         .to_string();
     let mut engine = state.engine.write().await;
-    // update_remote_schema keeps the existing permissions.
-    let kept_permissions = engine
+    // update_remote_schema keeps the existing permissions; the previous
+    // entry is restored if the update fails validation.
+    let previous = engine
         .metadata
         .remote_schemas
         .iter()
         .find(|r| r.name == name)
+        .cloned();
+    let kept_permissions = previous
+        .as_ref()
         .map(|r| r.permissions.clone())
         .unwrap_or_default();
     engine.metadata.remote_schemas.retain(|r| r.name != name);
@@ -907,6 +925,32 @@ async fn remote_schema(state: &SharedState, args: &Json, add: bool) -> Result<Js
         {
             if let Ok(body) = resp.json::<Json>().await {
                 let upstream = crate::remote_validate::parse_upstream(&body);
+                // update_remote_schema re-validates the permissions it keeps
+                // against the new upstream; a mismatch fails the update.
+                let engine = state.engine.read().await;
+                if let Some(schema) = engine.metadata.remote_schemas.iter().find(|r| r.name == name)
+                {
+                    for perm in &schema.permissions {
+                        if let Err(report) =
+                            crate::remote_validate::validate(&perm.definition.schema, &upstream)
+                        {
+                            drop(engine);
+                            let mut eng = state.engine.write().await;
+                            eng.metadata.remote_schemas.retain(|r| r.name != name);
+                            if let Some(prev) = previous {
+                                eng.metadata.remote_schemas.push(prev);
+                            }
+                            return Err(OpError {
+                                status: 400,
+                                body: json!({
+                                    "code": "remote-schema-error",
+                                    "error": report,
+                                    "path": "$.args",
+                                }),
+                            });
+                        }
+                    }
+                }
                 state
                     .remote_upstreams
                     .write()
@@ -1036,10 +1080,15 @@ async fn collection_query(state: &SharedState, args: &Json, add: bool) -> Result
             .ok_or_else(|| OpError::bad_request("parse-failed", "expected query"))?
             .to_string();
         if entry.definition.queries.iter().any(|q| q.name == query_name) {
-            return Err(OpError::bad_request(
-                "already-exists",
-                format!("query with name \"{query_name}\" already exists in collection \"{collection}\""),
-            ));
+            // Hasura scopes metadata-op argument errors to $.args.
+            return Err(OpError {
+                status: 400,
+                body: json!({
+                    "code": "already-exists",
+                    "error": format!("query with name \"{query_name}\" already exists in collection \"{collection}\""),
+                    "path": "$.args",
+                }),
+            });
         }
         entry.definition.queries.push(dist_metadata::CollectionQuery {
             name: query_name,
@@ -1209,5 +1258,90 @@ fn internal(e: impl std::fmt::Display) -> OpError {
     OpError {
         status: 500,
         body: json!({ "code": "unexpected", "error": e.to_string(), "path": "$" }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn role(name: &str, set: &[&str]) -> dist_metadata::InheritedRole {
+        dist_metadata::InheritedRole {
+            role_name: name.to_string(),
+            role_set: set.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn op_error_bad_request_shape() {
+        let e = OpError::bad_request("parse-failed", "boom");
+        assert_eq!(e.status, 400);
+        assert_eq!(e.body, json!({ "code": "parse-failed", "error": "boom", "path": "$" }));
+    }
+
+    #[test]
+    fn plan_error_maps_to_hasura_body() {
+        let e = plan_err(PlanError::new("$.args", "validation-failed", "nope"));
+        assert_eq!(e.status, 400);
+        assert_eq!(
+            e.body,
+            json!({ "code": "validation-failed", "error": "nope", "path": "$.args" })
+        );
+    }
+
+    #[test]
+    fn internal_error_is_500_unexpected() {
+        let e = internal("kaput");
+        assert_eq!(e.status, 500);
+        assert_eq!(e.body, json!({ "code": "unexpected", "error": "kaput", "path": "$" }));
+    }
+
+    #[test]
+    fn parse_table_accepts_all_spellings() {
+        let t = parse_table(&json!({ "table": "author" })).unwrap();
+        assert_eq!((t.schema(), t.name()), ("public", "author"));
+        let t = parse_table(&json!({ "table": { "schema": "s", "name": "t" } })).unwrap();
+        assert_eq!((t.schema(), t.name()), ("s", "t"));
+        // v1 track_table style: schema/name directly in args.
+        let t = parse_table(&json!({ "name": "t2", "schema": "s2" })).unwrap();
+        assert_eq!((t.schema(), t.name()), ("s2", "t2"));
+        // Qualified form defaults the schema to public.
+        let t = parse_table(&json!({ "table": { "name": "t3" } })).unwrap();
+        assert_eq!((t.schema(), t.name()), ("public", "t3"));
+    }
+
+    #[test]
+    fn parse_table_rejects_garbage() {
+        let e = parse_table(&json!(42)).unwrap_err();
+        assert_eq!(e.status, 400);
+        assert_eq!(e.body["code"], "parse-failed");
+    }
+
+    #[test]
+    fn sql_quoting_escapes() {
+        assert_eq!(quote_ident_sql("plain"), "\"plain\"");
+        assert_eq!(quote_ident_sql("we\"ird"), "\"we\"\"ird\"");
+        assert_eq!(quote_lit_sql("O'Hara"), "'O''Hara'");
+    }
+
+    #[test]
+    fn role_cycle_detected_with_path() {
+        let roles = vec![role("a", &["b"]), role("b", &["c"]), role("c", &["a"])];
+        assert_eq!(
+            find_role_cycle(&roles),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string(), "a".to_string()])
+        );
+        // Self-reference is the shortest cycle.
+        assert_eq!(
+            find_role_cycle(&[role("x", &["x"])]),
+            Some(vec!["x".to_string(), "x".to_string()])
+        );
+    }
+
+    #[test]
+    fn role_cycle_absent_for_dag() {
+        // Diamond: shared parents are fine, only true cycles count.
+        let roles = vec![role("a", &["b", "c"]), role("b", &["c"])];
+        assert_eq!(find_role_cycle(&roles), None);
     }
 }

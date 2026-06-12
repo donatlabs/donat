@@ -1,0 +1,19 @@
+[package]
+name = "dist-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native conformance harness: Hasura-derived fixtures executed against dist-api"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+tungstenite = { workspace = true }
+postgres = { workspace = true }
+graphql-parser = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/ir_unit.rs
+expression: sql
+---
+SELECT json_build_object('author', (SELECT coalesce(json_agg("_t1".j), '[]'::json) FROM (SELECT json_build_object('name', CASE WHEN "_t0"."id" = (2)::"int4" THEN "_t0"."name" ELSE NULL END) AS j FROM "public"."author" AS "_t0") AS "_t1")) AS root

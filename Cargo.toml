@@ -7,6 +7,7 @@ members = [
     "crates/ir",
     "crates/sqlgen",
     "crates/server",
+    "crates/conformance",
 ]
 
 [workspace.package]
@@ -33,5 +34,7 @@ jsonwebtoken = "9"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
+tungstenite = "0.24"
+postgres = "0.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

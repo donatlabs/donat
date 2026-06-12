@@ -377,6 +377,7 @@ impl Planner<'_> {
                 CompareOp::StDWithin {
                     distance: scalar(distance)?,
                     from: scalar(from)?,
+                    three_d: op_name == "_st_3d_d_within",
                 }
             }
             other => {

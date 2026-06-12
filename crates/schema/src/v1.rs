@@ -226,7 +226,19 @@ impl<'a> Planner<'a> {
         session: &Session,
     ) -> Result<SelectQuery, PlanError> {
         let path = "$";
-        let (_, ctx) = self.v1_table_ctx(args, session, path)?;
+        let table = parse_table(args, path)?;
+        // Hasura's count op reports the permission failure with its own shape.
+        let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
+            PlanError::new(
+                "$.args",
+                "permission-denied",
+                format!(
+                    "select on \"{}\" for role \"{}\" is not allowed. ; \"count\" is only allowed if the role has \"select\" permissions on the table",
+                    table.name(),
+                    session.role
+                ),
+            )
+        })?;
 
         let mut predicates = vec![];
         if let Some(w) = args.get("where").filter(|w| !w.is_null()) {
@@ -330,7 +342,7 @@ impl<'a> Planner<'a> {
                     }
                     if !allowed(col) {
                         return Err(PlanError::new(
-                            path,
+                            &format!("{path}.args[\"{key}\"]"),
                             "permission-denied",
                             format!("role \"{}\" does not have permission to update column \"{col}\"", session.role),
                         ));
@@ -469,10 +481,12 @@ impl<'a> Planner<'a> {
             .map(|p| &p.permission)
             .ok_or_else(|| {
                 PlanError::new(
-                    path,
+                    "$.args",
                     "permission-denied",
+                    // Hasura's exact v1 shape, trailing space included.
                     format!(
-                        "role \"{}\" does not have permission to insert into table \"{table}\"",
+                        "insert on \"{}\" for role \"{}\" is not allowed. ",
+                        table.name(),
                         session.role
                     ),
                 )

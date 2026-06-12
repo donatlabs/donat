@@ -8,6 +8,7 @@ use dist_schema::{Planner, Session};
 use crate::state::SharedState;
 
 /// A planning-level GraphQL error (shared with remote validation).
+#[derive(Debug)]
 pub struct GqlError {
     pub path: String,
     pub code: &'static str,
@@ -470,6 +471,7 @@ pub async fn execute_full(
                                         session,
                                         &query.fields,
                                         node,
+                                        &format!("$.selectionSet.{alias}"),
                                     )
                                     .await
                                     {
@@ -611,12 +613,13 @@ fn resolve_remote_joins<'a>(
     session: &'a Session,
     fields: &'a [dist_ir::OutputField],
     node: &'a mut Json,
+    path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
     Box::pin(async move {
         match node {
             Json::Array(items) => {
                 for item in items {
-                    resolve_remote_joins(state, session, fields, item).await?;
+                    resolve_remote_joins(state, session, fields, item, path).await?;
                 }
                 Ok(())
             }
@@ -626,8 +629,14 @@ fn resolve_remote_joins<'a>(
                         dist_ir::FieldValue::Object { query, .. }
                         | dist_ir::FieldValue::Array { query, .. } => {
                             if let Some(child) = node.get_mut(field.alias.as_str()) {
-                                resolve_remote_joins(state, session, &query.fields, child)
-                                    .await?;
+                                resolve_remote_joins(
+                                    state,
+                                    session,
+                                    &query.fields,
+                                    child,
+                                    &format!("{path}.selectionSet.{}", field.alias),
+                                )
+                                .await?;
                             }
                         }
                         dist_ir::FieldValue::RemoteJoin { spec } => {
@@ -678,9 +687,20 @@ fn resolve_remote_joins<'a>(
                                         .unwrap_or(Json::Null)
                                 }
                                 Some(Err(e)) => {
+                                    // Validation errors for the server-built
+                                    // join query are reported at the client's
+                                    // field path, not the join root's.
+                                    let client_field =
+                                        format!("{path}.selectionSet.{}", field.alias);
+                                    let server_root =
+                                        format!("$.selectionSet.{}", spec.root_field);
+                                    let rewritten = match e.path.strip_prefix(&server_root) {
+                                        Some(rest) => format!("{client_field}{rest}"),
+                                        None => client_field,
+                                    };
                                     return Err(json!({
                                         "errors": [{
-                                            "extensions": { "path": e.path, "code": e.code },
+                                            "extensions": { "path": rewritten, "code": e.code },
                                             "message": e.message,
                                         }]
                                     }));
@@ -750,4 +770,127 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
             "message": message.into(),
         }]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::try_from(*k).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn parse(q: &str) -> graphql_parser::query::Document<'static, String> {
+        graphql_parser::parse_query::<String>(q).unwrap().into_static()
+    }
+
+    #[test]
+    fn untrusted_request_falls_back_to_unauthorized_role() {
+        let h = headers(&[("x-hasura-role", "editor"), ("x-hasura-user-id", "1")]);
+        let s = session_from_headers(&h, Some("anonymous"), false).unwrap();
+        assert_eq!(s.role, "anonymous");
+        assert!(s.vars.is_empty(), "untrusted headers must be ignored");
+    }
+
+    #[test]
+    fn untrusted_request_without_unauthorized_role_is_denied() {
+        let e = session_from_headers(&HeaderMap::new(), None, false).unwrap_err();
+        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("access-denied")));
+        assert_eq!(
+            e.pointer("/errors/0/message"),
+            Some(&json!("x-hasura-admin-secret required, but not found"))
+        );
+    }
+
+    #[test]
+    fn trusted_request_collects_x_hasura_vars() {
+        let h = headers(&[
+            ("x-hasura-role", "editor"),
+            ("X-Hasura-User-Id", "7"),
+            ("x-hasura-admin-secret", "shh"),
+            ("content-type", "application/json"),
+        ]);
+        let s = session_from_headers(&h, None, true).unwrap();
+        assert_eq!(s.role, "editor");
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
+        assert!(!s.vars.contains_key("x-hasura-admin-secret"));
+        assert!(!s.vars.contains_key("content-type"));
+        assert!(!s.backend_request);
+    }
+
+    #[test]
+    fn trusted_request_requires_a_role() {
+        let e = session_from_headers(&headers(&[("x-hasura-user-id", "7")]), None, true)
+            .unwrap_err();
+        assert_eq!(
+            e.pointer("/errors/0/message"),
+            Some(&json!("x-hasura-role header is required (this engine has no admin role)"))
+        );
+    }
+
+    #[test]
+    fn backend_only_permissions_header_parsing() {
+        let with = |v: &str| {
+            session_from_headers(
+                &headers(&[("x-hasura-role", "u"), ("x-hasura-use-backend-only-permissions", v)]),
+                None,
+                true,
+            )
+        };
+        assert!(with("YES").unwrap().backend_request);
+        assert!(!with("f").unwrap().backend_request);
+        let e = with("maybe").unwrap_err();
+        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("bad-request")));
+        assert_eq!(
+            e.pointer("/errors/0/message"),
+            Some(&json!("x-hasura-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"))
+        );
+    }
+
+    #[test]
+    fn allowlist_comparison_ignores_typename_only() {
+        let listed = parse("query getAuthors { author { id name } }");
+        let with_typename =
+            parse("query getAuthors { __typename author { id __typename name } }");
+        let different = parse("query getAuthors { author { id } }");
+        assert_eq!(
+            normalize_for_allowlist(&with_typename),
+            normalize_for_allowlist(&listed)
+        );
+        assert_ne!(
+            normalize_for_allowlist(&different),
+            normalize_for_allowlist(&listed)
+        );
+    }
+
+    #[test]
+    fn top_level_fields_keeps_order_and_flags_introspection() {
+        let doc = parse("{ __schema { queryType { name } } a: user { id } __typename }");
+        assert_eq!(
+            top_level_fields(&doc),
+            vec![
+                ("__schema".to_string(), true),
+                ("a".to_string(), false),
+                ("__typename".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_json_shape() {
+        assert_eq!(
+            error_json("validation-failed", "boom"),
+            json!({ "errors": [{
+                "extensions": { "path": "$", "code": "validation-failed" },
+                "message": "boom",
+            }] })
+        );
+    }
 }

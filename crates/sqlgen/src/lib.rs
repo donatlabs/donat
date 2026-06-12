@@ -715,9 +715,14 @@ impl Ctx {
             CompareOp::StOp { function, value } => {
                 format!("{function}({col}, {})", geometry_sql(value, pg_type))
             }
-            CompareOp::StDWithin { distance, from } => {
+            CompareOp::StDWithin {
+                distance,
+                from,
+                three_d,
+            } => {
+                let func = if *three_d { "ST_3DDWithin" } else { "ST_DWithin" };
                 format!(
-                    "ST_DWithin({col}, {}, {})",
+                    "{func}({col}, {}, {})",
                     geometry_sql(from, pg_type),
                     scalar_sql(distance, "float8")
                 )

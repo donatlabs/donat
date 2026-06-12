@@ -166,6 +166,16 @@ impl<'a> TableCtx<'a> {
         self.perms.iter().any(|p| perm_grants_column(p, name))
     }
 
+    /// Whether the role may select at least one column. Roles with
+    /// `columns: []` still aggregate via count, but Hasura omits
+    /// column-typed arguments (e.g. `count(columns:)`) from their schema.
+    pub(crate) fn any_column_allowed(&self) -> bool {
+        self.info
+            .columns
+            .iter()
+            .any(|c| self.column_allowed(&c.name))
+    }
+
     pub(crate) fn column_allowed_for_filter(&self, name: &str, is_permission: bool) -> bool {
         if is_permission {
             self.info.column(name).is_some()
@@ -762,6 +772,14 @@ impl<'a> Planner<'a> {
                     let Some(ctx) = self.table_ctx(idx, &session.role) else {
                         return Err(not_found());
                     };
+                    // Hasura omits <table>_by_pk from the role's schema unless
+                    // the role may select every primary-key column.
+                    if kind == RootKind::ByPk
+                        && (ctx.info.primary_key.is_empty()
+                            || !ctx.info.primary_key.iter().all(|c| ctx.column_allowed(c)))
+                    {
+                        return Err(not_found());
+                    }
                     let from = FromSource::Table(Table {
                         schema: ctx.info.schema.clone(),
                         name: ctx.info.name.clone(),
@@ -1541,6 +1559,14 @@ impl<'a> Planner<'a> {
                         match arg.as_str() {
                             "distinct" => distinct = value.as_bool().unwrap_or(false),
                             "columns" => {
+                                // Hasura omits the columns arg from count for
+                                // roles with no selectable columns.
+                                if !ctx.any_column_allowed() {
+                                    return Err(PlanError::validation(
+                                        &fpath,
+                                        "'count' has no argument named 'columns'",
+                                    ));
+                                }
                                 columns = parse_columns_arg(&value, ctx, &fpath)?;
                             }
                             other => return Err(unexpected_arg(&fpath, other)),
@@ -1552,6 +1578,15 @@ impl<'a> Planner<'a> {
                     });
                 }
                 op if COLUMN_OPS.contains(&op) => {
+                    // Roles with no selectable columns get no column-op
+                    // fields in <table>_aggregate_fields at all.
+                    if !ctx.any_column_allowed() {
+                        return Err(field_not_found(
+                            &fpath,
+                            op,
+                            &format!("{}_aggregate_fields", ctx.type_name),
+                        ));
+                    }
                     let cols = flatten(&field.selection_set, fragments, vars, None)?;
                     let mut columns = vec![];
                     for col_field in cols {

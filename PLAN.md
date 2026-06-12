@@ -75,3 +75,22 @@ subscriptions, event triggers, actions, remote schemas.
   no N+1, no in-process result stitching.
 - **No runtime console** — files are the source of truth; `/v1/metadata`
   exists only as a protocol for tests-py and tooling.
+
+## Known issues (from the 2026-06-13 unit-test review; not yet fixed)
+
+- `crates/server/src/remote.rs::resolve_url_template` substitutes only the
+  first `{{VAR}}`; a `}}` preceding `{{` can slice with start>end and panic.
+- `apply_presets` Boolean coercion is silent (non-"true" -> false), unlike
+  the Int coercion-error path.
+- claims_map mode reports a non-array `x-hasura-allowed-roles` as
+  `jwt-missing-role-claims`, while direct-claims mode reports
+  `jwt-invalid-claims` with the Aeson parse message.
+- No include-cycle guard in `crates/metadata/src/loader.rs` and the
+  conformance fixture loader (self-include recurses to stack overflow).
+- `load_metadata_dir` ignores directory-form `inherited_roles` /
+  `query_collections` / `allowlist` / `remote_schemas` (only the
+  single-document form carries them).
+- `parse_array_literal` (session array literals "{a,b}") splits naively on
+  commas — breaks for quoted values containing commas.
+- sqlgen renders literals inline with quote-escaping; parameterized
+  execution remains a planned refactor (see crates/sqlgen/src/lib.rs).

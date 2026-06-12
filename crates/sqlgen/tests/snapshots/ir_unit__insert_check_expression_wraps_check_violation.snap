@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/ir_unit.rs
+expression: sql
+---
+WITH "ins" AS (INSERT INTO "public"."author" ("name") VALUES (('bob')::"text") RETURNING *) SELECT CASE WHEN (SELECT count(*) FROM "ins" WHERE NOT ("ins"."name" <> ('admin')::"text")) > 0 THEN dist_api.check_violation('{"path":"$.selectionSet.insert_author.args.objects","message":"check constraint of an insert/update permission has failed"}') ELSE json_build_object('affected_rows', (SELECT count(*) FROM "ins")) END AS root

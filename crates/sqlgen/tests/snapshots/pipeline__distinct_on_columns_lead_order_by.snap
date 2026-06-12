@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+expression: "plan_sql(r#\"query {\n            article(distinct_on: published, order_by: { id: desc }) { id }\n        }\"#)"
+---
+SELECT json_build_object('article', (SELECT coalesce(json_agg("_t1".j), '[]'::json) FROM (SELECT DISTINCT ON ("_t0"."published") json_build_object('id', "_t0"."id") AS j FROM "public"."article" AS "_t0" WHERE ("_t0"."published" = TRUE OR "_t0"."author_id" = ('1')::"int4") ORDER BY "_t0"."published" ASC NULLS LAST, "_t0"."id" DESC NULLS FIRST LIMIT 100) AS "_t1")) AS root

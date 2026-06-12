@@ -194,6 +194,25 @@ fn relationship_predicate_in_where() {
 }
 
 #[test]
+fn distinct_on_columns_lead_order_by() {
+    // The planner must prepend distinct_on columns to ORDER BY (Postgres
+    // requires DISTINCT ON expressions to match the leftmost ORDER BY).
+    insta::assert_snapshot!(plan_sql(
+        r#"query {
+            article(distinct_on: published, order_by: { id: desc }) { id }
+        }"#
+    ));
+}
+
+#[test]
+fn string_literals_are_escaped() {
+    // sqlgen inlines literals; quotes must be doubled, never raw.
+    let sql = plan_sql(r#"query { article(where: { title: { _eq: "O'Brien" } }) { id } }"#);
+    assert!(sql.contains("('O''Brien')::\"text\""), "escaped literal missing in: {sql}");
+    assert!(!sql.contains("'O'Brien'"), "raw unescaped literal leaked into: {sql}");
+}
+
+#[test]
 fn unknown_role_sees_nothing() {
     let session = Session {
         role: "stranger".into(),

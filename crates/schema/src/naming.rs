@@ -45,3 +45,80 @@ pub fn root_names(entry: &TableEntry) -> RootNames {
         select_aggregate: get("select_aggregate", format!("{base}_aggregate")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(value: serde_json::Value) -> TableEntry {
+        serde_json::from_value(value).expect("table entry deserializes")
+    }
+
+    #[test]
+    fn default_base_name_drops_public_schema() {
+        assert_eq!(
+            default_base_name(&QualifiedTable::Qualified {
+                schema: "public".into(),
+                name: "author".into(),
+            }),
+            "author"
+        );
+        // Bare names default to the public schema.
+        assert_eq!(default_base_name(&QualifiedTable::Name("author".into())), "author");
+    }
+
+    #[test]
+    fn default_base_name_prefixes_other_schemas() {
+        assert_eq!(
+            default_base_name(&QualifiedTable::Qualified {
+                schema: "sales".into(),
+                name: "order".into(),
+            }),
+            "sales_order"
+        );
+    }
+
+    #[test]
+    fn table_base_name_prefers_custom_name() {
+        let e = entry(serde_json::json!({
+            "table": { "schema": "sales", "name": "order" },
+            "configuration": { "custom_name": "purchase" },
+        }));
+        assert_eq!(table_base_name(&e), "purchase");
+    }
+
+    #[test]
+    fn table_base_name_falls_back_to_default_when_no_custom_name() {
+        let e = entry(serde_json::json!({
+            "table": { "schema": "sales", "name": "order" },
+            "configuration": { "custom_root_fields": { "select": "orders" } },
+        }));
+        assert_eq!(table_base_name(&e), "sales_order");
+    }
+
+    #[test]
+    fn root_names_derive_from_base_name() {
+        let e = entry(serde_json::json!({ "table": "author" }));
+        let names = root_names(&e);
+        assert_eq!(names.select, "author");
+        assert_eq!(names.select_by_pk, "author_by_pk");
+        assert_eq!(names.select_aggregate, "author_aggregate");
+    }
+
+    #[test]
+    fn custom_root_fields_override_individual_roots() {
+        let e = entry(serde_json::json!({
+            "table": "author",
+            "configuration": {
+                "custom_name": "writer",
+                "custom_root_fields": { "select_by_pk": "writerByPk" },
+            },
+        }));
+        let names = root_names(&e);
+        // Overridden root keeps the custom field name verbatim...
+        assert_eq!(names.select_by_pk, "writerByPk");
+        // ...the rest derive from the custom table name.
+        assert_eq!(names.select, "writer");
+        assert_eq!(names.select_aggregate, "writer_aggregate");
+    }
+}

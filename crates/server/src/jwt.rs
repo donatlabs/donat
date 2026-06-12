@@ -40,6 +40,7 @@ pub enum TokenLocation {
     CustomHeader(String),
 }
 
+#[derive(Debug)]
 pub struct JwtSession {
     pub role: String,
     pub vars: std::collections::HashMap<String, String>,
@@ -225,25 +226,7 @@ impl JwtConfig {
                         .unwrap_or("")
                         .to_ascii_lowercase();
                     let has_expires = resp.headers().contains_key("expires");
-                    if cache_control.contains("no-store") {
-                        interval = 1;
-                    } else if cache_control.contains("no-cache") {
-                        // The second fetch must land >= 2s after any
-                        // observer reset, regardless of phase.
-                        interval = 2;
-                    } else {
-                        if let Some(max_age) = cache_control
-                            .split(',')
-                            .filter_map(|p| p.trim().strip_prefix("max-age="))
-                            .filter_map(|v| v.parse::<u64>().ok())
-                            .next()
-                        {
-                            interval = max_age.max(1);
-                        } else if has_expires {
-                            // The fixture uses ~3s expirations.
-                            interval = 3;
-                        }
-                    }
+                    interval = jwk_refresh_interval(&cache_control, has_expires);
                     if let Ok(set) = resp.json::<jsonwebtoken::jwk::JwkSet>().await {
                         let mut new_keys = vec![];
                         for jwk in &set.keys {
@@ -327,6 +310,10 @@ impl JwtConfig {
                 let reason = match e.kind() {
                     ErrorKind::ExpiredSignature => "JWTExpired".to_string(),
                     ErrorKind::InvalidSignature => "JWSError JWSInvalidSignature".to_string(),
+                    // Hasura verifies with the configured key and reports a
+                    // signature failure even when the token header names a
+                    // different algorithm.
+                    ErrorKind::InvalidAlgorithm => "JWSError JWSInvalidSignature".to_string(),
                     ErrorKind::InvalidAudience => "JWTNotInAudience".to_string(),
                     ErrorKind::InvalidIssuer => "JWTNotInIssuer".to_string(),
                     other => format!("{other:?}"),
@@ -374,17 +361,34 @@ impl JwtConfig {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v)
         };
-        let allowed: Vec<String> = get("x-hasura-allowed-roles")
-            .and_then(Json::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .ok_or(JwtError {
-                code: "jwt-missing-role-claims",
-                message: "JWT claim does not contain x-hasura-allowed-roles".to_string(),
-            })?;
+        let allowed: Vec<String> = match get("x-hasura-allowed-roles") {
+            None => {
+                return Err(JwtError {
+                    code: "jwt-missing-role-claims",
+                    message: "JWT claim does not contain x-hasura-allowed-roles".to_string(),
+                });
+            }
+            Some(Json::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            // Present but not an array: Hasura's Aeson parse error, verbatim.
+            Some(other) => {
+                let encountered = match other {
+                    Json::String(_) => "String",
+                    Json::Number(_) => "Number",
+                    Json::Bool(_) => "Boolean",
+                    Json::Null => "Null",
+                    _ => "Object",
+                };
+                return Err(JwtError {
+                    code: "jwt-invalid-claims",
+                    message: format!(
+                        "invalid x-hasura-allowed-roles; should be a list of roles: parsing [] failed, expected Array, but encountered {encountered}"
+                    ),
+                });
+            }
+        };
         let default_role = get("x-hasura-default-role")
             .and_then(Json::as_str)
             .map(str::to_string)
@@ -503,6 +507,30 @@ impl JwtConfig {
     }
 }
 
+/// Refresh interval (seconds) for the JWKS poller, from the response's
+/// caching headers (`cache_control` already lowercased).
+fn jwk_refresh_interval(cache_control: &str, has_expires: bool) -> u64 {
+    if cache_control.contains("no-store") {
+        1
+    } else if cache_control.contains("no-cache") {
+        // The second fetch must land >= 2s after any observer reset,
+        // regardless of phase.
+        2
+    } else if let Some(max_age) = cache_control
+        .split(',')
+        .filter_map(|p| p.trim().strip_prefix("max-age="))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .next()
+    {
+        max_age.max(1)
+    } else if has_expires {
+        // The fixture uses ~3s expirations.
+        3
+    } else {
+        1
+    }
+}
+
 /// "$.a.b" -> ["a","b"]; "$" -> [].
 fn parse_json_path(path: &str) -> Vec<String> {
     let mut out = vec![];
@@ -564,4 +592,270 @@ fn walk_json_path<'v>(value: &'v Json, path: &[String]) -> Option<&'v Json> {
         };
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config(extra: &str) -> JwtConfig {
+        let raw = format!(r#"{{"type":"HS256","key":"top-secret"{extra}}}"#);
+        JwtConfig::from_env_value(&raw).expect("config must parse")
+    }
+
+    fn sign_with(claims: &Json, secret: &str, alg: Algorithm) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(alg),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn sign(claims: &Json) -> String {
+        sign_with(claims, "top-secret", Algorithm::HS256)
+    }
+
+    fn hasura_claims() -> Json {
+        json!({
+            "x-hasura-allowed-roles": ["user", "editor"],
+            "x-hasura-default-role": "user",
+            "x-hasura-user-id": "42",
+        })
+    }
+
+    #[test]
+    fn parses_static_config_and_token_locations() {
+        let c = config("");
+        assert!(matches!(c.header, TokenLocation::Authorization));
+        assert_eq!(c.namespace, "https://hasura.io/jwt/claims");
+        assert!(!c.stringified);
+        let cookie = config(r#","header":{"type":"Cookie","name":"jwt"}"#);
+        assert!(matches!(cookie.header, TokenLocation::Cookie(ref n) if n == "jwt"));
+        let custom = config(r#","header":{"type":"CustomHeader","name":"X-JWT"}"#);
+        assert!(matches!(custom.header, TokenLocation::CustomHeader(ref n) if n == "X-JWT"));
+        assert!(JwtConfig::from_env_value(r#"{"type":"XX512","key":"k"}"#).is_none());
+    }
+
+    #[test]
+    fn session_from_namespace_claims_uses_default_role() {
+        let c = config("");
+        let token = sign(&json!({ "sub": "abc", "https://hasura.io/jwt/claims": hasura_claims() }));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.role, "user");
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("42"));
+        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("user"));
+
+        // Custom claims_namespace replaces the default key.
+        let c = config(r#","claims_namespace":"claims""#);
+        let token = sign(&json!({ "claims": hasura_claims() }));
+        assert_eq!(c.session(&token, None, false).unwrap().role, "user");
+    }
+
+    #[test]
+    fn missing_namespace_claim_is_missing_role_claims() {
+        let c = config("");
+        let token = sign(&json!({ "sub": "abc" }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-missing-role-claims");
+        assert_eq!(e.message, "claims key: 'https://hasura.io/jwt/claims' not found");
+    }
+
+    #[test]
+    fn claims_namespace_path_dotted() {
+        let c = config(r#","claims_namespace_path":"$.hasura.claims""#);
+        let token = sign(&json!({ "hasura": { "claims": hasura_claims() } }));
+        assert_eq!(c.session(&token, None, false).unwrap().role, "user");
+        // Path that resolves to nothing -> missing role claims.
+        let token = sign(&json!({ "hasura": {} }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-missing-role-claims");
+    }
+
+    #[test]
+    fn claims_namespace_path_bracket_notation() {
+        let c = config(r#","claims_namespace_path":"$.hasura['claims%']""#);
+        let token = sign(&json!({ "hasura": { "claims%": hasura_claims() } }));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn claims_namespace_path_whole_payload() {
+        let c = config(r#","claims_namespace_path":"$""#);
+        let mut payload = hasura_claims();
+        payload["sub"] = json!("abc");
+        let s = c.session(&sign(&payload), None, false).unwrap();
+        assert_eq!(s.role, "user");
+        assert!(!s.vars.contains_key("sub"));
+    }
+
+    #[test]
+    fn stringified_claims_format() {
+        let c = config(r#","claims_format":"stringified_json""#);
+        let token = sign(&json!({
+            "https://hasura.io/jwt/claims": hasura_claims().to_string(),
+        }));
+        assert_eq!(c.session(&token, None, false).unwrap().role, "user");
+    }
+
+    #[test]
+    fn stringified_claims_must_parse() {
+        let c = config(r#","claims_format":"stringified_json""#);
+        let token = sign(&json!({ "https://hasura.io/jwt/claims": "not json" }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-invalid-claims");
+        assert_eq!(e.message, "invalid stringified claims");
+    }
+
+    #[test]
+    fn claims_map_paths_defaults_and_literals() {
+        let c = config(
+            r#","claims_map":{
+                "x-hasura-allowed-roles":{"path":"$.roles"},
+                "x-hasura-default-role":{"path":"$.role","default":"user"},
+                "x-hasura-user-id":{"path":"$.user.id"},
+                "x-hasura-org-id":"org-7"}"#,
+        );
+        let token = sign(&json!({ "roles": ["user", "editor"], "user": { "id": "42" } }));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.role, "user"); // $.role absent -> default applied
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("42"));
+        assert_eq!(s.vars.get("x-hasura-org-id").map(String::as_str), Some("org-7"));
+        // The requested role is checked against the mapped allowed roles.
+        assert_eq!(c.session(&token, Some("editor"), false).unwrap().role, "editor");
+        let e = c.session(&token, Some("admin"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+    }
+
+    #[test]
+    fn claims_map_missing_path_without_default_fails() {
+        let c = config(
+            r#","claims_map":{
+                "x-hasura-allowed-roles":{"path":"$.roles"},
+                "x-hasura-default-role":{"path":"$.role","default":"user"},
+                "x-hasura-user-id":{"path":"$.missing"}}"#,
+        );
+        let token = sign(&json!({ "roles": ["user"] }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-invalid-claims");
+        assert_eq!(e.message, "invalid claims_map entry for x-hasura-user-id");
+    }
+
+    #[test]
+    fn missing_role_claims_errors() {
+        let c = config("");
+        let token = sign(&json!({
+            "https://hasura.io/jwt/claims": { "x-hasura-default-role": "user" }
+        }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-missing-role-claims");
+        assert_eq!(e.message, "JWT claim does not contain x-hasura-allowed-roles");
+
+        let token = sign(&json!({
+            "https://hasura.io/jwt/claims": { "x-hasura-allowed-roles": ["user"] }
+        }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-missing-role-claims");
+        assert_eq!(e.message, "JWT claim does not contain x-hasura-default-role");
+    }
+
+    #[test]
+    fn allowed_roles_must_be_an_array() {
+        let c = config("");
+        let claims = |v: Json| {
+            json!({ "https://hasura.io/jwt/claims": {
+                "x-hasura-allowed-roles": v,
+                "x-hasura-default-role": "user",
+            }})
+        };
+        let e = c.session(&sign(&claims(json!("user"))), None, false).unwrap_err();
+        assert_eq!(e.code, "jwt-invalid-claims");
+        assert_eq!(
+            e.message,
+            "invalid x-hasura-allowed-roles; should be a list of roles: parsing [] failed, expected Array, but encountered String"
+        );
+        let e = c.session(&sign(&claims(json!(5))), None, false).unwrap_err();
+        assert!(e.message.ends_with("expected Array, but encountered Number"), "{}", e.message);
+    }
+
+    #[test]
+    fn requested_role_must_be_allowed() {
+        let c = config("");
+        let token = sign(&json!({ "https://hasura.io/jwt/claims": hasura_claims() }));
+        let s = c.session(&token, Some("editor"), false).unwrap();
+        assert_eq!(s.role, "editor");
+        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("editor"));
+        let e = c.session(&token, Some("admin"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+        assert_eq!(e.message, "Your requested role is not in allowed roles");
+    }
+
+    #[test]
+    fn claim_keys_lowercased_and_values_rendered() {
+        let c = config("");
+        let token = sign(&json!({ "https://hasura.io/jwt/claims": {
+            "X-Hasura-Allowed-Roles": ["user"],
+            "X-Hasura-Default-Role": "user",
+            "X-Hasura-Custom": 7,
+            "not-a-session-var": "x",
+        }}));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.vars.get("x-hasura-custom").map(String::as_str), Some("7"));
+        assert!(!s.vars.contains_key("not-a-session-var"));
+    }
+
+    #[test]
+    fn expired_token_reports_jwt_expired() {
+        let c = config("");
+        let token = sign(&json!({ "exp": 1000, "https://hasura.io/jwt/claims": hasura_claims() }));
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "invalid-jwt");
+        assert_eq!(e.message, "Could not verify JWT: JWTExpired");
+    }
+
+    #[test]
+    fn signature_and_algorithm_failures_report_jws_invalid_signature() {
+        let c = config("");
+        let payload = json!({ "https://hasura.io/jwt/claims": hasura_claims() });
+        // Wrong key.
+        let token = sign_with(&payload, "other-secret", Algorithm::HS256);
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "invalid-jwt");
+        assert_eq!(e.message, "Could not verify JWT: JWSError JWSInvalidSignature");
+        // Wrong algorithm in the token header maps to the same report.
+        let token = sign_with(&payload, "top-secret", Algorithm::HS384);
+        let e = c.session(&token, None, false).unwrap_err();
+        assert_eq!(e.code, "invalid-jwt");
+        assert_eq!(e.message, "Could not verify JWT: JWSError JWSInvalidSignature");
+    }
+
+    #[test]
+    fn parse_json_path_segments() {
+        assert!(parse_json_path("$").is_empty());
+        assert_eq!(parse_json_path("$.hasura.claims"), vec!["hasura", "claims"]);
+        assert_eq!(parse_json_path("$.hasura['claims%']"), vec!["hasura", "claims%"]);
+        assert_eq!(parse_json_path(r#"$["a"].b[0]"#), vec!["a", "b", "0"]);
+    }
+
+    #[test]
+    fn walk_json_path_objects_and_arrays() {
+        let v = json!({ "a": { "b": [ { "c": 1 } ] } });
+        assert_eq!(walk_json_path(&v, &parse_json_path("$.a.b[0].c")), Some(&json!(1)));
+        assert_eq!(walk_json_path(&v, &parse_json_path("$.a.missing")), None);
+        assert_eq!(walk_json_path(&v, &parse_json_path("$.a.b.c")), None);
+        assert_eq!(walk_json_path(&v, &parse_json_path("$")), Some(&v));
+    }
+
+    #[test]
+    fn jwk_refresh_interval_honors_caching_headers() {
+        assert_eq!(jwk_refresh_interval("max-age=10", false), 10);
+        assert_eq!(jwk_refresh_interval("public, max-age=600", true), 600);
+        assert_eq!(jwk_refresh_interval("max-age=0", false), 1); // clamped to 1s
+        assert_eq!(jwk_refresh_interval("no-store", false), 1);
+        assert_eq!(jwk_refresh_interval("no-cache, max-age=60", true), 2);
+        assert_eq!(jwk_refresh_interval("", true), 3); // Expires header only
+        assert_eq!(jwk_refresh_interval("", false), 1);
+    }
 }

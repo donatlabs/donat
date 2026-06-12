@@ -17,8 +17,23 @@ impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Hasura reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
+        // backend_only insert permissions don't exist for non-backend
+        // requests: a role with only such permissions has an empty
+        // mutation_root ("no mutations exist").
+        let insert_usable = |list: &[dist_metadata::PermissionEntry<
+            dist_metadata::InsertPermission,
+        >]| {
+            let usable = |p: &dist_metadata::PermissionEntry<dist_metadata::InsertPermission>| {
+                !p.permission.backend_only || session.backend_request
+            };
+            list.iter().any(|p| p.role == session.role && usable(p))
+                || self
+                    .expand_role(&session.role)
+                    .iter()
+                    .any(|parent| list.iter().any(|p| &p.role == parent && usable(p)))
+        };
         self.tables().iter().any(|t| {
-            self.any_role_perm(&t.insert_permissions, &session.role)
+            insert_usable(&t.insert_permissions)
                 || self.any_role_perm(&t.update_permissions, &session.role)
                 || self.any_role_perm(&t.delete_permissions, &session.role)
         }) || self.role_has_function_mutation(&session.role)

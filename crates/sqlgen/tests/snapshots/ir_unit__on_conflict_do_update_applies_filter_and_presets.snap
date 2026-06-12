@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/ir_unit.rs
+expression: sql
+---
+WITH "ins" AS (INSERT INTO "public"."author" ("id", "name") VALUES ((1)::"int4", ('a')::"text") ON CONFLICT ON CONSTRAINT "author_pkey" DO UPDATE SET "name" = EXCLUDED."name", "updated_by" = ('1')::"text" WHERE "author"."id" = (1)::"int4" RETURNING *) SELECT json_build_object('affected_rows', (SELECT count(*) FROM "ins")) AS root
