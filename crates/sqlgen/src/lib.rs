@@ -21,21 +21,21 @@ pub fn operation_to_sql(roots: &[RootField]) -> String {
 /// (Donat's --stringify-numeric-types).
 pub fn operation_to_sql_opts(roots: &[RootField], stringify_numerics: bool) -> String {
     let mut ctx = Ctx { next_alias: 0, stringify_numerics };
-    let pairs: Vec<String> = roots
+    let pairs: Vec<(String, String)> = roots
         .iter()
         .map(|r| match r {
             RootField::Select { alias, query } => {
-                format!("{}, {}", quote_lit(alias), ctx.select_expr(query, None))
+                (alias.clone(), ctx.select_expr(query, None))
             }
             RootField::Connection { alias, conn } => {
-                format!("{}, {}", quote_lit(alias), ctx.connection_expr(conn, None))
+                (alias.clone(), ctx.connection_expr(conn, None))
             }
             RootField::Typename { alias, value } => {
-                format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                (alias.clone(), format!("{}::text", quote_lit(value)))
             }
         })
         .collect();
-    format!("SELECT json_build_object({}) AS root", pairs.join(", "))
+    format!("SELECT {} AS root", json_object(&pairs))
 }
 
 /// base64 without the newlines Postgres' encode() inserts.
@@ -130,8 +130,12 @@ impl Ctx {
             None => raw.clone(),
             Some(page) => {
                 let order = if page.backward { "t.i DESC" } else { "t.i ASC" };
+                // Only the json_agg leaf is delegated; the surrounding
+                // json_array_elements(...) WITH ORDINALITY size-limited wrapper
+                // stays inline (no leaf for that shape).
+                let agg = json_array_agg("t.e", Some(order));
                 format!(
-                    "(SELECT coalesce(json_agg(t.e ORDER BY {order}), '[]'::json) FROM json_array_elements({raw}) WITH ORDINALITY AS t(e, i) WHERE t.i <= {size})",
+                    "(SELECT {agg} FROM json_array_elements({raw}) WITH ORDINALITY AS t(e, i) WHERE t.i <= {size})",
                     size = page.size
                 )
             }
@@ -140,15 +144,15 @@ impl Ctx {
             "(json_array_length({raw}) > {})",
             conn.page.as_ref().map(|p| p.size).unwrap_or(u64::MAX)
         );
-        let pairs: Vec<String> = conn
+        let pairs: Vec<(String, String)> = conn
             .fields
             .iter()
             .map(|f| match f {
                 ConnectionField::Typename { alias, value } => {
-                    format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                    (alias.clone(), format!("{}::text", quote_lit(value)))
                 }
                 ConnectionField::PageInfo { alias, fields } => {
-                    let inner: Vec<String> = fields
+                    let inner: Vec<(String, String)> = fields
                         .iter()
                         .map(|(fa, name)| {
                             let value = match name.as_str() {
@@ -168,43 +172,50 @@ impl Ctx {
                                 },
                                 _ => "null".to_string(),
                             };
-                            format!("{}, {}", quote_lit(fa), value)
+                            (fa.clone(), value)
                         })
                         .collect();
-                    format!(
-                        "{}, json_build_object({})",
-                        quote_lit(alias),
-                        inner.join(", ")
-                    )
+                    (alias.clone(), json_object(&inner))
                 }
                 ConnectionField::Edges { alias, fields } => {
                     // Re-project the prebuilt edges array onto the selection.
-                    let inner: Vec<String> = fields
+                    let inner: Vec<(String, String)> = fields
                         .iter()
                         .map(|ef| match ef {
                             EdgeField::Cursor { alias } => {
-                                format!("{}, e.value->'cursor'", quote_lit(alias))
+                                (alias.clone(), "e.value->'cursor'".to_string())
                             }
                             EdgeField::Node { alias } => {
-                                format!("{}, e.value->'node'", quote_lit(alias))
+                                (alias.clone(), "e.value->'node'".to_string())
                             }
                             EdgeField::Typename { alias, value } => {
-                                format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                                (alias.clone(), format!("{}::text", quote_lit(value)))
                             }
                         })
                         .collect();
-                    format!(
-                        "{}, coalesce((SELECT json_agg(json_build_object({})) FROM json_array_elements({a}) AS e), '[]'::json)",
-                        quote_lit(alias),
-                        inner.join(", ")
+                    // The json_build_object leaf is delegated; the coalesce of a
+                    // SELECT json_agg(...) subquery has no leaf and stays inline.
+                    (
+                        alias.clone(),
+                        format!(
+                            "coalesce((SELECT json_agg({}) FROM json_array_elements({a}) AS e), '[]'::json)",
+                            json_object(&inner)
+                        ),
                     )
                 }
             })
             .collect();
 
+        // The relay edges array (json_agg of cursor/node objects, coalesced to
+        // []) is a clean array-agg leaf; the cursor/node object is a leaf too.
+        let edge_obj = json_object(&[
+            ("cursor".to_string(), format!("{ed}.c", ed = quote_ident(&format!("{arr}_e")))),
+            ("node".to_string(), format!("{ed}.n", ed = quote_ident(&format!("{arr}_e")))),
+        ]);
         format!(
-            "(SELECT json_build_object({pairs}) FROM (SELECT coalesce(json_agg(json_build_object('cursor', {ed}.c, 'node', {ed}.n)), '[]'::json) AS a FROM (SELECT {cursor} AS c, {row_json} AS n {tail}) AS {ed}) AS {arr_q})",
-            pairs = pairs.join(", "),
+            "(SELECT {obj} FROM (SELECT {agg} AS a FROM (SELECT {cursor} AS c, {row_json} AS n {tail}) AS {ed}) AS {arr_q})",
+            obj = json_object(&pairs),
+            agg = json_array_agg(&edge_obj, None),
             ed = quote_ident(&format!("{arr}_e")),
             arr_q = quote_ident(&arr),
         )
@@ -228,9 +239,10 @@ impl Ctx {
             format!("(SELECT {distinct}{row_json} {tail} LIMIT 1)")
         } else {
             let elem = self.alias();
+            let e = quote_ident(&elem);
             format!(
-                "(SELECT coalesce(json_agg({e}.j), '[]'::json) FROM (SELECT {distinct}{row_json} AS j {tail}) AS {e})",
-                e = quote_ident(&elem),
+                "(SELECT {agg} FROM (SELECT {distinct}{row_json} AS j {tail}) AS {e})",
+                agg = json_array_agg(&format!("{e}.j"), None),
             )
         }
     }
@@ -244,7 +256,7 @@ impl Ctx {
         let outer_alias = self.alias();
         let oa = quote_ident(&outer_alias);
 
-        let pairs: Vec<String> = q
+        let pairs: Vec<(String, String)> = q
             .fields
             .iter()
             .map(|f| {
@@ -269,24 +281,24 @@ impl Ctx {
                             self.select_expr(&nodes_query, outer)
                         } else {
                             let row = self.row_json(fields, &outer_alias);
-                            format!("coalesce(json_agg({row}), '[]'::json)")
+                            json_array_agg(&row, None)
                         }
                     }
-                    FieldValue::Typename { value } => format!("to_json({}::text)", quote_lit(value)),
+                    FieldValue::Typename { value } => to_json_text(&quote_lit(value)),
                     other => panic!("non-aggregate field in aggregate select: {other:?}"),
                 };
-                format!("{}, {}", quote_lit(&f.alias), value)
+                (f.alias.clone(), value)
             })
             .collect();
 
         format!(
-            "(SELECT json_build_object({pairs}) FROM (SELECT {distinct}* {tail}) AS {oa})",
-            pairs = pairs.join(", "),
+            "(SELECT {obj} FROM (SELECT {distinct}* {tail}) AS {oa})",
+            obj = json_object(&pairs),
         )
     }
 
     fn aggregate_json(&mut self, fields: &[AggregateField], table_alias: &str) -> String {
-        let pairs: Vec<String> = fields
+        let pairs: Vec<(String, String)> = fields
             .iter()
             .map(|f| {
                 let value = match &f.op {
@@ -309,7 +321,7 @@ impl Ctx {
                         }
                     }
                     AggregateOp::ColumnOp { op, columns } => {
-                        let inner: Vec<String> = columns
+                        let inner: Vec<(String, String)> = columns
                             .iter()
                             .map(|c| {
                                 let col = qualified(table_alias, &c.column);
@@ -321,16 +333,16 @@ impl Ctx {
                                     }
                                     None => col,
                                 };
-                                format!("{}, {op}({expr})", quote_lit(&c.alias))
+                                (c.alias.clone(), format!("{op}({expr})"))
                             })
                             .collect();
-                        format!("json_build_object({})", inner.join(", "))
+                        json_object(&inner)
                     }
                 };
-                format!("{}, {}", quote_lit(&f.alias), value)
+                (f.alias.clone(), value)
             })
             .collect();
-        format!("json_build_object({})", pairs.join(", "))
+        json_object(&pairs)
     }
 
     /// `FROM .. WHERE .. ORDER BY .. LIMIT .. OFFSET ..` for one select.
@@ -484,7 +496,7 @@ impl Ctx {
     }
 
     fn row_json(&mut self, fields: &[OutputField], table_alias: &str) -> String {
-        let pairs: Vec<String> = fields
+        let pairs: Vec<(String, String)> = fields
             .iter()
             .map(|f| {
                 let value = match &f.value {
@@ -548,10 +560,10 @@ impl Ctx {
                         panic!("aggregate fields must go through aggregate_expr")
                     }
                 };
-                format!("{}, {}", quote_lit(&f.alias), value)
+                (f.alias.clone(), value)
             })
             .collect();
-        format!("json_build_object({})", pairs.join(", "))
+        json_object(&pairs)
     }
 
     /// Column output expression with type-specific casts.
@@ -912,26 +924,31 @@ impl Ctx {
         let cte_ident = quote_ident(cte);
         let result = match output {
             MutationOutput::Response(fields) => {
-                let pairs: Vec<String> = fields
+                let pairs: Vec<(String, String)> = fields
                     .iter()
                     .map(|f| match f {
-                        MutationResponseField::AffectedRows { alias } => format!(
-                            "{}, (SELECT count(*) FROM {cte_ident})",
-                            quote_lit(alias)
+                        MutationResponseField::AffectedRows { alias } => (
+                            alias.clone(),
+                            format!("(SELECT count(*) FROM {cte_ident})"),
                         ),
                         MutationResponseField::Typename { alias, value } => {
-                            format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                            (alias.clone(), format!("{}::text", quote_lit(value)))
                         }
                         MutationResponseField::Returning { alias, fields } => {
                             let row = self.row_json(fields, cte);
-                            format!(
-                                "{}, (SELECT coalesce(json_agg({row}), '[]'::json) FROM {cte_ident})",
-                                quote_lit(alias)
+                            // json_agg leaf delegated; the (SELECT … FROM cte)
+                            // wrapper has no leaf and stays inline.
+                            (
+                                alias.clone(),
+                                format!(
+                                    "(SELECT {} FROM {cte_ident})",
+                                    json_array_agg(&row, None)
+                                ),
                             )
                         }
                     })
                     .collect();
-                format!("json_build_object({})", pairs.join(", "))
+                json_object(&pairs)
             }
             MutationOutput::SingleRow(fields) => {
                 let row = self.row_json(fields, cte);
@@ -995,6 +1012,25 @@ pub fn quote_ident(ident: &str) -> String {
 pub fn quote_lit(s: &str) -> String {
     use donat_backend::Dialect;
     donat_backend::PostgresDialect.quote_literal(s)
+}
+
+/// JSON object assembly (LEAF op #1). Delegates to the backend dialect;
+/// keys are raw and quoted internally, values are inlined verbatim.
+fn json_object(pairs: &[(String, String)]) -> String {
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.json_object(pairs)
+}
+
+/// JSON array aggregation (LEAF op #2/#8), coalescing empty to `[]`.
+fn json_array_agg(row_expr: &str, order_by: Option<&str>) -> String {
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.json_array_agg(row_expr, order_by)
+}
+
+/// Render an expression as a JSON string (LEAF op #7).
+fn to_json_text(expr: &str) -> String {
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.to_json_text(expr)
 }
 
 /// Render a JSON scalar as a SQL literal cast to the column's type.

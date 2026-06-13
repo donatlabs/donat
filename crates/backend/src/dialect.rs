@@ -17,6 +17,20 @@ pub trait Dialect {
     /// strings cast to `::"ty"`, JSON arrays/objects targeting json/jsonb,
     /// and the geometry/geography GeoJSON special-case.
     fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String;
+
+    /// Assemble a JSON object from `(raw key, value expr)` pairs. The key is
+    /// quoted internally; values are inlined verbatim. (LEAF op #1 in the
+    /// JSON-assembly inventory.)
+    fn json_object(&self, pairs: &[(String, String)]) -> String;
+
+    /// Aggregate a set of rows into a JSON array, with an optional
+    /// `ORDER BY` clause body, coalescing the empty set to `[]`.
+    /// (LEAF op #2/#8 in the JSON-assembly inventory.)
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String;
+
+    /// Render an expression as a JSON string (text). (LEAF op #7 in the
+    /// JSON-assembly inventory.)
+    fn to_json_text(&self, expr: &str) -> String;
 }
 
 /// Postgres dialect. Output matches `crates/sqlgen` exactly.
@@ -64,6 +78,29 @@ impl Dialect for PostgresDialect {
             // arrays/objects target json/jsonb columns
             other => format!("({})::{ty}", self.quote_literal(&other.to_string())),
         }
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        // Mirrors sqlgen's inlined `json_build_object('k', v, …)`: each key is
+        // rendered via quote_literal, then key/value alternate, joined by ", ".
+        let body: Vec<String> = pairs
+            .iter()
+            .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
+            .collect();
+        format!("json_build_object({})", body.join(", "))
+    }
+
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
+        // Mirrors sqlgen's inlined `coalesce(json_agg(x [ORDER BY ob]), '[]'::json)`.
+        match order_by {
+            Some(ob) => format!("coalesce(json_agg({row_expr} ORDER BY {ob}), '[]'::json)"),
+            None => format!("coalesce(json_agg({row_expr}), '[]'::json)"),
+        }
+    }
+
+    fn to_json_text(&self, expr: &str) -> String {
+        // Mirrors sqlgen's inlined `to_json(x::text)`.
+        format!("to_json({expr}::text)")
     }
 }
 
@@ -203,6 +240,67 @@ mod tests {
                 geo.to_string()
             )
         );
+    }
+
+    #[test]
+    fn json_object_alternates_quoted_keys_and_values() {
+        let d = PostgresDialect;
+        assert_eq!(
+            d.json_object(&[
+                ("id".to_string(), "_t0.id".to_string()),
+                ("name".to_string(), "_t0.name".to_string()),
+            ]),
+            "json_build_object('id', _t0.id, 'name', _t0.name)"
+        );
+    }
+
+    #[test]
+    fn json_object_fixed_keys_and_empty() {
+        let d = PostgresDialect;
+        // Fixed (raw) keys like cursor/node are quoted internally, matching
+        // sqlgen's `json_build_object('cursor', …, 'node', …)`.
+        assert_eq!(
+            d.json_object(&[
+                ("cursor".to_string(), "_t0.c".to_string()),
+                ("node".to_string(), "_t0.n".to_string()),
+            ]),
+            "json_build_object('cursor', _t0.c, 'node', _t0.n)"
+        );
+        // No pairs -> empty argument list, byte-identical to inlined output.
+        assert_eq!(d.json_object(&[]), "json_build_object()");
+    }
+
+    #[test]
+    fn json_object_quotes_embedded_single_quotes_in_key() {
+        let d = PostgresDialect;
+        assert_eq!(
+            d.json_object(&[("O'Hara".to_string(), "v".to_string())]),
+            "json_build_object('O''Hara', v)"
+        );
+    }
+
+    #[test]
+    fn json_array_agg_without_order() {
+        let d = PostgresDialect;
+        assert_eq!(
+            d.json_array_agg("_e.j", None),
+            "coalesce(json_agg(_e.j), '[]'::json)"
+        );
+    }
+
+    #[test]
+    fn json_array_agg_with_order() {
+        let d = PostgresDialect;
+        assert_eq!(
+            d.json_array_agg("t.e", Some("t.i ASC")),
+            "coalesce(json_agg(t.e ORDER BY t.i ASC), '[]'::json)"
+        );
+    }
+
+    #[test]
+    fn to_json_text_casts_expr() {
+        let d = PostgresDialect;
+        assert_eq!(d.to_json_text("'User'"), "to_json('User'::text)");
     }
 
     #[test]
