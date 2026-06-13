@@ -1,4 +1,4 @@
-module github.com/donat/donat-go
+module github.com/donatlabs/donat/sdk/go
 
 go 1.22
 

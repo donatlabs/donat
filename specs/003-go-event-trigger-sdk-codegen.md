@@ -112,7 +112,7 @@ every future transport:
 ## 2. Go SDK core (`sdk/go/donat`)
 
 Pure-Go package, no cgo, no transport (see the packaging constraint above).
-Module path TBD at scaffold time (placeholder `github.com/donat/donat-go`).
+Module path TBD at scaffold time (now `github.com/donatlabs/donat/sdk/go`).
 
 ### Event envelope
 

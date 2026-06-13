@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/donat/donat-go/donat"
-	"github.com/donat/donat-go/internal/golden"
+	"github.com/donatlabs/donat/sdk/go/donat"
+	"github.com/donatlabs/donat/sdk/go/internal/golden"
 )
 
 // Proves a generated struct composes with the SDK generics end to end.
