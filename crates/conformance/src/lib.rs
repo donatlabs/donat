@@ -239,8 +239,8 @@ use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
     FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
-    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableEntry,
-    UpdatePermission,
+    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableConfiguration,
+    TableEntry, UpdatePermission,
 };
 
 fn workspace_root() -> PathBuf {
@@ -696,13 +696,23 @@ impl Running {
 
             "track_table" => {
                 // The arg is either `{table: <name|{schema,name}>}` or the
-                // bare `{schema, name}` form.
+                // bare `{schema, name}` form. An optional `configuration`
+                // (custom_name, custom_root_fields, column_config, ...) is
+                // applied to the table entry.
                 let table = if args.get("table").is_some() {
                     qualified_from(&args["table"])
                 } else {
                     qualified_from(&args)
                 };
-                self.with_table(&table, |_| {});
+                let configuration: Option<TableConfiguration> = args
+                    .get("configuration")
+                    .filter(|c| !c.is_null())
+                    .map(|c| from_value("table configuration", c));
+                self.with_table(&table, |t| {
+                    if configuration.is_some() {
+                        t.configuration = configuration;
+                    }
+                });
             }
 
             "create_select_permission" => {

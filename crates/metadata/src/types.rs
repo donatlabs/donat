@@ -594,7 +594,24 @@ pub struct TableConfiguration {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_column_names: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub column_config: BTreeMap<String, serde_json::Value>,
+    pub column_config: BTreeMap<String, ColumnConfig>,
+}
+
+/// Per-column presentation metadata (Donat v2 `column_config.<column>`).
+///
+/// Only `custom_name` and `comment` carry meaning to this engine; the
+/// `comment` is surfaced as a column's GraphQL-introspection `description`
+/// and in the MCP `describe_table` tool. Any other keys Hasura/Donat might
+/// emit are preserved in `extra` so metadata round-trips losslessly.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ColumnConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Unknown keys, kept for lossless round-trip.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

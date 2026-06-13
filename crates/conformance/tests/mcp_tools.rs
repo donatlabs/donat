@@ -24,6 +24,7 @@ fn mcp_tools() {
     for f in [
         "initialize.yaml",
         "tools_list.yaml",
+        "describe_table.yaml",
         "permission_denied.yaml",
         "query.yaml",
         "query_filter.yaml",

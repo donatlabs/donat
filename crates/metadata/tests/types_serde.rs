@@ -7,7 +7,8 @@ use std::path::Path;
 
 use donat_metadata::{
     Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
-    QualifiedTable, RemoteSchema, RestEndpoint, SelectPermission, SourceKind, load_metadata_dir,
+    QualifiedTable, RemoteSchema, RestEndpoint, SelectPermission, SourceKind, TableConfiguration,
+    load_metadata_dir,
 };
 use serde_json::json;
 
@@ -164,6 +165,43 @@ fn database_url_plain_string_and_from_env() {
         DatabaseUrl::FromEnv { from_env } => assert_eq!(from_env, "PG_URL"),
         other => panic!("expected from_env, got {other:?}"),
     }
+}
+
+#[test]
+fn table_configuration_column_config_deserializes_and_round_trips() {
+    // column_config carries per-column custom_name/comment; the comment is
+    // surfaced as a field description. Unknown keys (an `extra`) must survive
+    // a serialize -> deserialize cycle so exported v2 metadata is lossless.
+    let yaml = "\
+column_config:
+  id:
+    comment: The primary key
+  name:
+    custom_name: full_name
+    comment: The person's name
+    some_future_key: 42
+";
+    let cfg: TableConfiguration =
+        serde_yaml::from_str(yaml).expect("column_config must deserialize");
+
+    let id = &cfg.column_config["id"];
+    assert_eq!(id.comment.as_deref(), Some("The primary key"));
+    assert!(id.custom_name.is_none());
+    assert!(id.extra.is_empty());
+
+    let name = &cfg.column_config["name"];
+    assert_eq!(name.custom_name.as_deref(), Some("full_name"));
+    assert_eq!(name.comment.as_deref(), Some("The person's name"));
+    assert_eq!(name.extra.get("some_future_key"), Some(&json!(42)));
+
+    // Serialize -> deserialize must be lossless, including the unknown key.
+    let out = serde_json::to_value(&cfg).unwrap();
+    let back: TableConfiguration = serde_json::from_value(out).unwrap();
+    let name_back = &back.column_config["name"];
+    assert_eq!(name_back.custom_name.as_deref(), Some("full_name"));
+    assert_eq!(name_back.comment.as_deref(), Some("The person's name"));
+    assert_eq!(name_back.extra.get("some_future_key"), Some(&json!(42)));
+    assert_eq!(back.column_config["id"].comment.as_deref(), Some("The primary key"));
 }
 
 #[test]

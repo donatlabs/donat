@@ -1,6 +1,16 @@
 table:
   name: customer
   schema: public
+# Per-column documentation. Each comment is surfaced as the column field's
+# `description` in GraphQL introspection and in the MCP `describe_table` tool.
+configuration:
+  column_config:
+    id:
+      comment: Unique identifier for the customer.
+    name:
+      comment: The customer's full display name.
+    email:
+      comment: Contact email address; used for order confirmations.
 array_relationships:
   - name: orders
     using:

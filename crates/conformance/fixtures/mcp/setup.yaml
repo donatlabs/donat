@@ -19,6 +19,10 @@ args:
   args:
     schema: public
     name: pet
+    configuration:
+      column_config:
+        status:
+          comment: Availability status of the pet
 
 - type: create_select_permission
   args:

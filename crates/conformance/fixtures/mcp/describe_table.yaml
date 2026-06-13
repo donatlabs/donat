@@ -1,0 +1,41 @@
+description: >
+  tools/call describe_table returns each column's name/type/nullable plus a
+  description sourced from metadata column_config.<col>.comment: `status`
+  carries its configured comment; `id`/`name` (no comment) are null.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 9
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: pet
+response:
+  jsonrpc: "2.0"
+  id: 9
+  result:
+    isError: false
+    structuredContent:
+      name: pet
+      schema: public
+      columns:
+      - name: id
+        type: int4
+        nullable: false
+        description: null
+      - name: name
+        type: text
+        nullable: false
+        description: null
+      - name: status
+        type: text
+        nullable: false
+        description: Availability status of the pet
+      object_relationships: []
+      array_relationships: []
+      selectable_columns: "*"

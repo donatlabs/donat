@@ -383,14 +383,27 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
         return tool_err(format!("unknown table '{base}'"), None);
     };
 
-    // Catalog columns + types.
+    // Catalog columns + types; per-column description from metadata
+    // `column_config.<col>.comment` (null when absent).
     let catalog = engine.default_catalog();
     let columns: Vec<Json> = catalog
         .table(entry.table.schema(), entry.table.name())
         .map(|t| {
             t.columns
                 .iter()
-                .map(|c| json!({ "name": c.name, "type": c.pg_type, "nullable": c.nullable }))
+                .map(|c| {
+                    let description = entry
+                        .configuration
+                        .as_ref()
+                        .and_then(|cfg| cfg.column_config.get(&c.name))
+                        .and_then(|cc| cc.comment.as_deref());
+                    json!({
+                        "name": c.name,
+                        "type": c.pg_type,
+                        "nullable": c.nullable,
+                        "description": description,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
