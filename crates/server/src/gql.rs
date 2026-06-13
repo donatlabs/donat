@@ -533,6 +533,21 @@ pub async fn execute_full(
             }
         }
         donat_schema::Plan::Mutation(roots) => {
+            // SQLite can't run the Postgres CTE-wrapped, in-DB-assembled
+            // mutation (DML in a CTE/subquery is forbidden), so it has its own
+            // executor: one top-level DML per root, response folded in Rust,
+            // rollback on a permission-check violation (see ADR 003). The
+            // Postgres path below is unchanged (byte-identical SQL + tx).
+            if matches!(
+                state.default_source_kind().await,
+                donat_metadata::SourceKind::Sqlite
+            ) {
+                drop(engine);
+                return match state.execute_sqlite_mutations(&roots).await {
+                    Ok(data) => ok(json!({ "data": data })),
+                    Err(e) => ok(sqlite_mutation_error_json(e)),
+                };
+            }
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
             let fields: Vec<(String, String)> = roots
@@ -886,6 +901,25 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
             "message": message,
         }]
     })
+}
+
+/// Map a SQLite mutation failure to the GraphQL error body. `CheckViolation`
+/// reproduces the exact `permission-error` shape the Postgres path produces
+/// from `donat.check_violation()` (SQLSTATE 23514), so a violated check looks
+/// identical regardless of backend.
+fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
+    use crate::state::SqliteMutationError as E;
+    match e {
+        E::NoDefaultSource => error_json("unexpected", "no default source"),
+        E::CheckViolation { path } => json!({
+            "errors": [{
+                "extensions": { "path": path, "code": "permission-error" },
+                "message": "check constraint of an insert/update permission has failed",
+            }]
+        }),
+        E::Sqlite(msg) => error_json("data-exception", msg),
+        E::Other(msg) => error_json("unexpected", msg),
+    }
 }
 
 fn error_json(code: &str, message: impl Into<String>) -> Json {

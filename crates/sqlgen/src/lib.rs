@@ -959,6 +959,303 @@ fn mutation_to_sql_full(
     }
 }
 
+// ---------------------------------------------------------------------
+// SQLite mutation path (M4 carve-out, see ADR 003)
+// ---------------------------------------------------------------------
+
+/// A planned SQLite mutation: one TOP-LEVEL DML statement whose RETURNING
+/// clause yields, per affected row, a `node` JSON object (built from BARE
+/// column names — SQLite RETURNING cannot reference an alias-qualified or
+/// aggregated expression) and a `violated` flag (1 when the permission check
+/// fails for that row, else 0). The executor runs `dml_sql` inside a
+/// transaction, folds the rows into the response, and rolls back if any
+/// `violated` flag is set. This replaces the Postgres CTE-wrapped, in-database
+/// assembly, which SQLite's grammar forbids (DML in a CTE/subquery).
+#[derive(Debug, Clone)]
+pub struct SqliteMutationPlan {
+    /// The single top-level DML to execute.
+    pub dml_sql: String,
+    /// Response key for the `returning` array, when the selection asked for it.
+    pub returning_alias: Option<String>,
+    /// Response key for `affected_rows`, when selected.
+    pub affected_rows_alias: Option<String>,
+    /// `(alias, value)` for a `__typename` field on the mutation response.
+    pub typename: Option<(String, String)>,
+    /// `(alias, value)` when the root is a `__typename` mutation root itself.
+    pub root_typename: Option<(String, String)>,
+    /// Error path reported on a check violation (carried into the executor's
+    /// permission-error body).
+    pub check_path: String,
+}
+
+/// Build the [`SqliteMutationPlan`] for an insert/update/delete mutation root.
+/// Renders with the SQLite dialect; `on_conflict` is not supported on SQLite
+/// (different `ON CONFLICT` grammar) and triggers a panic by design — the
+/// planner does not surface it on this path and the carve-out defers it.
+pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
+    let dialect = donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect);
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics: false, dialect };
+    match root {
+        MutationRoot::Typename { value, .. } => SqliteMutationPlan {
+            dml_sql: String::new(),
+            returning_alias: None,
+            affected_rows_alias: None,
+            typename: None,
+            root_typename: Some((String::new(), value.clone())),
+            check_path: "$".into(),
+        },
+        MutationRoot::FunctionCall { .. } => {
+            panic!("volatile function mutations are not supported on sqlite")
+        }
+        MutationRoot::Insert { insert, .. } => {
+            assert!(
+                insert.on_conflict.is_none(),
+                "on_conflict is not supported on sqlite mutations"
+            );
+            let cols: Vec<String> = insert
+                .columns
+                .iter()
+                .map(|(name, _)| quote_ident(name))
+                .collect();
+            let rows: Vec<String> = insert
+                .rows
+                .iter()
+                .map(|row| {
+                    let values: Vec<String> = row
+                        .iter()
+                        .zip(&insert.columns)
+                        .map(|(v, (_, pg_type))| match v {
+                            None => "NULL".to_string(),
+                            Some(s) => scalar_sql(&dialect, s, pg_type),
+                        })
+                        .collect();
+                    format!("({})", values.join(", "))
+                })
+                .collect();
+            let dml = format!(
+                "INSERT INTO {}.{} ({}) VALUES {}",
+                quote_ident(&insert.table.schema),
+                quote_ident(&insert.table.name),
+                cols.join(", "),
+                rows.join(", ")
+            );
+            ctx.sqlite_finish(
+                dml,
+                insert.check.as_ref(),
+                &insert.check_path,
+                &insert.output,
+            )
+        }
+        MutationRoot::Update { update, .. } => {
+            let sets: Vec<String> = update
+                .sets
+                .iter()
+                .map(|s| match s {
+                    SetOp::Set { column, pg_type, value } => {
+                        format!("{} = {}", quote_ident(column), scalar_sql(&dialect, value, pg_type))
+                    }
+                    SetOp::Inc { column, pg_type, value } => format!(
+                        "{} = {} + {}",
+                        quote_ident(column),
+                        quote_ident(column),
+                        scalar_sql(&dialect, value, pg_type)
+                    ),
+                })
+                .collect();
+            let alias = "_t".to_string();
+            let mut dml = format!(
+                "UPDATE {}.{} AS {} SET {}",
+                quote_ident(&update.table.schema),
+                quote_ident(&update.table.name),
+                quote_ident(&alias),
+                sets.join(", ")
+            );
+            if let Some(pred) = &update.predicate {
+                dml.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
+            }
+            ctx.sqlite_finish(dml, update.check.as_ref(), &update.check_path, &update.output)
+        }
+        MutationRoot::Delete { delete, .. } => {
+            let alias = "_t".to_string();
+            let mut dml = format!(
+                "DELETE FROM {}.{} AS {}",
+                quote_ident(&delete.table.schema),
+                quote_ident(&delete.table.name),
+                quote_ident(&alias)
+            );
+            if let Some(pred) = &delete.predicate {
+                dml.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
+            }
+            ctx.sqlite_finish(dml, None, "$", &delete.output)
+        }
+    }
+}
+
+impl Ctx {
+    /// Append the SQLite `RETURNING json_object(<bare cols>) AS node, <flag> AS
+    /// violated` clause to a top-level DML and package it into a
+    /// [`SqliteMutationPlan`]. `RETURNING` expressions must use BARE column
+    /// names (no alias qualification, no aggregation) — hence the dedicated
+    /// bare-column renderers below rather than reusing `row_json`/`bool_exp`'s
+    /// alias-qualified output.
+    fn sqlite_finish(
+        &mut self,
+        dml: String,
+        check: Option<&BoolExp>,
+        check_path: &str,
+        output: &MutationOutput,
+    ) -> SqliteMutationPlan {
+        let dialect = self.dialect;
+        let mut returning_alias = None;
+        let mut affected_rows_alias = None;
+        let mut typename = None;
+        // Determine the node fields (the per-row `returning { ... }` selection).
+        // A SingleRow output (`insert_one` / `_by_pk`) also produces a node.
+        let node_fields: Vec<OutputField> = match output {
+            MutationOutput::Response(fields) => {
+                let mut node_fields = vec![];
+                for f in fields {
+                    match f {
+                        MutationResponseField::AffectedRows { alias } => {
+                            affected_rows_alias = Some(alias.clone());
+                        }
+                        MutationResponseField::Typename { alias, value } => {
+                            typename = Some((alias.clone(), value.clone()));
+                        }
+                        MutationResponseField::Returning { alias, fields } => {
+                            returning_alias = Some(alias.clone());
+                            node_fields = fields.clone();
+                        }
+                    }
+                }
+                node_fields
+            }
+            MutationOutput::SingleRow(fields) => {
+                // `insert_<t>_one` / `_by_pk`: the row itself is the node;
+                // there is no affected_rows. Represent it as a returning alias
+                // so the executor still folds rows; the server's SingleRow
+                // handling for sqlite is out of scope for this carve-out.
+                returning_alias = Some("returning".to_string());
+                fields.clone()
+            }
+        };
+
+        let node_expr = self.sqlite_node_json(&node_fields);
+        let violated = match check {
+            Some(check) => {
+                format!("CASE WHEN NOT ({}) THEN 1 ELSE 0 END", self.sqlite_bare_bool(check))
+            }
+            None => "0".to_string(),
+        };
+        let _ = dialect;
+        let dml_sql = format!("{dml} RETURNING {node_expr} AS node, {violated} AS violated");
+        SqliteMutationPlan {
+            dml_sql,
+            returning_alias,
+            affected_rows_alias,
+            typename,
+            root_typename: None,
+            check_path: check_path.to_string(),
+        }
+    }
+
+    /// Build a `json_object(...)` over the requested returning fields using
+    /// BARE column names. Only column / typename leaves are expressible in a
+    /// SQLite top-level RETURNING; nested relationships/computed/aggregate
+    /// fields cannot be (they require correlated subqueries the grammar
+    /// rejects), so they are refused explicitly.
+    fn sqlite_node_json(&mut self, fields: &[OutputField]) -> String {
+        let dialect = self.dialect;
+        let pairs: Vec<(String, String)> = fields
+            .iter()
+            .map(|f| {
+                let value = match &f.value {
+                    FieldValue::Column { column, .. } => quote_ident(column),
+                    FieldValue::ColumnGuarded { column, guard, .. } => {
+                        let cond = self.sqlite_bare_bool(guard);
+                        format!("CASE WHEN {cond} THEN {} ELSE NULL END", quote_ident(column))
+                    }
+                    FieldValue::Typename { value } => quote_lit(value),
+                    other => panic!(
+                        "field {:?} is not expressible in a sqlite top-level RETURNING",
+                        std::mem::discriminant(other)
+                    ),
+                };
+                (f.alias.clone(), value)
+            })
+            .collect();
+        json_object(&dialect, &pairs)
+    }
+
+    /// Render a permission BoolExp over BARE column names for use inside a
+    /// SQLite RETURNING `CASE`. Covers the connectives plus the scalar
+    /// comparison operators a permission check uses; constructs that need an
+    /// alias-qualified subquery (relationship/exists/computed/column-to-column)
+    /// are rejected — a SQLite check carve-out does not support them.
+    fn sqlite_bare_bool(&mut self, exp: &BoolExp) -> String {
+        let dialect = self.dialect;
+        match exp {
+            BoolExp::And(exps) => {
+                if exps.is_empty() {
+                    "1".into()
+                } else {
+                    let parts: Vec<String> = exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
+                    format!("({})", parts.join(" AND "))
+                }
+            }
+            BoolExp::Or(exps) => {
+                if exps.is_empty() {
+                    "0".into()
+                } else {
+                    let parts: Vec<String> = exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
+                    format!("({})", parts.join(" OR "))
+                }
+            }
+            BoolExp::Not(inner) => format!("(NOT {})", self.sqlite_bare_bool(inner)),
+            BoolExp::Compare { column, pg_type, op } => {
+                let col = quote_ident(column);
+                let lit = |s: &Scalar| scalar_sql(&dialect, s, pg_type);
+                match op {
+                    CompareOp::Eq(v) => format!("{col} = {}", lit(v)),
+                    CompareOp::Neq(v) => format!("{col} <> {}", lit(v)),
+                    CompareOp::Gt(v) => format!("{col} > {}", lit(v)),
+                    CompareOp::Lt(v) => format!("{col} < {}", lit(v)),
+                    CompareOp::Gte(v) => format!("{col} >= {}", lit(v)),
+                    CompareOp::Lte(v) => format!("{col} <= {}", lit(v)),
+                    CompareOp::In(vs) => {
+                        if vs.is_empty() {
+                            "0".into()
+                        } else {
+                            let items: Vec<String> = vs.iter().map(lit).collect();
+                            format!("{col} IN ({})", items.join(", "))
+                        }
+                    }
+                    CompareOp::Nin(vs) => {
+                        if vs.is_empty() {
+                            "1".into()
+                        } else {
+                            let items: Vec<String> = vs.iter().map(lit).collect();
+                            format!("{col} NOT IN ({})", items.join(", "))
+                        }
+                    }
+                    CompareOp::Like(v) => format!("{col} LIKE {}", lit(v)),
+                    CompareOp::Nlike(v) => format!("{col} NOT LIKE {}", lit(v)),
+                    CompareOp::IsNull(true) => format!("{col} IS NULL"),
+                    CompareOp::IsNull(false) => format!("{col} IS NOT NULL"),
+                    other => panic!(
+                        "comparison {:?} is not supported in a sqlite mutation check",
+                        std::mem::discriminant(other)
+                    ),
+                }
+            }
+            other => panic!(
+                "bool-exp {:?} is not supported in a sqlite mutation check",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+}
+
 impl Ctx {
     /// Wrap a DML statement in a CTE and select the GraphQL response from
     /// its RETURNING set, enforcing the permission check expression.

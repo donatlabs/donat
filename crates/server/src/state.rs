@@ -55,6 +55,18 @@ pub enum QueryError {
     Sqlite(String),
 }
 
+/// Failure of a SQLite mutation in [`AppState::execute_sqlite_mutations`].
+/// The caller maps each variant to the GraphQL error body; `CheckViolation`
+/// reproduces the same `permission-error` shape the Postgres path emits.
+pub enum SqliteMutationError {
+    NoDefaultSource,
+    /// A row failed its insert/update permission check; the transaction was
+    /// rolled back. `path` is the GraphQL error path for the body.
+    CheckViolation { path: String },
+    Sqlite(String),
+    Other(String),
+}
+
 pub struct Engine {
     pub metadata: Metadata,
     /// Catalog snapshot per source name.
@@ -167,6 +179,124 @@ impl AppState {
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
         }
+    }
+
+    /// Execute a planned mutation against the default SQLite source.
+    ///
+    /// SQLite forbids DML in a CTE/subquery, so the Postgres "one statement
+    /// assembles the whole response" shape is impossible (see ADR 003). Each
+    /// root is one top-level DML with `RETURNING <node> AS node, <flag> AS
+    /// violated`; this runs them in a transaction, folds the rows into the
+    /// response in Rust, and ROLLs BACK if any row violated its permission
+    /// check — returning [`SqliteMutationError::CheckViolation`] so the caller
+    /// can render the exact permission-error body. The check is computed in
+    /// the same DML and the rollback is in the same transaction, so the
+    /// permission is still enforced atomically (no bypass).
+    pub async fn execute_sqlite_mutations(
+        &self,
+        roots: &[donat_ir::MutationRoot],
+    ) -> Result<Json, SqliteMutationError> {
+        use donat_sqlgen::SqliteMutationPlan;
+
+        // Plan every root up front (alias + SQLite mutation plan), preserving
+        // selection order for the response map.
+        let planned: Vec<(String, SqliteMutationPlan)> = roots
+            .iter()
+            .map(|m| {
+                let alias = match m {
+                    donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Insert { alias, .. }
+                    | donat_ir::MutationRoot::Update { alias, .. }
+                    | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                };
+                (alias, donat_sqlgen::sqlite_mutation_plan(m))
+            })
+            .collect();
+
+        let path = {
+            let paths = self.sqlite_paths.read().await;
+            paths
+                .get("default")
+                .or_else(|| paths.values().next())
+                .cloned()
+                .ok_or(SqliteMutationError::NoDefaultSource)?
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<Json, SqliteMutationError> {
+            let mut conn = rusqlite::Connection::open(&path)
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+
+            let mut data = serde_json::Map::new();
+            for (alias, plan) in &planned {
+                // A `__typename`-only mutation root has no DML.
+                if let Some((_, value)) = &plan.root_typename {
+                    data.insert(alias.clone(), Json::String(value.clone()));
+                    continue;
+                }
+
+                let mut returning: Vec<Json> = vec![];
+                let mut affected_rows: i64 = 0;
+                let mut violated = false;
+                {
+                    let mut stmt = tx
+                        .prepare(&plan.dml_sql)
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                    let mut rows = stmt
+                        .query([])
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                    while let Some(row) = rows
+                        .next()
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?
+                    {
+                        affected_rows += 1;
+                        let node_text: String = row
+                            .get("node")
+                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                        let flag: i64 = row
+                            .get("violated")
+                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                        if flag != 0 {
+                            violated = true;
+                        }
+                        let node: Json = serde_json::from_str(&node_text)
+                            .map_err(|e| SqliteMutationError::Other(e.to_string()))?;
+                        returning.push(node);
+                    }
+                }
+
+                if violated {
+                    // Drop without commit rolls the whole transaction back.
+                    let _ = tx.rollback();
+                    return Err(SqliteMutationError::CheckViolation {
+                        path: plan.check_path.clone(),
+                    });
+                }
+
+                // Assemble this root's response object from the plan's aliases,
+                // mirroring the Postgres `Plan::Mutation` response shape.
+                let mut obj = serde_json::Map::new();
+                if let Some(ret_alias) = &plan.returning_alias {
+                    obj.insert(ret_alias.clone(), Json::Array(returning));
+                }
+                if let Some(ar_alias) = &plan.affected_rows_alias {
+                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
+                }
+                if let Some((tn_alias, tn_value)) = &plan.typename {
+                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                }
+                data.insert(alias.clone(), Json::Object(obj));
+            }
+
+            tx.commit()
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+            Ok(Json::Object(data))
+        })
+        .await
+        .map_err(|e| SqliteMutationError::Other(format!("sqlite task panicked: {e}")))?
     }
 
     /// Reconcile pools and catalogs with the current metadata sources,
