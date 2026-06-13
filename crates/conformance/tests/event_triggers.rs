@@ -9,7 +9,7 @@
 //! per-table Postgres triggers are created by `migrate --metadata-dir`
 //! (reconcile), exactly as a real deploy would.
 //!
-//! Difference from Donat, by design: this engine has no admin role, so
+//! Difference from Hasura, by design: this engine has no admin role, so
 //! mutations run as an explicit `tester` role (via
 //! DONAT_GRAPHQL_UNAUTHORIZED_ROLE). Session variables are not yet captured
 //! into the event payload (the engine does not set the `donat.user` GUC), so

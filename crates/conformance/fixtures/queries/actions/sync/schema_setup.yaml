@@ -89,7 +89,7 @@ args:
     - name: OutObject
       fields:
       - name: id
-        type: ID! # For issue https://github.com/donat/graphql-engine/issues/4061
+        type: ID! # For issue https://github.com/hasura/graphql-engine/issues/4061
       - name: name
         type: String
 

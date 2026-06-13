@@ -11,7 +11,7 @@
 //!
 //! Out of scope (not part of the 9):
 //! - `test_start_duplicate`: skipped upstream too
-//!   (`@pytest.mark.skip`, donat/graphql-engine#387).
+//!   (`@pytest.mark.skip`, hasura/graphql-engine#387).
 //! - `TestSubscriptionBasicNoAuth`, `TestSubscriptionCtrl*`: separate
 //!   classes, not in this port's scope.
 

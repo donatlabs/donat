@@ -100,7 +100,7 @@ header resolution (value / value_from_env) mirroring actions.
 
 ## 5. Conformance (`crates/conformance`)
 
-No Donat tests-py fixtures exist for delivery; native tests are the source
+No Hasura tests-py fixtures exist for delivery; native tests are the source
 of truth (same pattern as `remote_schemas.rs` / actions).
 
 - A native cron webhook stub receiver (records received body + headers),

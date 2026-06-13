@@ -72,7 +72,7 @@ args:
 
 
 # for table permissions over functions
-# See https://github.com/donat/graphql-engine/issues/7617
+# See https://github.com/hasura/graphql-engine/issues/7617
 
 - type: run_sql
   args:

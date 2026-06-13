@@ -1,7 +1,7 @@
 # Spec 002 — Table event triggers
 
 Status: in progress. Table event triggers (webhooks on row insert/update/
-delete), TDD-ported from Donat `tests-py/test_events.py`. Reuses the cron
+delete), TDD-ported from Hasura `tests-py/test_events.py`. Reuses the cron
 delivery machinery (the `donat` journal + `FOR UPDATE SKIP LOCKED` poller +
 retries).
 
