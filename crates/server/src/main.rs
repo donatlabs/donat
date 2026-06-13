@@ -194,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             actions: vec![],
             custom_types: Default::default(),
             cron_triggers: vec![],
+            rest_endpoints: vec![],
         },
     };
     ensure_default_source(&mut metadata);

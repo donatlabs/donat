@@ -322,6 +322,7 @@ fn empty_metadata() -> Metadata {
         actions: vec![],
         custom_types: Default::default(),
         cron_triggers: vec![],
+        rest_endpoints: vec![],
     }
 }
 

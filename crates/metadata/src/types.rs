@@ -34,6 +34,9 @@ pub struct Metadata {
     /// schedule with a static payload. Deploy-time configuration only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cron_triggers: Vec<CronTrigger>,
+    /// REST endpoints exposing saved queries over templated URLs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rest_endpoints: Vec<RestEndpoint>,
 }
 
 /// A custom GraphQL field (query or mutation) resolved by calling an HTTP
@@ -345,6 +348,32 @@ pub struct CollectionQuery {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AllowlistEntry {
     pub collection: String,
+}
+
+/// A REST endpoint that exposes a saved query (from a [`QueryCollection`])
+/// over a templated URL. `:param` segments in `url` bind to path variables.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RestEndpoint {
+    pub name: String,
+    /// URL template; `:param` segments are path variables (e.g. `pet/:id`).
+    pub url: String,
+    /// HTTP methods this endpoint answers, e.g. `["GET"]` or `["POST", "PUT"]`.
+    pub methods: Vec<String>,
+    pub definition: RestEndpointDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RestEndpointDefinition {
+    pub query: RestEndpointQuery,
+}
+
+/// References a [`CollectionQuery`] by collection and query name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RestEndpointQuery {
+    pub collection_name: String,
+    pub query_name: String,
 }
 
 /// An inherited role combines the permissions of its parents.

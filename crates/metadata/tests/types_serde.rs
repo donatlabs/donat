@@ -7,7 +7,7 @@ use std::path::Path;
 
 use donat_metadata::{
     Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
-    QualifiedTable, RemoteSchema, SelectPermission, SourceKind, load_metadata_dir,
+    QualifiedTable, RemoteSchema, RestEndpoint, SelectPermission, SourceKind, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -384,6 +384,110 @@ event_triggers:
     let te: donat_metadata::TableEntry = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(te.event_triggers.len(), 1);
     assert_eq!(te.event_triggers[0].name, "t1_all");
+}
+
+#[test]
+fn rest_endpoints_parse_single_and_multi_method() {
+    // The shape donat-cli writes to rest_endpoints.yaml: a list of endpoints
+    // referencing a saved query by collection + query name.
+    let yaml = "\
+- name: get_pet_by_id
+  url: pet/:id
+  methods:
+    - GET
+  definition:
+    query:
+      collection_name: pet_queries
+      query_name: PetById
+  comment: fetch one pet
+- name: upsert_pet
+  url: pet
+  methods:
+    - POST
+    - PUT
+  definition:
+    query:
+      collection_name: pet_queries
+      query_name: UpsertPet
+";
+    let endpoints: Vec<RestEndpoint> =
+        serde_yaml::from_str(yaml).expect("rest endpoints must deserialize");
+    assert_eq!(endpoints.len(), 2);
+
+    let get = &endpoints[0];
+    assert_eq!(get.name, "get_pet_by_id");
+    assert_eq!(get.url, "pet/:id");
+    assert_eq!(get.methods, vec!["GET"]);
+    assert_eq!(get.definition.query.collection_name, "pet_queries");
+    assert_eq!(get.definition.query.query_name, "PetById");
+    assert_eq!(get.comment.as_deref(), Some("fetch one pet"));
+
+    let upsert = &endpoints[1];
+    assert_eq!(upsert.methods, vec!["POST", "PUT"]);
+    assert!(upsert.comment.is_none());
+}
+
+#[test]
+fn rest_endpoints_load_from_metadata_section() {
+    let yaml = "\
+version: 3
+sources: []
+rest_endpoints:
+  - name: get_pet_by_id
+    url: pet/:id
+    methods: [GET]
+    definition:
+      query:
+        collection_name: pet_queries
+        query_name: PetById
+";
+    let md: Metadata = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(md.rest_endpoints.len(), 1);
+    assert_eq!(md.rest_endpoints[0].name, "get_pet_by_id");
+    assert_eq!(md.rest_endpoints[0].definition.query.query_name, "PetById");
+}
+
+#[test]
+fn rest_endpoint_round_trips_omitting_none_comment() {
+    let yaml = "\
+- name: get_pet_by_id
+  url: pet/:id
+  methods: [GET]
+  definition:
+    query:
+      collection_name: pet_queries
+      query_name: PetById
+";
+    let endpoints: Vec<RestEndpoint> = serde_yaml::from_str(yaml).unwrap();
+
+    // Serialize -> deserialize must be lossless for the populated fields.
+    let out = serde_json::to_value(&endpoints).unwrap();
+    let obj = out[0].as_object().unwrap();
+    assert!(!obj.contains_key("comment"), "None comment must be omitted");
+
+    let back: Vec<RestEndpoint> = serde_json::from_value(out).unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].name, endpoints[0].name);
+    assert_eq!(back[0].url, endpoints[0].url);
+    assert_eq!(back[0].methods, endpoints[0].methods);
+    assert_eq!(
+        back[0].definition.query.collection_name,
+        endpoints[0].definition.query.collection_name
+    );
+    assert_eq!(
+        back[0].definition.query.query_name,
+        endpoints[0].definition.query.query_name
+    );
+    assert_eq!(back[0].comment, endpoints[0].comment);
+}
+
+#[test]
+fn rest_endpoints_absent_from_directory_yields_empty_vec() {
+    // The canonical fixture has no rest_endpoints.yaml; load_section must
+    // treat the absent file as an empty section.
+    let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/metadata"));
+    let md = load_metadata_dir(dir).expect("fixture metadata should load");
+    assert!(md.rest_endpoints.is_empty());
 }
 
 #[test]
