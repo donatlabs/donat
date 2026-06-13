@@ -478,12 +478,8 @@ impl Ctx {
             sql.push_str(&format!(" ORDER BY {}", items.join(", ")));
         }
 
-        if let Some(limit) = q.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-        if let Some(offset) = q.offset {
-            sql.push_str(&format!(" OFFSET {offset}"));
-        }
+        use donat_backend::Dialect;
+        sql.push_str(&donat_backend::PostgresDialect.limit_offset(q.limit, q.offset));
         sql
     }
 
@@ -992,11 +988,13 @@ fn qualified(alias: &str, column: &str) -> String {
 }
 
 pub fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.quote_ident(ident)
 }
 
 pub fn quote_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.quote_literal(s)
 }
 
 /// Render a JSON scalar as a SQL literal cast to the column's type.

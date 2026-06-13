@@ -630,6 +630,7 @@ dependencies = [
 name = "donat-sqlgen"
 version = "0.1.0"
 dependencies = [
+ "donat-backend",
  "donat-catalog",
  "donat-ir",
  "donat-metadata",
