@@ -397,6 +397,7 @@ pub struct FunctionConfiguration {
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     Postgres,
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

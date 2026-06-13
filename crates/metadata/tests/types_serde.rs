@@ -387,6 +387,27 @@ event_triggers:
 }
 
 #[test]
+fn source_kind_sqlite_and_postgres_deserialize_from_string() {
+    // `kind` is a lowercase string discriminant; both backends parse.
+    let sqlite: SourceKind = serde_yaml::from_str("sqlite").unwrap();
+    assert_eq!(sqlite, SourceKind::Sqlite);
+    let postgres: SourceKind = serde_yaml::from_str("postgres").unwrap();
+    assert_eq!(postgres, SourceKind::Postgres);
+
+    // And through a Source document's `kind` field.
+    let yaml = "\
+name: db
+kind: sqlite
+configuration:
+  connection_info:
+    database_url: file:local.db
+tables: []
+";
+    let src: donat_metadata::Source = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(src.kind, SourceKind::Sqlite);
+}
+
+#[test]
 fn existing_fixture_directory_still_loads() {
     // Guard: the canonical on-disk fixture (string-spelled includes, the
     // donat-cli layout) keeps loading through the public entry point.
