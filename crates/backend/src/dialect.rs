@@ -34,6 +34,7 @@ pub trait Dialect {
 }
 
 /// Postgres dialect. Output matches `crates/sqlgen` exactly.
+#[derive(Debug, Clone, Copy)]
 pub struct PostgresDialect;
 
 impl Dialect for PostgresDialect {
@@ -120,6 +121,144 @@ impl PostgresDialect {
             }
             serde_json::Value::String(s) => format!("({})::{cast}", self.quote_literal(s)),
             other => format!("({})::{cast}", self.quote_literal(&other.to_string())),
+        }
+    }
+}
+
+/// SQLite dialect. The identifier/literal/limit syntax is shared with
+/// Postgres; only the JSON-assembly and scalar-rendering leaves differ
+/// (no typed casts, json1 builtins). The chosen renderings below are design
+/// choices pinned by unit tests and validated against a real SQLite in the
+/// harness slice.
+#[derive(Debug, Clone, Copy)]
+pub struct SqliteDialect;
+
+impl Dialect for SqliteDialect {
+    fn quote_ident(&self, ident: &str) -> String {
+        // SQLite uses the same double-quoted identifier syntax as Postgres.
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+
+    fn quote_literal(&self, lit: &str) -> String {
+        // SQLite uses the same single-quoted string literal syntax.
+        format!("'{}'", lit.replace('\'', "''"))
+    }
+
+    fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String {
+        // Identical LIMIT/OFFSET tail to Postgres.
+        let mut sql = String::new();
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        if let Some(offset) = offset {
+            sql.push_str(&format!(" OFFSET {offset}"));
+        }
+        sql
+    }
+
+    fn render_scalar(&self, scalar: &donat_ir::Scalar, _native_type: &str) -> String {
+        // SQLite has no typed casts, so the native type is intentionally
+        // ignored: values are rendered as bare literals.
+        // validated against real sqlite in the harness slice
+        match scalar.as_json() {
+            serde_json::Value::Null => "NULL".into(),
+            // No boolean type in SQLite: TRUE/FALSE are 1/0.
+            serde_json::Value::Bool(b) => {
+                if *b { "1".into() } else { "0".into() }
+            }
+            // No cast: bare numeric literal.
+            serde_json::Value::Number(n) => format!("{n}"),
+            serde_json::Value::String(s) => self.quote_literal(s),
+            // JSON object/array: wrap in json(...) so json1 validates/minifies
+            // the literal. (Geometry is not a SQLite capability and won't
+            // reach here; this is the same quoted-text fallback.)
+            // validated against real sqlite in the harness slice
+            other => format!("json({})", self.quote_literal(&other.to_string())),
+        }
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        // json1's json_object('k', v, …): keys quoted, values inlined.
+        let body: Vec<String> = pairs
+            .iter()
+            .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
+            .collect();
+        format!("json_object({})", body.join(", "))
+    }
+
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
+        // json1's json_group_array(...), coalesced to an empty json array.
+        // validated against real sqlite in the harness slice
+        match order_by {
+            Some(ob) => format!(
+                "coalesce(json_group_array({row_expr} ORDER BY {ob}), json_array())"
+            ),
+            None => format!("coalesce(json_group_array({row_expr}), json_array())"),
+        }
+    }
+
+    fn to_json_text(&self, expr: &str) -> String {
+        // json1's json_quote(...) renders a value as a JSON string.
+        format!("json_quote({expr})")
+    }
+}
+
+/// A backend dialect selected at runtime. Implements [`Dialect`] by
+/// delegating every method to the inner concrete dialect, so callers can hold
+/// one value and stay dialect-agnostic.
+#[derive(Debug, Clone, Copy)]
+pub enum AnyDialect {
+    Postgres(PostgresDialect),
+    Sqlite(SqliteDialect),
+}
+
+impl Dialect for AnyDialect {
+    fn quote_ident(&self, ident: &str) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.quote_ident(ident),
+            AnyDialect::Sqlite(d) => d.quote_ident(ident),
+        }
+    }
+
+    fn quote_literal(&self, lit: &str) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.quote_literal(lit),
+            AnyDialect::Sqlite(d) => d.quote_literal(lit),
+        }
+    }
+
+    fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.limit_offset(limit, offset),
+            AnyDialect::Sqlite(d) => d.limit_offset(limit, offset),
+        }
+    }
+
+    fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.render_scalar(scalar, native_type),
+            AnyDialect::Sqlite(d) => d.render_scalar(scalar, native_type),
+        }
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.json_object(pairs),
+            AnyDialect::Sqlite(d) => d.json_object(pairs),
+        }
+    }
+
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.json_array_agg(row_expr, order_by),
+            AnyDialect::Sqlite(d) => d.json_array_agg(row_expr, order_by),
+        }
+    }
+
+    fn to_json_text(&self, expr: &str) -> String {
+        match self {
+            AnyDialect::Postgres(d) => d.to_json_text(expr),
+            AnyDialect::Sqlite(d) => d.to_json_text(expr),
         }
     }
 }
@@ -313,5 +452,154 @@ mod tests {
             d.render_scalar(&s(serde_json::json!("POINT(1 2)")), "geometry"),
             "('POINT(1 2)')::\"geometry\""
         );
+    }
+
+    // ---- SqliteDialect ----------------------------------------------------
+
+    #[test]
+    fn sqlite_quote_ident_matches_postgres() {
+        let d = SqliteDialect;
+        // SQLite uses the same double-quoted identifier syntax as Postgres.
+        assert_eq!(d.quote_ident("users"), "\"users\"");
+        assert_eq!(d.quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn sqlite_quote_literal_matches_postgres() {
+        let d = SqliteDialect;
+        assert_eq!(d.quote_literal("O'Hara"), "'O''Hara'");
+    }
+
+    #[test]
+    fn sqlite_limit_offset_matches_postgres() {
+        let d = SqliteDialect;
+        assert_eq!(d.limit_offset(None, None), "");
+        assert_eq!(d.limit_offset(Some(10), Some(5)), " LIMIT 10 OFFSET 5");
+    }
+
+    #[test]
+    fn sqlite_render_scalar_null() {
+        let d = SqliteDialect;
+        assert_eq!(d.render_scalar(&s(serde_json::Value::Null), "TEXT"), "NULL");
+    }
+
+    #[test]
+    fn sqlite_render_scalar_bool_to_int() {
+        let d = SqliteDialect;
+        // SQLite has no boolean type: TRUE/FALSE are 1/0.
+        assert_eq!(d.render_scalar(&s(serde_json::json!(true)), "INTEGER"), "1");
+        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "INTEGER"), "0");
+    }
+
+    #[test]
+    fn sqlite_render_scalar_number_no_cast() {
+        let d = SqliteDialect;
+        // No typed casts in SQLite: bare numeric literal.
+        assert_eq!(d.render_scalar(&s(serde_json::json!(42)), "INTEGER"), "42");
+    }
+
+    #[test]
+    fn sqlite_render_scalar_string_quoted_no_cast() {
+        let d = SqliteDialect;
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("O'Hara")), "TEXT"),
+            "'O''Hara'"
+        );
+    }
+
+    #[test]
+    fn sqlite_render_scalar_json_object_and_array() {
+        let d = SqliteDialect;
+        // JSON object/array wrapped in json(...) so json1 validates/minifies.
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": 1})), "JSON"),
+            "json('{\"a\":1}')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!([1, 2])), "JSON"),
+            "json('[1,2]')"
+        );
+    }
+
+    #[test]
+    fn sqlite_render_scalar_json_object_quotes_embedded_quote() {
+        let d = SqliteDialect;
+        // The serialized JSON text is single-quote-escaped before json(...).
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": "O'Hara"})), "JSON"),
+            "json('{\"a\":\"O''Hara\"}')"
+        );
+    }
+
+    #[test]
+    fn sqlite_json_object_alternates_quoted_keys_and_values() {
+        let d = SqliteDialect;
+        assert_eq!(
+            d.json_object(&[
+                ("id".to_string(), "_t0.id".to_string()),
+                ("name".to_string(), "_t0.name".to_string()),
+            ]),
+            "json_object('id', _t0.id, 'name', _t0.name)"
+        );
+    }
+
+    #[test]
+    fn sqlite_json_object_empty() {
+        let d = SqliteDialect;
+        assert_eq!(d.json_object(&[]), "json_object()");
+    }
+
+    #[test]
+    fn sqlite_json_array_agg_without_order() {
+        let d = SqliteDialect;
+        assert_eq!(
+            d.json_array_agg("_e.j", None),
+            "coalesce(json_group_array(_e.j), json_array())"
+        );
+    }
+
+    #[test]
+    fn sqlite_json_array_agg_with_order() {
+        let d = SqliteDialect;
+        assert_eq!(
+            d.json_array_agg("t.e", Some("t.i ASC")),
+            "coalesce(json_group_array(t.e ORDER BY t.i ASC), json_array())"
+        );
+    }
+
+    #[test]
+    fn sqlite_to_json_text_uses_json_quote() {
+        let d = SqliteDialect;
+        assert_eq!(d.to_json_text("'User'"), "json_quote('User')");
+    }
+
+    // ---- AnyDialect delegation -------------------------------------------
+
+    #[test]
+    fn any_dialect_postgres_delegates() {
+        let d = AnyDialect::Postgres(PostgresDialect);
+        assert_eq!(d.quote_ident("users"), "\"users\"");
+        assert_eq!(d.quote_literal("x"), "'x'");
+        assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
+        assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int4"), "(1)::\"int4\"");
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "json_build_object('k', v)"
+        );
+        assert_eq!(d.json_array_agg("x", None), "coalesce(json_agg(x), '[]'::json)");
+        assert_eq!(d.to_json_text("x"), "to_json(x::text)");
+    }
+
+    #[test]
+    fn any_dialect_sqlite_delegates() {
+        let d = AnyDialect::Sqlite(SqliteDialect);
+        assert_eq!(d.quote_ident("users"), "\"users\"");
+        assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "INTEGER"), "1");
+        assert_eq!(d.json_object(&[("k".into(), "v".into())]), "json_object('k', v)");
+        assert_eq!(
+            d.json_array_agg("x", None),
+            "coalesce(json_group_array(x), json_array())"
+        );
+        assert_eq!(d.to_json_text("x"), "json_quote(x)");
     }
 }

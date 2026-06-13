@@ -52,9 +52,40 @@ pub fn postgres() -> Capabilities {
     }
 }
 
+/// Capabilities of the SQLite backend.
+pub fn sqlite() -> Capabilities {
+    Capabilities {
+        // json1 builtins (text-backed json, no jsonb operator class).
+        json_ops: JsonOps::Json,
+        geo: false,
+        // ON CONFLICT ... DO UPDATE is supported; no DO NOTHING-only limit.
+        upsert: UpsertKind::Update,
+        returning: true,
+        // No DISTINCT ON in SQLite.
+        distinct_on: false,
+        // No LATERAL joins.
+        lateral: false,
+        aggregates: true,
+        nested_inserts: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_descriptor_is_correct() {
+        let caps = sqlite();
+        assert_eq!(caps.json_ops, JsonOps::Json);
+        assert!(!caps.geo);
+        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert!(caps.returning);
+        assert!(!caps.distinct_on);
+        assert!(!caps.lateral);
+        assert!(caps.aggregates);
+        assert!(caps.nested_inserts);
+    }
 
     #[test]
     fn postgres_descriptor_is_correct() {

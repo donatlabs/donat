@@ -11,5 +11,5 @@ pub mod dialect;
 pub mod scalar;
 
 pub use capabilities::Capabilities;
-pub use dialect::{Dialect, PostgresDialect};
+pub use dialect::{AnyDialect, Dialect, PostgresDialect, SqliteDialect};
 pub use scalar::ScalarType;

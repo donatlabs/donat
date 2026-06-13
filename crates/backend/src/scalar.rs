@@ -58,6 +58,24 @@ pub fn postgres_scalar(native: &str) -> ScalarType {
     }
 }
 
+/// Map a SQLite declared/native type name to its logical [`ScalarType`].
+/// SQLite typing is dynamic and declared types are free-form, so matching is
+/// case-insensitive over the common declared spellings. Unknown names map to
+/// [`ScalarType::Other`] carrying the original native name verbatim.
+pub fn sqlite_scalar(native: &str) -> ScalarType {
+    match native.to_ascii_uppercase().as_str() {
+        "INTEGER" | "INT" => ScalarType::Int,
+        "REAL" | "DOUBLE" | "FLOAT" => ScalarType::Double,
+        "TEXT" | "VARCHAR" | "CHAR" | "CLOB" => ScalarType::Text,
+        "BLOB" => ScalarType::Bytes,
+        "NUMERIC" | "DECIMAL" => ScalarType::Numeric,
+        "BOOLEAN" => ScalarType::Bool,
+        "DATE" => ScalarType::Date,
+        "DATETIME" | "TIMESTAMP" => ScalarType::Timestamp,
+        _ => ScalarType::Other(native.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +134,60 @@ mod tests {
         assert_eq!(
             postgres_scalar("_int4"),
             ScalarType::Other("_int4".to_string())
+        );
+    }
+
+    // ---- sqlite_scalar ----------------------------------------------------
+
+    #[test]
+    fn sqlite_maps_integer_family() {
+        assert_eq!(sqlite_scalar("INTEGER"), ScalarType::Int);
+        assert_eq!(sqlite_scalar("INT"), ScalarType::Int);
+    }
+
+    #[test]
+    fn sqlite_maps_real_family() {
+        assert_eq!(sqlite_scalar("REAL"), ScalarType::Double);
+        assert_eq!(sqlite_scalar("DOUBLE"), ScalarType::Double);
+        assert_eq!(sqlite_scalar("FLOAT"), ScalarType::Double);
+    }
+
+    #[test]
+    fn sqlite_maps_text_family() {
+        assert_eq!(sqlite_scalar("TEXT"), ScalarType::Text);
+        assert_eq!(sqlite_scalar("VARCHAR"), ScalarType::Text);
+        assert_eq!(sqlite_scalar("CHAR"), ScalarType::Text);
+        assert_eq!(sqlite_scalar("CLOB"), ScalarType::Text);
+    }
+
+    #[test]
+    fn sqlite_maps_blob_and_numeric() {
+        assert_eq!(sqlite_scalar("BLOB"), ScalarType::Bytes);
+        assert_eq!(sqlite_scalar("NUMERIC"), ScalarType::Numeric);
+        assert_eq!(sqlite_scalar("DECIMAL"), ScalarType::Numeric);
+    }
+
+    #[test]
+    fn sqlite_maps_bool_and_temporal() {
+        assert_eq!(sqlite_scalar("BOOLEAN"), ScalarType::Bool);
+        assert_eq!(sqlite_scalar("DATE"), ScalarType::Date);
+        assert_eq!(sqlite_scalar("DATETIME"), ScalarType::Timestamp);
+        assert_eq!(sqlite_scalar("TIMESTAMP"), ScalarType::Timestamp);
+    }
+
+    #[test]
+    fn sqlite_is_case_insensitive() {
+        assert_eq!(sqlite_scalar("integer"), ScalarType::Int);
+        assert_eq!(sqlite_scalar("Text"), ScalarType::Text);
+        assert_eq!(sqlite_scalar("Boolean"), ScalarType::Bool);
+    }
+
+    #[test]
+    fn sqlite_unknown_falls_back_to_other_verbatim() {
+        // Unknown declared type keeps its original (non-uppercased) spelling.
+        assert_eq!(
+            sqlite_scalar("citext"),
+            ScalarType::Other("citext".to_string())
         );
     }
 }

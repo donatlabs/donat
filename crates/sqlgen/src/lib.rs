@@ -20,7 +20,25 @@ pub fn operation_to_sql(roots: &[RootField]) -> String {
 /// `stringify_numerics` renders bigint/numeric columns as text
 /// (Donat's --stringify-numeric-types).
 pub fn operation_to_sql_opts(roots: &[RootField], stringify_numerics: bool) -> String {
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics };
+    operation_to_sql_full(
+        roots,
+        stringify_numerics,
+        donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect),
+    )
+}
+
+/// Like [`operation_to_sql`], but compiling for an explicit backend dialect.
+/// The Postgres dialect produces byte-identical SQL to [`operation_to_sql`].
+pub fn operation_to_sql_with(roots: &[RootField], dialect: donat_backend::AnyDialect) -> String {
+    operation_to_sql_full(roots, false, dialect)
+}
+
+fn operation_to_sql_full(
+    roots: &[RootField],
+    stringify_numerics: bool,
+    dialect: donat_backend::AnyDialect,
+) -> String {
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics, dialect };
     let pairs: Vec<(String, String)> = roots
         .iter()
         .map(|r| match r {
@@ -35,7 +53,7 @@ pub fn operation_to_sql_opts(roots: &[RootField], stringify_numerics: bool) -> S
             }
         })
         .collect();
-    format!("SELECT {} AS root", json_object(&pairs))
+    format!("SELECT {} AS root", json_object(&ctx.dialect, &pairs))
 }
 
 /// base64 without the newlines Postgres' encode() inserts.
@@ -46,6 +64,11 @@ fn b64(expr: &str) -> String {
 struct Ctx {
     next_alias: usize,
     stringify_numerics: bool,
+    /// Backend dialect used for the four backend-divergent leaf renderings
+    /// (`scalar_sql`, `json_object`, `json_array_agg`, `to_json_text`). The
+    /// identifier/literal/limit ops are backend-identical and stay as free
+    /// functions.
+    dialect: donat_backend::AnyDialect,
 }
 
 /// Join condition pairs against an enclosing table alias:
@@ -95,6 +118,7 @@ impl Ctx {
 
     /// A parenthesized scalar subquery producing a connection's JSON value.
     fn connection_expr(&mut self, conn: &Connection, outer: Option<OuterJoin>) -> String {
+        let dialect = self.dialect;
         let alias = self.alias();
         let row_json = self.row_json(&conn.query.fields, &alias);
         let cursor = self.cursor_expr(&alias, &conn.pk);
@@ -133,7 +157,7 @@ impl Ctx {
                 // Only the json_agg leaf is delegated; the surrounding
                 // json_array_elements(...) WITH ORDINALITY size-limited wrapper
                 // stays inline (no leaf for that shape).
-                let agg = json_array_agg("t.e", Some(order));
+                let agg = json_array_agg(&dialect, "t.e", Some(order));
                 format!(
                     "(SELECT {agg} FROM json_array_elements({raw}) WITH ORDINALITY AS t(e, i) WHERE t.i <= {size})",
                     size = page.size
@@ -175,7 +199,7 @@ impl Ctx {
                             (fa.clone(), value)
                         })
                         .collect();
-                    (alias.clone(), json_object(&inner))
+                    (alias.clone(), json_object(&dialect, &inner))
                 }
                 ConnectionField::Edges { alias, fields } => {
                     // Re-project the prebuilt edges array onto the selection.
@@ -199,7 +223,7 @@ impl Ctx {
                         alias.clone(),
                         format!(
                             "coalesce((SELECT json_agg({}) FROM json_array_elements({a}) AS e), '[]'::json)",
-                            json_object(&inner)
+                            json_object(&dialect, &inner)
                         ),
                     )
                 }
@@ -208,14 +232,14 @@ impl Ctx {
 
         // The relay edges array (json_agg of cursor/node objects, coalesced to
         // []) is a clean array-agg leaf; the cursor/node object is a leaf too.
-        let edge_obj = json_object(&[
+        let edge_obj = json_object(&dialect, &[
             ("cursor".to_string(), format!("{ed}.c", ed = quote_ident(&format!("{arr}_e")))),
             ("node".to_string(), format!("{ed}.n", ed = quote_ident(&format!("{arr}_e")))),
         ]);
         format!(
             "(SELECT {obj} FROM (SELECT {agg} AS a FROM (SELECT {cursor} AS c, {row_json} AS n {tail}) AS {ed}) AS {arr_q})",
-            obj = json_object(&pairs),
-            agg = json_array_agg(&edge_obj, None),
+            obj = json_object(&dialect, &pairs),
+            agg = json_array_agg(&dialect, &edge_obj, None),
             ed = quote_ident(&format!("{arr}_e")),
             arr_q = quote_ident(&arr),
         )
@@ -242,7 +266,7 @@ impl Ctx {
             let e = quote_ident(&elem);
             format!(
                 "(SELECT {agg} FROM (SELECT {distinct}{row_json} AS j {tail}) AS {e})",
-                agg = json_array_agg(&format!("{e}.j"), None),
+                agg = json_array_agg(&self.dialect, &format!("{e}.j"), None),
             )
         }
     }
@@ -250,6 +274,7 @@ impl Ctx {
     /// `<t>_aggregate` (root or relationship): aggregate + nodes over one
     /// filtered row set.
     fn aggregate_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
+        let dialect = self.dialect;
         let inner_alias = self.alias();
         let tail = self.from_where_order(q, &inner_alias, outer);
         let distinct = distinct_clause(q, &inner_alias);
@@ -281,10 +306,10 @@ impl Ctx {
                             self.select_expr(&nodes_query, outer)
                         } else {
                             let row = self.row_json(fields, &outer_alias);
-                            json_array_agg(&row, None)
+                            json_array_agg(&dialect, &row, None)
                         }
                     }
-                    FieldValue::Typename { value } => to_json_text(&quote_lit(value)),
+                    FieldValue::Typename { value } => to_json_text(&dialect, &quote_lit(value)),
                     other => panic!("non-aggregate field in aggregate select: {other:?}"),
                 };
                 (f.alias.clone(), value)
@@ -293,11 +318,12 @@ impl Ctx {
 
         format!(
             "(SELECT {obj} FROM (SELECT {distinct}* {tail}) AS {oa})",
-            obj = json_object(&pairs),
+            obj = json_object(&dialect, &pairs),
         )
     }
 
     fn aggregate_json(&mut self, fields: &[AggregateField], table_alias: &str) -> String {
+        let dialect = self.dialect;
         let pairs: Vec<(String, String)> = fields
             .iter()
             .map(|f| {
@@ -336,13 +362,13 @@ impl Ctx {
                                 (c.alias.clone(), format!("{op}({expr})"))
                             })
                             .collect();
-                        json_object(&inner)
+                        json_object(&dialect, &inner)
                     }
                 };
                 (f.alias.clone(), value)
             })
             .collect();
-        json_object(&pairs)
+        json_object(&dialect, &pairs)
     }
 
     /// `FROM .. WHERE .. ORDER BY .. LIMIT .. OFFSET ..` for one select.
@@ -352,6 +378,7 @@ impl Ctx {
         alias: &str,
         outer: Option<OuterJoin>,
     ) -> String {
+        let dialect = self.dialect;
         let from_item = match &q.from {
             FromSource::Table(t) => {
                 format!("{}.{}", quote_ident(&t.schema), quote_ident(&t.name))
@@ -360,7 +387,7 @@ impl Ctx {
                 let rendered: Vec<String> = args
                     .iter()
                     .map(|a| {
-                        let value = scalar_sql(&a.value, &a.pg_type);
+                        let value = scalar_sql(&dialect, &a.value, &a.pg_type);
                         match &a.name {
                             Some(arg_name) => {
                                 format!("{} => {value}", quote_ident(arg_name))
@@ -382,7 +409,7 @@ impl Ctx {
                     .expect("row function requires an enclosing row");
                 let rendered: Vec<String> = args
                     .iter()
-                    .map(|a| row_function_arg(a, outer_alias))
+                    .map(|a| row_function_arg(&dialect, a, outer_alias))
                     .collect();
                 format!(
                     "{}.{}({})",
@@ -496,6 +523,7 @@ impl Ctx {
     }
 
     fn row_json(&mut self, fields: &[OutputField], table_alias: &str) -> String {
+        let dialect = self.dialect;
         let pairs: Vec<(String, String)> = fields
             .iter()
             .map(|f| {
@@ -539,7 +567,7 @@ impl Ctx {
                     FieldValue::ComputedScalar { schema, name, args, guard } => {
                         let rendered: Vec<String> = args
                             .iter()
-                            .map(|a| row_function_arg(a, table_alias))
+                            .map(|a| row_function_arg(&dialect, a, table_alias))
                             .collect();
                         let call = format!(
                             "{}.{}({})",
@@ -563,7 +591,7 @@ impl Ctx {
                 (f.alias.clone(), value)
             })
             .collect();
-        json_object(&pairs)
+        json_object(&dialect, &pairs)
     }
 
     /// Column output expression with type-specific casts.
@@ -577,6 +605,7 @@ impl Ctx {
     }
 
     fn bool_exp(&mut self, exp: &BoolExp, alias: &str, root: &str) -> String {
+        let dialect = self.dialect;
         match exp {
             BoolExp::And(exps) => {
                 if exps.is_empty() {
@@ -620,7 +649,7 @@ impl Ctx {
             }
             BoolExp::ComputedCompare { schema, name, args, pg_type, op } => {
                 let rendered: Vec<String> =
-                    args.iter().map(|a| row_function_arg(a, alias)).collect();
+                    args.iter().map(|a| row_function_arg(&dialect, a, alias)).collect();
                 let expr = format!(
                     "{}.{}({})",
                     quote_ident(schema),
@@ -643,7 +672,7 @@ impl Ctx {
             BoolExp::RowFunctionExists { schema, name, args, predicate } => {
                 let ra = self.alias();
                 let rendered: Vec<String> =
-                    args.iter().map(|a| row_function_arg(a, alias)).collect();
+                    args.iter().map(|a| row_function_arg(&dialect, a, alias)).collect();
                 let pred = self.bool_exp(predicate, &ra, root);
                 format!(
                     "EXISTS (SELECT 1 FROM {}.{}({}) AS {} WHERE {})",
@@ -658,7 +687,8 @@ impl Ctx {
     }
 
     fn compare(&mut self, col: &str, pg_type: &str, op: &CompareOp, alias: &str, root: &str) -> String {
-        let lit = |s: &Scalar| scalar_sql(s, pg_type);
+        let dialect = self.dialect;
+        let lit = |s: &Scalar| scalar_sql(&dialect, s, pg_type);
         match op {
             CompareOp::Eq(v) => format!("{col} = {}", lit(v)),
             CompareOp::Neq(v) => format!("{col} <> {}", lit(v)),
@@ -715,11 +745,11 @@ impl Ctx {
                     conds.join(" AND ")
                 )
             }
-            CompareOp::HasKey(v) => format!("{col} ? {}", scalar_sql(v, "text")),
+            CompareOp::HasKey(v) => format!("{col} ? {}", scalar_sql(&dialect, v, "text")),
             CompareOp::HasKeysAny(keys) => format!("{col} ?| {}", text_array(keys)),
             CompareOp::HasKeysAll(keys) => format!("{col} ?& {}", text_array(keys)),
-            CompareOp::Contains(v) => format!("{col} @> {}", scalar_sql(v, "jsonb")),
-            CompareOp::ContainedIn(v) => format!("{col} <@ {}", scalar_sql(v, "jsonb")),
+            CompareOp::Contains(v) => format!("{col} @> {}", scalar_sql(&dialect, v, "jsonb")),
+            CompareOp::ContainedIn(v) => format!("{col} <@ {}", scalar_sql(&dialect, v, "jsonb")),
             CompareOp::StOp { function, value } => {
                 format!("{function}({col}, {})", geometry_sql(value, pg_type))
             }
@@ -732,7 +762,7 @@ impl Ctx {
                 format!(
                     "{func}({col}, {}, {})",
                     geometry_sql(from, pg_type),
-                    scalar_sql(distance, "float8")
+                    scalar_sql(&dialect, distance, "float8")
                 )
             }
         }
@@ -771,7 +801,26 @@ pub fn mutation_to_sql(root: &MutationRoot) -> String {
 }
 
 pub fn mutation_to_sql_opts(root: &MutationRoot, stringify_numerics: bool) -> String {
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics };
+    mutation_to_sql_full(
+        root,
+        stringify_numerics,
+        donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect),
+    )
+}
+
+/// Like [`mutation_to_sql`], but compiling for an explicit backend dialect.
+/// The Postgres dialect produces byte-identical SQL to [`mutation_to_sql`].
+pub fn mutation_to_sql_with(root: &MutationRoot, dialect: donat_backend::AnyDialect) -> String {
+    mutation_to_sql_full(root, false, dialect)
+}
+
+fn mutation_to_sql_full(
+    root: &MutationRoot,
+    stringify_numerics: bool,
+    dialect: donat_backend::AnyDialect,
+) -> String {
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics, dialect };
+    let dialect = ctx.dialect;
     match root {
         MutationRoot::Typename { value, .. } => {
             format!("SELECT {}::text AS root", quote_lit(value))
@@ -794,7 +843,7 @@ pub fn mutation_to_sql_opts(root: &MutationRoot, stringify_numerics: bool) -> St
                         .zip(&insert.columns)
                         .map(|(v, (_, pg_type))| match v {
                             None => "DEFAULT".to_string(),
-                            Some(s) => scalar_sql(s, pg_type),
+                            Some(s) => scalar_sql(&dialect, s, pg_type),
                         })
                         .collect();
                     format!("({})", values.join(", "))
@@ -824,14 +873,14 @@ pub fn mutation_to_sql_opts(root: &MutationRoot, stringify_numerics: bool) -> St
                             SetOp::Set { column, pg_type, value } => sets.push(format!(
                                 "{} = {}",
                                 quote_ident(column),
-                                scalar_sql(value, pg_type)
+                                scalar_sql(&dialect, value, pg_type)
                             )),
                             SetOp::Inc { column, pg_type, value } => sets.push(format!(
                                 "{} = {}.{} + {}",
                                 quote_ident(column),
                                 quote_ident(&insert.table.name),
                                 quote_ident(column),
-                                scalar_sql(value, pg_type)
+                                scalar_sql(&dialect, value, pg_type)
                             )),
                         }
                     }
@@ -863,13 +912,13 @@ pub fn mutation_to_sql_opts(root: &MutationRoot, stringify_numerics: bool) -> St
                 .iter()
                 .map(|s| match s {
                     SetOp::Set { column, pg_type, value } => {
-                        format!("{} = {}", quote_ident(column), scalar_sql(value, pg_type))
+                        format!("{} = {}", quote_ident(column), scalar_sql(&dialect, value, pg_type))
                     }
                     SetOp::Inc { column, pg_type, value } => format!(
                         "{} = {} + {}",
                         quote_ident(column),
                         quote_ident(column),
-                        scalar_sql(value, pg_type)
+                        scalar_sql(&dialect, value, pg_type)
                     ),
                 })
                 .collect();
@@ -921,6 +970,7 @@ impl Ctx {
         check_path: &str,
         output: &MutationOutput,
     ) -> String {
+        let dialect = self.dialect;
         let cte_ident = quote_ident(cte);
         let result = match output {
             MutationOutput::Response(fields) => {
@@ -942,13 +992,13 @@ impl Ctx {
                                 alias.clone(),
                                 format!(
                                     "(SELECT {} FROM {cte_ident})",
-                                    json_array_agg(&row, None)
+                                    json_array_agg(&dialect, &row, None)
                                 ),
                             )
                         }
                     })
                     .collect();
-                json_object(&pairs)
+                json_object(&dialect, &pairs)
             }
             MutationOutput::SingleRow(fields) => {
                 let row = self.row_json(fields, cte);
@@ -980,13 +1030,17 @@ impl Ctx {
     }
 }
 
-fn row_function_arg(arg: &RowFunctionArg, outer_alias: &str) -> String {
+fn row_function_arg(
+    dialect: &donat_backend::AnyDialect,
+    arg: &RowFunctionArg,
+    outer_alias: &str,
+) -> String {
     match arg {
         // The enclosing FROM alias is a composite value of the table's
         // row type, which is exactly what the function expects.
         RowFunctionArg::Row => quote_ident(outer_alias),
         RowFunctionArg::SessionJson(json) => format!("({})::json", quote_lit(json)),
-        RowFunctionArg::Value { value, pg_type } => scalar_sql(value, pg_type),
+        RowFunctionArg::Value { value, pg_type } => scalar_sql(dialect, value, pg_type),
     }
 }
 
@@ -1014,29 +1068,111 @@ pub fn quote_lit(s: &str) -> String {
     donat_backend::PostgresDialect.quote_literal(s)
 }
 
-/// JSON object assembly (LEAF op #1). Delegates to the backend dialect;
-/// keys are raw and quoted internally, values are inlined verbatim.
-fn json_object(pairs: &[(String, String)]) -> String {
+/// JSON object assembly (LEAF op #1). Delegates to the active backend
+/// dialect; keys are raw and quoted internally, values are inlined verbatim.
+fn json_object(dialect: &donat_backend::AnyDialect, pairs: &[(String, String)]) -> String {
     use donat_backend::Dialect;
-    donat_backend::PostgresDialect.json_object(pairs)
+    dialect.json_object(pairs)
 }
 
 /// JSON array aggregation (LEAF op #2/#8), coalescing empty to `[]`.
-fn json_array_agg(row_expr: &str, order_by: Option<&str>) -> String {
+fn json_array_agg(
+    dialect: &donat_backend::AnyDialect,
+    row_expr: &str,
+    order_by: Option<&str>,
+) -> String {
     use donat_backend::Dialect;
-    donat_backend::PostgresDialect.json_array_agg(row_expr, order_by)
+    dialect.json_array_agg(row_expr, order_by)
 }
 
 /// Render an expression as a JSON string (LEAF op #7).
-fn to_json_text(expr: &str) -> String {
+fn to_json_text(dialect: &donat_backend::AnyDialect, expr: &str) -> String {
     use donat_backend::Dialect;
-    donat_backend::PostgresDialect.to_json_text(expr)
+    dialect.to_json_text(expr)
 }
 
 /// Render a JSON scalar as a SQL literal cast to the column's type.
-/// Delegates to the backend dialect's `render_scalar`, which holds the
+/// Delegates to the active backend dialect's `render_scalar`, which holds the
 /// byte-for-byte rendering (including the geometry/geography GeoJSON case).
-fn scalar_sql(scalar: &Scalar, pg_type: &str) -> String {
+fn scalar_sql(dialect: &donat_backend::AnyDialect, scalar: &Scalar, pg_type: &str) -> String {
     use donat_backend::Dialect;
-    donat_backend::PostgresDialect.render_scalar(scalar, pg_type)
+    dialect.render_scalar(scalar, pg_type)
+}
+
+#[cfg(test)]
+mod dialect_dispatch_tests {
+    use super::*;
+    use donat_backend::{AnyDialect, PostgresDialect};
+
+    fn sample_roots() -> Vec<RootField> {
+        let cols = vec![
+            OutputField {
+                alias: "id".into(),
+                value: FieldValue::Column { column: "id".into(), pg_type: "int4".into() },
+            },
+            OutputField {
+                alias: "name".into(),
+                value: FieldValue::Column { column: "name".into(), pg_type: "text".into() },
+            },
+        ];
+        let query = |single: bool| SelectQuery {
+            from: FromSource::Table(Table { schema: "public".into(), name: "author".into() }),
+            fields: cols.clone(),
+            predicate: Some(BoolExp::Compare {
+                column: "id".into(),
+                pg_type: "int4".into(),
+                op: CompareOp::Eq(Scalar::Json(serde_json::json!(7))),
+            }),
+            order_by: vec![],
+            limit: Some(10),
+            nodes_limit: None,
+            offset: Some(2),
+            distinct_on: vec![],
+            single,
+        };
+        vec![
+            RootField::Select { alias: "author_by_pk".into(), query: query(true) },
+            RootField::Select { alias: "authors".into(), query: query(false) },
+        ]
+    }
+
+    #[test]
+    fn operation_to_sql_with_postgres_equals_default_wrapper() {
+        // The dialect-explicit entry point with the Postgres dialect must
+        // produce byte-identical SQL to the default (Postgres-wrapper) entry
+        // point. Guards the dispatch refactor: the Postgres path is unchanged.
+        let roots = sample_roots();
+        let default = operation_to_sql(&roots);
+        let explicit =
+            operation_to_sql_with(&roots, AnyDialect::Postgres(PostgresDialect));
+        assert_eq!(default, explicit);
+    }
+
+    #[test]
+    fn mutation_to_sql_with_postgres_equals_default_wrapper() {
+        let root = MutationRoot::Insert {
+            alias: "insert_author".into(),
+            insert: InsertMutation {
+                table: Table { schema: "public".into(), name: "author".into() },
+                columns: vec![("name".into(), "text".into())],
+                rows: vec![vec![Some(Scalar::Json(serde_json::json!("Ada")))]],
+                on_conflict: None,
+                check: None,
+                check_path: "$".into(),
+                output: MutationOutput::Response(vec![
+                    MutationResponseField::AffectedRows { alias: "affected_rows".into() },
+                    MutationResponseField::Returning {
+                        alias: "returning".into(),
+                        fields: vec![OutputField {
+                            alias: "id".into(),
+                            value: FieldValue::Column { column: "id".into(), pg_type: "int4".into() },
+                        }],
+                    },
+                ]),
+            },
+        };
+        let default = mutation_to_sql(&root);
+        let explicit = mutation_to_sql_with(&root, AnyDialect::Postgres(PostgresDialect));
+        assert_eq!(default, explicit);
+    }
 }
