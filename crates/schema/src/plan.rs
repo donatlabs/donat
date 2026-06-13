@@ -1542,10 +1542,6 @@ impl<'a> Planner<'a> {
         session: &Session,
         path: &str,
     ) -> Result<Vec<AggregateField>, PlanError> {
-        const COLUMN_OPS: &[&str] = &[
-            "sum", "avg", "max", "min", "stddev", "stddev_samp", "stddev_pop", "variance",
-            "var_samp", "var_pop",
-        ];
         let fields = flatten(selection_set, fragments, vars, None)?;
         let mut out = vec![];
         for field in fields {
@@ -1578,7 +1574,7 @@ impl<'a> Planner<'a> {
                         op: AggregateOp::Count { distinct, columns },
                     });
                 }
-                op if COLUMN_OPS.contains(&op) => {
+                op if AGGREGATE_COLUMN_OPS.contains(&op) => {
                     // Roles with no selectable columns get no column-op
                     // fields in <table>_aggregate_fields at all.
                     if !ctx.any_column_allowed() {
@@ -1699,6 +1695,17 @@ impl<'a> Planner<'a> {
                                     nulls,
                                 });
                             } else {
+                                // The function name is rendered into SQL
+                                // verbatim by sqlgen, so it must be one of the
+                                // fixed column-aggregate ops — never arbitrary
+                                // input.
+                                if !AGGREGATE_COLUMN_OPS.contains(&agg.as_str()) {
+                                    return Err(field_not_found(
+                                        path,
+                                        agg,
+                                        &format!("{}_aggregate_order_by", remote.type_name),
+                                    ));
+                                }
                                 let Json::Object(cols) = agg_value else {
                                     return Err(PlanError::validation(
                                         path,
@@ -2304,6 +2311,15 @@ fn op_name<'o>(op: &'o OperationDefinition<'static, String>) -> Option<&'o str> 
         OperationDefinition::SelectionSet(_) => None,
     }
 }
+
+/// The column-aggregate functions (i.e. every aggregate except `count`).
+/// Single source of truth for both `_aggregate_fields` selection and
+/// `order_by` over a relationship aggregate — the function name reaches SQL
+/// verbatim, so it must never be taken from unvalidated input.
+pub(crate) const AGGREGATE_COLUMN_OPS: &[&str] = &[
+    "sum", "avg", "max", "min", "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp",
+    "var_pop",
+];
 
 pub(crate) fn field_not_found(path: &str, field: &str, type_name: &str) -> PlanError {
     PlanError::validation(path, format!("field '{field}' not found in type: '{type_name}'"))

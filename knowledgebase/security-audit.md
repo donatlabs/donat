@@ -24,6 +24,11 @@ items are downgraded accordingly.
   the `X-Hasura-Admin-Secret` check in `resolve_session`.
 - **Metadata `!include` cycle → overflow: FIXED.** The loader tracks the
   include chain and returns `LoadError::IncludeCycle`.
+- **Aggregate-function injection in `order_by` (SEC-01): FIXED (2026-06-13).**
+  The relationship-aggregate `order_by` path interpolated an *unvalidated*
+  function name into SQL; it is now checked against the shared
+  `AGGREGATE_COLUMN_OPS` allowlist. See the correction under "SQL generation"
+  below — this audit's original "injection-safe" verdict had missed it.
 - **`cargo audit`: ADDED to CI** (`rustsec/audit-check`); current scan shows
   no vulnerabilities (the yanked `time` transitive dep was bumped).
 - **Still open (non-security / by design):** serde_yaml deprecated (tech
@@ -35,7 +40,21 @@ items are downgraded accordingly.
 
 The original ranked findings below are kept for history.
 
-## SQL generation — verdict: injection-safe
+## SQL generation — verdict: injection-safe (one miss, since fixed)
+
+> **Correction (2026-06-13):** the "no injection" verdict below missed one
+> path. The aggregate function name in an `order_by` over a *relationship
+> aggregate* was **not** validated against the allowlist — it flowed from a
+> GraphQL object key straight into sqlgen's `format!("{function}(..)")`
+> (`crates/sqlgen/src/lib.rs:455`), letting a client invoke arbitrary
+> single-arg SQL functions (e.g. `pg_sleep`). GraphQL's Name grammar
+> (`[A-Za-z_][A-Za-z0-9_]*`) blocked quote/semicolon breakout, so the impact
+> was arbitrary-function-call (DoS / info-disclosure), not statement
+> breakout; the v1 JSON `order_by` path does not handle relationship
+> aggregates and was unaffected. Fixed in `plan.rs::parse_order_by` by
+> validating against the shared `AGGREGATE_COLUMN_OPS` allowlist (the same
+> one the `_aggregate_fields` selection path already used), with regression
+> tests in `crates/schema/tests/planner.rs`.
 
 Audited every literal/identifier path in `crates/sqlgen`. No GraphQL-path
 injection found:
@@ -45,10 +64,12 @@ injection found:
   Correct under `standard_conforming_strings = on` (PG default).
 - All identifiers (table/column/alias names) come from catalog introspection
   or are validated against it at plan time — unknown columns error out.
-- The three raw `format!("{name}(...)")` interpolations are from trusted
-  sources: aggregate op (fixed `COLUMN_OPS` allowlist), PostGIS function
-  (fixed `st_op(...)` constants), computed-field function (operator-defined
-  metadata = trust-equivalent to DDL).
+- The raw `format!("{name}(...)")` interpolations must come from trusted
+  sources: aggregate op (validated against the shared `AGGREGATE_COLUMN_OPS`
+  allowlist — note the `order_by`-relationship-aggregate path originally
+  missed this check; see the correction above), PostGIS function (fixed
+  `st_op(...)` constants), computed-field function (operator-defined metadata
+  = trust-equivalent to DDL).
 - Session-variable values become `Scalar::Json` → `quote_lit`; never used as
   identifiers.
 

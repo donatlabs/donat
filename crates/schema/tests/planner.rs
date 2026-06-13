@@ -485,6 +485,41 @@ fn aggregate_root_requires_allow_aggregations() {
 }
 
 #[test]
+fn order_by_relationship_aggregate_rejects_unknown_function() {
+    // SEC-01: sqlgen interpolates the order-by relationship-aggregate function
+    // name into SQL verbatim (`format!("{function}(..)")`), so an
+    // un-whitelisted name lets a client invoke arbitrary single-arg SQL
+    // functions (e.g. pg_sleep). Only the fixed aggregate set (plus `count`)
+    // is valid; anything else must be a field-not-found, exactly like the
+    // aggregate-fields path.
+    let err = gql_err(
+        "query { author(order_by: { articles_aggregate: { evilfunc: { id: asc } } }) { id } }",
+        &user(),
+    );
+    assert_eq!(err.code, "validation-failed");
+    assert_eq!(
+        err.message,
+        "field 'evilfunc' not found in type: 'article_aggregate_order_by'"
+    );
+}
+
+#[test]
+fn order_by_relationship_aggregate_allows_whitelisted_function() {
+    // Guard: a legitimate aggregate function must still plan after the fix.
+    let q = gql_select(
+        "query { author(order_by: { articles_aggregate: { max: { id: asc } } }) { id } }",
+        &user(),
+    );
+    assert!(matches!(
+        q.order_by.as_slice(),
+        [dist_ir::OrderBy {
+            target: dist_ir::OrderByTarget::RelationshipAggregate { .. },
+            ..
+        }]
+    ));
+}
+
+#[test]
 fn permission_limit_caps_user_limit() {
     // article select for "user" carries limit: 100.
     assert_eq!(gql_select("query { article { id } }", &user()).limit, Some(100));
