@@ -852,7 +852,6 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Sqlite(msg) => error_json("data-exception", msg),
     }
 }
-
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
