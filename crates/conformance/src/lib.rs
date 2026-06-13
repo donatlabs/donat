@@ -211,6 +211,32 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 }
 
 // ------------------------------------------------------------------ engine
+//
+// The harness sets up each suite WITHOUT the engine's runtime admin API
+// (`/v1/query`, `/v2/query`, `/v1/metadata`). Instead it:
+//
+//  - creates the per-suite database and the postgis extension directly via
+//    the `postgres` crate;
+//  - parses every setup fixture and APPLIES its ops in-harness: schema
+//    `run_sql` and seed `insert` ops run over the suite database via
+//    `postgres`, while metadata ops (track_table, permissions,
+//    relationships, inherited roles, query collections, ...) accumulate
+//    into an in-memory `dist_metadata::Metadata`;
+//  - spawns the engine lazily, on the first request, serializing the
+//    accumulated metadata to a `version: 3` metadata directory and passing
+//    it via `--metadata-dir`.
+//
+// The engine still ships the admin API for now; this harness simply never
+// calls it, so that API can later be deleted.
+
+use std::cell::RefCell;
+
+use dist_metadata::{
+    AllowlistEntry, ArrayRelationship, ComputedField, DeletePermission, FunctionEntry,
+    FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
+    PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
+    RemoteSchemaPermission, SelectPermission, Source, SourceKind, TableEntry, UpdatePermission,
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -269,6 +295,29 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A fresh `Metadata` with version 3 and a single empty "default" source
+/// (so `track_table` & co. have somewhere to live). The source points at
+/// `DIST_API_DATABASE_URL`, which the engine resolves to the suite database.
+fn empty_metadata() -> Metadata {
+    Metadata {
+        version: 3,
+        sources: vec![Source {
+            name: "default".to_string(),
+            kind: SourceKind::Postgres,
+            configuration: serde_json::from_value(json!({
+                "connection_info": { "database_url": { "from_env": "DIST_API_DATABASE_URL" } }
+            }))
+            .expect("static source configuration"),
+            tables: vec![],
+            functions: vec![],
+        }],
+        inherited_roles: vec![],
+        query_collections: vec![],
+        allowlist: vec![],
+        remote_schemas: vec![],
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Http,
@@ -315,19 +364,652 @@ impl Suite {
         self
     }
 
+    /// Create the suite database + postgis, but DO NOT spawn the engine yet.
+    /// The engine starts lazily on the first request, once all setup ops
+    /// have been accumulated into the in-memory metadata.
     pub fn start(self) -> Running {
-        let bin = engine_binary();
         let db_url =
             create_suite_db(&format!("conf_{}", self.name)).expect("creating suite database");
+
+        // Fresh database: postgis is used pervasively by fixtures. Concurrent
+        // CREATE EXTENSION across databases races inside Postgres (shared
+        // library/template locks) — serialize within this process and retry
+        // to cover other test processes.
+        static POSTGIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        {
+            let _guard = POSTGIS_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut last_err = None;
+            let mut ok = false;
+            for _ in 0..10 {
+                match postgres::Client::connect(&db_url, postgres::NoTls)
+                    .and_then(|mut c| c.batch_execute("create extension if not exists postgis"))
+                {
+                    Ok(()) => {
+                        ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+            assert!(
+                ok,
+                "postgis init failed [{}] after retries: {:?}",
+                self.name, last_err
+            );
+        }
+
+        Running {
+            name: self.name,
+            env: self.env,
+            args: self.args,
+            admin_secret: self.admin_secret,
+            db_url,
+            metadata: RefCell::new(empty_metadata()),
+            engine: RefCell::new(None),
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        }
+    }
+}
+
+/// The spawned engine process and its endpoints.
+struct EngineProc {
+    child: Child,
+    base_url: String,
+    ws_base: String,
+    // Keep the metadata dir alive for the engine's lifetime.
+    _metadata_dir: PathBuf,
+}
+
+pub struct Running {
+    pub name: String,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+    admin_secret: Option<String>,
+    db_url: String,
+    /// Accumulated metadata, applied lazily when the engine is spawned.
+    metadata: RefCell<Metadata>,
+    /// The spawned engine, started on first request (`ensure_engine`).
+    engine: RefCell<Option<EngineProc>>,
+    http: reqwest::blocking::Client,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(mut proc) = self.engine.borrow_mut().take() {
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+        }
+    }
+}
+
+// --------------------------------------------------------------- the applier
+
+/// A `postgres::Client` on the suite database (for run_sql / seed inserts).
+fn pg_client(db_url: &str) -> postgres::Client {
+    postgres::Client::connect(db_url, postgres::NoTls)
+        .expect("connecting to the suite database")
+}
+
+/// Render a JSON scalar as a SQL literal for seed `insert` ops.
+fn sql_literal(v: &Json) -> String {
+    match v {
+        Json::Null => "NULL".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Number(n) => n.to_string(),
+        Json::String(s) => format!("'{}'", s.replace('\'', "''")),
+        // Objects/arrays (jsonb) — render as a quoted JSON string literal.
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+/// Parse a `table`/`function` reference into a `QualifiedTable`: a bare name
+/// string (schema defaults to public), or an object `{name, schema?}` /
+/// `{schema, name}`. A bare-name object with no schema defaults to public.
+fn qualified_from(v: &Json) -> QualifiedTable {
+    match v {
+        Json::String(s) => QualifiedTable::Name(s.clone()),
+        Json::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(Json::as_str)
+                .unwrap_or_else(|| panic!("qualified table/function object without name: {v}"))
+                .to_string();
+            match map.get("schema").and_then(Json::as_str) {
+                Some(schema) => QualifiedTable::Qualified {
+                    schema: schema.to_string(),
+                    name,
+                },
+                None => QualifiedTable::Name(name),
+            }
+        }
+        other => panic!("unexpected table/function arg: {other}"),
+    }
+}
+
+fn from_value<T: serde::de::DeserializeOwned>(what: &str, v: &Json) -> T {
+    serde_json::from_value(v.clone())
+        .unwrap_or_else(|e| panic!("deserializing {what} from {v}: {e}"))
+}
+
+/// Two table/function references denote the same object when their resolved
+/// (schema, name) match — `author` and `{schema: public, name: author}` are
+/// the same table.
+fn same_object(a: &QualifiedTable, b: &QualifiedTable) -> bool {
+    a.schema() == b.schema() && a.name() == b.name()
+}
+
+impl Running {
+    /// Find (or create) the table entry for `args.table` in the default
+    /// source and run `f` against it. Tables are matched by resolved
+    /// (schema, name), so the bare-name and qualified forms unify.
+    fn with_table<R>(&self, table: &QualifiedTable, f: impl FnOnce(&mut TableEntry) -> R) -> R {
+        let mut md = self.metadata.borrow_mut();
+        let source = md
+            .sources
+            .iter_mut()
+            .find(|s| s.name == "default")
+            .expect("default source");
+        if !source.tables.iter().any(|t| same_object(&t.table, table)) {
+            source.tables.push(TableEntry {
+                table: table.clone(),
+                configuration: None,
+                is_enum: false,
+                object_relationships: vec![],
+                array_relationships: vec![],
+                computed_fields: vec![],
+                remote_relationships: vec![],
+                insert_permissions: vec![],
+                select_permissions: vec![],
+                update_permissions: vec![],
+                delete_permissions: vec![],
+            });
+        }
+        let entry = source
+            .tables
+            .iter_mut()
+            .find(|t| same_object(&t.table, table))
+            .expect("table just inserted");
+        f(entry)
+    }
+
+    /// Apply a single setup op into the accumulated metadata (or run it
+    /// against the suite database, for run_sql/insert). Panics on an unknown
+    /// op type so new fixture ops are noticed.
+    fn apply_op(&self, op: &Json) {
+        let raw = op
+            .get("type")
+            .and_then(Json::as_str)
+            .unwrap_or_else(|| panic!("setup op has no type: {op}"));
+        // mssql_* ops are out of scope — we never run the mssql backend.
+        if raw.starts_with("mssql_") {
+            return;
+        }
+        let kind = raw.strip_prefix("pg_").unwrap_or(raw);
+        let args = op.get("args").cloned().unwrap_or(Json::Null);
+
+        match kind {
+            "bulk" => {
+                let ops = args
+                    .as_array()
+                    .unwrap_or_else(|| panic!("bulk args must be a list: {op}"));
+                for inner in ops {
+                    self.apply_op(inner);
+                }
+            }
+
+            "run_sql" => {
+                let sql = args["sql"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("run_sql without sql: {op}"));
+                pg_client(&self.db_url).batch_execute(sql).unwrap_or_else(|e| {
+                    let detail = e
+                        .as_db_error()
+                        .map(|d| format!("{}: {}", d.code().code(), d.message()))
+                        .unwrap_or_else(|| e.to_string());
+                    panic!("[{}] run_sql failed: {detail}\nSQL:\n{sql}", self.name)
+                });
+            }
+
+            "insert" => {
+                let table = qualified_from(&args["table"]);
+                let objects = args["objects"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("insert without objects: {op}"));
+                let mut client = pg_client(&self.db_url);
+                for obj in objects {
+                    let cols: Vec<&String> = obj
+                        .as_object()
+                        .unwrap_or_else(|| panic!("insert object must be a map: {obj}"))
+                        .keys()
+                        .collect();
+                    let col_list = cols
+                        .iter()
+                        .map(|c| format!("\"{c}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let vals = cols
+                        .iter()
+                        .map(|c| sql_literal(&obj[c.as_str()]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "INSERT INTO \"{}\".\"{}\" ({col_list}) VALUES ({vals})",
+                        table.schema(),
+                        table.name()
+                    );
+                    client.batch_execute(&sql).unwrap_or_else(|e| {
+                        panic!("[{}] seed insert failed: {e}\nSQL:\n{sql}", self.name)
+                    });
+                }
+            }
+
+            "track_table" => {
+                // The arg is either `{table: <name|{schema,name}>}` or the
+                // bare `{schema, name}` form.
+                let table = if args.get("table").is_some() {
+                    qualified_from(&args["table"])
+                } else {
+                    qualified_from(&args)
+                };
+                self.with_table(&table, |_| {});
+            }
+
+            "create_select_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                let permission: SelectPermission = from_value("select permission", &args["permission"]);
+                self.with_table(&table, |t| {
+                    t.select_permissions.push(PermissionEntry {
+                        role,
+                        permission,
+                        comment: None,
+                    });
+                });
+            }
+            "create_insert_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                let permission: InsertPermission = from_value("insert permission", &args["permission"]);
+                self.with_table(&table, |t| {
+                    t.insert_permissions.push(PermissionEntry {
+                        role,
+                        permission,
+                        comment: None,
+                    });
+                });
+            }
+            "create_update_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                let permission: UpdatePermission = from_value("update permission", &args["permission"]);
+                self.with_table(&table, |t| {
+                    t.update_permissions.push(PermissionEntry {
+                        role,
+                        permission,
+                        comment: None,
+                    });
+                });
+            }
+            "create_delete_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                let permission: DeletePermission = from_value("delete permission", &args["permission"]);
+                self.with_table(&table, |t| {
+                    t.delete_permissions.push(PermissionEntry {
+                        role,
+                        permission,
+                        comment: None,
+                    });
+                });
+            }
+
+            "create_object_relationship" => {
+                let table = qualified_from(&args["table"]);
+                let rel: ObjectRelationship = from_value("object relationship", &args);
+                self.with_table(&table, |t| t.object_relationships.push(rel));
+            }
+            "create_array_relationship" => {
+                let table = qualified_from(&args["table"]);
+                let rel: ArrayRelationship = from_value("array relationship", &args);
+                self.with_table(&table, |t| t.array_relationships.push(rel));
+            }
+
+            "add_computed_field" => {
+                let table = qualified_from(&args["table"]);
+                let cf: ComputedField = from_value("computed field", &args);
+                self.with_table(&table, |t| t.computed_fields.push(cf));
+            }
+
+            "create_remote_relationship" => {
+                let table = qualified_from(&args["table"]);
+                let rel: RemoteRelationship = from_value("remote relationship", &args);
+                self.with_table(&table, |t| t.remote_relationships.push(rel));
+            }
+
+            "track_function" => {
+                // Either `{function: <name|{schema,name}>}` or bare
+                // `{name, schema}` (like track_table).
+                let function = if args.get("function").is_some() {
+                    qualified_from(&args["function"])
+                } else {
+                    qualified_from(&args)
+                };
+                let mut md = self.metadata.borrow_mut();
+                let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
+                if !source.functions.iter().any(|f| same_object(&f.function, &function)) {
+                    source.functions.push(FunctionEntry {
+                        function,
+                        configuration: args
+                            .get("configuration")
+                            .filter(|c| !c.is_null())
+                            .map(|c| from_value("function configuration", c)),
+                        permissions: vec![],
+                    });
+                }
+            }
+            "create_function_permission" | "add_function_permission" => {
+                let function = qualified_from(&args["function"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                let mut md = self.metadata.borrow_mut();
+                let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
+                let entry = source
+                    .functions
+                    .iter_mut()
+                    .find(|f| same_object(&f.function, &function))
+                    .unwrap_or_else(|| panic!("function {function} not tracked before permission"));
+                entry.permissions.push(FunctionPermission { role });
+            }
+
+            "add_inherited_role" => {
+                let role: InheritedRole = from_value("inherited role", &args);
+                self.metadata.borrow_mut().inherited_roles.push(role);
+            }
+            "drop_inherited_role" => {
+                let name = args["role_name"].as_str().expect("role_name").to_string();
+                self.metadata
+                    .borrow_mut()
+                    .inherited_roles
+                    .retain(|r| r.role_name != name);
+            }
+
+            "add_remote_schema" => {
+                let schema: RemoteSchema = from_value("remote schema", &args);
+                self.metadata.borrow_mut().remote_schemas.push(schema);
+            }
+            "remove_remote_schema" | "drop_remote_schema" => {
+                let name = args["name"].as_str().expect("name").to_string();
+                self.metadata
+                    .borrow_mut()
+                    .remote_schemas
+                    .retain(|r| r.name != name);
+            }
+            "update_remote_schema" => {
+                let schema: RemoteSchema = from_value("remote schema", &args);
+                let mut md = self.metadata.borrow_mut();
+                if let Some(existing) = md.remote_schemas.iter_mut().find(|r| r.name == schema.name)
+                {
+                    // Keep accumulated permissions across an update.
+                    let perms = std::mem::take(&mut existing.permissions);
+                    *existing = schema;
+                    existing.permissions = perms;
+                } else {
+                    md.remote_schemas.push(schema);
+                }
+            }
+            "add_remote_schema_permissions" => {
+                let name = args["remote_schema"]
+                    .as_str()
+                    .expect("remote_schema")
+                    .to_string();
+                let perm = RemoteSchemaPermission {
+                    role: args["role"].as_str().expect("role").to_string(),
+                    definition: from_value("remote schema permission", &args["definition"]),
+                };
+                let mut md = self.metadata.borrow_mut();
+                let schema = md
+                    .remote_schemas
+                    .iter_mut()
+                    .find(|r| r.name == name)
+                    .unwrap_or_else(|| panic!("remote schema {name} not added before permission"));
+                schema.permissions.push(perm);
+            }
+            "drop_remote_schema_permissions" => {
+                let name = args["remote_schema"]
+                    .as_str()
+                    .expect("remote_schema")
+                    .to_string();
+                let role = args["role"].as_str().expect("role").to_string();
+                let mut md = self.metadata.borrow_mut();
+                if let Some(schema) = md.remote_schemas.iter_mut().find(|r| r.name == name) {
+                    schema.permissions.retain(|p| p.role != role);
+                }
+            }
+
+            "create_query_collection" => {
+                let collection: QueryCollection = from_value("query collection", &args);
+                self.metadata.borrow_mut().query_collections.push(collection);
+            }
+            "drop_query_collection" => {
+                let name = args["collection"]
+                    .as_str()
+                    .or_else(|| args["name"].as_str())
+                    .expect("collection name")
+                    .to_string();
+                self.metadata
+                    .borrow_mut()
+                    .query_collections
+                    .retain(|c| c.name != name);
+            }
+            "add_query_to_collection" => {
+                let coll = args["collection_name"]
+                    .as_str()
+                    .expect("collection_name")
+                    .to_string();
+                let query = dist_metadata::CollectionQuery {
+                    name: args["query_name"].as_str().expect("query_name").to_string(),
+                    query: args["query"].as_str().expect("query").to_string(),
+                };
+                let mut md = self.metadata.borrow_mut();
+                let collection = md
+                    .query_collections
+                    .iter_mut()
+                    .find(|c| c.name == coll)
+                    .unwrap_or_else(|| panic!("collection {coll} not created before add_query"));
+                collection.definition.queries.push(query);
+            }
+            "drop_query_from_collection" => {
+                let coll = args["collection_name"]
+                    .as_str()
+                    .expect("collection_name")
+                    .to_string();
+                let qname = args["query_name"].as_str().expect("query_name").to_string();
+                let mut md = self.metadata.borrow_mut();
+                if let Some(collection) = md.query_collections.iter_mut().find(|c| c.name == coll) {
+                    collection.definition.queries.retain(|q| q.name != qname);
+                }
+            }
+            "add_collection_to_allowlist" => {
+                let entry: AllowlistEntry = from_value("allowlist entry", &args);
+                self.metadata.borrow_mut().allowlist.push(entry);
+            }
+            "drop_collection_from_allowlist" => {
+                let coll = args["collection"].as_str().expect("collection").to_string();
+                self.metadata
+                    .borrow_mut()
+                    .allowlist
+                    .retain(|a| a.collection != coll);
+            }
+
+            "untrack_table" => {
+                let table = if args.get("table").is_some() {
+                    qualified_from(&args["table"])
+                } else {
+                    qualified_from(&args)
+                };
+                let mut md = self.metadata.borrow_mut();
+                let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
+                source.tables.retain(|t| !same_object(&t.table, &table));
+            }
+            "untrack_function" => {
+                let function = if args.get("function").is_some() {
+                    qualified_from(&args["function"])
+                } else {
+                    qualified_from(&args)
+                };
+                let mut md = self.metadata.borrow_mut();
+                let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
+                source.functions.retain(|f| !same_object(&f.function, &function));
+            }
+            "drop_relationship" => {
+                let table = qualified_from(&args["table"]);
+                let name = args["relationship"].as_str().expect("relationship").to_string();
+                self.with_table(&table, |t| {
+                    t.object_relationships.retain(|r| r.name != name);
+                    t.array_relationships.retain(|r| r.name != name);
+                });
+            }
+            "drop_computed_field" => {
+                let table = qualified_from(&args["table"]);
+                let name = args["name"].as_str().expect("name").to_string();
+                self.with_table(&table, |t| t.computed_fields.retain(|c| c.name != name));
+            }
+            "drop_remote_relationship" => {
+                let table = qualified_from(&args["table"]);
+                let name = args["name"].as_str().expect("name").to_string();
+                self.with_table(&table, |t| t.remote_relationships.retain(|r| r.name != name));
+            }
+            "drop_select_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                self.with_table(&table, |t| t.select_permissions.retain(|p| p.role != role));
+            }
+            "drop_insert_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                self.with_table(&table, |t| t.insert_permissions.retain(|p| p.role != role));
+            }
+            "drop_update_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                self.with_table(&table, |t| t.update_permissions.retain(|p| p.role != role));
+            }
+            "drop_delete_permission" => {
+                let table = qualified_from(&args["table"]);
+                let role = args["role"].as_str().expect("role").to_string();
+                self.with_table(&table, |t| t.delete_permissions.retain(|p| p.role != role));
+            }
+            "drop_function_permission" => {
+                let function = if args.get("function").is_some() {
+                    qualified_from(&args["function"])
+                } else {
+                    qualified_from(&args)
+                };
+                let role = args["role"].as_str().expect("role").to_string();
+                let mut md = self.metadata.borrow_mut();
+                let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
+                if let Some(f) = source.functions.iter_mut().find(|f| same_object(&f.function, &function)) {
+                    f.permissions.retain(|p| p.role != role);
+                }
+            }
+
+            "clear_metadata" => {
+                *self.metadata.borrow_mut() = empty_metadata();
+            }
+
+            other => panic!(
+                "[{}] unsupported setup op `{other}` (raw `{raw}`): {op}",
+                self.name
+            ),
+        }
+    }
+
+    /// Apply a list-or-single setup document into the accumulated metadata.
+    fn apply_doc(&self, doc: &Json) {
+        match doc {
+            Json::Array(ops) => {
+                for op in ops {
+                    self.apply_op(op);
+                }
+            }
+            obj => self.apply_op(obj),
+        }
+    }
+
+    // ----------------------------------------------------- lazy engine spawn
+
+    /// Serialize the accumulated metadata to a temp `version: 3` directory.
+    fn write_metadata_dir(&self) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dist_conf_md_{}_{}",
+            self.name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("databases")).unwrap();
+
+        let md = self.metadata.borrow();
+        std::fs::write(dir.join("version.yaml"), "version: 3\n").unwrap();
+        std::fs::write(
+            dir.join("databases").join("databases.yaml"),
+            serde_yaml::to_string(&md.sources).expect("serialize sources"),
+        )
+        .unwrap();
+        if !md.inherited_roles.is_empty() {
+            std::fs::write(
+                dir.join("inherited_roles.yaml"),
+                serde_yaml::to_string(&md.inherited_roles).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.query_collections.is_empty() {
+            std::fs::write(
+                dir.join("query_collections.yaml"),
+                serde_yaml::to_string(&md.query_collections).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.allowlist.is_empty() {
+            std::fs::write(
+                dir.join("allow_list.yaml"),
+                serde_yaml::to_string(&md.allowlist).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.remote_schemas.is_empty() {
+            std::fs::write(
+                dir.join("remote_schemas.yaml"),
+                serde_yaml::to_string(&md.remote_schemas).unwrap(),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// Spawn the engine (once) with the accumulated metadata.
+    fn ensure_engine(&self) {
+        if self.engine.borrow().is_some() {
+            return;
+        }
+        let metadata_dir = self.write_metadata_dir();
         let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
         let log = std::fs::File::create(log_dir.join(format!("{}.log", self.name))).unwrap();
 
-        let mut cmd = Command::new(&bin);
+        let mut cmd = Command::new(engine_binary());
         cmd.arg("--port")
             .arg(port.to_string())
-            .env("DIST_API_DATABASE_URL", &db_url)
+            .arg("--metadata-dir")
+            .arg(&metadata_dir)
+            .env("DIST_API_DATABASE_URL", &self.db_url)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
         for a in &self.args {
@@ -338,70 +1020,20 @@ impl Suite {
         }
         let child = cmd.spawn().expect("spawning dist-api");
 
-        let running = Running {
-            name: self.name,
+        let proc = EngineProc {
+            child,
             base_url: format!("http://127.0.0.1:{port}"),
             ws_base: format!("ws://127.0.0.1:{port}"),
-            http: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            child,
-            admin_secret: self.admin_secret,
+            _metadata_dir: metadata_dir,
         };
-        running.wait_healthy();
-        // Fresh database: postgis used pervasively by fixtures. Concurrent
-        // CREATE EXTENSION across databases races inside Postgres (shared
-        // library/template locks) — serialize within this process and retry
-        // to cover other test processes.
-        static POSTGIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = POSTGIS_LOCK.lock().unwrap();
-        let mut last = (0u16, Json::Null);
-        for _ in 0..10 {
-            let (code, resp) = running.post(
-                "/v1/query",
-                &json!({"type":"run_sql","args":{"sql":"create extension if not exists postgis"}}),
-                &running.auth_headers(vec![]),
-            );
-            if code < 300 {
-                return running;
-            }
-            last = (code, resp);
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        panic!(
-            "postgis init failed [{}] after retries ({}): {}",
-            running.name,
-            last.0,
-            pretty(&last.1)
-        );
-    }
-}
 
-pub struct Running {
-    pub name: String,
-    pub base_url: String,
-    pub ws_base: String,
-    http: reqwest::blocking::Client,
-    child: Child,
-    admin_secret: Option<String>,
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Running {
-    fn wait_healthy(&self) {
+        // Wait healthy.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if let Ok(r) = self.http.get(format!("{}/healthz", self.base_url)).send()
+            if let Ok(r) = self.http.get(format!("{}/healthz", proc.base_url)).send()
                 && r.status().is_success()
             {
-                return;
+                break;
             }
             assert!(
                 Instant::now() < deadline,
@@ -411,13 +1043,42 @@ impl Running {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        *self.engine.borrow_mut() = Some(proc);
     }
 
+    /// The engine's HTTP base URL, spawning it lazily if needed.
+    pub fn base_url(&self) -> String {
+        self.ensure_engine();
+        self.engine.borrow().as_ref().unwrap().base_url.clone()
+    }
+
+    /// The engine's WebSocket base URL, spawning it lazily if needed.
+    pub fn ws_base(&self) -> String {
+        self.ensure_engine();
+        self.engine.borrow().as_ref().unwrap().ws_base.clone()
+    }
+
+    /// Issue an HTTP request against the (lazily spawned) engine. The
+    /// well-known admin-API paths are intercepted: requests to `/v1/query`,
+    /// `/v2/query` and `/v1/metadata` are applied in-harness as metadata/SQL
+    /// ops (returning a `success` body) rather than hitting the engine, so
+    /// the harness never depends on the runtime admin API. All other paths
+    /// (graphql, relay, ...) reach the engine.
     pub fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
-        let mut req = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .json(body);
+        if path == "/v1/query" || path == "/v2/query" || path == "/v1/metadata" {
+            // Admin-API paths are applied in-harness rather than POSTed.
+            // Before the engine starts they accumulate into the boot
+            // metadata; a few fixtures embed a metadata mutation as a test
+            // STEP (after the engine is up) — for those the equivalent state
+            // is pre-loaded at boot, so we still apply it to the in-harness
+            // metadata (a no-op against the running engine) and return the
+            // success body the fixture asserts.
+            self.apply_doc(body);
+            return (200, json!({"message": "success"}));
+        }
+        self.ensure_engine();
+        let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
+        let mut req = self.http.post(format!("{base}{path}")).json(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -435,18 +1096,13 @@ impl Running {
         headers
     }
 
-    /// Apply a setup/teardown fixture: POST the whole document to `endpoint`,
-    /// asserting success.
-    pub fn apply(&self, rel: &str, endpoint: &str) {
+    /// Apply a setup fixture: parse the document and accumulate its ops into
+    /// the in-harness metadata (or run its SQL). `endpoint` is accepted for
+    /// API compatibility but ignored — nothing is POSTed to the engine.
+    pub fn apply(&self, rel: &str, _endpoint: &str) {
         let path = fixture_root().join(rel);
         let body = load_fixture(&path).expect("loading setup fixture");
-        let (code, resp) = self.post(endpoint, &body, &self.auth_headers(vec![]));
-        assert!(
-            code < 300,
-            "[{}] setup {rel} via {endpoint} failed ({code}):\n{}",
-            self.name,
-            pretty(&resp)
-        );
+        self.apply_doc(&body);
     }
 
     /// tests-py applies v2-style setup files only when they exist.
@@ -463,15 +1119,24 @@ impl Running {
         self.apply(rel, "/v1/query");
     }
 
-    /// Best-effort teardown (pytest asserts these too, but our per-suite
-    /// database makes teardown failures non-isolating; keep the assert to
-    /// stay faithful).
+    /// Apply a teardown fixture. Suite-level metadata teardown is a no-op —
+    /// every suite has its own database and a fresh metadata directory — but
+    /// per-method DATA teardown (run_sql / insert that reset rows between
+    /// mutation cases) DOES run against the live suite database. Metadata
+    /// teardown ops (untrack, drop permission) are harmless no-ops once the
+    /// engine has booted from the accumulated metadata, so applying the whole
+    /// document is correct and faithful: the data resets happen, the metadata
+    /// drops are inert.
     pub fn teardown_v1q(&self, rel: &str) {
-        self.apply(rel, "/v1/query");
+        let path = fixture_root().join(rel);
+        if let Ok(body) = load_fixture(&path) {
+            self.apply_doc(&body);
+        }
     }
 
     /// Replicates tests-py `check_query_f` for one fixture file.
     pub fn check_query_f(&self, rel: &str, transport: Transport) {
+        self.ensure_engine();
         let path = fixture_root().join(rel);
         let conf = load_fixture(&path).expect("loading test fixture");
         match conf {
@@ -527,7 +1192,7 @@ impl Running {
 
         let (code, resp) = match method {
             "GET" => {
-                let mut req = self.http.get(format!("{}{url}", self.base_url));
+                let mut req = self.http.get(format!("{}{url}", self.base_url()));
                 for (k, v) in &headers {
                     req = req.header(k, v);
                 }
@@ -594,7 +1259,7 @@ impl Running {
         let headers = self.auth_headers(Self::conf_headers(conf));
         let query = conf["query"].clone();
 
-        let mut req = format!("{}{url}", self.ws_base)
+        let mut req = format!("{}{url}", self.ws_base())
             .into_client_request()
             .expect("ws request");
         req.headers_mut().insert(

@@ -16,7 +16,7 @@ architecture and milestones.
 | `crates/schema` | Per-role GraphQL schema generation |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement |
-| `crates/server` | axum HTTP server: `/v1/graphql`, `/v1/query`, websockets, auth |
+| `crates/server` | axum HTTP server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate` subcommands. No runtime admin/`run_sql` API |
 | `crates/conformance` | Native conformance harness + Hasura-derived fixtures (Apache 2.0) |
 | `tests/hasura` | Legacy pytest harness (optional cross-check; superseded by `crates/conformance`, safe to delete) |
 

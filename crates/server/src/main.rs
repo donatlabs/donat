@@ -1,19 +1,18 @@
-//! HTTP entry point. Mirrors the Hasura v2 surface that `tests-py` talks
-//! to: `/v1/graphql` (+ws), `/v1/query`, `/v2/query`, `/v1/metadata`,
-//! `/healthz`, `/v1/version`.
+//! HTTP entry point. The serving surface is data-plane only:
+//! `/v1/graphql` (+ws), `/v1alpha1/graphql`, `/v1/relay`, `/v1beta1/relay`,
+//! `/healthz`, `/v1/version`. There is NO runtime admin/management API
+//! (no `/v1/query` run_sql, no metadata mutation): schema is applied with
+//! the `migrate` subcommand, metadata is loaded from YAML at boot.
 //!
-//! Two launch forms:
-//! - native: `dist-api --database-url <url> [--port N]`
-//! - Hasura-compatible (what the pytest harness spawns):
-//!   `dist-api --metadata-database-url <url> serve --server-port N
-//!    [--stringify-numeric-types] [--admin-secret K]`
+//! Launch forms:
+//! - serve: `dist-api --database-url <url> [--metadata-dir <dir>] [--port N]`
+//! - migrate (DDL): `dist-api migrate --migrations-dir <dir>`
+//! - validate (metadata vs DB): `dist-api validate --metadata-dir <dir>`
 
 mod gql;
 mod jwt;
 mod migrate;
-mod ops;
 mod remote;
-mod remote_validate;
 mod state;
 mod ws;
 
@@ -199,7 +198,6 @@ async fn main() -> anyhow::Result<()> {
         auth_hook,
         http: reqwest::Client::new(),
         allowlist_enabled,
-        remote_upstreams: tokio::sync::RwLock::new(std::collections::HashMap::new()),
     });
 
     // The database may still be starting; retry the first sync.
@@ -233,9 +231,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1alpha1/graphql", post(graphql_legacy).get(ws::upgrade))
         .route("/v1/relay", post(relay).get(ws::upgrade_relay))
         .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay))
-        .route("/v1/query", post(query_api))
-        .route("/v2/query", post(query_api))
-        .route("/v1/metadata", post(query_api))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -251,31 +246,6 @@ async fn healthz() -> &'static str {
 
 async fn version() -> Json<Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
-}
-
-/// Admin-secret gate for the metadata/query APIs.
-fn check_admin_secret(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(expected) = &state.admin_secret else {
-        return Ok(());
-    };
-    let provided = headers
-        .get("x-hasura-admin-secret")
-        .and_then(|v| v.to_str().ok());
-    if provided == Some(expected.as_str()) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "code": "access-denied",
-                "error": "invalid x-hasura-admin-secret",
-                "path": "$",
-            })),
-        ))
-    }
 }
 
 async fn graphql(
@@ -318,20 +288,3 @@ async fn relay(
     (status, Json(response))
 }
 
-async fn query_api(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    if let Err((status, body)) = check_admin_secret(&state, &headers) {
-        return (status, body);
-    }
-    let session = gql::optional_session(&headers);
-    match ops::execute(&state, &body, session.as_ref()).await {
-        Ok(result) => (StatusCode::OK, Json(result)),
-        Err(e) => (
-            StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST),
-            Json(e.body),
-        ),
-    }
-}

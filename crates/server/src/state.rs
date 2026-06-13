@@ -32,9 +32,6 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// HASURA_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
     pub allowlist_enabled: bool,
-    /// Upstream introspection per remote schema name.
-    pub remote_upstreams:
-        RwLock<HashMap<String, crate::remote_validate::Upstream>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -81,10 +78,6 @@ fn resolve_source_url(source: &Source, default_url: &str) -> String {
 }
 
 impl AppState {
-    pub async fn pool(&self, source: &str) -> Option<deadpool_postgres::Pool> {
-        self.pools.read().await.get(source).map(|(_, p)| p.clone())
-    }
-
     pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
         let pools = self.pools.read().await;
         pools
@@ -164,11 +157,6 @@ impl AppState {
         }
         engine.catalogs = new_catalogs;
         Ok(())
-    }
-
-    /// Backwards-compatible alias used after DDL.
-    pub async fn reintrospect(&self) -> anyhow::Result<()> {
-        self.sync_sources().await
     }
 }
 

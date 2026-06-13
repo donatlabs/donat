@@ -41,7 +41,7 @@ struct WsClient {
 impl WsClient {
     fn connect(s: &Running) -> WsClient {
         use tungstenite::client::IntoClientRequest;
-        let mut req = format!("{}/v1/graphql", s.ws_base)
+        let mut req = format!("{}/v1/graphql", s.ws_base())
             .into_client_request()
             .expect("ws request");
         req.headers_mut().insert(

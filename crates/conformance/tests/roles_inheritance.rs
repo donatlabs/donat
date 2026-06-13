@@ -18,7 +18,6 @@
 //! `.admin_secret()` is set, so using it here would also work.)
 
 use dist_conformance::{Running, Suite, Transport};
-use serde_json::json;
 
 const INHERITED: &str = "queries/graphql_query/permissions/inherited_roles";
 const NESTED: &str = "queries/graphql_query/permissions/roles_inheritance";
@@ -58,50 +57,12 @@ fn graphql_inherited_roles_schema() {
         Transport::Http,
     );
 
-    // test_throw_error_when_roles_form_a_cycle: programmatic in pytest —
-    // export the metadata, append circular inherited roles, and expect
-    // replace_metadata to fail with the exact cycle error.
-    {
-        let (code, mut metadata) = s.post(
-            "/v1/query",
-            &json!({"type": "export_metadata", "args": {}}),
-            &[],
-        );
-        assert!(code < 300, "export_metadata failed ({code}): {metadata}");
-        let circular_roles = [
-            json!({
-                "role_name": "intermediate_circular_role_1",
-                "role_set": ["manager_employee", "circular_role"]
-            }),
-            json!({
-                "role_name": "intermediate_circular_role_2",
-                "role_set": ["intermediate_circular_role_1", "employee"]
-            }),
-            json!({
-                "role_name": "circular_role",
-                "role_set": ["intermediate_circular_role_2", "author"]
-            }),
-        ];
-        metadata["inherited_roles"]
-            .as_array_mut()
-            .expect("exported metadata must contain inherited_roles")
-            .extend(circular_roles);
-        let (code, resp) = s.post(
-            "/v1/query",
-            &json!({"type": "replace_metadata", "args": {"metadata": metadata}}),
-            &[],
-        );
-        assert_eq!(code, 400, "replace_metadata with role cycle: {resp}");
-        assert_eq!(
-            resp["error"],
-            json!(
-                "found cycle(s) in roles: \
-                 [\"circular_role\",\"intermediate_circular_role_2\",\
-                 \"intermediate_circular_role_1\",\"circular_role\"]"
-            ),
-            "unexpected cycle error: {resp}"
-        );
-    }
+    // test_throw_error_when_roles_form_a_cycle DROPPED: it exported the
+    // metadata, appended circular inherited roles, and asserted that the
+    // replace_metadata management API rejects the cycle. That tests the
+    // admin metadata API itself (export_metadata + replace_metadata), which
+    // is being removed; the inherited-role DATA behavior is still covered by
+    // the YAML-configured cases below.
 
     s.check_query_f(
         &format!("{INHERITED}/override_inherited_permission.yaml"),
@@ -171,7 +132,12 @@ fn graphql_mutation_roles_inheritance() {
     };
 
     per_method("inheritance_from_single_parent.yaml");
-    per_method("resolve_inconsistent_permission.yaml");
+    // resolve_inconsistent_permission.yaml DROPPED: it drives the metadata
+    // CONSISTENCY management API (get_inconsistent_metadata) and a runtime
+    // create_update_permission/drop pivot as test steps — both are part of
+    // the admin metadata API that is being removed. The underlying
+    // inherited-permission DATA behavior is covered by the YAML-configured
+    // inheritance cases.
     per_method("inherited_mutation_permission_for_nested_roles.yaml");
     // test_defined_permission_should_override_inherited_permission:
     // step [1] posts an update_articles mutation to /v1/graphql with no
@@ -198,10 +164,15 @@ fn custom_function_permissions_inheritance() {
         &format!("{FUNCTION}/multiple_parents_inheritance.yaml"),
         Transport::Http,
     );
-    s.check_query_f(
-        &format!("{FUNCTION}/override_inherited_permission.yaml"),
-        Transport::Http,
-    );
+    // override_inherited_permission.yaml DROPPED: its pivot is a runtime
+    // create_function_permission for `inherited_role2` applied as a test STEP
+    // (step[0] expects the role to be denied, step[1] grants the permission
+    // via the metadata API, step[2] expects success, step[3] revokes). That
+    // depends on mutating metadata against the running engine — part of the
+    // admin metadata API being removed — and cannot be expressed as boot
+    // metadata (the same role must be both denied and allowed in one engine).
+    // multiple_parents_inheritance.yaml already covers inherited function
+    // permission DATA behavior.
 
     v2_teardown(&s, FUNCTION);
 }

@@ -76,6 +76,54 @@ subscriptions, event triggers, actions, remote schemas.
 - **No runtime console** — files are the source of truth; `/v1/metadata`
   exists only as a protocol for tests-py and tooling.
 
+## Conformance harness no longer uses the runtime admin API (2026-06-13)
+
+The conformance harness (`crates/conformance`) sets up each suite WITHOUT
+the engine's runtime admin API (`/v1/query`, `/v2/query`, `/v1/metadata` —
+run_sql + metadata mutation), so that API can later be deleted. The engine
+still ships it; the harness simply never calls it.
+
+- `Suite::start()` creates the per-suite database and the postgis extension
+  directly via the `postgres` crate (no engine).
+- Setup fixtures are parsed and APPLIED in-harness: `run_sql`/`insert` run
+  over the suite database via `postgres`; metadata ops (track_table,
+  permissions, relationships, inherited roles, query collections,
+  computed/remote fields, functions + function permissions, remote schemas
+  + permissions) accumulate into an in-memory `dist_metadata::Metadata`.
+  mssql_* ops are ignored; unknown ops panic.
+- The engine starts LAZILY on the first request: the accumulated metadata
+  is serialized to a `version: 3` directory (`version.yaml`,
+  `databases/databases.yaml`, and `inherited_roles`/`query_collections`/
+  `allow_list`/`remote_schemas` when non-empty) and passed via
+  `--metadata-dir`. `Running::post` intercepts the admin-API paths and
+  applies them in-harness instead of hitting the engine.
+- Teardown of metadata is a no-op (per-suite DB + fresh metadata dir), but
+  per-method DATA teardown (run_sql/insert resets between mutation cases)
+  still runs against the live database.
+
+**Dropped (admin-API-as-test-step; that API is going away):**
+
+- `crates/conformance/tests/v1_queries.rs` (whole module) — it tested the
+  legacy `/v1/query` DATA API directly.
+- `crates/conformance/tests/remote_schemas.rs` (whole module, + its
+  `support/remote_stub.rs`) — it tested add_remote_schema / SDL validation /
+  remote-schema management, and remote-schema EXECUTION needs the engine to
+  introspect upstreams at boot, which it does NOT do from YAML. Deferred
+  until boot-time upstream introspection exists.
+- `roles_inheritance.rs`: the cycle-detection step (export_metadata +
+  replace_metadata) in `graphql_inherited_roles_schema`; the
+  `resolve_inconsistent_permission.yaml` case (get_inconsistent_metadata +
+  runtime permission pivot) in `graphql_mutation_roles_inheritance`; the
+  `override_inherited_permission.yaml` case (runtime
+  create_function_permission pivot for a non-admin inherited role) in
+  `custom_function_permissions_inheritance`.
+- `auth_env.rs`: `test_update_query` from the allowlist class (it mutated an
+  allowlisted collection at request time and asserted the duplicate-query
+  error from the mutation API). Allowlist ENFORCEMENT is kept via metadata.
+  The bespoke `EnvEngine` spawner was removed; the unauthorized-role/cookie
+  and function-permission suites now use the regular lazy `Suite`/`Running`
+  (function perms split into three per-method suites for isolation).
+
 ## Known issues (from the 2026-06-13 unit-test review; not yet fixed)
 
 - `crates/server/src/remote.rs::resolve_url_template` substitutes only the
@@ -116,3 +164,23 @@ Two admin-adjacent gaps remain, gated with `FIXME(engine-admin)` /
   validation errors for a customized remote schema report de-customized
   upstream names/paths instead of the customized spelling the client used,
   because validate_field runs over the decustomized document.
+
+## Admin API removed (2026-06-13)
+
+The runtime admin/management API was DELETED from the engine (not
+feature-gated): `crates/server/src/ops.rs` and `remote_validate.rs` removed;
+the `/v1/query`, `/v2/query`, `/v1/metadata` routes, `query_api`,
+`check_admin_secret`, `optional_session`, and `AppState.remote_upstreams`
+are gone. The serving binary has no run_sql and no metadata mutation —
+verified live (those routes 404, `/v1/graphql` 200). Configuration is
+deploy-time only: `migrate` (DDL) + YAML metadata at boot.
+
+Consequence (accepted): the conformance suites that tested the management
+API itself were dropped — `tests/v1_queries.rs` (legacy /v1/query data API)
+and `tests/remote_schemas.rs` (+ remote_stub; remote-schema execution needs
+boot-time upstream introspection, deferred), plus a few management-API test
+STEPS in roles_inheritance.rs / auth_env.rs. The harness now sets up each
+suite without the admin API: DDL/seed via direct SQL, metadata accumulated
+in-harness and loaded via `--metadata-dir` (lazy engine start). 228 tests
+green. Remaining: remote-schema support from YAML needs boot-time upstream
+introspection (the data-plane forwarding code in remote.rs remains).

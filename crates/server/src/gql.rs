@@ -276,12 +276,6 @@ async fn webhook_session(
     })
 }
 
-/// Session for the /v1/query data API: present only when the request
-/// carries an explicit role.
-pub fn optional_session(headers: &HeaderMap) -> Option<Session> {
-    headers.get("x-hasura-role")?;
-    session_from_headers(headers, None, true).ok()
-}
 
 pub async fn execute(
     state: &SharedState,

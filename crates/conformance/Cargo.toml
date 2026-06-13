@@ -7,6 +7,8 @@ description = "Native conformance harness: Hasura-derived fixtures executed agai
 
 [dependencies]
 anyhow = { workspace = true }
+dist-metadata = { path = "../metadata" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }

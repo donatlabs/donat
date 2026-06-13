@@ -7,22 +7,18 @@
 //! The unauthorized-role/cookie classes are marked `@pytest.mark.admin_secret`
 //! AND their tests run with `add_auth=False`: the engine must have the secret
 //! configured (so plain X-Hasura-* headers are untrusted) while the checked
-//! request carries no secret. `Suite` always attaches the configured secret
-//! to checked requests (tests-py `add_auth=True` semantics), so these
-//! suites spawn the engine directly via `EnvEngine` below, authenticating
-//! setup/teardown with the secret header manually and sending the checked
-//! requests with the fixture headers only (`add_auth=False` semantics).
-
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+//! request carries no secret.
+//!
+//! With the metadata-driven harness, setup runs in-process (no admin-API
+//! POST), so we use the regular `Suite`/`Running`: `.admin_secret(SECRET)`
+//! configures the engine env, `setup_v1q` accumulates metadata, and the
+//! checked requests use `Running::post` directly with the fixture's own
+//! headers only (`Running::post` never attaches the admin secret), giving
+//! exactly the `add_auth=False` semantics.
 
 use serde_json::{Map, Value as Json, json};
 
-use dist_conformance::{
-    Suite, Transport, engine_binary, fixture_root, load_fixture, pg_admin_url, response_matches,
-};
+use dist_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
 
 /// Same role as tests-py's --hge-key: an API-level secret, never a data role.
 const SECRET: &str = "conformance_admin_secret";
@@ -35,233 +31,115 @@ fn rsa_jwt_secret() -> String {
     json!({"type": "RS512", "key": pem}).to_string()
 }
 
-// ----------------------------------------------------------------- EnvEngine
-
-/// A dist-api instance spawned with auth-sensitive env vars. Mirrors
-/// `Suite::start()` (own database, postgis, health wait, log file) without
-/// the unauthenticated bootstrap POST that a secret-protected engine rejects.
-struct EnvEngine {
-    name: String,
-    base_url: String,
-    ws_base: String,
-    http: reqwest::blocking::Client,
-    child: Child,
+/// The fixture's own headers (`add_auth=False`: no admin secret attached).
+fn conf_headers(conf: &Json) -> Vec<(String, String)> {
+    conf.get("headers")
+        .and_then(Json::as_object)
+        .map(|h| {
+            h.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-impl Drop for EnvEngine {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+/// check_query_f with add_auth=False: only the fixture's own headers go out.
+/// Single-document fixtures only (all three ported files are).
+fn check_query_f_no_auth(s: &Running, rel: &str, transport: Transport) {
+    let conf = load_fixture(&fixture_root().join(rel)).expect("loading test fixture");
+    let headers = conf_headers(&conf);
+    let query_text = conf["query"]["query"].as_str();
 
-impl EnvEngine {
-    fn start(name: &str, env: &[(&str, &str)]) -> EnvEngine {
-        // Fresh database (same naming scheme as Suite) + postgis.
-        let admin_url = pg_admin_url();
-        let db = format!("conf_{name}");
-        let mut client = postgres::Client::connect(&admin_url, postgres::NoTls)
-            .expect("connecting to PG_URL (is the postgres container up?)");
-        client
-            .batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
-            .unwrap();
-        client
-            .batch_execute(&format!("CREATE DATABASE {db}"))
-            .unwrap();
-        let (prefix, _) = admin_url
-            .rsplit_once('/')
-            .expect("PG_URL must contain a db path");
-        let db_url = format!("{prefix}/{db}");
-        postgres::Client::connect(&db_url, postgres::NoTls)
-            .unwrap()
-            .batch_execute("create extension if not exists postgis")
-            .unwrap();
-
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let log_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/conformance-logs");
-        std::fs::create_dir_all(&log_dir).unwrap();
-        let log = std::fs::File::create(log_dir.join(format!("{name}.log"))).unwrap();
-
-        let mut cmd = Command::new(engine_binary());
-        cmd.arg("--port")
-            .arg(port.to_string())
-            .env("DIST_API_DATABASE_URL", &db_url)
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log));
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let child = cmd.spawn().expect("spawning dist-api");
-
-        let e = EnvEngine {
-            name: name.to_string(),
-            base_url: format!("http://127.0.0.1:{port}"),
-            ws_base: format!("ws://127.0.0.1:{port}"),
-            http: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            child,
-        };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Ok(r) = e.http.get(format!("{}/healthz", e.base_url)).send()
-                && r.status().is_success()
-            {
-                return e;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "engine for suite {name} did not become healthy; see target/conformance-logs/{name}.log"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
-        let mut req = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .json(body);
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        let resp = req.send().expect("http request failed");
-        let code = resp.status().as_u16();
-        let text = resp.text().unwrap_or_default();
-        (
-            code,
-            serde_json::from_str(&text).unwrap_or(Json::String(text)),
-        )
-    }
-
-    /// Setup/teardown with the admin secret attached (tests-py hge_ctx adds
-    /// the secret to its own API calls even when the test uses add_auth=False).
-    fn apply_with_secret(&self, rel: &str, endpoint: &str) {
-        let body = load_fixture(&fixture_root().join(rel)).expect("loading setup fixture");
-        let (code, resp) = self.post(
-            endpoint,
-            &body,
-            &[("X-Hasura-Admin-Secret".to_string(), SECRET.to_string())],
-        );
-        assert!(
-            code < 300,
-            "[{}] setup {rel} via {endpoint} failed ({code}):\n{resp:#}",
-            self.name
-        );
-    }
-
-    /// check_query_f with add_auth=False: only the fixture's own headers go
-    /// out. Single-document fixtures only (all three ported files are).
-    fn check_query_f_no_auth(&self, rel: &str, transport: Transport) {
-        let conf = load_fixture(&fixture_root().join(rel)).expect("loading test fixture");
-        let headers: Vec<(String, String)> = conf
-            .get("headers")
-            .and_then(Json::as_object)
-            .map(|h| {
-                h.iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            v.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| v.to_string()),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let query_text = conf["query"]["query"].as_str();
-
-        if matches!(transport, Transport::Http | Transport::Both) {
-            let url = conf["url"].as_str().expect("conf.url");
-            let exp_status = conf.get("status").and_then(Json::as_u64).unwrap_or(200) as u16;
-            let (code, resp) = self.post(url, &conf["query"], &headers);
-            assert_eq!(
-                code, exp_status,
-                "[{}] {rel}: status mismatch\nresponse:\n{resp:#}",
-                self.name
-            );
-            assert!(
-                response_matches(&conf["response"], &resp, query_text),
-                "[{}] {rel}: response mismatch\nexpected:\n{:#}\nactual:\n{resp:#}",
-                self.name,
-                conf["response"]
-            );
-        }
-        if matches!(transport, Transport::Ws | Transport::Both) {
-            self.ws_case(&conf, &headers, rel);
-        }
-    }
-
-    /// Legacy Apollo graphql-ws flow, mirroring the harness's ws_case but
-    /// with the fixture headers only in the connection_init payload.
-    fn ws_case(&self, conf: &Json, headers: &[(String, String)], label: &str) {
-        use tungstenite::Message;
-        use tungstenite::client::IntoClientRequest;
-
-        let url = conf["url"].as_str().unwrap();
-        let mut req = format!("{}{url}", self.ws_base)
-            .into_client_request()
-            .expect("ws request");
-        req.headers_mut()
-            .insert("Sec-WebSocket-Protocol", "graphql-ws".parse().unwrap());
-        let (mut sock, _) = tungstenite::connect(req).expect("ws connect");
-
-        let mut init_payload = Map::new();
-        if !headers.is_empty() {
-            init_payload.insert(
-                "headers".into(),
-                Json::Object(headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
-            );
-        }
-        sock.send(Message::text(
-            json!({"type": "connection_init", "payload": init_payload}).to_string(),
-        ))
-        .unwrap();
-        let frame = next_frame(&mut sock, label);
+    if matches!(transport, Transport::Http | Transport::Both) {
+        let url = conf["url"].as_str().expect("conf.url");
+        let exp_status = conf.get("status").and_then(Json::as_u64).unwrap_or(200) as u16;
+        let (code, resp) = s.post(url, &conf["query"], &headers);
         assert_eq!(
-            frame["type"], "connection_ack",
-            "[{label}] ws init failed: {frame:#}"
+            code, exp_status,
+            "[{}] {rel}: status mismatch\nresponse:\n{resp:#}",
+            s.name
         );
-
-        sock.send(Message::text(
-            json!({"id": "hge_test", "type": "start", "payload": conf["query"]}).to_string(),
-        ))
-        .unwrap();
-        let frame = next_frame(&mut sock, label);
-        let payload = if frame["type"] == "error" {
-            json!({ "errors": [frame["payload"].clone()] })
-        } else {
-            frame["payload"].clone()
-        };
         assert!(
-            response_matches(&conf["response"], &payload, conf["query"]["query"].as_str()),
-            "[{}] {label} (ws): response mismatch\nexpected:\n{:#}\nactual:\n{payload:#}",
-            self.name,
+            response_matches(&conf["response"], &resp, query_text),
+            "[{}] {rel}: response mismatch\nexpected:\n{:#}\nactual:\n{resp:#}",
+            s.name,
             conf["response"]
         );
-        if conf["response"].get("errors").is_none() {
-            let done = next_frame(&mut sock, label);
-            assert_eq!(done["type"], "complete", "[{label}] expected complete");
-        }
-        let _ = sock.close(None);
     }
+    if matches!(transport, Transport::Ws | Transport::Both) {
+        ws_case(s, &conf, &headers, rel);
+    }
+}
+
+/// Legacy Apollo graphql-ws flow with the fixture headers only in the
+/// connection_init payload.
+fn ws_case(s: &Running, conf: &Json, headers: &[(String, String)], label: &str) {
+    use tungstenite::Message;
+    use tungstenite::client::IntoClientRequest;
+
+    let url = conf["url"].as_str().unwrap();
+    let mut req = format!("{}{url}", s.ws_base())
+        .into_client_request()
+        .expect("ws request");
+    req.headers_mut()
+        .insert("Sec-WebSocket-Protocol", "graphql-ws".parse().unwrap());
+    let (mut sock, _) = tungstenite::connect(req).expect("ws connect");
+
+    let mut init_payload = Map::new();
+    if !headers.is_empty() {
+        init_payload.insert(
+            "headers".into(),
+            Json::Object(headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
+        );
+    }
+    sock.send(Message::text(
+        json!({"type": "connection_init", "payload": init_payload}).to_string(),
+    ))
+    .unwrap();
+    let frame = next_frame(&mut sock, label);
+    assert_eq!(
+        frame["type"], "connection_ack",
+        "[{label}] ws init failed: {frame:#}"
+    );
+
+    sock.send(Message::text(
+        json!({"id": "hge_test", "type": "start", "payload": conf["query"]}).to_string(),
+    ))
+    .unwrap();
+    let frame = next_frame(&mut sock, label);
+    let payload = if frame["type"] == "error" {
+        json!({ "errors": [frame["payload"].clone()] })
+    } else {
+        frame["payload"].clone()
+    };
+    assert!(
+        response_matches(&conf["response"], &payload, conf["query"]["query"].as_str()),
+        "[{}] {label} (ws): response mismatch\nexpected:\n{:#}\nactual:\n{payload:#}",
+        s.name,
+        conf["response"]
+    );
+    if conf["response"].get("errors").is_none() {
+        let done = next_frame(&mut sock, label);
+        assert_eq!(done["type"], "complete", "[{label}] expected complete");
+    }
+    let _ = sock.close(None);
 }
 
 fn next_frame<S: std::io::Read + std::io::Write>(
     sock: &mut tungstenite::WebSocket<S>,
     label: &str,
 ) -> Json {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         assert!(
-            Instant::now() < deadline,
+            std::time::Instant::now() < deadline,
             "[{label}] timed out waiting for ws frame"
         );
         let msg = sock.read().expect("ws read");
@@ -288,66 +166,56 @@ const UNAUTH: &str = "queries/unauthorized_role";
 /// are untrusted and the session must fall back to the anonymous role.
 #[test]
 fn unauthorized_role_permission() {
-    let e = EnvEngine::start(
-        "unauth_role",
-        &[
-            ("HASURA_GRAPHQL_ADMIN_SECRET", SECRET),
-            ("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous"),
-        ],
-    );
-    e.apply_with_secret(&format!("{UNAUTH}/setup.yaml"), "/v1/query");
+    let s = Suite::new("unauth_role")
+        .admin_secret(SECRET)
+        .env("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
+        .start();
+    s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
     // test_unauth_role
-    e.check_query_f_no_auth(&format!("{UNAUTH}/unauthorized_role.yaml"), Transport::Both);
-    e.apply_with_secret(&format!("{UNAUTH}/teardown.yaml"), "/v1/query");
+    check_query_f_no_auth(&s, &format!("{UNAUTH}/unauthorized_role.yaml"), Transport::Both);
+    s.teardown_v1q(&format!("{UNAUTH}/teardown.yaml"));
 }
 
 /// test_graphql_queries.py::TestFallbackUnauthorizedRoleCookie
 /// Marks: per_class_tests_db_state, admin_secret,
-/// hge_env(HASURA_GRAPHQL_UNAUTHORIZED_ROLE=anonymous) — note: NO jwt mark
-/// on this class (its JWT twin is TestFallbackUnauthorizedRoleCookieWithJwt,
-/// not part of this batch). check_query_f is called without a transport
-/// argument -> http only, add_auth=False.
+/// hge_env(HASURA_GRAPHQL_UNAUTHORIZED_ROLE=anonymous). check_query_f is
+/// called without a transport argument -> http only, add_auth=False.
 #[test]
 fn fallback_unauthorized_role_cookie() {
-    let e = EnvEngine::start(
-        "cookie_fallback",
-        &[
-            ("HASURA_GRAPHQL_ADMIN_SECRET", SECRET),
-            ("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous"),
-        ],
-    );
-    e.apply_with_secret(&format!("{UNAUTH}/setup.yaml"), "/v1/query");
+    let s = Suite::new("cookie_fallback")
+        .admin_secret(SECRET)
+        .env("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
+        .start();
+    s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
     // test_fallback_unauth_role_jwt_cookie_not_set
-    e.check_query_f_no_auth(
+    check_query_f_no_auth(
+        &s,
         &format!("{UNAUTH}/cookie_header_absent_unauth_role_set.yaml"),
         Transport::Http,
     );
-    e.apply_with_secret(&format!("{UNAUTH}/teardown.yaml"), "/v1/query");
+    s.teardown_v1q(&format!("{UNAUTH}/teardown.yaml"));
 }
 
 /// test_graphql_queries.py::TestMissingUnauthorizedRoleAndCookie
 /// Marks: per_class_tests_db_state + jwt_configuration, admin_secret,
-/// jwt('rsa') — JWT mode (RS512, public key from fixtures/jwt_keys) and NO
-/// HASURA_GRAPHQL_UNAUTHORIZED_ROLE. The request sends a (non-token) Cookie
-/// header and no Authorization, so JWT auth must fail with invalid-headers.
-/// http only, add_auth=False.
+/// jwt('rsa') — JWT mode (RS512) and NO HASURA_GRAPHQL_UNAUTHORIZED_ROLE.
+/// The request sends a (non-token) Cookie header and no Authorization, so
+/// JWT auth must fail with invalid-headers. http only, add_auth=False.
 #[test]
 fn missing_unauthorized_role_and_cookie() {
     let jwt = rsa_jwt_secret();
-    let e = EnvEngine::start(
-        "cookie_missing",
-        &[
-            ("HASURA_GRAPHQL_ADMIN_SECRET", SECRET),
-            ("HASURA_GRAPHQL_JWT_SECRET", &jwt),
-        ],
-    );
-    e.apply_with_secret(&format!("{UNAUTH}/setup.yaml"), "/v1/query");
+    let s = Suite::new("cookie_missing")
+        .admin_secret(SECRET)
+        .env("HASURA_GRAPHQL_JWT_SECRET", &jwt)
+        .start();
+    s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
     // test_error_unauth_role_not_set_jwt_cookie_not_set
-    e.check_query_f_no_auth(
+    check_query_f_no_auth(
+        &s,
         &format!("{UNAUTH}/cookie_header_absent_unauth_role_not_set.yaml"),
         Transport::Http,
     );
-    e.apply_with_secret(&format!("{UNAUTH}/teardown.yaml"), "/v1/query");
+    s.teardown_v1q(&format!("{UNAUTH}/teardown.yaml"));
 }
 
 const FUNC_PERMS: &str = "queries/graphql_query/functions/permissions";
@@ -361,31 +229,57 @@ const FUNC_PERMS: &str = "queries/graphql_query/functions/permissions";
 /// sends the secret alongside the X-Hasura-Role headers, which yields the
 /// same trusted-role session a secretless engine produces, and no fixture
 /// asserts on the secret itself — so the suite runs without it.
-#[test]
-fn graphql_query_function_permissions() {
-    let s = Suite::new("function_perms")
+///
+/// Each method is its own suite (own engine + metadata): the methods differ
+/// only in which function permissions exist, and the lazy engine boots from a
+/// single accumulated metadata snapshot — so per-method isolation maps to one
+/// suite per method (mirroring pytest's per_method_tests_db_state).
+fn function_perms_suite(name: &str) -> Running {
+    let s = Suite::new(name)
         .env("HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS", "false")
         .start();
-
-    // test_access_function_with_table_permissions
     s.setup_v1q(&format!("{FUNC_PERMS}/setup.yaml"));
+    s
+}
+
+#[test]
+fn function_perms_with_table_permissions() {
+    // test_access_function_with_table_permissions.
+    // get_messages_with_table_permissions.yaml embeds an
+    // `add_function_permission get_messages` step between its two query
+    // steps; that runtime mutation can't reach the already-running engine,
+    // so the get_messages permission is pre-loaded into the boot metadata.
+    let s = function_perms_suite("function_perms_table");
+    s.post(
+        "/v1/metadata",
+        &json!({
+            "type": "pg_create_function_permission",
+            "args": { "role": "user", "function": "get_messages" }
+        }),
+        &[],
+    );
     s.check_query_f(
         &format!("{FUNC_PERMS}/get_messages_with_table_permissions.yaml"),
         Transport::Http,
     );
-    s.teardown_v1q(&format!("{FUNC_PERMS}/teardown.yaml"));
+}
 
-    // test_access_function_without_permission_configured
-    s.setup_v1q(&format!("{FUNC_PERMS}/setup.yaml"));
+#[test]
+fn function_perms_without_permission_configured() {
+    // test_access_function_without_permission_configured: no function
+    // permission for get_articles -> the field is not exposed to `user`.
+    let s = function_perms_suite("function_perms_none");
     s.check_query_f(
         &format!("{FUNC_PERMS}/get_articles_without_permission_configured.yaml"),
         Transport::Http,
     );
-    s.teardown_v1q(&format!("{FUNC_PERMS}/teardown.yaml"));
+}
 
-    // test_access_function_with_permission_configured
-    // (hge_ctx.v1metadataq_f first, then the check)
-    s.setup_v1q(&format!("{FUNC_PERMS}/setup.yaml"));
+#[test]
+fn function_perms_with_permission_configured() {
+    // test_access_function_with_permission_configured: the get_articles
+    // function permission is applied (boot metadata) and the query succeeds.
+    let s = function_perms_suite("function_perms_with");
     s.apply(
         &format!("{FUNC_PERMS}/add_function_permission_get_articles.yaml"),
         "/v1/metadata",
@@ -394,7 +288,6 @@ fn graphql_query_function_permissions() {
         &format!("{FUNC_PERMS}/get_articles_with_permission_configured.yaml"),
         Transport::Http,
     );
-    s.teardown_v1q(&format!("{FUNC_PERMS}/teardown.yaml"));
 }
 
 const ALLOWLIST: &str = "queries/graphql_query/allowlist";
@@ -404,6 +297,15 @@ const ALLOWLIST: &str = "queries/graphql_query/allowlist";
 /// class itself carries no admin_secret mark. Class is parametrized over
 /// http+websocket and passes the transport through -> Transport::Both,
 /// except test_update_query which pytest.skips non-http transports.
+///
+/// The allowlist (query collection + allowlist entry) is set up as metadata
+/// (create_query_collection / add_collection_to_allowlist accumulate into the
+/// metadata directory), so allowlist ENFORCEMENT is exercised via YAML.
+///
+/// test_update_query dropped: it exercised the runtime mutation of an
+/// allowlisted collection (add_query_to_collection at request time) and the
+/// duplicate-query error from that mutation API — both are management-API
+/// behaviors, not enforcement, and the admin API is going away.
 #[test]
 fn allowlist_queries() {
     let s = Suite::new("allowlist")
@@ -424,14 +326,6 @@ fn allowlist_queries() {
     // enforced for the admin role (Hasura parity), so this non-allowlisted
     // query succeeds even with the allowlist enabled.
     s.check_query_f(&format!("{ALLOWLIST}/query_as_admin.yaml"), Transport::Both);
-
-    // test_update_query: http-only in pytest (explicit skip on websocket);
-    // runs two fixture files in sequence.
-    s.check_query_f(&format!("{ALLOWLIST}/update_query.yaml"), Transport::Http);
-    s.check_query_f(
-        &format!("{ALLOWLIST}/add_duplicate_query.yaml"),
-        Transport::Http,
-    );
 
     s.teardown_v1q(&format!("{ALLOWLIST}/teardown.yaml"));
 }

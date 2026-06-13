@@ -189,14 +189,10 @@ fn sign_rs256_jwt() -> String {
     jsonwebtoken::encode(&header, &claims, &key).expect("signing jwt")
 }
 
-/// The fetched JWKS must actually verify tokens: set up a table with a
-/// `user` select permission (admin-secret auth) and run a GraphQL query
-/// authorized only by an RS256 bearer token with the stub's kid.
-fn verify_jwt_authorizes_query(s: &dist_conformance::Running) {
-    let admin = [(
-        "X-Hasura-Admin-Secret".to_string(),
-        ADMIN_SECRET.to_string(),
-    )];
+/// Accumulate the table + `user` select permission as metadata (run before
+/// the engine is started, so it boots with them). The fetched JWKS is then
+/// proven to verify tokens by `query_with_jwt`.
+fn setup_account_metadata(s: &dist_conformance::Running) {
     let setup = json!({
         "type": "bulk",
         "args": [
@@ -209,9 +205,13 @@ fn verify_jwt_authorizes_query(s: &dist_conformance::Running) {
                         "permission": { "columns": ["id", "name"], "filter": {} } } }
         ]
     });
-    let (code, resp) = s.post("/v1/query", &setup, &admin);
-    assert!(code < 300, "jwk suite setup failed ({code}): {resp}");
+    // Applied in-harness (no admin API); the engine boots with this metadata.
+    s.post("/v1/query", &setup, &[]);
+}
 
+/// Run a GraphQL query authorized only by an RS256 bearer token carrying the
+/// stub's kid, proving the fetched keys are actually used.
+fn query_with_jwt(s: &dist_conformance::Running) {
     let bearer = [(
         "Authorization".to_string(),
         format!("Bearer {}", sign_rs256_jwt()),
@@ -255,13 +255,19 @@ fn run_scenario(
         let _start = ENGINE_START
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Suite::new(suite)
+        let s = Suite::new(suite)
             .admin_secret(ADMIN_SECRET)
             .env(
                 "HASURA_GRAPHQL_JWT_SECRET",
                 &format!(r#"{{"jwk_url": "{}{}"}}"#, stub.url, jwk_path),
             )
-            .start()
+            .start();
+        // Accumulate metadata first, then force the engine to start (it
+        // begins fetching the JWKS at boot — what this suite times). The
+        // engine starts lazily, so we must trigger it before the wait loop.
+        setup_account_metadata(&s);
+        let _ = s.base_url();
+        s
     };
 
     let counter = match state_key {
@@ -276,7 +282,7 @@ fn run_scenario(
         );
     }
 
-    verify_jwt_authorizes_query(&s);
+    query_with_jwt(&s);
 }
 
 // test_cache_control_header_max_age: max-age=3 -> refresh interval 3s; one

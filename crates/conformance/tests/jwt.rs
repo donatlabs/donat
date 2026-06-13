@@ -305,8 +305,10 @@ fn run_request(
 }
 
 /// Like [`run_request`] but only asserts the HTTP status, returning the
-/// body for partial assertions (used by the FIXME(engine) cases where the
-/// exact error body is known to diverge from Hasura).
+/// body for partial assertions (kept for the FIXME(engine) cases where the
+/// exact error body is known to diverge from Hasura; currently no live
+/// caller — all ported cases assert the full body).
+#[allow(dead_code)]
 fn run_request_status_only(
     s: &Running,
     endpoint: &str,
