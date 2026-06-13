@@ -1,0 +1,52 @@
+# Classic petshop example for dist-api.
+#
+#   docker compose up
+#
+# Pulls the prebuilt public engine image (ghcr.io/pantyukhov/dist-api, pushed
+# by .github/workflows/release.yml on each release tag) — no local build.
+# Then open http://localhost:8080/v1/graphql (see README.md for queries per
+# role). Postgres is seeded from db/init.sql on first start; the engine loads
+# the petshop metadata from ./metadata and introspects the seeded schema.
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: petshop
+    ports:
+      - "15432:5432"
+    volumes:
+      - petshop-db:/var/lib/postgresql/data
+      # Runs only when the data directory is empty (first boot).
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d petshop"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  engine:
+    # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
+    #   ENGINE_TAG=v1.2.3 docker compose up
+    image: ghcr.io/pantyukhov/dist-api:${ENGINE_TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DIST_API_METADATA_DIR: /metadata
+      DIST_API_PORT: "8080"
+      # Trusted requests (with this secret) act as admin and may impersonate
+      # any role via the X-Hasura-Role header. Change it for anything real.
+      HASURA_GRAPHQL_ADMIN_SECRET: petshop-secret
+      # Requests with no/role-less auth fall back to the public catalog role.
+      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+    volumes:
+      - ./metadata:/metadata:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  petshop-db:
