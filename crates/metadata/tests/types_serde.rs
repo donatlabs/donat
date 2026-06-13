@@ -393,6 +393,8 @@ fn source_kind_sqlite_and_postgres_deserialize_from_string() {
     assert_eq!(sqlite, SourceKind::Sqlite);
     let postgres: SourceKind = serde_yaml::from_str("postgres").unwrap();
     assert_eq!(postgres, SourceKind::Postgres);
+    let mysql: SourceKind = serde_yaml::from_str("mysql").unwrap();
+    assert_eq!(mysql, SourceKind::Mysql);
 
     // And through a Source document's `kind` field.
     let yaml = "\

@@ -548,6 +548,19 @@ pub async fn execute_full(
                     Err(e) => ok(sqlite_mutation_error_json(e)),
                 };
             }
+            // MySQL has no `RETURNING`, so the in-DB-assembled mutation shape
+            // is not yet supported. Queries work; mutations are guarded with a
+            // clear error rather than emitting Postgres SQL against MySQL.
+            if matches!(
+                state.default_source_kind().await,
+                donat_metadata::SourceKind::Mysql
+            ) {
+                drop(engine);
+                return ok(error_json(
+                    "not-supported",
+                    "mutations are not yet supported on mysql sources",
+                ));
+            }
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
             let fields: Vec<(String, String)> = roots

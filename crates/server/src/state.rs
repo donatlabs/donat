@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use donat_backend::{AnyDialect, SqliteDialect};
+use donat_backend::{AnyDialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
@@ -21,6 +21,11 @@ pub struct AppState {
     /// runtime opens a `rusqlite::Connection` per query inside
     /// `spawn_blocking` (see `execute_query_json`).
     pub sqlite_paths: RwLock<HashMap<String, String>>,
+    /// One connection url per MySQL source name. Like SQLite, MySQL uses no
+    /// pool: the runtime opens a `mysql::Conn` per query inside
+    /// `spawn_blocking` (see `execute_query_json`). The url carries the
+    /// database name, which is also the tracked schema.
+    pub mysql_urls: RwLock<HashMap<String, String>>,
     pub engine: RwLock<Engine>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
@@ -176,6 +181,35 @@ impl AppState {
                 })
                 .await
                 .map_err(|e| QueryError::Pool(format!("sqlite task panicked: {e}")))??;
+                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+            }
+            SourceKind::Mysql => {
+                use mysql::prelude::Queryable;
+
+                let sql =
+                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Mysql(MySqlDialect));
+                let url = {
+                    let urls = self.mysql_urls.read().await;
+                    urls.get("default")
+                        .or_else(|| urls.values().next())
+                        .cloned()
+                        .ok_or(QueryError::NoDefaultSource)?
+                };
+                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
+                    let mut conn = mysql::Conn::new(url.as_str())
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    // The engine emits Postgres-style `"ident"` quoting; MySQL
+                    // reads double quotes as string literals unless ANSI_QUOTES
+                    // is enabled for the session.
+                    conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    let row: Option<String> = conn
+                        .query_first(&sql)
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    row.ok_or_else(|| QueryError::Sqlite("mysql returned no rows".to_string()))
+                })
+                .await
+                .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
         }
@@ -361,6 +395,34 @@ impl AppState {
                     )
                     .await??;
                     self.sqlite_paths
+                        .write()
+                        .await
+                        .insert(name.clone(), url.clone());
+                    catalog
+                }
+                SourceKind::Mysql => {
+                    // MySQL uses no pool and no PL/pgSQL helper: introspect once
+                    // at boot via a blocking connection, then remember the url
+                    // for per-query connections in `execute_query_json`. The
+                    // tracked schema is the database name from the url.
+                    let conn_url = url.clone();
+                    let catalog = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<Catalog> {
+                            let opts = mysql::Opts::from_url(&conn_url)?;
+                            let db = opts
+                                .get_db_name()
+                                .map(|s| s.to_string())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "mysql source url has no database name: {conn_url}"
+                                    )
+                                })?;
+                            let mut conn = mysql::Conn::new(opts)?;
+                            Ok(donat_catalog::mysql_introspect(&mut conn, &db)?)
+                        },
+                    )
+                    .await??;
+                    self.mysql_urls
                         .write()
                         .await
                         .insert(name.clone(), url.clone());

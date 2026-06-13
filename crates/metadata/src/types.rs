@@ -398,6 +398,7 @@ pub struct FunctionConfiguration {
 pub enum SourceKind {
     Postgres,
     Sqlite,
+    Mysql,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
