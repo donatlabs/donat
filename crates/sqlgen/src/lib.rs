@@ -998,19 +998,9 @@ pub fn quote_lit(s: &str) -> String {
 }
 
 /// Render a JSON scalar as a SQL literal cast to the column's type.
+/// Delegates to the backend dialect's `render_scalar`, which holds the
+/// byte-for-byte rendering (including the geometry/geography GeoJSON case).
 fn scalar_sql(scalar: &Scalar, pg_type: &str) -> String {
-    if matches!(pg_type, "geometry" | "geography") && scalar.as_json().is_object() {
-        return geometry_sql(scalar, pg_type);
-    }
-    let ty = quote_ident(pg_type);
-    match scalar.as_json() {
-        serde_json::Value::Null => "NULL".into(),
-        serde_json::Value::Bool(b) => {
-            if *b { "TRUE".into() } else { "FALSE".into() }
-        }
-        serde_json::Value::Number(n) => format!("({n})::{ty}"),
-        serde_json::Value::String(s) => format!("({})::{ty}", quote_lit(s)),
-        // arrays/objects target json/jsonb columns
-        other => format!("({})::{ty}", quote_lit(&other.to_string())),
-    }
+    use donat_backend::Dialect;
+    donat_backend::PostgresDialect.render_scalar(scalar, pg_type)
 }

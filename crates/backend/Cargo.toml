@@ -6,3 +6,5 @@ license.workspace = true
 description = "Backend-neutral primitives: logical scalar types, capability descriptors, SQL dialect rendering"
 
 [dependencies]
+donat-ir = { path = "../ir" }
+serde_json = { workspace = true }

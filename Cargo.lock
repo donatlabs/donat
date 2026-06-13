@@ -536,6 +536,10 @@ dependencies = [
 [[package]]
 name = "donat-backend"
 version = "0.1.0"
+dependencies = [
+ "donat-ir",
+ "serde_json",
+]
 
 [[package]]
 name = "donat-catalog"
