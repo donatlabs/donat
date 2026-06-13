@@ -18,7 +18,7 @@ conformance harness (`crates/conformance`).
 | `crates/schema` | Per-role GraphQL schema generation, introspection |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
-| `crates/server` | axum server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
+| `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
