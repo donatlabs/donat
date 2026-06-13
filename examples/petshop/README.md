@@ -31,6 +31,10 @@ the project's deploy model:
    saved queries in [`metadata/query_collections.yaml`](metadata/query_collections.yaml),
    and the REST routes in [`metadata/rest_endpoints.yaml`](metadata/rest_endpoints.yaml).
    The serving engine never runs DDL and exposes no runtime `run_sql`.
+   All three surfaces are on by default; restrict them at deploy time with
+   `DONAT_GRAPHQL_ENABLED_APIS` (comma-separated `graphql`/`rest`/`mcp`), e.g.
+   `DONAT_GRAPHQL_ENABLED_APIS=graphql` to expose GraphQL only (REST and MCP
+   then return `404`).
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:

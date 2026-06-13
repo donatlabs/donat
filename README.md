@@ -47,6 +47,24 @@ YAML (Donat v3 directory: `version.yaml`, `databases/`, `inherited_roles.yaml`,
 `actions.yaml`) loaded at boot; `validate` fails the deploy if it is
 inconsistent with the schema.
 
+### Selecting API surfaces
+
+The engine serves three transports over the same data plane: GraphQL
+(`/v1/graphql` + relay + websockets), REST (`/api/rest`), and MCP (`/mcp`).
+Which surfaces are mounted is a deploy-time choice via a single
+comma-separated list (CLI `--enabled-apis` wins over the env var):
+
+```sh
+DONAT_GRAPHQL_ENABLED_APIS=graphql          # GraphQL only; REST and MCP off
+DONAT_GRAPHQL_ENABLED_APIS=graphql,rest     # GraphQL + REST; MCP off
+```
+
+Tokens (case-insensitive): `graphql`, `rest`, `mcp`. **Omitting the variable
+enables all three.** A surface left out of the list is not registered, so
+requests to it get a plain `404` (there is no per-request gate). Unknown tokens
+(e.g. Hasura's `metadata`/`config`) are warned about and ignored. `/healthz`
+and `/v1/version` are always mounted.
+
 Conformance Postgres: `postgis/postgis:16-3.4` reachable as
 `postgresql://postgres:postgres@127.0.0.1:15432/postgres` (override via
 `PG_URL`). Each suite spawns its own engine on a fresh database, so runs
