@@ -23,7 +23,7 @@ configuration:
     price:
       comment: >-
         Sale price in US dollars as a decimal number with two places, e.g.
-        350.00. Stored as SQL numeric. Always non-negative.
+        350.00. Stored as SQL numeric; defaults to 0.
     status:
       comment: >-
         Availability of the pet. Exactly one of: "available" (can be ordered),
