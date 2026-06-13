@@ -5,15 +5,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use donat_backend::{AnyDialect, SqliteDialect};
 use donat_catalog::Catalog;
+use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
 pub struct AppState {
-    /// One (url, pool) per source name; the pool is recreated when the
-    /// source's url changes (e.g. replace_metadata pointing 'default'
+    /// One (url, pool) per Postgres source name; the pool is recreated when
+    /// the source's url changes (e.g. replace_metadata pointing 'default'
     /// at a per-test database).
     pub pools: RwLock<HashMap<String, (String, deadpool_postgres::Pool)>>,
+    /// One db path/url per SQLite source name. SQLite uses no pool: the
+    /// runtime opens a `rusqlite::Connection` per query inside
+    /// `spawn_blocking` (see `execute_query_json`).
+    pub sqlite_paths: RwLock<HashMap<String, String>>,
     pub engine: RwLock<Engine>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
@@ -35,6 +42,18 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Failure of a backend read in `execute_query_json`. The caller maps each
+/// variant to the existing GraphQL error body so the Postgres path keeps
+/// byte-for-byte identical error shaping (`Postgres` carries the real
+/// `tokio_postgres::Error` for `db_error_json`).
+pub enum QueryError {
+    NoDefaultSource,
+    Pool(String),
+    Decode(String),
+    Postgres(tokio_postgres::Error),
+    Sqlite(String),
+}
 
 pub struct Engine {
     pub metadata: Metadata,
@@ -86,48 +105,138 @@ impl AppState {
             .map(|(_, p)| p.clone())
     }
 
+    /// The backend kind of the source the GraphQL schema is built against
+    /// (the "default" source, or the first one) — mirrors
+    /// `Engine::default_catalog`'s selection. Defaults to Postgres when no
+    /// source is declared.
+    pub async fn default_source_kind(&self) -> SourceKind {
+        let engine = self.engine.read().await;
+        engine
+            .metadata
+            .sources
+            .iter()
+            .find(|s| s.name == "default")
+            .or_else(|| engine.metadata.sources.first())
+            .map(|s| s.kind)
+            .unwrap_or(SourceKind::Postgres)
+    }
+
+    /// Run a planned read operation against the default source's backend and
+    /// return the assembled JSON `data` object. Dispatches on the source's
+    /// backend kind so the Postgres path is byte-for-byte identical to the
+    /// pre-multi-backend behavior (same SQL, same client call, same error
+    /// shaping — the caller maps `QueryError` back to the existing bodies).
+    pub async fn execute_query_json(&self, roots: &[RootField]) -> Result<Json, QueryError> {
+        match self.default_source_kind().await {
+            SourceKind::Postgres => {
+                let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
+                let pool = self
+                    .default_pool()
+                    .await
+                    .ok_or(QueryError::NoDefaultSource)?;
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|e| QueryError::Pool(e.to_string()))?;
+                let row = client
+                    .query_one(&sql, &[])
+                    .await
+                    .map_err(QueryError::Postgres)?;
+                row.try_get::<_, Json>(0)
+                    .map_err(|e| QueryError::Decode(e.to_string()))
+            }
+            SourceKind::Sqlite => {
+                let sql =
+                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Sqlite(SqliteDialect));
+                let path = {
+                    let paths = self.sqlite_paths.read().await;
+                    paths
+                        .get("default")
+                        .or_else(|| paths.values().next())
+                        .cloned()
+                        .ok_or(QueryError::NoDefaultSource)?
+                };
+                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
+                    let conn = rusqlite::Connection::open(&path)
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    conn.query_row(&sql, [], |r| r.get::<_, String>(0))
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))
+                })
+                .await
+                .map_err(|e| QueryError::Pool(format!("sqlite task panicked: {e}")))??;
+                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+            }
+        }
+    }
+
     /// Reconcile pools and catalogs with the current metadata sources,
     /// pruning metadata that refers to dropped objects (run_sql untracks
     /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         // Later same-named sources override earlier ones (the harness
         // appends a second 'default' pointing at a per-test database).
-        let sources: Vec<(String, String)> = {
+        let sources: Vec<(String, SourceKind, String)> = {
             let engine = self.engine.read().await;
-            let mut resolved: Vec<(String, String)> = vec![];
+            let mut resolved: Vec<(String, SourceKind, String)> = vec![];
             for s in &engine.metadata.sources {
                 let url = resolve_source_url(s, &self.default_url);
-                match resolved.iter_mut().find(|(n, _)| n == &s.name) {
-                    Some(entry) => entry.1 = url,
-                    None => resolved.push((s.name.clone(), url)),
+                match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
+                    Some(entry) => {
+                        entry.1 = s.kind;
+                        entry.2 = url;
+                    }
+                    None => resolved.push((s.name.clone(), s.kind, url)),
                 }
             }
             resolved
         };
 
         let mut new_catalogs = HashMap::new();
-        for (name, url) in &sources {
-            let existing = {
-                let pools = self.pools.read().await;
-                pools
-                    .get(name)
-                    .filter(|(u, _)| u == url)
-                    .map(|(_, p)| p.clone())
-            };
-            let pool = match existing {
-                Some(pool) => pool,
-                None => {
-                    let pool = make_pool(url)?;
-                    self.pools
+        for (name, kind, url) in &sources {
+            let catalog = match kind {
+                SourceKind::Postgres => {
+                    let existing = {
+                        let pools = self.pools.read().await;
+                        pools
+                            .get(name)
+                            .filter(|(u, _)| u == url)
+                            .map(|(_, p)| p.clone())
+                    };
+                    let pool = match existing {
+                        Some(pool) => pool,
+                        None => {
+                            let pool = make_pool(url)?;
+                            self.pools
+                                .write()
+                                .await
+                                .insert(name.clone(), (url.clone(), pool.clone()));
+                            pool
+                        }
+                    };
+                    let client = pool.get().await?;
+                    ensure_check_violation_helper(&client).await?;
+                    donat_catalog::introspect(&client).await?
+                }
+                SourceKind::Sqlite => {
+                    // SQLite uses no pool and no PL/pgSQL helper: introspect
+                    // once at boot via a blocking connection, then remember
+                    // the path for per-query connections in
+                    // `execute_query_json`.
+                    let path = url.clone();
+                    let catalog = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<Catalog> {
+                            let conn = rusqlite::Connection::open(&path)?;
+                            Ok(donat_catalog::sqlite_introspect(&conn)?)
+                        },
+                    )
+                    .await??;
+                    self.sqlite_paths
                         .write()
                         .await
-                        .insert(name.clone(), (url.clone(), pool.clone()));
-                    pool
+                        .insert(name.clone(), url.clone());
+                    catalog
                 }
             };
-            let client = pool.get().await?;
-            ensure_check_violation_helper(&client).await?;
-            let catalog = donat_catalog::introspect(&client).await?;
             new_catalogs.insert(name.clone(), catalog);
         }
 

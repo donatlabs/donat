@@ -5,7 +5,7 @@ use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_schema::{Planner, Session};
 
-use crate::state::SharedState;
+use crate::state::{QueryError, SharedState};
 
 /// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
 /// the planner both recurse on nesting, so an unbounded query would overflow
@@ -504,42 +504,32 @@ pub async fn execute_full(
 
     match plan {
         donat_schema::Plan::Query(roots) => {
-            let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+            // Dispatch on the default source's backend kind. For Postgres the
+            // dispatch renders and runs exactly the same SQL as before; the
+            // error variants below reproduce the previous bodies verbatim.
             drop(engine);
-            tracing::debug!(%sql, "executing query");
-
-            let Some(pool) = state.default_pool().await else {
-                return ok(error_json("unexpected", "no default source"));
-            };
-            let client = match pool.get().await {
-                Ok(c) => c,
-                Err(e) => return ok(error_json("unexpected", format!("connection pool error: {e}"))),
-            };
-            match client.query_one(&sql, &[]).await {
-                Ok(row) => match row.try_get::<_, Json>(0) {
-                    Ok(mut data) => {
-                        for root in &roots {
-                            if let donat_ir::RootField::Select { alias, query } = root {
-                                if let Some(node) = data.get_mut(alias.as_str()) {
-                                    if let Err(e) = resolve_remote_joins(
-                                        state,
-                                        session,
-                                        &query.fields,
-                                        node,
-                                        &format!("$.selectionSet.{alias}"),
-                                    )
-                                    .await
-                                    {
-                                        return ok(e);
-                                    }
+            match state.execute_query_json(&roots).await {
+                Ok(mut data) => {
+                    for root in &roots {
+                        if let donat_ir::RootField::Select { alias, query } = root {
+                            if let Some(node) = data.get_mut(alias.as_str()) {
+                                if let Err(e) = resolve_remote_joins(
+                                    state,
+                                    session,
+                                    &query.fields,
+                                    node,
+                                    &format!("$.selectionSet.{alias}"),
+                                )
+                                .await
+                                {
+                                    return ok(e);
                                 }
                             }
                         }
-                        ok(json!({ "data": data }))
                     }
-                    Err(e) => ok(error_json("unexpected", format!("cannot decode result: {e}"))),
-                },
-                Err(e) => ok(db_error_json(&e)),
+                    ok(json!({ "data": data }))
+                }
+                Err(e) => ok(query_error_json(e)),
             }
         }
         donat_schema::Plan::Mutation(roots) => {
@@ -850,6 +840,19 @@ fn ok(body: Json) -> (axum::http::StatusCode, Json) {
 }
 
 /// Map Postgres errors onto Donat v2 error codes/messages.
+/// Map a backend read failure to the GraphQL error body. The Postgres
+/// variants reproduce the exact bodies the inline query path produced before
+/// the multi-backend dispatch was introduced.
+fn query_error_json(e: QueryError) -> Json {
+    match e {
+        QueryError::NoDefaultSource => error_json("unexpected", "no default source"),
+        QueryError::Pool(msg) => error_json("unexpected", format!("connection pool error: {msg}")),
+        QueryError::Decode(msg) => error_json("unexpected", format!("cannot decode result: {msg}")),
+        QueryError::Postgres(err) => db_error_json(&err),
+        QueryError::Sqlite(msg) => error_json("data-exception", msg),
+    }
+}
+
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
