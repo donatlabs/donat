@@ -1,5 +1,5 @@
 # Build the donat engine binary, then ship a slim runtime image.
-# Published to ghcr.io/pantyukhov/donat by .github/workflows/release.yml.
+# Published to ghcr.io/donatlabs/donat by .github/workflows/release.yml.
 # Build context is the repository root.
 
 FROM rust:1-bookworm AS build

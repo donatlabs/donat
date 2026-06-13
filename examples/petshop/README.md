@@ -11,7 +11,7 @@ docker compose up
 ```
 
 All services use the same prebuilt public engine image
-(`ghcr.io/pantyukhov/donat`, published by the release workflow) and follow
+(`ghcr.io/donatlabs/donat`, published by the release workflow) and follow
 the project's deploy model:
 
 1. **`migrate`** — `donat migrate` applies the versioned DDL in
@@ -28,7 +28,7 @@ the project's deploy model:
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
-> `docker build -t ghcr.io/pantyukhov/donat:latest .`
+> `docker build -t ghcr.io/donatlabs/donat:latest .`
 > (The image needs the `migrate`/`validate` subcommands, so build from a
 > revision that includes them.)
 
