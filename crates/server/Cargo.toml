@@ -1,20 +1,20 @@
 [package]
-name = "dist-server"
+name = "donat-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "HTTP server exposing the Hasura v2 API surface (/v1/graphql, /healthz, /v1/version)"
 
 [[bin]]
-name = "dist-api"
+name = "donat"
 path = "src/main.rs"
 
 [dependencies]
-dist-metadata = { path = "../metadata" }
-dist-catalog = { path = "../catalog" }
-dist-schema = { path = "../schema" }
-dist-ir = { path = "../ir" }
-dist-sqlgen = { path = "../sqlgen" }
+donat-metadata = { path = "../metadata" }
+donat-catalog = { path = "../catalog" }
+donat-schema = { path = "../schema" }
+donat-ir = { path = "../ir" }
+donat-sqlgen = { path = "../sqlgen" }
 graphql-parser = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }

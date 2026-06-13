@@ -5,16 +5,16 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use dist_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
-use dist_metadata::Metadata;
-use dist_schema::{Planner, Session};
+use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
+use donat_metadata::Metadata;
+use donat_schema::{Planner, Session};
 
 fn fixture_metadata() -> Metadata {
     let dir = Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../metadata/tests/fixtures/metadata"
     ));
-    dist_metadata::load_metadata_dir(dir).expect("fixture metadata loads")
+    donat_metadata::load_metadata_dir(dir).expect("fixture metadata loads")
 }
 
 fn col(name: &str, pg_type: &str, nullable: bool) -> ColumnInfo {
@@ -95,8 +95,8 @@ fn plan_sql_with(query: &str, session: &Session) -> String {
         .plan(&doc, None, &serde_json::Map::new(), session)
         .expect("planning succeeds");
     match plan {
-        dist_schema::Plan::Query(roots) => dist_sqlgen::operation_to_sql(&roots),
-        dist_schema::Plan::Mutation(_) => panic!("expected a query plan"),
+        donat_schema::Plan::Query(roots) => donat_sqlgen::operation_to_sql(&roots),
+        donat_schema::Plan::Mutation(_) => panic!("expected a query plan"),
     }
 }
 

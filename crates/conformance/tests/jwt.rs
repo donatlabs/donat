@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Running, Suite, fixture_root, load_fixture, response_matches};
+use donat_conformance::{Running, Suite, fixture_root, load_fixture, response_matches};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value as Json, json};
 

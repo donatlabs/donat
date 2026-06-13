@@ -42,9 +42,9 @@ Types:
   timeout_seconds=60, tolerance_seconds=21600 }` — Hasura `RetryConfST`
   field names and defaults (verified against the engine source).
 
-## 2. Catalog DDL (`migrations/V1__dist_api_cron.sql`)
+## 2. Catalog DDL (`migrations/V1__donat_cron.sql`)
 
-Schema `dist_api` (engine-internal catalog), plus:
+Schema `donat` (engine-internal catalog), plus:
 
 - `cron_events(id uuid pk, trigger_name text, scheduled_time timestamptz,
   status text default 'scheduled', tries int default 0,
@@ -68,7 +68,7 @@ of the database.
 ## 4. Delivery (`crates/server/src/cron.rs`, spawned from `main.rs`)
 
 A tokio task started after `sync_sources` (only when metadata has cron
-triggers). Poll interval from `DIST_API_CRON_POLL_SECONDS` (default 10; the
+triggers). Poll interval from `DONAT_CRON_POLL_SECONDS` (default 10; the
 conformance test sets it low for determinism).
 
 Each tick, against the default pool:
@@ -105,9 +105,9 @@ of truth (same pattern as `remote_schemas.rs` / actions).
 
 - A native cron webhook stub receiver (records received body + headers),
   modeled on `src/action_webhook.rs`.
-- Harness `Builder::with_migrations()` runs `dist-api migrate
+- Harness `Builder::with_migrations()` runs `donat migrate
   --migrations-dir <workspace>/migrations` against the suite DB before the
-  engine spawns, so `dist_api.*` exists.
+  engine spawns, so `donat.*` exists.
 - `tests/cron_triggers.rs`:
   - fires a past-due event → stub receives the exact envelope + header;
     `cron_events` row → `delivered`; an invocation log row exists.

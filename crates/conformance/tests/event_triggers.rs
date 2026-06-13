@@ -17,9 +17,9 @@
 
 use std::time::{Duration, Instant};
 
-use dist_conformance::Suite;
-use dist_conformance::cron_webhook::{CronWebhook, Received};
-use dist_metadata::{EventTrigger, QualifiedTable};
+use donat_conformance::Suite;
+use donat_conformance::cron_webhook::{CronWebhook, Received};
+use donat_metadata::{EventTrigger, QualifiedTable};
 use serde_json::{Value as Json, json};
 
 const TABLE: &str = "test_t1";
@@ -46,7 +46,7 @@ fn event_trigger(name: &str, webhook_suffix: &str, retry: Json) -> EventTrigger 
 /// Bring up a suite with: the hge_tests.test_t1 table, a `tester` role with
 /// full DML permissions, and the given event trigger — then force the engine
 /// (migrate + reconcile + serve) to start.
-fn setup(name: &str, trigger: EventTrigger) -> dist_conformance::Running {
+fn setup(name: &str, trigger: EventTrigger) -> donat_conformance::Running {
     let r = Suite::new(name)
         .env("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
         .with_event_webhook()
@@ -94,7 +94,7 @@ fn setup(name: &str, trigger: EventTrigger) -> dist_conformance::Running {
     r
 }
 
-fn gql(r: &dist_conformance::Running, query: &str) {
+fn gql(r: &donat_conformance::Running, query: &str) {
     let (status, body) = r.post("/v1/graphql", &json!({ "query": query }), &[]);
     assert_eq!(status, 200, "graphql HTTP status; body: {body}");
     assert!(body.get("errors").is_none(), "graphql errors: {body}");
@@ -209,7 +209,7 @@ fn event_trigger_retries_then_errors_on_failing_webhook() {
 fn status_count(db_url: &str, trigger: &str, status: &str) -> i64 {
     let mut c = postgres::Client::connect(db_url, postgres::NoTls).expect("connect suite db");
     c.query_one(
-        "SELECT count(*) FROM dist_api.event_log WHERE trigger_name = $1 AND status = $2",
+        "SELECT count(*) FROM donat.event_log WHERE trigger_name = $1 AND status = $2",
         &[&trigger, &status],
     )
     .expect("status count")
@@ -219,8 +219,8 @@ fn status_count(db_url: &str, trigger: &str, status: &str) -> i64 {
 fn invocation_count(db_url: &str, trigger: &str) -> i64 {
     let mut c = postgres::Client::connect(db_url, postgres::NoTls).expect("connect suite db");
     c.query_one(
-        "SELECT count(*) FROM dist_api.event_invocation_logs l \
-         JOIN dist_api.event_log e ON e.id = l.event_id \
+        "SELECT count(*) FROM donat.event_invocation_logs l \
+         JOIN donat.event_log e ON e.id = l.event_id \
          WHERE e.trigger_name = $1",
         &[&trigger],
     )

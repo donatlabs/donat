@@ -9,7 +9,7 @@
 //! tests-py/context.py; the engine reaches it through `ACTION_WEBHOOK_HANDLER`.
 //! Webhook handlers that call back into the engine run under the same role.
 
-use dist_conformance::{Running, Suite, Transport};
+use donat_conformance::{Running, Suite, Transport};
 use serde_json::{json, Value as Json};
 
 const SYNC: &str = "queries/actions/sync";

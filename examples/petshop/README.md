@@ -1,6 +1,6 @@
 # Petshop example
 
-A classic pet-store running on **dist-api** — a small catalogue of pets in
+A classic pet-store running on **donat** — a small catalogue of pets in
 categories, customers, and their orders — wired up with the permission set a
 normal store needs: a public catalogue, authenticated shoppers, and store
 staff. Every access goes through an explicit role permission — there is no
@@ -11,14 +11,14 @@ docker compose up
 ```
 
 All services use the same prebuilt public engine image
-(`ghcr.io/pantyukhov/dist-api`, published by the release workflow) and follow
+(`ghcr.io/pantyukhov/donat`, published by the release workflow) and follow
 the project's deploy model:
 
-1. **`migrate`** — `dist-api migrate` applies the versioned DDL in
+1. **`migrate`** — `donat migrate` applies the versioned DDL in
    [`migrations/`](migrations) (one `V{n}__create_<table>.sql` per table) via
    refinery, tracked in `refinery_schema_history`. This is the only thing that
    runs DDL.
-2. **`validate`** — `dist-api validate` loads the [`metadata/`](metadata),
+2. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
    introspects the migrated database, and exits non-zero if anything tracked
    is missing, so a bad deploy fails before the server boots.
 3. **`engine`** — serves GraphQL at <http://localhost:8080/v1/graphql>. The
@@ -28,7 +28,7 @@ the project's deploy model:
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
-> `docker build -t ghcr.io/pantyukhov/dist-api:latest .`
+> `docker build -t ghcr.io/pantyukhov/donat:latest .`
 > (The image needs the `migrate`/`validate` subcommands, so build from a
 > revision that includes them.)
 

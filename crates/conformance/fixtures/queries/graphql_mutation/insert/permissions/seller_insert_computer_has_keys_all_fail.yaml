@@ -1,6 +1,6 @@
 description: Inserts computer specs without all the required keys (error)
 url: /v1alpha1/graphql
-# dist-api: Hasura fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
+# donat: Hasura fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
 status: 200
 response:
   errors:

@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
+use donat_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value as Json, json};
 use tungstenite::stream::MaybeTlsStream;

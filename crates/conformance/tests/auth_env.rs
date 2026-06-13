@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value as Json, json};
 
-use dist_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
+use donat_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
 
 /// Same role as tests-py's --hge-key: an API-level secret, never a data role.
 const SECRET: &str = "conformance_admin_secret";

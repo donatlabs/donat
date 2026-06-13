@@ -8,11 +8,11 @@ test:
 # postgresql://postgres:postgres@127.0.0.1:15432/postgres, override via
 # PG_URL). Spawns its own engine instances, one database per suite.
 conformance:
-	cargo build -p dist-server --bin dist-api
-	cargo test -p dist-conformance
+	cargo build -p donat-server --bin donat
+	cargo test -p donat-conformance
 
 run:
-	cargo run --bin dist-api -- --metadata-dir crates/metadata/tests/fixtures/metadata
+	cargo run --bin donat -- --metadata-dir crates/metadata/tests/fixtures/metadata
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux

@@ -1,13 +1,13 @@
 [package]
-name = "dist-conformance"
+name = "donat-conformance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native conformance harness: Hasura-derived fixtures executed against dist-api"
+description = "Native conformance harness: Hasura-derived fixtures executed against donat"
 
 [dependencies]
 anyhow = { workspace = true }
-dist-metadata = { path = "../metadata" }
+donat-metadata = { path = "../metadata" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

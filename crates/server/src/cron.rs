@@ -2,13 +2,13 @@
 //! cron schedule with a static payload.
 //!
 //! There is no runtime admin surface; cron triggers come from YAML metadata
-//! (`cron_triggers`). The catalog tables in `dist_api` are created by
+//! (`cron_triggers`). The catalog tables in `donat` are created by
 //! `migrate` (the serving binary never runs DDL); this module only reads and
 //! writes rows.
 //!
 //! Lifecycle (see [`spawn`]): a single background task periodically
 //! *materializes* the next occurrence of each trigger into
-//! `dist_api.cron_events`, then *delivers* due events to their webhook with
+//! `donat.cron_events`, then *delivers* due events to their webhook with
 //! at-least-once semantics — claim with `FOR UPDATE SKIP LOCKED`, deliver
 //! while holding the row lock (a crash rolls the claim back, so the event is
 //! re-delivered), retry per `retry_conf`, and record an invocation log per
@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use croner::Cron;
 use serde_json::{Value as Json, json};
 
-use dist_metadata::{ActionHeader, CronTrigger};
+use donat_metadata::{ActionHeader, CronTrigger};
 
 use crate::remote::resolve_url_template;
 use crate::state::SharedState;
@@ -36,7 +36,7 @@ pub fn next_after(schedule: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>>
 
 /// Start the cron delivery loop as a background task. No-op (the task exits
 /// immediately) when the metadata declares no cron triggers, so a plain
-/// deployment without cron never touches the `dist_api` catalog.
+/// deployment without cron never touches the `donat` catalog.
 pub fn spawn(state: SharedState) {
     tokio::spawn(async move { run(state).await });
 }
@@ -46,7 +46,7 @@ async fn run(state: SharedState) {
     if !has_triggers {
         return;
     }
-    let interval = std::env::var("DIST_API_CRON_POLL_SECONDS")
+    let interval = std::env::var("DONAT_CRON_POLL_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(10)
@@ -81,7 +81,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
             Some(next) => {
                 client
                     .execute(
-                        "INSERT INTO dist_api.cron_events (trigger_name, scheduled_time) \
+                        "INSERT INTO donat.cron_events (trigger_name, scheduled_time) \
                          VALUES ($1, $2) ON CONFLICT (trigger_name, scheduled_time) DO NOTHING",
                         &[&t.name, &next],
                     )
@@ -99,7 +99,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
     let rows = tx
         .query(
             "SELECT id, trigger_name, scheduled_time, tries \
-             FROM dist_api.cron_events \
+             FROM donat.cron_events \
              WHERE status = 'scheduled' AND scheduled_time <= now() \
                AND (next_retry_at IS NULL OR next_retry_at <= now()) \
              ORDER BY scheduled_time \
@@ -118,7 +118,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         let Some(trigger) = triggers.iter().find(|t| t.name == trigger_name) else {
             // Trigger was removed from metadata: drop the orphaned event.
             tx.execute(
-                "UPDATE dist_api.cron_events SET status = 'dead' WHERE id = $1",
+                "UPDATE donat.cron_events SET status = 'dead' WHERE id = $1",
                 &[&id],
             )
             .await?;
@@ -131,7 +131,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         let lateness = (Utc::now() - scheduled_time).num_seconds();
         if tries == 0 && lateness > retry.tolerance_seconds as i64 {
             tx.execute(
-                "UPDATE dist_api.cron_events SET status = 'dead' WHERE id = $1",
+                "UPDATE donat.cron_events SET status = 'dead' WHERE id = $1",
                 &[&id],
             )
             .await?;
@@ -151,7 +151,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         let success = http_status.map(|s| (200..300).contains(&s)).unwrap_or(false);
 
         tx.execute(
-            "INSERT INTO dist_api.cron_event_invocation_logs (event_id, status, request, response) \
+            "INSERT INTO donat.cron_event_invocation_logs (event_id, status, request, response) \
              VALUES ($1, $2, $3, $4)",
             &[&id, &http_status, &envelope, &response_body],
         )
@@ -159,7 +159,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
 
         if success {
             tx.execute(
-                "UPDATE dist_api.cron_events SET status = 'delivered', tries = tries + 1 \
+                "UPDATE donat.cron_events SET status = 'delivered', tries = tries + 1 \
                  WHERE id = $1",
                 &[&id],
             )
@@ -168,7 +168,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
             let new_tries = tries + 1;
             if new_tries > retry.num_retries as i32 {
                 tx.execute(
-                    "UPDATE dist_api.cron_events SET status = 'error', tries = $2 \
+                    "UPDATE donat.cron_events SET status = 'error', tries = $2 \
                      WHERE id = $1",
                     &[&id, &new_tries],
                 )
@@ -177,7 +177,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
                 let next_retry =
                     Utc::now() + chrono::Duration::seconds(retry.retry_interval_seconds as i64);
                 tx.execute(
-                    "UPDATE dist_api.cron_events SET tries = $2, next_retry_at = $3 \
+                    "UPDATE donat.cron_events SET tries = $2, next_retry_at = $3 \
                      WHERE id = $1",
                     &[&id, &new_tries, &next_retry],
                 )
@@ -238,7 +238,7 @@ pub(crate) fn resolve_headers(headers: &[ActionHeader]) -> Vec<(String, String)>
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use dist_metadata::ActionHeader;
+    use donat_metadata::ActionHeader;
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
@@ -278,7 +278,7 @@ mod tests {
             ActionHeader {
                 name: "X-Env".into(),
                 value: None,
-                value_from_env: Some("DIST_API_TEST_UNSET_HEADER_VAR".into()),
+                value_from_env: Some("DONAT_TEST_UNSET_HEADER_VAR".into()),
             },
         ];
         let resolved = resolve_headers(&headers);

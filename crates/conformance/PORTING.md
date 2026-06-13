@@ -13,7 +13,7 @@ fixtures copied under `crates/conformance/fixtures/` (same relative paths).
 - **Status-only known-diffs** (documented in tests/hasura/COVERAGE.md): we
   return 200 where 3 old insert fixtures say 400 with byte-identical
   bodies. Patch the *copied* fixture to `status: 200` and add a YAML
-  comment `# dist-api: Hasura fixtures are inconsistent here; we return 200
+  comment `# donat: Hasura fixtures are inconsistent here; we return 200
   everywhere (see COVERAGE.md)`. Never patch anything else.
 
 ## Mapping a pytest class
@@ -46,7 +46,7 @@ fixtures copied under `crates/conformance/fixtures/` (same relative paths).
 ## Module skeleton
 
 ```rust
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 #[test]
 fn pytest_class_name_snake() {
@@ -67,7 +67,7 @@ Suite names must be unique across ALL modules (they become database names
    crates/conformance/fixtures/queries/<dir>` (create parents). Copy ONLY
    dirs the ported class needs, but copy them whole.
 2. Write the module, run
-   `cargo test -p dist-conformance --test <module>` until green.
+   `cargo test -p donat-conformance --test <module>` until green.
 3. A mismatch means EITHER a porting mistake (wrong setup endpoint, wrong
    order, missed exclusion) OR a real engine bug previously masked by
    shared-database state — pytest ran suites against one long-lived
@@ -77,4 +77,4 @@ Suite names must be unique across ALL modules (they become database names
 
 Postgres must be reachable (default
 `postgresql://postgres:postgres@127.0.0.1:15432/postgres`, override via
-`PG_URL`). Engine binary: `target/debug/dist-api` (auto-built).
+`PG_URL`). Engine binary: `target/debug/donat` (auto-built).

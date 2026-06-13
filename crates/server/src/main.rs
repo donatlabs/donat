@@ -5,9 +5,9 @@
 //! the `migrate` subcommand, metadata is loaded from YAML at boot.
 //!
 //! Launch forms:
-//! - serve: `dist-api --database-url <url> [--metadata-dir <dir>] [--port N]`
-//! - migrate (DDL): `dist-api migrate --migrations-dir <dir>`
-//! - validate (metadata vs DB): `dist-api validate --metadata-dir <dir>`
+//! - serve: `donat --database-url <url> [--metadata-dir <dir>] [--port N]`
+//! - migrate (DDL): `donat migrate --migrations-dir <dir>`
+//! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
 mod action;
 mod cron;
@@ -36,21 +36,21 @@ use serde_json::{Value, json};
 use state::{AppState, Engine, SharedState, ensure_default_source};
 
 #[derive(Parser, Debug)]
-#[command(name = "dist-api", about = "GraphQL engine over Postgres (Hasura v2-compatible)")]
+#[command(name = "donat", about = "GraphQL engine over Postgres (Hasura v2-compatible)")]
 struct Args {
     /// Hasura v2 metadata directory (version: 3 format). Optional.
-    #[arg(long, env = "DIST_API_METADATA_DIR")]
+    #[arg(long, env = "DONAT_METADATA_DIR")]
     metadata_dir: Option<PathBuf>,
 
     /// Postgres connection string.
-    #[arg(long, env = "DIST_API_DATABASE_URL")]
+    #[arg(long, env = "DONAT_DATABASE_URL")]
     database_url: Option<String>,
 
     /// Hasura-compatible alias; also the default source's database.
     #[arg(long)]
     metadata_database_url: Option<String>,
 
-    #[arg(long, env = "DIST_API_PORT", default_value_t = 8080)]
+    #[arg(long, env = "DONAT_PORT", default_value_t = 8080)]
     port: u16,
 
     /// If set, metadata endpoints require X-Hasura-Admin-Secret.
@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dist_api=debug".into()),
+                .unwrap_or_else(|_| "donat=debug".into()),
         )
         .init();
 
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
             // Postgres triggers from the YAML metadata.
             let md_dir = m.metadata_dir.clone().or_else(|| args.metadata_dir.clone());
             if let Some(dir) = md_dir {
-                let metadata = dist_metadata::load_metadata_dir(&dir)?;
+                let metadata = donat_metadata::load_metadata_dir(&dir)?;
                 events::reconcile(&database_url, &metadata).await?;
                 tracing::info!(dir = %dir.display(), "event triggers reconciled");
             }
@@ -180,11 +180,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut metadata = match &args.metadata_dir {
         Some(dir) if dir.exists() => {
-            let md = dist_metadata::load_metadata_dir(dir)?;
+            let md = donat_metadata::load_metadata_dir(dir)?;
             tracing::info!(dir = %dir.display(), "metadata loaded");
             md
         }
-        _ => dist_metadata::Metadata {
+        _ => donat_metadata::Metadata {
             version: 3,
             sources: vec![],
             inherited_roles: vec![],
@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Background delivery of cron (scheduled) triggers. No-op unless the
-    // metadata declares any (then the `dist_api` catalog must exist — apply
+    // metadata declares any (then the `donat` catalog must exist — apply
     // `migrate` before serving).
     cron::spawn(state.clone());
     // Background delivery of table event triggers. The per-table Postgres

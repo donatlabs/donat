@@ -16,8 +16,8 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use dist_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable};
-use dist_schema::Session;
+use donat_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable};
+use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
 use crate::state::SharedState;
@@ -439,7 +439,7 @@ fn validate(
 /// Project an object value against its declared fields and the selection set.
 fn project_object(
     custom_types: &CustomTypes,
-    obj: &dist_metadata::ObjectType,
+    obj: &donat_metadata::ObjectType,
     value: &serde_json::Map<String, Json>,
     selection: &[Selection<'static, String>],
 ) -> Result<Json, String> {
@@ -595,7 +595,7 @@ fn err(path: &str, code: &str, message: impl Into<String>) -> (StatusCode, Json)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dist_metadata::{CustomTypeField, ObjectType};
+    use donat_metadata::{CustomTypeField, ObjectType};
 
     fn out_object() -> CustomTypes {
         CustomTypes {
@@ -740,7 +740,7 @@ mod tests {
         // as a null placeholder by the pure shaper; fill_relationships (async,
         // integration-tested) replaces it. It must not error here.
         let ct = CustomTypes {
-            objects: vec![dist_metadata::ObjectType {
+            objects: vec![donat_metadata::ObjectType {
                 name: "UserId".into(),
                 fields: vec![CustomTypeField {
                     name: "id".into(),

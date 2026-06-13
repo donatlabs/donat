@@ -23,7 +23,7 @@ instances run the same loop.
 Implement **cron triggers only**, configured in YAML metadata
 (`cron_triggers`, Hasura `CronTriggerMetadata` shape) and delivered by a
 background loop in the serving binary. The durable state lives in a Postgres
-catalog schema `dist_api` (tables `cron_events`,
+catalog schema `donat` (tables `cron_events`,
 `cron_event_invocation_logs`), created by `migrate` — the serving binary
 never runs DDL.
 

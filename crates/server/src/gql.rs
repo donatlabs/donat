@@ -3,7 +3,7 @@
 use axum::http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use dist_schema::{Planner, Session};
+use donat_schema::{Planner, Session};
 
 use crate::state::SharedState;
 
@@ -384,7 +384,7 @@ pub async fn execute_full(
                     let catalog = engine.default_catalog();
                     let mut planner = Planner::new(&engine.metadata, &catalog);
                     planner.infer_function_permissions = state.infer_function_permissions;
-                    let intro_data = match dist_schema::execute_introspection(
+                    let intro_data = match donat_schema::execute_introspection(
                         &planner,
                         session,
                         &intro_doc,
@@ -485,7 +485,7 @@ pub async fn execute_full(
     planner.infer_function_permissions = state.infer_function_permissions;
     planner.relay = relay;
     // Introspection operations are answered from the type system directly.
-    if let Some(result) = dist_schema::execute_introspection(
+    if let Some(result) = donat_schema::execute_introspection(
         &planner,
         session,
         &doc,
@@ -503,8 +503,8 @@ pub async fn execute_full(
     };
 
     match plan {
-        dist_schema::Plan::Query(roots) => {
-            let sql = dist_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+        donat_schema::Plan::Query(roots) => {
+            let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
             drop(engine);
             tracing::debug!(%sql, "executing query");
 
@@ -519,7 +519,7 @@ pub async fn execute_full(
                 Ok(row) => match row.try_get::<_, Json>(0) {
                     Ok(mut data) => {
                         for root in &roots {
-                            if let dist_ir::RootField::Select { alias, query } = root {
+                            if let donat_ir::RootField::Select { alias, query } = root {
                                 if let Some(node) = data.get_mut(alias.as_str()) {
                                     if let Err(e) = resolve_remote_joins(
                                         state,
@@ -542,20 +542,20 @@ pub async fn execute_full(
                 Err(e) => ok(db_error_json(&e)),
             }
         }
-        dist_schema::Plan::Mutation(roots) => {
+        donat_schema::Plan::Mutation(roots) => {
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
             let fields: Vec<(String, String)> = roots
                 .iter()
                 .map(|root| {
                     let alias = match root {
-                        dist_ir::MutationRoot::FunctionCall { alias, .. }
-                        | dist_ir::MutationRoot::Insert { alias, .. }
-                        | dist_ir::MutationRoot::Update { alias, .. }
-                        | dist_ir::MutationRoot::Delete { alias, .. }
-                        | dist_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                        donat_ir::MutationRoot::FunctionCall { alias, .. }
+                        | donat_ir::MutationRoot::Insert { alias, .. }
+                        | donat_ir::MutationRoot::Update { alias, .. }
+                        | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
-                    (alias, dist_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
+                    (alias, donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
                 })
                 .collect();
             drop(engine);
@@ -633,10 +633,10 @@ pub(crate) async fn execute_select_internal(
         .plan(&doc, None, variables, session)
         .map_err(|e| e.to_graphql())?;
     let roots = match plan {
-        dist_schema::Plan::Query(roots) => roots,
+        donat_schema::Plan::Query(roots) => roots,
         _ => return Err(error_json("unexpected", "internal query must be a select")),
     };
-    let sql = dist_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+    let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
     drop(engine);
 
     let pool = state
@@ -655,7 +655,7 @@ pub(crate) async fn execute_select_internal(
         .try_get::<_, Json>(0)
         .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
     for root in &roots {
-        if let dist_ir::RootField::Select { alias, query } = root {
+        if let donat_ir::RootField::Select { alias, query } = root {
             if let Some(node) = data.get_mut(alias.as_str()) {
                 resolve_remote_joins(
                     state,
@@ -734,7 +734,7 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
 fn resolve_remote_joins<'a>(
     state: &'a SharedState,
     session: &'a Session,
-    fields: &'a [dist_ir::OutputField],
+    fields: &'a [donat_ir::OutputField],
     node: &'a mut Json,
     path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
@@ -749,8 +749,8 @@ fn resolve_remote_joins<'a>(
             Json::Object(_) => {
                 for field in fields {
                     match &field.value {
-                        dist_ir::FieldValue::Object { query, .. }
-                        | dist_ir::FieldValue::Array { query, .. } => {
+                        donat_ir::FieldValue::Object { query, .. }
+                        | donat_ir::FieldValue::Array { query, .. } => {
                             if let Some(child) = node.get_mut(field.alias.as_str()) {
                                 resolve_remote_joins(
                                     state,
@@ -762,7 +762,7 @@ fn resolve_remote_joins<'a>(
                                 .await?;
                             }
                         }
-                        dist_ir::FieldValue::RemoteJoin { spec } => {
+                        donat_ir::FieldValue::RemoteJoin { spec } => {
                             // Variables from the row's hidden columns.
                             let mut vars = serde_json::Map::new();
                             for (var, hidden) in &spec.variables {

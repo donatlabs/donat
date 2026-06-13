@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use dist_metadata::{Columns, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir};
+use donat_metadata::{Columns, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir};
 
 fn fixture_dir() -> &'static Path {
     Path::new(concat!(

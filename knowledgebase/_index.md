@@ -1,4 +1,4 @@
-# dist-api Knowledge Base
+# donat Knowledge Base
 
 > Living documentation for design explorations and decisions that are not yet
 > (or not only) code. Engine internals and conformance status live in PLAN.md

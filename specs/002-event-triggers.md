@@ -2,7 +2,7 @@
 
 Status: in progress. Table event triggers (webhooks on row insert/update/
 delete), TDD-ported from Hasura `tests-py/test_events.py`. Reuses the cron
-delivery machinery (the `dist_api` journal + `FOR UPDATE SKIP LOCKED` poller +
+delivery machinery (the `donat` journal + `FOR UPDATE SKIP LOCKED` poller +
 retries).
 
 Compatible with the no-admin-role posture: triggers are declared in YAML under
@@ -33,13 +33,13 @@ event_triggers:
 cron's `RetryConfST` (`interval_sec`/`timeout_sec`, not
 `retry_interval_seconds`/`timeout_seconds`).
 
-## 2. Catalog DDL (`migrations/V2__dist_api_event_log.sql`)
+## 2. Catalog DDL (`migrations/V2__donat_event_log.sql`)
 
-- `dist_api.event_log` (id, trigger_name, schema_name, table_name, op,
+- `donat.event_log` (id, trigger_name, schema_name, table_name, op,
   data_old, data_new, session_variables, status, tries, next_retry_at,
   created_at).
-- `dist_api.event_invocation_logs` (per attempt).
-- `dist_api.notify_event()` — one generic PL/pgSQL function shared by every
+- `donat.event_invocation_logs` (per attempt).
+- `donat.notify_event()` — one generic PL/pgSQL function shared by every
   per-table trigger. Captures `to_jsonb(OLD/NEW)` and inserts an `event_log`
   row **in the mutation's transaction** (so nothing is lost on crash, and raw
   SQL writes fire events too). Reads the `hasura.user` GUC for session
@@ -49,14 +49,14 @@ cron's `RetryConfST` (`interval_sec`/`timeout_sec`, not
 
 Run from `migrate --metadata-dir`: for each `event_triggers` entry, create the
 per-table `AFTER INSERT/UPDATE/DELETE` triggers calling
-`dist_api.notify_event('<name>')`; selected-column updates become `AFTER
+`donat.notify_event('<name>')`; selected-column updates become `AFTER
 UPDATE OF <cols>`. Engine-managed triggers (name prefix
-`dist_api_notify_`) that are no longer declared are dropped. Identifiers and
+`donat_notify_`) that are no longer declared are dropped. Identifiers and
 the trigger-name literal are quoted/escaped.
 
 ## 4. Delivery (`crates/server/src/events.rs`, spawned from `main.rs`)
 
-Background loop (poll `DIST_API_EVENTS_POLL_SECONDS`, default 10). Claim due
+Background loop (poll `DONAT_EVENTS_POLL_SECONDS`, default 10). Claim due
 `event_log` rows with `FOR UPDATE SKIP LOCKED`, POST the Hasura event
 envelope, retry per `retry_conf`, write invocation logs. Same multi-instance
 properties as cron (at-least-once; handlers must be idempotent).

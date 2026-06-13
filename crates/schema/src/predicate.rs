@@ -5,7 +5,7 @@
 //! are substituted only in permission filters; clients cannot reference
 //! them in `where`.
 
-use dist_ir::{BoolExp, CompareOp, Scalar, Table};
+use donat_ir::{BoolExp, CompareOp, Scalar, Table};
 use serde_json::Value as Json;
 
 use crate::plan::{PlanError, Planner, Session, TableCtx};
@@ -65,7 +65,7 @@ impl Planner<'_> {
                     let table_value = sub.get("_table").ok_or_else(|| {
                         PlanError::validation(path, "_exists needs a _table")
                     })?;
-                    let table: dist_metadata::QualifiedTable =
+                    let table: donat_metadata::QualifiedTable =
                         serde_json::from_value(table_value.clone()).map_err(|e| {
                             PlanError::validation(path, format!("bad _exists table: {e}"))
                         })?;
@@ -189,7 +189,7 @@ impl Planner<'_> {
     /// comparison, or EXISTS over a table-valued function's rows.
     fn computed_field_predicate(
         &self,
-        cf: &dist_metadata::ComputedField,
+        cf: &donat_metadata::ComputedField,
         value: &Json,
         ctx: &TableCtx<'_>,
         session: &Session,
@@ -205,7 +205,7 @@ impl Planner<'_> {
                     format!("function for computed field '{}' not found", cf.name),
                 )
             })?;
-        let args: Vec<dist_ir::RowFunctionArg> = finfo
+        let args: Vec<donat_ir::RowFunctionArg> = finfo
             .args
             .iter()
             .map(|a| {
@@ -215,15 +215,15 @@ impl Planner<'_> {
                     .zip(def.session_argument.as_deref())
                     .is_some_and(|(n, s)| n == s);
                 if is_session {
-                    dist_ir::RowFunctionArg::SessionJson(crate::plan::session_json(session))
+                    donat_ir::RowFunctionArg::SessionJson(crate::plan::session_json(session))
                 } else {
-                    dist_ir::RowFunctionArg::Row
+                    donat_ir::RowFunctionArg::Row
                 }
             })
             .collect();
 
         if let Some((rschema, rname)) = &finfo.returns_table {
-            let remote_table = dist_metadata::QualifiedTable::Qualified {
+            let remote_table = donat_metadata::QualifiedTable::Qualified {
                 schema: rschema.clone(),
                 name: rname.clone(),
             };

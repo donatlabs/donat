@@ -1,12 +1,12 @@
-//! Integration tests for the deploy-time subcommands `dist-api migrate`
-//! (refinery DDL) and `dist-api validate` (metadata consistency). These are
+//! Integration tests for the deploy-time subcommands `donat migrate`
+//! (refinery DDL) and `donat validate` (metadata consistency). These are
 //! the replacement for the runtime run_sql / metadata-mutation API: schema
 //! is migrated out-of-band, metadata is validated against the migrated DB.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use dist_conformance::{engine_binary, pg_admin_url};
+use donat_conformance::{engine_binary, pg_admin_url};
 
 fn with_db(admin_url: &str, db: &str) -> String {
     let (prefix, _) = admin_url.rsplit_once('/').expect("PG_URL has a db path");
@@ -38,13 +38,13 @@ fn write(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
-/// Run a dist-api subcommand; returns (success, combined output).
+/// Run a donat subcommand; returns (success, combined output).
 fn run(db_url: &str, args: &[&str]) -> (bool, String) {
     let out = Command::new(engine_binary())
         .args(args)
-        .env("DIST_API_DATABASE_URL", db_url)
+        .env("DONAT_DATABASE_URL", db_url)
         .output()
-        .expect("spawn dist-api");
+        .expect("spawn donat");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.success(), s)

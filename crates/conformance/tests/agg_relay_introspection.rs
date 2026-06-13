@@ -7,7 +7,7 @@
 //! `test_introspection_directive_is_repeatable`) are no-role admin requests
 //! — out of scope: this engine has no admin role.
 
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 const AGG_PERM: &str = "queries/graphql_query/agg_perm";
 const RELAY_PERMS: &str = "queries/graphql_query/relay/permissions";

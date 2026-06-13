@@ -1,7 +1,7 @@
-# dist-conformance
+# donat-conformance
 
 Native conformance harness: Hasura-derived YAML fixtures executed against a
-spawned `dist-api`, replicating tests-py `check_query_f` semantics (fixture
+spawned `donat`, replicating tests-py `check_query_f` semantics (fixture
 format, response comparison with selection-set key ordering, legacy-Apollo
 websocket transport). This crate is the conformance source of truth; the
 legacy pytest harness under `tests/hasura` is an optional cross-check.
@@ -11,8 +11,8 @@ legacy pytest harness under `tests/hasura` is an optional cross-check.
 ```sh
 make conformance
 # or a single module:
-cargo build -p dist-server --bin dist-api
-cargo test -p dist-conformance --test jwt
+cargo build -p donat-server --bin donat
+cargo test -p donat-conformance --test jwt
 ```
 
 Requires Postgres (`postgis/postgis:16-3.4`) at `PG_URL`
@@ -20,7 +20,7 @@ Requires Postgres (`postgis/postgis:16-3.4`) at `PG_URL`
 Every suite gets its own database (`conf_<suite>`) and engine process
 (logs: `target/conformance-logs/<suite>.log`), so suites run in parallel
 and never share state. **Rebuild the engine binary after engine changes** —
-the harness spawns the existing `target/debug/dist-api`.
+the harness spawns the existing `target/debug/donat`.
 
 ## Suites
 

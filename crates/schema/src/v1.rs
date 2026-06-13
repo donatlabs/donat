@@ -3,13 +3,13 @@
 //! GraphQL; only the argument syntax differs. As everywhere: no admin
 //! role — these planners always run as the request's explicit role.
 
-use dist_ir::*;
-use dist_metadata::Columns;
+use donat_ir::*;
+use donat_metadata::Columns;
 use serde_json::Value as Json;
 
 use crate::plan::{PlanError, Planner, Session, TableCtx};
 
-fn parse_table(args: &Json, path: &str) -> Result<dist_metadata::QualifiedTable, PlanError> {
+fn parse_table(args: &Json, path: &str) -> Result<donat_metadata::QualifiedTable, PlanError> {
     let table = args
         .get("table")
         .ok_or_else(|| PlanError::validation(path, "expected a table"))?;
@@ -23,7 +23,7 @@ impl<'a> Planner<'a> {
         args: &Json,
         session: &Session,
         path: &str,
-    ) -> Result<(dist_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
+    ) -> Result<(donat_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
         let table = parse_table(args, path)?;
         let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
             PlanError::new(
@@ -654,7 +654,7 @@ impl<'a> Planner<'a> {
         }];
         if let Some(cols) = args.get("returning").and_then(Json::as_array) {
             // Returning requires select permission.
-            let table = dist_metadata::QualifiedTable::Qualified {
+            let table = donat_metadata::QualifiedTable::Qualified {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
             };

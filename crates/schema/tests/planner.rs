@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use dist_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
-use dist_ir::{BoolExp, CompareOp, FieldValue, RootField, Scalar, SelectQuery};
-use dist_metadata::Metadata;
-use dist_schema::{Plan, PlanError, Planner, Session};
+use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
+use donat_ir::{BoolExp, CompareOp, FieldValue, RootField, Scalar, SelectQuery};
+use donat_metadata::Metadata;
+use donat_schema::{Plan, PlanError, Planner, Session};
 use serde_json::{Value as Json, json};
 
 fn metadata() -> Metadata {
@@ -512,8 +512,8 @@ fn order_by_relationship_aggregate_allows_whitelisted_function() {
     );
     assert!(matches!(
         q.order_by.as_slice(),
-        [dist_ir::OrderBy {
-            target: dist_ir::OrderByTarget::RelationshipAggregate { .. },
+        [donat_ir::OrderBy {
+            target: donat_ir::OrderByTarget::RelationshipAggregate { .. },
             ..
         }]
     ));
@@ -606,7 +606,7 @@ fn identical_parent_permissions_are_inherited() {
     .expect("identical parent permissions resolve");
     let Plan::Mutation(roots) = plan else { panic!("expected a mutation plan") };
     assert_eq!(roots.len(), 1);
-    assert!(matches!(&roots[0], dist_ir::MutationRoot::Delete { .. }));
+    assert!(matches!(&roots[0], donat_ir::MutationRoot::Delete { .. }));
 }
 
 #[test]

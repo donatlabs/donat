@@ -1,4 +1,4 @@
-# dist-api — GraphQL engine over Postgres (Hasura v2-compatible)
+# donat — GraphQL engine over Postgres (Hasura v2-compatible)
 
 A Rust monolith exposing the Hasura v2 surface (metadata format, API shape,
 behavior) with a v3-style internal architecture: a hard IR boundary between
@@ -55,7 +55,7 @@ references something that doesn't exist) → build per-role schemas → listen.
   `nodes` semantics), computed fields in filters.
 - **M6 — mutations** ✅: insert/upsert (on_conflict + update-permission
   filter and presets), update (_set/_inc/by_pk), delete, returning, check
-  expressions raised in-statement (`dist_api.check_violation`), exact
+  expressions raised in-statement (`donat.check_violation`), exact
   Hasura error shapes, backend_only, transactions.
 - **M7 — harness** 🔄: run_suite.sh + triage.py; see
   tests/hasura/COVERAGE.md for the live conformance table.
@@ -67,7 +67,7 @@ subscriptions, event triggers, actions, remote schemas.
 Done since: subscriptions, actions (sync), remote schemas (partial),
 **cron (scheduled) triggers**, and **table event triggers**
 (insert/update/delete). Both deliver webhooks from YAML via a background loop
-over a `dist_api` Postgres catalog (multi-pod safe: `ON CONFLICT`/`FOR UPDATE
+over a `donat` Postgres catalog (multi-pod safe: `ON CONFLICT`/`FOR UPDATE
 SKIP LOCKED`, at-least-once). Event capture is in-transaction via per-table
 Postgres triggers created by `migrate --metadata-dir` (deploy-time DDL; the
 serving binary still runs no DDL). See `specs/001-cron-triggers.md`,
@@ -101,7 +101,7 @@ still ships it; the harness simply never calls it.
   over the suite database via `postgres`; metadata ops (track_table,
   permissions, relationships, inherited roles, query collections,
   computed/remote fields, functions + function permissions, remote schemas
-  + permissions) accumulate into an in-memory `dist_metadata::Metadata`.
+  + permissions) accumulate into an in-memory `donat_metadata::Metadata`.
   mssql_* ops are ignored; unknown ops panic.
 - The engine starts LAZILY on the first request: the accumulated metadata
   is serialized to a `version: 3` directory (`version.yaml`,

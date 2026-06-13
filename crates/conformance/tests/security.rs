@@ -8,7 +8,7 @@
 //! leaked another user's data, let injection through, or dropped a table would
 //! flip the expected response and fail here.
 
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 const SEC: &str = "queries/security";
 

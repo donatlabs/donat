@@ -66,9 +66,9 @@ created: 2026-06-12
 ## API sketch (Go)
 
 ```go
-eng := distapi.Start(cfg)
-distapi.PreInsert(eng, "public", "order", func(ctx context.Context, rows []Order) ([]Order, error) { ... })
-distapi.OnInsert(eng, "public", "article", func(ctx context.Context, ev distapi.Event[Article]) error { ... })
+eng := donat.Start(cfg)
+donat.PreInsert(eng, "public", "order", func(ctx context.Context, rows []Order) ([]Order, error) { ... })
+donat.OnInsert(eng, "public", "article", func(ctx context.Context, ev donat.Event[Article]) error { ... })
 eng.Run()
 ```
 

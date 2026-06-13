@@ -534,7 +534,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-catalog"
+name = "donat-catalog"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -542,13 +542,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-conformance"
+name = "donat-conformance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64",
- "dist-metadata",
+ "donat-metadata",
  "graphql-parser",
  "jsonwebtoken",
  "postgres",
@@ -561,7 +561,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-ir"
+name = "donat-ir"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -569,7 +569,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-metadata"
+name = "donat-metadata"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -579,13 +579,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-schema"
+name = "donat-schema"
 version = "0.1.0"
 dependencies = [
  "base64",
- "dist-catalog",
- "dist-ir",
- "dist-metadata",
+ "donat-catalog",
+ "donat-ir",
+ "donat-metadata",
  "graphql-parser",
  "serde",
  "serde_json",
@@ -593,7 +593,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-server"
+name = "donat-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -602,11 +602,11 @@ dependencies = [
  "clap",
  "croner",
  "deadpool-postgres",
- "dist-catalog",
- "dist-ir",
- "dist-metadata",
- "dist-schema",
- "dist-sqlgen",
+ "donat-catalog",
+ "donat-ir",
+ "donat-metadata",
+ "donat-schema",
+ "donat-sqlgen",
  "futures-util",
  "graphql-parser",
  "jsonwebtoken",
@@ -623,13 +623,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "dist-sqlgen"
+name = "donat-sqlgen"
 version = "0.1.0"
 dependencies = [
- "dist-catalog",
- "dist-ir",
- "dist-metadata",
- "dist-schema",
+ "donat-catalog",
+ "donat-ir",
+ "donat-metadata",
+ "donat-schema",
  "graphql-parser",
  "insta",
  "serde_json",

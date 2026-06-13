@@ -8,8 +8,8 @@
 //! `values_teardown.yaml` (mutations mutate data), and `schema_teardown.yaml`
 //! runs at the end — all via /v1/query (default backend, metadata API v1).
 
-use dist_conformance::Suite;
-use dist_conformance::{Running, Transport};
+use donat_conformance::Suite;
+use donat_conformance::{Running, Transport};
 
 /// One mutation case, wrapped in the per-method data fixtures.
 fn check_mutation(s: &Running, dir: &str, file: &str) {

@@ -3,18 +3,18 @@
 //! tests-py has no fixtures that exercise scheduled delivery (it depends on
 //! wall-clock timing and an external receiver), so these are native tests, in
 //! the spirit of `remote_schemas.rs` / `actions.rs`: a recording webhook stub
-//! plus a suite database with the `dist_api` catalog migrated in.
+//! plus a suite database with the `donat` catalog migrated in.
 //!
 //! Timing is made deterministic by *seeding a past-due occurrence directly*
-//! into `dist_api.cron_events` and using a schedule far in the future
+//! into `donat.cron_events` and using a schedule far in the future
 //! (`0 0 1 1 *`), so the engine's own materialization never fires inside the
 //! test window — only the seeded row does.
 
 use std::time::{Duration, Instant};
 
-use dist_conformance::Suite;
-use dist_conformance::cron_webhook::{CronWebhook, Received};
-use dist_metadata::CronTrigger;
+use donat_conformance::Suite;
+use donat_conformance::cron_webhook::{CronWebhook, Received};
+use donat_metadata::CronTrigger;
 use serde_json::{Value as Json, json};
 
 /// A cron trigger whose webhook resolves to the suite's stub at `path`. The
@@ -37,7 +37,7 @@ fn seed_past_due(db_url: &str, trigger: &str, seconds_ago: i64) {
     let mut c = postgres::Client::connect(db_url, postgres::NoTls).expect("connect suite db");
     c.execute(
         &format!(
-            "INSERT INTO dist_api.cron_events (trigger_name, scheduled_time) \
+            "INSERT INTO donat.cron_events (trigger_name, scheduled_time) \
              VALUES ($1, now() - interval '{seconds_ago} seconds')"
         ),
         &[&trigger],
@@ -53,7 +53,7 @@ fn count(db_url: &str, sql: &str, trigger: &str) -> i64 {
 fn status_count(db_url: &str, trigger: &str, status: &str) -> i64 {
     let mut c = postgres::Client::connect(db_url, postgres::NoTls).expect("connect suite db");
     c.query_one(
-        "SELECT count(*) FROM dist_api.cron_events WHERE trigger_name = $1 AND status = $2",
+        "SELECT count(*) FROM donat.cron_events WHERE trigger_name = $1 AND status = $2",
         &[&trigger, &status],
     )
     .expect("status count")
@@ -63,8 +63,8 @@ fn status_count(db_url: &str, trigger: &str, status: &str) -> i64 {
 fn invocation_count(db_url: &str, trigger: &str) -> i64 {
     count(
         db_url,
-        "SELECT count(*) FROM dist_api.cron_event_invocation_logs l \
-         JOIN dist_api.cron_events e ON e.id = l.event_id \
+        "SELECT count(*) FROM donat.cron_event_invocation_logs l \
+         JOIN donat.cron_events e ON e.id = l.event_id \
          WHERE e.trigger_name = $1",
         trigger,
     )

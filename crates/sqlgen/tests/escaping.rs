@@ -4,7 +4,7 @@
 //! Every user-controlled value reaches SQL through `quote_lit`; every
 //! identifier through `quote_ident`.
 
-use dist_sqlgen::{quote_ident, quote_lit};
+use donat_sqlgen::{quote_ident, quote_lit};
 
 /// A literal is wrapped in single quotes with every embedded `'` doubled, and
 /// nothing else is altered (Postgres `standard_conforming_strings = on`, so a

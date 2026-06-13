@@ -1,4 +1,4 @@
-# dist-api
+# donat
 
 A GraphQL engine over Postgres, compatible with the Hasura v2 surface
 (metadata format, API shape). The conformance contract is enforced by a
@@ -35,9 +35,9 @@ Schema (DDL) and metadata are separate concerns and neither is mutated at
 runtime — the serving binary has no `run_sql` / metadata-mutation surface:
 
 ```sh
-dist-api migrate  --migrations-dir migrations   # versioned SQL (refinery), DDL only
-dist-api validate --metadata-dir metadata       # YAML metadata vs the migrated DB
-dist-api serve                                  # boots from the migrated DB + YAML metadata
+donat migrate  --migrations-dir migrations   # versioned SQL (refinery), DDL only
+donat validate --metadata-dir metadata       # YAML metadata vs the migrated DB
+donat serve                                  # boots from the migrated DB + YAML metadata
 ```
 
 DDL lives in `migrations/` (`V{n}__name.sql`). Metadata is desired-state
@@ -93,7 +93,7 @@ has the per-suite detail.
 - **Deploy** — `migrate` (refinery DDL), `validate` (metadata vs DB),
   boot-from-YAML; multi-source metadata; per-source pools/catalogs.
 - **Cron (scheduled) triggers** — recurring webhooks from YAML
-  (`cron_triggers`, Hasura shape): a `dist_api` catalog (created by
+  (`cron_triggers`, Hasura shape): a `donat` catalog (created by
   `migrate`), a background delivery loop that materializes occurrences and
   delivers with the Hasura scheduled-event envelope, `retry_conf`
   (retries/timeout/tolerance), and per-attempt invocation logs. Multi-pod
@@ -121,7 +121,7 @@ has the per-suite detail.
   introspection, response-header forwarding.
 - **Table event triggers** — webhooks on row insert/update/delete from YAML
   (`event_triggers` under a table). In-transaction capture via per-table
-  Postgres triggers writing `dist_api.event_log` (created by `migrate
+  Postgres triggers writing `donat.event_log` (created by `migrate
   --metadata-dir` reconcile; the serving binary never runs DDL), delivered by
   the shared event loop with the Hasura event envelope and `retry_conf`.
   Native coverage in `crates/conformance/tests/event_triggers.rs`

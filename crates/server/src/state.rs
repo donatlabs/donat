@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dist_catalog::Catalog;
-use dist_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_catalog::Catalog;
+use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
 use tokio::sync::RwLock;
 
 pub struct AppState {
@@ -127,7 +127,7 @@ impl AppState {
             };
             let client = pool.get().await?;
             ensure_check_violation_helper(&client).await?;
-            let catalog = dist_catalog::introspect(&client).await?;
+            let catalog = donat_catalog::introspect(&client).await?;
             new_catalogs.insert(name.clone(), catalog);
         }
 
@@ -168,8 +168,8 @@ pub async fn ensure_check_violation_helper(
     client
         .batch_execute(
             r#"
-            CREATE SCHEMA IF NOT EXISTS dist_api;
-            CREATE OR REPLACE FUNCTION dist_api.check_violation(msg text)
+            CREATE SCHEMA IF NOT EXISTS donat;
+            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
             RETURNS json AS $$
             BEGIN
                 RAISE EXCEPTION USING message = msg, errcode = '23514';
@@ -189,7 +189,7 @@ pub fn ensure_default_source(metadata: &mut Metadata) {
             name: "default".to_string(),
             kind: SourceKind::Postgres,
             configuration: serde_json::from_value(serde_json::json!({
-                "connection_info": { "database_url": { "from_env": "DIST_API_DATABASE_URL" } }
+                "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
             }))
             .expect("static source configuration"),
             tables: vec![],

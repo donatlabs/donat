@@ -1,4 +1,4 @@
-# dist-api
+# donat
 
 A GraphQL engine over Postgres, compatible with the Hasura v2 surface
 (metadata format, API shape), developed TDD-style against a native
@@ -31,16 +31,16 @@ conformance harness (`crates/conformance`).
 | Build | `make build` |
 | Unit/snapshot tests | `make test` (or `cargo test -p <crate>`) |
 | Run with fixture metadata | `make run` (serves :8080) |
-| Apply schema migrations (DDL) | `dist-api migrate --migrations-dir migrations` (refinery) |
-| Validate metadata vs DB | `dist-api validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
-| Conformance suite | `make conformance` (or `cargo test -p dist-conformance [--test <module>]`) |
+| Apply schema migrations (DDL) | `donat migrate --migrations-dir migrations` (refinery) |
+| Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
+| Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
 | Legacy pytest cross-check | `tests/hasura/run_suite.sh <selector>` (optional) |
 
 The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
 `PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
-It builds/spawns the engine itself — REBUILD `cargo build -p dist-server
---bin dist-api` after engine changes before re-running conformance, the
+It builds/spawns the engine itself — REBUILD `cargo build -p donat-server
+--bin donat` after engine changes before re-running conformance, the
 harness uses the existing binary. One database per suite (`conf_<name>`),
 parallel-safe. Conventions: `crates/conformance/PORTING.md`.
 
@@ -49,12 +49,12 @@ parallel-safe. Conventions: `crates/conformance/PORTING.md`.
 1. Engine-behavior changes start from a failing conformance case: a fixture
    in `crates/conformance/fixtures` + a call in `crates/conformance/tests/`.
 2. Implement; add/adjust unit + insta tests in the touched crate.
-3. `cargo build -p dist-server --bin dist-api && cargo test -p
-   dist-conformance --test <module>` until green; then run the full
+3. `cargo build -p donat-server --bin donat && cargo test -p
+   donat-conformance --test <module>` until green; then run the full
    conformance crate — suites share engine semantics and regress together.
 4. Fixtures are ground truth (exact bodies, error codes, paths, status).
    Local fixture edits are allowed ONLY for documented known-diffs and must
-   carry a `# dist-api:` comment (see fixtures/README.md).
+   carry a `# donat:` comment (see fixtures/README.md).
 
 Quirks to remember: some fixtures `!include` files as quoted strings;
 legacy `$op` permission spellings are valid input; three insert fixtures

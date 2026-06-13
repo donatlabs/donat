@@ -1,5 +1,5 @@
 [package]
-name = "dist-metadata"
+name = "donat-metadata"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

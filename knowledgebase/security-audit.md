@@ -5,7 +5,7 @@ created: 2026-06-13
 
 # Security & dependency audit (2026-06-13)
 
-Threat model: dist-api is an **internal microservice component** (sidecar /
+Threat model: donat is an **internal microservice component** (sidecar /
 behind a mesh / trusted network). TLS termination and edge auth are assumed
 to live in front of it. Findings are ranked for that model; "network-edge"
 items are downgraded accordingly.

@@ -17,7 +17,7 @@
 //! `.env()`. (Suite::start() authenticates its bootstrap calls when
 //! `.admin_secret()` is set, so using it here would also work.)
 
-use dist_conformance::{Running, Suite, Transport};
+use donat_conformance::{Running, Suite, Transport};
 
 const INHERITED: &str = "queries/graphql_query/permissions/inherited_roles";
 const NESTED: &str = "queries/graphql_query/permissions/roles_inheritance";

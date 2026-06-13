@@ -24,14 +24,14 @@ transaction (see [[hooks-and-events]] and
 Declare event triggers in YAML under the table (`event_triggers`, Hasura's
 directory-format `EventTriggerConf`). Split the work by lifetime:
 
-- **Capture (DDL) is deploy-time.** A migration creates the `dist_api`
-  event-log catalog and one generic `dist_api.notify_event()` function. The
+- **Capture (DDL) is deploy-time.** A migration creates the `donat`
+  event-log catalog and one generic `donat.notify_event()` function. The
   per-table `CREATE TRIGGER` statements — the only DDL that depends on
   metadata — are applied by `migrate --metadata-dir` (a `reconcile` step that
   also drops engine-managed triggers no longer declared). This keeps all DDL
   in the deploy-time `migrate` path; the serving binary still never runs DDL.
 - **Delivery (DML) is runtime.** The serving binary runs a background poller
-  over `dist_api.event_log` reusing the cron machinery (`FOR UPDATE SKIP
+  over `donat.event_log` reusing the cron machinery (`FOR UPDATE SKIP
   LOCKED`, retries, invocation logs) — at-least-once, multi-instance safe, no
   leader election (see [[006-cron-triggers-yaml-only]]).
 

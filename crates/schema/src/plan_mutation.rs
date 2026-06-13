@@ -3,8 +3,8 @@
 //! everywhere, there is no admin bypass: the mutation root only exists for
 //! a role that has the corresponding permission.
 
-use dist_ir::*;
-use dist_metadata::Columns;
+use donat_ir::*;
+use donat_metadata::Columns;
 use graphql_parser::query::{Field as GqlField, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -20,10 +20,10 @@ impl<'a> Planner<'a> {
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
         // mutation_root ("no mutations exist").
-        let insert_usable = |list: &[dist_metadata::PermissionEntry<
-            dist_metadata::InsertPermission,
+        let insert_usable = |list: &[donat_metadata::PermissionEntry<
+            donat_metadata::InsertPermission,
         >]| {
-            let usable = |p: &dist_metadata::PermissionEntry<dist_metadata::InsertPermission>| {
+            let usable = |p: &donat_metadata::PermissionEntry<donat_metadata::InsertPermission>| {
                 !p.permission.backend_only || session.backend_request
             };
             list.iter().any(|p| p.role == session.role && usable(p))
@@ -649,7 +649,7 @@ impl<'a> Planner<'a> {
 
         // Returning rows requires the role to have a select permission.
         let select_ctx = self.relationship_ctx(
-            &dist_metadata::QualifiedTable::Qualified {
+            &donat_metadata::QualifiedTable::Qualified {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
             },

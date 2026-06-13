@@ -1,6 +1,6 @@
 description: Editor inserts article data for a not allowed user-id
 url: /v1alpha1/graphql
-# dist-api: Hasura fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
+# donat: Hasura fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
 status: 200
 headers:
   X-Hasura-Role: editor

@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use dist_metadata::{
+use donat_metadata::{
     Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
     QualifiedTable, RemoteSchema, SelectPermission, SourceKind, load_metadata_dir,
 };
@@ -331,7 +331,7 @@ headers:
   - name: X-Header
     value: foo
 ";
-    let et: dist_metadata::EventTrigger = serde_yaml::from_str(yaml).expect("event trigger loads");
+    let et: donat_metadata::EventTrigger = serde_yaml::from_str(yaml).expect("event trigger loads");
     assert_eq!(et.name, "t1_all");
     assert_eq!(et.webhook.as_deref(), Some("{{EVENT_WEBHOOK_HANDLER}}"));
     assert!(et.webhook_from_env.is_none());
@@ -359,7 +359,7 @@ definition:
     columns: '*'
 webhook_from_env: MY_HOOK
 ";
-    let et: dist_metadata::EventTrigger = serde_yaml::from_str(yaml).unwrap();
+    let et: donat_metadata::EventTrigger = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(et.webhook_from_env.as_deref(), Some("MY_HOOK"));
     assert!(et.webhook.is_none());
     assert!(et.definition.insert.is_some());
@@ -367,7 +367,7 @@ webhook_from_env: MY_HOOK
     assert!(et.definition.delete.is_none());
     assert!(et.retry_conf.is_none());
     // RetryConf defaults (Hasura): num_retries=0, interval_sec=10, timeout_sec=60.
-    let rc = dist_metadata::EventRetryConf::default();
+    let rc = donat_metadata::EventRetryConf::default();
     assert_eq!((rc.num_retries, rc.interval_sec, rc.timeout_sec), (0, 10, 60));
 }
 
@@ -381,7 +381,7 @@ event_triggers:
       insert: { columns: '*' }
     webhook: http://localhost/hook
 ";
-    let te: dist_metadata::TableEntry = serde_yaml::from_str(yaml).unwrap();
+    let te: donat_metadata::TableEntry = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(te.event_triggers.len(), 1);
     assert_eq!(te.event_triggers[0].name, "t1_all");
 }

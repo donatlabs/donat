@@ -4,7 +4,7 @@
 //! Two halves:
 //!
 //! - [`reconcile`] (deploy-time): creates/drops the per-table Postgres
-//!   triggers that capture row changes into `dist_api.event_log`. This is
+//!   triggers that capture row changes into `donat.event_log`. This is
 //!   DDL, so it runs from the `migrate` subcommand path — never from the
 //!   serving binary.
 //! - [`spawn`] (runtime): a background loop that delivers captured events to
@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value as Json, json};
 use tokio_postgres::NoTls;
 
-use dist_metadata::{Columns, EventTrigger, Metadata};
+use donat_metadata::{Columns, EventTrigger, Metadata};
 
 use crate::cron::resolve_headers;
 use crate::remote::resolve_url_template;
@@ -58,7 +58,7 @@ pub async fn reconcile(database_url: &str, metadata: &Metadata) -> anyhow::Resul
              FROM pg_trigger t \
              JOIN pg_class c ON c.oid = t.tgrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE NOT t.tgisinternal AND t.tgname LIKE 'dist_api_notify_%'",
+             WHERE NOT t.tgisinternal AND t.tgname LIKE 'donat_notify_%'",
             &[],
         )
         .await?;
@@ -102,7 +102,7 @@ fn create_statements(et: &EventTrigger, schema: &str, table: &str) -> Vec<Create
         let pg_name = trigger_pg_name(&et.name, op);
         let sql = format!(
             "CREATE OR REPLACE TRIGGER {name} {event_clause} ON {qtable} \
-             FOR EACH ROW EXECUTE FUNCTION dist_api.notify_event({arg})",
+             FOR EACH ROW EXECUTE FUNCTION donat.notify_event({arg})",
             name = quote_ident(&pg_name),
         );
         out.push(CreateStmt { pg_name, sql });
@@ -135,13 +135,13 @@ fn create_statements(et: &EventTrigger, schema: &str, table: &str) -> Vec<Create
 /// Postgres trigger name for `(trigger, op)`, kept within the 63-byte
 /// identifier limit.
 fn trigger_pg_name(trigger: &str, op: &str) -> String {
-    let base = format!("dist_api_notify_{trigger}_{op}");
+    let base = format!("donat_notify_{trigger}_{op}");
     if base.len() <= 63 {
         base
     } else {
         // Truncate the trigger portion, keep the op suffix unambiguous.
-        let keep = 63 - format!("dist_api_notify__{op}").len();
-        format!("dist_api_notify_{}_{op}", &trigger[..keep.min(trigger.len())])
+        let keep = 63 - format!("donat_notify__{op}").len();
+        format!("donat_notify_{}_{op}", &trigger[..keep.min(trigger.len())])
     }
 }
 
@@ -173,7 +173,7 @@ async fn run(state: SharedState) {
     if !has_triggers {
         return;
     }
-    let interval = std::env::var("DIST_API_EVENTS_POLL_SECONDS")
+    let interval = std::env::var("DONAT_EVENTS_POLL_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(10)
@@ -215,7 +215,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         .query(
             "SELECT id, trigger_name, schema_name, table_name, op, data_old, data_new, \
                     session_variables, tries, created_at \
-             FROM dist_api.event_log \
+             FROM donat.event_log \
              WHERE status = 'scheduled' \
                AND (next_retry_at IS NULL OR next_retry_at <= now()) \
              ORDER BY created_at \
@@ -240,7 +240,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         let Some(trigger) = triggers.get(&trigger_name) else {
             // Trigger removed from metadata: drop the orphaned event.
             tx.execute(
-                "UPDATE dist_api.event_log SET status = 'error' WHERE id = $1",
+                "UPDATE donat.event_log SET status = 'error' WHERE id = $1",
                 &[&id],
             )
             .await?;
@@ -265,7 +265,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         let success = http_status.map(|s| (200..300).contains(&s)).unwrap_or(false);
 
         tx.execute(
-            "INSERT INTO dist_api.event_invocation_logs (event_id, status, request, response) \
+            "INSERT INTO donat.event_invocation_logs (event_id, status, request, response) \
              VALUES ($1, $2, $3, $4)",
             &[&id, &http_status, &envelope, &response_body],
         )
@@ -273,7 +273,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
 
         if success {
             tx.execute(
-                "UPDATE dist_api.event_log SET status = 'delivered', tries = tries + 1 \
+                "UPDATE donat.event_log SET status = 'delivered', tries = tries + 1 \
                  WHERE id = $1",
                 &[&id],
             )
@@ -282,7 +282,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
             let new_tries = tries + 1;
             if new_tries > retry.num_retries as i32 {
                 tx.execute(
-                    "UPDATE dist_api.event_log SET status = 'error', tries = $2 WHERE id = $1",
+                    "UPDATE donat.event_log SET status = 'error', tries = $2 WHERE id = $1",
                     &[&id, &new_tries],
                 )
                 .await?;
@@ -290,7 +290,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
                 let next_retry =
                     Utc::now() + chrono::Duration::seconds(retry.interval_sec as i64);
                 tx.execute(
-                    "UPDATE dist_api.event_log SET tries = $2, next_retry_at = $3 WHERE id = $1",
+                    "UPDATE donat.event_log SET tries = $2, next_retry_at = $3 WHERE id = $1",
                     &[&id, &new_tries, &next_retry],
                 )
                 .await?;
@@ -338,7 +338,7 @@ async fn deliver(state: &SharedState, trigger: &EventTrigger, envelope: &Json) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dist_metadata::{EventTriggerDefinition, OperationSpec};
+    use donat_metadata::{EventTriggerDefinition, OperationSpec};
 
     fn trig(name: &str, def: EventTriggerDefinition) -> EventTrigger {
         EventTrigger {
@@ -370,7 +370,7 @@ mod tests {
         // Selected-column update fires only on that column.
         assert!(joined.contains("AFTER UPDATE OF \"c2\" ON"));
         assert!(joined.contains("AFTER DELETE ON"));
-        assert!(joined.contains("dist_api.notify_event('t1_all')"));
+        assert!(joined.contains("donat.notify_event('t1_all')"));
     }
 
     #[test]

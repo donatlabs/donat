@@ -6,14 +6,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use dist_metadata::{LoadError, load_metadata_dir};
+use donat_metadata::{LoadError, load_metadata_dir};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Unique scratch directory per test (std::env::temp_dir + pid + counter).
 fn tempdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "dist_metadata_loader_{tag}_{}_{}",
+        "donat_metadata_loader_{tag}_{}_{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

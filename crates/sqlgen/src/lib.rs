@@ -10,7 +10,7 @@
 //! and cast to the column's pg type. Parameterized execution can replace
 //! this later without touching the IR.
 
-use dist_ir::*;
+use donat_ir::*;
 
 /// Compile one operation: `SELECT json_build_object('field1', (...), ...)`.
 pub fn operation_to_sql(roots: &[RootField]) -> String {
@@ -757,7 +757,7 @@ fn geometry_sql(value: &Scalar, pg_type: &str) -> String {
 /// Compile one mutation root field into one SQL statement. The statement
 /// computes the GraphQL value of the field as a single `json` column named
 /// `root`. Permission check expressions are enforced in-statement via
-/// `dist_api.check_violation(...)`, which raises SQLSTATE 23514.
+/// `donat.check_violation(...)`, which raises SQLSTATE 23514.
 pub fn mutation_to_sql(root: &MutationRoot) -> String {
     mutation_to_sql_opts(root, false)
 }
@@ -957,7 +957,7 @@ impl Ctx {
                 })
                 .to_string();
                 format!(
-                    "CASE WHEN {violated} > 0 THEN dist_api.check_violation({}) ELSE {result} END",
+                    "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {result} END",
                     quote_lit(&payload)
                 )
             }

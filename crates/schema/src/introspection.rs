@@ -541,10 +541,10 @@ pub fn execute_introspection(
 /// column is NOT NULL (the referenced row is guaranteed to exist). Manual
 /// relationships are always nullable.
 fn object_rel_is_non_null(
-    rel: &dist_metadata::ObjectRelationship,
-    info: &dist_catalog::TableInfo,
+    rel: &donat_metadata::ObjectRelationship,
+    info: &donat_catalog::TableInfo,
 ) -> bool {
-    use dist_metadata::ObjRelFkColumns;
+    use donat_metadata::ObjRelFkColumns;
     let Some(fk) = &rel.using.foreign_key_constraint_on else {
         return false;
     };
