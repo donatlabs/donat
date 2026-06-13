@@ -42,6 +42,29 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
 
+  go-sdk:
+    name: Go SDK (cgo-free, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      # The hard packaging constraint (specs/003): the SDK must be
+      # go-get-able and statically buildable with no cgo.
+      - name: Build with cgo disabled
+        run: CGO_ENABLED=0 go build ./...
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: gofmt (must be clean)
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
   audit:
     name: Security advisories (cargo-audit)
     runs-on: ubuntu-latest
