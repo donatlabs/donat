@@ -24,6 +24,170 @@ pub struct Metadata {
     pub allowlist: Vec<AllowlistEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_schemas: Vec<RemoteSchema>,
+    /// Synchronous actions: custom GraphQL fields backed by an HTTP webhook.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionEntry>,
+    /// Custom GraphQL types referenced by action input/output.
+    #[serde(default, skip_serializing_if = "CustomTypes::is_empty")]
+    pub custom_types: CustomTypes,
+}
+
+/// A custom GraphQL field (query or mutation) resolved by calling an HTTP
+/// handler (webhook), with input/output shaped by [`CustomTypes`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActionEntry {
+    pub name: String,
+    pub definition: ActionDefinition,
+    /// Roles allowed to call the action. Empty = available to every role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<ActionPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActionDefinition {
+    /// `synchronous` (default) or `asynchronous`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `query` or `mutation` (default mutation).
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub action_type: Option<String>,
+    // `arguments: null` (no args) appears in exported metadata, so tolerate an
+    // explicit null as "empty", not just an absent key.
+    #[serde(
+        default,
+        deserialize_with = "null_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub arguments: Vec<ArgumentDefinition>,
+    /// GraphQL type reference for the result, e.g. `UserId` or `[UserId]`.
+    pub output_type: String,
+    /// Webhook URL ({{ENV}} templates allowed).
+    pub handler: String,
+    #[serde(default)]
+    pub forward_client_headers: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ActionHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+/// Deserialize a list that may be written as an explicit `null` (meaning
+/// "none"), as Hasura's exported action metadata sometimes does.
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ArgumentDefinition {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActionHeader {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_from_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActionPermission {
+    pub role: String,
+}
+
+/// The action type system: input objects, output objects (which may relate to
+/// tracked tables), custom scalars, and enums.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CustomTypes {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_objects: Vec<InputObjectType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ObjectType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scalars: Vec<ScalarType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enums: Vec<EnumType>,
+}
+
+impl CustomTypes {
+    pub fn is_empty(&self) -> bool {
+        self.input_objects.is_empty()
+            && self.objects.is_empty()
+            && self.scalars.is_empty()
+            && self.enums.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputObjectType {
+    pub name: String,
+    pub fields: Vec<CustomTypeField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObjectType {
+    pub name: String,
+    pub fields: Vec<CustomTypeField>,
+    /// Relationships from this output object to tracked tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<CustomTypeRelationship>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CustomTypeField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CustomTypeRelationship {
+    pub name: String,
+    /// `object` or `array`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub remote_table: QualifiedTable,
+    /// Output-object field -> remote-table column.
+    pub field_mapping: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScalarType {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnumType {
+    pub name: String,
+    pub values: Vec<EnumValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnumValue {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

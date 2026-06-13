@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value as Json, json};
 
+mod action_webhook;
+
 // ---------------------------------------------------------------- fixtures
 
 pub fn fixture_root() -> PathBuf {
@@ -315,6 +317,8 @@ fn empty_metadata() -> Metadata {
         query_collections: vec![],
         allowlist: vec![],
         remote_schemas: vec![],
+        actions: vec![],
+        custom_types: Default::default(),
     }
 }
 
@@ -330,6 +334,7 @@ pub struct Suite {
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
+    webhook: Option<action_webhook::EngineHandle>,
 }
 
 impl Suite {
@@ -339,7 +344,17 @@ impl Suite {
             env: vec![],
             args: vec![],
             admin_secret: None,
+            webhook: None,
         }
+    }
+
+    /// Start the action-webhook stub and expose its base URL to the engine as
+    /// `ACTION_WEBHOOK_HANDLER`, so action handler templates resolve to it.
+    pub fn with_action_webhook(mut self) -> Self {
+        let (base, handle) = action_webhook::spawn();
+        self.env.push(("ACTION_WEBHOOK_HANDLER".to_string(), base));
+        self.webhook = Some(handle);
+        self
     }
 
     /// Classes marked `@pytest.mark.admin_secret`: the engine gets
@@ -408,6 +423,7 @@ impl Suite {
             env: self.env,
             args: self.args,
             admin_secret: self.admin_secret,
+            webhook: self.webhook,
             db_url,
             metadata: RefCell::new(empty_metadata()),
             engine: RefCell::new(None),
@@ -433,6 +449,7 @@ pub struct Running {
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
+    webhook: Option<action_webhook::EngineHandle>,
     db_url: String,
     /// Accumulated metadata, applied lazily when the engine is spawned.
     metadata: RefCell<Metadata>,
@@ -920,6 +937,61 @@ impl Running {
                 }
             }
 
+            "set_custom_types" => {
+                let custom_types: dist_metadata::CustomTypes =
+                    serde_json::from_value(args.clone())
+                        .unwrap_or_else(|e| panic!("[{}] bad set_custom_types: {e}\n{op}", self.name));
+                self.metadata.borrow_mut().custom_types = custom_types;
+            }
+
+            "create_action" => {
+                let entry: dist_metadata::ActionEntry = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| panic!("[{}] bad create_action: {e}\n{op}", self.name));
+                let mut md = self.metadata.borrow_mut();
+                md.actions.retain(|a| a.name != entry.name);
+                md.actions.push(entry);
+            }
+
+            "update_action" => {
+                let entry: dist_metadata::ActionEntry = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| panic!("[{}] bad update_action: {e}\n{op}", self.name));
+                let mut md = self.metadata.borrow_mut();
+                // Preserve existing permissions across a definition update.
+                let permissions = md
+                    .actions
+                    .iter()
+                    .find(|a| a.name == entry.name)
+                    .map(|a| a.permissions.clone())
+                    .unwrap_or_default();
+                md.actions.retain(|a| a.name != entry.name);
+                md.actions.push(dist_metadata::ActionEntry { permissions, ..entry });
+            }
+
+            "drop_action" => {
+                let name = args["name"].as_str().expect("action name").to_string();
+                self.metadata.borrow_mut().actions.retain(|a| a.name != name);
+            }
+
+            "create_action_permission" => {
+                let action = args["action"].as_str().expect("action").to_string();
+                let role = args["role"].as_str().expect("role").to_string();
+                let mut md = self.metadata.borrow_mut();
+                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
+                    if !a.permissions.iter().any(|p| p.role == role) {
+                        a.permissions.push(dist_metadata::ActionPermission { role });
+                    }
+                }
+            }
+
+            "drop_action_permission" => {
+                let action = args["action"].as_str().expect("action").to_string();
+                let role = args["role"].as_str().expect("role").to_string();
+                let mut md = self.metadata.borrow_mut();
+                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
+                    a.permissions.retain(|p| p.role != role);
+                }
+            }
+
             "clear_metadata" => {
                 *self.metadata.borrow_mut() = empty_metadata();
             }
@@ -990,6 +1062,18 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.actions.is_empty() || !md.custom_types.is_empty() {
+            // Both live together in actions.yaml, the hasura-cli export layout.
+            let doc = json!({
+                "actions": md.actions,
+                "custom_types": md.custom_types,
+            });
+            std::fs::write(
+                dir.join("actions.yaml"),
+                serde_yaml::to_string(&doc).unwrap(),
+            )
+            .unwrap();
+        }
         dir
     }
 
@@ -1042,6 +1126,10 @@ impl Running {
                 self.name
             );
             std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let webhook callback endpoints reach the now-running engine.
+        if let Some(handle) = &self.webhook {
+            handle.set(&proc.base_url, self.admin_secret.clone());
         }
         *self.engine.borrow_mut() = Some(proc);
     }

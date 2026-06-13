@@ -1,0 +1,34 @@
+actions:
+- name: mirror
+  definition:
+    kind: synchronous
+    arguments:
+    - name: arg
+      type: InObject!
+    output_type: OutObject
+    handler: "{{ACTION_WEBHOOK_HANDLER}}/mirror-action"
+  permissions:
+  - role: user
+- name: null_response
+  definition:
+    kind: synchronous
+    arguments:
+    output_type: NullableResp
+    handler: "{{ACTION_WEBHOOK_HANDLER}}/null-response"
+custom_types:
+  input_objects:
+  - name: InObject
+    fields:
+    - name: id
+      type: ID
+    - name: name
+      type: String
+  objects:
+  - name: OutObject
+    fields:
+    - name: id
+      type: ID!
+    - name: name
+      type: String
+  scalars:
+  - name: myCustomScalar

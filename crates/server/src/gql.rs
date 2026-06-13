@@ -441,6 +441,21 @@ pub async fn execute_full(
             })),
         };
     }
+    // Action routing: an operation whose top-level fields are actions is
+    // resolved by calling the action's HTTP handler, not by SQL planning.
+    if let Some(ctx) = crate::action::match_action(&engine.metadata, &doc, operation_name) {
+        drop(engine);
+        return crate::action::resolve(
+            state,
+            session,
+            &ctx,
+            &doc,
+            &variables,
+            operation_name,
+            headers,
+        )
+        .await;
+    }
     // Allowlist gate: the query must structurally match a listed one
     // (__typename selections are ignored, like Hasura).
     if state.allowlist_enabled {

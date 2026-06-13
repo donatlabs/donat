@@ -9,6 +9,7 @@
 //! - migrate (DDL): `dist-api migrate --migrations-dir <dir>`
 //! - validate (metadata vs DB): `dist-api validate --metadata-dir <dir>`
 
+mod action;
 mod gql;
 mod jwt;
 mod migrate;
@@ -176,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
             query_collections: vec![],
             allowlist: vec![],
             remote_schemas: vec![],
+            actions: vec![],
+            custom_types: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);

@@ -1,0 +1,21 @@
+# Ported from tests-py with the `extensions.internal` diagnostic trimmed (see
+# mirror_action_not_null.yaml and tests/hasura/COVERAGE.md).
+description: Expected field not found in response
+url: /v1/graphql
+status: 200
+response:
+  errors:
+  - extensions:
+      path: $
+      code: unexpected
+    message: field "id" expected in webhook response, but not found
+query:
+  variables:
+    name: Alice
+  query: |
+    mutation ($name: String) {
+      mirror(arg: {name: $name}){
+        id
+        name
+      }
+    }

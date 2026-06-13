@@ -68,3 +68,25 @@ fn loads_v2_metadata_directory() {
     assert!(article_select.permission.allow_aggregations);
     assert!(article_select.permission.filter["_or"].is_array());
 }
+
+#[test]
+fn loads_actions_and_custom_types() {
+    let md = load_metadata_dir(fixture_dir()).expect("metadata should load");
+
+    assert_eq!(md.actions.len(), 2);
+    let mirror = &md.actions[0];
+    assert_eq!(mirror.name, "mirror");
+    assert_eq!(mirror.definition.output_type, "OutObject");
+    assert_eq!(mirror.definition.arguments.len(), 1);
+    assert_eq!(mirror.definition.arguments[0].type_, "InObject!");
+    assert_eq!(mirror.permissions[0].role, "user");
+
+    // `arguments:` written as an explicit null parses as "no arguments".
+    let null_response = &md.actions[1];
+    assert!(null_response.definition.arguments.is_empty());
+
+    assert_eq!(md.custom_types.input_objects.len(), 1);
+    assert_eq!(md.custom_types.objects.len(), 1);
+    assert_eq!(md.custom_types.objects[0].name, "OutObject");
+    assert_eq!(md.custom_types.scalars[0].name, "myCustomScalar");
+}

@@ -62,6 +62,11 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
             source,
         })?;
 
+    // Actions and their custom type system live together in `actions.yaml`,
+    // which has two top-level keys: `actions:` (a list) and `custom_types:`
+    // (a mapping). Both are optional. This mirrors the hasura-cli export.
+    let (actions, custom_types) = load_actions(dir)?;
+
     // Optional top-level sections, in the Hasura v3 export layout. Each file
     // is a list (with `!include` allowed); absent files mean "none". This is
     // what lets the whole metadata surface boot from the filesystem with no
@@ -73,7 +78,35 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         query_collections: load_section(dir, "query_collections.yaml")?,
         allowlist: load_section(dir, "allow_list.yaml")?,
         remote_schemas: load_section(dir, "remote_schemas.yaml")?,
+        actions,
+        custom_types,
     })
+}
+
+/// Load `actions.yaml`, which carries both the action list and the custom
+/// type system. Returns empties when the file is absent or blank.
+fn load_actions(
+    dir: &Path,
+) -> Result<(Vec<crate::types::ActionEntry>, crate::types::CustomTypes), LoadError> {
+    #[derive(Deserialize, Default)]
+    struct ActionsFile {
+        #[serde(default)]
+        actions: Vec<crate::types::ActionEntry>,
+        #[serde(default)]
+        custom_types: crate::types::CustomTypes,
+    }
+
+    let path = dir.join("actions.yaml");
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let value = load_yaml_resolved(&path)?;
+    if value.is_null() {
+        return Ok(Default::default());
+    }
+    let parsed: ActionsFile =
+        serde_yaml::from_value(value).map_err(|source| LoadError::Yaml { path, source })?;
+    Ok((parsed.actions, parsed.custom_types))
 }
 
 /// Load an optional top-level list section (`!include`-resolved). Returns an
