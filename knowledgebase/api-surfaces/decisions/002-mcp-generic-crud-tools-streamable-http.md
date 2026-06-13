@@ -51,3 +51,29 @@ REST — one deployment, one session-resolution path.
 - **Transport spec:** pin an MCP protocol version; prefer the maintained
   `rmcp` Rust SDK but keep the tool/translation layer SDK-agnostic so the
   transport can be swapped (R2).
+
+## Final implementation (Phase 3)
+
+- **Transport:** a hand-rolled JSON-RPC 2.0 handler at `POST /mcp` in
+  **JSON mode** — it answers a POST with a single `application/json` response;
+  no SSE response stream yet (`GET /mcp` returns 405). The `rmcp` SDK was
+  *not* adopted, matching the project's minimal-dependency ethos; the tool
+  layer stays SDK-agnostic so SSE/`rmcp` can be added later (R2).
+- **Protocol version:** `2025-06-18`. `initialize` advertises
+  `capabilities.tools`; the `notifications/initialized` notification (no `id`)
+  is acknowledged with an empty 200.
+- **Methods:** `initialize`, `tools/list`, `tools/call`; unknown method →
+  JSON-RPC `-32601`. Each tool call renders a parametrized GraphQL operation
+  (arguments passed as GraphQL *variables*, never inline literals) and runs
+  through `gql::execute_full` — role mandatory, permissions enforced, no admin
+  bypass. Only arguments the caller supplied are declared/referenced, because
+  the engine requires a value for any referenced variable without a default.
+- **Known limitations (v1):** only the Donat default root-field naming is used
+  (`<t>` for `public`, `<schema>_<t>` otherwise) — `custom_root_fields` /
+  `custom_name` are not honored by the tool layer; `list_tables` matches the
+  session role directly (inherited roles are not expanded).
+- **Conformance:** fixtures under `fixtures/mcp/` driven by
+  `tests/mcp_tools.rs`. The harness ignores the JSON-RPC `result.content`
+  (a text duplicate) when comparing `/mcp` responses, and also ignores
+  `structuredContent` on error results (engine-dependent GraphQL error detail);
+  the failure contract is `isError: true`.

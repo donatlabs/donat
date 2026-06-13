@@ -1,0 +1,53 @@
+type: bulk
+args:
+
+- type: run_sql
+  args:
+    sql: |
+      CREATE TABLE pet (
+        id INT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL
+      );
+
+      INSERT INTO pet (id, name, status) VALUES
+        (1, 'Rex', 'available'),
+        (2, 'Milo', 'pending'),
+        (3, 'Luna', 'available');
+
+- type: track_table
+  args:
+    schema: public
+    name: pet
+
+- type: create_select_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      filter: {}
+      columns: '*'
+
+- type: create_insert_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      check: {}
+      columns: '*'
+
+- type: create_update_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      columns: '*'
+      filter: {}
+      check: {}
+
+- type: create_delete_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      filter: {}

@@ -1,0 +1,105 @@
+description: >
+  tools/list returns the six generic CRUD + discovery tools, each with a
+  name, description, and JSON-Schema inputSchema. The full array is asserted
+  so all six tools (and their schemas) are verified to exist.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 2
+  method: tools/list
+  params: {}
+response:
+  jsonrpc: "2.0"
+  id: 2
+  result:
+    tools:
+    - name: list_tables
+      description: List the tables the current role may access, with the operations (select/insert/update/delete) permitted on each.
+      inputSchema:
+        type: object
+        properties: {}
+        additionalProperties: false
+    - name: describe_table
+      description: "Describe a table: its columns and types, relationships, and the columns the current role may select."
+      inputSchema:
+        type: object
+        properties:
+          table:
+            type: string
+            description: Base table name.
+        required: [table]
+        additionalProperties: false
+    - name: query
+      description: Read rows from a table with optional column selection, where-filter, order_by, limit and offset.
+      inputSchema:
+        type: object
+        properties:
+          table:
+            type: string
+          columns:
+            type: array
+            items:
+              type: string
+          where:
+            type: object
+          order_by:
+            description: An order_by object or array of objects.
+          limit:
+            type: integer
+          offset:
+            type: integer
+        required: [table]
+        additionalProperties: false
+    - name: insert
+      description: Insert one or more rows into a table. Returns affected_rows and the returning rows.
+      inputSchema:
+        type: object
+        properties:
+          table:
+            type: string
+          objects:
+            type: array
+            items:
+              type: object
+          returning:
+            type: array
+            items:
+              type: string
+        required: [table, objects]
+        additionalProperties: false
+    - name: update
+      description: Update rows matching a where-filter by setting columns. Returns affected_rows and the returning rows.
+      inputSchema:
+        type: object
+        properties:
+          table:
+            type: string
+          where:
+            type: object
+          set:
+            type: object
+          returning:
+            type: array
+            items:
+              type: string
+        required: [table, where, set]
+        additionalProperties: false
+    - name: delete
+      description: Delete rows matching a where-filter. Returns affected_rows and the returning rows.
+      inputSchema:
+        type: object
+        properties:
+          table:
+            type: string
+          where:
+            type: object
+          returning:
+            type: array
+            items:
+              type: string
+        required: [table, where]
+        additionalProperties: false

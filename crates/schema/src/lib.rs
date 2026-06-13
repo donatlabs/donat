@@ -19,4 +19,5 @@ mod predicate;
 mod v1;
 
 pub use introspection::execute_introspection;
+pub use naming::{default_base_name, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};

@@ -1479,11 +1479,24 @@ impl Running {
             pretty(&resp)
         );
 
+        // MCP (`/mcp`) responses are JSON-RPC: the `result.content` field is a
+        // human/text duplicate of `result.structuredContent` and is NOT part
+        // of the contract. Strip it from both expected and actual before
+        // comparing, so fixtures assert only the structured payload (plus
+        // protocolVersion / serverInfo / tools / isError / ...). GraphQL and
+        // REST comparison is unchanged.
+        let resp = if url == "/mcp" {
+            strip_mcp_content(&resp)
+        } else {
+            resp
+        };
+
         let query_text = conf_query_text(conf);
         if let Some(allowed) = conf.get("allowed_responses").and_then(Json::as_array) {
             let ok = allowed.iter().any(|a| {
                 a.get("response")
-                    .is_some_and(|exp| response_matches(exp, &resp, query_text))
+                    .map(|exp| if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() })
+                    .is_some_and(|exp| response_matches(&exp, &resp, query_text))
             });
             assert!(
                 ok,
@@ -1492,7 +1505,8 @@ impl Running {
                 pretty(&resp)
             );
         } else if let Some(exp) = conf.get("response") {
-            self.assert_response(exp, &resp, query_text, label);
+            let exp = if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() };
+            self.assert_response(&exp, &resp, query_text, label);
         }
     }
 
@@ -1609,6 +1623,29 @@ fn conf_query_text(conf: &Json) -> Option<&str> {
 
 fn pretty(v: &Json) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+/// Normalize a JSON-RPC `result` for MCP comparison by dropping fields that
+/// are not part of the conformance contract:
+///
+/// - `content` (always): a text duplicate of the structured data.
+/// - `structuredContent` *only when* `isError` is true: an error tool result's
+///   structured payload carries engine-dependent GraphQL error details, so the
+///   contract for a failure is just `isError: true`. On success,
+///   `structuredContent` (the real data) is kept and asserted.
+///
+/// Everything else (`isError`, `tools`, `protocolVersion`, `serverInfo`,
+/// `capabilities`, ...) is asserted as-is. GraphQL/REST comparison never calls
+/// this.
+fn strip_mcp_content(v: &Json) -> Json {
+    let mut out = v.clone();
+    if let Some(result) = out.get_mut("result").and_then(Json::as_object_mut) {
+        result.remove("content");
+        if result.get("isError") == Some(&Json::Bool(true)) {
+            result.remove("structuredContent");
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------------- tests

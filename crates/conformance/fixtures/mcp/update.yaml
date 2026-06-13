@@ -1,0 +1,34 @@
+description: >
+  tools/call update sets status on the rows matching the where-filter via
+  update_pet(where: $where, _set: $set); structuredContent holds
+  affected_rows and the returning rows.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 6
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        id:
+          _eq: 1
+      set:
+        status: sold
+      returning: [id, name, status]
+response:
+  jsonrpc: "2.0"
+  id: 6
+  result:
+    isError: false
+    structuredContent:
+      affected_rows: 1
+      returning:
+      - id: 1
+        name: Rex
+        status: sold

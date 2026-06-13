@@ -14,6 +14,7 @@ mod cron;
 mod events;
 mod gql;
 mod jwt;
+mod mcp;
 mod migrate;
 mod remote;
 mod rest;
@@ -260,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/relay", post(relay).get(ws::upgrade_relay))
         .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay))
         .route("/api/rest/{*path}", any(rest::dispatch))
+        .route("/mcp", post(mcp::dispatch).get(mcp::get_not_allowed))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
