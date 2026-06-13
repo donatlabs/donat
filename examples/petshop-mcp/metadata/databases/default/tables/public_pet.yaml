@@ -1,22 +1,38 @@
 table:
   name: pet
   schema: public
-# Per-column documentation, surfaced by the MCP `describe_table` tool (and as
-# the GraphQL field description if the GraphQL surface is enabled).
+# Per-column documentation. Written for an LLM consuming the MCP
+# `describe_table` tool: each comment states what the column means, its type
+# and units, the exact allowed values, and how to use it in filters/joins.
 configuration:
   column_config:
     id:
-      comment: Unique identifier for the pet.
+      comment: >-
+        Primary key of the pet. Auto-generated integer, unique per pet. Use it
+        to fetch a single pet (query with where {id: {_eq: N}}) or as the
+        target of order_item.pet_id.
     name:
-      comment: Display name of the pet.
+      comment: >-
+        The pet's display name shown in the catalogue, e.g. "Rex". Free text,
+        not unique — do not use it as an identifier.
     category_id:
-      comment: The category this pet belongs to (foreign key).
+      comment: >-
+        Foreign key to category.id (integer). The catalogue section this pet
+        belongs to (e.g. Dogs, Cats). Use the `category` object relationship to
+        read the category name instead of joining manually.
     price:
-      comment: Sale price in dollars.
+      comment: >-
+        Sale price in US dollars as a decimal number with two places, e.g.
+        350.00. Stored as SQL numeric. Always non-negative.
     status:
-      comment: "Availability: available, pending, or sold."
+      comment: >-
+        Availability of the pet. Exactly one of: "available" (can be ordered),
+        "pending" (reserved / in someone's cart), or "sold" (no longer for
+        sale). To list buyable pets filter where {status: {_eq: "available"}}.
     description:
-      comment: Free-text description shown in the catalogue.
+      comment: >-
+        Optional free-text marketing description shown in the catalogue. May be
+        null. Not meant for filtering.
 object_relationships:
   - name: category
     using:

@@ -1,16 +1,22 @@
 table:
   name: customer
   schema: public
-# Per-column documentation. Each comment is surfaced as the column field's
-# `description` in GraphQL introspection and in the MCP `describe_table` tool.
+# Per-column documentation. Written for an LLM consuming the MCP
+# `describe_table` tool (and surfaced as the GraphQL field description).
 configuration:
   column_config:
     id:
-      comment: Unique identifier for the customer.
+      comment: >-
+        Primary key of the customer. A TEXT value (not numeric) that equals the
+        X-Donat-User-Id session variable used for row-level auth: a `customer`
+        role may only read or edit the row whose id matches their own.
+        Referenced by orders.customer_id.
     name:
-      comment: The customer's full display name.
+      comment: The customer's full display name, e.g. "Alice Buyer". Free text.
     email:
-      comment: Contact email address; used for order confirmations.
+      comment: >-
+        Contact email address, unique across all customers; used for order
+        confirmations. Format: a valid email such as "alice@example.com".
 array_relationships:
   - name: orders
     using:

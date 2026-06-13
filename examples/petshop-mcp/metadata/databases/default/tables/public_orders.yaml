@@ -1,6 +1,25 @@
 table:
   name: orders
   schema: public
+# Per-column documentation for the MCP `describe_table` tool.
+configuration:
+  column_config:
+    id:
+      comment: >-
+        Primary key of the order: an auto-generated integer order number.
+        Referenced by order_item.order_id.
+    customer_id:
+      comment: >-
+        Foreign key to customer.id (TEXT) — the shopper who placed this order.
+        Use the `customer` object relationship to read the buyer's details.
+    status:
+      comment: >-
+        Fulfilment status. Exactly one of: "placed" (default for new orders),
+        "approved", "shipped", "delivered", or "cancelled".
+    created_at:
+      comment: >-
+        Timestamp with time zone when the order was created (defaults to now()).
+        Use it to sort or filter orders by recency.
 object_relationships:
   - name: customer
     using:

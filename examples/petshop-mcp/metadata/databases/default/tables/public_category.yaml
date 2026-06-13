@@ -1,6 +1,16 @@
 table:
   name: category
   schema: public
+# Per-column documentation for the MCP `describe_table` tool.
+configuration:
+  column_config:
+    id:
+      comment: >-
+        Primary key of the category. Auto-generated integer. Referenced by
+        pet.category_id.
+    name:
+      comment: >-
+        Unique catalogue section name, e.g. "Dogs", "Cats", "Birds", "Fish".
 array_relationships:
   - name: pets
     using:

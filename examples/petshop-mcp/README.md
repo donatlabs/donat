@@ -87,7 +87,9 @@ curl -s localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
         "name":"describe_table","arguments":{"table":"pet"}}}'
 # ... structuredContent.columns: [{"name":"status","type":"text","nullable":false,
-#     "description":"Availability: available, pending, or sold."}, ...]
+#     "description":"Availability of the pet. Exactly one of: \"available\" ..."}, ...]
+# The comments come from configuration.column_config.<col>.comment in the table
+# metadata — write them verbosely; the text is what an LLM reads to use a column.
 ```
 
 Query the inventory as staff (arguments are passed as GraphQL variables — a
