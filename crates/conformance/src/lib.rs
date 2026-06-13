@@ -239,7 +239,8 @@ use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
     FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
-    RemoteSchemaPermission, SelectPermission, Source, SourceKind, TableEntry, UpdatePermission,
+    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableEntry,
+    UpdatePermission,
 };
 
 fn workspace_root() -> PathBuf {
@@ -918,6 +919,17 @@ impl Running {
                     collection.definition.queries.retain(|q| q.name != qname);
                 }
             }
+            "create_rest_endpoint" => {
+                let endpoint: RestEndpoint = from_value("rest endpoint", &args);
+                self.metadata.borrow_mut().rest_endpoints.push(endpoint);
+            }
+            "drop_rest_endpoint" => {
+                let name = args["name"].as_str().expect("rest endpoint name").to_string();
+                self.metadata
+                    .borrow_mut()
+                    .rest_endpoints
+                    .retain(|e| e.name != name);
+            }
             "add_collection_to_allowlist" => {
                 let entry: AllowlistEntry = from_value("allowlist entry", &args);
                 self.metadata.borrow_mut().allowlist.push(entry);
@@ -1131,6 +1143,13 @@ impl Running {
             std::fs::write(
                 dir.join("cron_triggers.yaml"),
                 serde_yaml::to_string(&md.cron_triggers).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.rest_endpoints.is_empty() {
+            std::fs::write(
+                dir.join("rest_endpoints.yaml"),
+                serde_yaml::to_string(&md.rest_endpoints).unwrap(),
             )
             .unwrap();
         }
@@ -1422,9 +1441,33 @@ impl Running {
                     serde_json::from_str(&text).unwrap_or(Json::String(text)),
                 )
             }
-            _ => {
+            "POST" => {
                 let body = conf.get("query").or_else(|| conf.get("body")).cloned();
                 self.post(url, &body.unwrap_or(Json::Null), &headers)
+            }
+            // Other verbs (PUT/PATCH/DELETE) are used by REST endpoint
+            // fixtures; issue the real method against the engine. The
+            // admin-API interception only applies to POST paths, so these
+            // always reach the engine.
+            other => {
+                let m = reqwest::Method::from_bytes(other.as_bytes())
+                    .unwrap_or_else(|_| panic!("[{label}] bad method {other}"));
+                let mut req = self
+                    .http
+                    .request(m, format!("{}{url}", self.base_url()));
+                for (k, v) in &headers {
+                    req = req.header(k, v);
+                }
+                if let Some(body) = conf.get("body") {
+                    req = req.json(body);
+                }
+                let r = req.send().expect("http request failed");
+                let code = r.status().as_u16();
+                let text = r.text().unwrap_or_default();
+                (
+                    code,
+                    serde_json::from_str(&text).unwrap_or(Json::String(text)),
+                )
             }
         };
 

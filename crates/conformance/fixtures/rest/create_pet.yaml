@@ -1,0 +1,18 @@
+description: >
+  POST pet with a JSON body creates a row via the saved mutation, sourcing
+  $id/$name/$status from the body, and returns the inserted row.
+url: /api/rest/pet
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  id: 10
+  name: Biscuit
+  status: available
+response:
+  insert_pet:
+    returning:
+    - id: 10
+      name: Biscuit
+      status: available

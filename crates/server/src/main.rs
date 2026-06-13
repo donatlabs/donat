@@ -16,6 +16,7 @@ mod gql;
 mod jwt;
 mod migrate;
 mod remote;
+mod rest;
 mod state;
 mod ws;
 
@@ -28,7 +29,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use clap::Parser;
 use serde_json::{Value, json};
@@ -258,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1alpha1/graphql", post(graphql_legacy).get(ws::upgrade))
         .route("/v1/relay", post(relay).get(ws::upgrade_relay))
         .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay))
+        .route("/api/rest/{*path}", any(rest::dispatch))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
