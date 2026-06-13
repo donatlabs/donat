@@ -236,8 +236,8 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 use std::cell::RefCell;
 
 use dist_metadata::{
-    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, FunctionEntry,
-    FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
+    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
+    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
     RemoteSchemaPermission, SelectPermission, Source, SourceKind, TableEntry, UpdatePermission,
 };
@@ -339,6 +339,7 @@ pub struct Suite {
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
     cron: Option<cron_webhook::CronWebhook>,
+    event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
 }
 
@@ -351,6 +352,7 @@ impl Suite {
             admin_secret: None,
             webhook: None,
             cron: None,
+            event: None,
             run_migrations: false,
         }
     }
@@ -374,6 +376,22 @@ impl Suite {
         self.env
             .push(("DIST_API_CRON_POLL_SECONDS".to_string(), "1".to_string()));
         self.cron = Some(stub);
+        self.run_migrations = true;
+        self
+    }
+
+    /// Start the recording event webhook stub and expose its base URL to the
+    /// engine as `EVENT_WEBHOOK_HANDLER` (table event triggers reference it via
+    /// `webhook: "{{EVENT_WEBHOOK_HANDLER}}"`). Implies `with_migrations`
+    /// (which also reconciles the per-table trigger DDL) and sets a 1-second
+    /// poll interval so tests observe delivery quickly.
+    pub fn with_event_webhook(mut self) -> Self {
+        let stub = cron_webhook::spawn();
+        self.env
+            .push(("EVENT_WEBHOOK_HANDLER".to_string(), stub.base_url().to_string()));
+        self.env
+            .push(("DIST_API_EVENTS_POLL_SECONDS".to_string(), "1".to_string()));
+        self.event = Some(stub);
         self.run_migrations = true;
         self
     }
@@ -464,6 +482,7 @@ impl Suite {
             admin_secret: self.admin_secret,
             webhook: self.webhook,
             cron: self.cron,
+            event: self.event,
             run_migrations: self.run_migrations,
             db_url,
             metadata: RefCell::new(empty_metadata()),
@@ -492,6 +511,7 @@ pub struct Running {
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
     cron: Option<cron_webhook::CronWebhook>,
+    event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
     db_url: String,
     /// Accumulated metadata, applied lazily when the engine is spawned.
@@ -590,6 +610,7 @@ impl Running {
                 select_permissions: vec![],
                 update_permissions: vec![],
                 delete_permissions: vec![],
+                event_triggers: vec![],
             });
         }
         let entry = source
@@ -1132,19 +1153,23 @@ impl Running {
         if self.engine.borrow().is_some() {
             return;
         }
-        // Apply DDL (the dist_api catalog) before serving, like a real deploy.
+        let metadata_dir = self.write_metadata_dir();
+        // Apply DDL before serving, like a real deploy: the dist_api catalog
+        // (migrations) plus per-table event-trigger reconciliation from the
+        // metadata we are about to serve.
         if self.run_migrations {
             let migrations = workspace_root().join("migrations");
             let status = Command::new(engine_binary())
                 .arg("migrate")
                 .arg("--migrations-dir")
                 .arg(&migrations)
+                .arg("--metadata-dir")
+                .arg(&metadata_dir)
                 .env("DIST_API_DATABASE_URL", &self.db_url)
                 .status()
                 .expect("running dist-api migrate");
             assert!(status.success(), "dist-api migrate failed for suite {}", self.name);
         }
-        let metadata_dir = self.write_metadata_dir();
         let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -1230,6 +1255,24 @@ impl Running {
             "add_cron_trigger must be called before the engine spawns"
         );
         self.metadata.borrow_mut().cron_triggers.push(trigger);
+    }
+
+    /// The recording event webhook stub (only present after
+    /// [`Suite::with_event_webhook`]).
+    pub fn event_webhook(&self) -> &cron_webhook::CronWebhook {
+        self.event
+            .as_ref()
+            .expect("with_event_webhook() was not called on this suite")
+    }
+
+    /// Attach a table event trigger to a tracked table before the engine
+    /// spawns (so `migrate --metadata-dir` reconciles its Postgres triggers).
+    pub fn add_event_trigger(&self, table: &QualifiedTable, trigger: EventTrigger) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "add_event_trigger must be called before the engine spawns"
+        );
+        self.with_table(table, |t| t.event_triggers.push(trigger));
     }
 
     /// Issue an HTTP request against the (lazily spawned) engine. The

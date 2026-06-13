@@ -310,6 +310,83 @@ cron_triggers:
 }
 
 #[test]
+fn event_trigger_full_parse() {
+    // Hasura directory-format event trigger (under a table entry).
+    let yaml = "\
+name: t1_all
+definition:
+  enable_manual: false
+  insert:
+    columns: '*'
+  update:
+    columns: [c2]
+  delete:
+    columns: '*'
+retry_conf:
+  num_retries: 3
+  interval_sec: 5
+  timeout_sec: 30
+webhook: '{{EVENT_WEBHOOK_HANDLER}}'
+headers:
+  - name: X-Header
+    value: foo
+";
+    let et: dist_metadata::EventTrigger = serde_yaml::from_str(yaml).expect("event trigger loads");
+    assert_eq!(et.name, "t1_all");
+    assert_eq!(et.webhook.as_deref(), Some("{{EVENT_WEBHOOK_HANDLER}}"));
+    assert!(et.webhook_from_env.is_none());
+    assert!(!et.definition.enable_manual);
+    assert_eq!(et.definition.insert.unwrap().columns, Columns::Star);
+    assert_eq!(
+        et.definition.update.unwrap().columns,
+        Columns::List(vec!["c2".into()])
+    );
+    assert!(et.definition.delete.is_some());
+    let rc = et.retry_conf.unwrap();
+    assert_eq!(rc.num_retries, 3);
+    assert_eq!(rc.interval_sec, 5);
+    assert_eq!(rc.timeout_sec, 30);
+    assert_eq!(et.headers[0].name, "X-Header");
+}
+
+#[test]
+fn event_trigger_defaults_and_webhook_from_env() {
+    // Insert-only trigger, webhook from env, no retry_conf.
+    let yaml = "\
+name: insert_only
+definition:
+  insert:
+    columns: '*'
+webhook_from_env: MY_HOOK
+";
+    let et: dist_metadata::EventTrigger = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(et.webhook_from_env.as_deref(), Some("MY_HOOK"));
+    assert!(et.webhook.is_none());
+    assert!(et.definition.insert.is_some());
+    assert!(et.definition.update.is_none());
+    assert!(et.definition.delete.is_none());
+    assert!(et.retry_conf.is_none());
+    // RetryConf defaults (Hasura): num_retries=0, interval_sec=10, timeout_sec=60.
+    let rc = dist_metadata::EventRetryConf::default();
+    assert_eq!((rc.num_retries, rc.interval_sec, rc.timeout_sec), (0, 10, 60));
+}
+
+#[test]
+fn event_triggers_load_under_table_entry() {
+    let yaml = "\
+table: { schema: hge_tests, name: test_t1 }
+event_triggers:
+  - name: t1_all
+    definition:
+      insert: { columns: '*' }
+    webhook: http://localhost/hook
+";
+    let te: dist_metadata::TableEntry = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(te.event_triggers.len(), 1);
+    assert_eq!(te.event_triggers[0].name, "t1_all");
+}
+
+#[test]
 fn existing_fixture_directory_still_loads() {
     // Guard: the canonical on-disk fixture (string-spelled includes, the
     // hasura-cli layout) keeps loading through the public entry point.

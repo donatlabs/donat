@@ -218,8 +218,9 @@ async fn deliver(state: &SharedState, trigger: &CronTrigger, envelope: &Json) ->
 }
 
 /// Resolve header values: literal `value`, or `value_from_env` looked up at
-/// delivery time. Headers whose env var is unset are skipped.
-fn resolve_headers(headers: &[ActionHeader]) -> Vec<(String, String)> {
+/// delivery time. Headers whose env var is unset are skipped. Shared with
+/// table event-trigger delivery.
+pub(crate) fn resolve_headers(headers: &[ActionHeader]) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|h| {

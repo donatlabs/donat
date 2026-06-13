@@ -81,7 +81,11 @@ pub fn spawn() -> CronWebhook {
                         body,
                         headers,
                     });
-                    let status = if path.starts_with("/fail-then-ok") && prior == 0 {
+                    let status = if path.starts_with("/fail-then-ok") {
+                        // 500 on the first hit, 200 afterwards (retry → success).
+                        if prior == 0 { 500 } else { 200 }
+                    } else if path.starts_with("/fail") {
+                        // Always fails — exercises retry exhaustion.
                         500
                     } else {
                         200

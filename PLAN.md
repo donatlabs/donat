@@ -64,14 +64,17 @@ Next: websocket transport, `--hge-bin` harness mode (env-marked classes),
 GraphQL introspection, inherited roles, relay, v1 data API reads. Later:
 subscriptions, event triggers, actions, remote schemas.
 
-Done since: subscriptions, actions (sync), remote schemas (partial), and
-**cron (scheduled) triggers** — recurring webhooks from YAML, delivered by a
-background loop over a `dist_api` Postgres catalog (multi-pod safe via
-`ON CONFLICT` materialization + `FOR UPDATE SKIP LOCKED`, at-least-once). See
-`specs/001-cron-triggers.md` and
-`knowledgebase/embedded-sdk/decisions/006-cron-triggers-yaml-only.md`. Still
-out: table event triggers (insert/update/delete) and one-off scheduled
-events (would need a runtime create surface the no-admin posture rejects).
+Done since: subscriptions, actions (sync), remote schemas (partial),
+**cron (scheduled) triggers**, and **table event triggers**
+(insert/update/delete). Both deliver webhooks from YAML via a background loop
+over a `dist_api` Postgres catalog (multi-pod safe: `ON CONFLICT`/`FOR UPDATE
+SKIP LOCKED`, at-least-once). Event capture is in-transaction via per-table
+Postgres triggers created by `migrate --metadata-dir` (deploy-time DDL; the
+serving binary still runs no DDL). See `specs/001-cron-triggers.md`,
+`specs/002-event-triggers.md`, and ADRs 006/007. Still out: one-off scheduled
+events (need a runtime create surface the no-admin posture rejects), and
+event-trigger follow-ups (session vars, column-filtered payloads,
+manual/async/transform).
 
 ## Decisions and why
 

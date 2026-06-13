@@ -475,6 +475,85 @@ pub struct TableEntry {
     pub update_permissions: Vec<PermissionEntry<UpdatePermission>>,
     #[serde(default)]
     pub delete_permissions: Vec<PermissionEntry<DeletePermission>>,
+    /// Webhooks fired on row insert/update/delete (Hasura event triggers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_triggers: Vec<EventTrigger>,
+}
+
+/// A table event trigger: a webhook called when rows change. Field names
+/// match Hasura's directory-format `EventTriggerConf` so exported metadata
+/// loads without translation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EventTrigger {
+    pub name: String,
+    pub definition: EventTriggerDefinition,
+    /// Webhook URL ({{ENV}} templates allowed). Exactly one of `webhook` /
+    /// `webhook_from_env` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_from_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_conf: Option<EventRetryConf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ActionHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// Which operations fire the trigger, and which columns each carries.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EventTriggerDefinition {
+    /// Allow manually-invoked events (via the metadata API in Hasura; accepted
+    /// for round-trip fidelity).
+    #[serde(default)]
+    pub enable_manual: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert: Option<OperationSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<OperationSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<OperationSpec>,
+}
+
+/// Per-operation spec: which columns are delivered (and, for update, which
+/// columns trigger the event). `columns` is `"*"` or a list.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OperationSpec {
+    #[serde(default)]
+    pub columns: Columns,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Columns>,
+}
+
+/// Retry/timeout policy for event triggers (Hasura `RetryConf`). Note the
+/// field names differ from cron's `RetryConfST` (`interval_sec` /
+/// `timeout_sec` vs `retry_interval_seconds` / `timeout_seconds`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EventRetryConf {
+    #[serde(default)]
+    pub num_retries: u32,
+    #[serde(default = "default_interval_sec")]
+    pub interval_sec: u64,
+    #[serde(default = "default_event_timeout_sec")]
+    pub timeout_sec: u64,
+}
+
+impl Default for EventRetryConf {
+    fn default() -> Self {
+        EventRetryConf {
+            num_retries: 0,
+            interval_sec: default_interval_sec(),
+            timeout_sec: default_event_timeout_sec(),
+        }
+    }
+}
+
+fn default_interval_sec() -> u64 {
+    10
+}
+fn default_event_timeout_sec() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -119,15 +119,21 @@ has the per-suite detail.
 - **Actions** — done as above; *remaining:* output → remote-schema joins,
   request/response (Kriti) transforms, asynchronous actions, action
   introspection, response-header forwarding.
+- **Table event triggers** — webhooks on row insert/update/delete from YAML
+  (`event_triggers` under a table). In-transaction capture via per-table
+  Postgres triggers writing `dist_api.event_log` (created by `migrate
+  --metadata-dir` reconcile; the serving binary never runs DDL), delivered by
+  the shared event loop with the Hasura event envelope and `retry_conf`.
+  Native coverage in `crates/conformance/tests/event_triggers.rs`
+  (insert/update/delete payloads, retry→error). *Remaining:* session-variable
+  capture, column-filtered payloads, manual/async events, transforms (see
+  `specs/002-event-triggers.md`).
 
 ### Not planned (by design)
 
 - **No admin role / no runtime admin API** — no `run_sql`, no metadata
   mutation over HTTP. Configuration is deploy-time only (`migrate` + YAML).
   This is a deliberate security posture, not a gap.
-- **Table event triggers** — webhooks on row insert/update/delete. Not yet
-  built; would reuse the cron delivery machinery (journal + `FOR UPDATE SKIP
-  LOCKED` poller) with per-table Postgres triggers writing the event log.
 - **One-off scheduled events** — Hasura creates these via a runtime
   `create_scheduled_event` mutation, which contradicts the no-admin-API
   posture; out of scope unless declared as a deploy-time seed in YAML. (See

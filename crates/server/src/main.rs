@@ -11,6 +11,7 @@
 
 mod action;
 mod cron;
+mod events;
 mod gql;
 mod jwt;
 mod migrate;
@@ -75,6 +76,10 @@ struct MigrateArgs {
     /// Directory of `V{n}__name.sql` migration files.
     #[arg(long, default_value = "migrations")]
     migrations_dir: PathBuf,
+    /// If given, also reconcile table event-trigger DDL (per-table Postgres
+    /// triggers) from this metadata directory after applying SQL migrations.
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -124,6 +129,14 @@ async fn main() -> anyhow::Result<()> {
     match &args.command {
         Some(Command::Migrate(m)) => {
             migrate::run_migrate(&database_url, &m.migrations_dir).await?;
+            // Optional deploy-time DDL: reconcile per-table event-trigger
+            // Postgres triggers from the YAML metadata.
+            let md_dir = m.metadata_dir.clone().or_else(|| args.metadata_dir.clone());
+            if let Some(dir) = md_dir {
+                let metadata = dist_metadata::load_metadata_dir(&dir)?;
+                events::reconcile(&database_url, &metadata).await?;
+                tracing::info!(dir = %dir.display(), "event triggers reconciled");
+            }
             return Ok(());
         }
         Some(Command::Validate(v)) => {
@@ -233,6 +246,9 @@ async fn main() -> anyhow::Result<()> {
     // metadata declares any (then the `dist_api` catalog must exist — apply
     // `migrate` before serving).
     cron::spawn(state.clone());
+    // Background delivery of table event triggers. The per-table Postgres
+    // triggers that capture events are created by `migrate --metadata-dir`.
+    events::spawn(state.clone());
 
     let app = Router::new()
         .route("/healthz", get(healthz))
