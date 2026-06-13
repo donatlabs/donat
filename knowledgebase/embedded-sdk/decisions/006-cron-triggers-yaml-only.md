@@ -11,7 +11,7 @@ features:
 ## Context
 
 The user needs scheduled (cron) webhooks but explicitly does not want an
-admin role or any runtime mutation surface (see [[no-admin-role]]). Hasura v2
+admin role or any runtime mutation surface (see [[no-admin-role]]). Donat v2
 has two scheduled-trigger flavors: **cron triggers** (recurring, defined in
 metadata) and **one-off scheduled events** (created at runtime via the
 metadata API `create_scheduled_event`). The engine also runs as multiple
@@ -21,7 +21,7 @@ instances run the same loop.
 ## Decision
 
 Implement **cron triggers only**, configured in YAML metadata
-(`cron_triggers`, Hasura `CronTriggerMetadata` shape) and delivered by a
+(`cron_triggers`, Donat `CronTriggerMetadata` shape) and delivered by a
 background loop in the serving binary. The durable state lives in a Postgres
 catalog schema `donat` (tables `cron_events`,
 `cron_event_invocation_logs`), created by `migrate` — the serving binary
@@ -38,7 +38,7 @@ election:
    LOCKED`; delivery happens inside the claiming transaction. One instance
    delivers each event; a crash mid-delivery rolls the claim back and another
    instance redelivers. This is **at-least-once** — handlers must be
-   idempotent (same contract as Hasura).
+   idempotent (same contract as Donat).
 
 Time comparisons (`scheduled_time <= now()`, `next_retry_at`) use the
 database clock, the single source of truth across pods.

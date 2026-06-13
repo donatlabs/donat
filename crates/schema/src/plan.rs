@@ -15,14 +15,14 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::naming::{root_names, table_base_name};
 
-/// Per-request session: an explicit role + X-Hasura-* variables (keys
+/// Per-request session: an explicit role + X-Donat-* variables (keys
 /// lower-cased). There is no admin role — every access goes through an
 /// explicit per-role permission.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub role: String,
     pub vars: HashMap<String, String>,
-    /// True when x-hasura-use-backend-only-permissions enables
+    /// True when x-donat-use-backend-only-permissions enables
     /// backend_only mutation permissions for this request.
     pub backend_request: bool,
 }
@@ -54,7 +54,7 @@ impl PlanError {
         Self::new(path, "validation-failed", message)
     }
 
-    /// Hasura v2 GraphQL error body.
+    /// Donat v2 GraphQL error body.
     pub fn to_graphql(&self) -> Json {
         serde_json::json!({
             "errors": [{
@@ -168,7 +168,7 @@ impl<'a> TableCtx<'a> {
     }
 
     /// Whether the role may select at least one column. Roles with
-    /// `columns: []` still aggregate via count, but Hasura omits
+    /// `columns: []` still aggregate via count, but Donat omits
     /// column-typed arguments (e.g. `count(columns:)`) from their schema.
     pub(crate) fn any_column_allowed(&self) -> bool {
         self.info
@@ -191,7 +191,7 @@ impl<'a> TableCtx<'a> {
 }
 
 pub struct Planner<'a> {
-    /// When false (HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
+    /// When false (DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
     /// tracked functions need an explicit per-role permission entry.
     pub infer_function_permissions: bool,
     /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
@@ -773,7 +773,7 @@ impl<'a> Planner<'a> {
                     let Some(ctx) = self.table_ctx(idx, &session.role) else {
                         return Err(not_found());
                     };
-                    // Hasura omits <table>_by_pk from the role's schema unless
+                    // Donat omits <table>_by_pk from the role's schema unless
                     // the role may select every primary-key column.
                     if kind == RootKind::ByPk
                         && (ctx.info.primary_key.is_empty()
@@ -1330,7 +1330,7 @@ impl<'a> Planner<'a> {
                     ));
                 }
                 // Hidden columns carry the joining values.
-                for col in &rel.hasura_fields {
+                for col in &rel.donat_fields {
                     let hidden = format!("__rr__{col}");
                     if !out.iter().any(|f: &OutputField| f.alias == hidden) {
                         if let Some(info) = ctx.info.column(col) {
@@ -1556,7 +1556,7 @@ impl<'a> Planner<'a> {
                         match arg.as_str() {
                             "distinct" => distinct = value.as_bool().unwrap_or(false),
                             "columns" => {
-                                // Hasura omits the columns arg from count for
+                                // Donat omits the columns arg from count for
                                 // roles with no selectable columns.
                                 if !ctx.any_column_allowed() {
                                     return Err(PlanError::validation(
@@ -1990,7 +1990,7 @@ pub(crate) fn render_selection(
     Ok(format!("{{ {} }}", parts.join(" ")))
 }
 
-/// All session variables as the json object Hasura passes to
+/// All session variables as the json object Donat passes to
 /// session-aware SQL functions.
 pub(crate) fn session_json(session: &Session) -> String {
     let map: JsonMap<String, Json> = session

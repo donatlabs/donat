@@ -22,7 +22,7 @@
 
           type User {
             user_id: Int
-            gimmeText(text: String @preset(value: "x-hasura-gimme-text")): String
+            gimmeText(text: String @preset(value: "x-donat-gimme-text")): String
           }
 
           type Query {
@@ -34,8 +34,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: user
+    X-Donat-User-Id: '1'
   response:
     data:
       profiles:
@@ -57,9 +57,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '1'
-    X-Hasura-Gimme-Text: 'world'
+    X-Donat-Role: user
+    X-Donat-User-Id: '1'
+    X-Donat-Gimme-Text: 'world'
   response:
     data:
       profiles:
@@ -85,8 +85,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: user
+    X-Donat-User-Id: '1'
   response:
     errors:
       - extensions:

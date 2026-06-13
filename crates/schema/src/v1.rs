@@ -127,7 +127,7 @@ impl<'a> Planner<'a> {
                 }
                 Json::String(name) => {
                     if !ctx.column_allowed(name) {
-                        // Hasura distinguishes hidden vs unknown columns.
+                        // Donat distinguishes hidden vs unknown columns.
                         if ctx.info.column(name).is_some() {
                             return Err(PlanError::new(
                                 &format!("{path}.args.columns[{idx}]"),
@@ -227,7 +227,7 @@ impl<'a> Planner<'a> {
     ) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let table = parse_table(args, path)?;
-        // Hasura's count op reports the permission failure with its own shape.
+        // Donat's count op reports the permission failure with its own shape.
         let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
             PlanError::new(
                 "$.args",
@@ -483,7 +483,7 @@ impl<'a> Planner<'a> {
                 PlanError::new(
                     "$.args",
                     "permission-denied",
-                    // Hasura's exact v1 shape, trailing space included.
+                    // Donat's exact v1 shape, trailing space included.
                     format!(
                         "insert on \"{}\" for role \"{}\" is not allowed. ",
                         table.name(),
@@ -684,7 +684,7 @@ fn ctx_ref<'b, 'a>(ctx: &'b TableCtx<'a>) -> &'b TableCtx<'a> {
 
 fn resolve_preset(value: &Json, session: &Session) -> Result<Json, PlanError> {
     match value {
-        Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
             let v = session.var(s).ok_or_else(|| {
                 PlanError::new(
                     "$",

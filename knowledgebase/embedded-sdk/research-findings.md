@@ -37,7 +37,7 @@ created: 2026-06-12
 
 ## Honest coverage gaps
 
-- Research questions about Hasura/Supabase/PostGraphile delivery semantics,
+- Research questions about Donat/Supabase/PostGraphile delivery semantics,
   DuckDB/libSQL/wasmtime-go/wazero FFI designs, and the wasm/embedded-JS/CDC
   alternatives comparison did NOT survive verification — under-evidenced.
   Only PocketBase represents "backend engine with native hooks".

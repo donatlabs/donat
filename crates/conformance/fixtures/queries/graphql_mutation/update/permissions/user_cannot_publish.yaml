@@ -7,8 +7,8 @@ response:
       code: permission-error
     message: check constraint of an insert/update permission has failed
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '1'
+  X-Donat-Role: user
+  X-Donat-User-Id: '1'
 status: 200
 query:
   query: |

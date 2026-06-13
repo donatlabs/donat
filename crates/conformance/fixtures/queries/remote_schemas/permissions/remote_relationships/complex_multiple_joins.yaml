@@ -1,7 +1,7 @@
 - description: Many remote fields, etc with permissions, id=1
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: user
+    X-Donat-User-Id: '1'
   url: /v1/graphql
   status: 200
   response:
@@ -45,8 +45,8 @@
       }
 - description: Many remote fields, etc with permissions, id=2
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '2'
+    X-Donat-Role: user
+    X-Donat-User-Id: '2'
   url: /v1/graphql
   status: 200
   response:

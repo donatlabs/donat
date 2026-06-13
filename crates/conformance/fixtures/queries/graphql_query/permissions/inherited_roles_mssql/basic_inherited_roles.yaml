@@ -2,7 +2,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: editor
+    X-Donat-Role: editor
   response:
     errors:
     - extensions:
@@ -24,8 +24,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: author
-    x-hasura-author-id: '1'
+    X-Donat-Role: author
+    x-donat-author-id: '1'
   response:
     data:
       author:
@@ -54,7 +54,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: guest
+    X-Donat-Role: guest
   response:
     errors:
     - extensions:
@@ -78,7 +78,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: guest
+    X-Donat-Role: guest
   response:
    errors:
    - extensions:
@@ -99,7 +99,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: guest
+    X-Donat-Role: guest
   response:
     errors:
     - extensions:
@@ -119,8 +119,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: author
-    X-Hasura-Author-Id: '1'
+    X-Donat-Role: author
+    X-Donat-Author-Id: '1'
   response:
     data:
       article:
@@ -152,8 +152,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: author_and_editor
-    X-Hasura-Author-Id: '1'
+    X-Donat-Role: author_and_editor
+    X-Donat-Author-Id: '1'
   response:
     data:
       author:
@@ -181,7 +181,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    x-hasura-role: limited_retrieval
+    x-donat-role: limited_retrieval
   query:
     query: |
       query {
@@ -203,8 +203,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    x-hasura-role: permissions_with_custom_check
-    x-hasura-user-id: "2"
+    x-donat-role: permissions_with_custom_check
+    x-donat-user-id: "2"
   query:
     query: |
       query {
@@ -232,8 +232,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    x-hasura-role: permissions_with_custom_check
-    x-hasura-user-id: "3"
+    x-donat-role: permissions_with_custom_check
+    x-donat-user-id: "3"
   query:
     query: |
       query {

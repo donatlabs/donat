@@ -45,7 +45,7 @@ create index if not exists event_invocation_logs_event_idx
 
 -- Generic capture function, shared by every per-table trigger. The trigger
 -- name is passed as the first trigger argument (TG_ARGV[0]); old/new rows are
--- captured as jsonb. Session variables, when the engine sets the `hasura.user`
+-- captured as jsonb. Session variables, when the engine sets the `donat.user`
 -- GUC inside the mutation transaction, are captured too (NULL otherwise).
 create or replace function donat.notify_event() returns trigger
 language plpgsql as $$
@@ -66,7 +66,7 @@ begin
         (trigger_name, schema_name, table_name, op, data_old, data_new, session_variables)
     values
         (tg_argv[0], tg_table_schema, tg_table_name, tg_op, v_old, v_new,
-         nullif(current_setting('hasura.user', true), '')::jsonb);
+         nullif(current_setting('donat.user', true), '')::jsonb);
 
     return null;
 end;

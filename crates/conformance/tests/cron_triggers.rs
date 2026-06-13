@@ -86,7 +86,7 @@ fn received_for(cw: &CronWebhook, path: &str) -> Vec<Received> {
 }
 
 #[test]
-fn cron_event_fires_and_delivers_the_hasura_envelope() {
+fn cron_event_fires_and_delivers_the_donat_envelope() {
     let s = Suite::new("cron_deliver").with_cron_webhook().start();
     s.add_cron_trigger(cron_trigger(
         "reminders",

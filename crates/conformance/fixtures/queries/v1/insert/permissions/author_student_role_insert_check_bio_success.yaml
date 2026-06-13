@@ -9,7 +9,7 @@ responose:
     is_registered: false
     bio: Electrical Engineering
 headers:
-  X-Hasura-Role: student
+  X-Donat-Role: student
 query:
   type: insert
   args:

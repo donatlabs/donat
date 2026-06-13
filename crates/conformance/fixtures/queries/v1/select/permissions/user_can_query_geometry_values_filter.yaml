@@ -2,7 +2,7 @@ description: User can query geometry values which satisfies filter in select per
 url: /v1/query
 status: 200
 headers:
-  X-Hasura-Role: user1
+  X-Donat-Role: user1
 response:
 - id: 3
   type: linestring

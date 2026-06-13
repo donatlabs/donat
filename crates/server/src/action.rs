@@ -1,4 +1,4 @@
-//! Hasura Actions: custom GraphQL fields resolved by an HTTP webhook.
+//! Donat Actions: custom GraphQL fields resolved by an HTTP webhook.
 //!
 //! A top-level action field maps to a webhook call. The engine POSTs
 //! `{action: {name}, input: {<args>}, session_variables: {...}}` to the
@@ -146,9 +146,9 @@ async fn call_action(
         input.insert(name.clone(), value_to_json(value, variables));
     }
 
-    // Session variables, as Hasura passes them (x-hasura-* lowercased).
+    // Session variables, as Donat passes them (x-donat-* lowercased).
     let mut session_vars = JsonMap::new();
-    session_vars.insert("x-hasura-role".into(), Json::String(session.role.clone()));
+    session_vars.insert("x-donat-role".into(), Json::String(session.role.clone()));
     for (k, v) in &session.vars {
         session_vars.insert(k.clone(), Json::String(v.clone()));
     }
@@ -164,7 +164,7 @@ async fn call_action(
     if action.definition.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-hasura-") || name == "authorization" {
+            if name.starts_with("x-donat-") || name == "authorization" {
                 if let Ok(value) = value.to_str() {
                     req = req.header(name, value);
                 }
@@ -185,7 +185,7 @@ async fn call_action(
     let status = response.status();
     let body: Json = response.json().await.unwrap_or(Json::Null);
 
-    // A non-2xx handler response is an action error. Hasura surfaces the
+    // A non-2xx handler response is an action error. Donat surfaces the
     // handler body's `message`, and for the error `extensions`:
     //   * if the body carries an `extensions` object, use it verbatim;
     //   * otherwise build `{ path, code }`, taking `code` from the body's
@@ -212,7 +212,7 @@ async fn call_action(
     let ty = parse_type(&action.definition.output_type);
     let mut shaped = match validate(custom_types, &ty, &body, &field.selection_set.items) {
         Ok(value) => value,
-        // Output-shape errors are reported at the top level, like Hasura.
+        // Output-shape errors are reported at the top level, like Donat.
         Err(message) => return Err(err("$", "unexpected", message)),
     };
     // Output objects may declare relationships to tracked tables; resolve them
@@ -339,7 +339,7 @@ async fn resolve_relationship(
 }
 
 /// The GraphQL base name of a table: bare name for `public`, else
-/// `<schema>_<name>` (Hasura's default; custom names are not handled here).
+/// `<schema>_<name>` (Donat's default; custom names are not handled here).
 fn table_base_name(table: &QualifiedTable) -> String {
     match table.schema() {
         "public" => table.name().to_string(),
@@ -390,7 +390,7 @@ fn parse_type(s: &str) -> TypeRef {
 }
 
 /// Validate (and shape) a webhook value against an output type and selection
-/// set, reproducing Hasura's response-checking error messages.
+/// set, reproducing Donat's response-checking error messages.
 fn validate(
     custom_types: &CustomTypes,
     ty: &TypeRef,

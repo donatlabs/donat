@@ -3,7 +3,7 @@ name = "donat-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP server exposing the Hasura v2 API surface (/v1/graphql, /healthz, /v1/version)"
+description = "HTTP server exposing the Donat v2 API surface (/v1/graphql, /healthz, /v1/version)"
 
 [[bin]]
 name = "donat"

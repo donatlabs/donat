@@ -2,7 +2,7 @@ description: Query function as a role without permission being configured for th
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 response:
   errors:
     - extensions:

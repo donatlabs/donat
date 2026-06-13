@@ -1,4 +1,4 @@
-//! Hasura v2 GraphQL naming for tracked tables.
+//! Donat v2 GraphQL naming for tracked tables.
 
 use donat_metadata::{QualifiedTable, TableEntry};
 

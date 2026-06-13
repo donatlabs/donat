@@ -73,7 +73,7 @@ fn user_session() -> Session {
     Session {
         role: "user".into(),
         vars: std::collections::HashMap::from([(
-            "x-hasura-user-id".to_string(),
+            "x-donat-user-id".to_string(),
             "1".to_string(),
         )]),
         backend_request: false,
@@ -252,7 +252,7 @@ fn injection_payload_in_session_var_is_escaped() {
     let session = Session {
         role: "user".into(),
         vars: std::collections::HashMap::from([(
-            "x-hasura-user-id".to_string(),
+            "x-donat-user-id".to_string(),
             "1' OR '1'='1".to_string(),
         )]),
         backend_request: false,
@@ -313,5 +313,5 @@ fn missing_session_variable_errors() {
     let err = planner
         .plan(&doc, None, &serde_json::Map::new(), &session)
         .expect_err("session var required by the row filter");
-    assert_eq!(err.message, "missing session variable: \"x-hasura-user-id\"");
+    assert_eq!(err.message, "missing session variable: \"x-donat-user-id\"");
 }

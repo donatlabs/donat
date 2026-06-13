@@ -83,7 +83,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article insert and udpate permission for user
@@ -93,7 +93,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 - type: create_update_permission
   args:
@@ -102,7 +102,7 @@ args:
     permission:
       columns: '*'
       filter:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Author select permission for user
 - type: create_select_permission
@@ -115,7 +115,7 @@ args:
       - name
       - is_registered
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Author insert and update permission for user
 #Only admin can set is_registered to true
@@ -126,7 +126,7 @@ args:
     permission:
       check:
         $and:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - is_registered: false
 
 - type: create_update_permission
@@ -137,7 +137,7 @@ args:
       columns: '*'
       filter:
         $and:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - is_registered: false
 
 #Author insert permission for student
@@ -158,7 +158,7 @@ args:
     role: resident
     permission:
       check:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 
 - type: create_update_permission
   args:
@@ -167,7 +167,7 @@ args:
     permission:
       columns: '*'
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 - type: create_select_permission
   args:
     table: resident
@@ -175,5 +175,5 @@ args:
     permission:
       columns: '*'
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 

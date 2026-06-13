@@ -47,14 +47,14 @@ args:
         - name
         - score
       filter:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
 
 - type: pg_track_function
   args:
     function: add_to_score
     configuration:
       exposed_as: mutation
-      session_argument: hasura_session
+      session_argument: donat_session
 
 - type: pg_create_function_permission
   args:

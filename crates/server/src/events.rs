@@ -1,4 +1,4 @@
-//! Table event triggers: webhooks fired when rows change (Hasura event
+//! Table event triggers: webhooks fired when rows change (Donat event
 //! triggers), configured deploy-time in YAML under each table.
 //!
 //! Two halves:
@@ -8,7 +8,7 @@
 //!   DDL, so it runs from the `migrate` subcommand path — never from the
 //!   serving binary.
 //! - [`spawn`] (runtime): a background loop that delivers captured events to
-//!   their webhook with the Hasura event envelope, retries per `retry_conf`,
+//!   their webhook with the Donat event envelope, retries per `retry_conf`,
 //!   and records invocation logs. Reuses the same claim pattern as cron
 //!   (`FOR UPDATE SKIP LOCKED`), so it is multi-instance safe and
 //!   at-least-once.

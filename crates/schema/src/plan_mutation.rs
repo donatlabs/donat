@@ -15,7 +15,7 @@ use crate::plan::{
 
 impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
-    /// backend_only)? Hasura reports "no mutations exist" when not.
+    /// backend_only)? Donat reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
@@ -58,7 +58,7 @@ impl<'a> Planner<'a> {
             }
             let path = format!("$.selectionSet.{}", field.name);
             let not_found = || {
-                // Hasura reports an empty mutation_root differently.
+                // Donat reports an empty mutation_root differently.
                 if !self.role_has_any_mutation(session) {
                     PlanError::validation("$", "no mutations exist")
                 } else {
@@ -211,7 +211,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",
@@ -341,7 +341,7 @@ impl<'a> Planner<'a> {
                     let Some(info) = ctx.info.column(col) else { continue };
                     let resolved = match value {
                         Json::String(s)
-                            if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") =>
+                            if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
                         {
                             let v = session.var(s).ok_or_else(|| {
                                 PlanError::new(
@@ -479,7 +479,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",

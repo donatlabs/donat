@@ -2,8 +2,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: free_user_in
-    X-Hasura-free-artists: "{Camilla,DSP}"
+    X-Donat-Role: free_user_in
+    X-Donat-free-artists: "{Camilla,DSP}"
   response:
     data:
       Artist:
@@ -21,8 +21,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: free_user_in
-    X-Hasura-free-artists: "{}"
+    X-Donat-Role: free_user_in
+    X-Donat-free-artists: "{}"
   response:
     data:
       Artist: []
@@ -38,8 +38,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: free_user_nin
-    X-Hasura-premium-artists: "{Akon}"
+    X-Donat-Role: free_user_nin
+    X-Donat-premium-artists: "{Akon}"
   response:
     data:
       Artist:
@@ -57,8 +57,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: free_user_nin
-    X-Hasura-premium-artists: "{}"
+    X-Donat-Role: free_user_nin
+    X-Donat-premium-artists: "{}"
   response:
     data:
       Artist:

@@ -1,6 +1,6 @@
 //! Native conformance harness.
 //!
-//! Executes Hasura-derived YAML fixtures (`crates/conformance/fixtures`)
+//! Executes Donat-derived YAML fixtures (`crates/conformance/fixtures`)
 //! against a freshly spawned `donat` instance, replicating the semantics
 //! of tests-py `check_query_f`: same fixture format (`url`, `status`,
 //! `headers`, `query`, `response`, list-of-steps files, `!include`), same
@@ -31,7 +31,7 @@ pub fn fixture_root() -> PathBuf {
 }
 
 /// Load a fixture YAML into JSON, resolving `!include <file>` (both the real
-/// YAML tag and the quoted-string spelling hasura-cli produces) relative to
+/// YAML tag and the quoted-string spelling donat-cli produces) relative to
 /// the including file.
 pub fn load_fixture(path: &Path) -> Result<Json> {
     let text = std::fs::read_to_string(path)
@@ -415,12 +415,12 @@ impl Suite {
     }
 
     /// Classes marked `@pytest.mark.admin_secret`: the engine gets
-    /// HASURA_GRAPHQL_ADMIN_SECRET and every request carries the secret
+    /// DONAT_GRAPHQL_ADMIN_SECRET and every request carries the secret
     /// header (mirroring tests-py `add_auth`).
     pub fn admin_secret(mut self, secret: &str) -> Self {
         self.admin_secret = Some(secret.to_string());
         self.env.push((
-            "HASURA_GRAPHQL_ADMIN_SECRET".to_string(),
+            "DONAT_GRAPHQL_ADMIN_SECRET".to_string(),
             secret.to_string(),
         ));
         self
@@ -1134,7 +1134,7 @@ impl Running {
             .unwrap();
         }
         if !md.actions.is_empty() || !md.custom_types.is_empty() {
-            // Both live together in actions.yaml, the hasura-cli export layout.
+            // Both live together in actions.yaml, the donat-cli export layout.
             let doc = json!({
                 "actions": md.actions,
                 "custom_types": md.custom_types,
@@ -1308,7 +1308,7 @@ impl Running {
 
     fn auth_headers(&self, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
         if let Some(secret) = &self.admin_secret {
-            headers.push(("X-Hasura-Admin-Secret".to_string(), secret.clone()));
+            headers.push(("X-Donat-Admin-Secret".to_string(), secret.clone()));
         }
         headers
     }

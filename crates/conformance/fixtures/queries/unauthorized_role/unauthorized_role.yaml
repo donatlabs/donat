@@ -2,7 +2,7 @@ description: Make request with role header value as admin
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: 'admin'
+  X-Donat-Role: 'admin'
 response:
   data:
     user:

@@ -16,7 +16,7 @@ insert_permissions:
       check:
         order:
           customer_id:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
       columns:
         - order_id
         - pet_id
@@ -30,7 +30,7 @@ select_permissions:
       filter:
         order:
           customer_id:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
   - role: staff
     permission:
       columns: "*"

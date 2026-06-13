@@ -11,7 +11,7 @@ features:
 ## Context
 
 Table event triggers (webhooks on row insert/update/delete) are required for
-Hasura v2 parity. Hasura creates them at runtime via the `create_event_trigger`
+Donat v2 parity. Donat creates them at runtime via the `create_event_trigger`
 metadata API, which also issues the `CREATE TRIGGER` DDL on the user table.
 This engine has no admin/runtime API and a hard rule that **the serving binary
 never runs DDL** (see [[no-admin-role]]). Yet event capture fundamentally needs
@@ -21,7 +21,7 @@ transaction (see [[hooks-and-events]] and
 
 ## Decision
 
-Declare event triggers in YAML under the table (`event_triggers`, Hasura's
+Declare event triggers in YAML under the table (`event_triggers`, Donat's
 directory-format `EventTriggerConf`). Split the work by lifetime:
 
 - **Capture (DDL) is deploy-time.** A migration creates the `donat`
@@ -55,6 +55,6 @@ Event triggers are fully deploy-time: `migrate --metadata-dir` is now the one
 place trigger DDL is reconciled, composing with the existing migrate→validate
 →serve order. Delivery shares cron's code and guarantees. Open items
 (tracked in `specs/002-event-triggers.md`): session-variable capture (needs a
-`SET LOCAL hasura.user` wrapper on triggered mutations — a deviation from the
+`SET LOCAL donat.user` wrapper on triggered mutations — a deviation from the
 single-statement model, applied only when a trigger exists), column-filtered
 payloads, manual/async/transform features, and multi-source reconcile.

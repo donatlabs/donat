@@ -2,8 +2,8 @@ description: Search tracks of an artist
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: Artist
-  X-Hasura-Artist-Id: '1'
+  X-Donat-Role: Artist
+  X-Donat-Artist-Id: '1'
 response:
   data:
     search_tracks:

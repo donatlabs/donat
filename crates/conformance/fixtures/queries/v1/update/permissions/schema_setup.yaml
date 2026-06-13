@@ -77,7 +77,7 @@ args:
     permission:
       columns: '*'
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Article select permission for user
 - type: create_select_permission
@@ -88,7 +88,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 
@@ -107,7 +107,7 @@ args:
       - version
       filter:
         $and:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: false
 
 
@@ -151,4 +151,4 @@ args:
       filter: {}
       columns: '*'
       set:
-        city: X-Hasura-City
+        city: X-Donat-City

@@ -1,4 +1,4 @@
-//! Hasura v2-compatible metadata: the typed model and the YAML directory
+//! Donat v2-compatible metadata: the typed model and the YAML directory
 //! loader. This crate is the single source of truth for "what the user
 //! configured"; everything downstream (schema generation, permissions,
 //! sqlgen) consumes these types and never re-reads YAML.

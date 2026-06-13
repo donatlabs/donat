@@ -11,7 +11,7 @@ args:
     role: user
     permission:
       set:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
       check: {}
       columns: '*'
 
@@ -22,7 +22,7 @@ args:
     role: user1
     permission:
       set:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
       check: {}
       columns: '*'
 

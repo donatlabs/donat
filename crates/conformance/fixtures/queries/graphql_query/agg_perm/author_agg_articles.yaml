@@ -2,7 +2,7 @@ description: Query aggregations on author along with it's articles with user rol
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 response:
   data:
    author_aggregate:

@@ -10,7 +10,7 @@ args:
 
     insert into "user" (name, score) values ('user 1', 143), ('user 2', 132);
 
-    CREATE FUNCTION add_to_score(hasura_session json, search text, increment integer default 1)
+    CREATE FUNCTION add_to_score(donat_session json, search text, increment integer default 1)
     RETURNS SETOF "user" AS $$
         UPDATE "user"
         SET score = score + increment
@@ -18,5 +18,5 @@ args:
         RETURNING id,
                   name,
                   score,
-                  hasura_session->>'x-hasura-role' AS role_echo
+                  donat_session->>'x-donat-role' AS role_echo
       $$ LANGUAGE sql VOLATILE;

@@ -2,7 +2,7 @@ description: Query author along with posts with order by posts count
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 response:
   data:
     author:

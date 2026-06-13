@@ -38,7 +38,7 @@ the project's deploy model:
 |--------------|----------------------------------------------------|
 | `category`   | Catalogue sections (Dogs, Cats, …)                 |
 | `pet`        | Items for sale, with `status` available/pending/sold |
-| `customer`   | Shoppers; `id` is the `X-Hasura-User-Id` value     |
+| `customer`   | Shoppers; `id` is the `X-Donat-User-Id` value     |
 | `orders`     | A customer's order with a fulfilment `status`      |
 | `order_item` | Line items linking an order to pets                |
 
@@ -55,9 +55,9 @@ Relationships: `pet.category`, `category.pets`, `orders.customer`,
 
 There is **no admin role**: every request runs as one of the roles above,
 each scoped by its explicit permissions. `anonymous` is the
-`HASURA_GRAPHQL_UNAUTHORIZED_ROLE` — any request with no/role-less auth falls
+`DONAT_GRAPHQL_UNAUTHORIZED_ROLE` — any request with no/role-less auth falls
 back to it. The secret `petshop-secret` (see `docker-compose.yml`) marks a
-request as *trusted* so it may assert a role via the `X-Hasura-Role` header (a
+request as *trusted* so it may assert a role via the `X-Donat-Role` header (a
 demo stand-in for edge auth); a trusted request must still name a role. In
 production, issue JWTs instead of passing roles by hand.
 
@@ -81,9 +81,9 @@ curl -s localhost:8080/v1/graphql -H 'content-type: application/json' -d '{
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: customer' \
-  -H 'x-hasura-user-id: 1' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' \
+  -H 'x-donat-user-id: 1' \
   -d '{ "query": "{ customer { name email orders { id status items { quantity pet { name } } } } }" }'
 ```
 
@@ -96,9 +96,9 @@ shoppers cannot order on someone else's behalf):
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: customer' \
-  -H 'x-hasura-user-id: 1' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' \
+  -H 'x-donat-user-id: 1' \
   -d '{ "query": "mutation { insert_orders_one(object: {status: \"placed\"}) { id customer_id status } }" }'
 ```
 
@@ -110,16 +110,16 @@ order's fulfilment status:
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: staff' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: staff' \
   -d '{ "query": "mutation { update_orders(where: {id: {_eq: 1}}, _set: {status: \"shipped\"}) { affected_rows } }" }'
 ```
 
 > A request with **no** role — even with the secret — runs as `anonymous`
 > (the unauthorized-role fallback); there is no admin role or bypass. To read
-> across all customers, ask as `staff`. (If `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`
+> across all customers, ask as `staff`. (If `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
 > were unset, a trusted role-less request would instead be rejected with
-> `x-hasura-role header is required`.)
+> `x-donat-role header is required`.)
 
 ## Reset
 

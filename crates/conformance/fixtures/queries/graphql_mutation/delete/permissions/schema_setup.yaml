@@ -73,7 +73,7 @@ args:
     permission:
       filter:
         $and:
-          - id: X-HASURA-USER-ID
+          - id: X-DONAT-USER-ID
           - payments_done: true
 
 #Author select permission for user
@@ -84,7 +84,7 @@ args:
     permission:
       columns: [id, name, payments_done]
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #A user can delete only his articles
 - type: create_select_permission
@@ -99,7 +99,7 @@ args:
       - author_id
       filter:
         $and:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
 
 #A user can delete only his articles
 - type: create_delete_permission
@@ -109,7 +109,7 @@ args:
     permission:
       filter:
         $and:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
 
 #Create resident table
 - type: track_table
@@ -123,7 +123,7 @@ args:
     role: resident
     permission:
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 
 - type: create_delete_permission
   args:
@@ -132,7 +132,7 @@ args:
     permission:
       filter:
         id:
-          $in: X-Hasura-Allowed-Resident-Ids
+          $in: X-Donat-Allowed-Resident-Ids
 
 - type: create_select_permission
   args:
@@ -145,7 +145,7 @@ args:
       - age
       filter:
         id:
-          $in: X-Hasura-Allowed-Resident-Ids
+          $in: X-Donat-Allowed-Resident-Ids
 
 # Tables to test '_exist' field
 - type: track_table
@@ -167,7 +167,7 @@ args:
         _exists:
           _table: user
           _where:
-            id: X-Hasura-User-Id
+            id: X-Donat-User-Id
             is_admin: true
 
 - type: create_select_permission
@@ -182,5 +182,5 @@ args:
         _exists:
           _table: user
           _where:
-            id: X-Hasura-User-Id
+            id: X-Donat-User-Id
             is_admin: true

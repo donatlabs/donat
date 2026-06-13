@@ -36,7 +36,7 @@ fn metadata() -> Metadata {
                     "select_permissions": [
                         { "role": "user", "permission": {
                             "columns": ["id", "name"],
-                            "filter": { "id": { "_eq": "X-Hasura-User-Id" } }
+                            "filter": { "id": { "_eq": "X-Donat-User-Id" } }
                         }},
                         { "role": "nopk", "permission": { "columns": ["name"], "filter": {} } },
                         { "role": "s1", "permission": {
@@ -69,7 +69,7 @@ fn metadata() -> Metadata {
                         }},
                         { "role": "tagged", "permission": {
                             "columns": ["id", "title"],
-                            "filter": { "id": { "_in": "X-Hasura-Allowed-Ids" } }
+                            "filter": { "id": { "_in": "X-Donat-Allowed-Ids" } }
                         }}
                     ],
                     "delete_permissions": [
@@ -149,7 +149,7 @@ fn session(role: &str, vars: &[(&str, &str)]) -> Session {
 }
 
 fn user() -> Session {
-    session("user", &[("x-hasura-user-id", "7")])
+    session("user", &[("x-donat-user-id", "7")])
 }
 
 fn plan_gql(query: &str, sess: &Session, variables: Json) -> Result<Plan, PlanError> {
@@ -273,7 +273,7 @@ fn exists_predicate_parses() {
 
 #[test]
 fn session_var_substituted_in_permission_filter() {
-    // The author filter references X-Hasura-User-Id (mixed case); lookup is
+    // The author filter references X-Donat-User-Id (mixed case); lookup is
     // case-insensitive and the substituted value lands as a string literal.
     let q = gql_select("query { author { id } }", &user());
     let Some(BoolExp::Compare { column, op: CompareOp::Eq(Scalar::Json(v)), .. }) = q.predicate
@@ -288,16 +288,16 @@ fn session_var_substituted_in_permission_filter() {
 fn missing_session_var_error_shape() {
     let err = gql_err("query { author { id } }", &session("user", &[]));
     assert_eq!(err.code, "not-found");
-    // Hasura reports path "$" regardless of filter depth, name lower-cased.
+    // Donat reports path "$" regardless of filter depth, name lower-cased.
     assert_eq!(err.path, "$");
-    assert_eq!(err.message, "missing session variable: \"x-hasura-user-id\"");
+    assert_eq!(err.message, "missing session variable: \"x-donat-user-id\"");
 }
 
 #[test]
 fn session_var_not_resolved_in_user_where() {
     // Clients cannot reference session variables; the string stays literal.
     let pred = article_where(
-        json!({ "title": { "_eq": "X-Hasura-User-Id" } }),
+        json!({ "title": { "_eq": "X-Donat-User-Id" } }),
         &session("user", &[]),
     )
     .unwrap()
@@ -305,7 +305,7 @@ fn session_var_not_resolved_in_user_where() {
     let BoolExp::Compare { op: CompareOp::Eq(Scalar::Json(v)), .. } = pred else {
         panic!("expected compare")
     };
-    assert_eq!(v, json!("X-Hasura-User-Id"));
+    assert_eq!(v, json!("X-Donat-User-Id"));
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn in_session_var_accepts_array_spellings() {
     // A session variable used with _in may hold a Postgres array literal...
     let q = v1_select(
         json!({ "table": "article", "columns": ["id"] }),
-        &session("tagged", &[("x-hasura-allowed-ids", "{1,2}")]),
+        &session("tagged", &[("x-donat-allowed-ids", "{1,2}")]),
     )
     .unwrap();
     let Some(BoolExp::Compare { op: CompareOp::In(items), .. }) = q.predicate else {
@@ -327,7 +327,7 @@ fn in_session_var_accepts_array_spellings() {
     // ...or a JSON array.
     let q = v1_select(
         json!({ "table": "article", "columns": ["id"] }),
-        &session("tagged", &[("x-hasura-allowed-ids", "[1,2]")]),
+        &session("tagged", &[("x-donat-allowed-ids", "[1,2]")]),
     )
     .unwrap();
     let Some(BoolExp::Compare { op: CompareOp::In(items), .. }) = q.predicate else {
@@ -460,7 +460,7 @@ fn columnless_role_count_columns_arg_rejected() {
         json!({}),
     )
     .expect("plain count plans");
-    // ...but Hasura omits count(columns:) from such a role's schema.
+    // ...but Donat omits count(columns:) from such a role's schema.
     let err = gql_err(
         "query { article_aggregate { aggregate { count(columns: id) } } }",
         &session("counter", &[]),
@@ -650,7 +650,7 @@ fn v1_insert_not_allowed_shape_keeps_trailing_space() {
         .unwrap_err();
     assert_eq!(err.code, "permission-denied");
     assert_eq!(err.path, "$.args");
-    // Hasura's exact message ends with ". " — the trailing space matters.
+    // Donat's exact message ends with ". " — the trailing space matters.
     assert_eq!(err.message, "insert on \"author\" for role \"stranger\" is not allowed. ");
 }
 

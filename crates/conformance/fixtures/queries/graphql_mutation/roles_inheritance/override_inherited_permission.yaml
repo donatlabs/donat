@@ -15,8 +15,8 @@
           updated_at: "NOW()"
         filter:
           _or:
-            - id: X-Hasura-Author-Id
-            - editor_id: X-Hasura-Editor-Id
+            - id: X-Donat-Author-Id
+            - editor_id: X-Donat-Editor-Id
 
 - description: query to test if the update mutation uses the
   url: /v1/graphql

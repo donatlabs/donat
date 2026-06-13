@@ -102,7 +102,7 @@ args:
 
       INSERT INTO jsonb_table (id, jsonb_col)
         VALUES
-        (1, '{"name": "Hasura", "age": 7}'),
+        (1, '{"name": "Donat", "age": 7}'),
         (2, '{"name": "Cross"}');
 
       CREATE TABLE gpa (
@@ -150,9 +150,9 @@ args:
         SELECT student_row.physics + student_row.chemistry + student_row.mathematics
       $$ LANGUAGE SQL STABLE;
 
-      CREATE FUNCTION student_total_marks_offset (hasura_session json, student_row student_marks)
+      CREATE FUNCTION student_total_marks_offset (donat_session json, student_row student_marks)
       RETURNS INTEGER AS $$
-        SELECT student_row.physics + student_row.chemistry + student_row.mathematics - (hasura_session ->> 'x-hasura-offset-marks')::integer
+        SELECT student_row.physics + student_row.chemistry + student_row.mathematics - (donat_session ->> 'x-donat-offset-marks')::integer
       $$ LANGUAGE SQL STABLE;
 
 - type: track_table
@@ -207,7 +207,7 @@ args:
       - is_published
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article select permission for anonymous (only published articles)
@@ -231,7 +231,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Author select permission for user
 - type: create_select_permission
@@ -245,7 +245,7 @@ args:
       - is_registered
       filter:
         _or:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - articles:
             is_published:
               _eq: true
@@ -285,7 +285,7 @@ args:
     role: user
     permission:
       check:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Create Artist table
 - type: track_table
@@ -316,7 +316,7 @@ args:
       columns: '*'
       filter:
         Artist:
-          id: X-Hasura-Artist-Id
+          id: X-Donat-Artist-Id
       allow_aggregations: true
 
 #Create select permssion on Track using _in operator
@@ -328,7 +328,7 @@ args:
       columns: '*'
       filter:
         name:
-          _in: X-Hasura-Free-Artists
+          _in: X-Donat-Free-Artists
 
 #Create select permssion on Track using _nin operator
 - type: create_select_permission
@@ -339,7 +339,7 @@ args:
       columns: '*'
       filter:
         name:
-          _nin: X-Hasura-Premium-Artists
+          _nin: X-Donat-Premium-Artists
 
 #Create select permission on Track using _iregex operator
 - type: create_select_permission
@@ -350,7 +350,7 @@ args:
       columns: '*'
       filter:
         name:
-          _iregex: X-Hasura-IRegex-Artists
+          _iregex: X-Donat-IRegex-Artists
 
 # Create search_track function
 - type: track_function
@@ -421,8 +421,8 @@ args:
       filter:
         geom_col:
           $st_d_within:
-            distance: X-Hasura-Geom-Dist
-            from: X-Hasura-Geom-Val
+            distance: X-Donat-Geom-Dist
+            from: X-Donat-Geom-Val
 #Insert data
 - type: track_table
   args:
@@ -452,7 +452,7 @@ args:
       - jsonb_col
       filter:
         jsonb_col:
-          $has_key: X-Hasura-Has-Key
+          $has_key: X-Donat-Has-Key
 
 # Using jsonb column and $has_keys_any operator
 - type: create_select_permission
@@ -465,7 +465,7 @@ args:
       - jsonb_col
       filter:
         jsonb_col:
-          $has_keys_any: X-Hasura-Json-Keys
+          $has_keys_any: X-Donat-Json-Keys
 
 # Using jsonb column and $has_keys_all operator
 - type: create_select_permission
@@ -478,7 +478,7 @@ args:
       - jsonb_col
       filter:
         jsonb_col:
-          $has_keys_all: X-Hasura-Json-Required-Keys
+          $has_keys_all: X-Donat-Json-Required-Keys
 
 #Create grade_point table
 - type: track_table
@@ -525,7 +525,7 @@ args:
       - is_published
       filter:
         id:
-          _eq: X-Hasura-Critic-Id
+          _eq: X-Donat-Critic-Id
 
 - type: create_select_permission
   args:
@@ -555,7 +555,7 @@ args:
     definition:
       function: student_total_marks_offset
       table_argument: student_row
-      session_argument: hasura_session
+      session_argument: donat_session
 
 - type: create_select_permission
   args:

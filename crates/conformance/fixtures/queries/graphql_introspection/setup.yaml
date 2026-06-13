@@ -73,7 +73,7 @@ args:
       - content
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article insert permission for user
@@ -83,7 +83,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Author select permission for user
 - type: create_select_permission
@@ -94,7 +94,7 @@ args:
       columns:
       - name
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Author insert permission for user
 - type: create_insert_permission
@@ -103,5 +103,5 @@ args:
     role: user
     permission:
       check:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 

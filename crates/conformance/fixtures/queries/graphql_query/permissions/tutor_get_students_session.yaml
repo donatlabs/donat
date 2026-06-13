@@ -1,9 +1,9 @@
-description: Fetch student names with tutor role with an offset given via hasura session
+description: Fetch student names with tutor role with an offset given via donat session
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: tutor_session
-  X-Hasura-Offset-Marks: '10'
+  X-Donat-Role: tutor_session
+  X-Donat-Offset-Marks: '10'
 query:
   query: |
     query {

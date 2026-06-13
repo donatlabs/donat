@@ -3,7 +3,7 @@ description: |
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: non_paying_user_and_guest
+  X-Donat-Role: non_paying_user_and_guest
 query:
   query: |
     query {

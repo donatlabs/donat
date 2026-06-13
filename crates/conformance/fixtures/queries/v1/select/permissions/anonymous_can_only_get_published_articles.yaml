@@ -2,7 +2,7 @@
   url: /v1/query
   status: 200
   headers:
-    X-Hasura-Role: anonymous
+    X-Donat-Role: anonymous
   response: []
   query:
     type: select
@@ -23,7 +23,7 @@
   url: /v1/query
   status: 200
   headers:
-    X-Hasura-Role: anonymous
+    X-Donat-Role: anonymous
   response:
     - id: 2
       title: Article 2

@@ -33,7 +33,7 @@ args:
   args:
     name: userInfo
     table: {schema: custom, name: authors}
-    hasura_fields:
+    donat_fields:
       - id
     remote_schema: my-remote-schema
     remote_field:

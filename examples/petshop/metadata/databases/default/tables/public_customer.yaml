@@ -19,7 +19,7 @@ select_permissions:
         - email
       filter:
         id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id
   - role: staff
     permission:
       columns: "*"
@@ -33,7 +33,7 @@ update_permissions:
         - email
       filter:
         id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id
       check:
         id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id

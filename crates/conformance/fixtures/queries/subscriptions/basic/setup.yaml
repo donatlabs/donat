@@ -23,4 +23,4 @@ args:
     permission:
       columns: '*'
       filter:
-        c1: X-Hasura-Custom
+        c1: X-Donat-Custom

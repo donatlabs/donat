@@ -1,5 +1,5 @@
 //! Ported from tests-py test_jwk.py: the engine's background JWKS refresher
-//! (HASURA_GRAPHQL_JWT_SECRET = {"jwk_url": ...}) must re-fetch the key set
+//! (DONAT_GRAPHQL_JWT_SECRET = {"jwk_url": ...}) must re-fetch the key set
 //! on a schedule driven by the stub's Cache-Control / Expires headers.
 //!
 //! The stub mirrors tests-py jwk_server.py: GET /jwk-cache-control builds a
@@ -180,10 +180,10 @@ fn sign_rs256_jwt() -> String {
         "sub": "1",
         "iat": now,
         "exp": now + 3600,
-        "https://hasura.io/jwt/claims": {
-            "x-hasura-allowed-roles": ["user"],
-            "x-hasura-default-role": "user",
-            "x-hasura-user-id": "1",
+        "https://donat.io/jwt/claims": {
+            "x-donat-allowed-roles": ["user"],
+            "x-donat-default-role": "user",
+            "x-donat-user-id": "1",
         }
     });
     jsonwebtoken::encode(&header, &claims, &key).expect("signing jwt")
@@ -258,7 +258,7 @@ fn run_scenario(
         let s = Suite::new(suite)
             .admin_secret(ADMIN_SECRET)
             .env(
-                "HASURA_GRAPHQL_JWT_SECRET",
+                "DONAT_GRAPHQL_JWT_SECRET",
                 &format!(r#"{{"jwk_url": "{}{}"}}"#, stub.url, jwk_path),
             )
             .start();

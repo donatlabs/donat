@@ -8,8 +8,8 @@ response:
     name: Author 5
     is_registered: false
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '5'
+  X-Donat-Role: user
+  X-Donat-User-Id: '5'
 query:
   type: insert
   args:

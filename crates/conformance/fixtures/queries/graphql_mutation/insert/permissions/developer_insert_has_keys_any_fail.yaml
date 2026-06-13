@@ -1,6 +1,6 @@
 description: Inserts computer specs with atleast one of the required keys
 url: /v1alpha1/graphql
-# donat: Hasura fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
+# donat: Donat fixtures are inconsistent here; we return 200 everywhere (see COVERAGE.md)
 status: 200
 response:
   errors:
@@ -9,8 +9,8 @@ response:
       code: permission-error
     message: check constraint of an insert/update permission has failed
 headers:
-  X-Hasura-Role: developer
-  X-Hasura-Spec-Keys: |-
+  X-Donat-Role: developer
+  X-Donat-Spec-Keys: |-
     {display,memory,warranty}
 query:
   variables:

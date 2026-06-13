@@ -21,7 +21,7 @@ fn loads_v2_metadata_directory() {
     assert_eq!(source.kind, SourceKind::Postgres);
     match &source.configuration.connection_info.database_url {
         DatabaseUrl::FromEnv { from_env } => {
-            assert_eq!(from_env, "HASURA_GRAPHQL_DATABASE_URL")
+            assert_eq!(from_env, "DONAT_GRAPHQL_DATABASE_URL")
         }
         other => panic!("expected from_env database url, got {other:?}"),
     }
@@ -55,7 +55,7 @@ fn loads_v2_metadata_directory() {
     );
     assert_eq!(
         author_select.permission.filter["id"]["_eq"],
-        serde_json::json!("X-Hasura-User-Id")
+        serde_json::json!("X-Donat-User-Id")
     );
 
     let article = &source.tables[1];

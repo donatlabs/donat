@@ -2,8 +2,8 @@ description: Query author connection with edges and pageinfo as user role
 url: /v1/relay
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '2'
+  X-Donat-Role: user
+  X-Donat-User-Id: '2'
 query:
   query: |
     query {

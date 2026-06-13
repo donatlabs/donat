@@ -63,7 +63,7 @@ args:
       - is_published
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article select permission for anonymous (only published articles)
@@ -87,7 +87,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Author select permission for user
 - type: create_select_permission
@@ -101,7 +101,7 @@ args:
       - is_registered
       filter:
         _or:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - articles:
             is_published:
               _eq: true
@@ -128,7 +128,7 @@ args:
     role: user
     permission:
       check:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Insert Author values
 - type: insert

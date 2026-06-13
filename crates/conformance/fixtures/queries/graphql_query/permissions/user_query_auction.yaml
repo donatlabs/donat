@@ -2,7 +2,7 @@ description: Query bid prices more than actual price
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 response:
   data:
     auction:

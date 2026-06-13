@@ -2,7 +2,7 @@ description: Fetch student names with tutor role
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: tutor
+  X-Donat-Role: tutor
 query:
   query: |
     query {

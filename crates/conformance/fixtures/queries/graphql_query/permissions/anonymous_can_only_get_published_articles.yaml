@@ -2,7 +2,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: anonymous
+    X-Donat-Role: anonymous
   response:
     data:
       article: []
@@ -26,7 +26,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: anonymous
+    X-Donat-Role: anonymous
   response:
     data:
       article:

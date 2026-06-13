@@ -19,18 +19,18 @@ pub struct AppState {
     /// --hge-bin mode).
     pub default_url: String,
     pub admin_secret: Option<String>,
-    /// HASURA_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
     pub unauthorized_role: Option<String>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,
-    /// HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS (default true).
+    /// DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS (default true).
     pub infer_function_permissions: bool,
-    /// JWT authentication mode, when HASURA_GRAPHQL_JWT_SECRET is set.
+    /// JWT authentication mode, when DONAT_GRAPHQL_JWT_SECRET is set.
     pub jwt: Option<crate::jwt::JwtConfig>,
     /// Webhook authentication mode: (url, "GET"|"POST").
     pub auth_hook: Option<(String, String)>,
     pub http: reqwest::Client,
-    /// HASURA_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
+    /// DONAT_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
     pub allowlist_enabled: bool,
 }
 
@@ -88,7 +88,7 @@ impl AppState {
 
     /// Reconcile pools and catalogs with the current metadata sources,
     /// pruning metadata that refers to dropped objects (run_sql untracks
-    /// dropped tables/functions, like Hasura).
+    /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         // Later same-named sources override earlier ones (the harness
         // appends a second 'default' pointing at a per-test database).

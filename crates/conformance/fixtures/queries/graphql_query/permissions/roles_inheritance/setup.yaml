@@ -31,7 +31,7 @@ args:
         - name
         - restricted_field
       filter:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
 
 # Create inherited roles
 - type: add_inherited_role

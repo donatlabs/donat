@@ -2,7 +2,7 @@ description: Update resident using preset
 url: /v1/query
 status: 200
 headers:
-  X-Hasura-Role: user1
+  X-Donat-Role: user1
 response:
   returning:
   - id: 3

@@ -2,7 +2,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: introspection_disabled
+    X-Donat-Role: introspection_disabled
   response:
     errors:
       - extensions:
@@ -23,7 +23,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: introspection_disabled
+    X-Donat-Role: introspection_disabled
   response:
     errors:
       - extensions:
@@ -44,7 +44,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: introspection_disabled
+    X-Donat-Role: introspection_disabled
   response:
     data:
       __typename: query_root

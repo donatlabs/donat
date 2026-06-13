@@ -2,8 +2,8 @@ description: Update data in account table as a user who is non admin
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '1'
+  X-Donat-Role: user
+  X-Donat-User-Id: '1'
 response:
   data:
     update_account:

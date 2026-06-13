@@ -2,13 +2,13 @@ description: Artist can only select their tracks. Without sending header (Error)
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: Artist
+  X-Donat-Role: Artist
 response:
   errors:
   - extensions:
       code: not-found
       path: "$"
-    message: 'missing session variable: "x-hasura-artist-id"'
+    message: 'missing session variable: "x-donat-artist-id"'
 query:
   query: |
     query {

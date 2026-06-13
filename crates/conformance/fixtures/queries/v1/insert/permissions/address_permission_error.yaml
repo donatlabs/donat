@@ -2,7 +2,7 @@ description: Insert into order table as user role (Check Constraint Error)
 url: /v1/query
 status: 400
 headers:
-  X-Hasura-Role: merchant
+  X-Donat-Role: merchant
 response:
   path: $.args
   error: 'insert on "address" for role "merchant" is not allowed. '

@@ -18,7 +18,7 @@
 - description: Querying an inconsistent table permission should not be available
   url: /v1/graphql
   headers:
-    X-Hasura-Role: author_editor
+    X-Donat-Role: author_editor
   status: 200
   query:
     query: |
@@ -51,7 +51,7 @@
           - age
           - editor_id
         filter:
-          id: X-Hasura-Author-Id
+          id: X-Donat-Author-Id
         set:
           updated_at: "NOW()"
   response:
@@ -72,8 +72,8 @@
     was added
   url: /v1/graphql
   headers:
-    X-Hasura-Role: author_editor
-    X-Hasura-Author-Id: "1"
+    X-Donat-Role: author_editor
+    X-Donat-Author-Id: "1"
   status: 200
   query:
     query: |

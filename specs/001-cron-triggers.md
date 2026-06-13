@@ -13,7 +13,7 @@ deploy-time configuration (YAML + `migrate`), no runtime mutation surface.
 
 ## 1. Metadata (`crates/metadata`)
 
-Hasura exports cron triggers to `cron_triggers.yaml` at the metadata root, a
+Donat exports cron triggers to `cron_triggers.yaml` at the metadata root, a
 top-level list. Add `cron_triggers: Vec<CronTrigger>` to `Metadata` and load
 it with the existing `load_section(dir, "cron_triggers.yaml")` helper.
 
@@ -39,7 +39,7 @@ Types:
   include_in_metadata (default true), retry_conf: Option<CronRetryConf>,
   headers: Vec<ActionHeader> (reused), comment: Option<String> }`
 - `CronRetryConf { num_retries=0, retry_interval_seconds=10,
-  timeout_seconds=60, tolerance_seconds=21600 }` — Hasura `RetryConfST`
+  timeout_seconds=60, tolerance_seconds=21600 }` — Donat `RetryConfST`
   field names and defaults (verified against the engine source).
 
 ## 2. Catalog DDL (`migrations/V1__donat_cron.sql`)
@@ -87,7 +87,7 @@ Each tick, against the default pool:
    num_retries` → `error`, else `next_retry_at = now() +
    retry_interval_seconds` (stays `scheduled`).
 
-Webhook body (Hasura `ScheduledEventWebhookPayload`, snake_case,
+Webhook body (Donat `ScheduledEventWebhookPayload`, snake_case,
 `omitNothingFields`; `created_at` omitted for cron):
 
 ```json
@@ -100,7 +100,7 @@ header resolution (value / value_from_env) mirroring actions.
 
 ## 5. Conformance (`crates/conformance`)
 
-No Hasura tests-py fixtures exist for delivery; native tests are the source
+No Donat tests-py fixtures exist for delivery; native tests are the source
 of truth (same pattern as `remote_schemas.rs` / actions).
 
 - A native cron webhook stub receiver (records received body + headers),

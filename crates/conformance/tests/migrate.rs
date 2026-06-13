@@ -96,7 +96,7 @@ fn validate_passes_when_consistent_and_fails_when_not() {
     write(&md.join("version.yaml"), "version: 3\n");
     write(
         &md.join("databases/databases.yaml"),
-        "- name: default\n  kind: postgres\n  configuration:\n    connection_info:\n      database_url:\n        from_env: HASURA_GRAPHQL_DATABASE_URL\n  tables: \"!include default/tables/tables.yaml\"\n",
+        "- name: default\n  kind: postgres\n  configuration:\n    connection_info:\n      database_url:\n        from_env: DONAT_GRAPHQL_DATABASE_URL\n  tables: \"!include default/tables/tables.yaml\"\n",
     );
     write(
         &md.join("databases/default/tables/tables.yaml"),

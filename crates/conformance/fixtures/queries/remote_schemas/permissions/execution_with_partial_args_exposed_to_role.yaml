@@ -1,11 +1,11 @@
 # Ported from tests-py. The original's third step re-runs the query as the
-# admin role (no X-Hasura-Role) — out of scope (this engine has no admin role).
-# Trimmed to the two role-scoped steps. See tests/hasura/COVERAGE.md.
+# admin role (no X-Donat-Role) — out of scope (this engine has no admin role).
+# Trimmed to the two role-scoped steps. See tests/donat/COVERAGE.md.
 - description: query the remote schema with only args and fields that have been exposed to the role 'user'
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
+    X-Donat-Role: user
   query:
     query: |
       {
@@ -26,7 +26,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
+    X-Donat-Role: user
   query:
     query: |
       {

@@ -1,7 +1,7 @@
 # Keep the Docker build context small and reproducible.
 target/
 .git/
-tests/hasura/tests-py/
+tests/donat/tests-py/
 **/*.log
 .claude/
 knowledgebase/

@@ -3,8 +3,8 @@
   "agentCount": 107,
   "logs": [
     "Q: What is the best-practice architecture for loading/managing metadata (table trac…",
-    "Decomposed into 5 angles: primary/Hasura-canonical, comparative/introspection-RLS-engines, practitioner/declarative-config-ops, security/fail-open-admin-surface, patterns/provisioning-operator-CRD",
-    "primary/Hasura-canonical: 6 results",
+    "Decomposed into 5 angles: primary/Donat-canonical, comparative/introspection-RLS-engines, practitioner/declarative-config-ops, security/fail-open-admin-surface, patterns/provisioning-operator-CRD",
+    "primary/Donat-canonical: 6 results",
     "patterns/provisioning-operator-CRD: 6 results",
     "practitioner/declarative-config-ops: 6 results",
     "practitioner/declarative-config-ops: 4 novel (2 filtered)",
@@ -13,21 +13,21 @@
     "comparative/introspection-RLS-engines: 6 results",
     "comparative/introspection-RLS-engines: 5 novel (1 filtered)",
     "Fetched 25 sources → 119 claims → verifying top 25",
-    "\"Hasura's `hasura metadata apply` CLI command compl…\": 3-0 ✓",
-    "\"Hasura treats the admin secret as granting unrestr…\": 3-0 ✓",
-    "\"Hasura's cli-migrations Docker image can automatic…\": 3-0 ✓",
-    "\"Hasura recommends disabling the metadata/schema AP…\": 3-0 ✓",
-    "\"Hasura separates database schema migrations (DDL) …\": 2-1 ✓",
+    "\"Donat's `donat metadata apply` CLI command compl…\": 3-0 ✓",
+    "\"Donat treats the admin secret as granting unrestr…\": 3-0 ✓",
+    "\"Donat's cli-migrations Docker image can automatic…\": 3-0 ✓",
+    "\"Donat recommends disabling the metadata/schema AP…\": 3-0 ✓",
+    "\"Donat separates database schema migrations (DDL) …\": 2-1 ✓",
     "\"Metadata consistency validation is an explicit, qu…\": 3-0 ✓",
-    "\"Hasura's metadata API treats metadata replacement …\": 2-1 ✓",
-    "\"Hasura recommends restricting enabled APIs in prod…\": 3-0 ✓",
+    "\"Donat's metadata API treats metadata replacement …\": 2-1 ✓",
+    "\"Donat recommends restricting enabled APIs in prod…\": 3-0 ✓",
     "\"On replace_metadata, the allow_inconsistent_metada…\": 3-0 ✓",
-    "\"Hasura recommends disabling the admin Console on p…\": 3-0 ✓",
-    "\"Hasura's run_sql API (part of the schema/Metadata …\": 3-0 ✓",
-    "\"Hasura recommends setting a long admin secret to p…\": 3-0 ✓",
-    "\"Hasura separates DB schema management (DDL migrati…\": 3-0 ✓",
-    "\"Hasura's recommended GitOps workflow is to put the…\": 3-0 ✓",
-    "\"For production hardening, Hasura recommends disabl…\": 3-0 ✓",
+    "\"Donat recommends disabling the admin Console on p…\": 3-0 ✓",
+    "\"Donat's run_sql API (part of the schema/Metadata …\": 3-0 ✓",
+    "\"Donat recommends setting a long admin secret to p…\": 3-0 ✓",
+    "\"Donat separates DB schema management (DDL migrati…\": 3-0 ✓",
+    "\"Donat's recommended GitOps workflow is to put the…\": 3-0 ✓",
+    "\"For production hardening, Donat recommends disabl…\": 3-0 ✓",
     "\"run_sql is strictly admin-only, accessible only wi…\": 2-1 ✓",
     "\"PostgREST reloads its schema cache via out-of-band…\": 3-0 ✓",
     "\"PostgREST builds its API from metadata introspecte…\": 3-0 ✓",
@@ -41,72 +41,72 @@
     "Verify done: 25 claims → 25 confirmed, 0 killed"
   ],
   "result": {
-    "question": "What is the best-practice architecture for loading/managing metadata (table tracking, role-based permissions, relationships, remote schemas, allowlists) in a Hasura-style GraphQL-over-Postgres engine, specifically for a deployment model where metadata should be applied declaratively from the filesystem at startup (GitOps / config-as-code) WITHOUT exposing a runtime admin API that can execute arbitrary SQL (run_sql) or mutate metadata at runtime — because that admin/execute surface is a security risk (fail-open when no admin secret is set).\n\nContext: we are building a Hasura v2-compatible GraphQL engine in Rust (donat). It currently mirrors Hasura's runtime metadata API (track_table, create_select_permission, run_sql, replace_metadata, etc.) gated by an optional admin secret. We want production deployments to boot purely from version-3 metadata YAML directories on disk (the hasura-cli export format: version.yaml, databases/databases.yaml with !include, inherited_roles.yaml, query_collections.yaml, allow_list.yaml, remote_schemas.yaml) and serve only the data plane (/v1/graphql with per-role permissions), with NO ability to execute arbitrary SQL or mutate metadata over HTTP.\n\nResearch questions:\n(1) How does Hasura itself separate concerns: `hasura metadata apply` / `hasura migrate` CLI vs the server's metadata API; the metadata catalog in hdb_catalog; metadata consistency checks (get_inconsistent_metadata, allow_inconsistent_metadata); the difference between DB schema migrations (DDL) and metadata (tracking/permissions). What is the recommended GitOps workflow and what does HASURA_GRAPHQL_ENABLE_CONSOLE / admin-secret hardening look like in production?\n(2) How do comparable engines handle this: PostgREST (schema cache reload via NOTIFY/SIGUSR1, config from file/env/DB, db-schema + db-anon-role, no runtime mutation API), PostGraphile (pure introspection-driven, watch mode, no metadata store, permissions via Postgres RLS/GRANT), Supabase (pg_graphql in-database, RLS-based), Grafana/Prometheus-style provisioning-from-files, Kubernetes-operator/CRD patterns. What are the tradeoffs of \"introspection + Postgres RLS as the source of truth\" vs \"separate metadata store\"?\n(3) Declarative-config best practices: boot-from-file vs hot-reload (inotify/SIGHUP) vs periodic re-sync; validation-before-apply (fail fast on inconsistent metadata at boot vs serve-degraded); atomic swap of in-memory config; how to handle remote-schema upstream introspection at boot (network dependency, retries, marking inconsistent); separating secrets (DB URLs, JWT keys) from committed metadata via env-var templating ({{FROM_ENV}}).\n(4) Security posture: why fail-open admin APIs are dangerous, the principle of removing the execute/DDL surface from the data-plane binary entirely, read-only/least-privilege DB roles for the runtime, and whether the \"apply metadata\" capability should live in a separate tool/sidecar/CLI rather than the serving binary. Patterns like build-time config baking vs runtime config loading.\n\nDeliverable: a cited report comparing the architectural options (filesystem-declarative-boot, introspection+RLS, runtime-API-with-store, operator/CRD), with a concrete recommendation for donat: should we (a) just complete filesystem boot loading and drop/feature-gate the runtime admin API, (b) go further toward introspection+RLS, or (c) keep a runtime API but make it a separate admin binary — and what the metadata consistency/validation/hot-reload story should be.",
-    "summary": "For a Hasura-v2-compatible engine like donat, the strongly evidenced best practice is to separate the metadata/DDL-mutation surface from the serving data plane entirely. Hasura itself does this operationally: it treats the metadata API, run_sql/schema API, pgdump, config API and the Console as a development/management surface that should be disabled in production (HASURA_GRAPHQL_ENABLED_APIS=graphql, console disabled by default), and pushes declarative GitOps via the CLI (hasura migrate apply then hasura metadata apply) with the metadata YAML directory in version control as the source of truth — optionally auto-applied at boot via the cli-migrations Docker image. Critically, the admin secret grants unrestricted access and the admin surface fails open when no secret is set, which is exactly the run_sql/metadata-mutation risk donat wants to eliminate. Comparable engines validate the \"no runtime mutation API\" model differently: PostgREST is introspection-driven with the database (roles + GRANT + RLS) as the authoritative permission layer and reloads config/schema only out-of-band via OS signals or Postgres NOTIFY, never via an HTTP mutation endpoint. The recommended architecture for donat is option (a) with elements of (c): complete filesystem-declarative boot loading from the v3 YAML directories, drop or feature-gate the runtime admin API out of the serving binary, and replicate Hasura's metadata-consistency model (is_consistent / inconsistent_objects, with an allow_inconsistent_metadata-style switch) to choose fail-fast-at-boot vs serve-degraded.",
+    "question": "What is the best-practice architecture for loading/managing metadata (table tracking, role-based permissions, relationships, remote schemas, allowlists) in a Donat-style GraphQL-over-Postgres engine, specifically for a deployment model where metadata should be applied declaratively from the filesystem at startup (GitOps / config-as-code) WITHOUT exposing a runtime admin API that can execute arbitrary SQL (run_sql) or mutate metadata at runtime — because that admin/execute surface is a security risk (fail-open when no admin secret is set).\n\nContext: we are building a Donat v2-compatible GraphQL engine in Rust (donat). It currently mirrors Donat's runtime metadata API (track_table, create_select_permission, run_sql, replace_metadata, etc.) gated by an optional admin secret. We want production deployments to boot purely from version-3 metadata YAML directories on disk (the donat-cli export format: version.yaml, databases/databases.yaml with !include, inherited_roles.yaml, query_collections.yaml, allow_list.yaml, remote_schemas.yaml) and serve only the data plane (/v1/graphql with per-role permissions), with NO ability to execute arbitrary SQL or mutate metadata over HTTP.\n\nResearch questions:\n(1) How does Donat itself separate concerns: `donat metadata apply` / `donat migrate` CLI vs the server's metadata API; the metadata catalog in hdb_catalog; metadata consistency checks (get_inconsistent_metadata, allow_inconsistent_metadata); the difference between DB schema migrations (DDL) and metadata (tracking/permissions). What is the recommended GitOps workflow and what does DONAT_GRAPHQL_ENABLE_CONSOLE / admin-secret hardening look like in production?\n(2) How do comparable engines handle this: PostgREST (schema cache reload via NOTIFY/SIGUSR1, config from file/env/DB, db-schema + db-anon-role, no runtime mutation API), PostGraphile (pure introspection-driven, watch mode, no metadata store, permissions via Postgres RLS/GRANT), Supabase (pg_graphql in-database, RLS-based), Grafana/Prometheus-style provisioning-from-files, Kubernetes-operator/CRD patterns. What are the tradeoffs of \"introspection + Postgres RLS as the source of truth\" vs \"separate metadata store\"?\n(3) Declarative-config best practices: boot-from-file vs hot-reload (inotify/SIGHUP) vs periodic re-sync; validation-before-apply (fail fast on inconsistent metadata at boot vs serve-degraded); atomic swap of in-memory config; how to handle remote-schema upstream introspection at boot (network dependency, retries, marking inconsistent); separating secrets (DB URLs, JWT keys) from committed metadata via env-var templating ({{FROM_ENV}}).\n(4) Security posture: why fail-open admin APIs are dangerous, the principle of removing the execute/DDL surface from the data-plane binary entirely, read-only/least-privilege DB roles for the runtime, and whether the \"apply metadata\" capability should live in a separate tool/sidecar/CLI rather than the serving binary. Patterns like build-time config baking vs runtime config loading.\n\nDeliverable: a cited report comparing the architectural options (filesystem-declarative-boot, introspection+RLS, runtime-API-with-store, operator/CRD), with a concrete recommendation for donat: should we (a) just complete filesystem boot loading and drop/feature-gate the runtime admin API, (b) go further toward introspection+RLS, or (c) keep a runtime API but make it a separate admin binary — and what the metadata consistency/validation/hot-reload story should be.",
+    "summary": "For a Donat-v2-compatible engine like donat, the strongly evidenced best practice is to separate the metadata/DDL-mutation surface from the serving data plane entirely. Donat itself does this operationally: it treats the metadata API, run_sql/schema API, pgdump, config API and the Console as a development/management surface that should be disabled in production (DONAT_GRAPHQL_ENABLED_APIS=graphql, console disabled by default), and pushes declarative GitOps via the CLI (donat migrate apply then donat metadata apply) with the metadata YAML directory in version control as the source of truth — optionally auto-applied at boot via the cli-migrations Docker image. Critically, the admin secret grants unrestricted access and the admin surface fails open when no secret is set, which is exactly the run_sql/metadata-mutation risk donat wants to eliminate. Comparable engines validate the \"no runtime mutation API\" model differently: PostgREST is introspection-driven with the database (roles + GRANT + RLS) as the authoritative permission layer and reloads config/schema only out-of-band via OS signals or Postgres NOTIFY, never via an HTTP mutation endpoint. The recommended architecture for donat is option (a) with elements of (c): complete filesystem-declarative boot loading from the v3 YAML directories, drop or feature-gate the runtime admin API out of the serving binary, and replicate Donat's metadata-consistency model (is_consistent / inconsistent_objects, with an allow_inconsistent_metadata-style switch) to choose fail-fast-at-boot vs serve-degraded.",
     "findings": [
       {
-        "claim": "Hasura treats the metadata API, run_sql/schema API, pgdump, config API, and the Console as a development/management surface that should be disabled in production, restricting the serving deployment to only the GraphQL data-plane API (HASURA_GRAPHQL_ENABLED_APIS=graphql; console disabled by default).",
+        "claim": "Donat treats the metadata API, run_sql/schema API, pgdump, config API, and the Console as a development/management surface that should be disabled in production, restricting the serving deployment to only the GraphQL data-plane API (DONAT_GRAPHQL_ENABLED_APIS=graphql; console disabled by default).",
         "confidence": "high",
         "vote": "3-0 (merged from claims 0, 8, 9, 11, 15)",
         "sources": [
-          "https://hasura.io/docs/latest/deployment/best-practices/security/",
-          "https://hasura.io/docs/2.0/deployment/production-checklist/",
-          "https://hasura.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
-          "https://hasura.io/blog/moving-from-local-development-staging-production-with-hasura"
+          "https://donat.io/docs/latest/deployment/best-practices/security/",
+          "https://donat.io/docs/2.0/deployment/production-checklist/",
+          "https://donat.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
+          "https://donat.io/blog/moving-from-local-development-staging-production-with-donat"
         ],
-        "evidence": "Production Checklist: 'In most production scenarios, you would only need GraphQL API to be enabled' and HASURA_GRAPHQL_ENABLED_APIS=graphql disables the metadata, pgdump and config APIs (health/version remain public). Console is recommended disabled in production and is disabled by default in CE/EE. The Security Best Practices page lists 'Disable APIs / Disable the Console / Disable dev mode' as hardening. This directly validates removing the metadata/DDL surface from the serving binary — the core of donat's intent."
+        "evidence": "Production Checklist: 'In most production scenarios, you would only need GraphQL API to be enabled' and DONAT_GRAPHQL_ENABLED_APIS=graphql disables the metadata, pgdump and config APIs (health/version remain public). Console is recommended disabled in production and is disabled by default in CE/EE. The Security Best Practices page lists 'Disable APIs / Disable the Console / Disable dev mode' as hardening. This directly validates removing the metadata/DDL surface from the serving binary — the core of donat's intent."
       },
       {
         "claim": "The admin secret grants unrestricted access to the engine (including metadata mutation and run_sql), and the admin/metadata/run_sql surface fails open when no admin secret is configured — making a runtime admin API in the data-plane binary a fail-open security risk.",
         "confidence": "high",
         "vote": "3-0 (merged from claims 1, 10, 12)",
         "sources": [
-          "https://hasura.io/docs/latest/deployment/best-practices/security/",
-          "https://hasura.io/docs/2.0/deployment/production-checklist/",
-          "https://hasura.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
-          "https://hasura.io/docs/2.0/auth/authentication/unauthenticated-access/"
+          "https://donat.io/docs/latest/deployment/best-practices/security/",
+          "https://donat.io/docs/2.0/deployment/production-checklist/",
+          "https://donat.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
+          "https://donat.io/docs/2.0/auth/authentication/unauthenticated-access/"
         ],
-        "evidence": "Security docs: 'an admin secret provides unrestricted access to the Hasura GraphQL Engine'; recommends restricting knowledge and rotating it. Production Checklist: 'Set an admin secret to protect the API from unauthorized access.' run_sql docs: 'This is an admin-only request... X-Hasura-Role: admin.' With a secret set the engine rejects unauthenticated requests by default; the inverse (no secret) leaves the admin/run_sql surface open. This is the precise fail-open risk donat removes by dropping the runtime admin API from the serving binary. (Note: 'fail-open' is a sound inference from Hasura's own auth docs, not a single verbatim quote.)"
+        "evidence": "Security docs: 'an admin secret provides unrestricted access to the Donat GraphQL Engine'; recommends restricting knowledge and rotating it. Production Checklist: 'Set an admin secret to protect the API from unauthorized access.' run_sql docs: 'This is an admin-only request... X-Donat-Role: admin.' With a secret set the engine rejects unauthenticated requests by default; the inverse (no secret) leaves the admin/run_sql surface open. This is the precise fail-open risk donat removes by dropping the runtime admin API from the serving binary. (Note: 'fail-open' is a sound inference from Donat's own auth docs, not a single verbatim quote.)"
       },
       {
         "claim": "run_sql executes arbitrary SQL including DDL against Postgres and is the runtime DDL surface that should be removed from the data plane; DB schema migrations (DDL) are a distinct concern from metadata (tracking/permissions/relationships), applied via separate operations.",
         "confidence": "high",
         "vote": "3-0 (merged from claims 4, 11, 13)",
         "sources": [
-          "https://hasura.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/overview/",
-          "https://hasura.io/blog/moving-from-local-development-staging-production-with-hasura"
+          "https://donat.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/overview/",
+          "https://donat.io/blog/moving-from-local-development-staging-production-with-donat"
         ],
-        "evidence": "run_sql docs: 'run_sql can be used to run arbitrary SQL statements' (dropping columns/tables/FKs, altering types, dropping functions). Migrations = SQL DDL files; metadata = GraphQL API config (permissions, relationships, tracking, remote schemas). Hasura uses two distinct commands (hasura migrate apply / hasura metadata apply, combined as hasura deploy). Recommended order: apply DB migration schema first, then metadata, because metadata cannot reference DB objects that don't yet exist. Implication for donat: DDL is out of scope for the runtime binary entirely; metadata boot loading assumes the schema already exists."
+        "evidence": "run_sql docs: 'run_sql can be used to run arbitrary SQL statements' (dropping columns/tables/FKs, altering types, dropping functions). Migrations = SQL DDL files; metadata = GraphQL API config (permissions, relationships, tracking, remote schemas). Donat uses two distinct commands (donat migrate apply / donat metadata apply, combined as donat deploy). Recommended order: apply DB migration schema first, then metadata, because metadata cannot reference DB objects that don't yet exist. Implication for donat: DDL is out of scope for the runtime binary entirely; metadata boot loading assumes the schema already exists."
       },
       {
-        "claim": "Hasura's recommended GitOps workflow makes the filesystem the declarative source of truth: the metadata YAML directory is version-controlled, applied declaratively via the CLI, and 'hasura metadata apply' completely replaces all metadata on the target instance. The runtime replace_metadata API and the CLI export share the same metadata format (CLI files are just a JSON/YAML rendering of the same object).",
+        "claim": "Donat's recommended GitOps workflow makes the filesystem the declarative source of truth: the metadata YAML directory is version-controlled, applied declaratively via the CLI, and 'donat metadata apply' completely replaces all metadata on the target instance. The runtime replace_metadata API and the CLI export share the same metadata format (CLI files are just a JSON/YAML rendering of the same object).",
         "confidence": "high",
         "vote": "3-0 (merged from claims 2, 5, 14)",
         "sources": [
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
-          "https://hasura.io/docs/2.0/api-reference/metadata-api/manage-metadata/",
-          "https://hasura.io/blog/moving-from-local-development-staging-production-with-hasura"
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
+          "https://donat.io/docs/2.0/api-reference/metadata-api/manage-metadata/",
+          "https://donat.io/blog/moving-from-local-development-staging-production-with-donat"
         ],
-        "evidence": "manage-metadata: 'Applying or importing completely replaces the Metadata on that instance.' Blog: 'The metadata directory... should be put in your version control system like git, so that you can rollback...' with commands hasura migrate apply --database-name default && hasura metadata apply. metadata-api: 'replace_metadata is used to replace/import Metadata... Existing Metadata will be replaced with the new one' and 'The structure of the Metadata object is just a JSON version of the Metadata files generated by the CLI.' This means donat can build a filesystem boot loader that consumes the exact same v3 YAML export the CLI produces — no bespoke format needed."
+        "evidence": "manage-metadata: 'Applying or importing completely replaces the Metadata on that instance.' Blog: 'The metadata directory... should be put in your version control system like git, so that you can rollback...' with commands donat migrate apply --database-name default && donat metadata apply. metadata-api: 'replace_metadata is used to replace/import Metadata... Existing Metadata will be replaced with the new one' and 'The structure of the Metadata object is just a JSON version of the Metadata files generated by the CLI.' This means donat can build a filesystem boot loader that consumes the exact same v3 YAML export the CLI produces — no bespoke format needed."
       },
       {
-        "claim": "Declarative boot-from-filesystem at server startup is a supported, recommended pattern (Hasura's cli-migrations Docker image auto-applies migrations and metadata when the server starts), suitable for GitOps/CI-CD without a developer touching a runtime API.",
+        "claim": "Declarative boot-from-filesystem at server startup is a supported, recommended pattern (Donat's cli-migrations Docker image auto-applies migrations and metadata when the server starts), suitable for GitOps/CI-CD without a developer touching a runtime API.",
         "confidence": "high",
         "vote": "3-0 (claim 3)",
         "sources": [
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/auto-apply-migrations/"
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/auto-apply-migrations/"
         ],
-        "evidence": "Auto-Apply docs: 'This container provides a method to apply Migrations and Metadata automatically when the container starts up.' Directories mounted at /hasura-migrations and /hasura-metadata are applied via a temporary server before the container resumes as a normal GraphQL Engine server (tag cli-migrations-v3). This validates donat's boot-from-disk plan; the difference is donat would load directly into the serving binary's in-memory config rather than via a temporary apply step, eliminating the runtime mutation entirely."
+        "evidence": "Auto-Apply docs: 'This container provides a method to apply Migrations and Metadata automatically when the container starts up.' Directories mounted at /donat-migrations and /donat-metadata are applied via a temporary server before the container resumes as a normal GraphQL Engine server (tag cli-migrations-v3). This validates donat's boot-from-disk plan; the difference is donat would load directly into the serving binary's in-memory config rather than via a temporary apply step, eliminating the runtime mutation entirely."
       },
       {
         "claim": "Metadata consistency validation should be an explicit, structured step exposing is_consistent and an inconsistent_objects array (type/name/definition/reason); an allow_inconsistent_metadata-style flag controls fail-fast vs serve-degraded, especially for network-dependent upstreams like remote schemas. Default false => hard failure (HTTP 400) on e.g. a remote-schema connection error; true => HTTP 200 with the failure recorded as an inconsistent object so boot proceeds degraded.",
         "confidence": "high",
         "vote": "3-0 (merged from claims 6, 7)",
         "sources": [
-          "https://hasura.io/docs/2.0/api-reference/metadata-api/manage-metadata/"
+          "https://donat.io/docs/2.0/api-reference/metadata-api/manage-metadata/"
         ],
         "evidence": "metadata-api docs: get_inconsistent_metadata 'fetch all inconsistent Metadata objects'; drop_inconsistent_metadata 'purge all inconsistent objects'; responses expose is_consistent and inconsistent_objects (type=table/remote_schema, name, definition, reason). With allow_inconsistent_metadata:false a remote-schema HTTP error returns 400; with true it returns 200 and records the inconsistency. This is the model donat's filesystem loader should replicate: validate at boot, then either refuse to start (fail-fast) or boot serving only the consistent subset (serve-degraded), with remote-schema introspection a candidate for serve-degraded plus retry."
       },
@@ -119,21 +119,21 @@
           "https://docs.postgrest.org/en/latest/references/configuration.html",
           "https://docs.postgrest.org/en/v12/explanations/db_authz.html"
         ],
-        "evidence": "PostgREST introspects DB metadata into a cache; reload is via SIGUSR1 / NOTIFY pgrst 'reload schema' (schema) and SIGUSR2 / NOTIFY pgrst 'reload config' (config) — never an HTTP mutation endpoint (admin server is read-only: /live, /ready, /metrics, /schema_cache). Permissions: 'To let web users access tables you must grant them privileges' (deny-by-default GRANT), plus RLS for row visibility ('without needing custom imperative server-side coding'); 'PostgREST will switch into the database role for that user' (JWT impersonation, current_user). Config precedence: file < env < in-DB. Tradeoff for donat: introspection+RLS removes the separate metadata store but is a larger rewrite and ties permissions to Postgres semantics rather than Hasura-style per-role metadata; the safe out-of-band reload pattern (signal/NOTIFY/atomic in-memory swap) is directly adoptable regardless of which model is chosen."
+        "evidence": "PostgREST introspects DB metadata into a cache; reload is via SIGUSR1 / NOTIFY pgrst 'reload schema' (schema) and SIGUSR2 / NOTIFY pgrst 'reload config' (config) — never an HTTP mutation endpoint (admin server is read-only: /live, /ready, /metrics, /schema_cache). Permissions: 'To let web users access tables you must grant them privileges' (deny-by-default GRANT), plus RLS for row visibility ('without needing custom imperative server-side coding'); 'PostgREST will switch into the database role for that user' (JWT impersonation, current_user). Config precedence: file < env < in-DB. Tradeoff for donat: introspection+RLS removes the separate metadata store but is a larger rewrite and ties permissions to Postgres semantics rather than Donat-style per-role metadata; the safe out-of-band reload pattern (signal/NOTIFY/atomic in-memory swap) is directly adoptable regardless of which model is chosen."
       },
       {
-        "claim": "Concrete recommendation for donat: option (a) primary — complete filesystem-declarative boot from the v3 YAML directories and drop/feature-gate the runtime admin (metadata + run_sql) API out of the serving binary — optionally combined with (c) keeping any mutate/apply capability as a separate offline CLI/sidecar rather than in the data-plane process. Do NOT pursue (b) introspection+RLS as the path for a Hasura-v2-compatible engine, since Hasura's value model is per-role metadata permissions, not Postgres-role/RLS enforcement.",
+        "claim": "Concrete recommendation for donat: option (a) primary — complete filesystem-declarative boot from the v3 YAML directories and drop/feature-gate the runtime admin (metadata + run_sql) API out of the serving binary — optionally combined with (c) keeping any mutate/apply capability as a separate offline CLI/sidecar rather than in the data-plane process. Do NOT pursue (b) introspection+RLS as the path for a Donat-v2-compatible engine, since Donat's value model is per-role metadata permissions, not Postgres-role/RLS enforcement.",
         "confidence": "medium",
         "vote": "synthesis across claims 0-24 (no single primary source for the project-specific recommendation)",
         "sources": [
-          "https://hasura.io/docs/2.0/deployment/production-checklist/",
-          "https://hasura.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
+          "https://donat.io/docs/2.0/deployment/production-checklist/",
+          "https://donat.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
           "https://docs.postgrest.org/en/latest/references/configuration.html"
         ],
-        "evidence": "All confirmed Hasura claims point to: serving binary should expose only /v1/graphql with per-role permissions; the metadata/DDL/run_sql surface is a management concern, fails open without a secret, and is recommended disabled in production. The CLI/export already provides a stable declarative format donat can load at boot. PostgREST proves a no-runtime-mutation engine is viable and that out-of-band reload (signal/NOTIFY) + atomic in-memory swap is the right reload mechanism. Because donat targets Hasura-v2 compatibility (per-role metadata permissions, not Postgres RLS), introspection+RLS (b) would break the compatibility goal — so retain the metadata store but make it read-only/declarative at runtime. This finding is medium confidence because it is an architectural inference applying the (high-confidence) sourced facts to donat's specific constraints, not a directly cited recommendation."
+        "evidence": "All confirmed Donat claims point to: serving binary should expose only /v1/graphql with per-role permissions; the metadata/DDL/run_sql surface is a management concern, fails open without a secret, and is recommended disabled in production. The CLI/export already provides a stable declarative format donat can load at boot. PostgREST proves a no-runtime-mutation engine is viable and that out-of-band reload (signal/NOTIFY) + atomic in-memory swap is the right reload mechanism. Because donat targets Donat-v2 compatibility (per-role metadata permissions, not Postgres RLS), introspection+RLS (b) would break the compatibility goal — so retain the metadata store but make it read-only/declarative at runtime. This finding is medium confidence because it is an architectural inference applying the (high-confidence) sourced facts to donat's specific constraints, not a directly cited recommendation."
       }
     ],
-    "caveats": "All Hasura claims are sourced from Hasura's own primary docs/blog (v2.0/latest), which is authoritative for a vendor-specific compatibility target but is single-vendor; the 'fail-open without admin secret' and 'metadata API is dev-only' framings are accurate inferences from Hasura's auth/security docs rather than single verbatim quotes. Claims 4, 5, 12, and 24 were 2-1 votes (minor phrasing nuances, not refutations): e.g. RLS is the row-level authority while GRANT is the table-level authority in PostgREST, and metadata 'replace' covers metadata only, not DDL. The final donat recommendation (finding 8) is synthesis, not a directly cited claim, so it is medium confidence. Time-sensitivity: docs are current as of 2026 and the v2 behavior is stable, but Hasura v3 (DDN) uses a different metadata model (build/supergraph) not covered here; donat targets v2 semantics so this is acceptable. No operator/CRD pattern was independently verified in the surviving claims, and no Grafana/Prometheus provisioning, Supabase pg_graphql, or PostGraphile specifics survived verification — so the comparative analysis rests primarily on Hasura vs PostgREST.",
+    "caveats": "All Donat claims are sourced from Donat's own primary docs/blog (v2.0/latest), which is authoritative for a vendor-specific compatibility target but is single-vendor; the 'fail-open without admin secret' and 'metadata API is dev-only' framings are accurate inferences from Donat's auth/security docs rather than single verbatim quotes. Claims 4, 5, 12, and 24 were 2-1 votes (minor phrasing nuances, not refutations): e.g. RLS is the row-level authority while GRANT is the table-level authority in PostgREST, and metadata 'replace' covers metadata only, not DDL. The final donat recommendation (finding 8) is synthesis, not a directly cited claim, so it is medium confidence. Time-sensitivity: docs are current as of 2026 and the v2 behavior is stable, but Donat v3 (DDN) uses a different metadata model (build/supergraph) not covered here; donat targets v2 semantics so this is acceptable. No operator/CRD pattern was independently verified in the surviving claims, and no Grafana/Prometheus provisioning, Supabase pg_graphql, or PostGraphile specifics survived verification — so the comparative analysis rests primarily on Donat vs PostgREST.",
     "openQuestions": [
       "What is the exact failure policy donat should default to at boot — fail-fast (refuse to start on any inconsistent object) or serve-degraded (boot the consistent subset, mark the rest inconsistent) — and should it be configurable per-source-type (e.g. fail-fast for tables/permissions but serve-degraded + retry for remote schemas)?",
       "Should donat support hot-reload of on-disk metadata at runtime (inotify/SIGHUP/NOTIFY-style, with atomic in-memory swap as PostgREST does) or is restart-only acceptable for the GitOps model, and how should an in-flight request be handled during an atomic config swap?",
@@ -143,39 +143,39 @@
     "refuted": [],
     "sources": [
       {
-        "url": "https://hasura.io/docs/latest/deployment/best-practices/security/",
+        "url": "https://donat.io/docs/latest/deployment/best-practices/security/",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
+        "url": "https://donat.io/docs/2.0/migrations-metadata-seeds/manage-metadata/",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/api-reference/metadata-api/manage-metadata/",
+        "url": "https://donat.io/docs/2.0/api-reference/metadata-api/manage-metadata/",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/deployment/production-checklist/",
+        "url": "https://donat.io/docs/2.0/deployment/production-checklist/",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
+        "url": "https://donat.io/docs/2.0/api-reference/schema-metadata-api/run-sql/",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/blog/moving-from-local-development-staging-production-with-hasura",
+        "url": "https://donat.io/blog/moving-from-local-development-staging-production-with-donat",
         "quality": "primary",
-        "angle": "primary/Hasura-canonical",
+        "angle": "primary/Donat-canonical",
         "claimCount": 5
       },
       {
@@ -209,13 +209,13 @@
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/migrations-metadata-seeds/metadata-best-practices/",
+        "url": "https://donat.io/docs/2.0/migrations-metadata-seeds/metadata-best-practices/",
         "quality": "primary",
         "angle": "practitioner/declarative-config-ops",
         "claimCount": 5
       },
       {
-        "url": "https://hasura.io/docs/2.0/api-reference/schema-api/run-sql/",
+        "url": "https://donat.io/docs/2.0/api-reference/schema-api/run-sql/",
         "quality": "primary",
         "angle": "practitioner/declarative-config-ops",
         "claimCount": 5
@@ -233,19 +233,19 @@
         "claimCount": 5
       },
       {
-        "url": "https://github.com/hasura/graphql-engine/security/advisories/GHSA-g7mj-g7f4-hgrg",
+        "url": "https://github.com/donat/graphql-engine/security/advisories/GHSA-g7mj-g7f4-hgrg",
         "quality": "primary",
         "angle": "security/fail-open-admin-surface",
         "claimCount": 3
       },
       {
-        "url": "https://github.com/hasura/graphql-engine/issues/4613",
+        "url": "https://github.com/donat/graphql-engine/issues/4613",
         "quality": "primary",
         "angle": "security/fail-open-admin-surface",
         "claimCount": 4
       },
       {
-        "url": "https://hasura.io/docs/2.0/auth/authentication/admin-secret-access/",
+        "url": "https://donat.io/docs/2.0/auth/authentication/admin-secret-access/",
         "quality": "primary",
         "angle": "security/fail-open-admin-surface",
         "claimCount": 4

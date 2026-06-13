@@ -27,7 +27,7 @@ create table if not exists donat.cron_events (
 create index if not exists cron_events_due_idx
     on donat.cron_events (status, scheduled_time);
 
--- One row per delivery attempt (audit trail; mirrors Hasura's invocation logs).
+-- One row per delivery attempt (audit trail; mirrors Donat's invocation logs).
 create table if not exists donat.cron_event_invocation_logs (
     id         uuid primary key default gen_random_uuid(),
     event_id   uuid not null references donat.cron_events (id) on delete cascade,

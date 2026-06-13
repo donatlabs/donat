@@ -2,8 +2,8 @@ description: Update blog written by Author 1
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '2'
+  X-Donat-Role: user
+  X-Donat-User-Id: '2'
 response:
   data:
     insert_blog:

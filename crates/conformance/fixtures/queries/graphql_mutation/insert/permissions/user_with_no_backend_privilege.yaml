@@ -2,8 +2,8 @@ description: As backend user and without backend only permissions
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: backend_user
-  X-Hasura-Use-Backend-Only-Permissions: "false"
+  X-Donat-Role: backend_user
+  X-Donat-Use-Backend-Only-Permissions: "false"
 response:
   errors:
     - extensions:

@@ -41,7 +41,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ./migrations:/migrations:ro
     restart: "no"
@@ -54,7 +54,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ./metadata:/metadata:ro
     restart: "no"
@@ -67,16 +67,16 @@ services:
       validate:
         condition: service_completed_successfully
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
       DONAT_METADATA_DIR: /metadata
       DONAT_PORT: "8080"
       # The secret marks a request as trusted: it may then assert any role
-      # via the X-Hasura-Role header (a demo stand-in for real edge auth /
+      # via the X-Donat-Role header (a demo stand-in for real edge auth /
       # JWTs). There is no admin role — a trusted request must still name a
       # role. Change the secret for anything real.
-      HASURA_GRAPHQL_ADMIN_SECRET: petshop-secret
+      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
       # Requests with no/role-less auth fall back to the public catalog role.
-      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
     volumes:
       - ./metadata:/metadata:ro
     ports:

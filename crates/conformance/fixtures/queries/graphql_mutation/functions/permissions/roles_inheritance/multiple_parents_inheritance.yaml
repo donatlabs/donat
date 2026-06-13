@@ -1,7 +1,7 @@
 description: When any of the parent roles can access the function then add as inherited role
 url: /v1/graphql
 headers:
-  X-Hasura-Role: inherited_role1
+  X-Donat-Role: inherited_role1
 status: 200
 query:
   query: |

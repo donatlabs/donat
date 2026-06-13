@@ -1,7 +1,7 @@
-//! Boolean expression parsing: Hasura bool_exp JSON -> IR predicate.
+//! Boolean expression parsing: Donat bool_exp JSON -> IR predicate.
 //!
 //! Used for both the user's `where` argument and role row filters from
-//! metadata. Session variables (string values starting with "x-hasura-")
+//! metadata. Session variables (string values starting with "x-donat-")
 //! are substituted only in permission filters; clients cannot reference
 //! them in `where`.
 
@@ -27,7 +27,7 @@ impl Planner<'_> {
 
         let mut conjuncts = vec![];
         for (key, sub) in map {
-            // Hasura accepts both the modern `_op` and the legacy `$op`
+            // Donat accepts both the modern `_op` and the legacy `$op`
             // spellings for logical operators.
             let logical = match key.as_str() {
                 "$and" => "_and",
@@ -485,7 +485,7 @@ fn parse_array_literal(s: &str) -> Option<Vec<Json>> {
     )
 }
 
-/// In permission filters, string values starting with "x-hasura-"
+/// In permission filters, string values starting with "x-donat-"
 /// (case-insensitive) refer to session variables.
 fn resolve_session(
     value: &Json,
@@ -497,11 +497,11 @@ fn resolve_session(
         return Ok(value.clone());
     }
     match value {
-        Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
             let _ = path;
             match session.var(s) {
                 Some(v) => Ok(Json::String(v.to_string())),
-                // Hasura reports this with path "$" regardless of depth.
+                // Donat reports this with path "$" regardless of depth.
                 None => Err(PlanError::new(
                     "$",
                     "not-found",

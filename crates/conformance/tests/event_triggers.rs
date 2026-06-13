@@ -3,16 +3,16 @@
 //! `TestEventRetryConf`).
 //!
 //! tests-py drives delivery to a recording webhook server and asserts the
-//! event envelope; we do the same with a native recording stub. Hasura's
+//! event envelope; we do the same with a native recording stub. Donat's
 //! `create_event_trigger` is a runtime metadata call this engine does not
 //! have — here the trigger is declared in YAML (under the table) and its
 //! per-table Postgres triggers are created by `migrate --metadata-dir`
 //! (reconcile), exactly as a real deploy would.
 //!
-//! Difference from Hasura, by design: this engine has no admin role, so
+//! Difference from Donat, by design: this engine has no admin role, so
 //! mutations run as an explicit `tester` role (via
-//! HASURA_GRAPHQL_UNAUTHORIZED_ROLE). Session variables are not yet captured
-//! into the event payload (the engine does not set the `hasura.user` GUC), so
+//! DONAT_GRAPHQL_UNAUTHORIZED_ROLE). Session variables are not yet captured
+//! into the event payload (the engine does not set the `donat.user` GUC), so
 //! `event.session_variables` is currently null — asserted as such here.
 
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ fn event_trigger(name: &str, webhook_suffix: &str, retry: Json) -> EventTrigger 
 /// (migrate + reconcile + serve) to start.
 fn setup(name: &str, trigger: EventTrigger) -> donat_conformance::Running {
     let r = Suite::new(name)
-        .env("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
+        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
         .with_event_webhook()
         .start();
 
@@ -128,7 +128,7 @@ fn assert_event(received: &[Received], op: &str, exp_data: Json) {
     assert_eq!(body["event"]["data"], exp_data, "event data for {op}");
     assert!(body["id"].is_string(), "envelope has id");
     assert!(body["created_at"].is_string(), "envelope has created_at");
-    // Not yet captured by this engine (no admin role / no hasura.user GUC).
+    // Not yet captured by this engine (no admin role / no donat.user GUC).
     assert_eq!(body["event"]["session_variables"], Json::Null);
     assert_eq!(body["delivery_info"]["current_retry"], json!(0));
 }

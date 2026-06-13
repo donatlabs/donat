@@ -12,6 +12,6 @@ select_permissions:
       filter:
         _or:
           - published: { _eq: true }
-          - author_id: { _eq: X-Hasura-User-Id }
+          - author_id: { _eq: X-Donat-User-Id }
       limit: 100
       allow_aggregations: true

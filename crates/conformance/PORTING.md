@@ -1,19 +1,19 @@
 # Porting tests-py suites to the native harness
 
-Source of truth: `tests/hasura/tests-py` (vendored, git-ignored). Target:
+Source of truth: `tests/donat/tests-py` (vendored, git-ignored). Target:
 one Rust `#[test]` per pytest class in `crates/conformance/tests/*.rs`,
 fixtures copied under `crates/conformance/fixtures/` (same relative paths).
 
 ## Scope rules (CLAUDE.md governs)
 
-- **No admin role.** Skip tests whose fixture sends no `X-Hasura-Role`
+- **No admin role.** Skip tests whose fixture sends no `X-Donat-Role`
   header (or an `admin` role), and multi-step fixtures' admin-only steps if
   the whole test depends on them. Mark every exclusion with a comment:
   `// <file>: no-role (admin) request — out of scope.`
-- **Status-only known-diffs** (documented in tests/hasura/COVERAGE.md): we
+- **Status-only known-diffs** (documented in tests/donat/COVERAGE.md): we
   return 200 where 3 old insert fixtures say 400 with byte-identical
   bodies. Patch the *copied* fixture to `status: 200` and add a YAML
-  comment `# donat: Hasura fixtures are inconsistent here; we return 200
+  comment `# donat: Donat fixtures are inconsistent here; we return 200
   everywhere (see COVERAGE.md)`. Never patch anything else.
 
 ## Mapping a pytest class
@@ -63,7 +63,7 @@ Suite names must be unique across ALL modules (they become database names
 
 ## Workflow
 
-1. Copy the fixture dir: `cp -R tests/hasura/tests-py/queries/<dir>
+1. Copy the fixture dir: `cp -R tests/donat/tests-py/queries/<dir>
    crates/conformance/fixtures/queries/<dir>` (create parents). Copy ONLY
    dirs the ported class needs, but copy them whole.
 2. Write the module, run

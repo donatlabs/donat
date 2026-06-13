@@ -2,7 +2,7 @@
 //!
 //! tests-py runs these as admin; this engine has no admin role, so each
 //! action is granted to an explicit `tester` role (role-less requests fall
-//! back to it via `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`). A dedicated role avoids
+//! back to it via `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`). A dedicated role avoids
 //! the restrictive `user`-role permission the shared schema_setup installs.
 //! The webhook handler is a
 //! native Rust stub (`action_webhook`) mirroring `ActionsWebhookHandler` in
@@ -20,7 +20,7 @@ const SYNC: &str = "queries/actions/sync";
 /// can read/write through the GraphQL API.
 fn sync_suite(name: &str) -> Running {
     let s = Suite::new(name)
-        .env("HASURA_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
+        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
         .with_action_webhook()
         .start();
     s.setup_v1q(&format!("{SYNC}/schema_setup.yaml"));
@@ -93,7 +93,7 @@ fn seed_user(s: &Running, name: &str, email: &str) {
 
 /// Single-step sync action cases that resolve against the boot-time metadata.
 /// (Multi-step `update_action`-then-query cases are out of scope: this engine
-/// has no runtime metadata API — see tests/hasura/COVERAGE.md.)
+/// has no runtime metadata API — see tests/donat/COVERAGE.md.)
 #[test]
 fn sync_actions() {
     let s = sync_suite("actions_sync");
@@ -109,10 +109,10 @@ fn sync_actions() {
         "expecting_custom_scalar_response_success.yaml",
         "expecting_custom_scalar_array_response_success.yaml",
         "get_string_scalar_array_action_output_type_success.yaml",
-        // query_action_recursive_output.yaml: Hasura omits (vs nulls) a
+        // query_action_recursive_output.yaml: Donat omits (vs nulls) a
         // selected-but-absent nullable field only at deep nesting — an
         // inconsistency with the top-level omitted-field behaviour we follow.
-        // Out of scope; see tests/hasura/COVERAGE.md.
+        // Out of scope; see tests/donat/COVERAGE.md.
         // Output-validation errors (internal diagnostic trimmed).
         "mirror_action_not_null.yaml",
         "mirror_action_no_field.yaml",

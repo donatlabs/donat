@@ -13,7 +13,7 @@ use serde_json::json;
 
 #[test]
 fn legacy_dollar_op_filter_spellings_are_accepted_verbatim() {
-    // Pre-v1 Hasura wrote operators as $eq/$or/...; BoolExp stays untyped,
+    // Pre-v1 Donat wrote operators as $eq/$or/...; BoolExp stays untyped,
     // so legacy spellings must deserialize and survive unchanged.
     let yaml = "\
 role: user
@@ -22,7 +22,7 @@ permission:
   filter:
     $or:
       - id:
-          $eq: X-Hasura-User-Id
+          $eq: X-Donat-User-Id
       - is_public:
           $eq: true
 ";
@@ -31,7 +31,7 @@ permission:
     assert_eq!(entry.role, "user");
     assert_eq!(
         entry.permission.filter["$or"][0]["id"]["$eq"],
-        json!("X-Hasura-User-Id")
+        json!("X-Donat-User-Id")
     );
     assert_eq!(
         entry.permission.filter["$or"][1]["is_public"]["$eq"],
@@ -186,7 +186,7 @@ sources:
           - role: user
             permission:
               columns: [name]
-              filter: { id: { _eq: X-Hasura-User-Id } }
+              filter: { id: { _eq: X-Donat-User-Id } }
               check: { name: { _ne: \"\" } }
 inherited_roles:
   - role_name: combined
@@ -218,7 +218,7 @@ remote_schemas:
 
 #[test]
 fn cron_trigger_full_parse() {
-    // The shape hasura-cli writes to cron_triggers.yaml.
+    // The shape donat-cli writes to cron_triggers.yaml.
     let yaml = "\
 name: send_reminders
 webhook: '{{WEBHOOK_BASE}}/cron'
@@ -269,7 +269,7 @@ schedule: '* * * * *'
 }
 
 #[test]
-fn cron_retry_conf_field_defaults_match_hasura() {
+fn cron_retry_conf_field_defaults_match_donat() {
     // RetryConfST defaults: num_retries=0, interval=10, timeout=60,
     // tolerance=21600. A partial retry_conf fills the rest from defaults.
     let ct: CronTrigger = serde_yaml::from_str(
@@ -311,7 +311,7 @@ cron_triggers:
 
 #[test]
 fn event_trigger_full_parse() {
-    // Hasura directory-format event trigger (under a table entry).
+    // Donat directory-format event trigger (under a table entry).
     let yaml = "\
 name: t1_all
 definition:
@@ -366,7 +366,7 @@ webhook_from_env: MY_HOOK
     assert!(et.definition.update.is_none());
     assert!(et.definition.delete.is_none());
     assert!(et.retry_conf.is_none());
-    // RetryConf defaults (Hasura): num_retries=0, interval_sec=10, timeout_sec=60.
+    // RetryConf defaults (Donat): num_retries=0, interval_sec=10, timeout_sec=60.
     let rc = donat_metadata::EventRetryConf::default();
     assert_eq!((rc.num_retries, rc.interval_sec, rc.timeout_sec), (0, 10, 60));
 }
@@ -389,7 +389,7 @@ event_triggers:
 #[test]
 fn existing_fixture_directory_still_loads() {
     // Guard: the canonical on-disk fixture (string-spelled includes, the
-    // hasura-cli layout) keeps loading through the public entry point.
+    // donat-cli layout) keeps loading through the public entry point.
     let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/metadata"));
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert_eq!(md.sources.len(), 1);

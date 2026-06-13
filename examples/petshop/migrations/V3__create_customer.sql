@@ -1,4 +1,4 @@
--- Shoppers. customer.id is the value carried in the X-Hasura-User-Id session
+-- Shoppers. customer.id is the value carried in the X-Donat-User-Id session
 -- variable, so it is a text key rather than a serial.
 
 CREATE TABLE customer (

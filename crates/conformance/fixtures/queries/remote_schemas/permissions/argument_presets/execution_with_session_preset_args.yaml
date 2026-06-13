@@ -2,8 +2,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: "1"
+    X-Donat-Role: user
+    X-Donat-User-Id: "1"
   query:
     query: |
       {
@@ -20,7 +20,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
+    X-Donat-Role: user
   query:
     query: |
       {
@@ -33,14 +33,14 @@
     - extensions:
         code: not-found
         path: $
-      message: '"x-hasura-user-id" session variable expected, but not found'
+      message: '"x-donat-user-id" session variable expected, but not found'
 
 - description: "throw error when the session variable cannot be coerced into the appropriate type"
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: randomid123
+    X-Donat-Role: user
+    X-Donat-User-Id: randomid123
   query:
     query: |
       {

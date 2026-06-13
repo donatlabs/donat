@@ -2,13 +2,13 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: critic
+    X-Donat-Role: critic
   response:
     errors:
     - extensions:
         path: "$"
         code: not-found
-      message: 'missing session variable: "x-hasura-critic-id"'
+      message: 'missing session variable: "x-donat-critic-id"'
   query:
     query: |
       query {
@@ -27,7 +27,7 @@
   status: 200
   url: /v1/graphql
   headers:
-    X-Hasura-Role: anonymous
+    X-Donat-Role: anonymous
   response:
     data:
       author:

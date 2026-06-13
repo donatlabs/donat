@@ -2,8 +2,8 @@ description: Insert Company data as user role
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Company-Id: '1'
-  X-Hasura-Role: user
+  X-Donat-Company-Id: '1'
+  X-Donat-Role: user
 response:
   data:
     insert_Company:

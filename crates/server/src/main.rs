@@ -36,9 +36,9 @@ use serde_json::{Value, json};
 use state::{AppState, Engine, SharedState, ensure_default_source};
 
 #[derive(Parser, Debug)]
-#[command(name = "donat", about = "GraphQL engine over Postgres (Hasura v2-compatible)")]
+#[command(name = "donat", about = "GraphQL engine over Postgres (Donat v2-compatible)")]
 struct Args {
-    /// Hasura v2 metadata directory (version: 3 format). Optional.
+    /// Donat v2 metadata directory (version: 3 format). Optional.
     #[arg(long, env = "DONAT_METADATA_DIR")]
     metadata_dir: Option<PathBuf>,
 
@@ -46,15 +46,15 @@ struct Args {
     #[arg(long, env = "DONAT_DATABASE_URL")]
     database_url: Option<String>,
 
-    /// Hasura-compatible alias; also the default source's database.
+    /// Donat-compatible alias; also the default source's database.
     #[arg(long)]
     metadata_database_url: Option<String>,
 
     #[arg(long, env = "DONAT_PORT", default_value_t = 8080)]
     port: u16,
 
-    /// If set, metadata endpoints require X-Hasura-Admin-Secret.
-    #[arg(long, env = "HASURA_GRAPHQL_ADMIN_SECRET")]
+    /// If set, metadata endpoints require X-Donat-Admin-Secret.
+    #[arg(long, env = "DONAT_GRAPHQL_ADMIN_SECRET")]
     admin_secret: Option<String>,
 
     #[command(subcommand)]
@@ -63,7 +63,7 @@ struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 enum Command {
-    /// Hasura-compatible serve subcommand.
+    /// Donat-compatible serve subcommand.
     Serve(ServeArgs),
     /// Apply versioned SQL schema migrations (DDL), then exit.
     Migrate(MigrateArgs),
@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         .database_url
         .clone()
         .or_else(|| args.metadata_database_url.clone())
-        .or_else(|| std::env::var("HASURA_GRAPHQL_DATABASE_URL").ok())
+        .or_else(|| std::env::var("DONAT_GRAPHQL_DATABASE_URL").ok())
         .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
 
     // Deploy-time subcommands: do their job and exit (no server, no
@@ -162,19 +162,19 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.admin_secret.clone())
         .or(args.admin_secret);
     let stringify_numerics = serve.map(|s| s.stringify_numeric_types).unwrap_or(false);
-    let unauthorized_role = std::env::var("HASURA_GRAPHQL_UNAUTHORIZED_ROLE").ok();
-    let allowlist_enabled = std::env::var("HASURA_GRAPHQL_ENABLE_ALLOWLIST")
+    let unauthorized_role = std::env::var("DONAT_GRAPHQL_UNAUTHORIZED_ROLE").ok();
+    let allowlist_enabled = std::env::var("DONAT_GRAPHQL_ENABLE_ALLOWLIST")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let auth_hook = std::env::var("HASURA_GRAPHQL_AUTH_HOOK").ok().map(|url| {
-        let mode = std::env::var("HASURA_GRAPHQL_AUTH_HOOK_MODE")
+    let auth_hook = std::env::var("DONAT_GRAPHQL_AUTH_HOOK").ok().map(|url| {
+        let mode = std::env::var("DONAT_GRAPHQL_AUTH_HOOK_MODE")
             .unwrap_or_else(|_| "GET".to_string());
         (url, mode)
     });
-    let jwt = std::env::var("HASURA_GRAPHQL_JWT_SECRET")
+    let jwt = std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
         .and_then(|raw| jwt::JwtConfig::from_env_value(&raw));
-    let infer_function_permissions = std::env::var("HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS")
+    let infer_function_permissions = std::env::var("DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS")
         .map(|v| !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
 

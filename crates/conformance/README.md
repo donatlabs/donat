@@ -1,10 +1,9 @@
 # donat-conformance
 
-Native conformance harness: Hasura-derived YAML fixtures executed against a
-spawned `donat`, replicating tests-py `check_query_f` semantics (fixture
-format, response comparison with selection-set key ordering, legacy-Apollo
-websocket transport). This crate is the conformance source of truth; the
-legacy pytest harness under `tests/hasura` is an optional cross-check.
+Native conformance harness: YAML fixtures executed against a spawned
+`donat`, with fixture-format parsing, response comparison (selection-set key
+ordering) and a legacy-Apollo websocket transport. This crate is the
+conformance source of truth.
 
 ## Running
 

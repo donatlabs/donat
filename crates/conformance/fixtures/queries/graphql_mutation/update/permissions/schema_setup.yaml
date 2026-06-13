@@ -105,7 +105,7 @@ args:
     permission:
       columns: [id, name]
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Author update permission for user
 - type: create_update_permission
@@ -116,7 +116,7 @@ args:
       columns:
       - name
       filter:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
 
 #Article select permission for user
 - type: create_select_permission
@@ -127,7 +127,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article update permission for user
@@ -145,7 +145,7 @@ args:
       - version
       filter:
         $and:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: false
       check:
         is_published: false
@@ -189,7 +189,7 @@ args:
       filter: {}
       columns: '*'
       set:
-        city: X-Hasura-City
+        city: X-Donat-City
 
 # Tables to test '_exist' field
 - type: track_table
@@ -213,7 +213,7 @@ args:
         _exists:
           _table: user
           _where:
-            id: X-Hasura-User-Id
+            id: X-Donat-User-Id
             is_admin: true
 
 - type: create_select_permission
@@ -228,5 +228,5 @@ args:
         _exists:
           _table: user
           _where:
-            id: X-Hasura-User-Id
+            id: X-Donat-User-Id
             is_admin: true

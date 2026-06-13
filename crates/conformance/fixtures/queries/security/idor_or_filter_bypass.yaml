@@ -2,8 +2,8 @@ description: An _or in the where clause cannot widen access beyond the permissio
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '1'
+  X-Donat-Role: user
+  X-Donat-User-Id: '1'
 query:
   query: |
     query {

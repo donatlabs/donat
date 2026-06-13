@@ -1,19 +1,19 @@
 # Spec 002 — Table event triggers
 
 Status: in progress. Table event triggers (webhooks on row insert/update/
-delete), TDD-ported from Hasura `tests-py/test_events.py`. Reuses the cron
+delete), TDD-ported from Donat `tests-py/test_events.py`. Reuses the cron
 delivery machinery (the `donat` journal + `FOR UPDATE SKIP LOCKED` poller +
 retries).
 
 Compatible with the no-admin-role posture: triggers are declared in YAML under
 the table (`event_triggers`); the per-table Postgres triggers (DDL) are
 created by the deploy-time `migrate --metadata-dir` step, never by the serving
-binary. Hasura's runtime `create_event_trigger` metadata API is intentionally
+binary. Donat's runtime `create_event_trigger` metadata API is intentionally
 absent.
 
 ## 1. Metadata (`crates/metadata`)
 
-`event_triggers: Vec<EventTrigger>` on `TableEntry` (Hasura directory-format
+`event_triggers: Vec<EventTrigger>` on `TableEntry` (Donat directory-format
 `EventTriggerConf`):
 
 ```yaml
@@ -29,7 +29,7 @@ event_triggers:
     headers: [{ name: X-Api-Key, value_from_env: API_KEY }]
 ```
 
-`EventRetryConf` is Hasura `RetryConf` — note the field names differ from
+`EventRetryConf` is Donat `RetryConf` — note the field names differ from
 cron's `RetryConfST` (`interval_sec`/`timeout_sec`, not
 `retry_interval_seconds`/`timeout_seconds`).
 
@@ -42,7 +42,7 @@ cron's `RetryConfST` (`interval_sec`/`timeout_sec`, not
 - `donat.notify_event()` — one generic PL/pgSQL function shared by every
   per-table trigger. Captures `to_jsonb(OLD/NEW)` and inserts an `event_log`
   row **in the mutation's transaction** (so nothing is lost on crash, and raw
-  SQL writes fire events too). Reads the `hasura.user` GUC for session
+  SQL writes fire events too). Reads the `donat.user` GUC for session
   variables when set (NULL otherwise — see Limitations).
 
 ## 3. Reconcile (deploy-time DDL, `crates/server/src/events.rs::reconcile`)
@@ -57,11 +57,11 @@ the trigger-name literal are quoted/escaped.
 ## 4. Delivery (`crates/server/src/events.rs`, spawned from `main.rs`)
 
 Background loop (poll `DONAT_EVENTS_POLL_SECONDS`, default 10). Claim due
-`event_log` rows with `FOR UPDATE SKIP LOCKED`, POST the Hasura event
+`event_log` rows with `FOR UPDATE SKIP LOCKED`, POST the Donat event
 envelope, retry per `retry_conf`, write invocation logs. Same multi-instance
 properties as cron (at-least-once; handlers must be idempotent).
 
-Envelope (Hasura shape):
+Envelope (Donat shape):
 
 ```json
 { "id": "<uuid>", "created_at": "<ts>",
@@ -88,8 +88,8 @@ implies migrations+reconcile, 1s poll) and `Running::add_event_trigger()`.
 ## Limitations / follow-ups
 
 - **Session variables** not yet captured (engine does not set the
-  `hasura.user` GUC inside the mutation transaction); `session_variables` is
-  null. Hasura asserts the role here; tracked as a follow-up (needs wrapping
+  `donat.user` GUC inside the mutation transaction); `session_variables` is
+  null. Donat asserts the role here; tracked as a follow-up (needs wrapping
   mutations with `SET LOCAL` when a trigger exists on the target table).
 - **Column-filtered payloads** (`columns: [..]` limiting the delivered row,
   and `payload`) not yet applied — the full row is delivered. Update *firing*

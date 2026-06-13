@@ -1,14 +1,14 @@
-description: A permission that needs X-Hasura-User-Id errors when the header is absent (no silent full access)
+description: A permission that needs X-Donat-User-Id errors when the header is absent (no silent full access)
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 response:
   errors:
     - extensions:
         path: $
         code: not-found
-      message: 'missing session variable: "x-hasura-user-id"'
+      message: 'missing session variable: "x-donat-user-id"'
 query:
   query: |
     query {

@@ -151,7 +151,7 @@ pub fn match_remote_with<'m>(
         if !all_match {
             continue;
         }
-        // Deep validation with exact Hasura-style errors. Under customization,
+        // Deep validation with exact Donat-style errors. Under customization,
         // errors are reported with the client-facing names and the namespaced
         // path, so build the base path from the namespace + customized name.
         let customizer = customization.map(|c| Customizer { c });
@@ -215,7 +215,7 @@ pub fn match_remote_with<'m>(
     None
 }
 
-/// Hasura resolves {{ENV_VAR}} templates in remote urls itself.
+/// Donat resolves {{ENV_VAR}} templates in remote urls itself.
 pub fn resolve_url_template(raw_url: &str) -> String {
     // Substitute every {{ENV_VAR}}. Anchoring the closing `}}` search AFTER
     // each `{{` avoids the start>end slice panic when `}}` precedes `{{`, and
@@ -293,7 +293,7 @@ fn field_on_type<'d>(
 
 /// Maps upstream names back to the client-facing customized spelling for error
 /// reporting against a customized remote schema. Validation runs on the
-/// decustomized query (upstream names), but Hasura reports errors using the
+/// decustomized query (upstream names), but Donat reports errors using the
 /// customized type/field names and the namespaced path.
 struct Customizer<'a> {
     c: &'a donat_metadata::RemoteSchemaCustomization,
@@ -626,7 +626,7 @@ fn apply_presets(
                 };
                 let value = match raw {
                     graphql_parser::schema::Value::String(s)
-                        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") =>
+                        if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
                     {
                         let Some(found) = session.var(s) else {
                             return Err(crate::gql::GqlError {
@@ -757,7 +757,7 @@ pub async fn forward(
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-hasura-") || name == "authorization" || name == "cookie" {
+            if name.starts_with("x-donat-") || name == "authorization" || name == "cookie" {
                 if let Ok(value) = value.to_str() {
                     request = request.header(name, value);
                 }
@@ -812,7 +812,7 @@ mod tests {
 
     const PRESET_SDL: &str = r#"
         type Query {
-            user(id: Int! @preset(value: "x-hasura-user-id")): User
+            user(id: Int! @preset(value: "x-donat-user-id")): User
             items(limit: Int @preset(value: 5)): String
             search(where: Filter): String
         }
@@ -858,7 +858,7 @@ mod tests {
         let types = type_map(&sdl);
         let mut doc = parse_op("{ user { name } items }");
         let mut vars = serde_json::Map::new();
-        let session = session(&[("x-hasura-user-id", "42")]);
+        let session = session(&[("x-donat-user-id", "42")]);
         let changed = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap();
         assert!(changed);
         let rendered = format!("{doc}");
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(e.code, "not-found");
         assert_eq!(
             e.message,
-            "\"x-hasura-user-id\" session variable expected, but not found"
+            "\"x-donat-user-id\" session variable expected, but not found"
         );
     }
 
@@ -886,7 +886,7 @@ mod tests {
         let types = type_map(&sdl);
         let mut doc = parse_op("{ user { name } }");
         let mut vars = serde_json::Map::new();
-        let session = session(&[("x-hasura-user-id", "x")]);
+        let session = session(&[("x-donat-user-id", "x")]);
         let e = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap_err();
         assert_eq!(e.code, "coercion-error");
         assert_eq!(e.message, "\"x\" cannot be coerced into an Int value");
