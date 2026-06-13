@@ -59,14 +59,35 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
             source,
         })?;
 
+    // Optional top-level sections, in the Hasura v3 export layout. Each file
+    // is a list (with `!include` allowed); absent files mean "none". This is
+    // what lets the whole metadata surface boot from the filesystem with no
+    // runtime admin/metadata API.
     Ok(Metadata {
         version: version.version,
         sources,
-        inherited_roles: vec![],
-        query_collections: vec![],
-        allowlist: vec![],
-        remote_schemas: vec![],
+        inherited_roles: load_section(dir, "inherited_roles.yaml")?,
+        query_collections: load_section(dir, "query_collections.yaml")?,
+        allowlist: load_section(dir, "allow_list.yaml")?,
+        remote_schemas: load_section(dir, "remote_schemas.yaml")?,
     })
+}
+
+/// Load an optional top-level list section (`!include`-resolved). Returns an
+/// empty vec when the file is absent or blank.
+fn load_section<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+    file: &str,
+) -> Result<Vec<T>, LoadError> {
+    let path = dir.join(file);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let value = load_yaml_resolved(&path)?;
+    if value.is_null() {
+        return Ok(vec![]);
+    }
+    serde_yaml::from_value(value).map_err(|source| LoadError::Yaml { path, source })
 }
 
 fn parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LoadError> {

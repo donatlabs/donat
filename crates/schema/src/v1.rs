@@ -301,22 +301,32 @@ impl<'a> Planner<'a> {
         let ctx = self
             .relationship_ctx(&table, session, true)
             .ok_or_else(|| PlanError::validation(path, format!("table \"{table}\" not tracked")))?;
-        let perm = ctx
-            .entry
-            .update_permissions
-            .iter()
-            .find(|p| p.role == session.role)
-            .map(|p| &p.permission)
-            .ok_or_else(|| {
-                PlanError::new(
-                    path,
-                    "permission-denied",
-                    format!(
-                        "role \"{}\" does not have permission to update table \"{table}\"",
-                        session.role
-                    ),
-                )
-            })?;
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::UpdatePermission {
+                columns: Columns::Star,
+                filter: Default::default(),
+                check: None,
+                set: Default::default(),
+            };
+            &admin_perm
+        } else {
+            ctx.entry
+                .update_permissions
+                .iter()
+                .find(|p| p.role == session.role)
+                .map(|p| &p.permission)
+                .ok_or_else(|| {
+                    PlanError::new(
+                        path,
+                        "permission-denied",
+                        format!(
+                            "role \"{}\" does not have permission to update table \"{table}\"",
+                            session.role
+                        ),
+                    )
+                })?
+        };
 
         let allowed = |col: &str| -> bool {
             ctx.info.column(col).is_some()
@@ -417,22 +427,29 @@ impl<'a> Planner<'a> {
         let ctx = self
             .relationship_ctx(&table, session, true)
             .ok_or_else(|| PlanError::validation(path, format!("table \"{table}\" not tracked")))?;
-        let perm = ctx
-            .entry
-            .delete_permissions
-            .iter()
-            .find(|p| p.role == session.role)
-            .map(|p| &p.permission)
-            .ok_or_else(|| {
-                PlanError::new(
-                    path,
-                    "permission-denied",
-                    format!(
-                        "role \"{}\" does not have permission to delete from table \"{table}\"",
-                        session.role
-                    ),
-                )
-            })?;
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::DeletePermission {
+                filter: Default::default(),
+            };
+            &admin_perm
+        } else {
+            ctx.entry
+                .delete_permissions
+                .iter()
+                .find(|p| p.role == session.role)
+                .map(|p| &p.permission)
+                .ok_or_else(|| {
+                    PlanError::new(
+                        path,
+                        "permission-denied",
+                        format!(
+                            "role \"{}\" does not have permission to delete from table \"{table}\"",
+                            session.role
+                        ),
+                    )
+                })?
+        };
 
         let mut predicates = vec![];
         if let Some(w) = args.get("where").filter(|w| !w.is_null()) {
@@ -470,8 +487,17 @@ impl<'a> Planner<'a> {
         let ctx = self
             .relationship_ctx(&table, session, true)
             .ok_or_else(|| PlanError::validation(path, format!("table \"{table}\" not tracked")))?;
-        let perm = ctx
-            .entry
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::InsertPermission {
+                check: Default::default(),
+                set: Default::default(),
+                columns: Columns::Star,
+                backend_only: false,
+            };
+            &admin_perm
+        } else {
+            ctx.entry
             .insert_permissions
             .iter()
             .find(|p| {
@@ -490,7 +516,8 @@ impl<'a> Planner<'a> {
                         session.role
                     ),
                 )
-            })?;
+            })?
+        };
 
         let objects = args
             .get("objects")

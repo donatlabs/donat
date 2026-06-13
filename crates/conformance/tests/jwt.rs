@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Suite, Running, fixture_root, load_fixture, response_matches};
+use dist_conformance::{Running, Suite, fixture_root, load_fixture, response_matches};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value as Json, json};
 
@@ -150,7 +150,10 @@ impl JwtCfg {
                 m.insert("header".into(), json!({"type": "Cookie", "name": name}));
             }
             TokenIn::CustomHeader(name) => {
-                m.insert("header".into(), json!({"type": "CustomHeader", "name": name}));
+                m.insert(
+                    "header".into(),
+                    json!({"type": "CustomHeader", "name": name}),
+                );
             }
         }
         if self.stringified {
@@ -249,9 +252,9 @@ fn base_claims() -> Map<String, Json> {
 /// The base test conf every class loads:
 /// permissions/user_select_query_unpublished_articles.yaml.
 fn base_conf() -> Json {
-    load_fixture(
-        &fixture_root().join(format!("{PERMS}/user_select_query_unpublished_articles.yaml")),
-    )
+    load_fixture(&fixture_root().join(format!(
+        "{PERMS}/user_select_query_unpublished_articles.yaml"
+    )))
     .expect("loading base conf")
 }
 
@@ -331,12 +334,20 @@ fn run_request_status_only(
 }
 
 fn error_status(endpoint: &str) -> u16 {
-    if endpoint == "/v1alpha1/graphql" { 400 } else { 200 }
+    if endpoint == "/v1alpha1/graphql" {
+        400
+    } else {
+        200
+    }
 }
 
 /// Build a token carrying `hasura_claims` (formatted + namespaced per cfg),
 /// with optional extra mutation of the registered claims.
-fn make_token(cfg: &JwtCfg, hasura_claims: Json, tweak: impl FnOnce(&mut Map<String, Json>)) -> String {
+fn make_token(
+    cfg: &JwtCfg,
+    hasura_claims: Json,
+    tweak: impl FnOnce(&mut Map<String, Json>),
+) -> String {
     let mut claims = base_claims();
     let formatted = cfg.format_claims(hasura_claims);
     cfg.set_claims(&mut claims, formatted);
@@ -365,7 +376,14 @@ fn jwt_valid_claims_success(s: &Running, cfg: &JwtCfg, endpoint: &str) {
         |_| {},
     );
     let expected = base_conf()["response"].clone();
-    run_request(s, endpoint, cfg.auth_header(&token), 200, &expected, "valid_claims_success");
+    run_request(
+        s,
+        endpoint,
+        cfg.auth_header(&token),
+        200,
+        &expected,
+        "valid_claims_success",
+    );
 }
 
 fn jwt_invalid_role_in_request_header(s: &Running, cfg: &JwtCfg, endpoint: &str) {
@@ -378,7 +396,10 @@ fn jwt_invalid_role_in_request_header(s: &Running, cfg: &JwtCfg, endpoint: &str)
         }),
         |_| {},
     );
-    let expected = error_body("access-denied", "Your requested role is not in allowed roles");
+    let expected = error_body(
+        "access-denied",
+        "Your requested role is not in allowed roles",
+    );
     run_request(
         s,
         endpoint,
@@ -506,7 +527,14 @@ fn jwt_no_audience_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
         claims.insert("aud".into(), json!("hasura-test-suite"));
     });
     let expected = base_conf()["response"].clone();
-    run_request(s, endpoint, cfg.auth_header(&token), 200, &expected, "no_audience_in_conf");
+    run_request(
+        s,
+        endpoint,
+        cfg.auth_header(&token),
+        200,
+        &expected,
+        "no_audience_in_conf",
+    );
 }
 
 fn jwt_no_issuer_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
@@ -514,7 +542,14 @@ fn jwt_no_issuer_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
         claims.insert("iss".into(), json!("rubbish-issuer"));
     });
     let expected = base_conf()["response"].clone();
-    run_request(s, endpoint, cfg.auth_header(&token), 200, &expected, "no_issuer_in_conf");
+    run_request(
+        s,
+        endpoint,
+        cfg.auth_header(&token),
+        200,
+        &expected,
+        "no_issuer_in_conf",
+    );
 }
 
 // --------------------------------------------------------------- suite loops
@@ -585,7 +620,14 @@ fn run_expiry_skew_suite(name: &str, cfg: JwtCfg) {
             claims.insert("exp".into(), json!(now() - 30));
         });
         let expected = base_conf()["response"].clone();
-        run_request(&s, endpoint, cfg.auth_header(&token), 200, &expected, "expiry_leeway");
+        run_request(
+            &s,
+            endpoint,
+            cfg.auth_header(&token),
+            200,
+            &expected,
+            "expiry_leeway",
+        );
     }
     finish(&s);
 }
@@ -605,7 +647,14 @@ fn run_audience_suite(name: &str, cfg: JwtCfg) {
             claims.insert("aud".into(), json!(valid_aud));
         });
         let expected = base_conf()["response"].clone();
-        run_request(&s, endpoint, cfg.auth_header(&token), 200, &expected, "valid_audience");
+        run_request(
+            &s,
+            endpoint,
+            cfg.auth_header(&token),
+            200,
+            &expected,
+            "valid_audience",
+        );
 
         let token = make_token(&cfg, full_hasura_claims(), |claims| {
             claims.insert("aud".into(), json!("rubbish_audience"));
@@ -633,7 +682,14 @@ fn run_issuer_suite(name: &str, cfg: JwtCfg) {
             claims.insert("iss".into(), json!(valid_iss));
         });
         let expected = base_conf()["response"].clone();
-        run_request(&s, endpoint, cfg.auth_header(&token), 200, &expected, "valid_issuer");
+        run_request(
+            &s,
+            endpoint,
+            cfg.auth_header(&token),
+            200,
+            &expected,
+            "valid_issuer",
+        );
 
         let token = make_token(&cfg, full_hasura_claims(), |claims| {
             claims.insert("iss".into(), json!("rubbish_issuer"));
@@ -663,9 +719,24 @@ macro_rules! suite {
 }
 
 // TestJwtBasicWith{Rsa,Ed25519,Es}
-suite!(jwt_basic_with_rsa, run_basic_suite, "jwt_rsa", JwtCfg::new(Alg::Rsa));
-suite!(jwt_basic_with_ed25519, run_basic_suite, "jwt_ed", JwtCfg::new(Alg::Ed25519));
-suite!(jwt_basic_with_es, run_basic_suite, "jwt_es", JwtCfg::new(Alg::Es));
+suite!(
+    jwt_basic_with_rsa,
+    run_basic_suite,
+    "jwt_rsa",
+    JwtCfg::new(Alg::Rsa)
+);
+suite!(
+    jwt_basic_with_ed25519,
+    run_basic_suite,
+    "jwt_ed",
+    JwtCfg::new(Alg::Ed25519)
+);
+suite!(
+    jwt_basic_with_es,
+    run_basic_suite,
+    "jwt_es",
+    JwtCfg::new(Alg::Es)
+);
 
 // TestJwtBasicWith{Rsa,Ed25519,Es}AndCookie
 suite!(

@@ -15,8 +15,13 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::naming::{root_names, table_base_name};
 
-/// Per-request session: explicit role + X-Hasura-* variables
-/// (keys lower-cased). There is no admin role.
+/// Hasura's built-in superuser role: full access to every tracked table,
+/// bypassing all permission checks. Assigned to trusted requests that carry
+/// no explicit role (valid admin secret, or no secret configured).
+pub const ADMIN_ROLE: &str = "admin";
+
+/// Per-request session: a role + X-Hasura-* variables (keys lower-cased).
+/// The role may be [`ADMIN_ROLE`], which bypasses permissions.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub role: String,
@@ -110,6 +115,9 @@ pub(crate) struct TableCtx<'a> {
     /// (anything goes); one = a plain role; several = an inherited role
     /// combining its parents.
     pub(crate) perms: Vec<&'a SelectPermission>,
+    /// The admin role: full access to every tracked table — all columns, no
+    /// row filter, no limit, aggregates and computed fields allowed.
+    pub(crate) is_admin: bool,
     pub(crate) type_name: String,
 }
 
@@ -138,13 +146,15 @@ impl<'a> TableCtx<'a> {
     }
 
     pub(crate) fn allow_aggregations(&self) -> bool {
-        self.perms.iter().any(|p| p.allow_aggregations)
+        self.is_admin || self.perms.iter().any(|p| p.allow_aggregations)
     }
 
     pub(crate) fn computed_field_allowed(&self, name: &str) -> bool {
-        self.perms
-            .iter()
-            .any(|p| p.computed_fields.iter().any(|c| c == name))
+        self.is_admin
+            || self
+                .perms
+                .iter()
+                .any(|p| p.computed_fields.iter().any(|c| c == name))
     }
 
     /// Parents granting this column (for cell-level guards).
@@ -313,6 +323,15 @@ impl<'a> Planner<'a> {
         let info = self
             .catalog
             .table(entry.table.schema(), entry.table.name())?;
+        if role == ADMIN_ROLE {
+            return Some(TableCtx {
+                entry,
+                info,
+                perms: vec![],
+                is_admin: true,
+                type_name: table_base_name(entry),
+            });
+        }
         let perms = self.role_select_perms(entry, role);
         if perms.is_empty() {
             return None;
@@ -321,6 +340,7 @@ impl<'a> Planner<'a> {
             entry,
             info,
             perms,
+            is_admin: false,
             type_name: table_base_name(entry),
         })
     }
@@ -560,6 +580,7 @@ impl<'a> Planner<'a> {
             entry,
             info,
             perms: vec![],
+            is_admin: false,
             type_name: table_base_name(entry),
         })
     }
@@ -651,6 +672,7 @@ impl<'a> Planner<'a> {
             entry: ctx.entry,
             info: ctx.info,
             perms: vec![],
+            is_admin: ctx.is_admin,
             type_name: ctx.type_name.clone(),
         }
     }
@@ -1100,6 +1122,7 @@ impl<'a> Planner<'a> {
             entry: ctx.entry,
             info: ctx.info,
             perms: vec![],
+            is_admin: ctx.is_admin,
             type_name: ctx.type_name.clone(),
         };
         let mut parts = vec![];

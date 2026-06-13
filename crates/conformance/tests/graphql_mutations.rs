@@ -1,5 +1,6 @@
-//! Ported from tests-py test_graphql_mutations.py (permission classes;
-//! admin/no-role tests are out of scope per the no-admin-role design rule).
+//! Ported from tests-py test_graphql_mutations.py (permission classes).
+//! No-role requests on a trusted connection are the `admin` superuser
+//! (admin role is now implemented), so admin steps are in scope.
 //!
 //! These pytest classes use `per_class_db_schema_for_mutation_tests` +
 //! `per_method_db_data_for_mutation_tests`: `schema_setup.yaml` is applied
@@ -7,8 +8,8 @@
 //! `values_teardown.yaml` (mutations mutate data), and `schema_teardown.yaml`
 //! runs at the end — all via /v1/query (default backend, metadata API v1).
 
-use dist_conformance::{Running, Transport};
 use dist_conformance::Suite;
+use dist_conformance::{Running, Transport};
 
 /// One mutation case, wrapped in the per-method data fixtures.
 fn check_mutation(s: &Running, dir: &str, file: &str) {
@@ -45,7 +46,9 @@ fn graphql_insert_permission() {
         "resident_infant.yaml",
         "resident_infant_fail.yaml",
         "resident_5_modifies_resident_6_upsert.yaml",
-        // resident_on_conflict_where.yaml: no-role (admin) request — out of scope.
+        // resident_on_conflict_where.yaml: no-role (admin) request — now
+        // covered (admin role implemented).
+        "resident_on_conflict_where.yaml",
         "blog_on_conflict_update_preset.yaml",
         "insert_article_arr_sess_var_editor_allowed_user_id.yaml",
         // Status-only known-diff (fixture patched 400 -> 200, see COVERAGE.md):

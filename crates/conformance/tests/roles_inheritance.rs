@@ -62,8 +62,11 @@ fn graphql_inherited_roles_schema() {
     // export the metadata, append circular inherited roles, and expect
     // replace_metadata to fail with the exact cycle error.
     {
-        let (code, mut metadata) =
-            s.post("/v1/query", &json!({"type": "export_metadata", "args": {}}), &[]);
+        let (code, mut metadata) = s.post(
+            "/v1/query",
+            &json!({"type": "export_metadata", "args": {}}),
+            &[],
+        );
         assert!(code < 300, "export_metadata failed ({code}): {metadata}");
         let circular_roles = [
             json!({
@@ -170,11 +173,11 @@ fn graphql_mutation_roles_inheritance() {
     per_method("inheritance_from_single_parent.yaml");
     per_method("resolve_inconsistent_permission.yaml");
     per_method("inherited_mutation_permission_for_nested_roles.yaml");
-    // test_defined_permission_should_override_inherited_permission
-    // (override_inherited_permission.yaml): step [1] posts an update_articles
-    // mutation to /v1/graphql with no X-Hasura-Role header (implicit admin),
-    // and the test's whole point is verifying that admin-side update — no-role
-    // (admin) request, out of scope per the no-admin-role design rule.
+    // test_defined_permission_should_override_inherited_permission:
+    // step [1] posts an update_articles mutation to /v1/graphql with no
+    // X-Hasura-Role header (implicit admin). Admin mutations are now
+    // implemented, so the admin-side update succeeds.
+    per_method("override_inherited_permission.yaml");
 
     v2_teardown(&s, MUTATION);
 }

@@ -414,7 +414,10 @@ impl Running {
     }
 
     pub fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
-        let mut req = self.http.post(format!("{}{path}", self.base_url)).json(body);
+        let mut req = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -543,7 +546,8 @@ impl Running {
         };
 
         assert_eq!(
-            code, exp_status,
+            code,
+            exp_status,
             "[{}] {label}: status mismatch (got {code}, want {exp_status})\nresponse:\n{}",
             self.name,
             pretty(&resp)
@@ -613,7 +617,8 @@ impl Running {
 
         let frame = next_frame(&mut sock, &["connection_ack", "connection_error"], label);
         assert_eq!(
-            frame["type"], "connection_ack",
+            frame["type"],
+            "connection_ack",
             "[{label}] ws init failed: {}",
             pretty(&frame)
         );
@@ -631,7 +636,12 @@ impl Running {
         } else {
             payload
         };
-        self.assert_response(exp, payload, conf_query_text(conf), &format!("{label} (ws)"));
+        self.assert_response(
+            exp,
+            payload,
+            conf_query_text(conf),
+            &format!("{label} (ws)"),
+        );
 
         let has_errors = exp.get("errors").is_some() || exp.get("error").is_some();
         if !has_errors {
@@ -642,11 +652,7 @@ impl Running {
     }
 }
 
-fn next_frame<S>(
-    sock: &mut tungstenite::WebSocket<S>,
-    wanted: &[&str],
-    label: &str,
-) -> Json
+fn next_frame<S>(sock: &mut tungstenite::WebSocket<S>, wanted: &[&str], label: &str) -> Json
 where
     S: Read + std::io::Write,
 {
@@ -723,7 +729,11 @@ mod tests {
             "suite/case.yaml",
             "setup: \"!include sub/inner.yaml\"\nname: top\n",
         );
-        write(&dir, "suite/sub/inner.yaml", "deep: \"!include leaf.yaml\"\n");
+        write(
+            &dir,
+            "suite/sub/inner.yaml",
+            "deep: \"!include leaf.yaml\"\n",
+        );
         write(&dir, "suite/sub/leaf.yaml", "- 1\n- two\n");
 
         let v = load_fixture(&dir.join("suite/case.yaml")).unwrap();
@@ -786,8 +796,16 @@ mod tests {
     #[test]
     fn object_key_set_mismatch_fails() {
         // Missing, extra, and renamed keys all fail even order-insensitively.
-        assert!(!json_matches(&json!({"a": 1}), &json!({"a": 1, "b": 2}), None));
-        assert!(!json_matches(&json!({"a": 1, "b": 2}), &json!({"a": 1}), None));
+        assert!(!json_matches(
+            &json!({"a": 1}),
+            &json!({"a": 1, "b": 2}),
+            None
+        ));
+        assert!(!json_matches(
+            &json!({"a": 1, "b": 2}),
+            &json!({"a": 1}),
+            None
+        ));
         assert!(!json_matches(&json!({"a": 1}), &json!({"b": 1}), None));
     }
 
@@ -907,7 +925,11 @@ mod tests {
         assert!(sel_tree_from_query("not a graphql query {{{").is_none());
         let exp = json!({"data": {"a": 1, "b": 2}});
         let act = json!({"data": {"b": 2, "a": 1}});
-        assert!(response_matches(&exp, &act, Some("not a graphql query {{{")));
+        assert!(response_matches(
+            &exp,
+            &act,
+            Some("not a graphql query {{{")
+        ));
         assert!(response_matches(&exp, &act, None));
     }
 

@@ -27,7 +27,7 @@ incomplete, inaccurate, or optimistic."**
 
 ## Reference Files (READ THESE FIRST)
 
-- `CLAUDE.md` — blocking rules (no-admin-role, knowledgebase-first, SQL invariants)
+- `CLAUDE.md` — rules (admin-role Hasura parity, knowledgebase-first, SQL invariants)
 - `PLAN.md` — architecture, milestone decisions and their rationale
 - `crates/conformance/PORTING.md` + `crates/conformance/fixtures/README.md` — conformance conventions and known-diffs
 - `knowledgebase/<domain>/decisions/` — ADRs relevant to the touched area
@@ -118,7 +118,7 @@ Only after Stage 1 passes.
 
 | Domain | Extra Check |
 |--------|-------------|
-| **Admin role** | ANY hint of implicit admin bypass → Critical, reject. All access via explicit role permissions (CLAUDE.md blocking rule) |
+| **Admin role** | The `admin` role bypasses permissions like Hasura (full access). Verify bypass is gated on role==ADMIN_ROLE only and faithful to Hasura; non-admin roles must still be permission-checked. |
 | **sqlgen** | Still one SQL statement per operation? JSON assembled in Postgres? insta snapshots updated AND reviewed (diff explained in the report)? |
 | **Permissions** | Filters compiled into SQL (WHERE/CASE), never post-filtered in Rust? Column masks and limits preserved through aggregates/relationships? |
 | **Error shapes** | `code`, `path`, message text byte-exact vs fixtures? Status-only known-diffs carried as `# dist-api:`-commented fixture patches, not "fixed" by inventing behavior? |
@@ -130,7 +130,7 @@ Only after Stage 1 passes.
 
 | Severity | Definition | Action |
 |----------|-----------|--------|
-| **Critical** | Breaks conformance, admin bypass, SQL injection, data loss | **Always reject** |
+| **Critical** | Breaks conformance, non-admin permission bypass, SQL injection, data loss | **Always reject** |
 | **Important** | Wrong abstraction, missing error handling, untested edge case, unreviewed snapshot churn | **Always reject** |
 | **Minor** | Naming, style, non-blocking suggestions | **Never reject** for minor-only — note in ACCEPT |
 

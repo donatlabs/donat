@@ -193,11 +193,16 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                         .table_ctx_by_name(&remote, &session.role)
                         .is_some()
                     {
-                        fields.push(field(
-                            &rel.name,
-                            vec![],
-                            named("OBJECT", &table_base_name(remote_entry)),
-                        ));
+                        // Hasura makes an FK-based object relationship
+                        // non-nullable when the local FK column(s) are NOT
+                        // NULL (the related row always exists).
+                        let base = named("OBJECT", &table_base_name(remote_entry));
+                        let ty = if object_rel_is_non_null(rel, ctx.info) {
+                            non_null(base)
+                        } else {
+                            base
+                        };
+                        fields.push(field(&rel.name, vec![], ty));
                     }
                 }
             }
@@ -532,6 +537,27 @@ pub fn execute_introspection(
 }
 
 /// Project a prebuilt introspection value through a selection set.
+/// An FK-based object relationship is non-nullable when every local FK
+/// column is NOT NULL (the referenced row is guaranteed to exist). Manual
+/// relationships are always nullable.
+fn object_rel_is_non_null(
+    rel: &dist_metadata::ObjectRelationship,
+    info: &dist_catalog::TableInfo,
+) -> bool {
+    use dist_metadata::ObjRelFkColumns;
+    let Some(fk) = &rel.using.foreign_key_constraint_on else {
+        return false;
+    };
+    let cols: Vec<&str> = match fk {
+        ObjRelFkColumns::Single(c) => vec![c.as_str()],
+        ObjRelFkColumns::Multiple(cs) => cs.iter().map(String::as_str).collect(),
+    };
+    !cols.is_empty()
+        && cols
+            .iter()
+            .all(|c| info.column(c).is_some_and(|col| !col.nullable))
+}
+
 fn project(
     node: &Json,
     selection_set: &graphql_parser::query::SelectionSet<'static, String>,

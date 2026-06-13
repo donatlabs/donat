@@ -17,7 +17,9 @@ fn graphql_query_permissions() {
         "user_can_query_other_users_published_articles.yaml",
         "anonymous_can_only_get_published_articles.yaml",
         "anonymous_can_only_get_published_articles_v1alpha1.yaml",
-        // user_cannot_access_remarks_col.yaml: no-role (admin) request — out of scope.
+        // Step [0] role=user (column hidden), step [1] no role = admin
+        // (full access) — Hasura admin parity.
+        "user_cannot_access_remarks_col.yaml",
         "user_can_query_geometry_values_filter.yaml",
         "user_can_query_geometry_values_filter_session_vars.yaml",
         "user_can_query_jsonb_values_filter.yaml",

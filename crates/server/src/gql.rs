@@ -3,7 +3,7 @@
 use axum::http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use dist_schema::{Planner, Session};
+use dist_schema::{ADMIN_ROLE, Planner, Session};
 
 use crate::state::SharedState;
 
@@ -68,19 +68,15 @@ pub fn session_from_headers(
             }
         },
     };
-    match role.or_else(|| unauthorized_role.map(str::to_string)) {
-        Some(role) => Ok(Session {
-            role,
-            vars,
-            backend_request,
-        }),
-        None => Err(json!({
-            "errors": [{
-                "extensions": { "path": "$", "code": "access-denied" },
-                "message": "x-hasura-role header is required (this engine has no admin role)",
-            }]
-        })),
-    }
+    // Trusted with no explicit role = admin (valid admin secret, or no
+    // secret configured) — Hasura's superuser behavior. An explicit
+    // X-Hasura-Role still selects that role (admin impersonation).
+    let role = role.unwrap_or_else(|| ADMIN_ROLE.to_string());
+    Ok(Session {
+        role,
+        vars,
+        backend_request,
+    })
 }
 
 /// Full session resolution: admin secret wins (X-Hasura-* honored), then
@@ -402,8 +398,9 @@ pub async fn execute_full(
         };
     }
     // Allowlist gate: the query must structurally match a listed one
-    // (__typename selections are ignored, like Hasura).
-    if state.allowlist_enabled {
+    // (__typename selections are ignored, like Hasura). The admin role
+    // bypasses the allowlist, as in Hasura.
+    if state.allowlist_enabled && session.role != ADMIN_ROLE {
         let normalized = normalize_for_allowlist(&doc);
         let allowed = engine.metadata.allowlist.iter().any(|entry| {
             engine
@@ -826,14 +823,14 @@ mod tests {
     }
 
     #[test]
-    fn trusted_request_requires_a_role() {
-        let e = session_from_headers(&headers(&[("x-hasura-user-id", "7")]), None, true)
-            .unwrap_err();
-        assert_eq!(
-            e.pointer("/errors/0/message"),
-            Some(&json!("x-hasura-role header is required (this engine has no admin role)"))
-        );
+    fn trusted_request_without_role_is_admin() {
+        // Hasura parity: a trusted request (valid admin secret, or no secret
+        // configured) with no explicit role gets the admin superuser role.
+        let s = session_from_headers(&headers(&[("x-hasura-user-id", "7")]), None, true).unwrap();
+        assert_eq!(s.role, ADMIN_ROLE);
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
     }
+
 
     #[test]
     fn backend_only_permissions_header_parsing() {

@@ -10,8 +10,18 @@
 use dist_metadata::{
     ArrayRelationship, ObjectRelationship, PermissionEntry, QualifiedTable, TableEntry,
 };
-use dist_schema::{PlanError, Planner, Session};
+use dist_schema::{ADMIN_ROLE, PlanError, Planner, Session};
 use serde_json::{Value as Json, json};
+
+/// The admin superuser session (no role header on an admin-authenticated
+/// request maps to the admin role, like Hasura).
+fn admin_session() -> Session {
+    Session {
+        role: ADMIN_ROLE.to_string(),
+        vars: std::collections::HashMap::new(),
+        backend_request: false,
+    }
+}
 
 use crate::state::{SharedState, ensure_default_source};
 
@@ -69,34 +79,12 @@ pub async fn execute(
             Some(session) => v1_insert(state, args, session).await,
             None => insert_rows(state, args).await,
         },
-        "select" => match session {
-            Some(session) => v1_select(state, args, session).await,
-            None => Err(OpError::bad_request(
-                "not-supported",
-                "select without a role is not supported (no admin role)",
-            )),
-        },
-        "count" => match session {
-            Some(session) => v1_count(state, args, session).await,
-            None => Err(OpError::bad_request(
-                "not-supported",
-                "count without a role is not supported (no admin role)",
-            )),
-        },
-        "update" => match session {
-            Some(session) => v1_update(state, args, session).await,
-            None => Err(OpError::bad_request(
-                "not-supported",
-                "update without a role is not supported (no admin role)",
-            )),
-        },
-        "delete" => match session {
-            Some(session) => v1_delete(state, args, session).await,
-            None => Err(OpError::bad_request(
-                "not-supported",
-                "delete without a role is not supported (no admin role)",
-            )),
-        },
+        // No session = admin-authenticated request with no explicit role
+        // (the endpoint already passed check_admin_secret): run as admin.
+        "select" => v1_select(state, args, session.unwrap_or(&admin_session())).await,
+        "count" => v1_count(state, args, session.unwrap_or(&admin_session())).await,
+        "update" => v1_update(state, args, session.unwrap_or(&admin_session())).await,
+        "delete" => v1_delete(state, args, session.unwrap_or(&admin_session())).await,
         "track_table" => track_table(state, args).await,
         "untrack_table" => untrack_table(state, args).await,
         "create_object_relationship" => create_relationship(state, args, true).await,

@@ -65,8 +65,12 @@ impl EnvEngine {
         client
             .batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
             .unwrap();
-        client.batch_execute(&format!("CREATE DATABASE {db}")).unwrap();
-        let (prefix, _) = admin_url.rsplit_once('/').expect("PG_URL must contain a db path");
+        client
+            .batch_execute(&format!("CREATE DATABASE {db}"))
+            .unwrap();
+        let (prefix, _) = admin_url
+            .rsplit_once('/')
+            .expect("PG_URL must contain a db path");
         let db_url = format!("{prefix}/{db}");
         postgres::Client::connect(&db_url, postgres::NoTls)
             .unwrap()
@@ -78,7 +82,8 @@ impl EnvEngine {
             .local_addr()
             .unwrap()
             .port();
-        let log_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/conformance-logs");
+        let log_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
         let log = std::fs::File::create(log_dir.join(format!("{name}.log"))).unwrap();
 
@@ -119,14 +124,20 @@ impl EnvEngine {
     }
 
     fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
-        let mut req = self.http.post(format!("{}{path}", self.base_url)).json(body);
+        let mut req = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
         let resp = req.send().expect("http request failed");
         let code = resp.status().as_u16();
         let text = resp.text().unwrap_or_default();
-        (code, serde_json::from_str(&text).unwrap_or(Json::String(text)))
+        (
+            code,
+            serde_json::from_str(&text).unwrap_or(Json::String(text)),
+        )
     }
 
     /// Setup/teardown with the admin secret attached (tests-py hge_ctx adds
@@ -154,7 +165,14 @@ impl EnvEngine {
             .and_then(Json::as_object)
             .map(|h| {
                 h.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.to_string()),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -207,7 +225,10 @@ impl EnvEngine {
         ))
         .unwrap();
         let frame = next_frame(&mut sock, label);
-        assert_eq!(frame["type"], "connection_ack", "[{label}] ws init failed: {frame:#}");
+        assert_eq!(
+            frame["type"], "connection_ack",
+            "[{label}] ws init failed: {frame:#}"
+        );
 
         sock.send(Message::text(
             json!({"id": "hge_test", "type": "start", "payload": conf["query"]}).to_string(),
@@ -239,7 +260,10 @@ fn next_frame<S: std::io::Read + std::io::Write>(
 ) -> Json {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(Instant::now() < deadline, "[{label}] timed out waiting for ws frame");
+        assert!(
+            Instant::now() < deadline,
+            "[{label}] timed out waiting for ws frame"
+        );
         let msg = sock.read().expect("ws read");
         if !msg.is_text() {
             continue;
@@ -396,8 +420,10 @@ fn allowlist_queries() {
     ] {
         s.check_query_f(&format!("{ALLOWLIST}/{f}"), Transport::Both);
     }
-    // query_as_admin.yaml: no-role (admin) request relying on the implicit
-    // admin allowlist bypass — out of scope (no admin role by design).
+    // query_as_admin.yaml: no-role (admin) request. The allowlist is not
+    // enforced for the admin role (Hasura parity), so this non-allowlisted
+    // query succeeds even with the allowlist enabled.
+    s.check_query_f(&format!("{ALLOWLIST}/query_as_admin.yaml"), Transport::Both);
 
     // test_update_query: http-only in pytest (explicit skip on websocket);
     // runs two fixture files in sequence.

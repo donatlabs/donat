@@ -1,6 +1,6 @@
-//! Ported from tests-py test_v1_queries.py (legacy /v1/query data API;
-//! role-based permission suites only — admin/no-role tests are out of scope
-//! per the no-admin-role design rule).
+//! Ported from tests-py test_v1_queries.py (legacy /v1/query data API).
+//! No-role requests on a trusted connection are the `admin` superuser
+//! (admin role is now implemented), so admin steps are in scope.
 //!
 //! The v1 data API has no websocket transport, so every case is Http.
 //!
@@ -27,8 +27,9 @@ fn v1_select_permissions() {
         "user_select_query_unpublished_articles.yaml",
         "user_can_query_other_users_published_articles.yaml",
         "anonymous_can_only_get_published_articles.yaml",
-        // user_cannot_access_remarks_col.yaml: second step is a no-role
-        // (admin) request — out of scope.
+        // user_cannot_access_remarks_col.yaml: step[1] is a no-role (admin)
+        // request — now covered (admin role implemented).
+        "user_cannot_access_remarks_col.yaml",
         "user_can_query_geometry_values_filter.yaml",
         "user_can_query_geometry_values_filter_session_vars.yaml",
         "user_can_query_geog_filter.yaml",

@@ -222,3 +222,104 @@ fn missing_version_file_is_io_error() {
         other => panic!("expected Io error, got {other:?}"),
     }
 }
+
+// --- Top-level sections boot from the filesystem (no admin API needed) ---
+
+/// Minimal valid metadata dir (version + one source/table) plus whatever
+/// extra top-level files the caller writes.
+fn base_dir(tag: &str) -> PathBuf {
+    let dir = tempdir(tag);
+    write(&dir, "version.yaml", VERSION_3);
+    write(
+        &dir,
+        "databases/databases.yaml",
+        &databases_yaml("\"!include default/tables/tables.yaml\""),
+    );
+    write(
+        &dir,
+        "databases/default/tables/tables.yaml",
+        "- \"!include public_author.yaml\"\n",
+    );
+    write(&dir, "databases/default/tables/public_author.yaml", AUTHOR_TABLE);
+    dir
+}
+
+#[test]
+fn top_level_sections_absent_default_to_empty() {
+    let dir = base_dir("sections_absent");
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert!(md.inherited_roles.is_empty());
+    assert!(md.query_collections.is_empty());
+    assert!(md.allowlist.is_empty());
+    assert!(md.remote_schemas.is_empty());
+}
+
+#[test]
+fn inherited_roles_load_from_filesystem() {
+    let dir = base_dir("inherited");
+    write(
+        &dir,
+        "inherited_roles.yaml",
+        "- role_name: manager\n  role_set: [user, auditor]\n",
+    );
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert_eq!(md.inherited_roles.len(), 1);
+    assert_eq!(md.inherited_roles[0].role_name, "manager");
+    assert_eq!(md.inherited_roles[0].role_set, vec!["user", "auditor"]);
+}
+
+#[test]
+fn query_collections_and_allow_list_load_from_filesystem() {
+    let dir = base_dir("collections");
+    write(
+        &dir,
+        "query_collections.yaml",
+        "\
+- name: ops
+  definition:
+    queries:
+      - name: q1
+        query: \"query { author { id } }\"
+",
+    );
+    // Hasura's filename is allow_list.yaml; it maps to Metadata.allowlist.
+    write(&dir, "allow_list.yaml", "- collection: ops\n");
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert_eq!(md.query_collections.len(), 1);
+    assert_eq!(md.query_collections[0].name, "ops");
+    assert_eq!(md.query_collections[0].definition.queries.len(), 1);
+    assert_eq!(md.allowlist.len(), 1);
+    assert_eq!(md.allowlist[0].collection, "ops");
+}
+
+#[test]
+fn remote_schemas_load_from_filesystem_with_include() {
+    let dir = base_dir("remotes");
+    // The list itself may be an !include, like hasura-cli emits.
+    write(&dir, "remote_schemas.yaml", "\"!include remote_schemas/schemas.yaml\"\n");
+    write(
+        &dir,
+        "remote_schemas/schemas.yaml",
+        "\
+- name: countries
+  definition:
+    url: http://countries.example/graphql
+    forward_client_headers: true
+",
+    );
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert_eq!(md.remote_schemas.len(), 1);
+    assert_eq!(md.remote_schemas[0].name, "countries");
+    assert_eq!(
+        md.remote_schemas[0].definition.url.as_deref(),
+        Some("http://countries.example/graphql")
+    );
+}
+
+#[test]
+fn blank_section_file_is_treated_as_empty() {
+    let dir = base_dir("blank_section");
+    write(&dir, "inherited_roles.yaml", "");
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert!(md.inherited_roles.is_empty());
+}

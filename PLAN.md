@@ -94,3 +94,25 @@ subscriptions, event triggers, actions, remote schemas.
   commas — breaks for quoted values containing commas.
 - sqlgen renders literals inline with quote-escaping; parameterized
   execution remains a planned refactor (see crates/sqlgen/src/lib.rs).
+
+## Admin role (Hasura parity, 2026-06-13) — remaining gaps
+
+The `admin` role was implemented (reversing the earlier no-admin-role rule):
+full permission bypass on the data plane, v1 data API, mutations,
+introspection (incl. NON_NULL for FK object relationships), and allowlist.
+Two admin-adjacent gaps remain, gated with `FIXME(engine-admin)` /
+`FIXME(engine-customized-error)` in crates/conformance/tests/remote_schemas.rs:
+
+- **Admin forwarding through a remote schema.** `match_remote_with`
+  (crates/server/src/remote.rs) matches a remote schema only via
+  `schema.permissions.find(role == session.role)`; admin has no permission
+  entry, so admin queries to remote fields fall through to the local
+  planner ("field not found"). Faithful fix: for admin, match by the
+  upstream schema (already captured in `AppState.remote_upstreams` at
+  add_remote_schema) and forward the query verbatim (skip validate_field /
+  apply_presets), still applying decustomize for customized schemas.
+  Requires threading the upstream schemas into the matcher.
+- **Customized-schema validation error names** (pre-existing, not admin):
+  validation errors for a customized remote schema report de-customized
+  upstream names/paths instead of the customized spelling the client used,
+  because validate_field runs over the decustomized document.

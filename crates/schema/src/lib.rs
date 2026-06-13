@@ -19,4 +19,4 @@ mod predicate;
 mod v1;
 
 pub use introspection::execute_introspection;
-pub use plan::{Plan, PlanError, Planner, Session};
+pub use plan::{ADMIN_ROLE, Plan, PlanError, Planner, Session};

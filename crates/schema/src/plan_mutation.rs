@@ -17,6 +17,9 @@ impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Hasura reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
+        if session.role == crate::plan::ADMIN_ROLE {
+            return true;
+        }
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
         // mutation_root ("no mutations exist").
@@ -145,11 +148,22 @@ impl<'a> Planner<'a> {
         path: &str,
         not_found: impl Fn() -> PlanError,
     ) -> Result<InsertMutation, PlanError> {
-        let perm = self
-            .resolve_role_perm(&ctx.entry.insert_permissions, &session.role, |p| {
+        // Admin: full insert access (all columns, no check, no presets).
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::InsertPermission {
+                check: Default::default(),
+                set: Default::default(),
+                columns: Columns::Star,
+                backend_only: false,
+            };
+            &admin_perm
+        } else {
+            self.resolve_role_perm(&ctx.entry.insert_permissions, &session.role, |p| {
                 !p.backend_only || session.backend_request
             })
-            .ok_or_else(&not_found)?;
+            .ok_or_else(&not_found)?
+        };
 
         let mut objects: Vec<Json> = vec![];
         let mut on_conflict = None;
@@ -386,9 +400,20 @@ impl<'a> Planner<'a> {
         path: &str,
         not_found: impl Fn() -> PlanError,
     ) -> Result<UpdateMutation, PlanError> {
-        let perm = self
-            .resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true)
-            .ok_or_else(&not_found)?;
+        // Admin: full update access (all columns, no row filter, no check).
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::UpdatePermission {
+                columns: Columns::Star,
+                filter: Default::default(),
+                check: None,
+                set: Default::default(),
+            };
+            &admin_perm
+        } else {
+            self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true)
+                .ok_or_else(&not_found)?
+        };
 
         let allowed = |col: &str| -> bool {
             ctx.info.column(col).is_some()
@@ -550,9 +575,17 @@ impl<'a> Planner<'a> {
         path: &str,
         not_found: impl Fn() -> PlanError,
     ) -> Result<DeleteMutation, PlanError> {
-        let perm = self
-            .resolve_role_perm(&ctx.entry.delete_permissions, &session.role, |_| true)
-            .ok_or_else(&not_found)?;
+        // Admin: full delete access (no row filter).
+        let admin_perm;
+        let perm = if session.role == crate::plan::ADMIN_ROLE {
+            admin_perm = dist_metadata::DeletePermission {
+                filter: Default::default(),
+            };
+            &admin_perm
+        } else {
+            self.resolve_role_perm(&ctx.entry.delete_permissions, &session.role, |_| true)
+                .ok_or_else(&not_found)?
+        };
 
         let mut user_where = None;
         let mut pk_predicate: Vec<BoolExp> = vec![];

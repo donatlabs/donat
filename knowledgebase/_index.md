@@ -12,6 +12,11 @@ native-function hooks (`pre_insert` / `post_insert` / post-commit) instead of
 Hasura-style webhooks. 6 design notes, 1 research report, 5 decisions.
 **Status: idea, deferred until core conformance is done.**
 
+## Cross-cutting
+
+- [[security-audit|Security & dependency audit]] — SQL-gen injection review, ranked findings (internal-microservice threat model), library assessment (2026-06-13)
+- [research-metadata-architecture.json](research-metadata-architecture.json) — deep-research: declarative/GitOps metadata loading vs runtime admin API; recommends completing filesystem-boot + production-disabling the admin/run_sql surface (2026-06-13)
+
 ## Templates
 
 - [[_templates/feature-dossier|Feature Dossier Template]]
