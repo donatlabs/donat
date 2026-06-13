@@ -1,0 +1,82 @@
+# Saved GraphQL operations exposed as RESTified endpoints (see
+# rest_endpoints.yaml). Each query runs through the normal per-role
+# permission system, so the same operation returns different rows for
+# anonymous/customer/staff — there is no admin bypass.
+- name: petshop
+  definition:
+    queries:
+      # GET /api/rest/pet/:id — one pet by primary key. anonymous/customer
+      # only see it when its status is `available` (row permission); staff
+      # see any pet.
+      - name: PetById
+        query: |
+          query ($id: Int!) {
+            pet_by_pk(id: $id) {
+              id
+              name
+              price
+              status
+              description
+              category {
+                name
+              }
+            }
+          }
+      # GET /api/rest/pets?limit=N — the catalogue the role may browse,
+      # newest id last. `limit` comes from the query string.
+      - name: AvailablePets
+        query: |
+          query ($limit: Int) {
+            pet(order_by: { id: asc }, limit: $limit) {
+              id
+              name
+              price
+              status
+            }
+          }
+      # GET /api/rest/categories — every category with the pets the role
+      # may see nested underneath.
+      - name: Categories
+        query: |
+          query {
+            category(order_by: { id: asc }) {
+              id
+              name
+              pets(order_by: { id: asc }) {
+                id
+                name
+                price
+                status
+              }
+            }
+          }
+      # POST /api/rest/pet — add an item to the inventory. Only `staff` has
+      # insert permission on `pet`; any other role is denied by the engine.
+      # The variables are taken from the JSON request body.
+      - name: CreatePet
+        query: |
+          mutation (
+            $name: String!
+            $category_id: Int!
+            $price: numeric!
+            $status: String!
+            $description: String
+          ) {
+            insert_pet(
+              objects: {
+                name: $name
+                category_id: $category_id
+                price: $price
+                status: $status
+                description: $description
+              }
+            ) {
+              affected_rows
+              returning {
+                id
+                name
+                price
+                status
+              }
+            }
+          }

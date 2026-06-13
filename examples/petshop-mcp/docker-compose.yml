@@ -1,0 +1,74 @@
+# Petshop MCP example for donat — MCP server only.
+#
+#   docker compose up
+#
+# Same deploy model as the main petshop example (one-shot `migrate` then
+# `validate`, then the engine serves), but here the engine exposes ONLY the
+# MCP surface: DONAT_GRAPHQL_ENABLED_APIS=mcp. /v1/graphql and /api/rest are
+# not mounted (they return 404). The MCP server speaks JSON-RPC 2.0 over
+# streamable HTTP at POST /mcp with generic CRUD tools derived from the
+# tracked tables + per-role permissions. See README.md.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: petshop_mcp
+    volumes:
+      - petshop-mcp-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d petshop_mcp"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply versioned V{n}__*.sql migrations, then exit.
+  migrate:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_mcp
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+
+  # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
+  validate:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["validate", "--metadata-dir", "/metadata"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_mcp
+    volumes:
+      - ./metadata:/metadata:ro
+    restart: "no"
+
+  engine:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    depends_on:
+      validate:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_mcp
+      DONAT_METADATA_DIR: /metadata
+      DONAT_PORT: "8080"
+      # Expose only the MCP surface.
+      DONAT_GRAPHQL_ENABLED_APIS: mcp
+      # Trusted-request secret; a trusted request must still name a role.
+      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
+      # Role-less requests fall back to the public catalogue role.
+      DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+    volumes:
+      - ./metadata:/metadata:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  petshop-mcp-db:
