@@ -10,12 +10,13 @@
 //! actions are layered on later.
 
 use axum::http::{HeaderMap, StatusCode};
+use futures_util::future::BoxFuture;
 use graphql_parser::query::{
-    Definition, Document, Field, OperationDefinition, Selection, Value as GqlValue,
+    Definition, Document, Field, OperationDefinition, Selection, SelectionSet, Value as GqlValue,
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use dist_metadata::{ActionEntry, CustomTypes, Metadata};
+use dist_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable};
 use dist_schema::Session;
 
 use crate::remote::resolve_url_template;
@@ -209,11 +210,146 @@ async fn call_action(
     }
 
     let ty = parse_type(&action.definition.output_type);
-    match validate(custom_types, &ty, &body, &field.selection_set.items) {
-        Ok(value) => Ok(value),
+    let mut shaped = match validate(custom_types, &ty, &body, &field.selection_set.items) {
+        Ok(value) => value,
         // Output-shape errors are reported at the top level, like Hasura.
-        Err(message) => Err(err("$", "unexpected", message)),
+        Err(message) => return Err(err("$", "unexpected", message)),
+    };
+    // Output objects may declare relationships to tracked tables; resolve them
+    // by querying the target under the same session (so the role's permissions
+    // apply), using the raw webhook row for the join values.
+    fill_relationships(
+        state,
+        session,
+        custom_types,
+        &ty,
+        &mut shaped,
+        &body,
+        &field.selection_set.items,
+    )
+    .await?;
+    Ok(shaped)
+}
+
+/// Walk the shaped output alongside the raw webhook value, resolving any
+/// selected output-object relationship into its tracked table.
+fn fill_relationships<'a>(
+    state: &'a SharedState,
+    session: &'a Session,
+    custom_types: &'a CustomTypes,
+    ty: &'a TypeRef,
+    shaped: &'a mut Json,
+    raw: &'a Json,
+    selection: &'a [Selection<'static, String>],
+) -> BoxFuture<'a, Result<(), (StatusCode, Json)>> {
+    Box::pin(async move {
+        if shaped.is_null() {
+            return Ok(());
+        }
+        match ty {
+            TypeRef::List { inner, .. } => {
+                if let (Json::Array(items), Json::Array(raws)) = (&mut *shaped, raw) {
+                    for (item, raw_item) in items.iter_mut().zip(raws.iter()) {
+                        fill_relationships(state, session, custom_types, inner, item, raw_item, selection)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+            TypeRef::Named { name, .. } => {
+                let Some(obj) = custom_types.objects.iter().find(|o| &o.name == name) else {
+                    return Ok(());
+                };
+                for item in selection {
+                    let Selection::Field(field) = item else { continue };
+                    let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
+
+                    if let Some(rel) = obj.relationships.iter().find(|r| r.name == field.name) {
+                        let resolved =
+                            resolve_relationship(state, session, rel, raw, &field.selection_set).await?;
+                        if let Some(map) = shaped.as_object_mut() {
+                            map.insert(alias, resolved);
+                        }
+                        continue;
+                    }
+
+                    // A declared object/list field may itself contain
+                    // relationships further down (e.g. NestedJoinObject.user_id).
+                    if let Some(field_def) = obj.fields.iter().find(|f| f.name == field.name) {
+                        let ftype = parse_type(&field_def.type_);
+                        let raw_child = raw.get(&field.name).cloned().unwrap_or(Json::Null);
+                        if let Some(child) = shaped.get_mut(&alias) {
+                            fill_relationships(
+                                state,
+                                session,
+                                custom_types,
+                                &ftype,
+                                child,
+                                &raw_child,
+                                &field.selection_set.items,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Resolve a single output-object relationship by querying its target table.
+async fn resolve_relationship(
+    state: &SharedState,
+    session: &Session,
+    rel: &CustomTypeRelationship,
+    raw: &Json,
+    selection: &SelectionSet<'static, String>,
+) -> Result<Json, (StatusCode, Json)> {
+    let base = table_base_name(&rel.remote_table);
+    // Build `where: { <remote_col>: { _eq: <row value> }, ... }` from the
+    // mapping (output-object field -> remote table column).
+    let mut where_map = serde_json::Map::new();
+    for (out_field, remote_col) in &rel.field_mapping {
+        let value = raw.get(out_field).cloned().unwrap_or(Json::Null);
+        where_map.insert(remote_col.clone(), json!({ "_eq": value }));
     }
+    let is_array = rel.type_ == "array";
+    let selset = render_selection(selection);
+    let query = if is_array {
+        format!("query($w: {base}_bool_exp){{ {base}(where: $w) {selset} }}")
+    } else {
+        format!("query($w: {base}_bool_exp){{ {base}(where: $w, limit: 1) {selset} }}")
+    };
+    let mut vars = JsonMap::new();
+    vars.insert("w".into(), Json::Object(where_map));
+
+    let data = crate::gql::execute_select_internal(state, session, &query, &vars)
+        .await
+        .map_err(|e| (StatusCode::OK, e))?;
+    let rows = data.get(&base).cloned().unwrap_or(Json::Null);
+    if is_array {
+        Ok(rows)
+    } else {
+        Ok(rows
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .unwrap_or(Json::Null))
+    }
+}
+
+/// The GraphQL base name of a table: bare name for `public`, else
+/// `<schema>_<name>` (Hasura's default; custom names are not handled here).
+fn table_base_name(table: &QualifiedTable) -> String {
+    match table.schema() {
+        "public" => table.name().to_string(),
+        schema => format!("{schema}_{}", table.name()),
+    }
+}
+
+/// Render a selection set back to GraphQL source for an internal query.
+fn render_selection(set: &SelectionSet<'static, String>) -> String {
+    format!("{set}")
 }
 
 /// A GraphQL type reference: a named type or a list, each optionally non-null.
@@ -584,5 +720,53 @@ mod tests {
         let ct = CustomTypes::default();
         let err = validate(&ct, &parse_type("[String!]!"), &json!(["a", null]), &[]).unwrap_err();
         assert_eq!(err, "got null for the action webhook response");
+    }
+
+    #[test]
+    fn table_base_name_handles_schema() {
+        assert_eq!(table_base_name(&QualifiedTable::Name("user".into())), "user");
+        assert_eq!(
+            table_base_name(&QualifiedTable::Qualified {
+                schema: "app".into(),
+                name: "orders".into()
+            }),
+            "app_orders"
+        );
+    }
+
+    #[test]
+    fn relationship_field_is_not_shaped_as_a_scalar() {
+        // A selected relationship (absent from the object's `fields`) is left
+        // as a null placeholder by the pure shaper; fill_relationships (async,
+        // integration-tested) replaces it. It must not error here.
+        let ct = CustomTypes {
+            objects: vec![dist_metadata::ObjectType {
+                name: "UserId".into(),
+                fields: vec![CustomTypeField {
+                    name: "id".into(),
+                    type_: "Int!".into(),
+                    description: None,
+                }],
+                relationships: vec![],
+                description: None,
+            }],
+            ..Default::default()
+        };
+        let doc = graphql_parser::parse_query::<String>("{ x { id user { name } } }")
+            .unwrap()
+            .into_static();
+        let sel = if let Definition::Operation(OperationDefinition::SelectionSet(s)) =
+            &doc.definitions[0]
+        {
+            if let Selection::Field(f) = &s.items[0] {
+                f.selection_set.items.clone()
+            } else {
+                unreachable!()
+            }
+        } else {
+            unreachable!()
+        };
+        let out = validate(&ct, &parse_type("UserId"), &json!({ "id": 1 }), &sel).unwrap();
+        assert_eq!(out, json!({ "id": 1, "user": null }));
     }
 }

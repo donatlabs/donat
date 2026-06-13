@@ -611,6 +611,66 @@ pub async fn execute_full(
     }
 }
 
+/// Plan and run a self-contained SELECT for the given role, returning the
+/// `data` object on success or a GraphQL error body on failure. Used to
+/// resolve action output-object relationships into tracked tables (the target
+/// is queried under the same session, so the role's permissions apply).
+pub(crate) async fn execute_select_internal(
+    state: &SharedState,
+    session: &Session,
+    query: &str,
+    variables: &JsonMap<String, Json>,
+) -> Result<Json, Json> {
+    let doc = graphql_parser::parse_query::<String>(query)
+        .map_err(|e| error_json("unexpected", format!("internal query parse error: {e}")))?
+        .into_static();
+
+    let engine = state.engine.read().await;
+    let catalog = engine.default_catalog();
+    let mut planner = Planner::new(&engine.metadata, &catalog);
+    planner.infer_function_permissions = state.infer_function_permissions;
+    let plan = planner
+        .plan(&doc, None, variables, session)
+        .map_err(|e| e.to_graphql())?;
+    let roots = match plan {
+        dist_schema::Plan::Query(roots) => roots,
+        _ => return Err(error_json("unexpected", "internal query must be a select")),
+    };
+    let sql = dist_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+    drop(engine);
+
+    let pool = state
+        .default_pool()
+        .await
+        .ok_or_else(|| error_json("unexpected", "no default source"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| error_json("unexpected", format!("connection pool error: {e}")))?;
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .map_err(|e| db_error_json(&e))?;
+    let mut data: Json = row
+        .try_get::<_, Json>(0)
+        .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
+    for root in &roots {
+        if let dist_ir::RootField::Select { alias, query } = root {
+            if let Some(node) = data.get_mut(alias.as_str()) {
+                resolve_remote_joins(
+                    state,
+                    session,
+                    &query.fields,
+                    node,
+                    &format!("$.selectionSet.{alias}"),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(data)
+}
+
 /// Render a document with every __typename selection removed.
 fn normalize_for_allowlist(doc: &graphql_parser::query::Document<'static, String>) -> String {
     use graphql_parser::query::{Definition, Selection};

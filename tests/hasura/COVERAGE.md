@@ -49,6 +49,7 @@ bypass and are out of conformance scope. Role-based suites are the target.
 | webhook auth (`TestFallbackUnauthorizedRoleCookie`, `TestMissingUnauthorizedRoleAndCookie`, cookie classes) | 4/6 | HASURA_GRAPHQL_AUTH_HOOK GET/POST, 401→unauthorized-role fallback; 2 fails = admin-role queries |
 | `test_jwt.py` (hge-bin) | 441/441 | COMPLETE — incl. websocket token-expiry connection close |
 | `TestActionsSync` + `TestQueryActions` (sync core) | 19/— | synchronous webhook actions: input → `{action,input,session_variables}` POST, output shaping against custom object/scalar/list types, full response-validation messages, and handler-error surfacing (message/code/extensions rules). Native Rust webhook stub replaces tests-py's Python handler. Multi-step `update_action`-then-query cases out of scope (no runtime metadata API). |
+| Actions — engine-callback + relationships | create_user(s) ±, get_user(s)_by_email ± | the real end-to-end HTTP hook: handler calls back into the engine over GraphQL (insert/query), then the action output object's relationships to tracked tables (`UserId.user`, per-row) are resolved under the calling role's permissions. Run under a dedicated `tester` role (the shared schema_setup installs a restrictive `user`-role permission). |
 
 Features proven by these: row filters with session variables (incl. legacy
 `$op` spellings, implicit `_eq`, Postgres array literals in session vars),
@@ -87,15 +88,15 @@ admin access is missing.
   args, function roots, mutation by_pk/one variants in `__schema`
 - remote schemas: mixed introspection+remote root queries (split &
   merge), remote relationships, schema customization
-- actions, remaining work: handlers that call back into the engine via
-  GraphQL (create_user / get_user_by_email — needs the webhook stub's
-  engine-callback path), output-object → tracked-table relationships and
-  remote joins, request/response (Kriti) transforms, async actions, action
-  introspection, and the multi-step `update_action`-then-query error
-  fixtures (need a runtime metadata API we deliberately don't expose). The
-  `extensions.internal` diagnostic block Hasura attaches to action errors is
-  not reproduced (admin/transform-coupled) — error fixtures are trimmed to
-  message/code/path; see the trimmed `mirror_action_*` fixtures.
+- actions, remaining work: output-object → *remote-schema* joins (local
+  table relationships are done), request/response (Kriti) transforms, async
+  actions, action introspection, response-header forwarding
+  (`TestActionsSyncResponseHeaders`), and the multi-step
+  `update_action`-then-query error fixtures (need a runtime metadata API we
+  deliberately don't expose). The `extensions.internal` diagnostic block
+  Hasura attaches to action errors is not reproduced (admin/transform-
+  coupled) — error fixtures are trimmed to message/code/path; see the
+  trimmed `mirror_action_*` and `create_user(s)_fail` fixtures.
 - event triggers / scheduled triggers (0 role-based fixtures)
 - multiplexed live-query suites (admin-based)
 

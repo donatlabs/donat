@@ -23,11 +23,7 @@ pub struct EngineHandle {
     inner: Arc<Mutex<Option<EngineInfo>>>,
 }
 
-// `base_url`/`admin_secret` and `EngineHandle::get` are consumed by the
-// callback endpoints added in phase 2 (handlers that run a GraphQL query back
-// against the engine); kept here so the wiring is in place.
 #[derive(Clone)]
-#[allow(dead_code)]
 struct EngineInfo {
     base_url: String,
     admin_secret: Option<String>,
@@ -41,7 +37,6 @@ impl EngineHandle {
         });
     }
 
-    #[allow(dead_code)]
     fn get(&self) -> Option<EngineInfo> {
         self.inner.lock().unwrap().clone()
     }
@@ -207,14 +202,135 @@ fn dispatch(
     }
 }
 
-/// Endpoints that run a GraphQL query back against the engine. Returns `None`
-/// for unknown paths so the caller can answer 204.
-fn handled_with_engine(
-    _path: &str,
-    _input: &Json,
-    _engine: &EngineHandle,
-) -> Option<(u16, Json)> {
-    // Phase 2+: create-user / get-user-by-email and friends call back into the
-    // engine here. Not needed for the sync-core slice.
-    None
+/// Endpoints that run a GraphQL query back against the engine (the realistic
+/// webhook pattern: the handler does work by calling the GraphQL API).
+/// Returns `None` for unknown paths so the caller can answer 204.
+fn handled_with_engine(path: &str, input: &Json, engine: &EngineHandle) -> Option<(u16, Json)> {
+    match path {
+        "/create-user" => Some(create_user(input, engine)),
+        "/create-users" => Some(create_users(input, engine)),
+        "/get-user-by-email" => Some(get_users_by_email(input, engine, true)),
+        "/get-users-by-email" => Some(get_users_by_email(input, engine, false)),
+        "/get-user-by-email-nested" => Some(get_users_by_email_nested(input, engine, true)),
+        "/get-users-by-email-nested" => Some(get_users_by_email_nested(input, engine, false)),
+        _ => None,
+    }
+}
+
+/// POST a GraphQL query to the running engine (trusted by the admin secret;
+/// with no role header it runs as the unauthorized-role fallback). Returns the
+/// parsed response body.
+fn engine_gql(engine: &EngineHandle, query: &str, variables: Json) -> Option<Json> {
+    let info = engine.get()?;
+    let client = reqwest::blocking::Client::new();
+    let mut req = client
+        .post(format!("{}/v1/graphql", info.base_url))
+        .json(&json!({ "query": query, "variables": variables }));
+    if let Some(secret) = &info.admin_secret {
+        req = req.header("X-Hasura-Admin-Secret", secret);
+    }
+    let resp = req.send().ok()?;
+    resp.json::<Json>().ok()
+}
+
+/// A lax e-mail check mirroring tests-py's regex for the fixtures' purposes:
+/// `local@domain.tld`.
+fn valid_email(email: &str) -> bool {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty() && domain.contains('.') && !email.contains(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
+fn gql_failed() -> (u16, Json) {
+    (400, json!({ "message": "GraphQL query execution failed", "code": "unexpected" }))
+}
+
+fn create_user(input: &Json, engine: &EngineHandle) -> (u16, Json) {
+    let email = input.get("email").and_then(Json::as_str).unwrap_or("");
+    let name = input.get("name").and_then(Json::as_str).unwrap_or("");
+    if !valid_email(email) {
+        return (400, json!({ "message": "Given email address is not valid", "code": "invalid-email" }));
+    }
+    let query = "mutation ($email: String! $name: String!) { \
+        insert_user_one(object: {email: $email, name: $name}){ id } }";
+    let Some(resp) = engine_gql(engine, query, json!({ "email": email, "name": name })) else {
+        return gql_failed();
+    };
+    match resp.pointer("/data/insert_user_one") {
+        Some(user) if !user.is_null() => (200, user.clone()),
+        _ => gql_failed(),
+    }
+}
+
+fn create_users(input: &Json, engine: &EngineHandle) -> (u16, Json) {
+    let users = input.get("users").and_then(Json::as_array).cloned().unwrap_or_default();
+    for u in &users {
+        let email = u.get("email").and_then(Json::as_str).unwrap_or("");
+        if !valid_email(email) {
+            return (
+                400,
+                json!({ "message": format!("Email address is not valid: {email}"), "code": "invalid-email" }),
+            );
+        }
+    }
+    let query = "mutation ($insert_inputs: [user_insert_input!]!){ \
+        insert_user(objects: $insert_inputs){ returning { id } } }";
+    let Some(resp) = engine_gql(engine, query, json!({ "insert_inputs": users })) else {
+        return gql_failed();
+    };
+    match resp.pointer("/data/insert_user/returning") {
+        Some(returning) if returning.is_array() => (200, returning.clone()),
+        _ => gql_failed(),
+    }
+}
+
+fn get_users_by_email(input: &Json, engine: &EngineHandle, single: bool) -> (u16, Json) {
+    let email = input.get("email").and_then(Json::as_str).unwrap_or("");
+    if !valid_email(email) {
+        return (400, json!({ "message": "Given email address is not valid", "code": "invalid-email" }));
+    }
+    let query = "query get_user($email:String!) { \
+        user(where:{email:{_eq:$email}}, order_by: {id: asc}) { id } }";
+    let Some(resp) = engine_gql(engine, query, json!({ "email": email })) else {
+        return gql_failed();
+    };
+    let Some(users) = resp.pointer("/data/user").and_then(Json::as_array) else {
+        return gql_failed();
+    };
+    if single {
+        match users.first() {
+            Some(u) => (200, u.clone()),
+            None => gql_failed(),
+        }
+    } else {
+        (200, Json::Array(users.clone()))
+    }
+}
+
+fn get_users_by_email_nested(input: &Json, engine: &EngineHandle, single: bool) -> (u16, Json) {
+    let (status, body) = get_users_by_email(input, engine, single);
+    if status != 200 {
+        return (status, body);
+    }
+    let nest = |obj: &Json| -> Json {
+        let id = obj.get("id").cloned().unwrap_or(Json::Null);
+        json!({
+            "id": id,
+            "user_id": { "id": id },
+            "address": { "city": "New York", "country": "USA" },
+            "addresses": [
+                { "city": "Bangalore", "country": "India" },
+                { "city": "Melbourne", "country": "Australia" }
+            ]
+        })
+    };
+    if single {
+        (200, nest(&body))
+    } else {
+        let list = body.as_array().map(|a| a.iter().map(nest).collect()).unwrap_or_default();
+        (200, Json::Array(list))
+    }
 }

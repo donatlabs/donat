@@ -1,0 +1,20 @@
+# Ported from tests-py. The original lists a redundant `data: null` next
+# to `errors`; this engine omits `data` on action errors (consistent with the
+# extensions_code_* cases). Trimmed accordingly — see tests/hasura/COVERAGE.md.
+description: Run create_user sync action mutation with invalid email
+url: /v1/graphql
+status: 200
+query:
+  query: |
+    mutation {
+      create_user(email: "random-email", name: "Clarke"){
+        id
+      }
+    }
+
+response:
+  errors:
+  - extensions:
+      path: $
+      code: invalid-email
+    message: Given email address is not valid
