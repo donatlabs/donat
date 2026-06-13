@@ -609,6 +609,7 @@ dependencies = [
  "donat-sqlgen",
  "futures-util",
  "graphql-parser",
+ "insta",
  "jsonwebtoken",
  "refinery",
  "reqwest",
