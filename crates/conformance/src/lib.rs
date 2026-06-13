@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
+pub mod cron_webhook;
 mod remote_graphql;
 
 // ---------------------------------------------------------------- fixtures
@@ -235,7 +236,7 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 use std::cell::RefCell;
 
 use dist_metadata::{
-    AllowlistEntry, ArrayRelationship, ComputedField, DeletePermission, FunctionEntry,
+    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, FunctionEntry,
     FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
     RemoteSchemaPermission, SelectPermission, Source, SourceKind, TableEntry, UpdatePermission,
@@ -320,6 +321,7 @@ fn empty_metadata() -> Metadata {
         remote_schemas: vec![],
         actions: vec![],
         custom_types: Default::default(),
+        cron_triggers: vec![],
     }
 }
 
@@ -336,6 +338,8 @@ pub struct Suite {
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
+    cron: Option<cron_webhook::CronWebhook>,
+    run_migrations: bool,
 }
 
 impl Suite {
@@ -346,7 +350,32 @@ impl Suite {
             args: vec![],
             admin_secret: None,
             webhook: None,
+            cron: None,
+            run_migrations: false,
         }
+    }
+
+    /// Apply the `migrations/` DDL (the `dist_api` catalog) to the suite
+    /// database before the engine spawns, mirroring the real deploy order
+    /// (`migrate` then serve). Required for cron triggers.
+    pub fn with_migrations(mut self) -> Self {
+        self.run_migrations = true;
+        self
+    }
+
+    /// Start the recording cron webhook stub and expose its base URL to the
+    /// engine as `CRON_WEBHOOK_BASE` (cron metadata references it via
+    /// `webhook: "{{CRON_WEBHOOK_BASE}}/ok"`). Implies `with_migrations` and
+    /// sets a 1-second poll interval so tests observe delivery quickly.
+    pub fn with_cron_webhook(mut self) -> Self {
+        let stub = cron_webhook::spawn();
+        self.env
+            .push(("CRON_WEBHOOK_BASE".to_string(), stub.base_url().to_string()));
+        self.env
+            .push(("DIST_API_CRON_POLL_SECONDS".to_string(), "1".to_string()));
+        self.cron = Some(stub);
+        self.run_migrations = true;
+        self
     }
 
     /// Start the action-webhook stub and expose its base URL to the engine as
@@ -434,6 +463,8 @@ impl Suite {
             args: self.args,
             admin_secret: self.admin_secret,
             webhook: self.webhook,
+            cron: self.cron,
+            run_migrations: self.run_migrations,
             db_url,
             metadata: RefCell::new(empty_metadata()),
             engine: RefCell::new(None),
@@ -460,6 +491,8 @@ pub struct Running {
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
+    cron: Option<cron_webhook::CronWebhook>,
+    run_migrations: bool,
     db_url: String,
     /// Accumulated metadata, applied lazily when the engine is spawned.
     metadata: RefCell<Metadata>,
@@ -1072,6 +1105,13 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.cron_triggers.is_empty() {
+            std::fs::write(
+                dir.join("cron_triggers.yaml"),
+                serde_yaml::to_string(&md.cron_triggers).unwrap(),
+            )
+            .unwrap();
+        }
         if !md.actions.is_empty() || !md.custom_types.is_empty() {
             // Both live together in actions.yaml, the hasura-cli export layout.
             let doc = json!({
@@ -1091,6 +1131,18 @@ impl Running {
     fn ensure_engine(&self) {
         if self.engine.borrow().is_some() {
             return;
+        }
+        // Apply DDL (the dist_api catalog) before serving, like a real deploy.
+        if self.run_migrations {
+            let migrations = workspace_root().join("migrations");
+            let status = Command::new(engine_binary())
+                .arg("migrate")
+                .arg("--migrations-dir")
+                .arg(&migrations)
+                .env("DIST_API_DATABASE_URL", &self.db_url)
+                .status()
+                .expect("running dist-api migrate");
+            assert!(status.success(), "dist-api migrate failed for suite {}", self.name);
         }
         let metadata_dir = self.write_metadata_dir();
         let port = free_port();
@@ -1154,6 +1206,30 @@ impl Running {
     pub fn ws_base(&self) -> String {
         self.ensure_engine();
         self.engine.borrow().as_ref().unwrap().ws_base.clone()
+    }
+
+    /// The suite database URL (for cron tests that seed/inspect the
+    /// `dist_api` catalog directly).
+    pub fn db_url(&self) -> &str {
+        &self.db_url
+    }
+
+    /// The recording cron webhook stub (only present after
+    /// [`Suite::with_cron_webhook`]).
+    pub fn cron_webhook(&self) -> &cron_webhook::CronWebhook {
+        self.cron
+            .as_ref()
+            .expect("with_cron_webhook() was not called on this suite")
+    }
+
+    /// Register a cron trigger in the metadata before the engine spawns.
+    /// Panics if the engine has already started (metadata is read at boot).
+    pub fn add_cron_trigger(&self, trigger: CronTrigger) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "add_cron_trigger must be called before the engine spawns"
+        );
+        self.metadata.borrow_mut().cron_triggers.push(trigger);
     }
 
     /// Issue an HTTP request against the (lazily spawned) engine. The

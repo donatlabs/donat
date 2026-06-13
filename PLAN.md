@@ -64,6 +64,15 @@ Next: websocket transport, `--hge-bin` harness mode (env-marked classes),
 GraphQL introspection, inherited roles, relay, v1 data API reads. Later:
 subscriptions, event triggers, actions, remote schemas.
 
+Done since: subscriptions, actions (sync), remote schemas (partial), and
+**cron (scheduled) triggers** — recurring webhooks from YAML, delivered by a
+background loop over a `dist_api` Postgres catalog (multi-pod safe via
+`ON CONFLICT` materialization + `FOR UPDATE SKIP LOCKED`, at-least-once). See
+`specs/001-cron-triggers.md` and
+`knowledgebase/embedded-sdk/decisions/006-cron-triggers-yaml-only.md`. Still
+out: table event triggers (insert/update/delete) and one-off scheduled
+events (would need a runtime create surface the no-admin posture rejects).
+
 ## Decisions and why
 
 - **Full v2 format** — tests-py applies as-is; metadata exported from

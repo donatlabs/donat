@@ -80,6 +80,7 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         remote_schemas: load_section(dir, "remote_schemas.yaml")?,
         actions,
         custom_types,
+        cron_triggers: load_section(dir, "cron_triggers.yaml")?,
     })
 }
 

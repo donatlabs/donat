@@ -25,7 +25,7 @@ thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
 deadpool-postgres = "0.14"
 graphql-parser = "0.4"
 insta = { version = "1", features = ["yaml"] }
@@ -39,3 +39,6 @@ postgres = "0.19"
 refinery = { version = "0.8", features = ["tokio-postgres"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "3"
+uuid = "1"

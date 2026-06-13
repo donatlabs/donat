@@ -30,6 +30,10 @@ pub struct Metadata {
     /// Custom GraphQL types referenced by action input/output.
     #[serde(default, skip_serializing_if = "CustomTypes::is_empty")]
     pub custom_types: CustomTypes,
+    /// Recurring (cron) scheduled triggers: a webhook fired on a cron
+    /// schedule with a static payload. Deploy-time configuration only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cron_triggers: Vec<CronTrigger>,
 }
 
 /// A custom GraphQL field (query or mutation) resolved by calling an HTTP
@@ -104,6 +108,72 @@ pub struct ActionHeader {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ActionPermission {
     pub role: String,
+}
+
+/// A recurring scheduled trigger: the engine POSTs `payload` to `webhook`
+/// on the cron `schedule`. Field names match Hasura's `CronTriggerMetadata`
+/// so exported metadata loads without translation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CronTrigger {
+    pub name: String,
+    /// Webhook URL ({{ENV}} templates allowed).
+    pub webhook: String,
+    /// Standard 5-field cron expression, evaluated in UTC.
+    pub schedule: String,
+    /// Static JSON body sent to the webhook (under the envelope's `payload`).
+    /// Hasura tolerates an absent or explicitly null payload; both mean "no
+    /// payload" — we normalize to JSON null here and emit `{}`-or-null at
+    /// delivery time.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    /// Whether the trigger is exported in metadata. Default true; accepted
+    /// for round-trip fidelity (it does not change delivery behavior).
+    #[serde(default = "default_true")]
+    pub include_in_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_conf: Option<CronRetryConf>,
+    /// Custom headers sent with the webhook request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ActionHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// Retry/timeout policy for scheduled triggers (Hasura `RetryConfST`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CronRetryConf {
+    #[serde(default)]
+    pub num_retries: u32,
+    #[serde(default = "default_retry_interval_seconds")]
+    pub retry_interval_seconds: u64,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_tolerance_seconds")]
+    pub tolerance_seconds: u64,
+}
+
+impl Default for CronRetryConf {
+    fn default() -> Self {
+        CronRetryConf {
+            num_retries: 0,
+            retry_interval_seconds: default_retry_interval_seconds(),
+            timeout_seconds: default_timeout_seconds(),
+            tolerance_seconds: default_tolerance_seconds(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_retry_interval_seconds() -> u64 {
+    10
+}
+fn default_timeout_seconds() -> u64 {
+    60
+}
+fn default_tolerance_seconds() -> u64 {
+    21600
 }
 
 /// The action type system: input objects, output objects (which may relate to

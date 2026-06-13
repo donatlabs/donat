@@ -10,6 +10,7 @@
 //! - validate (metadata vs DB): `dist-api validate --metadata-dir <dir>`
 
 mod action;
+mod cron;
 mod gql;
 mod jwt;
 mod migrate;
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
             remote_schemas: vec![],
             actions: vec![],
             custom_types: Default::default(),
+            cron_triggers: vec![],
         },
     };
     ensure_default_source(&mut metadata);
@@ -226,6 +228,11 @@ async fn main() -> anyhow::Result<()> {
             "initialized"
         );
     }
+
+    // Background delivery of cron (scheduled) triggers. No-op unless the
+    // metadata declares any (then the `dist_api` catalog must exist — apply
+    // `migrate` before serving).
+    cron::spawn(state.clone());
 
     let app = Router::new()
         .route("/healthz", get(healthz))

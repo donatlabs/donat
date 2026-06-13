@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use dist_metadata::{
-    Columns, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
-    RemoteSchema, SelectPermission, SourceKind, load_metadata_dir,
+    Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
+    QualifiedTable, RemoteSchema, SelectPermission, SourceKind, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -214,6 +214,99 @@ remote_schemas:
     assert_eq!(md.query_collections[0].definition.queries[0].name, "q1");
     assert_eq!(md.allowlist[0].collection, "allowed-queries");
     assert_eq!(md.remote_schemas[0].name, "remote");
+}
+
+#[test]
+fn cron_trigger_full_parse() {
+    // The shape hasura-cli writes to cron_triggers.yaml.
+    let yaml = "\
+name: send_reminders
+webhook: '{{WEBHOOK_BASE}}/cron'
+schedule: '*/5 * * * *'
+payload:
+  kind: reminder
+include_in_metadata: true
+retry_conf:
+  num_retries: 3
+  retry_interval_seconds: 30
+  timeout_seconds: 120
+  tolerance_seconds: 3600
+headers:
+  - name: X-Api-Key
+    value_from_env: API_KEY
+comment: nightly reminders
+";
+    let ct: CronTrigger = serde_yaml::from_str(yaml).expect("cron trigger must load");
+    assert_eq!(ct.name, "send_reminders");
+    assert_eq!(ct.webhook, "{{WEBHOOK_BASE}}/cron");
+    assert_eq!(ct.schedule, "*/5 * * * *");
+    assert_eq!(ct.payload, json!({ "kind": "reminder" }));
+    assert!(ct.include_in_metadata);
+    let rc = ct.retry_conf.expect("retry_conf present");
+    assert_eq!(rc.num_retries, 3);
+    assert_eq!(rc.retry_interval_seconds, 30);
+    assert_eq!(rc.timeout_seconds, 120);
+    assert_eq!(rc.tolerance_seconds, 3600);
+    assert_eq!(ct.headers[0].name, "X-Api-Key");
+    assert_eq!(ct.headers[0].value_from_env.as_deref(), Some("API_KEY"));
+    assert_eq!(ct.comment.as_deref(), Some("nightly reminders"));
+}
+
+#[test]
+fn cron_trigger_defaults() {
+    // Minimal form: no payload, no retry_conf, no include_in_metadata.
+    let yaml = "\
+name: t
+webhook: http://localhost/hook
+schedule: '* * * * *'
+";
+    let ct: CronTrigger = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(ct.payload, serde_json::Value::Null);
+    assert!(ct.include_in_metadata, "include_in_metadata defaults to true");
+    assert!(ct.retry_conf.is_none());
+    assert!(ct.headers.is_empty());
+    assert!(ct.comment.is_none());
+}
+
+#[test]
+fn cron_retry_conf_field_defaults_match_hasura() {
+    // RetryConfST defaults: num_retries=0, interval=10, timeout=60,
+    // tolerance=21600. A partial retry_conf fills the rest from defaults.
+    let ct: CronTrigger = serde_yaml::from_str(
+        "name: t\nwebhook: http://h\nschedule: '* * * * *'\nretry_conf: { num_retries: 2 }\n",
+    )
+    .unwrap();
+    let rc = ct.retry_conf.unwrap();
+    assert_eq!(rc.num_retries, 2);
+    assert_eq!(rc.retry_interval_seconds, 10);
+    assert_eq!(rc.timeout_seconds, 60);
+    assert_eq!(rc.tolerance_seconds, 21600);
+}
+
+#[test]
+fn cron_trigger_round_trips_omitting_empty_fields() {
+    let ct: CronTrigger =
+        serde_yaml::from_str("name: t\nwebhook: http://h\nschedule: '* * * * *'\n").unwrap();
+    let out = serde_json::to_value(&ct).unwrap();
+    let obj = out.as_object().unwrap();
+    assert!(!obj.contains_key("comment"), "None comment omitted");
+    assert!(!obj.contains_key("retry_conf"), "None retry_conf omitted");
+    assert!(!obj.contains_key("headers"), "empty headers omitted");
+}
+
+#[test]
+fn cron_triggers_load_from_metadata_section() {
+    let yaml = "\
+version: 3
+sources: []
+cron_triggers:
+  - name: t
+    webhook: http://localhost/hook
+    schedule: '* * * * *'
+";
+    let md: Metadata = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(md.cron_triggers.len(), 1);
+    assert_eq!(md.cron_triggers[0].name, "t");
 }
 
 #[test]

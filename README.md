@@ -92,6 +92,14 @@ has the per-suite detail.
   (resolved under the calling role's permissions).
 - **Deploy** — `migrate` (refinery DDL), `validate` (metadata vs DB),
   boot-from-YAML; multi-source metadata; per-source pools/catalogs.
+- **Cron (scheduled) triggers** — recurring webhooks from YAML
+  (`cron_triggers`, Hasura shape): a `dist_api` catalog (created by
+  `migrate`), a background delivery loop that materializes occurrences and
+  delivers with the Hasura scheduled-event envelope, `retry_conf`
+  (retries/timeout/tolerance), and per-attempt invocation logs. Multi-pod
+  safe with no leader election (`ON CONFLICT` materialization + `FOR UPDATE
+  SKIP LOCKED` claim → at-least-once; handlers must be idempotent). Native
+  coverage in `crates/conformance/tests/cron_triggers.rs`.
 
 ### Partial
 
@@ -117,7 +125,13 @@ has the per-suite detail.
 - **No admin role / no runtime admin API** — no `run_sql`, no metadata
   mutation over HTTP. Configuration is deploy-time only (`migrate` + YAML).
   This is a deliberate security posture, not a gap.
-- **Event triggers / scheduled triggers** — no role-scoped surface.
+- **Table event triggers** — webhooks on row insert/update/delete. Not yet
+  built; would reuse the cron delivery machinery (journal + `FOR UPDATE SKIP
+  LOCKED` poller) with per-table Postgres triggers writing the event log.
+- **One-off scheduled events** — Hasura creates these via a runtime
+  `create_scheduled_event` mutation, which contradicts the no-admin-API
+  posture; out of scope unless declared as a deploy-time seed in YAML. (See
+  `knowledgebase/embedded-sdk/decisions/006-cron-triggers-yaml-only.md`.)
 - **Non-Postgres backends** (MSSQL, etc.).
 
 ## License
