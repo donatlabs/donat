@@ -31,6 +31,8 @@ conformance harness (`crates/conformance`).
 | Build | `make build` |
 | Unit/snapshot tests | `make test` (or `cargo test -p <crate>`) |
 | Run with fixture metadata | `make run` (serves :8080) |
+| Apply schema migrations (DDL) | `dist-api migrate --migrations-dir migrations` (refinery) |
+| Validate metadata vs DB | `dist-api validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
 | Conformance suite | `make conformance` (or `cargo test -p dist-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
 | Legacy pytest cross-check | `tests/hasura/run_suite.sh <selector>` (optional) |

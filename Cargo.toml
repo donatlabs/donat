@@ -36,5 +36,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
 tungstenite = "0.24"
 postgres = "0.19"
+refinery = { version = "0.8", features = ["tokio-postgres"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

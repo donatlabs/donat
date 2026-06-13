@@ -45,6 +45,19 @@ process**, so a single malformed/buggy-client query kills the service for
 everyone. Fix: reject queries past a max depth (e.g. 30–50) before/while
 parsing, and a max-aliases/complexity cap.
 
+### 1b. Admin role widened fail-open to the WHOLE data plane — UPDATE (2026-06-13)
+After the Hasura admin role landed, "no admin secret configured" now means
+**every no-role request is admin** on `/v1/graphql` too, not just the
+metadata API. Verified live: new binary, no secret, `{ __typename }` with no
+role → `{"data":...}` (full access); `run_sql` with no auth → executes
+arbitrary SQL. With a secret set it is fail-CLOSED (verified: no-secret
+request → access-denied; valid secret + no role → admin). This is faithful
+Hasura behavior ("no admin secret = everything is admin"), but it means: any
+shared/networked deployment MUST set `--admin-secret` (or be strictly
+network-isolated), otherwise all data and arbitrary SQL are exposed
+unauthenticated. Before the admin change a no-role request was denied, so
+this is a real posture change to flag in deploy docs.
+
 ### 2. `run_sql` / metadata API is fail-OPEN — FIX or document hard
 `/v1/query`, `/v2/query`, `/v1/metadata` (includes `run_sql` = arbitrary
 SQL, and `clear_metadata`) are gated only by `check_admin_secret`, which

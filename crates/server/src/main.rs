@@ -10,6 +10,7 @@
 
 mod gql;
 mod jwt;
+mod migrate;
 mod ops;
 mod remote;
 mod remote_validate;
@@ -62,6 +63,24 @@ struct Args {
 enum Command {
     /// Hasura-compatible serve subcommand.
     Serve(ServeArgs),
+    /// Apply versioned SQL schema migrations (DDL), then exit.
+    Migrate(MigrateArgs),
+    /// Validate YAML metadata against the database, then exit.
+    Validate(ValidateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct MigrateArgs {
+    /// Directory of `V{n}__name.sql` migration files.
+    #[arg(long, default_value = "migrations")]
+    migrations_dir: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct ValidateArgs {
+    /// Metadata directory to validate (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -89,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let serve = match &args.command {
         Some(Command::Serve(serve)) => Some(serve),
-        None => None,
+        _ => None,
     };
 
     let database_url = args
@@ -98,6 +117,32 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| args.metadata_database_url.clone())
         .or_else(|| std::env::var("HASURA_GRAPHQL_DATABASE_URL").ok())
         .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
+
+    // Deploy-time subcommands: do their job and exit (no server, no
+    // request-path mutation surface).
+    match &args.command {
+        Some(Command::Migrate(m)) => {
+            migrate::run_migrate(&database_url, &m.migrations_dir).await?;
+            return Ok(());
+        }
+        Some(Command::Validate(v)) => {
+            let dir = v
+                .metadata_dir
+                .clone()
+                .or_else(|| args.metadata_dir.clone())
+                .ok_or_else(|| anyhow::anyhow!("validate needs --metadata-dir"))?;
+            let problems = migrate::check_consistency(&database_url, &dir).await?;
+            if problems.is_empty() {
+                tracing::info!("metadata is consistent");
+                return Ok(());
+            }
+            for p in &problems {
+                tracing::error!("inconsistency: {p}");
+            }
+            anyhow::bail!("metadata validation failed: {} inconsistency(ies)", problems.len());
+        }
+        _ => {}
+    }
     let port = serve.and_then(|s| s.server_port).unwrap_or(args.port);
     let admin_secret = serve
         .and_then(|s| s.admin_secret.clone())
