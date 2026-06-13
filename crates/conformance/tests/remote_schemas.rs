@@ -126,3 +126,35 @@ fn customized_remote_schema_partial_args() {
     );
     s.check_query_f(&format!("{CUSTOM}/execution_with_partial_args_exposed_to_role.yaml"), Transport::Http);
 }
+
+const PRESETS: &str = "queries/remote_schemas/permissions/argument_presets";
+
+/// `TestRemoteSchemaPermissionsArgumentPresets`: a role SDL with `@preset`
+/// directives on arguments / input-object fields. The engine injects the
+/// presets into the forwarded query and hides preset args from the role.
+fn preset_suite(name: &str, permission_fixture: &str) -> Running {
+    let s = Suite::new(name)
+        .with_remote_graphql("GRAPHQL_SERVICE_1")
+        .start();
+    s.setup_v1q(&format!("{PRESETS}/setup.yaml"));
+    s.setup_v1q(&format!("{PRESETS}/{permission_fixture}"));
+    s
+}
+
+#[test]
+fn remote_schema_static_argument_presets() {
+    let s = preset_suite(
+        "remote_schema_static_preset",
+        "add_permission_with_static_preset_argument.yaml",
+    );
+    s.check_query_f(&format!("{PRESETS}/execution_with_static_preset_args.yaml"), Transport::Http);
+}
+
+#[test]
+fn remote_schema_session_argument_presets() {
+    let s = preset_suite(
+        "remote_schema_session_preset",
+        "add_permission_with_session_preset_argument.yaml",
+    );
+    s.check_query_f(&format!("{PRESETS}/execution_with_session_preset_args.yaml"), Transport::Http);
+}

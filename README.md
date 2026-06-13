@@ -97,13 +97,15 @@ has the per-suite detail.
 
 - **Remote schemas** — role-scoped SDL permissions + execution (request
   validation with exact errors, forwarding to the upstream, unknown-role
-  denial) and schema customization (namespace/prefix translation, fragments,
-  customization-aware validation errors) are covered by the native harness
+  denial), schema customization (namespace/prefix translation, fragments,
+  customization-aware validation errors), and `@preset` arguments (static +
+  session presets with coercion, preset-hidden args, input-object/variable
+  presets) are covered by the native harness
   (`crates/conformance/tests/remote_schemas.rs`, against a native upstream
   stub). Also implemented in the engine but currently only exercised by the
-  legacy pytest cross-check: `@preset` args, per-row remote relationships, and
-  the admin-only metadata-validation flows. Mixed introspection+remote root
-  queries (split & merge) remain incomplete.
+  legacy pytest cross-check: per-row remote relationships and the admin-only
+  metadata-validation flows. General mixed introspection+remote root queries
+  (split & merge) remain incomplete.
 - **Introspection completeness** — aggregate detail types, computed-field
   args, function roots, some mutation by_pk/one roots in `__schema`.
 - **Actions** — done as above; *remaining:* output → remote-schema joins,
