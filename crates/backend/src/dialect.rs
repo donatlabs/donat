@@ -188,12 +188,19 @@ impl Dialect for SqliteDialect {
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
         // json1's json_group_array(...), coalesced to an empty json array.
-        // validated against real sqlite in the harness slice
+        //
+        // The row expression is itself a JSON object/array built by
+        // `json_object(...)`/`json_group_array(...)`, which SQLite returns as
+        // TEXT. Feeding that text straight to json_group_array would treat it
+        // as a string scalar and JSON-escape it, double-encoding the nested
+        // value (the array would come back as `["{\"id\":1}"]`). Wrapping the
+        // row in `json(...)` reparses the text so the nested structure is
+        // preserved as real JSON. (validated against real sqlite)
         match order_by {
             Some(ob) => format!(
-                "coalesce(json_group_array({row_expr} ORDER BY {ob}), json_array())"
+                "coalesce(json_group_array(json({row_expr}) ORDER BY {ob}), json_array())"
             ),
-            None => format!("coalesce(json_group_array({row_expr}), json_array())"),
+            None => format!("coalesce(json_group_array(json({row_expr})), json_array())"),
         }
     }
 
@@ -552,9 +559,12 @@ mod tests {
     #[test]
     fn sqlite_json_array_agg_without_order() {
         let d = SqliteDialect;
+        // The row expression is reparsed with json(...) so the nested JSON
+        // object/array is aggregated as real JSON rather than being
+        // double-encoded into a string scalar.
         assert_eq!(
             d.json_array_agg("_e.j", None),
-            "coalesce(json_group_array(_e.j), json_array())"
+            "coalesce(json_group_array(json(_e.j)), json_array())"
         );
     }
 
@@ -563,7 +573,7 @@ mod tests {
         let d = SqliteDialect;
         assert_eq!(
             d.json_array_agg("t.e", Some("t.i ASC")),
-            "coalesce(json_group_array(t.e ORDER BY t.i ASC), json_array())"
+            "coalesce(json_group_array(json(t.e) ORDER BY t.i ASC), json_array())"
         );
     }
 
@@ -598,7 +608,7 @@ mod tests {
         assert_eq!(d.json_object(&[("k".into(), "v".into())]), "json_object('k', v)");
         assert_eq!(
             d.json_array_agg("x", None),
-            "coalesce(json_group_array(x), json_array())"
+            "coalesce(json_group_array(json(x)), json_array())"
         );
         assert_eq!(d.to_json_text("x"), "json_quote(x)");
     }
