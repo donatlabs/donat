@@ -90,10 +90,29 @@ donat codegen go --metadata-dir <dir> --out <dir> [--package donat_gen]
   Multi-schema name collisions are disambiguated by prefixing the schema
   (e.g. `AuthUser` for `auth.user`); `public` is never prefixed.
 
+## Packaging & deployment constraint (hard requirement)
+
+The Go package MUST be **deployable and natively loadable**: a plain
+`go get` + `import`, compiled into the user's own binary with no cgo, no
+shared object, no separate runtime to install. This holds for everything in
+this spec (codegen output + SDK core are already pure Go) and is binding on
+every future transport:
+
+- The eventual in-process transport MUST stay pure Go — wasm-core under a
+  pure-Go runtime (wazero), never cgo (precedent: `ncruces/go-sqlite3`). cgo
+  would break `go get`, cross-compilation, and "deploy as one static binary"
+  (see ADR-005 / [[knowledgebase/embedded-sdk/embedding-options]]).
+- The sidecar transport stays pure Go on the client side (a socket/gRPC
+  client is ordinary Go).
+- Generated code may depend only on pure-Go modules (`shopspring/decimal` is
+  pure Go — verified-safe). No generated dependency may pull cgo.
+- CI must include `CGO_ENABLED=0 go build ./...` over the SDK and a golden
+  generated package as the guardrail for this constraint.
+
 ## 2. Go SDK core (`sdk/go/donat`)
 
-Pure-Go package, no cgo, no transport. Module path TBD at scaffold time
-(placeholder `github.com/donat/donat-go`).
+Pure-Go package, no cgo, no transport (see the packaging constraint above).
+Module path TBD at scaffold time (placeholder `github.com/donat/donat-go`).
 
 ### Event envelope
 
