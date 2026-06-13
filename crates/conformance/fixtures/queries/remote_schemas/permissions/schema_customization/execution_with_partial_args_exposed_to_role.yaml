@@ -1,3 +1,5 @@
+# Ported from tests-py; the final admin (no-role) re-run step is trimmed
+# (no admin role). See tests/hasura/COVERAGE.md.
 - description: query the remote schema with only args and fields that have been exposed to the role 'user'
   url: /v1/graphql
   status: 200
@@ -46,24 +48,3 @@
           code: validation-failed
         message: "'messages' has no argument named 'includes'"
 
-- description: run the above query as the admin role
-  url: /v1/graphql
-  status: 200
-  query:
-    query: |
-      {
-        my_remote_schema {
-          messages(where: {id : {eq: 1}}, includes: {name:"alice"}) {
-            id
-            name
-            msg
-          }
-        }
-      }
-  response:
-    data:
-      my_remote_schema:
-        messages:
-          - id: 1
-            name: alice
-            msg: You win!

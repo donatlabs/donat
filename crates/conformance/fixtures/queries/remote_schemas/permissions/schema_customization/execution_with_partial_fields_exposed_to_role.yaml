@@ -1,3 +1,5 @@
+# Ported from tests-py; the final admin (no-role) re-run step is trimmed
+# (no admin role). See tests/hasura/COVERAGE.md.
 - description: query the remote schema with only fields that have been exposed to the role 'user'
   url: /v1/graphql
   status: 200
@@ -87,24 +89,3 @@
           code: validation-failed
         message: "field 'foo_gimmeText' not found in type: 'FooUser'"
 
-- description: run the above query as admin
-  url: /v1/graphql
-  status: 200
-  query:
-    query: |
-      query {
-        my_remote_schema {
-          hello
-          user (user_id: 1) {
-            foo_user_id
-            foo_gimmeText(text: "hello")
-          }
-        }
-      }
-  response:
-    data:
-      my_remote_schema:
-        hello: world
-        user:
-          foo_user_id: 1
-          foo_gimmeText: hello

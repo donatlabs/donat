@@ -90,3 +90,39 @@ fn remote_schema_permissions_execution() {
     // a role with no remote-schema permission can't see the fields at all.
     s.check_query_f(&format!("{PERMS}/unknown_role_execution.yaml"), Transport::Http);
 }
+
+const CUSTOM: &str = "queries/remote_schemas/permissions/schema_customization";
+
+/// A customized remote schema (`TestCustomizedRemoteSchemaPermissionsExecution`):
+/// namespace `my_remote_schema`, type prefix `Foo`, field prefix `foo_` on
+/// User. The engine unwraps the namespace, translates the customized
+/// type/field names back to upstream ones (validating against the role SDL),
+/// forwards, then re-applies the customized spelling to the response.
+fn customization_suite(name: &str, permission_fixture: &str) -> Running {
+    let s = Suite::new(name)
+        .with_remote_graphql("GRAPHQL_SERVICE_1")
+        .start();
+    s.setup_v1q(&format!("{CUSTOM}/setup.yaml"));
+    s.setup_v1q(&format!("{CUSTOM}/{permission_fixture}"));
+    s
+}
+
+#[test]
+fn customized_remote_schema_partial_fields() {
+    let s = customization_suite(
+        "remote_schema_custom_fields",
+        "add_permission_with_valid_subset_of_fields.yaml",
+    );
+    // Exposed `foo_user_id` (and fragments on `FooUser`) forward as `user_id`;
+    // unexposed `foo_gimmeText` fails validation against the customized SDL.
+    s.check_query_f(&format!("{CUSTOM}/execution_with_partial_fields_exposed_to_role.yaml"), Transport::Http);
+}
+
+#[test]
+fn customized_remote_schema_partial_args() {
+    let s = customization_suite(
+        "remote_schema_custom_args",
+        "add_permission_with_valid_subset_of_arguments.yaml",
+    );
+    s.check_query_f(&format!("{CUSTOM}/execution_with_partial_args_exposed_to_role.yaml"), Transport::Http);
+}

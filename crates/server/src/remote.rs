@@ -151,7 +151,17 @@ pub fn match_remote_with<'m>(
         if !all_match {
             continue;
         }
-        // Deep validation with exact Hasura-style errors.
+        // Deep validation with exact Hasura-style errors. Under customization,
+        // errors are reported with the client-facing names and the namespaced
+        // path, so build the base path from the namespace + customized name.
+        let customizer = customization.map(|c| Customizer { c });
+        let base_path = |field: &QField<'static, String>| match &namespace {
+            Some(ns) => format!(
+                "$.selectionSet.{ns}.selectionSet.{}",
+                display_field(field, customizer.as_ref())
+            ),
+            None => format!("$.selectionSet.{}", display_field(field, customizer.as_ref())),
+        };
         for field in &root_fields {
             if field.name == "__typename" {
                 continue;
@@ -160,8 +170,9 @@ pub fn match_remote_with<'m>(
                 &types,
                 &query_type,
                 field,
-                &format!("$.selectionSet.{}", field.name),
+                &base_path(field),
                 internal,
+                customizer.as_ref(),
             ) {
                 return Some(Err(e));
             }
@@ -280,18 +291,63 @@ fn field_on_type<'d>(
     }
 }
 
+/// Maps upstream names back to the client-facing customized spelling for error
+/// reporting against a customized remote schema. Validation runs on the
+/// decustomized query (upstream names), but Hasura reports errors using the
+/// customized type/field names and the namespaced path.
+struct Customizer<'a> {
+    c: &'a dist_metadata::RemoteSchemaCustomization,
+}
+
+impl Customizer<'_> {
+    /// Re-apply the type prefix/suffix to an upstream type name.
+    fn type_name(&self, upstream: &str) -> String {
+        let mut out = upstream.to_string();
+        if let Some(tn) = &self.c.type_names {
+            if let Some(p) = &tn.prefix {
+                out = format!("{p}{out}");
+            }
+            if let Some(s) = &tn.suffix {
+                out = format!("{out}{s}");
+            }
+        }
+        out
+    }
+}
+
+/// The client-facing name of a field: under customization the decustomizer
+/// stored the customized spelling as the field's alias.
+fn display_field(field: &QField<'static, String>, cust: Option<&Customizer>) -> String {
+    match cust {
+        Some(_) => field.alias.clone().unwrap_or_else(|| field.name.clone()),
+        None => field.name.clone(),
+    }
+}
+
+fn display_type(parent_type: &str, cust: Option<&Customizer>) -> String {
+    match cust {
+        Some(c) => c.type_name(parent_type),
+        None => parent_type.to_string(),
+    }
+}
+
 fn validate_field(
     types: &Types,
     parent_type: &str,
     field: &QField<'static, String>,
     path: &str,
     internal: bool,
+    cust: Option<&Customizer>,
 ) -> Result<(), crate::gql::GqlError> {
     let Some(def) = field_on_type(types, parent_type, &field.name) else {
         return Err(crate::gql::GqlError {
             path: path.to_string(),
             code: "validation-failed",
-            message: format!("field '{}' not found in type: '{parent_type}'", field.name),
+            message: format!(
+                "field '{}' not found in type: '{}'",
+                display_field(field, cust),
+                display_type(parent_type, cust)
+            ),
         });
     };
     for (arg, _) in &field.arguments {
@@ -305,7 +361,7 @@ fn validate_field(
             return Err(crate::gql::GqlError {
                 path: path.to_string(),
                 code: "validation-failed",
-                message: format!("'{}' has no argument named '{arg}'", field.name),
+                message: format!("'{}' has no argument named '{arg}'", display_field(field, cust)),
             });
         }
     }
@@ -319,8 +375,9 @@ fn validate_field(
                 types,
                 &inner_type,
                 sub,
-                &format!("{path}.selectionSet.{}", sub.name),
+                &format!("{path}.selectionSet.{}", display_field(sub, cust)),
                 internal,
+                cust,
             )?;
         }
     }
@@ -873,6 +930,23 @@ mod tests {
         // A document not rooted at the namespace does not match.
         let other = parse_op("{ other { x } }");
         assert!(decustomize(&other, &c).is_none());
+    }
+
+    #[test]
+    fn customizer_reapplies_type_prefix_for_error_names() {
+        let c = dist_metadata::RemoteSchemaCustomization {
+            root_fields_namespace: Some("my_remote_schema".to_string()),
+            type_names: Some(dist_metadata::NameCustomization {
+                prefix: Some("Foo".to_string()),
+                suffix: None,
+            }),
+            field_names: vec![],
+        };
+        let cust = Customizer { c: &c };
+        assert_eq!(cust.type_name("User"), "FooUser");
+        // Without a customizer, names pass through unchanged.
+        assert_eq!(display_type("User", None), "User");
+        assert_eq!(display_type("User", Some(&cust)), "FooUser");
     }
 
     #[test]

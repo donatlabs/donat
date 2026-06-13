@@ -13,10 +13,34 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use std::collections::HashMap;
+
 use graphql_parser::query::{
-    Definition, OperationDefinition, Selection, SelectionSet, Value as GqlValue,
+    Definition, Field, FragmentDefinition, OperationDefinition, Selection, SelectionSet,
+    Value as GqlValue,
 };
 use serde_json::{json, Map, Value as Json};
+
+type Fragments<'a> = HashMap<String, &'a FragmentDefinition<'static, String>>;
+
+/// Flatten a selection set into its concrete fields, expanding fragment
+/// spreads and inline fragments (the upstream stub ignores type conditions —
+/// the engine has already validated and rewritten the query).
+fn fields<'a>(set: &'a SelectionSet<'static, String>, frags: &Fragments<'a>) -> Vec<&'a Field<'static, String>> {
+    let mut out = Vec::new();
+    for item in &set.items {
+        match item {
+            Selection::Field(f) => out.push(f),
+            Selection::FragmentSpread(s) => {
+                if let Some(frag) = frags.get(&s.fragment_name) {
+                    out.extend(fields(&frag.selection_set, frags));
+                }
+            }
+            Selection::InlineFragment(inf) => out.extend(fields(&inf.selection_set, frags)),
+        }
+    }
+    out
+}
 
 /// The canned message rows, mirroring the Node server's `allMessages`.
 fn all_messages() -> Vec<Json> {
@@ -58,36 +82,43 @@ fn execute(body: &Json) -> Json {
         Ok(d) => d.into_static(),
         Err(e) => return gql_error(&format!("upstream parse error: {e}")),
     };
+    let frags: Fragments = doc
+        .definitions
+        .iter()
+        .filter_map(|d| match d {
+            Definition::Fragment(f) => Some((f.name.clone(), f)),
+            _ => None,
+        })
+        .collect();
     let Some(set) = operation_selection(&doc) else {
         return gql_error("no operation");
     };
 
     let mut data = Map::new();
-    for item in &set.items {
-        let Selection::Field(field) = item else { continue };
+    for field in fields(set, &frags) {
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         let args = arg_map(&field.arguments, &variables);
-        let value = resolve_root(&field.name, &args, &field.selection_set, &variables);
+        let value = resolve_root(&field.name, &args, &field.selection_set, &variables, &frags);
         data.insert(alias, value);
     }
     json!({ "data": data })
 }
 
 /// Resolve a top-level query field.
-fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>) -> Json {
+fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>, frags: &Fragments) -> Json {
     match name {
         "hello" => Json::String("world".into()),
         "user" => {
             let uid = args.get("user_id").cloned().unwrap_or(Json::Null);
-            project_user(&uid, sel, vars)
+            project_user(&uid, sel, vars, frags)
         }
         "users" => {
             let ids = args.get("user_ids").and_then(Json::as_array).cloned().unwrap_or_default();
-            Json::Array(ids.iter().map(|id| project_user(id, sel, vars)).collect())
+            Json::Array(ids.iter().map(|id| project_user(id, sel, vars, frags)).collect())
         }
         "messages" => {
             let rows = filter_messages(all_messages(), args);
-            Json::Array(rows.iter().map(|m| project_message(m, sel)).collect())
+            Json::Array(rows.iter().map(|m| project_message(m, sel, frags)).collect())
         }
         "communications" => {
             let mut rows = all_messages();
@@ -96,32 +127,31 @@ fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static
                     rows.retain(|m| &m["id"] == id);
                 }
             }
-            Json::Array(rows.iter().map(|m| project_message(m, sel)).collect())
+            Json::Array(rows.iter().map(|m| project_message(m, sel, frags)).collect())
         }
         "message" => {
             let id = args.get("id").cloned().unwrap_or(Json::Null);
             match all_messages().into_iter().find(|m| m["id"] == id) {
-                Some(m) => project_message(&m, sel),
+                Some(m) => project_message(&m, sel, frags),
                 None => Json::Null,
             }
         }
         "profilePicture" => {
             // Resolver returns the `dimensions` input verbatim as a Photo.
             let dims = args.get("dimensions").cloned().unwrap_or(Json::Null);
-            project_passthrough(&dims, sel)
+            project_passthrough(&dims, sel, frags)
         }
         _ => Json::Null,
     }
 }
 
 /// Project the `User` type: `user_id`, `gimmeText(text)`, `userMessages(...)`.
-fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>) -> Json {
+fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>, frags: &Fragments) -> Json {
     if user_id.is_null() {
         return Json::Null;
     }
     let mut out = Map::new();
-    for item in &sel.items {
-        let Selection::Field(field) = item else { continue };
+    for field in fields(sel, frags) {
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         let value = match field.name.as_str() {
             "user_id" => user_id.clone(),
@@ -138,7 +168,7 @@ fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<
                     .filter(|m| m["id"] == *user_id)
                     .collect();
                 rows = filter_user_messages(rows, &args);
-                Json::Array(rows.iter().map(|m| project_message(m, &field.selection_set)).collect())
+                Json::Array(rows.iter().map(|m| project_message(m, &field.selection_set, frags)).collect())
             }
             _ => Json::Null,
         };
@@ -148,10 +178,9 @@ fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<
 }
 
 /// Project the `Message` type onto the selection set.
-fn project_message(row: &Json, sel: &SelectionSet<'static, String>) -> Json {
+fn project_message(row: &Json, sel: &SelectionSet<'static, String>, frags: &Fragments) -> Json {
     let mut out = Map::new();
-    for item in &sel.items {
-        let Selection::Field(field) = item else { continue };
+    for field in fields(sel, frags) {
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         let value = match field.name.as_str() {
             "__typename" => Json::String("Message".into()),
@@ -163,13 +192,12 @@ fn project_message(row: &Json, sel: &SelectionSet<'static, String>) -> Json {
 }
 
 /// Project an arbitrary object (e.g. Photo) by copying selected fields.
-fn project_passthrough(value: &Json, sel: &SelectionSet<'static, String>) -> Json {
+fn project_passthrough(value: &Json, sel: &SelectionSet<'static, String>, frags: &Fragments) -> Json {
     if value.is_null() {
         return Json::Null;
     }
     let mut out = Map::new();
-    for item in &sel.items {
-        let Selection::Field(field) = item else { continue };
+    for field in fields(sel, frags) {
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         out.insert(alias, value.get(&field.name).cloned().unwrap_or(Json::Null));
     }
