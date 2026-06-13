@@ -76,6 +76,33 @@ pub fn sqlite_scalar(native: &str) -> ScalarType {
     }
 }
 
+/// Map a MySQL `information_schema.columns.DATA_TYPE` value to its logical
+/// [`ScalarType`]. MySQL `DATA_TYPE` is the base type name without the size
+/// suffix (e.g. `int`, `varchar`, `decimal`), reported in lower case, but we
+/// match case-insensitively for safety. Unknown names map to
+/// [`ScalarType::Other`] carrying the original native name verbatim.
+pub fn mysql_scalar(native: &str) -> ScalarType {
+    match native.to_ascii_lowercase().as_str() {
+        "tinyint" | "smallint" => ScalarType::SmallInt,
+        "mediumint" | "int" | "integer" => ScalarType::Int,
+        "bigint" => ScalarType::BigInt,
+        "float" => ScalarType::Float,
+        "double" | "double precision" | "real" => ScalarType::Double,
+        "decimal" | "numeric" | "dec" | "fixed" => ScalarType::Numeric,
+        "bool" | "boolean" => ScalarType::Bool,
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum"
+        | "set" => ScalarType::Text,
+        "json" => ScalarType::Json,
+        "datetime" | "timestamp" => ScalarType::Timestamp,
+        "date" => ScalarType::Date,
+        "time" => ScalarType::Time,
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
+            ScalarType::Bytes
+        }
+        _ => ScalarType::Other(native.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +215,63 @@ mod tests {
         assert_eq!(
             sqlite_scalar("citext"),
             ScalarType::Other("citext".to_string())
+        );
+    }
+
+    // ---- mysql_scalar -----------------------------------------------------
+
+    #[test]
+    fn mysql_maps_integer_family() {
+        assert_eq!(mysql_scalar("tinyint"), ScalarType::SmallInt);
+        assert_eq!(mysql_scalar("smallint"), ScalarType::SmallInt);
+        assert_eq!(mysql_scalar("mediumint"), ScalarType::Int);
+        assert_eq!(mysql_scalar("int"), ScalarType::Int);
+        assert_eq!(mysql_scalar("integer"), ScalarType::Int);
+        assert_eq!(mysql_scalar("bigint"), ScalarType::BigInt);
+    }
+
+    #[test]
+    fn mysql_maps_float_and_decimal_family() {
+        assert_eq!(mysql_scalar("float"), ScalarType::Float);
+        assert_eq!(mysql_scalar("double"), ScalarType::Double);
+        assert_eq!(mysql_scalar("real"), ScalarType::Double);
+        assert_eq!(mysql_scalar("decimal"), ScalarType::Numeric);
+        assert_eq!(mysql_scalar("numeric"), ScalarType::Numeric);
+    }
+
+    #[test]
+    fn mysql_maps_bool_and_text_family() {
+        assert_eq!(mysql_scalar("bool"), ScalarType::Bool);
+        assert_eq!(mysql_scalar("boolean"), ScalarType::Bool);
+        assert_eq!(mysql_scalar("varchar"), ScalarType::Text);
+        assert_eq!(mysql_scalar("char"), ScalarType::Text);
+        assert_eq!(mysql_scalar("text"), ScalarType::Text);
+        assert_eq!(mysql_scalar("longtext"), ScalarType::Text);
+    }
+
+    #[test]
+    fn mysql_maps_json_temporal_and_binary() {
+        assert_eq!(mysql_scalar("json"), ScalarType::Json);
+        assert_eq!(mysql_scalar("datetime"), ScalarType::Timestamp);
+        assert_eq!(mysql_scalar("timestamp"), ScalarType::Timestamp);
+        assert_eq!(mysql_scalar("date"), ScalarType::Date);
+        assert_eq!(mysql_scalar("time"), ScalarType::Time);
+        assert_eq!(mysql_scalar("blob"), ScalarType::Bytes);
+        assert_eq!(mysql_scalar("varbinary"), ScalarType::Bytes);
+    }
+
+    #[test]
+    fn mysql_is_case_insensitive() {
+        assert_eq!(mysql_scalar("INT"), ScalarType::Int);
+        assert_eq!(mysql_scalar("VarChar"), ScalarType::Text);
+        assert_eq!(mysql_scalar("JSON"), ScalarType::Json);
+    }
+
+    #[test]
+    fn mysql_unknown_falls_back_to_other_verbatim() {
+        assert_eq!(
+            mysql_scalar("geometry"),
+            ScalarType::Other("geometry".to_string())
         );
     }
 }

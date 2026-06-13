@@ -388,6 +388,135 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
     Ok(catalog)
 }
 
+/// Take a full snapshot of a MySQL database (the schema named by `schema`,
+/// e.g. `"donat"`), producing the same [`Catalog`] shape as the Postgres
+/// [`introspect`] so downstream schema-gen and planning run unchanged. The
+/// MySQL database name plays the role Postgres schemas / SQLite's `"main"`
+/// play; pass it explicitly so callers control which database is tracked.
+///
+/// Column types are read from `information_schema.columns.DATA_TYPE` and
+/// normalised to the nearest Postgres type *name* via [`mysql_type_to_pg`] —
+/// the same pragmatic pg-name bridge SQLite uses, because schema-gen still
+/// keys scalar naming off pg type names. MySQL has no stored row-returning
+/// functions modelled here, so [`Catalog::functions`] stays empty.
+pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<Catalog> {
+    use mysql::prelude::Queryable;
+
+    let mut catalog = Catalog::default();
+
+    // Columns, ordered by table then ordinal position. COLUMN_DEFAULT is SQL
+    // NULL when the column has no default, so deserialize it as Option.
+    let cols: Vec<(String, String, String, String, Option<String>)> = conn.exec(
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? \
+         ORDER BY TABLE_NAME, ORDINAL_POSITION",
+        (schema,),
+    )?;
+    for (table, column, data_type, is_nullable, default) in cols {
+        let key = format!("{schema}.{table}");
+        let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
+            schema: schema.to_string(),
+            name: table.clone(),
+            columns: vec![],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        });
+        entry.columns.push(ColumnInfo {
+            name: column,
+            pg_type: mysql_type_to_pg(&data_type).to_string(),
+            // IS_NULLABLE is the string 'YES' or 'NO'.
+            nullable: is_nullable.eq_ignore_ascii_case("YES"),
+            has_default: default.is_some(),
+        });
+    }
+
+    // Primary keys, in key ordinal order.
+    let pks: Vec<(String, String)> = conn.exec(
+        "SELECT TABLE_NAME, COLUMN_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = ? AND CONSTRAINT_NAME = 'PRIMARY' \
+         ORDER BY TABLE_NAME, ORDINAL_POSITION",
+        (schema,),
+    )?;
+    for (table, column) in pks {
+        if let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) {
+            info.primary_key.push(column);
+        }
+    }
+
+    // Foreign keys: KEY_COLUMN_USAGE rows with a REFERENCED_TABLE_NAME, grouped
+    // by constraint name and ordered by position within the constraint.
+    let fks: Vec<(String, String, String, String, String)> = conn.exec(
+        "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, \
+                REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+        (schema,),
+    )?;
+    // We need the referenced column per row too; fetch it in the same query
+    // order. (Selected separately to keep the tuple arity readable.)
+    let fk_refs: Vec<String> = conn.exec(
+        "SELECT REFERENCED_COLUMN_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+        (schema,),
+    )?;
+    for ((conname, table, from_col, ref_schema, ref_table), to_col) in
+        fks.into_iter().zip(fk_refs)
+    {
+        let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) else {
+            continue;
+        };
+        let fk = match info
+            .foreign_keys
+            .iter_mut()
+            .find(|fk| fk.constraint_name == conname)
+        {
+            Some(fk) => fk,
+            None => {
+                info.foreign_keys.push(ForeignKey {
+                    constraint_name: conname,
+                    column_mapping: BTreeMap::new(),
+                    referenced_schema: ref_schema,
+                    referenced_table: ref_table,
+                });
+                info.foreign_keys.last_mut().unwrap()
+            }
+        };
+        fk.column_mapping.insert(from_col, to_col);
+    }
+
+    Ok(catalog)
+}
+
+/// Map a MySQL `information_schema.columns.DATA_TYPE` value to the nearest
+/// Postgres type name (pg_catalog `typname` form). MySQL `DATA_TYPE` carries
+/// no size/precision suffix (that lives in `COLUMN_TYPE`), so no stripping is
+/// needed; matching is case-insensitive. This pg-name mapping is the same
+/// pragmatic bridge SQLite uses (see [`sqlite_type_to_pg`]).
+fn mysql_type_to_pg(data_type: &str) -> &'static str {
+    match data_type.to_ascii_lowercase().as_str() {
+        "tinyint" | "smallint" => "int2",
+        "mediumint" | "int" | "integer" => "int4",
+        "bigint" => "int8",
+        "float" => "float4",
+        "double" | "double precision" | "real" => "float8",
+        "decimal" | "numeric" | "dec" | "fixed" => "numeric",
+        "bool" | "boolean" => "bool",
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum"
+        | "set" => "text",
+        "json" => "json",
+        "datetime" | "timestamp" => "timestamp",
+        "date" => "date",
+        "time" => "time",
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => "bytea",
+        _ => "text",
+    }
+}
+
 #[cfg(test)]
 mod sqlite_tests {
     use super::*;

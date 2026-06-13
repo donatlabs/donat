@@ -507,18 +507,23 @@ impl Ctx {
                         OrderDirection::Asc => "ASC",
                         OrderDirection::Desc => "DESC",
                     };
-                    let nulls = match ob.nulls {
-                        NullsOrder::First => "NULLS FIRST",
-                        NullsOrder::Last => "NULLS LAST",
+                    // Null-ordering is a backend-divergent leaf: Postgres and
+                    // SQLite emit `NULLS FIRST/LAST` (the dialect's default
+                    // body reproduces sqlgen's historical output byte-for-byte),
+                    // while MySQL omits it (the clause is a parse error there).
+                    let nulls = {
+                        use donat_backend::Dialect;
+                        self.dialect
+                            .null_ordering(matches!(ob.nulls, NullsOrder::First))
                     };
-                    format!("{target} {dir} {nulls}")
+                    format!("{target} {dir}{nulls}")
                 })
                 .collect();
             sql.push_str(&format!(" ORDER BY {}", items.join(", ")));
         }
 
         use donat_backend::Dialect;
-        sql.push_str(&donat_backend::PostgresDialect.limit_offset(q.limit, q.offset));
+        sql.push_str(&self.dialect.limit_offset(q.limit, q.offset));
         sql
     }
 

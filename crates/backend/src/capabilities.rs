@@ -70,9 +70,43 @@ pub fn sqlite() -> Capabilities {
     }
 }
 
+/// Capabilities of the MySQL backend (8.0.14+).
+pub fn mysql() -> Capabilities {
+    Capabilities {
+        // MySQL has a real JSON type but no jsonb operator class.
+        json_ops: JsonOps::Json,
+        geo: false,
+        // INSERT ... ON DUPLICATE KEY UPDATE (mutations only; not exercised
+        // by the read-query slice).
+        upsert: UpsertKind::Update,
+        // No RETURNING clause — MySQL mutations are a separate, later slice.
+        returning: false,
+        // No DISTINCT ON in MySQL.
+        distinct_on: false,
+        // LATERAL derived tables since 8.0.14.
+        lateral: true,
+        aggregates: true,
+        // No multi-table nested INSERT (depends on RETURNING).
+        nested_inserts: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_descriptor_is_correct() {
+        let caps = mysql();
+        assert_eq!(caps.json_ops, JsonOps::Json);
+        assert!(!caps.geo);
+        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert!(!caps.returning);
+        assert!(!caps.distinct_on);
+        assert!(caps.lateral);
+        assert!(caps.aggregates);
+        assert!(!caps.nested_inserts);
+    }
 
     #[test]
     fn sqlite_descriptor_is_correct() {
