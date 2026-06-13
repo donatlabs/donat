@@ -206,13 +206,28 @@ pub fn match_remote_with<'m>(
 
 /// Hasura resolves {{ENV_VAR}} templates in remote urls itself.
 pub fn resolve_url_template(raw_url: &str) -> String {
-    if let (Some(start), Some(end)) = (raw_url.find("{{"), raw_url.find("}}")) {
-        let var = &raw_url[start + 2..end];
-        let value = std::env::var(var).unwrap_or_default();
-        format!("{}{}{}", &raw_url[..start], value, &raw_url[end + 2..])
-    } else {
-        raw_url.to_string()
+    // Substitute every {{ENV_VAR}}. Anchoring the closing `}}` search AFTER
+    // each `{{` avoids the start>end slice panic when `}}` precedes `{{`, and
+    // an unterminated `{{` is emitted literally.
+    let mut out = String::new();
+    let mut rest = raw_url;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let var = after[..end].trim();
+                out.push_str(&std::env::var(var).unwrap_or_default());
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+            }
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 type Types<'d> = HashMap<String, &'d TypeDefinition<'static, String>>;
@@ -761,6 +776,23 @@ mod tests {
         );
         // Unset variables substitute as empty.
         assert_eq!(resolve_url_template("{{DIST_API_TEST_UNSET_VAR}}/graphql"), "/graphql");
+    }
+
+    #[test]
+    fn url_template_is_panic_free_and_multi() {
+        // `}}` before `{{` must not panic (the old slice did start>end).
+        assert_eq!(resolve_url_template("a}}b{{X"), "a}}b{{X");
+        // Unterminated `{{` is emitted literally.
+        assert_eq!(resolve_url_template("http://x/{{NOPE"), "http://x/{{NOPE");
+        // Every occurrence is substituted, not just the first.
+        unsafe {
+            std::env::set_var("DIST_API_T_A", "A");
+            std::env::set_var("DIST_API_T_B", "B");
+        }
+        assert_eq!(
+            resolve_url_template("{{DIST_API_T_A}}-{{DIST_API_T_B}}"),
+            "A-B"
+        );
     }
 
     #[test]

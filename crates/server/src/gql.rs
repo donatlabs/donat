@@ -7,6 +7,46 @@ use dist_schema::{Planner, Session};
 
 use crate::state::SharedState;
 
+/// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
+/// the planner both recurse on nesting, so an unbounded query would overflow
+/// the stack (a fatal, process-aborting DoS). Real queries nest only a
+/// handful of levels; this cap is far above legitimate use and far below the
+/// overflow threshold.
+pub const MAX_QUERY_DEPTH: usize = 100;
+
+/// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
+/// [`MAX_QUERY_DEPTH`], before the recursive parser runs. Counting raw
+/// brackets (including any inside string literals) is conservative, which is
+/// the safe direction for a DoS guard.
+pub fn query_too_deep(query: &str) -> bool {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    for b in query.bytes() {
+        match b {
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max > MAX_QUERY_DEPTH
+}
+
+/// Constant-time byte-slice equality for the admin-secret check (avoids a
+/// timing side-channel on the secret value; length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// A planning-level GraphQL error (shared with remote validation).
 #[derive(Debug)]
 pub struct GqlError {
@@ -93,12 +133,10 @@ pub async fn resolve_session(
 ) -> Result<Session, (axum::http::StatusCode, Json)> {
     let secret_ok = match &state.admin_secret {
         None => true,
-        Some(expected) => {
-            headers
-                .get("x-hasura-admin-secret")
-                .and_then(|v| v.to_str().ok())
-                == Some(expected.as_str())
-        }
+        Some(expected) => headers
+            .get("x-hasura-admin-secret")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|provided| ct_eq(provided.as_bytes(), expected.as_bytes())),
     };
     if let Some((url, mode)) = &state.auth_hook {
         if state.admin_secret.is_some() && secret_ok {
@@ -317,6 +355,12 @@ pub async fn execute_full(
     };
     let operation_name = body.get("operationName").and_then(Json::as_str);
 
+    if query_too_deep(query) {
+        return ok(error_json(
+            "validation-failed",
+            format!("query exceeds maximum nesting depth of {MAX_QUERY_DEPTH}"),
+        ));
+    }
     let doc = match graphql_parser::parse_query::<String>(query) {
         Ok(doc) => doc.into_static(),
         Err(e) => return ok(error_json("validation-failed", format!("not a valid graphql query: {e}"))),
@@ -771,6 +815,27 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_depth_guard() {
+        assert!(!query_too_deep("{ a { b { c } } }"));
+        let deep = format!(
+            "{}{}",
+            "{ a ".repeat(MAX_QUERY_DEPTH + 5),
+            "}".repeat(MAX_QUERY_DEPTH + 5)
+        );
+        assert!(query_too_deep(&deep));
+        // Arg/list brackets count toward depth too.
+        assert!(query_too_deep(&"(".repeat(MAX_QUERY_DEPTH + 1)));
+    }
+
+    #[test]
+    fn constant_time_eq() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secrey"));
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(ct_eq(b"", b""));
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

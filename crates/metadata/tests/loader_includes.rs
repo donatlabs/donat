@@ -323,3 +323,17 @@ fn blank_section_file_is_treated_as_empty() {
     let md = load_metadata_dir(&dir).expect("metadata should load");
     assert!(md.inherited_roles.is_empty());
 }
+
+#[test]
+fn include_cycle_is_detected_not_overflow() {
+    // a.yaml includes b.yaml includes a.yaml -> cycle error, not stack overflow.
+    let dir = base_dir("cycle");
+    write(&dir, "query_collections.yaml", "\"!include a.yaml\"\n");
+    write(&dir, "a.yaml", "\"!include b.yaml\"\n");
+    write(&dir, "b.yaml", "\"!include a.yaml\"\n");
+    let err = load_metadata_dir(&dir).expect_err("cycle must error");
+    assert!(
+        matches!(err, LoadError::IncludeCycle { .. }),
+        "expected IncludeCycle, got {err:?}"
+    );
+}

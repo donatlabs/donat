@@ -13,6 +13,7 @@
 //! `!include` paths are resolved relative to the directory of the file that
 //! contains them, matching hasura-cli behaviour.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -34,6 +35,8 @@ pub enum LoadError {
     },
     #[error("invalid !include in {path}: expected a string path")]
     BadInclude { path: PathBuf },
+    #[error("!include cycle detected at {path}")]
+    IncludeCycle { path: PathBuf },
     #[error("unsupported metadata version {0} (only version 3 is supported)")]
     UnsupportedVersion(u32),
 }
@@ -103,17 +106,37 @@ fn parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LoadErro
 
 /// Parse a YAML file and recursively splice every `!include`.
 fn load_yaml_resolved(path: &Path) -> Result<Value, LoadError> {
-    let value: Value = parse_file(path)?;
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    resolve_includes(value, base, path)
+    load_yaml_tracked(path, &mut HashSet::new())
 }
 
-fn resolve_includes(value: Value, base: &Path, file: &Path) -> Result<Value, LoadError> {
+/// `seen` holds the include chain currently being resolved (canonicalized
+/// paths) so a file that transitively includes itself errors instead of
+/// recursing until the stack overflows.
+fn load_yaml_tracked(path: &Path, seen: &mut HashSet<PathBuf>) -> Result<Value, LoadError> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(key.clone()) {
+        return Err(LoadError::IncludeCycle {
+            path: path.to_path_buf(),
+        });
+    }
+    let value: Value = parse_file(path)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let resolved = resolve_includes(value, base, path, seen);
+    seen.remove(&key);
+    resolved
+}
+
+fn resolve_includes(
+    value: Value,
+    base: &Path,
+    file: &Path,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<Value, LoadError> {
     match value {
         // hasura-cli writes includes as plain quoted strings: "!include foo.yaml"
         Value::String(s) if s.starts_with("!include ") => {
             let rel = s["!include ".len()..].trim();
-            load_yaml_resolved(&base.join(rel))
+            load_yaml_tracked(&base.join(rel), seen)
         }
         // ...but accept the genuine YAML-tag form too: !include foo.yaml
         Value::Tagged(tagged) if is_include_tag(&tagged.tag) => {
@@ -123,18 +146,18 @@ fn resolve_includes(value: Value, base: &Path, file: &Path) -> Result<Value, Loa
                 .ok_or_else(|| LoadError::BadInclude {
                     path: file.to_path_buf(),
                 })?;
-            load_yaml_resolved(&base.join(rel))
+            load_yaml_tracked(&base.join(rel), seen)
         }
         Value::Mapping(map) => {
             let mut out = serde_yaml::Mapping::with_capacity(map.len());
             for (k, v) in map {
-                out.insert(k, resolve_includes(v, base, file)?);
+                out.insert(k, resolve_includes(v, base, file, seen)?);
             }
             Ok(Value::Mapping(out))
         }
         Value::Sequence(seq) => seq
             .into_iter()
-            .map(|v| resolve_includes(v, base, file))
+            .map(|v| resolve_includes(v, base, file, seen))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Sequence),
         other => Ok(other),

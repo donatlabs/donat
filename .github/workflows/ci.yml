@@ -42,6 +42,15 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
 
+  audit:
+    name: Security advisories (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
     needs: test

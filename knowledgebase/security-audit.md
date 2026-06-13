@@ -10,6 +10,31 @@ behind a mesh / trusted network). TLS termination and edge auth are assumed
 to live in front of it. Findings are ranked for that model; "network-edge"
 items are downgraded accordingly.
 
+## Resolution status (2026-06-13)
+
+- **Admin/`run_sql` fail-open (findings 1b, 2): RESOLVED by removal.** The
+  entire runtime admin/management API was deleted and the admin role removed
+  — there is no admin-over-HTTP surface and no permission-bypass role at all.
+- **Deep-nesting stack-overflow DoS (#1): FIXED.** `gql::query_too_deep`
+  rejects queries past `MAX_QUERY_DEPTH` (100) before the recursive parser
+  runs, on `/v1/graphql` and the ws path.
+- **`resolve_url_template` panic (#3): FIXED.** Rewritten to be panic-free
+  (anchors `}}` after `{{`) and to substitute all occurrences.
+- **Non-constant-time secret compare (#4): FIXED.** `gql::ct_eq` is used for
+  the `X-Hasura-Admin-Secret` check in `resolve_session`.
+- **Metadata `!include` cycle → overflow: FIXED.** The loader tracks the
+  include chain and returns `LoadError::IncludeCycle`.
+- **`cargo audit`: ADDED to CI** (`rustsec/audit-check`); current scan shows
+  no vulnerabilities (the yanked `time` transitive dep was bumped).
+- **Still open (non-security / by design):** serde_yaml deprecated (tech
+  debt); graphql-parser unmaintained (DoS now mitigated by the depth guard);
+  no `tower_http::catch_panic` layer (the fatal overflow path is gone; only
+  non-fatal handler panics remain, which drop a single connection); TLS
+  off by design (internal). Remote-schema-from-YAML needs boot-time upstream
+  introspection (a feature gap, not security) — see PLAN.md.
+
+The original ranked findings below are kept for history.
+
 ## SQL generation — verdict: injection-safe
 
 Audited every literal/identifier path in `crates/sqlgen`. No GraphQL-path
