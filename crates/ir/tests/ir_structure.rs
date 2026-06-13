@@ -4,7 +4,7 @@
 //! Scalar::Json passthrough, externally-tagged serialization shapes, and
 //! deep-clone equivalence. No database.
 
-use dist_ir::*;
+use donat_ir::*;
 use serde_json::json;
 
 fn table(name: &str) -> Table {

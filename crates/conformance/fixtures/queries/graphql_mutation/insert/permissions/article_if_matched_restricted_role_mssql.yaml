@@ -2,8 +2,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: restricted
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: restricted
+    X-Donat-User-Id: '1'
   response:
     data:
       insert_article:
@@ -39,8 +39,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: restricted
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: restricted
+    X-Donat-User-Id: '1'
   response:
     errors:
     - extensions:

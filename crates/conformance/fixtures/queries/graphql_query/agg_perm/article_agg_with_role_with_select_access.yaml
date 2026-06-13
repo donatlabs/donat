@@ -2,7 +2,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: role_with_access_to_cols
+    X-Donat-Role: role_with_access_to_cols
   response:
     data:
       article_aggregate:
@@ -22,7 +22,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: role_with_access_to_cols
+    X-Donat-Role: role_with_access_to_cols
   response:
     data:
       article_aggregate:

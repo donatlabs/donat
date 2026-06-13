@@ -2,8 +2,8 @@ description: Update mutation on resident using preset permission (session variab
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user2
-  X-Hasura-City: auckland
+  X-Donat-Role: user2
+  X-Donat-City: auckland
 response:
   data:
     update_resident:

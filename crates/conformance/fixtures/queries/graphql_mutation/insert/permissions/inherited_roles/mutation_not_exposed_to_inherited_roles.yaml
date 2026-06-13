@@ -1,8 +1,8 @@
 description: Mutations are not exposed to an inherited role
 url: /v1/graphql
 headers:
-  X-Hasura-Role: inherited_user
-  X-Hasura-User-Id: '3'
+  X-Donat-Role: inherited_user
+  X-Donat-User-Id: '3'
 status: 200
 query:
   query: |

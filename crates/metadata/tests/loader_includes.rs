@@ -1,19 +1,19 @@
 //! Unit tests for the metadata directory loader: `!include` resolution
-//! (real YAML tag and the quoted-string spelling hasura-cli writes),
+//! (real YAML tag and the quoted-string spelling donat-cli writes),
 //! nesting, relative-path semantics, and error cases. No database needed:
 //! each test builds a metadata directory in a unique temp dir.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use dist_metadata::{LoadError, load_metadata_dir};
+use donat_metadata::{LoadError, load_metadata_dir};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Unique scratch directory per test (std::env::temp_dir + pid + counter).
 fn tempdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "dist_metadata_loader_{tag}_{}_{}",
+        "donat_metadata_loader_{tag}_{}_{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -51,15 +51,15 @@ fn databases_yaml(tables_value: &str) -> String {
   configuration:
     connection_info:
       database_url:
-        from_env: HASURA_GRAPHQL_DATABASE_URL
+        from_env: DONAT_GRAPHQL_DATABASE_URL
   tables: {tables_value}
 "
     )
 }
 
 #[test]
-fn include_as_quoted_string_hasura_cli_quirk() {
-    // hasura-cli writes includes as plain strings: tables: "!include x.yaml"
+fn include_as_quoted_string_donat_cli_quirk() {
+    // donat-cli writes includes as plain strings: tables: "!include x.yaml"
     let dir = tempdir("string_include");
     write(&dir, "version.yaml", VERSION_3);
     write(
@@ -282,7 +282,7 @@ fn query_collections_and_allow_list_load_from_filesystem() {
         query: \"query { author { id } }\"
 ",
     );
-    // Hasura's filename is allow_list.yaml; it maps to Metadata.allowlist.
+    // Donat's filename is allow_list.yaml; it maps to Metadata.allowlist.
     write(&dir, "allow_list.yaml", "- collection: ops\n");
     let md = load_metadata_dir(&dir).expect("metadata should load");
     assert_eq!(md.query_collections.len(), 1);
@@ -295,7 +295,7 @@ fn query_collections_and_allow_list_load_from_filesystem() {
 #[test]
 fn remote_schemas_load_from_filesystem_with_include() {
     let dir = base_dir("remotes");
-    // The list itself may be an !include, like hasura-cli emits.
+    // The list itself may be an !include, like donat-cli emits.
     write(&dir, "remote_schemas.yaml", "\"!include remote_schemas/schemas.yaml\"\n");
     write(
         &dir,

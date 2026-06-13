@@ -104,7 +104,7 @@ args:
       - is_published
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article select permission for anonymous (only published articles)
@@ -128,7 +128,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Author select permission for user
 - type: create_select_permission
@@ -142,7 +142,7 @@ args:
       - is_registered
       filter:
         _or:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - articles:
             is_published:
               _eq: true
@@ -169,7 +169,7 @@ args:
     role: user
     permission:
       check:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Insert Author values
 - type: insert
@@ -258,8 +258,8 @@ args:
       filter:
         geom_col:
           $st_d_within:
-            distance: X-Hasura-Geom-Dist
-            from: X-Hasura-Geom-Val
+            distance: X-Donat-Geom-Dist
+            from: X-Donat-Geom-Val
 #Insert data
 - type: track_table
   args:
@@ -299,9 +299,9 @@ args:
       filter:
         geog_col:
           $st_d_within:
-            distance: X-Hasura-Geog-Dist
-            from: X-Hasura-Geog-From
-            use_spheroid: X-Hasura-Geog-Sph
+            distance: X-Donat-Geog-Dist
+            from: X-Donat-Geog-From
+            use_spheroid: X-Donat-Geog-Sph
 
 - type: track_table
   args:
@@ -331,7 +331,7 @@ args:
       - jsonb_col
       filter:
         jsonb_col:
-          $has_key: X-Hasura-Has-Key
+          $has_key: X-Donat-Has-Key
 
 #Insert data
 - type: insert
@@ -339,7 +339,7 @@ args:
     table: jsonb_table
     objects:
     - jsonb_col:
-        name: Hasura
+        name: Donat
         age: 7
     - jsonb_col:
         name: Cross

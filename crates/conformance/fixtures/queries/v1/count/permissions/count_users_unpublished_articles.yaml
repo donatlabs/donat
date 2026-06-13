@@ -2,8 +2,8 @@ description: Count number of authors
 url: /v1/query
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '3'
+  X-Donat-Role: user
+  X-Donat-User-Id: '3'
 response:
   count: 3
 query:

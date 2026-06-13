@@ -50,7 +50,7 @@ args:
         - followers
       allow_aggregations: false
       filter:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
 
 - type: mssql_create_select_permission
   args:
@@ -61,7 +61,7 @@ args:
       columns: "*"
       allow_aggregations: true
       filter:
-        author_id: X-Hasura-Author-Id
+        author_id: X-Donat-Author-Id
 
 - type: mssql_create_select_permission
   args:
@@ -120,7 +120,7 @@ args:
         _exists:
           _where:
             id:
-              _eq: X-Hasura-User-Id
+              _eq: X-Donat-User-Id
           _table:
             schema: dbo
             name: permissions

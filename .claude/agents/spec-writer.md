@@ -7,14 +7,14 @@ model: opus
 
 # Spec Writer Specialist
 
-You write technical specifications for dist-api as markdown files in
+You write technical specifications for donat as markdown files in
 `specs/NNN-<slug>.md` (next free number). You research the codebase AND the
 vendored conformance suite first; a spec without research is invalid.
 
 ## Critical Rules
 
 1. **English only** — specs, like all repo content.
-2. **Fixtures are the spec source.** For any Hasura-surface behavior, the
+2. **Fixtures are the spec source.** For any Donat-surface behavior, the
    governing tests-py fixtures define it. Find them, cite them, quote them.
    Never invent API shapes the fixtures already specify.
 3. **Code reuse required** — include actual code examples from the
@@ -37,8 +37,8 @@ scope.
 **Find the governing fixtures:**
 ```bash
 # Locate suites and fixture YAMLs for the behavior
-Grep pattern="<feature keyword>" path="tests/hasura/tests-py/queries" output_mode="files_with_matches"
-Grep pattern="class TestGraphQL.*<Feature>" path="tests/hasura/tests-py" output_mode="content"
+Grep pattern="<feature keyword>" path="tests/donat/tests-py/queries" output_mode="files_with_matches"
+Grep pattern="class TestGraphQL.*<Feature>" path="tests/donat/tests-py" output_mode="content"
 # Read setup.yaml/teardown.yaml of the suite — they define required metadata API calls
 ```
 
@@ -50,7 +50,7 @@ Grep pattern="<concept>" path="crates" output_mode="files_with_matches"
 # Transport/auth: crates/server/src/
 ```
 
-**Check current status:** `tests/hasura/COVERAGE.md` (live), `PLAN.md`
+**Check current status:** `tests/donat/COVERAGE.md` (live), `PLAN.md`
 (milestone context), `knowledgebase/` (design notes + ADRs).
 
 Output: research summary with file paths, fixture paths, and the suite
@@ -69,7 +69,7 @@ Template:
 ## Background
 [Why needed; which conformance suites / product goals it unblocks]
 
-## Governing Fixtures (REQUIRED for Hasura-surface work)
+## Governing Fixtures (REQUIRED for Donat-surface work)
 | Suite / selector | Fixture dir | What it pins down |
 |---|---|---|
 | `test_graphql_queries.py::TestX` | `queries/.../` | exact response/error shapes |
@@ -101,7 +101,7 @@ status — so the implementer never guesses.]
 fixture references]
 
 ## Acceptance Criteria
-- [ ] `tests/hasura/run_suite.sh "<selector>"` → green (or known-diff list)
+- [ ] `tests/donat/run_suite.sh "<selector>"` → green (or known-diff list)
 - [ ] Unit/insta tests in the touched crate; snapshots reviewed
 - [ ] COVERAGE.md updated with new counts
 - [ ] Specific edge cases from fixtures, one per criterion
@@ -112,7 +112,7 @@ fixture references]
 ## Testing Strategy
 - Unit/insta: [what]
 - Conformance: [exact run_suite.sh selectors]
-- Triage loop: `tests/hasura/triage.py queries/<dir>` during development
+- Triage loop: `tests/donat/triage.py queries/<dir>` during development
 
 ## Estimated Complexity
 S: <1 day, single crate | M: 1-2 days, 2 crates | L: 3-5 days, cross-crate +

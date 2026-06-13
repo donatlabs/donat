@@ -9,7 +9,7 @@ response:
       message: |-
         field 'articles_agg' not found in type: 'author'
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 query:
   query: |
     query {

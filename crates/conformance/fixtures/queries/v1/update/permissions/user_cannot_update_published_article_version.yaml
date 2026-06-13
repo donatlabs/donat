@@ -4,8 +4,8 @@ response:
   affected_rows: 0
   returning: []
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '1'
+  X-Donat-Role: user
+  X-Donat-User-Id: '1'
 status: 200
 query:
   type: update

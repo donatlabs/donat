@@ -4,7 +4,8 @@
 __pycache__/
 *.pyc
 .venv/
-# Vendored Hasura test suite — not committed; see tests/hasura/README.md
-tests/hasura/tests-py/
+# Vendored Donat test suite — not committed; see tests/donat/README.md
+tests/donat/tests-py/
 .DS_Store
 *.log
+.claude/agent-memory

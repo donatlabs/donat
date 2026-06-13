@@ -1,7 +1,7 @@
 # Embedded SDK & Native Hooks
 
 > Run the engine inside a host-language app (Go first, Node.js later) and
-> register native functions as data hooks — "PocketBase DX with Hasura v2
+> register native functions as data hooks — "PocketBase DX with Donat v2
 > compatibility".
 
 **Status: idea, deferred.** Resume after core conformance (websockets,

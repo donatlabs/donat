@@ -1,7 +1,7 @@
 //! Native conformance harness.
 //!
-//! Executes Hasura-derived YAML fixtures (`crates/conformance/fixtures`)
-//! against a freshly spawned `dist-api` instance, replicating the semantics
+//! Executes Donat-derived YAML fixtures (`crates/conformance/fixtures`)
+//! against a freshly spawned `donat` instance, replicating the semantics
 //! of tests-py `check_query_f`: same fixture format (`url`, `status`,
 //! `headers`, `query`, `response`, list-of-steps files, `!include`), same
 //! response comparison (key order enforced inside `data`, order-insensitive
@@ -31,7 +31,7 @@ pub fn fixture_root() -> PathBuf {
 }
 
 /// Load a fixture YAML into JSON, resolving `!include <file>` (both the real
-/// YAML tag and the quoted-string spelling hasura-cli produces) relative to
+/// YAML tag and the quoted-string spelling donat-cli produces) relative to
 /// the including file.
 pub fn load_fixture(path: &Path) -> Result<Json> {
     let text = std::fs::read_to_string(path)
@@ -225,7 +225,7 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 //    `run_sql` and seed `insert` ops run over the suite database via
 //    `postgres`, while metadata ops (track_table, permissions,
 //    relationships, inherited roles, query collections, ...) accumulate
-//    into an in-memory `dist_metadata::Metadata`;
+//    into an in-memory `donat_metadata::Metadata`;
 //  - spawns the engine lazily, on the first request, serializing the
 //    accumulated metadata to a `version: 3` metadata directory and passing
 //    it via `--metadata-dir`.
@@ -235,7 +235,7 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 
 use std::cell::RefCell;
 
-use dist_metadata::{
+use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
     FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
@@ -252,18 +252,18 @@ fn workspace_root() -> PathBuf {
 static BUILD_ENGINE: Once = Once::new();
 
 pub fn engine_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("DIST_API_BIN") {
+    if let Ok(p) = std::env::var("DONAT_BIN") {
         return PathBuf::from(p);
     }
-    let bin = workspace_root().join("target/debug/dist-api");
+    let bin = workspace_root().join("target/debug/donat");
     BUILD_ENGINE.call_once(|| {
         if !bin.exists() {
             let status = Command::new("cargo")
-                .args(["build", "-p", "dist-server", "--bin", "dist-api"])
+                .args(["build", "-p", "donat-server", "--bin", "donat"])
                 .current_dir(workspace_root())
                 .status()
                 .expect("running cargo build");
-            assert!(status.success(), "cargo build -p dist-server failed");
+            assert!(status.success(), "cargo build -p donat-server failed");
         }
     });
     bin
@@ -301,7 +301,7 @@ fn free_port() -> u16 {
 
 /// A fresh `Metadata` with version 3 and a single empty "default" source
 /// (so `track_table` & co. have somewhere to live). The source points at
-/// `DIST_API_DATABASE_URL`, which the engine resolves to the suite database.
+/// `DONAT_DATABASE_URL`, which the engine resolves to the suite database.
 fn empty_metadata() -> Metadata {
     Metadata {
         version: 3,
@@ -309,7 +309,7 @@ fn empty_metadata() -> Metadata {
             name: "default".to_string(),
             kind: SourceKind::Postgres,
             configuration: serde_json::from_value(json!({
-                "connection_info": { "database_url": { "from_env": "DIST_API_DATABASE_URL" } }
+                "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
             }))
             .expect("static source configuration"),
             tables: vec![],
@@ -357,7 +357,7 @@ impl Suite {
         }
     }
 
-    /// Apply the `migrations/` DDL (the `dist_api` catalog) to the suite
+    /// Apply the `migrations/` DDL (the `donat` catalog) to the suite
     /// database before the engine spawns, mirroring the real deploy order
     /// (`migrate` then serve). Required for cron triggers.
     pub fn with_migrations(mut self) -> Self {
@@ -374,7 +374,7 @@ impl Suite {
         self.env
             .push(("CRON_WEBHOOK_BASE".to_string(), stub.base_url().to_string()));
         self.env
-            .push(("DIST_API_CRON_POLL_SECONDS".to_string(), "1".to_string()));
+            .push(("DONAT_CRON_POLL_SECONDS".to_string(), "1".to_string()));
         self.cron = Some(stub);
         self.run_migrations = true;
         self
@@ -390,7 +390,7 @@ impl Suite {
         self.env
             .push(("EVENT_WEBHOOK_HANDLER".to_string(), stub.base_url().to_string()));
         self.env
-            .push(("DIST_API_EVENTS_POLL_SECONDS".to_string(), "1".to_string()));
+            .push(("DONAT_EVENTS_POLL_SECONDS".to_string(), "1".to_string()));
         self.event = Some(stub);
         self.run_migrations = true;
         self
@@ -415,12 +415,12 @@ impl Suite {
     }
 
     /// Classes marked `@pytest.mark.admin_secret`: the engine gets
-    /// HASURA_GRAPHQL_ADMIN_SECRET and every request carries the secret
+    /// DONAT_GRAPHQL_ADMIN_SECRET and every request carries the secret
     /// header (mirroring tests-py `add_auth`).
     pub fn admin_secret(mut self, secret: &str) -> Self {
         self.admin_secret = Some(secret.to_string());
         self.env.push((
-            "HASURA_GRAPHQL_ADMIN_SECRET".to_string(),
+            "DONAT_GRAPHQL_ADMIN_SECRET".to_string(),
             secret.to_string(),
         ));
         self
@@ -894,7 +894,7 @@ impl Running {
                     .as_str()
                     .expect("collection_name")
                     .to_string();
-                let query = dist_metadata::CollectionQuery {
+                let query = donat_metadata::CollectionQuery {
                     name: args["query_name"].as_str().expect("query_name").to_string(),
                     query: args["query"].as_str().expect("query").to_string(),
                 };
@@ -1002,14 +1002,14 @@ impl Running {
             }
 
             "set_custom_types" => {
-                let custom_types: dist_metadata::CustomTypes =
+                let custom_types: donat_metadata::CustomTypes =
                     serde_json::from_value(args.clone())
                         .unwrap_or_else(|e| panic!("[{}] bad set_custom_types: {e}\n{op}", self.name));
                 self.metadata.borrow_mut().custom_types = custom_types;
             }
 
             "create_action" => {
-                let entry: dist_metadata::ActionEntry = serde_json::from_value(args.clone())
+                let entry: donat_metadata::ActionEntry = serde_json::from_value(args.clone())
                     .unwrap_or_else(|e| panic!("[{}] bad create_action: {e}\n{op}", self.name));
                 let mut md = self.metadata.borrow_mut();
                 md.actions.retain(|a| a.name != entry.name);
@@ -1017,7 +1017,7 @@ impl Running {
             }
 
             "update_action" => {
-                let entry: dist_metadata::ActionEntry = serde_json::from_value(args.clone())
+                let entry: donat_metadata::ActionEntry = serde_json::from_value(args.clone())
                     .unwrap_or_else(|e| panic!("[{}] bad update_action: {e}\n{op}", self.name));
                 let mut md = self.metadata.borrow_mut();
                 // Preserve existing permissions across a definition update.
@@ -1028,7 +1028,7 @@ impl Running {
                     .map(|a| a.permissions.clone())
                     .unwrap_or_default();
                 md.actions.retain(|a| a.name != entry.name);
-                md.actions.push(dist_metadata::ActionEntry { permissions, ..entry });
+                md.actions.push(donat_metadata::ActionEntry { permissions, ..entry });
             }
 
             "drop_action" => {
@@ -1042,7 +1042,7 @@ impl Running {
                 let mut md = self.metadata.borrow_mut();
                 if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
                     if !a.permissions.iter().any(|p| p.role == role) {
-                        a.permissions.push(dist_metadata::ActionPermission { role });
+                        a.permissions.push(donat_metadata::ActionPermission { role });
                     }
                 }
             }
@@ -1134,7 +1134,7 @@ impl Running {
             .unwrap();
         }
         if !md.actions.is_empty() || !md.custom_types.is_empty() {
-            // Both live together in actions.yaml, the hasura-cli export layout.
+            // Both live together in actions.yaml, the donat-cli export layout.
             let doc = json!({
                 "actions": md.actions,
                 "custom_types": md.custom_types,
@@ -1154,7 +1154,7 @@ impl Running {
             return;
         }
         let metadata_dir = self.write_metadata_dir();
-        // Apply DDL before serving, like a real deploy: the dist_api catalog
+        // Apply DDL before serving, like a real deploy: the donat catalog
         // (migrations) plus per-table event-trigger reconciliation from the
         // metadata we are about to serve.
         if self.run_migrations {
@@ -1165,10 +1165,10 @@ impl Running {
                 .arg(&migrations)
                 .arg("--metadata-dir")
                 .arg(&metadata_dir)
-                .env("DIST_API_DATABASE_URL", &self.db_url)
+                .env("DONAT_DATABASE_URL", &self.db_url)
                 .status()
-                .expect("running dist-api migrate");
-            assert!(status.success(), "dist-api migrate failed for suite {}", self.name);
+                .expect("running donat migrate");
+            assert!(status.success(), "donat migrate failed for suite {}", self.name);
         }
         let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
@@ -1180,7 +1180,7 @@ impl Running {
             .arg(port.to_string())
             .arg("--metadata-dir")
             .arg(&metadata_dir)
-            .env("DIST_API_DATABASE_URL", &self.db_url)
+            .env("DONAT_DATABASE_URL", &self.db_url)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
         for a in &self.args {
@@ -1189,7 +1189,7 @@ impl Running {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("spawning dist-api");
+        let child = cmd.spawn().expect("spawning donat");
 
         let proc = EngineProc {
             child,
@@ -1234,7 +1234,7 @@ impl Running {
     }
 
     /// The suite database URL (for cron tests that seed/inspect the
-    /// `dist_api` catalog directly).
+    /// `donat` catalog directly).
     pub fn db_url(&self) -> &str {
         &self.db_url
     }
@@ -1308,7 +1308,7 @@ impl Running {
 
     fn auth_headers(&self, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
         if let Some(secret) = &self.admin_secret {
-            headers.push(("X-Hasura-Admin-Secret".to_string(), secret.clone()));
+            headers.push(("X-Donat-Admin-Secret".to_string(), secret.clone()));
         }
         headers
     }
@@ -1584,7 +1584,7 @@ mod tests {
 
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "dist_conformance_fixture_{tag}_{}_{}",
+            "donat_conformance_fixture_{tag}_{}_{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

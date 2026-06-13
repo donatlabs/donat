@@ -10,8 +10,8 @@ response:
         name: Griffin
         age: 25
 headers:
-  X-Hasura-Role: agent
-  X-Hasura-Allowed-Resident-Ids: '{1,2}'
+  X-Donat-Role: agent
+  X-Donat-Allowed-Resident-Ids: '{1,2}'
 query:
   query: |
     mutation{

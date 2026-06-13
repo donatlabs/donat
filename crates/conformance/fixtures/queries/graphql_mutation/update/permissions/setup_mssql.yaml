@@ -42,7 +42,7 @@ args:
     permission:
       columns: [id, name]
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Author update permission for user
 - type: mssql_create_update_permission
@@ -54,7 +54,7 @@ args:
       columns:
       - name
       filter:
-        id: X-Hasura-User-Id
+        id: X-Donat-User-Id
 
 #Article select permission for user
 - type: mssql_create_select_permission
@@ -66,7 +66,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: 1
 
 #Article update permission for user
@@ -84,7 +84,7 @@ args:
       - published_on
       filter:
         $and:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: 0
       check:
         is_published: 0

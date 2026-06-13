@@ -1,6 +1,6 @@
 # Schema migrations (DDL)
 
-Versioned SQL migrations applied by `dist-api migrate` (refinery). This is
+Versioned SQL migrations applied by `donat migrate` (refinery). This is
 the **only** thing that changes the database schema — the serving binary
 never runs DDL and has no `run_sql` endpoint.
 
@@ -11,8 +11,8 @@ Files named `V{n}__{description}.sql`, e.g. `V1__create_widget.sql`,
 `refinery_schema_history` table; re-running is idempotent.
 
 ```sh
-dist-api migrate --migrations-dir migrations   # apply pending DDL
-dist-api validate --metadata-dir metadata      # check YAML metadata vs DB
+donat migrate --migrations-dir migrations   # apply pending DDL
+donat validate --metadata-dir metadata      # check YAML metadata vs DB
 ```
 
 Deploy order: `migrate` (schema) → `validate` (metadata vs schema) →

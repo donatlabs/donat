@@ -2,7 +2,7 @@ description: GraphQL introspection query as user role
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
+  X-Donat-Role: user
 query:
   query: |
     query IntrospectionQuery {

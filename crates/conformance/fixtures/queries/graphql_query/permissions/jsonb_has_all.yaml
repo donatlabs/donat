@@ -2,15 +2,15 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user5
-    X-Hasura-Json-required-keys: |-
+    X-Donat-Role: user5
+    X-Donat-Json-required-keys: |-
       {name,age}
   response:
     data:
       jsonb_table:
       - id: 1
         jsonb_col:
-          name: Hasura
+          name: Donat
           age: 7
   query:
     query: |
@@ -25,8 +25,8 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user5
-    X-Hasura-Protected-Jsons: |-
+    X-Donat-Role: user5
+    X-Donat-Protected-Jsons: |-
       {}
   response:
     data:

@@ -28,7 +28,7 @@ reasoning survives the pause.
 | Option | Why Not |
 |--------|---------|
 | Embedded SDK now | Highest-maintenance artifact built before any user exists; starves conformance work that everything else depends on |
-| Drop the idea | The niche ("Hasura compatibility + PocketBase DX") is genuinely unoccupied; archiving costs nothing |
+| Drop the idea | The niche ("Donat compatibility + PocketBase DX") is genuinely unoccupied; archiving costs nothing |
 
 ## Consequences
 

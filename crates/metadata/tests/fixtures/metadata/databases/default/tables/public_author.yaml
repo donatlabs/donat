@@ -23,7 +23,7 @@ select_permissions:
         - name
       filter:
         id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id
 delete_permissions:
   - role: user
     permission:

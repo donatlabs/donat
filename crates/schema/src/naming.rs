@@ -1,6 +1,6 @@
-//! Hasura v2 GraphQL naming for tracked tables.
+//! Donat v2 GraphQL naming for tracked tables.
 
-use dist_metadata::{QualifiedTable, TableEntry};
+use donat_metadata::{QualifiedTable, TableEntry};
 
 /// The base GraphQL name of a table: `custom_name`/custom root field if set,
 /// otherwise `<name>` for the `public` schema and `<schema>_<name>` else.

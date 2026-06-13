@@ -30,7 +30,7 @@
 
           type Query {
             hello: String
-            user(user_id: Int! @preset(value: "x-hasura-user-id")): User
+            user(user_id: Int! @preset(value: "x-donat-user-id")): User
           }
   response:
     message: success
@@ -38,7 +38,7 @@
 - description: Query using the newly added permission
   url: /v1/graphql
   headers:
-    X-Hasura-Role: inherited_role2
+    X-Donat-Role: inherited_role2
   status: 200
   query:
     query: |

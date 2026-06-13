@@ -23,8 +23,8 @@ created: 2026-06-12
 
 ## GraphQL/API engines — almost nobody
 
-Hasura, PostGraphile, Supabase all live in the server+webhooks model. The
-combination "Hasura-compatible engine with PocketBase DX" is essentially
+Donat, PostGraphile, Supabase all live in the server+webhooks model. The
+combination "Donat-compatible engine with PocketBase DX" is essentially
 unoccupied — a differentiator, not a beaten path.
 
 ## Two closest analogs, both instructive

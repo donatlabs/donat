@@ -16,7 +16,7 @@ args:
     permission:
       columns: "*"
       filter:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
 
 - type: pg_create_insert_permission
   args:
@@ -24,9 +24,9 @@ args:
     role: author
     permission:
       check:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
       set:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
       columns:
         - first_name
         - last_name
@@ -46,7 +46,7 @@ args:
         - age
         - editor_id
       filter:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
       set:
         updated_at: "NOW()"
 
@@ -59,7 +59,7 @@ args:
         - phone
         - age
       filter:
-        editor_id: X-Hasura-Editor-Id
+        editor_id: X-Donat-Editor-Id
       set:
         updated_at: "NOW()"
 
@@ -84,7 +84,7 @@ args:
       columns: "*"
       allow_aggregations: true
       filter:
-        author_id: X-Hasura-Author-Id
+        author_id: X-Donat-Author-Id
 
 - type: pg_create_select_permission
   args:
@@ -93,7 +93,7 @@ args:
     permission:
       columns: "*"
       filter:
-        editor_id: X-Hasura-Editor-Id
+        editor_id: X-Donat-Editor-Id
 
 - type: pg_create_select_permission
   args:
@@ -126,7 +126,7 @@ args:
         - title
         - content
       filter:
-        editor_id: X-Hasura-Editor-Id
+        editor_id: X-Donat-Editor-Id
       set:
         updated_at: "NOW()"
 

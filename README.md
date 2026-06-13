@@ -1,24 +1,23 @@
-# dist-api
+# donat
 
-A GraphQL engine over Postgres, compatible with the Hasura v2 surface
-(metadata format, API shape). The conformance contract is enforced by a
-native Rust test harness (`crates/conformance`) executing Hasura-derived
-fixtures — no admin role by design: all data access goes through explicit
-role permissions. Rust workspace; see [PLAN.md](PLAN.md) for the
-architecture and milestones.
+A GraphQL engine over Postgres: a declarative v2 metadata format, a
+per-role GraphQL API, and one SQL statement per operation. The conformance
+contract is enforced by a native Rust test harness (`crates/conformance`)
+executing fixtures against a real Postgres — no admin role by design: all
+data access goes through explicit role permissions. Rust workspace; see
+[PLAN.md](PLAN.md) for the architecture and milestones.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `crates/metadata` | Hasura v2 metadata types + YAML directory loader (`!include`) |
+| `crates/metadata` | Donat v2 metadata types + YAML directory loader (`!include`) |
 | `crates/catalog` | Postgres introspection (pg_catalog) |
 | `crates/schema` | Per-role GraphQL schema generation |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement |
 | `crates/server` | axum HTTP server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate` subcommands. No runtime admin/`run_sql` API |
-| `crates/conformance` | Native conformance harness + Hasura-derived fixtures (Apache 2.0) |
-| `tests/hasura` | Legacy pytest harness (optional cross-check; superseded by `crates/conformance`, safe to delete) |
+| `crates/conformance` | Native conformance harness + fixtures (Apache 2.0; see `crates/conformance/fixtures/LICENSE.hasura`) |
 
 ## Quick start
 
@@ -35,13 +34,13 @@ Schema (DDL) and metadata are separate concerns and neither is mutated at
 runtime — the serving binary has no `run_sql` / metadata-mutation surface:
 
 ```sh
-dist-api migrate  --migrations-dir migrations   # versioned SQL (refinery), DDL only
-dist-api validate --metadata-dir metadata       # YAML metadata vs the migrated DB
-dist-api serve                                  # boots from the migrated DB + YAML metadata
+donat migrate  --migrations-dir migrations   # versioned SQL (refinery), DDL only
+donat validate --metadata-dir metadata       # YAML metadata vs the migrated DB
+donat serve                                  # boots from the migrated DB + YAML metadata
 ```
 
 DDL lives in `migrations/` (`V{n}__name.sql`). Metadata is desired-state
-YAML (Hasura v3 directory: `version.yaml`, `databases/`, `inherited_roles.yaml`,
+YAML (Donat v3 directory: `version.yaml`, `databases/`, `inherited_roles.yaml`,
 `query_collections.yaml`, `allow_list.yaml`, `remote_schemas.yaml`,
 `actions.yaml`) loaded at boot; `validate` fails the deploy if it is
 inconsistent with the schema.
@@ -56,10 +55,9 @@ release binaries for linux-x86_64 and macos-aarch64 as build artifacts.
 
 ## Roadmap
 
-Status of the Hasura v2 surface. Every "done" item is backed by a passing
+Status of the GraphQL surface. Every "done" item is backed by a passing
 module in the native conformance harness (`crates/conformance/tests/`, run
-with `make conformance`); [tests/hasura/COVERAGE.md](tests/hasura/COVERAGE.md)
-has the per-suite detail.
+with `make conformance`).
 
 ### Done
 
@@ -79,23 +77,23 @@ has the per-suite detail.
   protocol error frames, JWT token-expiry close.
 - **Auth** — JWT (complete, incl. JWK fetch with cache-control refresh),
   webhook auth hook (GET/POST, 401 → unauthorized-role fallback),
-  `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`, admin-secret as API-level auth only,
+  `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`, admin-secret as API-level auth only,
   trusted-header semantics.
 - **Inherited roles** — cell-level NULLing, guarded aggregates/computed
   fields, cycle detection with exact path.
 - **Allowlist / query collections** — `__typename`-insensitive matching.
 - **Introspection** — real per-role `__schema`/`__type`.
 - **Actions (synchronous)** — webhook handlers, custom type system
-  (input/output objects, scalars, enums), full output shaping + Hasura's
+  (input/output objects, scalars, enums), full output shaping + Donat's
   response-validation error messages, handler-error surfacing, handlers that
   call back into the engine, and output-object → tracked-table relationships
   (resolved under the calling role's permissions).
 - **Deploy** — `migrate` (refinery DDL), `validate` (metadata vs DB),
   boot-from-YAML; multi-source metadata; per-source pools/catalogs.
 - **Cron (scheduled) triggers** — recurring webhooks from YAML
-  (`cron_triggers`, Hasura shape): a `dist_api` catalog (created by
+  (`cron_triggers`, Donat shape): a `donat` catalog (created by
   `migrate`), a background delivery loop that materializes occurrences and
-  delivers with the Hasura scheduled-event envelope, `retry_conf`
+  delivers with the Donat scheduled-event envelope, `retry_conf`
   (retries/timeout/tolerance), and per-attempt invocation logs. Multi-pod
   safe with no leader election (`ON CONFLICT` materialization + `FOR UPDATE
   SKIP LOCKED` claim → at-least-once; handlers must be idempotent). Native
@@ -121,9 +119,9 @@ has the per-suite detail.
   introspection, response-header forwarding.
 - **Table event triggers** — webhooks on row insert/update/delete from YAML
   (`event_triggers` under a table). In-transaction capture via per-table
-  Postgres triggers writing `dist_api.event_log` (created by `migrate
+  Postgres triggers writing `donat.event_log` (created by `migrate
   --metadata-dir` reconcile; the serving binary never runs DDL), delivered by
-  the shared event loop with the Hasura event envelope and `retry_conf`.
+  the shared event loop with the Donat event envelope and `retry_conf`.
   Native coverage in `crates/conformance/tests/event_triggers.rs`
   (insert/update/delete payloads, retry→error). *Remaining:* session-variable
   capture, column-filtered payloads, manual/async events, transforms (see
@@ -134,7 +132,7 @@ has the per-suite detail.
 - **No admin role / no runtime admin API** — no `run_sql`, no metadata
   mutation over HTTP. Configuration is deploy-time only (`migrate` + YAML).
   This is a deliberate security posture, not a gap.
-- **One-off scheduled events** — Hasura creates these via a runtime
+- **One-off scheduled events** — Donat creates these via a runtime
   `create_scheduled_event` mutation, which contradicts the no-admin-API
   posture; out of scope unless declared as a deploy-time seed in YAML. (See
   `knowledgebase/embedded-sdk/decisions/006-cron-triggers-yaml-only.md`.)
@@ -143,5 +141,6 @@ has the per-suite detail.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-Conformance fixtures are derived from Hasura's tests-py suite (Apache 2.0,
-see `crates/conformance/fixtures/LICENSE.hasura`).
+Some conformance fixtures are derived from a third-party Apache-2.0 test
+suite; that upstream license and attribution are retained in
+`crates/conformance/fixtures/LICENSE.hasura`.

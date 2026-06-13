@@ -1,6 +1,6 @@
 # Petshop example
 
-A classic pet-store running on **dist-api** — a small catalogue of pets in
+A classic pet-store running on **donat** — a small catalogue of pets in
 categories, customers, and their orders — wired up with the permission set a
 normal store needs: a public catalogue, authenticated shoppers, and store
 staff. Every access goes through an explicit role permission — there is no
@@ -11,14 +11,14 @@ docker compose up
 ```
 
 All services use the same prebuilt public engine image
-(`ghcr.io/pantyukhov/dist-api`, published by the release workflow) and follow
+(`ghcr.io/donatlabs/donat`, published by the release workflow) and follow
 the project's deploy model:
 
-1. **`migrate`** — `dist-api migrate` applies the versioned DDL in
+1. **`migrate`** — `donat migrate` applies the versioned DDL in
    [`migrations/`](migrations) (one `V{n}__create_<table>.sql` per table) via
    refinery, tracked in `refinery_schema_history`. This is the only thing that
    runs DDL.
-2. **`validate`** — `dist-api validate` loads the [`metadata/`](metadata),
+2. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
    introspects the migrated database, and exits non-zero if anything tracked
    is missing, so a bad deploy fails before the server boots.
 3. **`engine`** — serves GraphQL at <http://localhost:8080/v1/graphql>. The
@@ -28,7 +28,7 @@ the project's deploy model:
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
-> `docker build -t ghcr.io/pantyukhov/dist-api:latest .`
+> `docker build -t ghcr.io/donatlabs/donat:latest .`
 > (The image needs the `migrate`/`validate` subcommands, so build from a
 > revision that includes them.)
 
@@ -38,7 +38,7 @@ the project's deploy model:
 |--------------|----------------------------------------------------|
 | `category`   | Catalogue sections (Dogs, Cats, …)                 |
 | `pet`        | Items for sale, with `status` available/pending/sold |
-| `customer`   | Shoppers; `id` is the `X-Hasura-User-Id` value     |
+| `customer`   | Shoppers; `id` is the `X-Donat-User-Id` value     |
 | `orders`     | A customer's order with a fulfilment `status`      |
 | `order_item` | Line items linking an order to pets                |
 
@@ -55,9 +55,9 @@ Relationships: `pet.category`, `category.pets`, `orders.customer`,
 
 There is **no admin role**: every request runs as one of the roles above,
 each scoped by its explicit permissions. `anonymous` is the
-`HASURA_GRAPHQL_UNAUTHORIZED_ROLE` — any request with no/role-less auth falls
+`DONAT_GRAPHQL_UNAUTHORIZED_ROLE` — any request with no/role-less auth falls
 back to it. The secret `petshop-secret` (see `docker-compose.yml`) marks a
-request as *trusted* so it may assert a role via the `X-Hasura-Role` header (a
+request as *trusted* so it may assert a role via the `X-Donat-Role` header (a
 demo stand-in for edge auth); a trusted request must still name a role. In
 production, issue JWTs instead of passing roles by hand.
 
@@ -81,9 +81,9 @@ curl -s localhost:8080/v1/graphql -H 'content-type: application/json' -d '{
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: customer' \
-  -H 'x-hasura-user-id: 1' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' \
+  -H 'x-donat-user-id: 1' \
   -d '{ "query": "{ customer { name email orders { id status items { quantity pet { name } } } } }" }'
 ```
 
@@ -96,9 +96,9 @@ shoppers cannot order on someone else's behalf):
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: customer' \
-  -H 'x-hasura-user-id: 1' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' \
+  -H 'x-donat-user-id: 1' \
   -d '{ "query": "mutation { insert_orders_one(object: {status: \"placed\"}) { id customer_id status } }" }'
 ```
 
@@ -110,16 +110,16 @@ order's fulfilment status:
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -H 'x-hasura-role: staff' \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: staff' \
   -d '{ "query": "mutation { update_orders(where: {id: {_eq: 1}}, _set: {status: \"shipped\"}) { affected_rows } }" }'
 ```
 
 > A request with **no** role — even with the secret — runs as `anonymous`
 > (the unauthorized-role fallback); there is no admin role or bypass. To read
-> across all customers, ask as `staff`. (If `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`
+> across all customers, ask as `staff`. (If `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
 > were unset, a trusted role-less request would instead be rejected with
-> `x-hasura-role header is required`.)
+> `x-donat-role header is required`.)
 
 ## Reset
 

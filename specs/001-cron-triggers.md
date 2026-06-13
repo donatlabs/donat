@@ -13,7 +13,7 @@ deploy-time configuration (YAML + `migrate`), no runtime mutation surface.
 
 ## 1. Metadata (`crates/metadata`)
 
-Hasura exports cron triggers to `cron_triggers.yaml` at the metadata root, a
+Donat exports cron triggers to `cron_triggers.yaml` at the metadata root, a
 top-level list. Add `cron_triggers: Vec<CronTrigger>` to `Metadata` and load
 it with the existing `load_section(dir, "cron_triggers.yaml")` helper.
 
@@ -39,12 +39,12 @@ Types:
   include_in_metadata (default true), retry_conf: Option<CronRetryConf>,
   headers: Vec<ActionHeader> (reused), comment: Option<String> }`
 - `CronRetryConf { num_retries=0, retry_interval_seconds=10,
-  timeout_seconds=60, tolerance_seconds=21600 }` — Hasura `RetryConfST`
+  timeout_seconds=60, tolerance_seconds=21600 }` — Donat `RetryConfST`
   field names and defaults (verified against the engine source).
 
-## 2. Catalog DDL (`migrations/V1__dist_api_cron.sql`)
+## 2. Catalog DDL (`migrations/V1__donat_cron.sql`)
 
-Schema `dist_api` (engine-internal catalog), plus:
+Schema `donat` (engine-internal catalog), plus:
 
 - `cron_events(id uuid pk, trigger_name text, scheduled_time timestamptz,
   status text default 'scheduled', tries int default 0,
@@ -68,7 +68,7 @@ of the database.
 ## 4. Delivery (`crates/server/src/cron.rs`, spawned from `main.rs`)
 
 A tokio task started after `sync_sources` (only when metadata has cron
-triggers). Poll interval from `DIST_API_CRON_POLL_SECONDS` (default 10; the
+triggers). Poll interval from `DONAT_CRON_POLL_SECONDS` (default 10; the
 conformance test sets it low for determinism).
 
 Each tick, against the default pool:
@@ -87,7 +87,7 @@ Each tick, against the default pool:
    num_retries` → `error`, else `next_retry_at = now() +
    retry_interval_seconds` (stays `scheduled`).
 
-Webhook body (Hasura `ScheduledEventWebhookPayload`, snake_case,
+Webhook body (Donat `ScheduledEventWebhookPayload`, snake_case,
 `omitNothingFields`; `created_at` omitted for cron):
 
 ```json
@@ -105,9 +105,9 @@ of truth (same pattern as `remote_schemas.rs` / actions).
 
 - A native cron webhook stub receiver (records received body + headers),
   modeled on `src/action_webhook.rs`.
-- Harness `Builder::with_migrations()` runs `dist-api migrate
+- Harness `Builder::with_migrations()` runs `donat migrate
   --migrations-dir <workspace>/migrations` against the suite DB before the
-  engine spawns, so `dist_api.*` exists.
+  engine spawns, so `donat.*` exists.
 - `tests/cron_triggers.rs`:
   - fires a past-due event → stub receives the exact envelope + header;
     `cron_events` row → `delivered`; an invocation log row exists.

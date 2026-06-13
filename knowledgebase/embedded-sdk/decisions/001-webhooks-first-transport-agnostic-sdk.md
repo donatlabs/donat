@@ -12,7 +12,7 @@ features:
 ## Context
 
 Event triggers (PG triggers → event journal → delivery with retries) are
-required for Hasura v2 conformance against tests-py regardless of the
+required for Donat v2 conformance against tests-py regardless of the
 embedded-SDK idea. The embedded idea wants the same events delivered to
 native host-language functions instead of webhooks.
 

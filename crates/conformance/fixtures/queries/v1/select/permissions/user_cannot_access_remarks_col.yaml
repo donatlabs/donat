@@ -6,8 +6,8 @@
     path: '$.args.columns[2]' 
     code: permission-denied
   headers:
-    X-Hasura-Role: user
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: user
+    X-Donat-User-Id: '1'
   query:
     type: select
     args:

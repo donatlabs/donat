@@ -1,6 +1,6 @@
 # Ported from tests-py, with the final `get_user_by_email_nested_transformed`
 # step dropped (response (Kriti) transforms are out of scope — see
-# tests/hasura/COVERAGE.md). The remaining steps need no output relationship:
+# tests/donat/COVERAGE.md). The remaining steps need no output relationship:
 # user_id/address/addresses are plain custom objects shaped from the webhook.
 - description: Run get_user_by_email_nested query action with valid email, the response should be an object
   url: /v1/graphql

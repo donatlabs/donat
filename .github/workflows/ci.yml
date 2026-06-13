@@ -36,9 +36,9 @@ jobs:
       - name: Build engine
         run: cargo build --workspace --bins
       - name: Unit and snapshot tests
-        run: cargo test --workspace --exclude dist-conformance
+        run: cargo test --workspace --exclude donat-conformance
       - name: Conformance suite
-        run: cargo test -p dist-conformance
+        run: cargo test -p donat-conformance
         env:
           RUST_BACKTRACE: "1"
 
@@ -67,10 +67,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release --bin dist-api
+        run: cargo build --release --bin donat
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist-api-${{ matrix.target.name }}
-          path: target/release/dist-api
+          name: donat-${{ matrix.target.name }}
+          path: target/release/donat
           if-no-files-found: error

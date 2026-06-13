@@ -4,7 +4,7 @@ status: 200
 query:
   query: |
     mutation {
-      create_users(users: [{email: "blake@hasura.io", name: "Blake"}, {email: "elsa@hasura.io", name: "Elsa"}]){
+      create_users(users: [{email: "blake@donat.io", name: "Blake"}, {email: "elsa@donat.io", name: "Elsa"}]){
         id
         __typename
         user {
@@ -24,12 +24,12 @@ response:
       user:
         __typename: user
         name: Blake
-        email: blake@hasura.io
+        email: blake@donat.io
         is_admin: false
     - id: 2
       __typename: UserId
       user:
         __typename: user
         name: Elsa
-        email: elsa@hasura.io
+        email: elsa@donat.io
         is_admin: false

@@ -1,4 +1,4 @@
-//! Loader for the Hasura v2 metadata *directory* format (version 3):
+//! Loader for the Donat v2 metadata *directory* format (version 3):
 //!
 //! ```text
 //! metadata/
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! `!include` paths are resolved relative to the directory of the file that
-//! contains them, matching hasura-cli behaviour.
+//! contains them, matching donat-cli behaviour.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -64,10 +64,10 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
 
     // Actions and their custom type system live together in `actions.yaml`,
     // which has two top-level keys: `actions:` (a list) and `custom_types:`
-    // (a mapping). Both are optional. This mirrors the hasura-cli export.
+    // (a mapping). Both are optional. This mirrors the donat-cli export.
     let (actions, custom_types) = load_actions(dir)?;
 
-    // Optional top-level sections, in the Hasura v3 export layout. Each file
+    // Optional top-level sections, in the Donat v3 export layout. Each file
     // is a list (with `!include` allowed); absent files mean "none". This is
     // what lets the whole metadata surface boot from the filesystem with no
     // runtime admin/metadata API.
@@ -167,7 +167,7 @@ fn resolve_includes(
     seen: &mut HashSet<PathBuf>,
 ) -> Result<Value, LoadError> {
     match value {
-        // hasura-cli writes includes as plain quoted strings: "!include foo.yaml"
+        // donat-cli writes includes as plain quoted strings: "!include foo.yaml"
         Value::String(s) if s.starts_with("!include ") => {
             let rel = s["!include ".len()..].trim();
             load_yaml_tracked(&base.join(rel), seen)

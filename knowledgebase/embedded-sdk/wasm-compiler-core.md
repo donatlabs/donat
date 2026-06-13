@@ -38,7 +38,7 @@ the JSON response inside Postgres**. So the host execution layer is thin —
 - **Host SDK per language** (Go: net/http + pgx; Node: fastify + pg): HTTP/WS
   with the user's own middleware/auth/metrics; JWT → session vars; PG pool;
   plan execution `begin → pre-hooks → exec → post-hooks → commit`; wrap the
-  Postgres-produced JSON into `{"data": ...}`; map errors to Hasura shapes.
+  Postgres-produced JSON into `{"data": ...}`; map errors to Donat shapes.
 - **Hooks are plain native functions** — the host owns the execution loop, so
   every FFI problem (trampolines, ownership, panic barriers, two schedulers)
   vanishes by construction.
@@ -78,7 +78,7 @@ HTTP → host router → session vars
    session vars as statement parameters, not literals. sqlgen already
    parameterizes — verify session vars specifically.
 3. **Error mapping is part of the plan contract**: the core emits rules
-   (constraint name → Hasura error shape, check_violation handling), the
+   (constraint name → Donat error shape, check_violation handling), the
    host applies them — so per-language layers can't drift on error formats.
 
 ## Honest costs

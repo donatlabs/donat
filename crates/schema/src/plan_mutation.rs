@@ -3,8 +3,8 @@
 //! everywhere, there is no admin bypass: the mutation root only exists for
 //! a role that has the corresponding permission.
 
-use dist_ir::*;
-use dist_metadata::Columns;
+use donat_ir::*;
+use donat_metadata::Columns;
 use graphql_parser::query::{Field as GqlField, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -15,15 +15,15 @@ use crate::plan::{
 
 impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
-    /// backend_only)? Hasura reports "no mutations exist" when not.
+    /// backend_only)? Donat reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
         // mutation_root ("no mutations exist").
-        let insert_usable = |list: &[dist_metadata::PermissionEntry<
-            dist_metadata::InsertPermission,
+        let insert_usable = |list: &[donat_metadata::PermissionEntry<
+            donat_metadata::InsertPermission,
         >]| {
-            let usable = |p: &dist_metadata::PermissionEntry<dist_metadata::InsertPermission>| {
+            let usable = |p: &donat_metadata::PermissionEntry<donat_metadata::InsertPermission>| {
                 !p.permission.backend_only || session.backend_request
             };
             list.iter().any(|p| p.role == session.role && usable(p))
@@ -58,7 +58,7 @@ impl<'a> Planner<'a> {
             }
             let path = format!("$.selectionSet.{}", field.name);
             let not_found = || {
-                // Hasura reports an empty mutation_root differently.
+                // Donat reports an empty mutation_root differently.
                 if !self.role_has_any_mutation(session) {
                     PlanError::validation("$", "no mutations exist")
                 } else {
@@ -211,7 +211,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",
@@ -341,7 +341,7 @@ impl<'a> Planner<'a> {
                     let Some(info) = ctx.info.column(col) else { continue };
                     let resolved = match value {
                         Json::String(s)
-                            if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") =>
+                            if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
                         {
                             let v = session.var(s).ok_or_else(|| {
                                 PlanError::new(
@@ -479,7 +479,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",
@@ -649,7 +649,7 @@ impl<'a> Planner<'a> {
 
         // Returning rows requires the role to have a select permission.
         let select_ctx = self.relationship_ctx(
-            &dist_metadata::QualifiedTable::Qualified {
+            &donat_metadata::QualifiedTable::Qualified {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
             },

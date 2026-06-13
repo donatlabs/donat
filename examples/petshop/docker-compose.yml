@@ -1,11 +1,11 @@
-# Classic petshop example for dist-api.
+# Classic petshop example for donat.
 #
 #   docker compose up
 #
 # Uses the project's deploy model: schema is migrated out-of-band by a
-# one-shot `dist-api migrate`, the metadata is checked against the migrated
-# database by `dist-api validate`, and only then does the engine serve. All
-# three use the same prebuilt public image (ghcr.io/pantyukhov/dist-api,
+# one-shot `donat migrate`, the metadata is checked against the migrated
+# database by `donat validate`, and only then does the engine serve. All
+# three use the same prebuilt public image (ghcr.io/donatlabs/donat,
 # pushed by .github/workflows/release.yml on each release tag) — no local
 # build. The engine itself never runs DDL.
 #
@@ -35,26 +35,26 @@ services:
 
   # One-shot: apply versioned V{n}__*.sql migrations, then exit.
   migrate:
-    image: ghcr.io/pantyukhov/dist-api:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["migrate", "--migrations-dir", "/migrations"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ./migrations:/migrations:ro
     restart: "no"
 
   # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
   validate:
-    image: ghcr.io/pantyukhov/dist-api:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["validate", "--metadata-dir", "/metadata"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ./metadata:/metadata:ro
     restart: "no"
@@ -62,21 +62,21 @@ services:
   engine:
     # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
     #   ENGINE_TAG=v1.2.3 docker compose up
-    image: ghcr.io/pantyukhov/dist-api:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     depends_on:
       validate:
         condition: service_completed_successfully
     environment:
-      HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
-      DIST_API_METADATA_DIR: /metadata
-      DIST_API_PORT: "8080"
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      DONAT_METADATA_DIR: /metadata
+      DONAT_PORT: "8080"
       # The secret marks a request as trusted: it may then assert any role
-      # via the X-Hasura-Role header (a demo stand-in for real edge auth /
+      # via the X-Donat-Role header (a demo stand-in for real edge auth /
       # JWTs). There is no admin role — a trusted request must still name a
       # role. Change the secret for anything real.
-      HASURA_GRAPHQL_ADMIN_SECRET: petshop-secret
+      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
       # Requests with no/role-less auth fall back to the public catalog role.
-      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
     volumes:
       - ./metadata:/metadata:ro
     ports:

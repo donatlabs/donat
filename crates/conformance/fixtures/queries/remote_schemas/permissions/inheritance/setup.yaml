@@ -19,7 +19,7 @@ args:
     permission:
       columns: "*"
       filter:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
 
 - type: add_remote_schema_permissions
   args:
@@ -63,7 +63,7 @@ args:
        type Query {
          hello: String
          messages(where: MessageWhereInpObj @preset(value: {id: {eq: 1}})): [Message]
-         user(user_id: Int! @preset(value: "x-hasura-user-id")): User
+         user(user_id: Int! @preset(value: "x-donat-user-id")): User
          users(user_ids: [Int]!): [User]
          message(id: Int!) : Message
          communications(id: Int): [Communication]
@@ -122,7 +122,7 @@ args:
          messages(where: MessageWhereInpObj @preset(value: {id: {eq: 1}})): [Message]
          users(user_ids: [Int]!): [User]
          message(id: Int!) : Message
-         user(user_id: Int! @preset(value: "x-hasura-user-id")): User
+         user(user_id: Int! @preset(value: "x-donat-user-id")): User
          communications(id: Int): [Communication]
          hello: String
        }

@@ -13,7 +13,7 @@ use graphql_parser::query::{
 use graphql_parser::schema::{Definition as SDef, Document as SDoc, Type, TypeDefinition};
 use serde_json::{Value as Json, json};
 
-use dist_schema::Session;
+use donat_schema::Session;
 
 use crate::state::AppState;
 
@@ -34,7 +34,7 @@ pub struct RemoteTarget {
 /// against the role's SDL and return the forwarding target. `None` means
 /// "not a remote operation".
 pub fn match_remote<'m>(
-    metadata: &'m dist_metadata::Metadata,
+    metadata: &'m donat_metadata::Metadata,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -45,7 +45,7 @@ pub fn match_remote<'m>(
 /// `internal` requests (remote-relationship joins) may set arguments that
 /// carry @preset (they are server-built, not client input).
 pub fn match_remote_with<'m>(
-    metadata: &'m dist_metadata::Metadata,
+    metadata: &'m donat_metadata::Metadata,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -151,7 +151,7 @@ pub fn match_remote_with<'m>(
         if !all_match {
             continue;
         }
-        // Deep validation with exact Hasura-style errors. Under customization,
+        // Deep validation with exact Donat-style errors. Under customization,
         // errors are reported with the client-facing names and the namespaced
         // path, so build the base path from the namespace + customized name.
         let customizer = customization.map(|c| Customizer { c });
@@ -215,7 +215,7 @@ pub fn match_remote_with<'m>(
     None
 }
 
-/// Hasura resolves {{ENV_VAR}} templates in remote urls itself.
+/// Donat resolves {{ENV_VAR}} templates in remote urls itself.
 pub fn resolve_url_template(raw_url: &str) -> String {
     // Substitute every {{ENV_VAR}}. Anchoring the closing `}}` search AFTER
     // each `{{` avoids the start>end slice panic when `}}` precedes `{{`, and
@@ -293,10 +293,10 @@ fn field_on_type<'d>(
 
 /// Maps upstream names back to the client-facing customized spelling for error
 /// reporting against a customized remote schema. Validation runs on the
-/// decustomized query (upstream names), but Hasura reports errors using the
+/// decustomized query (upstream names), but Donat reports errors using the
 /// customized type/field names and the namespaced path.
 struct Customizer<'a> {
-    c: &'a dist_metadata::RemoteSchemaCustomization,
+    c: &'a donat_metadata::RemoteSchemaCustomization,
 }
 
 impl Customizer<'_> {
@@ -391,7 +391,7 @@ fn validate_field(
 /// does not fit the customization (e.g. missing namespace root).
 fn decustomize(
     doc: &QDoc<'static, String>,
-    c: &dist_metadata::RemoteSchemaCustomization,
+    c: &donat_metadata::RemoteSchemaCustomization,
 ) -> Option<(QDoc<'static, String>, Option<String>)> {
     let mut doc = doc.clone();
 
@@ -626,7 +626,7 @@ fn apply_presets(
                 };
                 let value = match raw {
                     graphql_parser::schema::Value::String(s)
-                        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") =>
+                        if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
                     {
                         let Some(found) = session.var(s) else {
                             return Err(crate::gql::GqlError {
@@ -757,7 +757,7 @@ pub async fn forward(
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-hasura-") || name == "authorization" || name == "cookie" {
+            if name.starts_with("x-donat-") || name == "authorization" || name == "cookie" {
                 if let Ok(value) = value.to_str() {
                     request = request.header(name, value);
                 }
@@ -812,7 +812,7 @@ mod tests {
 
     const PRESET_SDL: &str = r#"
         type Query {
-            user(id: Int! @preset(value: "x-hasura-user-id")): User
+            user(id: Int! @preset(value: "x-donat-user-id")): User
             items(limit: Int @preset(value: 5)): String
             search(where: Filter): String
         }
@@ -826,13 +826,13 @@ mod tests {
     #[test]
     fn url_template_passthrough_and_substitution() {
         assert_eq!(resolve_url_template("http://x/v1"), "http://x/v1");
-        unsafe { std::env::set_var("DIST_API_TEST_REMOTE_URL", "http://remote:4000") };
+        unsafe { std::env::set_var("DONAT_TEST_REMOTE_URL", "http://remote:4000") };
         assert_eq!(
-            resolve_url_template("{{DIST_API_TEST_REMOTE_URL}}/graphql"),
+            resolve_url_template("{{DONAT_TEST_REMOTE_URL}}/graphql"),
             "http://remote:4000/graphql"
         );
         // Unset variables substitute as empty.
-        assert_eq!(resolve_url_template("{{DIST_API_TEST_UNSET_VAR}}/graphql"), "/graphql");
+        assert_eq!(resolve_url_template("{{DONAT_TEST_UNSET_VAR}}/graphql"), "/graphql");
     }
 
     #[test]
@@ -843,11 +843,11 @@ mod tests {
         assert_eq!(resolve_url_template("http://x/{{NOPE"), "http://x/{{NOPE");
         // Every occurrence is substituted, not just the first.
         unsafe {
-            std::env::set_var("DIST_API_T_A", "A");
-            std::env::set_var("DIST_API_T_B", "B");
+            std::env::set_var("DONAT_T_A", "A");
+            std::env::set_var("DONAT_T_B", "B");
         }
         assert_eq!(
-            resolve_url_template("{{DIST_API_T_A}}-{{DIST_API_T_B}}"),
+            resolve_url_template("{{DONAT_T_A}}-{{DONAT_T_B}}"),
             "A-B"
         );
     }
@@ -858,7 +858,7 @@ mod tests {
         let types = type_map(&sdl);
         let mut doc = parse_op("{ user { name } items }");
         let mut vars = serde_json::Map::new();
-        let session = session(&[("x-hasura-user-id", "42")]);
+        let session = session(&[("x-donat-user-id", "42")]);
         let changed = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap();
         assert!(changed);
         let rendered = format!("{doc}");
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(e.code, "not-found");
         assert_eq!(
             e.message,
-            "\"x-hasura-user-id\" session variable expected, but not found"
+            "\"x-donat-user-id\" session variable expected, but not found"
         );
     }
 
@@ -886,7 +886,7 @@ mod tests {
         let types = type_map(&sdl);
         let mut doc = parse_op("{ user { name } }");
         let mut vars = serde_json::Map::new();
-        let session = session(&[("x-hasura-user-id", "x")]);
+        let session = session(&[("x-donat-user-id", "x")]);
         let e = apply_presets(&mut doc, &types, "Query", &session, &mut vars).unwrap_err();
         assert_eq!(e.code, "coercion-error");
         assert_eq!(e.message, "\"x\" cannot be coerced into an Int value");
@@ -907,13 +907,13 @@ mod tests {
 
     #[test]
     fn decustomize_unwraps_namespace_and_strips_prefixes() {
-        let c = dist_metadata::RemoteSchemaCustomization {
+        let c = donat_metadata::RemoteSchemaCustomization {
             root_fields_namespace: Some("my_remote".to_string()),
-            type_names: Some(dist_metadata::NameCustomization {
+            type_names: Some(donat_metadata::NameCustomization {
                 prefix: Some("Pre".to_string()),
                 suffix: None,
             }),
-            field_names: vec![dist_metadata::FieldNameCustomization {
+            field_names: vec![donat_metadata::FieldNameCustomization {
                 parent_type: "Query".to_string(),
                 prefix: Some("foo_".to_string()),
                 suffix: None,
@@ -934,9 +934,9 @@ mod tests {
 
     #[test]
     fn customizer_reapplies_type_prefix_for_error_names() {
-        let c = dist_metadata::RemoteSchemaCustomization {
+        let c = donat_metadata::RemoteSchemaCustomization {
             root_fields_namespace: Some("my_remote_schema".to_string()),
-            type_names: Some(dist_metadata::NameCustomization {
+            type_names: Some(donat_metadata::NameCustomization {
                 prefix: Some("Foo".to_string()),
                 suffix: None,
             }),

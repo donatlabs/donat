@@ -10,7 +10,7 @@
 //! the "admin" steps with no role — out of scope here (no admin role), so the
 //! ported fixtures keep only the role-scoped steps.
 
-use dist_conformance::{Running, Suite, Transport};
+use donat_conformance::{Running, Suite, Transport};
 use serde_json::json;
 
 const PERMS: &str = "queries/remote_schemas/permissions";

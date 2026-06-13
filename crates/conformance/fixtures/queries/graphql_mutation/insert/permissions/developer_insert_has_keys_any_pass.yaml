@@ -10,8 +10,8 @@ response:
         spec:
           processor: AMD
 headers:
-  X-Hasura-Role: developer
-  X-Hasura-Spec-Keys: |-
+  X-Donat-Role: developer
+  X-Donat-Spec-Keys: |-
     {processor,display,memory,warranty}
 query:
   variables:

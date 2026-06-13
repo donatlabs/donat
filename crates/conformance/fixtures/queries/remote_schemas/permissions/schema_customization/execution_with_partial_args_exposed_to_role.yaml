@@ -1,10 +1,10 @@
 # Ported from tests-py; the final admin (no-role) re-run step is trimmed
-# (no admin role). See tests/hasura/COVERAGE.md.
+# (no admin role). See tests/donat/COVERAGE.md.
 - description: query the remote schema with only args and fields that have been exposed to the role 'user'
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
+    X-Donat-Role: user
   query:
     query: |
       {
@@ -28,7 +28,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: user
+    X-Donat-Role: user
   query:
     query: |
       {

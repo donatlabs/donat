@@ -17,7 +17,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-# preserve_order: Hasura's tests assert response key order matches the
+# preserve_order: Donat's tests assert response key order matches the
 # GraphQL selection set, so Value must keep insertion order.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"

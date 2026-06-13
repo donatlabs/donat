@@ -1,6 +1,6 @@
 # Attack-coverage suite: row/column/table-level access control and SQL
 # injection. A multi-tenant schema where a row's `owner` must equal the
-# caller's X-Hasura-User-Id. There is NO admin role in this engine, so every
+# caller's X-Donat-User-Id. There is NO admin role in this engine, so every
 # request below runs as the `user` role scoped strictly by these permissions.
 #
 # account.secret_pin is column-level hidden from `user`; the audit_log table is
@@ -13,7 +13,7 @@ args:
       sql: |
         CREATE TABLE account (
           id         serial PRIMARY KEY,
-          owner      text NOT NULL,        -- = X-Hasura-User-Id
+          owner      text NOT NULL,        -- = X-Donat-User-Id
           label      text NOT NULL,
           balance    integer NOT NULL DEFAULT 0,
           secret_pin text                  -- hidden from the user select perm
@@ -73,7 +73,7 @@ args:
         columns: [id, owner, label, balance]
         filter:
           owner:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
         allow_aggregations: true
   - type: create_insert_permission
     args:
@@ -84,9 +84,9 @@ args:
         columns: [label, balance]
         check:
           owner:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
         set:
-          owner: X-Hasura-User-Id
+          owner: X-Donat-User-Id
   - type: create_update_permission
     args:
       table: account
@@ -95,10 +95,10 @@ args:
         columns: [label, balance]
         filter:
           owner:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
         check:
           owner:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
   - type: create_delete_permission
     args:
       table: account
@@ -106,7 +106,7 @@ args:
       permission:
         filter:
           owner:
-            _eq: X-Hasura-User-Id
+            _eq: X-Donat-User-Id
 
   # memo: reachable only via an account the caller owns (relationship filter)
   - type: create_select_permission
@@ -118,7 +118,7 @@ args:
         filter:
           account:
             owner:
-              _eq: X-Hasura-User-Id
+              _eq: X-Donat-User-Id
   - type: create_insert_permission
     args:
       table: memo
@@ -128,7 +128,7 @@ args:
         check:
           account:
             owner:
-              _eq: X-Hasura-User-Id
+              _eq: X-Donat-User-Id
 
   # audit_log is visible only to `manager`, never to `user`
   - type: create_select_permission

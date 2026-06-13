@@ -2,11 +2,11 @@
     Only the `author` role has insert permissions on the
     authors table, so the permission of the inherited role
     should be the same as that of the author role, the author
-    role expects the `x-hasura-author-id` session variable to
+    role expects the `x-donat-author-id` session variable to
     be present which we don't provide in this test
   url: /v1/graphql
   headers:
-    X-Hasura-Role: author_editor
+    X-Donat-Role: author_editor
   status: 200
   query:
     query: |
@@ -26,12 +26,12 @@
     - extensions:
         path: $
         code: not-found
-      message: 'missing session variable: "x-hasura-author-id"'
+      message: 'missing session variable: "x-donat-author-id"'
 
 - url: /v1/graphql
   headers:
-    X-Hasura-Role: author_editor
-    X-Hasura-Author-Id: '4'
+    X-Donat-Role: author_editor
+    X-Donat-Author-Id: '4'
   query:
     query: |
       mutation {

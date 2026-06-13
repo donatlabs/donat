@@ -2,8 +2,8 @@
 //! reach: mutation check-expression wrapping, inherited-role cell guards,
 //! DEFAULT/on_conflict rendering, stringify-numerics, and quoting rules.
 
-use dist_ir::*;
-use dist_sqlgen::{mutation_to_sql, operation_to_sql, operation_to_sql_opts, quote_ident, quote_lit};
+use donat_ir::*;
+use donat_sqlgen::{mutation_to_sql, operation_to_sql, operation_to_sql_opts, quote_ident, quote_lit};
 use serde_json::json;
 
 fn table(schema: &str, name: &str) -> Table {
@@ -122,9 +122,9 @@ fn insert_check_expression_wraps_check_violation() {
         }]),
     };
     let sql = mutation_to_sql(&MutationRoot::Insert { alias: "insert_author".into(), insert });
-    // The check is enforced in-statement via dist_api.check_violation,
+    // The check is enforced in-statement via donat.check_violation,
     // whose payload carries the GraphQL error path.
-    assert!(sql.contains("dist_api.check_violation"), "missing check wrap in: {sql}");
+    assert!(sql.contains("donat.check_violation"), "missing check wrap in: {sql}");
     assert!(
         sql.contains("$.selectionSet.insert_author.args.objects"),
         "check payload must carry the error path: {sql}"
@@ -153,7 +153,7 @@ fn update_check_expression_wraps_check_violation() {
         }]),
     };
     let sql = mutation_to_sql(&MutationRoot::Update { alias: "update_author".into(), update });
-    assert!(sql.contains("dist_api.check_violation"), "missing check wrap in: {sql}");
+    assert!(sql.contains("donat.check_violation"), "missing check wrap in: {sql}");
     insta::assert_snapshot!(sql);
 }
 

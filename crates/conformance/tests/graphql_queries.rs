@@ -1,7 +1,7 @@
 //! Ported from tests-py test_graphql_queries.py (role-based suites only;
 //! admin/no-role tests are out of scope per the no-admin-role design rule).
 
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 const PERMS: &str = "queries/graphql_query/permissions";
 

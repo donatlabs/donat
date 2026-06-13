@@ -54,7 +54,7 @@ args:
         - yearly_salary
       filter:
         id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id
 
 - type: pg_create_select_permission
   args:
@@ -67,7 +67,7 @@ args:
         - manager_remarks
       filter:
         manager_id:
-          _eq: X-Hasura-Manager-Id
+          _eq: X-Donat-Manager-Id
       allow_aggregations: true
 
 - type: pg_create_select_permission
@@ -78,7 +78,7 @@ args:
       columns: '*'
       allow_aggregations: true
       filter:
-        id: X-Hasura-Manager-Id
+        id: X-Donat-Manager-Id
 
 - type: pg_create_select_permission
   args:
@@ -92,7 +92,7 @@ args:
       filter:
         employees:
           manager_id:
-            _eq: X-Hasura-Manager-Id
+            _eq: X-Donat-Manager-Id
 
 - type: add_inherited_role
   args:
@@ -120,7 +120,7 @@ args:
         - followers
       allow_aggregations: false
       filter:
-        id: X-Hasura-Author-Id
+        id: X-Donat-Author-Id
 
 - type: pg_create_select_permission
   args:
@@ -154,7 +154,7 @@ args:
       columns: "*"
       allow_aggregations: true
       filter:
-        author_id: X-Hasura-Author-Id
+        author_id: X-Donat-Author-Id
 
 - type: pg_create_select_permission
   args:

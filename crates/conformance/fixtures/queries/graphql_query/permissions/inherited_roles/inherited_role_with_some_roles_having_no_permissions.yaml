@@ -5,9 +5,9 @@ description: |
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: author_editor_guest_inherited_role
-  X-Hasura-Author-Id: '1'
-  X-Hasura-Editor-Id: '1'
+  X-Donat-Role: author_editor_guest_inherited_role
+  X-Donat-Author-Id: '1'
+  X-Donat-Editor-Id: '1'
 query:
   query: |
     query {

@@ -1,17 +1,17 @@
 [package]
-name = "dist-sqlgen"
+name = "donat-sqlgen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "IR -> single Postgres SQL query producing the JSON response shape"
 
 [dependencies]
-dist-ir = { path = "../ir" }
+donat-ir = { path = "../ir" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-dist-metadata = { path = "../metadata" }
-dist-catalog = { path = "../catalog" }
-dist-schema = { path = "../schema" }
+donat-metadata = { path = "../metadata" }
+donat-catalog = { path = "../catalog" }
+donat-schema = { path = "../schema" }
 graphql-parser = { workspace = true }
 insta = { workspace = true }

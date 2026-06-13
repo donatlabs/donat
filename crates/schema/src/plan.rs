@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use dist_catalog::{Catalog, TableInfo};
-use dist_ir::*;
-use dist_metadata::{
+use donat_catalog::{Catalog, TableInfo};
+use donat_ir::*;
+use donat_metadata::{
     Columns, Metadata, QualifiedTable, SelectPermission, TableEntry,
 };
 use graphql_parser::query::{
@@ -15,14 +15,14 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::naming::{root_names, table_base_name};
 
-/// Per-request session: an explicit role + X-Hasura-* variables (keys
+/// Per-request session: an explicit role + X-Donat-* variables (keys
 /// lower-cased). There is no admin role — every access goes through an
 /// explicit per-role permission.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub role: String,
     pub vars: HashMap<String, String>,
-    /// True when x-hasura-use-backend-only-permissions enables
+    /// True when x-donat-use-backend-only-permissions enables
     /// backend_only mutation permissions for this request.
     pub backend_request: bool,
 }
@@ -54,7 +54,7 @@ impl PlanError {
         Self::new(path, "validation-failed", message)
     }
 
-    /// Hasura v2 GraphQL error body.
+    /// Donat v2 GraphQL error body.
     pub fn to_graphql(&self) -> Json {
         serde_json::json!({
             "errors": [{
@@ -168,7 +168,7 @@ impl<'a> TableCtx<'a> {
     }
 
     /// Whether the role may select at least one column. Roles with
-    /// `columns: []` still aggregate via count, but Hasura omits
+    /// `columns: []` still aggregate via count, but Donat omits
     /// column-typed arguments (e.g. `count(columns:)`) from their schema.
     pub(crate) fn any_column_allowed(&self) -> bool {
         self.info
@@ -185,22 +185,22 @@ impl<'a> TableCtx<'a> {
         }
     }
 
-    pub(crate) fn column_info(&self, name: &str) -> Option<&'a dist_catalog::ColumnInfo> {
+    pub(crate) fn column_info(&self, name: &str) -> Option<&'a donat_catalog::ColumnInfo> {
         self.info.column(name)
     }
 }
 
 pub struct Planner<'a> {
-    /// When false (HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
+    /// When false (DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
     /// tracked functions need an explicit per-role permission entry.
     pub infer_function_permissions: bool,
     /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
     pub relay: bool,
-    inherited_roles: &'a [dist_metadata::InheritedRole],
-    remote_schemas: &'a [dist_metadata::RemoteSchema],
+    inherited_roles: &'a [donat_metadata::InheritedRole],
+    remote_schemas: &'a [donat_metadata::RemoteSchema],
     catalog: &'a Catalog,
     tables: &'a [TableEntry],
-    functions: &'a [dist_metadata::FunctionEntry],
+    functions: &'a [donat_metadata::FunctionEntry],
     /// "schema.name" -> index into `tables`.
     by_table: HashMap<String, usize>,
     /// root field name -> (kind, source).
@@ -213,7 +213,7 @@ pub struct Planner<'a> {
 
 impl<'a> Planner<'a> {
     pub fn new(metadata: &'a Metadata, catalog: &'a Catalog) -> Self {
-        let (tables, functions): (&[TableEntry], &[dist_metadata::FunctionEntry]) = metadata
+        let (tables, functions): (&[TableEntry], &[donat_metadata::FunctionEntry]) = metadata
             .sources
             .first()
             .map(|s| (s.tables.as_slice(), s.functions.as_slice()))
@@ -356,7 +356,7 @@ impl<'a> Planner<'a> {
     /// parents conflict simply contributes nothing.
     pub(crate) fn resolve_role_perm<'x, T: serde::Serialize>(
         &self,
-        list: &'x [dist_metadata::PermissionEntry<T>],
+        list: &'x [donat_metadata::PermissionEntry<T>],
         role: &str,
         applies: impl Fn(&T) -> bool,
     ) -> Option<&'x T> {
@@ -366,7 +366,7 @@ impl<'a> Planner<'a> {
 
     fn resolve_role_perm_rec<'x, T: serde::Serialize>(
         &self,
-        list: &'x [dist_metadata::PermissionEntry<T>],
+        list: &'x [donat_metadata::PermissionEntry<T>],
         role: &str,
         applies: &impl Fn(&T) -> bool,
         visiting: &mut std::collections::HashSet<String>,
@@ -404,7 +404,7 @@ impl<'a> Planner<'a> {
 
     /// Is the function permitted for the role (directly or via any
     /// inherited ancestor)? Always true when permissions are inferred.
-    fn function_allowed(&self, fentry: &dist_metadata::FunctionEntry, role: &str) -> bool {
+    fn function_allowed(&self, fentry: &donat_metadata::FunctionEntry, role: &str) -> bool {
         if self.infer_function_permissions {
             return true;
         }
@@ -479,7 +479,7 @@ impl<'a> Planner<'a> {
 
     fn conflicts_in<T: serde::Serialize>(
         &self,
-        list: &[dist_metadata::PermissionEntry<T>],
+        list: &[donat_metadata::PermissionEntry<T>],
         role: &str,
     ) -> bool {
         if list.iter().any(|p| p.role == role) {
@@ -510,7 +510,7 @@ impl<'a> Planner<'a> {
     /// mutation root non-empty.)
     pub(crate) fn any_role_perm<T>(
         &self,
-        list: &[dist_metadata::PermissionEntry<T>],
+        list: &[donat_metadata::PermissionEntry<T>],
         role: &str,
     ) -> bool {
         if list.iter().any(|p| p.role == role) {
@@ -604,8 +604,8 @@ impl<'a> Planner<'a> {
     /// row, the session json, and any extra user-provided `args`.
     pub(crate) fn computed_field_args(
         &self,
-        finfo: &dist_catalog::FunctionInfo,
-        def: &dist_metadata::ComputedFieldDefinition,
+        finfo: &donat_catalog::FunctionInfo,
+        def: &donat_metadata::ComputedFieldDefinition,
         session: &Session,
         user_args: Option<&JsonMap<String, Json>>,
         path: &str,
@@ -660,7 +660,7 @@ impl<'a> Planner<'a> {
         &self,
         schema: &str,
         name: &str,
-    ) -> Option<&'a dist_catalog::FunctionInfo> {
+    ) -> Option<&'a donat_catalog::FunctionInfo> {
         self.catalog.function(schema, name)
     }
 
@@ -773,7 +773,7 @@ impl<'a> Planner<'a> {
                     let Some(ctx) = self.table_ctx(idx, &session.role) else {
                         return Err(not_found());
                     };
-                    // Hasura omits <table>_by_pk from the role's schema unless
+                    // Donat omits <table>_by_pk from the role's schema unless
                     // the role may select every primary-key column.
                     if kind == RootKind::ByPk
                         && (ctx.info.primary_key.is_empty()
@@ -870,8 +870,8 @@ impl<'a> Planner<'a> {
     /// function's declared arguments (substituting the session argument).
     fn function_from(
         &self,
-        fentry: &dist_metadata::FunctionEntry,
-        finfo: &dist_catalog::FunctionInfo,
+        fentry: &donat_metadata::FunctionEntry,
+        finfo: &donat_catalog::FunctionInfo,
         field: &GqlField<'static, String>,
         vars: &JsonMap<String, Json>,
         session: &Session,
@@ -1330,7 +1330,7 @@ impl<'a> Planner<'a> {
                     ));
                 }
                 // Hidden columns carry the joining values.
-                for col in &rel.hasura_fields {
+                for col in &rel.donat_fields {
                     let hidden = format!("__rr__{col}");
                     if !out.iter().any(|f: &OutputField| f.alias == hidden) {
                         if let Some(info) = ctx.info.column(col) {
@@ -1556,7 +1556,7 @@ impl<'a> Planner<'a> {
                         match arg.as_str() {
                             "distinct" => distinct = value.as_bool().unwrap_or(false),
                             "columns" => {
-                                // Hasura omits the columns arg from count for
+                                // Donat omits the columns arg from count for
                                 // roles with no selectable columns.
                                 if !ctx.any_column_allowed() {
                                     return Err(PlanError::validation(
@@ -1788,7 +1788,7 @@ impl<'a> Planner<'a> {
     fn object_rel_target(
         &self,
         ctx: &TableCtx,
-        rel: &dist_metadata::ObjectRelationship,
+        rel: &donat_metadata::ObjectRelationship,
         path: &str,
     ) -> Result<(QualifiedTable, Vec<(String, String)>), PlanError> {
         if let Some(manual) = &rel.using.manual_configuration {
@@ -1801,8 +1801,8 @@ impl<'a> Planner<'a> {
         }
         if let Some(fk_cols) = &rel.using.foreign_key_constraint_on {
             let cols: Vec<String> = match fk_cols {
-                dist_metadata::ObjRelFkColumns::Single(c) => vec![c.clone()],
-                dist_metadata::ObjRelFkColumns::Multiple(cs) => cs.clone(),
+                donat_metadata::ObjRelFkColumns::Single(c) => vec![c.clone()],
+                donat_metadata::ObjRelFkColumns::Multiple(cs) => cs.clone(),
             };
             let fk = ctx
                 .info
@@ -1846,7 +1846,7 @@ impl<'a> Planner<'a> {
     fn array_rel_target(
         &self,
         ctx: &TableCtx,
-        rel: &dist_metadata::ArrayRelationship,
+        rel: &donat_metadata::ArrayRelationship,
         path: &str,
     ) -> Result<(QualifiedTable, Vec<(String, String)>), PlanError> {
         if let Some(manual) = &rel.using.manual_configuration {
@@ -1990,7 +1990,7 @@ pub(crate) fn render_selection(
     Ok(format!("{{ {} }}", parts.join(" ")))
 }
 
-/// All session variables as the json object Hasura passes to
+/// All session variables as the json object Donat passes to
 /// session-aware SQL functions.
 pub(crate) fn session_json(session: &Session) -> String {
     let map: JsonMap<String, Json> = session

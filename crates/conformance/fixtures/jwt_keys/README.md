@@ -17,12 +17,12 @@ openssl ec -in es256_private.pem -pubout -out es256_public.pem
 ```
 
 The engine is configured with
-`HASURA_GRAPHQL_JWT_SECRET={"type":"RS512"|"Ed25519"|"ES256","key":"<*_public.pem>",...}`.
+`DONAT_GRAPHQL_JWT_SECRET={"type":"RS512"|"Ed25519"|"ES256","key":"<*_public.pem>",...}`.
 Test-only keys, committed on purpose — never use them anywhere else.
 
 `rsa_jwk.json` is the JWK form of `rsa_public.pem` (kid `test-key-1`),
 served by the JWKS stub in `tests/jwk.rs` (jwk_url mode,
-`HASURA_GRAPHQL_JWT_SECRET={"jwk_url": ...}`). Precomputed via:
+`DONAT_GRAPHQL_JWT_SECRET={"jwk_url": ...}`). Precomputed via:
 
 ```sh
 openssl rsa -pubin -in rsa_public.pem -noout -modulus  # hex -> base64url = n

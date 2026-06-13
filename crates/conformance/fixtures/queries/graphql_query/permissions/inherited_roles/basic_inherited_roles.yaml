@@ -2,9 +2,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-User-Id: '1'
-    X-Hasura-Manager-Id: '2'
+    X-Donat-Role: manager_employee
+    X-Donat-User-Id: '1'
+    X-Donat-Manager-Id: '2'
   response:
     errors:
     - extensions:
@@ -26,9 +26,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-User-Id: '1'
-    X-Hasura-Manager-Id: '1'
+    X-Donat-Role: manager_employee
+    X-Donat-User-Id: '1'
+    X-Donat-Manager-Id: '1'
   response:
     data:
       employee:
@@ -63,9 +63,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-User-Id: '1'
-    X-Hasura-Manager-Id: '2'
+    X-Donat-Role: manager_employee
+    X-Donat-User-Id: '1'
+    X-Donat-Manager-Id: '2'
   response:
     data:
       employee:
@@ -86,7 +86,7 @@
   query:
     # `address` field in the `manager` relationship,is not accessible to the employee's role
     # but is accessible to the manager's role and the "employee 4"'s manager
-    # happens to be the manager with id = 2 (x-hasura-manager-id), hence
+    # happens to be the manager with id = 2 (x-donat-manager-id), hence
     # the `address` column is accessible to the inherited role
     query: |
       query {
@@ -108,9 +108,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-Manager-Id: '2'
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: manager_employee
+    X-Donat-Manager-Id: '2'
+    X-Donat-User-Id: '1'
   response:
     data:
       employee_aggregate:
@@ -137,9 +137,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-Manager-Id: '2'
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: manager_employee
+    X-Donat-Manager-Id: '2'
+    X-Donat-User-Id: '1'
   response:
     data:
       employee:
@@ -164,9 +164,9 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: manager_employee
-    X-Hasura-Manager-Id: '2'
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: manager_employee
+    X-Donat-Manager-Id: '2'
+    X-Donat-User-Id: '1'
   response:
     data:
       employee:
@@ -197,7 +197,7 @@
   url: /v1/graphql
   status: 200
   headers:
-    X-Hasura-Role: non_paying_user
+    X-Donat-Role: non_paying_user
   response:
     data:
       articles:

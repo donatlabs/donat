@@ -66,7 +66,7 @@ args:
         - is_published
       filter:
         _or:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - is_published:
             _eq: true
 
@@ -135,4 +135,4 @@ args:
     role: user
     permission:
       columns: "*"
-      filter: {"members":{"_and":[{"user_id":{"_eq":"X-Hasura-User-Id"}},{"join_date":{"_clt":["$","post_date"]}}]}}
+      filter: {"members":{"_and":[{"user_id":{"_eq":"X-Donat-User-Id"}},{"join_date":{"_clt":["$","post_date"]}}]}}

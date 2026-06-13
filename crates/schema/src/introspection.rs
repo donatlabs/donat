@@ -10,7 +10,7 @@ use graphql_parser::query::{Definition, Document, OperationDefinition};
 use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 use crate::naming::{root_names, table_base_name};
 
-/// GraphQL scalar name for a Postgres type (Hasura naming).
+/// GraphQL scalar name for a Postgres type (Donat naming).
 fn scalar_name(pg_type: &str) -> &str {
     match pg_type {
         "int2" | "int4" | "serial" => "Int",
@@ -193,7 +193,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                         .table_ctx_by_name(&remote, &session.role)
                         .is_some()
                     {
-                        // Hasura makes an FK-based object relationship
+                        // Donat makes an FK-based object relationship
                         // non-nullable when the local FK column(s) are NOT
                         // NULL (the related row always exists).
                         let base = named("OBJECT", &table_base_name(remote_entry));
@@ -541,10 +541,10 @@ pub fn execute_introspection(
 /// column is NOT NULL (the referenced row is guaranteed to exist). Manual
 /// relationships are always nullable.
 fn object_rel_is_non_null(
-    rel: &dist_metadata::ObjectRelationship,
-    info: &dist_catalog::TableInfo,
+    rel: &donat_metadata::ObjectRelationship,
+    info: &donat_catalog::TableInfo,
 ) -> bool {
-    use dist_metadata::ObjRelFkColumns;
+    use donat_metadata::ObjRelFkColumns;
     let Some(fk) = &rel.using.foreign_key_constraint_on else {
         return false;
     };

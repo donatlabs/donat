@@ -1,8 +1,8 @@
-# dist-api
+# donat
 
-A GraphQL engine over Postgres, compatible with the Hasura v2 surface
+A GraphQL engine over Postgres, compatible with the Donat v2 surface
 (metadata format, API shape), developed TDD-style against a native
-conformance harness with Hasura-derived fixtures (`crates/conformance`).
+conformance harness with Donat-derived fixtures (`crates/conformance`).
 
 ## Tech Stack
 
@@ -13,14 +13,13 @@ conformance harness (`crates/conformance`).
 
 | Path | Purpose |
 |---|---|
-| `crates/metadata` | Hasura v2 metadata types + YAML directory loader (`!include`) |
+| `crates/metadata` | Donat v2 metadata types + YAML directory loader (`!include`) |
 | `crates/catalog` | Postgres introspection (pg_catalog) |
 | `crates/schema` | Per-role GraphQL schema generation, introspection |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
-| `crates/conformance` | Native conformance harness + Hasura-derived fixtures (the conformance source of truth) |
-| `tests/hasura` | Legacy pytest harness (optional cross-check; safe to delete) |
+| `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 
@@ -31,16 +30,15 @@ conformance harness (`crates/conformance`).
 | Build | `make build` |
 | Unit/snapshot tests | `make test` (or `cargo test -p <crate>`) |
 | Run with fixture metadata | `make run` (serves :8080) |
-| Apply schema migrations (DDL) | `dist-api migrate --migrations-dir migrations` (refinery) |
-| Validate metadata vs DB | `dist-api validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
-| Conformance suite | `make conformance` (or `cargo test -p dist-conformance [--test <module>]`) |
+| Apply schema migrations (DDL) | `donat migrate --migrations-dir migrations` (refinery) |
+| Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
+| Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
-| Legacy pytest cross-check | `tests/hasura/run_suite.sh <selector>` (optional) |
 
 The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
 `PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
-It builds/spawns the engine itself — REBUILD `cargo build -p dist-server
---bin dist-api` after engine changes before re-running conformance, the
+It builds/spawns the engine itself — REBUILD `cargo build -p donat-server
+--bin donat` after engine changes before re-running conformance, the
 harness uses the existing binary. One database per suite (`conf_<name>`),
 parallel-safe. Conventions: `crates/conformance/PORTING.md`.
 
@@ -49,12 +47,12 @@ parallel-safe. Conventions: `crates/conformance/PORTING.md`.
 1. Engine-behavior changes start from a failing conformance case: a fixture
    in `crates/conformance/fixtures` + a call in `crates/conformance/tests/`.
 2. Implement; add/adjust unit + insta tests in the touched crate.
-3. `cargo build -p dist-server --bin dist-api && cargo test -p
-   dist-conformance --test <module>` until green; then run the full
+3. `cargo build -p donat-server --bin donat && cargo test -p
+   donat-conformance --test <module>` until green; then run the full
    conformance crate — suites share engine semantics and regress together.
 4. Fixtures are ground truth (exact bodies, error codes, paths, status).
    Local fixture edits are allowed ONLY for documented known-diffs and must
-   carry a `# dist-api:` comment (see fixtures/README.md).
+   carry a `# donat:` comment (see fixtures/README.md).
 
 Quirks to remember: some fixtures `!include` files as quoted strings;
 legacy `$op` permission spellings are valid input; three insert fixtures
@@ -70,8 +68,8 @@ data access goes through an explicit per-role permission. There is no
 permission-bypass role and no admin-over-HTTP surface at all: the runtime
 admin/management API (`run_sql`, metadata mutation) was deleted, and the
 admin DATA role (the `ADMIN_ROLE` permission bypass) was removed too. A
-trusted request with no `X-Hasura-Role` is denied ("x-hasura-role header is
-required"); `X-Hasura-Admin-Secret` is API-level auth only. Any diff that
+trusted request with no `X-Donat-Role` is denied ("x-donat-role header is
+required"); `X-Donat-Admin-Secret` is API-level auth only. Any diff that
 re-introduces an admin role or permission bypass must be rejected.
 Configuration is deploy-time: `migrate` (DDL) + YAML metadata at boot.
 
@@ -100,7 +98,7 @@ REJECT fix the issues first.
 
 - **Repo content in English** (docs, comments, specs, ADRs). Chat language
   may differ; the repo never does.
-- **Exact Hasura error shapes.** Error `code`/`path`/message text and HTTP
+- **Exact Donat error shapes.** Error `code`/`path`/message text and HTTP
   status are part of the conformance contract — never invent error formats.
 - **One SQL statement per operation** (M4 invariant): response JSON is
   assembled in Postgres (`json_build_object`/`json_agg`, correlated
@@ -111,7 +109,7 @@ REJECT fix the issues first.
   into SQL except through those helpers.
 - **insta snapshots are reviewed, never blind-accepted.** `cargo insta
   review` and read every diff; an unexplained snapshot change is a bug.
-- **Full v2 metadata format** — metadata exported from existing Hasura
+- **Full v2 metadata format** — metadata exported from existing Donat
   projects must load without conversion.
 - **Every change needs tests**: unit/insta in the touched crate AND the
   conformance crate green (`make conformance`) after rebuilding the engine

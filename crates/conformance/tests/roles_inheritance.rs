@@ -10,14 +10,14 @@
 //! so every class from that module would get `.admin_secret()` + that env var.
 //!
 //! NOTE: the admin_secret mark is purely environmental for these classes —
-//! tests-py sends the secret alongside explicit X-Hasura-Role headers,
+//! tests-py sends the secret alongside explicit X-Donat-Role headers,
 //! which yields the same trusted-role session a secretless engine
 //! produces, and no fixture asserts on the secret itself. The suites below
 //! therefore run without it; the hge_env marks are still replicated via
 //! `.env()`. (Suite::start() authenticates its bootstrap calls when
 //! `.admin_secret()` is set, so using it here would also work.)
 
-use dist_conformance::{Running, Suite, Transport};
+use donat_conformance::{Running, Suite, Transport};
 
 const INHERITED: &str = "queries/graphql_query/permissions/inherited_roles";
 const NESTED: &str = "queries/graphql_query/permissions/roles_inheritance";
@@ -103,7 +103,7 @@ fn graphql_inherited_roles_postgres() {
 #[test]
 fn nested_inherited_roles_select_permissions() {
     let s = Suite::new("nested_inherited")
-        .env("HASURA_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
+        .env("DONAT_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
         .start();
     v2_setup(&s, NESTED);
 
@@ -121,7 +121,7 @@ fn nested_inherited_roles_select_permissions() {
 #[test]
 fn graphql_mutation_roles_inheritance() {
     let s = Suite::new("mutation_inheritance")
-        .env("HASURA_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
+        .env("DONAT_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
         .start();
     v2_setup(&s, MUTATION);
 
@@ -152,8 +152,8 @@ fn graphql_mutation_roles_inheritance() {
 #[test]
 fn custom_function_permissions_inheritance() {
     let s = Suite::new("function_perm_inheritance")
-        .env("HASURA_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
-        .env("HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS", "false")
+        .env("DONAT_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS", "true")
+        .env("DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS", "false")
         .start();
     v2_setup(&s, FUNCTION);
 

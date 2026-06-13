@@ -1,14 +1,14 @@
 //! Attack-coverage suite (not ported from tests-py): classic broken-access-
 //! control / IDOR attempts and SQL-injection payloads, exercised end-to-end
 //! against a multi-tenant schema where a row's `owner` must equal the caller's
-//! X-Hasura-User-Id. This engine has no admin role, so every case runs as the
+//! X-Donat-User-Id. This engine has no admin role, so every case runs as the
 //! `user` role scoped strictly by its permissions.
 //!
 //! Each fixture encodes the SECURE expected behaviour; a regression that
 //! leaked another user's data, let injection through, or dropped a table would
 //! flip the expected response and fail here.
 
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 const SEC: &str = "queries/security";
 

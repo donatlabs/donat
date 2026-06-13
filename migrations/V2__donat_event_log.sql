@@ -10,7 +10,7 @@
 -- fire events too. A background poller delivers them (see crates/server).
 
 -- One row per captured row-change, awaiting delivery.
-create table if not exists dist_api.event_log (
+create table if not exists donat.event_log (
     id            uuid primary key default gen_random_uuid(),
     trigger_name  text        not null,
     schema_name   text        not null,
@@ -28,11 +28,11 @@ create table if not exists dist_api.event_log (
 );
 
 create index if not exists event_log_due_idx
-    on dist_api.event_log (status, created_at);
+    on donat.event_log (status, created_at);
 
-create table if not exists dist_api.event_invocation_logs (
+create table if not exists donat.event_invocation_logs (
     id         uuid primary key default gen_random_uuid(),
-    event_id   uuid not null references dist_api.event_log (id) on delete cascade,
+    event_id   uuid not null references donat.event_log (id) on delete cascade,
     -- HTTP status of the attempt; null on a transport error (no response).
     status     int,
     request    jsonb,
@@ -41,13 +41,13 @@ create table if not exists dist_api.event_invocation_logs (
 );
 
 create index if not exists event_invocation_logs_event_idx
-    on dist_api.event_invocation_logs (event_id);
+    on donat.event_invocation_logs (event_id);
 
 -- Generic capture function, shared by every per-table trigger. The trigger
 -- name is passed as the first trigger argument (TG_ARGV[0]); old/new rows are
--- captured as jsonb. Session variables, when the engine sets the `hasura.user`
+-- captured as jsonb. Session variables, when the engine sets the `donat.user`
 -- GUC inside the mutation transaction, are captured too (NULL otherwise).
-create or replace function dist_api.notify_event() returns trigger
+create or replace function donat.notify_event() returns trigger
 language plpgsql as $$
 declare
     v_old jsonb := null;
@@ -62,11 +62,11 @@ begin
         v_old := to_jsonb(old);
     end if;
 
-    insert into dist_api.event_log
+    insert into donat.event_log
         (trigger_name, schema_name, table_name, op, data_old, data_new, session_variables)
     values
         (tg_argv[0], tg_table_schema, tg_table_name, tg_op, v_old, v_new,
-         nullif(current_setting('hasura.user', true), '')::jsonb);
+         nullif(current_setting('donat.user', true), '')::jsonb);
 
     return null;
 end;

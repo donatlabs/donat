@@ -1,6 +1,6 @@
-//! Typed model of the Hasura v2 metadata format (metadata directory version 3).
+//! Typed model of the Donat v2 metadata format (metadata directory version 3).
 //!
-//! Field names and shapes follow the v2 spec so that exported Hasura metadata
+//! Field names and shapes follow the v2 spec so that exported Donat metadata
 //! (and the fixtures from `server/tests-py`) deserialize without translation.
 //! Open-ended expressions (boolean filters, column presets) are kept as
 //! `serde_json::Value` for now; they get a typed AST when the sqlgen
@@ -78,7 +78,7 @@ pub struct ActionDefinition {
 }
 
 /// Deserialize a list that may be written as an explicit `null` (meaning
-/// "none"), as Hasura's exported action metadata sometimes does.
+/// "none"), as Donat's exported action metadata sometimes does.
 fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -111,7 +111,7 @@ pub struct ActionPermission {
 }
 
 /// A recurring scheduled trigger: the engine POSTs `payload` to `webhook`
-/// on the cron `schedule`. Field names match Hasura's `CronTriggerMetadata`
+/// on the cron `schedule`. Field names match Donat's `CronTriggerMetadata`
 /// so exported metadata loads without translation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CronTrigger {
@@ -121,7 +121,7 @@ pub struct CronTrigger {
     /// Standard 5-field cron expression, evaluated in UTC.
     pub schedule: String,
     /// Static JSON body sent to the webhook (under the envelope's `payload`).
-    /// Hasura tolerates an absent or explicitly null payload; both mean "no
+    /// Donat tolerates an absent or explicitly null payload; both mean "no
     /// payload" — we normalize to JSON null here and emit `{}`-or-null at
     /// delivery time.
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct CronTrigger {
     pub comment: Option<String>,
 }
 
-/// Retry/timeout policy for scheduled triggers (Hasura `RetryConfST`).
+/// Retry/timeout policy for scheduled triggers (Donat `RetryConfST`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CronRetryConf {
     #[serde(default)]
@@ -475,13 +475,13 @@ pub struct TableEntry {
     pub update_permissions: Vec<PermissionEntry<UpdatePermission>>,
     #[serde(default)]
     pub delete_permissions: Vec<PermissionEntry<DeletePermission>>,
-    /// Webhooks fired on row insert/update/delete (Hasura event triggers).
+    /// Webhooks fired on row insert/update/delete (Donat event triggers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_triggers: Vec<EventTrigger>,
 }
 
 /// A table event trigger: a webhook called when rows change. Field names
-/// match Hasura's directory-format `EventTriggerConf` so exported metadata
+/// match Donat's directory-format `EventTriggerConf` so exported metadata
 /// loads without translation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EventTrigger {
@@ -504,7 +504,7 @@ pub struct EventTrigger {
 /// Which operations fire the trigger, and which columns each carries.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EventTriggerDefinition {
-    /// Allow manually-invoked events (via the metadata API in Hasura; accepted
+    /// Allow manually-invoked events (via the metadata API in Donat; accepted
     /// for round-trip fidelity).
     #[serde(default)]
     pub enable_manual: bool,
@@ -526,7 +526,7 @@ pub struct OperationSpec {
     pub payload: Option<Columns>,
 }
 
-/// Retry/timeout policy for event triggers (Hasura `RetryConf`). Note the
+/// Retry/timeout policy for event triggers (Donat `RetryConf`). Note the
 /// field names differ from cron's `RetryConfST` (`interval_sec` /
 /// `timeout_sec` vs `retry_interval_seconds` / `timeout_seconds`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -629,7 +629,7 @@ pub struct ManualConfiguration {
 pub struct RemoteRelationship {
     pub name: String,
     #[serde(default)]
-    pub hasura_fields: Vec<String>,
+    pub donat_fields: Vec<String>,
     #[serde(default)]
     pub remote_schema: String,
     /// { <remote root field>: { arguments: { arg: "$column" | literal } } }
@@ -663,7 +663,7 @@ pub struct PermissionEntry<T> {
     pub comment: Option<String>,
 }
 
-/// Boolean expression over rows (`{ author_id: { _eq: X-Hasura-User-Id } }`).
+/// Boolean expression over rows (`{ author_id: { _eq: X-Donat-User-Id } }`).
 /// Kept untyped until the sqlgen milestone.
 pub type BoolExp = serde_json::Value;
 

@@ -2,11 +2,11 @@ description: User can query geometry values which satisfies filter in select per
 url: /v1/query
 status: 200
 headers:
-  X-Hasura-Role: user1
+  X-Donat-Role: user1
 response:
 - id: 1
   jsonb_col:
-    name: Hasura
+    name: Donat
     age: 7
 query:
   type: select

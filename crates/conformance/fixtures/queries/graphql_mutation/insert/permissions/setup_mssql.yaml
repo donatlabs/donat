@@ -21,7 +21,7 @@ args:
       role: user
       permission:
         check:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns:
         - title
         - content
@@ -36,7 +36,7 @@ args:
       role: user_with_select_and_insert
       permission:
         check:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: '*'
   - type: mssql_create_select_permission
     args:
@@ -47,7 +47,7 @@ args:
         columns: '*'
         filter:
           $or:
-            - author_id: X-Hasura-User-Id
+            - author_id: X-Donat-User-Id
             - is_published: 1
 
   # Permissions for user_with_update_and_insert on article
@@ -59,7 +59,7 @@ args:
       role: user_with_update_and_insert
       permission:
         check:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: '*'
   - type: mssql_create_update_permission
     args:
@@ -69,7 +69,7 @@ args:
       role: user_with_update_and_insert
       permission:
         filter:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: '*'
 
   # Permissions for user_with_all_perms on article
@@ -82,7 +82,7 @@ args:
         columns: '*'
         filter:
           $or:
-            - author_id: X-Hasura-User-Id
+            - author_id: X-Donat-User-Id
             - is_published: 1
   - type: mssql_create_insert_permission
     args:
@@ -92,7 +92,7 @@ args:
       role: user_with_all_perms
       permission:
         check:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: '*'
   - type: mssql_create_update_permission
     args:
@@ -102,7 +102,7 @@ args:
       role: user_with_all_perms
       permission:
         filter:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: '*'
 
   # Permissions for restricted on article
@@ -115,7 +115,7 @@ args:
         columns: '*'
         filter:
           $or:
-            - author_id: X-Hasura-User-Id
+            - author_id: X-Donat-User-Id
             - is_published: 1
   - type: mssql_create_insert_permission
     args:
@@ -125,7 +125,7 @@ args:
       role: restricted
       permission:
         check:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
   - type: mssql_create_update_permission
     args:
       source: mssql
@@ -134,5 +134,5 @@ args:
       role: restricted
       permission:
         filter:
-          author_id: X-Hasura-User-Id
+          author_id: X-Donat-User-Id
         columns: []

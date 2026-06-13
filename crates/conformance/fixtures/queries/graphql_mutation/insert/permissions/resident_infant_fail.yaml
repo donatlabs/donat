@@ -2,9 +2,9 @@ description: Insert into resident table with non insertable columns (Error)
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: infant
-  X-Hasura-Infant-Id: '1'
-  X-Hasura-Infant-Name: 'Bittu'
+  X-Donat-Role: infant
+  X-Donat-Infant-Id: '1'
+  X-Donat-Infant-Name: 'Bittu'
 query:
   query: |
     mutation {

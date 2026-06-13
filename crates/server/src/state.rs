@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dist_catalog::Catalog;
-use dist_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_catalog::Catalog;
+use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
 use tokio::sync::RwLock;
 
 pub struct AppState {
@@ -19,18 +19,18 @@ pub struct AppState {
     /// --hge-bin mode).
     pub default_url: String,
     pub admin_secret: Option<String>,
-    /// HASURA_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
     pub unauthorized_role: Option<String>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,
-    /// HASURA_GRAPHQL_INFER_FUNCTION_PERMISSIONS (default true).
+    /// DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS (default true).
     pub infer_function_permissions: bool,
-    /// JWT authentication mode, when HASURA_GRAPHQL_JWT_SECRET is set.
+    /// JWT authentication mode, when DONAT_GRAPHQL_JWT_SECRET is set.
     pub jwt: Option<crate::jwt::JwtConfig>,
     /// Webhook authentication mode: (url, "GET"|"POST").
     pub auth_hook: Option<(String, String)>,
     pub http: reqwest::Client,
-    /// HASURA_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
+    /// DONAT_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
     pub allowlist_enabled: bool,
 }
 
@@ -88,7 +88,7 @@ impl AppState {
 
     /// Reconcile pools and catalogs with the current metadata sources,
     /// pruning metadata that refers to dropped objects (run_sql untracks
-    /// dropped tables/functions, like Hasura).
+    /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         // Later same-named sources override earlier ones (the harness
         // appends a second 'default' pointing at a per-test database).
@@ -127,7 +127,7 @@ impl AppState {
             };
             let client = pool.get().await?;
             ensure_check_violation_helper(&client).await?;
-            let catalog = dist_catalog::introspect(&client).await?;
+            let catalog = donat_catalog::introspect(&client).await?;
             new_catalogs.insert(name.clone(), catalog);
         }
 
@@ -168,8 +168,8 @@ pub async fn ensure_check_violation_helper(
     client
         .batch_execute(
             r#"
-            CREATE SCHEMA IF NOT EXISTS dist_api;
-            CREATE OR REPLACE FUNCTION dist_api.check_violation(msg text)
+            CREATE SCHEMA IF NOT EXISTS donat;
+            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
             RETURNS json AS $$
             BEGIN
                 RAISE EXCEPTION USING message = msg, errcode = '23514';
@@ -189,7 +189,7 @@ pub fn ensure_default_source(metadata: &mut Metadata) {
             name: "default".to_string(),
             kind: SourceKind::Postgres,
             configuration: serde_json::from_value(serde_json::json!({
-                "connection_info": { "database_url": { "from_env": "DIST_API_DATABASE_URL" } }
+                "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
             }))
             .expect("static source configuration"),
             tables: vec![],

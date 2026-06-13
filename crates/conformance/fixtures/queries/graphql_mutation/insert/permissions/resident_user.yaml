@@ -2,9 +2,9 @@ description: Insert into resident table where name is taken from header value
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-Resident-Id: '4'
-  X-Hasura-Resident-Name: Clarke
+  X-Donat-Role: user
+  X-Donat-Resident-Id: '4'
+  X-Donat-Resident-Name: Clarke
 response:
   data:
     insert_resident:

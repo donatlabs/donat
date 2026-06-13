@@ -1,4 +1,4 @@
-//! SQL generation (milestone M4) — the core trick of Hasura v2.
+//! SQL generation (milestone M4) — the core trick of Donat v2.
 //!
 //! Compiles a whole operation (all root fields) into ONE Postgres statement
 //! that returns the final GraphQL `data` object as a single `json` value.
@@ -10,7 +10,7 @@
 //! and cast to the column's pg type. Parameterized execution can replace
 //! this later without touching the IR.
 
-use dist_ir::*;
+use donat_ir::*;
 
 /// Compile one operation: `SELECT json_build_object('field1', (...), ...)`.
 pub fn operation_to_sql(roots: &[RootField]) -> String {
@@ -18,7 +18,7 @@ pub fn operation_to_sql(roots: &[RootField]) -> String {
 }
 
 /// `stringify_numerics` renders bigint/numeric columns as text
-/// (Hasura's --stringify-numeric-types).
+/// (Donat's --stringify-numeric-types).
 pub fn operation_to_sql_opts(roots: &[RootField], stringify_numerics: bool) -> String {
     let mut ctx = Ctx { next_alias: 0, stringify_numerics };
     let pairs: Vec<String> = roots
@@ -500,7 +500,7 @@ impl Ctx {
                     FieldValue::Column { column, pg_type } => {
                         let col = qualified(table_alias, column);
                         match pg_type.as_str() {
-                            // Hasura renders geometry as GeoJSON with the
+                            // Donat renders geometry as GeoJSON with the
                             // long CRS form (options bit 4).
                             "geometry" | "geography" => {
                                 format!("ST_AsGeoJSON({col}, 15, 4)::json")
@@ -757,7 +757,7 @@ fn geometry_sql(value: &Scalar, pg_type: &str) -> String {
 /// Compile one mutation root field into one SQL statement. The statement
 /// computes the GraphQL value of the field as a single `json` column named
 /// `root`. Permission check expressions are enforced in-statement via
-/// `dist_api.check_violation(...)`, which raises SQLSTATE 23514.
+/// `donat.check_violation(...)`, which raises SQLSTATE 23514.
 pub fn mutation_to_sql(root: &MutationRoot) -> String {
     mutation_to_sql_opts(root, false)
 }
@@ -950,14 +950,14 @@ impl Ctx {
                     self.bool_exp(check, cte, cte)
                 );
                 // The message carries the GraphQL error path as JSON; the
-                // executor unpacks it into the Hasura error shape.
+                // executor unpacks it into the Donat error shape.
                 let payload = serde_json::json!({
                     "path": check_path,
                     "message": "check constraint of an insert/update permission has failed",
                 })
                 .to_string();
                 format!(
-                    "CASE WHEN {violated} > 0 THEN dist_api.check_violation({}) ELSE {result} END",
+                    "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {result} END",
                     quote_lit(&payload)
                 )
             }

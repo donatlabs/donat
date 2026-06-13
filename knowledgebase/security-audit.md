@@ -5,7 +5,7 @@ created: 2026-06-13
 
 # Security & dependency audit (2026-06-13)
 
-Threat model: dist-api is an **internal microservice component** (sidecar /
+Threat model: donat is an **internal microservice component** (sidecar /
 behind a mesh / trusted network). TLS termination and edge auth are assumed
 to live in front of it. Findings are ranked for that model; "network-edge"
 items are downgraded accordingly.
@@ -21,7 +21,7 @@ items are downgraded accordingly.
 - **`resolve_url_template` panic (#3): FIXED.** Rewritten to be panic-free
   (anchors `}}` after `{{`) and to substitute all occurrences.
 - **Non-constant-time secret compare (#4): FIXED.** `gql::ct_eq` is used for
-  the `X-Hasura-Admin-Secret` check in `resolve_session`.
+  the `X-Donat-Admin-Secret` check in `resolve_session`.
 - **Metadata `!include` cycle → overflow: FIXED.** The loader tracks the
   include chain and returns `LoadError::IncludeCycle`.
 - **Aggregate-function injection in `order_by` (SEC-01): FIXED (2026-06-13).**
@@ -92,13 +92,13 @@ everyone. Fix: reject queries past a max depth (e.g. 30–50) before/while
 parsing, and a max-aliases/complexity cap.
 
 ### 1b. Admin role widened fail-open to the WHOLE data plane — UPDATE (2026-06-13)
-After the Hasura admin role landed, "no admin secret configured" now means
+After the Donat admin role landed, "no admin secret configured" now means
 **every no-role request is admin** on `/v1/graphql` too, not just the
 metadata API. Verified live: new binary, no secret, `{ __typename }` with no
 role → `{"data":...}` (full access); `run_sql` with no auth → executes
 arbitrary SQL. With a secret set it is fail-CLOSED (verified: no-secret
 request → access-denied; valid secret + no role → admin). This is faithful
-Hasura behavior ("no admin secret = everything is admin"), but it means: any
+Donat behavior ("no admin secret = everything is admin"), but it means: any
 shared/networked deployment MUST set `--admin-secret` (or be strictly
 network-isolated), otherwise all data and arbitrary SQL are exposed
 unauthenticated. Before the admin change a no-role request was denied, so

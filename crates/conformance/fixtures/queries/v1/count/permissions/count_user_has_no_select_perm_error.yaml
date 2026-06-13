@@ -2,7 +2,7 @@ description: Count number of authors
 url: /v1/query
 status: 400
 headers:
-  X-Hasura-Role: contractor
+  X-Donat-Role: contractor
 response:
   path: $.args
   error: select on "article" for role "contractor" is not allowed. ; "count" is only

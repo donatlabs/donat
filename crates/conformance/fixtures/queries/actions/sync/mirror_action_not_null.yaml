@@ -1,8 +1,8 @@
 # Ported from tests-py. The original asserts a large `extensions.internal`
-# diagnostic block (echoing the request with `x-hasura-role: admin` and the
+# diagnostic block (echoing the request with `x-donat-role: admin` and the
 # transformed request). This engine has no admin role and does not emit that
 # diagnostic, so the assertion is trimmed to the stable parts: message, code,
-# and path. See tests/hasura/COVERAGE.md.
+# and path. See tests/donat/COVERAGE.md.
 description: Null value for non-null output field
 url: /v1/graphql
 status: 200

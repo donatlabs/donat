@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
+use donat_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value as Json, json};
 use tungstenite::stream::MaybeTlsStream;
@@ -173,7 +173,7 @@ fn negative_ws(s: &Running, conf: &Json, via_subscription: bool) -> WsClient {
     }
 
     let mut headers = conf["headers"].clone();
-    headers["X-Hasura-Admin-Secret"] = json!(SECRET);
+    headers["X-Donat-Admin-Secret"] = json!(SECRET);
     let mut ws = WsClient::connect(s);
     ws.init(&headers);
 
@@ -244,7 +244,7 @@ fn subscription_basic() {
         &json!({"type": "run_sql", "args": {
             "sql": "drop schema if exists hge_tests cascade; create schema hge_tests;"
         }}),
-        &[("X-Hasura-Admin-Secret".to_string(), SECRET.to_string())],
+        &[("X-Donat-Admin-Secret".to_string(), SECRET.to_string())],
     );
     assert!(code < 300, "clear_db failed ({code}): {resp}");
 
@@ -252,7 +252,7 @@ fn subscription_basic() {
 
     // ws_conn_init class fixture: connection inited with the admin secret.
     let mut ws = WsClient::connect(&s);
-    ws.init(&json!({"X-Hasura-Admin-Secret": SECRET}));
+    ws.init(&json!({"X-Donat-Admin-Secret": SECRET}));
 
     // negative_test.yaml is a single-step list file.
     let conf = load_fixture(&fixture_root().join(format!("{DIR}/negative_test.yaml")))
@@ -328,12 +328,12 @@ fn jwt_expiry_suite(name: &str, stem: &str, key_type: &str, algorithm: Algorithm
         .expect("reading public key");
     let private =
         std::fs::read(keys.join(format!("{stem}_private.pem"))).expect("reading private key");
-    // conftest.py: HASURA_GRAPHQL_JWT_SECRET = {'type': ..., 'key': <pem>}.
+    // conftest.py: DONAT_GRAPHQL_JWT_SECRET = {'type': ..., 'key': <pem>}.
     let secret_json = json!({"type": key_type, "key": public}).to_string();
 
     let s = Suite::new(name)
         .admin_secret(SECRET)
-        .env("HASURA_GRAPHQL_JWT_SECRET", &secret_json)
+        .env("DONAT_GRAPHQL_JWT_SECRET", &secret_json)
         .start();
 
     let now = SystemTime::now()
@@ -344,10 +344,10 @@ fn jwt_expiry_suite(name: &str, stem: &str, key_type: &str, algorithm: Algorithm
         "sub": "1234567890",
         "name": "John Doe",
         "iat": now,
-        "https://hasura.io/jwt/claims": {
-            "x-hasura-user-id": "1",
-            "x-hasura-default-role": "user",
-            "x-hasura-allowed-roles": ["user"],
+        "https://donat.io/jwt/claims": {
+            "x-donat-user-id": "1",
+            "x-donat-default-role": "user",
+            "x-donat-allowed-roles": ["user"],
         },
         "exp": now + 4,
     });

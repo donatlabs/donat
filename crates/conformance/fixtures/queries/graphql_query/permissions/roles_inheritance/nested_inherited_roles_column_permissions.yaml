@@ -1,8 +1,8 @@
 - description: Test column permissions with base_role
   url: /v1/graphql
   headers:
-    X-Hasura-Role: base_role
-    X-Hasura-User-Id: "1"
+    X-Donat-Role: base_role
+    X-Donat-User-Id: "1"
   query:
     query: |
       query {
@@ -29,8 +29,8 @@
 - description: Test column permissions with nested_role (should inherit base_role's column permissions)
   url: /v1/graphql
   headers:
-    X-Hasura-Role: nested_role
-    X-Hasura-User-Id: "1"
+    X-Donat-Role: nested_role
+    X-Donat-User-Id: "1"
   query:
     query: |
       query {

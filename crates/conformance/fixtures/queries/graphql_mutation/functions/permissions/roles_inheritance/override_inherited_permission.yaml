@@ -1,7 +1,7 @@
 - description: Action not accessible to inherited role because any of the parent roles can't access it
   url: /v1/graphql
   headers:
-    X-Hasura-Role: inherited_role2
+    X-Donat-Role: inherited_role2
   status: 200
   query:
     query: |
@@ -33,8 +33,8 @@
 - description: Query the mutation after adding the explicit permission
   url: /v1/graphql
   headers:
-    X-Hasura-Role: inherited_role2
-    X-Hasura-User-Id: '1'
+    X-Donat-Role: inherited_role2
+    X-Donat-User-Id: '1'
   status: 200
   query:
     query: |

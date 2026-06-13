@@ -2,7 +2,7 @@ name: Release image
 
 # Build and publish the engine Docker image to the GitHub Container Registry
 # on every release tag (e.g. v1.2.3). The package is public, so examples and
-# users can `docker pull ghcr.io/pantyukhov/dist-api` without authentication.
+# users can `docker pull ghcr.io/donatlabs/donat` without authentication.
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/pantyukhov/dist-api
+  IMAGE: ghcr.io/donatlabs/donat
 
 jobs:
   image:

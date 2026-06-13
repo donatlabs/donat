@@ -2,8 +2,8 @@ description: Resident 5 trying to update Resident 6 age
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: resident
-  X-Hasura-Resident-Id: '5'
+  X-Donat-Role: resident
+  X-Donat-Resident-Id: '5'
 # affects zero rows
 response:
   data:

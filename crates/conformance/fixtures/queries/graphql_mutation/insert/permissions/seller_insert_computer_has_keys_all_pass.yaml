@@ -12,8 +12,8 @@ response:
           display: '16" FHD'
           memory: '16 GB DDR4'
 headers:
-  X-Hasura-Role: seller
-  X-Hasura-Spec-Required-Keys: |-
+  X-Donat-Role: seller
+  X-Donat-Spec-Required-Keys: |-
     {processor,display,memory}
 query:
   variables:

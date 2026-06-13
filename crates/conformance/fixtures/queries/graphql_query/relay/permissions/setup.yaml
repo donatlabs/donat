@@ -93,7 +93,7 @@ args:
     permission:
       columns: '*'
       filter:
-        id: x-hasura-user-id
+        id: x-donat-user-id
 
 - type: create_select_permission
   args:
@@ -107,5 +107,5 @@ args:
       - author_id
       filter:
         _or:
-        - author_id: x-hasura-user-id
+        - author_id: x-donat-user-id
         - is_published: true

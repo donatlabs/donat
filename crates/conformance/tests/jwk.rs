@@ -1,5 +1,5 @@
 //! Ported from tests-py test_jwk.py: the engine's background JWKS refresher
-//! (HASURA_GRAPHQL_JWT_SECRET = {"jwk_url": ...}) must re-fetch the key set
+//! (DONAT_GRAPHQL_JWT_SECRET = {"jwk_url": ...}) must re-fetch the key set
 //! on a schedule driven by the stub's Cache-Control / Expires headers.
 //!
 //! The stub mirrors tests-py jwk_server.py: GET /jwk-cache-control builds a
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Suite, fixture_root};
+use donat_conformance::{Suite, fixture_root};
 use serde_json::{Value as Json, json};
 
 const ADMIN_SECRET: &str = "jwk-test-secret";
@@ -180,10 +180,10 @@ fn sign_rs256_jwt() -> String {
         "sub": "1",
         "iat": now,
         "exp": now + 3600,
-        "https://hasura.io/jwt/claims": {
-            "x-hasura-allowed-roles": ["user"],
-            "x-hasura-default-role": "user",
-            "x-hasura-user-id": "1",
+        "https://donat.io/jwt/claims": {
+            "x-donat-allowed-roles": ["user"],
+            "x-donat-default-role": "user",
+            "x-donat-user-id": "1",
         }
     });
     jsonwebtoken::encode(&header, &claims, &key).expect("signing jwt")
@@ -192,7 +192,7 @@ fn sign_rs256_jwt() -> String {
 /// Accumulate the table + `user` select permission as metadata (run before
 /// the engine is started, so it boots with them). The fetched JWKS is then
 /// proven to verify tokens by `query_with_jwt`.
-fn setup_account_metadata(s: &dist_conformance::Running) {
+fn setup_account_metadata(s: &donat_conformance::Running) {
     let setup = json!({
         "type": "bulk",
         "args": [
@@ -211,7 +211,7 @@ fn setup_account_metadata(s: &dist_conformance::Running) {
 
 /// Run a GraphQL query authorized only by an RS256 bearer token carrying the
 /// stub's kid, proving the fetched keys are actually used.
-fn query_with_jwt(s: &dist_conformance::Running) {
+fn query_with_jwt(s: &donat_conformance::Running) {
     let bearer = [(
         "Authorization".to_string(),
         format!("Bearer {}", sign_rs256_jwt()),
@@ -258,7 +258,7 @@ fn run_scenario(
         let s = Suite::new(suite)
             .admin_secret(ADMIN_SECRET)
             .env(
-                "HASURA_GRAPHQL_JWT_SECRET",
+                "DONAT_GRAPHQL_JWT_SECRET",
                 &format!(r#"{{"jwk_url": "{}{}"}}"#, stub.url, jwk_path),
             )
             .start();

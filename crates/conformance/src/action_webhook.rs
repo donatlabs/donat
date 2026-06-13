@@ -1,6 +1,6 @@
 //! A minimal action-webhook stub for the conformance harness.
 //!
-//! Hasura's `tests-py` runs a Python `ActionsWebhookHandler`; this is the
+//! Donat's `tests-py` runs a Python `ActionsWebhookHandler`; this is the
 //! Rust equivalent. The engine subprocess POSTs the action payload
 //! (`{action, input, session_variables}`) here and we reply with the JSON the
 //! handler would produce. Started once per suite on an ephemeral port; the
@@ -227,7 +227,7 @@ fn engine_gql(engine: &EngineHandle, query: &str, variables: Json) -> Option<Jso
         .post(format!("{}/v1/graphql", info.base_url))
         .json(&json!({ "query": query, "variables": variables }));
     if let Some(secret) = &info.admin_secret {
-        req = req.header("X-Hasura-Admin-Secret", secret);
+        req = req.header("X-Donat-Admin-Secret", secret);
     }
     let resp = req.send().ok()?;
     resp.json::<Json>().ok()

@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dist_conformance::{Running, Suite, fixture_root, load_fixture, response_matches};
+use donat_conformance::{Running, Suite, fixture_root, load_fixture, response_matches};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map, Value as Json, json};
 
@@ -138,7 +138,7 @@ impl JwtCfg {
         self
     }
 
-    /// The HASURA_GRAPHQL_JWT_SECRET value, exactly as conftest.py builds
+    /// The DONAT_GRAPHQL_JWT_SECRET value, exactly as conftest.py builds
     /// it: {'type': ..., 'key': <public pem>, **marker configuration}.
     fn secret_json(&self) -> String {
         let mut m = Map::new();
@@ -174,38 +174,38 @@ impl JwtCfg {
         Json::Object(m).to_string()
     }
 
-    /// tests-py `format_claims`: stringified_json JSON-encodes the hasura
+    /// tests-py `format_claims`: stringified_json JSON-encodes the donat
     /// claims object into a string.
-    fn format_claims(&self, hasura_claims: Json) -> Json {
+    fn format_claims(&self, donat_claims: Json) -> Json {
         if self.stringified {
-            Json::String(hasura_claims.to_string())
+            Json::String(donat_claims.to_string())
         } else {
-            hasura_claims
+            donat_claims
         }
     }
 
-    /// tests-py `set_claims`: place the hasura claims at the configured
+    /// tests-py `set_claims`: place the donat claims at the configured
     /// namespace path.
-    fn set_claims(&self, claims: &mut Map<String, Json>, hasura_claims: Json) {
+    fn set_claims(&self, claims: &mut Map<String, Json>, donat_claims: Json) {
         match self.ns_path {
             None => {
-                claims.insert("https://hasura.io/jwt/claims".into(), hasura_claims);
+                claims.insert("https://donat.io/jwt/claims".into(), donat_claims);
             }
             Some("$") => {
-                let obj = hasura_claims
+                let obj = donat_claims
                     .as_object()
                     .expect("root namespace path requires object claims")
                     .clone();
                 claims.extend(obj);
             }
-            Some("$.hasura_claims") => {
-                claims.insert("hasura_claims".into(), hasura_claims);
+            Some("$.donat_claims") => {
+                claims.insert("donat_claims".into(), donat_claims);
             }
-            Some("$.hasura.claims") => {
-                claims.insert("hasura".into(), json!({"claims": hasura_claims}));
+            Some("$.donat.claims") => {
+                claims.insert("donat".into(), json!({"claims": donat_claims}));
             }
-            Some("$.hasura['claims%']") => {
-                claims.insert("hasura".into(), json!({"claims%": hasura_claims}));
+            Some("$.donat['claims%']") => {
+                claims.insert("donat".into(), json!({"claims%": donat_claims}));
             }
             Some(other) => panic!("unsupported claims_namespace_path: {other}"),
         }
@@ -268,7 +268,7 @@ fn error_body(code: &str, message: &str) -> Json {
 }
 
 /// POST the base conf's query to `endpoint` with the conf headers
-/// (X-Hasura-Role: user, X-Hasura-User-Id: '1') plus `auth`, then assert
+/// (X-Donat-Role: user, X-Donat-User-Id: '1') plus `auth`, then assert
 /// status + exact body, replicating check_query(..., add_auth=False).
 fn run_request(
     s: &Running,
@@ -343,25 +343,25 @@ fn error_status(endpoint: &str) -> u16 {
     }
 }
 
-/// Build a token carrying `hasura_claims` (formatted + namespaced per cfg),
+/// Build a token carrying `donat_claims` (formatted + namespaced per cfg),
 /// with optional extra mutation of the registered claims.
 fn make_token(
     cfg: &JwtCfg,
-    hasura_claims: Json,
+    donat_claims: Json,
     tweak: impl FnOnce(&mut Map<String, Json>),
 ) -> String {
     let mut claims = base_claims();
-    let formatted = cfg.format_claims(hasura_claims);
+    let formatted = cfg.format_claims(donat_claims);
     cfg.set_claims(&mut claims, formatted);
     tweak(&mut claims);
     cfg.encode(&claims)
 }
 
-fn full_hasura_claims() -> Json {
+fn full_donat_claims() -> Json {
     json!({
-        "x-hasura-user-id": "1",
-        "x-hasura-default-role": "user",
-        "x-hasura-allowed-roles": ["user"],
+        "x-donat-user-id": "1",
+        "x-donat-default-role": "user",
+        "x-donat-allowed-roles": ["user"],
     })
 }
 
@@ -371,9 +371,9 @@ fn jwt_valid_claims_success(s: &Running, cfg: &JwtCfg, endpoint: &str) {
     let token = make_token(
         cfg,
         json!({
-            "x-hasura-user-id": "1",
-            "x-hasura-allowed-roles": ["user", "editor"],
-            "x-hasura-default-role": "user",
+            "x-donat-user-id": "1",
+            "x-donat-allowed-roles": ["user", "editor"],
+            "x-donat-default-role": "user",
         }),
         |_| {},
     );
@@ -392,9 +392,9 @@ fn jwt_invalid_role_in_request_header(s: &Running, cfg: &JwtCfg, endpoint: &str)
     let token = make_token(
         cfg,
         json!({
-            "x-hasura-user-id": "1",
-            "x-hasura-allowed-roles": ["contractor", "editor"],
-            "x-hasura-default-role": "contractor",
+            "x-donat-user-id": "1",
+            "x-donat-allowed-roles": ["contractor", "editor"],
+            "x-donat-default-role": "contractor",
         }),
         |_| {},
     );
@@ -416,14 +416,14 @@ fn jwt_no_allowed_roles_in_claim(s: &Running, cfg: &JwtCfg, endpoint: &str) {
     let token = make_token(
         cfg,
         json!({
-            "x-hasura-user-id": "1",
-            "x-hasura-default-role": "user",
+            "x-donat-user-id": "1",
+            "x-donat-default-role": "user",
         }),
         |_| {},
     );
     let expected = error_body(
         "jwt-missing-role-claims",
-        "JWT claim does not contain x-hasura-allowed-roles",
+        "JWT claim does not contain x-donat-allowed-roles",
     );
     run_request(
         s,
@@ -439,15 +439,15 @@ fn jwt_invalid_allowed_roles_in_claim(s: &Running, cfg: &JwtCfg, endpoint: &str)
     let token = make_token(
         cfg,
         json!({
-            "x-hasura-user-id": "1",
-            "x-hasura-allowed-roles": "user",
-            "x-hasura-default-role": "user",
+            "x-donat-user-id": "1",
+            "x-donat-allowed-roles": "user",
+            "x-donat-default-role": "user",
         }),
         |_| {},
     );
     let expected = error_body(
         "jwt-invalid-claims",
-        "invalid x-hasura-allowed-roles; should be a list of roles: parsing [] failed, expected Array, but encountered String",
+        "invalid x-donat-allowed-roles; should be a list of roles: parsing [] failed, expected Array, but encountered String",
     );
     run_request(
         s,
@@ -463,14 +463,14 @@ fn jwt_no_default_role(s: &Running, cfg: &JwtCfg, endpoint: &str) {
     let token = make_token(
         cfg,
         json!({
-            "x-hasura-user-id": "1",
-            "x-hasura-allowed-roles": ["user"],
+            "x-donat-user-id": "1",
+            "x-donat-allowed-roles": ["user"],
         }),
         |_| {},
     );
     let expected = error_body(
         "jwt-missing-role-claims",
-        "JWT claim does not contain x-hasura-default-role",
+        "JWT claim does not contain x-donat-default-role",
     );
     run_request(
         s,
@@ -483,7 +483,7 @@ fn jwt_no_default_role(s: &Running, cfg: &JwtCfg, endpoint: &str) {
 }
 
 fn jwt_expired(s: &Running, cfg: &JwtCfg, endpoint: &str) {
-    let token = make_token(cfg, full_hasura_claims(), |claims| {
+    let token = make_token(cfg, full_donat_claims(), |claims| {
         claims.insert("exp".into(), json!(now() - 60));
     });
     let expected = error_body("invalid-jwt", "Could not verify JWT: JWTExpired");
@@ -502,7 +502,7 @@ fn jwt_invalid_signature(s: &Running, cfg: &JwtCfg, endpoint: &str) {
     // were HS256, never the case here) and a random key, so both the
     // algorithm and the signature are wrong.
     let mut claims = base_claims();
-    let formatted = cfg.format_claims(full_hasura_claims());
+    let formatted = cfg.format_claims(full_donat_claims());
     cfg.set_claims(&mut claims, formatted);
     let token = jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
@@ -525,8 +525,8 @@ fn jwt_invalid_signature(s: &Running, cfg: &JwtCfg, endpoint: &str) {
 }
 
 fn jwt_no_audience_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
-    let token = make_token(cfg, full_hasura_claims(), |claims| {
-        claims.insert("aud".into(), json!("hasura-test-suite"));
+    let token = make_token(cfg, full_donat_claims(), |claims| {
+        claims.insert("aud".into(), json!("donat-test-suite"));
     });
     let expected = base_conf()["response"].clone();
     run_request(
@@ -540,7 +540,7 @@ fn jwt_no_audience_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
 }
 
 fn jwt_no_issuer_in_conf(s: &Running, cfg: &JwtCfg, endpoint: &str) {
-    let token = make_token(cfg, full_hasura_claims(), |claims| {
+    let token = make_token(cfg, full_donat_claims(), |claims| {
         claims.insert("iss".into(), json!("rubbish-issuer"));
     });
     let expected = base_conf()["response"].clone();
@@ -584,7 +584,7 @@ impl Drop for Permit {
 fn start(name: &str, cfg: &JwtCfg) -> Running {
     let s = Suite::new(name)
         .admin_secret("conformance-jwt-secret")
-        .env("HASURA_GRAPHQL_JWT_SECRET", &cfg.secret_json())
+        .env("DONAT_GRAPHQL_JWT_SECRET", &cfg.secret_json())
         .start();
     s.setup_v1q(&format!("{PERMS}/setup.yaml"));
     s
@@ -618,7 +618,7 @@ fn run_expiry_skew_suite(name: &str, cfg: JwtCfg) {
     let _permit = acquire_permit();
     let s = start(name, &cfg);
     for endpoint in ENDPOINTS {
-        let token = make_token(&cfg, full_hasura_claims(), |claims| {
+        let token = make_token(&cfg, full_donat_claims(), |claims| {
             claims.insert("exp".into(), json!(now() - 30));
         });
         let expected = base_conf()["response"].clone();
@@ -645,7 +645,7 @@ fn run_audience_suite(name: &str, cfg: JwtCfg) {
         other => panic!("bad audience cfg: {other}"),
     };
     for endpoint in ENDPOINTS {
-        let token = make_token(&cfg, full_hasura_claims(), |claims| {
+        let token = make_token(&cfg, full_donat_claims(), |claims| {
             claims.insert("aud".into(), json!(valid_aud));
         });
         let expected = base_conf()["response"].clone();
@@ -658,7 +658,7 @@ fn run_audience_suite(name: &str, cfg: JwtCfg) {
             "valid_audience",
         );
 
-        let token = make_token(&cfg, full_hasura_claims(), |claims| {
+        let token = make_token(&cfg, full_donat_claims(), |claims| {
             claims.insert("aud".into(), json!("rubbish_audience"));
         });
         let expected = error_body("invalid-jwt", "Could not verify JWT: JWTNotInAudience");
@@ -680,7 +680,7 @@ fn run_issuer_suite(name: &str, cfg: JwtCfg) {
     let s = start(name, &cfg);
     let valid_iss = cfg.issuer.expect("issuer cfg");
     for endpoint in ENDPOINTS {
-        let token = make_token(&cfg, full_hasura_claims(), |claims| {
+        let token = make_token(&cfg, full_donat_claims(), |claims| {
             claims.insert("iss".into(), json!(valid_iss));
         });
         let expected = base_conf()["response"].clone();
@@ -693,7 +693,7 @@ fn run_issuer_suite(name: &str, cfg: JwtCfg) {
             "valid_issuer",
         );
 
-        let token = make_token(&cfg, full_hasura_claims(), |claims| {
+        let token = make_token(&cfg, full_donat_claims(), |claims| {
             claims.insert("iss".into(), json!("rubbish_issuer"));
         });
         let expected = error_body("invalid-jwt", "Could not verify JWT: JWTNotInIssuer");
@@ -745,19 +745,19 @@ suite!(
     jwt_basic_with_rsa_and_cookie,
     run_basic_suite,
     "jwt_rsa_cookie",
-    JwtCfg::new(Alg::Rsa).location(TokenIn::Cookie("hasura_user"))
+    JwtCfg::new(Alg::Rsa).location(TokenIn::Cookie("donat_user"))
 );
 suite!(
     jwt_basic_with_ed25519_and_cookie,
     run_basic_suite,
     "jwt_ed_cookie",
-    JwtCfg::new(Alg::Ed25519).location(TokenIn::Cookie("hasura_user"))
+    JwtCfg::new(Alg::Ed25519).location(TokenIn::Cookie("donat_user"))
 );
 suite!(
     jwt_basic_with_es_and_cookie,
     run_basic_suite,
     "jwt_es_cookie",
-    JwtCfg::new(Alg::Es).location(TokenIn::Cookie("hasura_user"))
+    JwtCfg::new(Alg::Es).location(TokenIn::Cookie("donat_user"))
 );
 
 // TestJwtBasicWithRsaAndCustomHeader (RSA only in tests-py)
@@ -765,7 +765,7 @@ suite!(
     jwt_basic_with_rsa_and_custom_header,
     run_basic_suite,
     "jwt_rsa_hdr",
-    JwtCfg::new(Alg::Rsa).location(TokenIn::CustomHeader("hasura_user"))
+    JwtCfg::new(Alg::Rsa).location(TokenIn::CustomHeader("donat_user"))
 );
 
 // TestJwtBasicWith{...}AndStringifiedJsonClaims
@@ -808,64 +808,64 @@ suite!(
     JwtCfg::new(Alg::Es).ns_path("$")
 );
 
-// ...AtOneLevelOfNesting ($.hasura_claims)
+// ...AtOneLevelOfNesting ($.donat_claims)
 suite!(
     jwt_basic_with_rsa_and_claims_namespace_path_one_level,
     run_basic_suite,
     "jwt_rsa_ns_one",
-    JwtCfg::new(Alg::Rsa).ns_path("$.hasura_claims")
+    JwtCfg::new(Alg::Rsa).ns_path("$.donat_claims")
 );
 suite!(
     jwt_basic_with_ed25519_and_claims_namespace_path_one_level,
     run_basic_suite,
     "jwt_ed_ns_one",
-    JwtCfg::new(Alg::Ed25519).ns_path("$.hasura_claims")
+    JwtCfg::new(Alg::Ed25519).ns_path("$.donat_claims")
 );
 suite!(
     jwt_basic_with_es_and_claims_namespace_path_one_level,
     run_basic_suite,
     "jwt_es_ns_one",
-    JwtCfg::new(Alg::Es).ns_path("$.hasura_claims")
+    JwtCfg::new(Alg::Es).ns_path("$.donat_claims")
 );
 
-// ...AtTwoLevelsOfNesting ($.hasura.claims)
+// ...AtTwoLevelsOfNesting ($.donat.claims)
 suite!(
     jwt_basic_with_rsa_and_claims_namespace_path_two_levels,
     run_basic_suite,
     "jwt_rsa_ns_two",
-    JwtCfg::new(Alg::Rsa).ns_path("$.hasura.claims")
+    JwtCfg::new(Alg::Rsa).ns_path("$.donat.claims")
 );
 suite!(
     jwt_basic_with_ed25519_and_claims_namespace_path_two_levels,
     run_basic_suite,
     "jwt_ed_ns_two",
-    JwtCfg::new(Alg::Ed25519).ns_path("$.hasura.claims")
+    JwtCfg::new(Alg::Ed25519).ns_path("$.donat.claims")
 );
 suite!(
     jwt_basic_with_es_and_claims_namespace_path_two_levels,
     run_basic_suite,
     "jwt_es_ns_two",
-    JwtCfg::new(Alg::Es).ns_path("$.hasura.claims")
+    JwtCfg::new(Alg::Es).ns_path("$.donat.claims")
 );
 
-// ...WithSpecialCharacters ($.hasura['claims%'])
+// ...WithSpecialCharacters ($.donat['claims%'])
 suite!(
     jwt_basic_with_rsa_and_claims_namespace_path_special_characters,
     run_basic_suite,
     "jwt_rsa_ns_spec",
-    JwtCfg::new(Alg::Rsa).ns_path("$.hasura['claims%']")
+    JwtCfg::new(Alg::Rsa).ns_path("$.donat['claims%']")
 );
 suite!(
     jwt_basic_with_ed25519_and_claims_namespace_path_special_characters,
     run_basic_suite,
     "jwt_ed_ns_spec",
-    JwtCfg::new(Alg::Ed25519).ns_path("$.hasura['claims%']")
+    JwtCfg::new(Alg::Ed25519).ns_path("$.donat['claims%']")
 );
 suite!(
     jwt_basic_with_es_and_claims_namespace_path_special_characters,
     run_basic_suite,
     "jwt_es_ns_spec",
-    JwtCfg::new(Alg::Es).ns_path("$.hasura['claims%']")
+    JwtCfg::new(Alg::Es).ns_path("$.donat['claims%']")
 );
 
 // TestJwtExpirySkewWith{Rsa,Ed25519,Es} (allowed_skew: 60)
@@ -936,17 +936,17 @@ suite!(
     jwt_issuer_check_with_rsa,
     run_issuer_suite,
     "jwt_rsa_iss",
-    JwtCfg::new(Alg::Rsa).issuer("https://hasura.com")
+    JwtCfg::new(Alg::Rsa).issuer("https://donat.com")
 );
 suite!(
     jwt_issuer_check_with_ed25519,
     run_issuer_suite,
     "jwt_ed_iss",
-    JwtCfg::new(Alg::Ed25519).issuer("https://hasura.com")
+    JwtCfg::new(Alg::Ed25519).issuer("https://donat.com")
 );
 suite!(
     jwt_issuer_check_with_es,
     run_issuer_suite,
     "jwt_es_iss",
-    JwtCfg::new(Alg::Es).issuer("https://hasura.com")
+    JwtCfg::new(Alg::Es).issuer("https://donat.com")
 );

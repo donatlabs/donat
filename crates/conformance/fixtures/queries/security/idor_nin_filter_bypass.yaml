@@ -2,8 +2,8 @@ description: A _nin filter cannot widen access beyond the permission's owner che
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user
-  X-Hasura-User-Id: '1'
+  X-Donat-Role: user
+  X-Donat-User-Id: '1'
 query:
   query: |
     query {

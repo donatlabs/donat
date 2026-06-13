@@ -2,14 +2,14 @@ description: User can query geometry values which satisfies filter in select per
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: user2
-  X-Hasura-Has-Key: age
+  X-Donat-Role: user2
+  X-Donat-Has-Key: age
 response:
   data:
     jsonb_table:
     - id: 1
       jsonb_col:
-        name: Hasura
+        name: Donat
         age: 7
 query:
   query: |

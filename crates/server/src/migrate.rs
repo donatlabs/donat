@@ -49,14 +49,14 @@ pub async fn run_migrate(database_url: &str, dir: &Path) -> Result<()> {
 /// Load metadata + introspect the database and report inconsistencies.
 /// Returns the list of human-readable inconsistencies (empty = consistent).
 pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Result<Vec<String>> {
-    let metadata = dist_metadata::load_metadata_dir(metadata_dir)
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
         .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
 
     let (client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
         .context("connecting to database for validate")?;
     let conn = tokio::spawn(async move { conn.await });
-    let catalog = dist_catalog::introspect(&client)
+    let catalog = donat_catalog::introspect(&client)
         .await
         .context("introspecting database")?;
     conn.abort();
@@ -87,7 +87,7 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
     }
 
     // Inherited-role mutation permission conflicts (the engine's own check).
-    let planner = dist_schema::Planner::new(&metadata, &catalog);
+    let planner = donat_schema::Planner::new(&metadata, &catalog);
     for (role, table, kind) in planner.mutation_permission_conflicts() {
         problems.push(format!(
             "inherited role \"{role}\": conflicting {kind} permission on table \"{table}\""

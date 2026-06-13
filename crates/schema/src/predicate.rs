@@ -1,11 +1,11 @@
-//! Boolean expression parsing: Hasura bool_exp JSON -> IR predicate.
+//! Boolean expression parsing: Donat bool_exp JSON -> IR predicate.
 //!
 //! Used for both the user's `where` argument and role row filters from
-//! metadata. Session variables (string values starting with "x-hasura-")
+//! metadata. Session variables (string values starting with "x-donat-")
 //! are substituted only in permission filters; clients cannot reference
 //! them in `where`.
 
-use dist_ir::{BoolExp, CompareOp, Scalar, Table};
+use donat_ir::{BoolExp, CompareOp, Scalar, Table};
 use serde_json::Value as Json;
 
 use crate::plan::{PlanError, Planner, Session, TableCtx};
@@ -27,7 +27,7 @@ impl Planner<'_> {
 
         let mut conjuncts = vec![];
         for (key, sub) in map {
-            // Hasura accepts both the modern `_op` and the legacy `$op`
+            // Donat accepts both the modern `_op` and the legacy `$op`
             // spellings for logical operators.
             let logical = match key.as_str() {
                 "$and" => "_and",
@@ -65,7 +65,7 @@ impl Planner<'_> {
                     let table_value = sub.get("_table").ok_or_else(|| {
                         PlanError::validation(path, "_exists needs a _table")
                     })?;
-                    let table: dist_metadata::QualifiedTable =
+                    let table: donat_metadata::QualifiedTable =
                         serde_json::from_value(table_value.clone()).map_err(|e| {
                             PlanError::validation(path, format!("bad _exists table: {e}"))
                         })?;
@@ -189,7 +189,7 @@ impl Planner<'_> {
     /// comparison, or EXISTS over a table-valued function's rows.
     fn computed_field_predicate(
         &self,
-        cf: &dist_metadata::ComputedField,
+        cf: &donat_metadata::ComputedField,
         value: &Json,
         ctx: &TableCtx<'_>,
         session: &Session,
@@ -205,7 +205,7 @@ impl Planner<'_> {
                     format!("function for computed field '{}' not found", cf.name),
                 )
             })?;
-        let args: Vec<dist_ir::RowFunctionArg> = finfo
+        let args: Vec<donat_ir::RowFunctionArg> = finfo
             .args
             .iter()
             .map(|a| {
@@ -215,15 +215,15 @@ impl Planner<'_> {
                     .zip(def.session_argument.as_deref())
                     .is_some_and(|(n, s)| n == s);
                 if is_session {
-                    dist_ir::RowFunctionArg::SessionJson(crate::plan::session_json(session))
+                    donat_ir::RowFunctionArg::SessionJson(crate::plan::session_json(session))
                 } else {
-                    dist_ir::RowFunctionArg::Row
+                    donat_ir::RowFunctionArg::Row
                 }
             })
             .collect();
 
         if let Some((rschema, rname)) = &finfo.returns_table {
-            let remote_table = dist_metadata::QualifiedTable::Qualified {
+            let remote_table = donat_metadata::QualifiedTable::Qualified {
                 schema: rschema.clone(),
                 name: rname.clone(),
             };
@@ -485,7 +485,7 @@ fn parse_array_literal(s: &str) -> Option<Vec<Json>> {
     )
 }
 
-/// In permission filters, string values starting with "x-hasura-"
+/// In permission filters, string values starting with "x-donat-"
 /// (case-insensitive) refer to session variables.
 fn resolve_session(
     value: &Json,
@@ -497,11 +497,11 @@ fn resolve_session(
         return Ok(value.clone());
     }
     match value {
-        Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
             let _ = path;
             match session.var(s) {
                 Some(v) => Ok(Json::String(v.to_string())),
-                // Hasura reports this with path "$" regardless of depth.
+                // Donat reports this with path "$" regardless of depth.
                 None => Err(PlanError::new(
                     "$",
                     "not-found",

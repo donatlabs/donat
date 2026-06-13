@@ -2,7 +2,7 @@ description: When remote schema permissions are enabled, it should not be accesi
 url: /v1/graphql
 status: 200
 headers:
-  X-Hasura-Role: unknown_role
+  X-Donat-Role: unknown_role
 query:
   query: |
     {

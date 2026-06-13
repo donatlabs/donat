@@ -3,13 +3,13 @@
 //! GraphQL; only the argument syntax differs. As everywhere: no admin
 //! role — these planners always run as the request's explicit role.
 
-use dist_ir::*;
-use dist_metadata::Columns;
+use donat_ir::*;
+use donat_metadata::Columns;
 use serde_json::Value as Json;
 
 use crate::plan::{PlanError, Planner, Session, TableCtx};
 
-fn parse_table(args: &Json, path: &str) -> Result<dist_metadata::QualifiedTable, PlanError> {
+fn parse_table(args: &Json, path: &str) -> Result<donat_metadata::QualifiedTable, PlanError> {
     let table = args
         .get("table")
         .ok_or_else(|| PlanError::validation(path, "expected a table"))?;
@@ -23,7 +23,7 @@ impl<'a> Planner<'a> {
         args: &Json,
         session: &Session,
         path: &str,
-    ) -> Result<(dist_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
+    ) -> Result<(donat_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
         let table = parse_table(args, path)?;
         let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
             PlanError::new(
@@ -127,7 +127,7 @@ impl<'a> Planner<'a> {
                 }
                 Json::String(name) => {
                     if !ctx.column_allowed(name) {
-                        // Hasura distinguishes hidden vs unknown columns.
+                        // Donat distinguishes hidden vs unknown columns.
                         if ctx.info.column(name).is_some() {
                             return Err(PlanError::new(
                                 &format!("{path}.args.columns[{idx}]"),
@@ -227,7 +227,7 @@ impl<'a> Planner<'a> {
     ) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let table = parse_table(args, path)?;
-        // Hasura's count op reports the permission failure with its own shape.
+        // Donat's count op reports the permission failure with its own shape.
         let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
             PlanError::new(
                 "$.args",
@@ -483,7 +483,7 @@ impl<'a> Planner<'a> {
                 PlanError::new(
                     "$.args",
                     "permission-denied",
-                    // Hasura's exact v1 shape, trailing space included.
+                    // Donat's exact v1 shape, trailing space included.
                     format!(
                         "insert on \"{}\" for role \"{}\" is not allowed. ",
                         table.name(),
@@ -654,7 +654,7 @@ impl<'a> Planner<'a> {
         }];
         if let Some(cols) = args.get("returning").and_then(Json::as_array) {
             // Returning requires select permission.
-            let table = dist_metadata::QualifiedTable::Qualified {
+            let table = donat_metadata::QualifiedTable::Qualified {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
             };
@@ -684,7 +684,7 @@ fn ctx_ref<'b, 'a>(ctx: &'b TableCtx<'a>) -> &'b TableCtx<'a> {
 
 fn resolve_preset(value: &Json, session: &Session) -> Result<Json, PlanError> {
     match value {
-        Json::String(s) if s.len() >= 8 && s[..8].eq_ignore_ascii_case("x-hasura") => {
+        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
             let v = session.var(s).ok_or_else(|| {
                 PlanError::new(
                     "$",

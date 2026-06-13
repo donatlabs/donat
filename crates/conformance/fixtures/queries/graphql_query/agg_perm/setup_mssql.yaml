@@ -93,7 +93,7 @@ args:
       columns: '*'
       filter:
         author_id:
-          _eq: X-Hasura-User-Id
+          _eq: X-Donat-User-Id
       allow_aggregations: true
 
 - type: mssql_create_select_permission

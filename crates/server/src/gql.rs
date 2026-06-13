@@ -3,7 +3,7 @@
 use axum::http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use dist_schema::{Planner, Session};
+use donat_schema::{Planner, Session};
 
 use crate::state::SharedState;
 
@@ -55,10 +55,10 @@ pub struct GqlError {
     pub message: String,
 }
 
-/// Build the request session from X-Hasura-* headers. There is no admin
+/// Build the request session from X-Donat-* headers. There is no admin
 /// role: the role header is mandatory and grants nothing by itself.
 /// `trusted` is false when an admin secret is configured but absent from
-/// the request: X-Hasura-* headers are then ignored entirely and the
+/// the request: X-Donat-* headers are then ignored entirely and the
 /// session falls back to the unauthorized role.
 pub fn session_from_headers(
     headers: &HeaderMap,
@@ -75,7 +75,7 @@ pub fn session_from_headers(
             None => Err(json!({
                 "errors": [{
                     "extensions": { "path": "$", "code": "access-denied" },
-                    "message": "x-hasura-admin-secret required, but not found",
+                    "message": "x-donat-admin-secret required, but not found",
                 }]
             })),
         };
@@ -84,16 +84,16 @@ pub fn session_from_headers(
     let mut vars = std::collections::HashMap::new();
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
-        if !name.starts_with("x-hasura-") || name == "x-hasura-admin-secret" {
+        if !name.starts_with("x-donat-") || name == "x-donat-admin-secret" {
             continue;
         }
         let Ok(value) = value.to_str() else { continue };
-        if name == "x-hasura-role" {
+        if name == "x-donat-role" {
             role = Some(value.to_string());
         }
         vars.insert(name, value.to_string());
     }
-    let backend_request = match vars.get("x-hasura-use-backend-only-permissions") {
+    let backend_request = match vars.get("x-donat-use-backend-only-permissions") {
         None => false,
         Some(raw) => match raw.to_ascii_lowercase().as_str() {
             "true" | "t" | "yes" | "y" => true,
@@ -102,7 +102,7 @@ pub fn session_from_headers(
                 return Err(json!({
                     "errors": [{
                         "extensions": { "path": "$", "code": "bad-request" },
-                        "message": "x-hasura-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
+                        "message": "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
                     }]
                 }));
             }
@@ -119,13 +119,13 @@ pub fn session_from_headers(
         None => Err(json!({
             "errors": [{
                 "extensions": { "path": "$", "code": "access-denied" },
-                "message": "x-hasura-role header is required (this engine has no admin role)",
+                "message": "x-donat-role header is required (this engine has no admin role)",
             }]
         })),
     }
 }
 
-/// Full session resolution: admin secret wins (X-Hasura-* honored), then
+/// Full session resolution: admin secret wins (X-Donat-* honored), then
 /// JWT bearer tokens when configured, then the unauthorized role.
 pub async fn resolve_session(
     state: &crate::state::AppState,
@@ -134,7 +134,7 @@ pub async fn resolve_session(
     let secret_ok = match &state.admin_secret {
         None => true,
         Some(expected) => headers
-            .get("x-hasura-admin-secret")
+            .get("x-donat-admin-secret")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|provided| ct_eq(provided.as_bytes(), expected.as_bytes())),
     };
@@ -189,10 +189,10 @@ pub async fn resolve_session(
             ));
         };
         let requested = headers
-            .get("x-hasura-role")
+            .get("x-donat-role")
             .and_then(|v| v.to_str().ok());
         let backend = headers
-            .get("x-hasura-use-backend-only-permissions")
+            .get("x-donat-use-backend-only-permissions")
             .and_then(|v| v.to_str().ok())
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "t" | "yes" | "y"))
             .unwrap_or(false);
@@ -292,7 +292,7 @@ async fn webhook_session(
     if let Some(map) = vars_raw.as_object() {
         for (k, v) in map {
             let key = k.to_ascii_lowercase();
-            if !key.starts_with("x-hasura-") {
+            if !key.starts_with("x-donat-") {
                 continue;
             }
             let value = match v {
@@ -302,13 +302,13 @@ async fn webhook_session(
             vars.insert(key, value);
         }
     }
-    let Some(role) = vars.get("x-hasura-role").cloned() else {
+    let Some(role) = vars.get("x-donat-role").cloned() else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
                 "errors": [{
                     "extensions": { "path": "$", "code": "unexpected" },
-                    "message": "webhook response did not include x-hasura-role",
+                    "message": "webhook response did not include x-donat-role",
                 }]
             }),
         ));
@@ -384,7 +384,7 @@ pub async fn execute_full(
                     let catalog = engine.default_catalog();
                     let mut planner = Planner::new(&engine.metadata, &catalog);
                     planner.infer_function_permissions = state.infer_function_permissions;
-                    let intro_data = match dist_schema::execute_introspection(
+                    let intro_data = match donat_schema::execute_introspection(
                         &planner,
                         session,
                         &intro_doc,
@@ -457,7 +457,7 @@ pub async fn execute_full(
         .await;
     }
     // Allowlist gate: the query must structurally match a listed one
-    // (__typename selections are ignored, like Hasura).
+    // (__typename selections are ignored, like Donat).
     if state.allowlist_enabled {
         let normalized = normalize_for_allowlist(&doc);
         let allowed = engine.metadata.allowlist.iter().any(|entry| {
@@ -485,7 +485,7 @@ pub async fn execute_full(
     planner.infer_function_permissions = state.infer_function_permissions;
     planner.relay = relay;
     // Introspection operations are answered from the type system directly.
-    if let Some(result) = dist_schema::execute_introspection(
+    if let Some(result) = donat_schema::execute_introspection(
         &planner,
         session,
         &doc,
@@ -503,8 +503,8 @@ pub async fn execute_full(
     };
 
     match plan {
-        dist_schema::Plan::Query(roots) => {
-            let sql = dist_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+        donat_schema::Plan::Query(roots) => {
+            let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
             drop(engine);
             tracing::debug!(%sql, "executing query");
 
@@ -519,7 +519,7 @@ pub async fn execute_full(
                 Ok(row) => match row.try_get::<_, Json>(0) {
                     Ok(mut data) => {
                         for root in &roots {
-                            if let dist_ir::RootField::Select { alias, query } = root {
+                            if let donat_ir::RootField::Select { alias, query } = root {
                                 if let Some(node) = data.get_mut(alias.as_str()) {
                                     if let Err(e) = resolve_remote_joins(
                                         state,
@@ -542,20 +542,20 @@ pub async fn execute_full(
                 Err(e) => ok(db_error_json(&e)),
             }
         }
-        dist_schema::Plan::Mutation(roots) => {
+        donat_schema::Plan::Mutation(roots) => {
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
             let fields: Vec<(String, String)> = roots
                 .iter()
                 .map(|root| {
                     let alias = match root {
-                        dist_ir::MutationRoot::FunctionCall { alias, .. }
-                        | dist_ir::MutationRoot::Insert { alias, .. }
-                        | dist_ir::MutationRoot::Update { alias, .. }
-                        | dist_ir::MutationRoot::Delete { alias, .. }
-                        | dist_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                        donat_ir::MutationRoot::FunctionCall { alias, .. }
+                        | donat_ir::MutationRoot::Insert { alias, .. }
+                        | donat_ir::MutationRoot::Update { alias, .. }
+                        | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
-                    (alias, dist_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
+                    (alias, donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
                 })
                 .collect();
             drop(engine);
@@ -633,10 +633,10 @@ pub(crate) async fn execute_select_internal(
         .plan(&doc, None, variables, session)
         .map_err(|e| e.to_graphql())?;
     let roots = match plan {
-        dist_schema::Plan::Query(roots) => roots,
+        donat_schema::Plan::Query(roots) => roots,
         _ => return Err(error_json("unexpected", "internal query must be a select")),
     };
-    let sql = dist_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
+    let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
     drop(engine);
 
     let pool = state
@@ -655,7 +655,7 @@ pub(crate) async fn execute_select_internal(
         .try_get::<_, Json>(0)
         .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
     for root in &roots {
-        if let dist_ir::RootField::Select { alias, query } = root {
+        if let donat_ir::RootField::Select { alias, query } = root {
             if let Some(node) = data.get_mut(alias.as_str()) {
                 resolve_remote_joins(
                     state,
@@ -734,7 +734,7 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
 fn resolve_remote_joins<'a>(
     state: &'a SharedState,
     session: &'a Session,
-    fields: &'a [dist_ir::OutputField],
+    fields: &'a [donat_ir::OutputField],
     node: &'a mut Json,
     path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
@@ -749,8 +749,8 @@ fn resolve_remote_joins<'a>(
             Json::Object(_) => {
                 for field in fields {
                     match &field.value {
-                        dist_ir::FieldValue::Object { query, .. }
-                        | dist_ir::FieldValue::Array { query, .. } => {
+                        donat_ir::FieldValue::Object { query, .. }
+                        | donat_ir::FieldValue::Array { query, .. } => {
                             if let Some(child) = node.get_mut(field.alias.as_str()) {
                                 resolve_remote_joins(
                                     state,
@@ -762,7 +762,7 @@ fn resolve_remote_joins<'a>(
                                 .await?;
                             }
                         }
-                        dist_ir::FieldValue::RemoteJoin { spec } => {
+                        donat_ir::FieldValue::RemoteJoin { spec } => {
                             // Variables from the row's hidden columns.
                             let mut vars = serde_json::Map::new();
                             for (var, hidden) in &spec.variables {
@@ -849,7 +849,7 @@ fn ok(body: Json) -> (axum::http::StatusCode, Json) {
     (axum::http::StatusCode::OK, body)
 }
 
-/// Map Postgres errors onto Hasura v2 error codes/messages.
+/// Map Postgres errors onto Donat v2 error codes/messages.
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn untrusted_request_falls_back_to_unauthorized_role() {
-        let h = headers(&[("x-hasura-role", "editor"), ("x-hasura-user-id", "1")]);
+        let h = headers(&[("x-donat-role", "editor"), ("x-donat-user-id", "1")]);
         let s = session_from_headers(&h, Some("anonymous"), false).unwrap();
         assert_eq!(s.role, "anonymous");
         assert!(s.vars.is_empty(), "untrusted headers must be ignored");
@@ -949,34 +949,34 @@ mod tests {
         assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("access-denied")));
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-hasura-admin-secret required, but not found"))
+            Some(&json!("x-donat-admin-secret required, but not found"))
         );
     }
 
     #[test]
-    fn trusted_request_collects_x_hasura_vars() {
+    fn trusted_request_collects_x_donat_vars() {
         let h = headers(&[
-            ("x-hasura-role", "editor"),
-            ("X-Hasura-User-Id", "7"),
-            ("x-hasura-admin-secret", "shh"),
+            ("x-donat-role", "editor"),
+            ("X-Donat-User-Id", "7"),
+            ("x-donat-admin-secret", "shh"),
             ("content-type", "application/json"),
         ]);
         let s = session_from_headers(&h, None, true).unwrap();
         assert_eq!(s.role, "editor");
-        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
-        assert!(!s.vars.contains_key("x-hasura-admin-secret"));
+        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some("7"));
+        assert!(!s.vars.contains_key("x-donat-admin-secret"));
         assert!(!s.vars.contains_key("content-type"));
         assert!(!s.backend_request);
     }
 
     #[test]
     fn trusted_request_requires_a_role() {
-        // No admin role: a trusted request with no X-Hasura-Role is denied.
-        let e = session_from_headers(&headers(&[("x-hasura-user-id", "7")]), None, true)
+        // No admin role: a trusted request with no X-Donat-Role is denied.
+        let e = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
             .unwrap_err();
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-hasura-role header is required (this engine has no admin role)"))
+            Some(&json!("x-donat-role header is required (this engine has no admin role)"))
         );
     }
 
@@ -985,7 +985,7 @@ mod tests {
     fn backend_only_permissions_header_parsing() {
         let with = |v: &str| {
             session_from_headers(
-                &headers(&[("x-hasura-role", "u"), ("x-hasura-use-backend-only-permissions", v)]),
+                &headers(&[("x-donat-role", "u"), ("x-donat-use-backend-only-permissions", v)]),
                 None,
                 true,
             )
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("bad-request")));
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-hasura-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"))
+            Some(&json!("x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"))
         );
     }
 

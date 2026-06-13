@@ -1,19 +1,19 @@
 # Porting tests-py suites to the native harness
 
-Source of truth: `tests/hasura/tests-py` (vendored, git-ignored). Target:
+Source of truth: `tests/donat/tests-py` (vendored, git-ignored). Target:
 one Rust `#[test]` per pytest class in `crates/conformance/tests/*.rs`,
 fixtures copied under `crates/conformance/fixtures/` (same relative paths).
 
 ## Scope rules (CLAUDE.md governs)
 
-- **No admin role.** Skip tests whose fixture sends no `X-Hasura-Role`
+- **No admin role.** Skip tests whose fixture sends no `X-Donat-Role`
   header (or an `admin` role), and multi-step fixtures' admin-only steps if
   the whole test depends on them. Mark every exclusion with a comment:
   `// <file>: no-role (admin) request — out of scope.`
-- **Status-only known-diffs** (documented in tests/hasura/COVERAGE.md): we
+- **Status-only known-diffs** (documented in tests/donat/COVERAGE.md): we
   return 200 where 3 old insert fixtures say 400 with byte-identical
   bodies. Patch the *copied* fixture to `status: 200` and add a YAML
-  comment `# dist-api: Hasura fixtures are inconsistent here; we return 200
+  comment `# donat: Donat fixtures are inconsistent here; we return 200
   everywhere (see COVERAGE.md)`. Never patch anything else.
 
 ## Mapping a pytest class
@@ -46,7 +46,7 @@ fixtures copied under `crates/conformance/fixtures/` (same relative paths).
 ## Module skeleton
 
 ```rust
-use dist_conformance::{Suite, Transport};
+use donat_conformance::{Suite, Transport};
 
 #[test]
 fn pytest_class_name_snake() {
@@ -63,11 +63,11 @@ Suite names must be unique across ALL modules (they become database names
 
 ## Workflow
 
-1. Copy the fixture dir: `cp -R tests/hasura/tests-py/queries/<dir>
+1. Copy the fixture dir: `cp -R tests/donat/tests-py/queries/<dir>
    crates/conformance/fixtures/queries/<dir>` (create parents). Copy ONLY
    dirs the ported class needs, but copy them whole.
 2. Write the module, run
-   `cargo test -p dist-conformance --test <module>` until green.
+   `cargo test -p donat-conformance --test <module>` until green.
 3. A mismatch means EITHER a porting mistake (wrong setup endpoint, wrong
    order, missed exclusion) OR a real engine bug previously masked by
    shared-database state — pytest ran suites against one long-lived
@@ -77,4 +77,4 @@ Suite names must be unique across ALL modules (they become database names
 
 Postgres must be reachable (default
 `postgresql://postgres:postgres@127.0.0.1:15432/postgres`, override via
-`PG_URL`). Engine binary: `target/debug/dist-api` (auto-built).
+`PG_URL`). Engine binary: `target/debug/donat` (auto-built).

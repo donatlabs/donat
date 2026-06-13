@@ -159,7 +159,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article select permission for restricted
@@ -171,7 +171,7 @@ args:
       columns: '*'
       filter:
         $or:
-          - author_id: X-HASURA-USER-ID
+          - author_id: X-DONAT-USER-ID
           - is_published: true
 
 #Article select permission for editor
@@ -184,7 +184,7 @@ args:
       filter:
         $or:
           - author_id:
-              $in: X-Hasura-Allowed-User-Ids
+              $in: X-Donat-Allowed-User-Ids
           - is_published: true
 
 #Article insert permission for user
@@ -194,7 +194,7 @@ args:
     role: user
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Article insert permission for restricted
 - type: create_insert_permission
@@ -203,7 +203,7 @@ args:
     role: restricted
     permission:
       check:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 #Article insert permission for editor
 #Editor can create articles for some of the users
@@ -214,7 +214,7 @@ args:
     permission:
       check:
         author_id:
-          $in: X-Hasura-Allowed-User-Ids
+          $in: X-Donat-Allowed-User-Ids
 
 #Article udpate permission for user
 - type: create_update_permission
@@ -223,7 +223,7 @@ args:
     role: user
     permission:
       filter:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
       columns: '*'
 
 #Article udpate permission for restricted
@@ -233,7 +233,7 @@ args:
     role: restricted
     permission:
       filter:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
       columns: []
 
 #Author select permission for user
@@ -247,7 +247,7 @@ args:
       - name
       - is_registered
       filter:
-        id: X-HASURA-USER-ID
+        id: X-DONAT-USER-ID
 
 #Author insert and update permission for user
 #Only admin can set is_registered to true
@@ -258,7 +258,7 @@ args:
     permission:
       check:
         $and:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - is_registered: false
 
 - type: create_update_permission
@@ -269,7 +269,7 @@ args:
       columns: '*'
       filter:
         $and:
-        - id: X-HASURA-USER-ID
+        - id: X-DONAT-USER-ID
         - is_registered: false
 
 #Author insert permission for student
@@ -290,7 +290,7 @@ args:
     role: user
     permission:
       check:
-        id: X-HASURA-COMPANY-ID
+        id: X-DONAT-COMPANY-ID
 
 #Company update permission for user
 - type: create_update_permission
@@ -299,7 +299,7 @@ args:
     role: user
     permission:
       filter:
-        id: X-HASURA-COMPANY-ID
+        id: X-DONAT-COMPANY-ID
       columns: '*'
 
 #Company select permission for user
@@ -312,7 +312,7 @@ args:
       - id
       - name
       filter:
-        id: X-HASURA-COMPANY-ID
+        id: X-DONAT-COMPANY-ID
 
 #Create insert permission for user on resident
 - type: create_insert_permission
@@ -321,9 +321,9 @@ args:
     role: user
     permission:
       check:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
       set:
-        name: X-Hasura-Resident-Name
+        name: X-Donat-Resident-Name
         is_user: true
 
 #Create select permission for user on resident
@@ -338,7 +338,7 @@ args:
       - age
       - is_user
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 
 #Create insert permission for infant on resident
 - type: create_insert_permission
@@ -347,10 +347,10 @@ args:
     role: infant
     permission:
       check:
-        id: X-Hasura-Infant-Id
+        id: X-Donat-Infant-Id
       set:
-        name: X-Hasura-Infant-Name
-        id: X-Hasura-Infant-Id
+        name: X-Donat-Infant-Name
+        id: X-Donat-Infant-Id
       columns:
       - age
 
@@ -366,7 +366,7 @@ args:
       - age
       - is_user
       filter:
-        id: X-Hasura-Infant-Id
+        id: X-Donat-Infant-Id
 
 #Create permissions for resident role on resident table
 - type: create_insert_permission
@@ -375,7 +375,7 @@ args:
     role: resident
     permission:
       check:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 
 - type: create_update_permission
   args:
@@ -384,7 +384,7 @@ args:
     permission:
       columns: '*'
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 - type: create_select_permission
   args:
     table: resident
@@ -392,7 +392,7 @@ args:
     permission:
       columns: '*'
       filter:
-        id: X-Hasura-Resident-Id
+        id: X-Donat-Resident-Id
 
 
 #Create blog table
@@ -408,7 +408,7 @@ args:
     permission:
       columns: '*'
       filter:
-        author_id: X-Hasura-User-Id
+        author_id: X-Donat-User-Id
 
 - type: create_insert_permission
   args:
@@ -428,7 +428,7 @@ args:
       filter: {}
       set:
         last_updated: NOW()
-        updated_by: X-Hasura-User-Id
+        updated_by: X-Donat-User-Id
 
 - type: track_table
   args:
@@ -442,7 +442,7 @@ args:
     permission:
       check:
         spec:
-          _has_keys_all: X-Hasura-Spec-Required-Keys
+          _has_keys_all: X-Donat-Spec-Required-Keys
       columns: '*'
 
 - type: create_insert_permission
@@ -452,7 +452,7 @@ args:
     permission:
       check:
         spec:
-          _has_keys_any: X-Hasura-Spec-Keys
+          _has_keys_any: X-Donat-Spec-Keys
       columns: '*'
 
 - type: create_select_permission
@@ -491,7 +491,7 @@ args:
         _exists:
           _table: user
           _where:
-            id: X-Hasura-User-Id
+            id: X-Donat-User-Id
             is_admin: true
 
 - type: create_update_permission
@@ -576,7 +576,7 @@ args:
     permission:
       columns: [name]
       filter:
-        added_by: X-Hasura-User-Id
+        added_by: X-Donat-User-Id
       check:
         name:
           _ne: ''
