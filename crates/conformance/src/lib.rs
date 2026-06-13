@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
+mod remote_graphql;
 
 // ---------------------------------------------------------------- fixtures
 
@@ -354,6 +355,15 @@ impl Suite {
         let (base, handle) = action_webhook::spawn();
         self.env.push(("ACTION_WEBHOOK_HANDLER".to_string(), base));
         self.webhook = Some(handle);
+        self
+    }
+
+    /// Start the upstream GraphQL stub and expose its base URL under the given
+    /// env var (e.g. `GRAPHQL_SERVICE_1`), which remote-schema metadata
+    /// references via `url: "{{GRAPHQL_SERVICE_1}}"`.
+    pub fn with_remote_graphql(mut self, env_var: &str) -> Self {
+        let base = remote_graphql::spawn();
+        self.env.push((env_var.to_string(), base));
         self
     }
 
