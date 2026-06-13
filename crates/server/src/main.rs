@@ -10,6 +10,7 @@
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
 mod action;
+mod codegen;
 mod cron;
 mod events;
 mod gql;
@@ -69,6 +70,8 @@ enum Command {
     Migrate(MigrateArgs),
     /// Validate YAML metadata against the database, then exit.
     Validate(ValidateArgs),
+    /// Generate Go row structs from the catalog for the embedded SDK.
+    Codegen(CodegenArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -87,6 +90,22 @@ struct ValidateArgs {
     /// Metadata directory to validate (defaults to --metadata-dir).
     #[arg(long)]
     metadata_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct CodegenArgs {
+    /// `go` is the only target today.
+    #[arg(value_parser = ["go"])]
+    target: String,
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Output directory for the generated file.
+    #[arg(long, default_value = "gen")]
+    out: PathBuf,
+    /// Go package name for the generated file.
+    #[arg(long, default_value = "donat_gen")]
+    package: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -154,6 +173,15 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("inconsistency: {p}");
             }
             anyhow::bail!("metadata validation failed: {} inconsistency(ies)", problems.len());
+        }
+        Some(Command::Codegen(c)) => {
+            let dir = c
+                .metadata_dir
+                .clone()
+                .or_else(|| args.metadata_dir.clone())
+                .ok_or_else(|| anyhow::anyhow!("codegen needs --metadata-dir"))?;
+            codegen::run_codegen(&database_url, &dir, &c.out, &c.package).await?;
+            return Ok(());
         }
         _ => {}
     }
