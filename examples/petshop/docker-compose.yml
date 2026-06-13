@@ -5,7 +5,7 @@
 # Uses the project's deploy model: schema is migrated out-of-band by a
 # one-shot `donat migrate`, the metadata is checked against the migrated
 # database by `donat validate`, and only then does the engine serve. All
-# three use the same prebuilt public image (ghcr.io/pantyukhov/donat,
+# three use the same prebuilt public image (ghcr.io/donatlabs/donat,
 # pushed by .github/workflows/release.yml on each release tag) — no local
 # build. The engine itself never runs DDL.
 #
@@ -35,7 +35,7 @@ services:
 
   # One-shot: apply versioned V{n}__*.sql migrations, then exit.
   migrate:
-    image: ghcr.io/pantyukhov/donat:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["migrate", "--migrations-dir", "/migrations"]
     depends_on:
       postgres:
@@ -48,7 +48,7 @@ services:
 
   # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
   validate:
-    image: ghcr.io/pantyukhov/donat:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["validate", "--metadata-dir", "/metadata"]
     depends_on:
       migrate:
@@ -62,7 +62,7 @@ services:
   engine:
     # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
     #   ENGINE_TAG=v1.2.3 docker compose up
-    image: ghcr.io/pantyukhov/donat:${ENGINE_TAG:-latest}
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     depends_on:
       validate:
         condition: service_completed_successfully
