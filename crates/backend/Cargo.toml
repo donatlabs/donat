@@ -1,0 +1,8 @@
+[package]
+name = "donat-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-neutral primitives: logical scalar types, capability descriptors, SQL dialect rendering"
+
+[dependencies]

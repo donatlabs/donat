@@ -534,6 +534,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-backend"
+version = "0.1.0"
+
+[[package]]
 name = "donat-catalog"
 version = "0.1.0"
 dependencies = [
