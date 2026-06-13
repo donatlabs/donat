@@ -9,16 +9,26 @@ and the built-in admin.
 docker compose up
 ```
 
-This pulls the prebuilt public engine image
-(`ghcr.io/pantyukhov/dist-api`, published by the release workflow), starts
-Postgres seeded from [`db/init.sql`](db/init.sql), and serves GraphQL at
-<http://localhost:8080/v1/graphql>. The schema (tables + foreign keys) comes
-from the seeded database; the [`metadata/`](metadata) directory adds
-relationships and the per-role permissions described below.
+All four services use the same prebuilt public engine image
+(`ghcr.io/pantyukhov/dist-api`, published by the release workflow) and follow
+the project's deploy model:
+
+1. **`migrate`** — `dist-api migrate` applies the versioned DDL in
+   [`migrations/`](migrations) (`V1__schema.sql`, `V2__seed.sql`) via refinery,
+   tracked in `refinery_schema_history`. This is the only thing that runs DDL.
+2. **`validate`** — `dist-api validate` loads the [`metadata/`](metadata),
+   introspects the migrated database, and exits non-zero if anything tracked
+   is missing, so a bad deploy fails before the server boots.
+3. **`engine`** — serves GraphQL at <http://localhost:8080/v1/graphql>. The
+   schema (tables + foreign keys) comes from the migrated database; the
+   metadata directory adds relationships and the per-role permissions below.
+   The serving engine never runs DDL and exposes no runtime `run_sql`.
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
 > `docker build -t ghcr.io/pantyukhov/dist-api:latest .`
+> (The image needs the `migrate`/`validate` subcommands, so build from a
+> revision that includes them.)
 
 ## Data model
 
