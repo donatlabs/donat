@@ -96,9 +96,7 @@ func mapPGError(err error, errorMap map[string]string) []byte {
 	}
 
 	// Split "code:prefix" on the first colon.
-	if idx := strings.IndexByte(directive, ':'); idx >= 0 {
-		code := directive[:idx]
-		prefix := directive[idx+1:]
+	if code, prefix, ok := strings.Cut(directive, ":"); ok {
 		return errorBody(code, "$", prefix+pgErr.Message)
 	}
 
