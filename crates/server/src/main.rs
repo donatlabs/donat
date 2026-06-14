@@ -281,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let state: SharedState = Arc::new(AppState {
         pools: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        sqlite_paths: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        mysql_urls: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         engine: tokio::sync::RwLock::new(Engine {
             metadata,
             catalogs: std::collections::HashMap::new(),

@@ -7,6 +7,7 @@ description = "IR -> single Postgres SQL query producing the JSON response shape
 
 [dependencies]
 donat-ir = { path = "../ir" }
+donat-backend = { path = "../backend" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
