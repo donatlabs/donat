@@ -2,8 +2,6 @@
 //! wasm core and the host. Additive evolution only within a major; the Go
 //! mirror rejects an unknown major (gated by `core_abi_version`).
 
-#![allow(dead_code)]
-
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -21,7 +19,7 @@ pub struct PlanBody {
     pub transaction: bool,
     pub statements: Vec<Statement>,
     /// Post-commit hooks the executor must fire (Spec 003 Registry.Dispatch).
-    /// v1: emitted empty until Task 2.7's follow-up wires event_triggers.
+    /// v1: emitted empty until event_trigger wiring is added.
     pub hooks: Vec<Hook>,
 }
 

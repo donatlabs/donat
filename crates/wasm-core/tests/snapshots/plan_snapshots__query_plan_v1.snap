@@ -1,0 +1,17 @@
+---
+source: crates/wasm-core/tests/plan_snapshots.rs
+expression: plan
+---
+{
+  "kind": "query",
+  "version": 1,
+  "transaction": false,
+  "statements": [
+    {
+      "alias": "data",
+      "sql": "SELECT json_build_object('article', (SELECT coalesce(json_agg(\"_t1\".j), '[]'::json) FROM (SELECT json_build_object('id', \"_t0\".\"id\", 'title', \"_t0\".\"title\") AS j FROM \"public\".\"article\" AS \"_t0\" LIMIT 100) AS \"_t1\")) AS root",
+      "params": []
+    }
+  ],
+  "hooks": []
+}

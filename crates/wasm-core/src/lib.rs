@@ -4,17 +4,19 @@
 //! i32 offsets. The host (Go/wazero) drives this surface:
 //!   1. `core_alloc(len)` -> ptr; host writes `len` input bytes at `ptr`.
 //!   2. `core_init(ptr, len)` loads serialized metadata + Catalog snapshot.
-//!   3. `core_compile(ptr, len)` -> packed i64 (out_ptr<<32 | out_len);
+//!   3. `core_compile(ptr, len)` -> packed i64 (out_ptr<<32|out_len);
 //!      host reads `out_len` bytes at `out_ptr`, then `core_dealloc`s it.
 //!
 //! All payloads are JSON byte buffers, so the wire format can evolve without
 //! breaking the numeric ABI. Instances are single-threaded (one per pooled
 //! wazero instance on the host side).
 
-mod compile;
-mod plan;
+pub mod compile;
+pub mod plan;
 
 use std::cell::RefCell;
+
+pub use compile::{compile, CompileInput, CoreState};
 
 /// Bump on any breaking ABI/PlanV1-major change. The Go mirror asserts this.
 pub const ABI_VERSION: i32 = 1;
@@ -78,4 +80,43 @@ pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
         }
         Err(_) => 1,
     }
+}
+
+/// Compile (query, vars, session) -> PlanV1 JSON.
+///
+/// Returns a packed i64: `(out_ptr << 32) | out_len`. The host reads
+/// `out_len` bytes at `out_ptr` then calls `core_dealloc(out_ptr, out_len)`.
+/// Requires a prior `core_init`; returns an error PlanV1 if uninitialised.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
+#[unsafe(no_mangle)]
+pub extern "C" fn core_compile(ptr: *mut u8, len: i32) -> i64 {
+    // SAFETY: ptr/len originate from core_alloc; host wrote len initialised bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let out = STATE.with(|s| {
+        let borrow = s.borrow();
+        match borrow.as_ref() {
+            None => err_json("validation-failed", "core not initialized"),
+            Some(state) => match serde_json::from_slice::<compile::CompileInput>(bytes) {
+                Ok(input) => serde_json::to_vec(&compile::compile(state, &input))
+                    .unwrap_or_else(|_| err_json("validation-failed", "plan serialize failed")),
+                Err(e) => err_json("validation-failed", &e.to_string()),
+            },
+        }
+    });
+    let out_len = out.len() as i64;
+    let mut boxed = out.into_boxed_slice();
+    let out_ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    (out_ptr as i64) << 32 | out_len
+}
+
+fn err_json(code: &str, message: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "kind": "error",
+        "version": plan::PLAN_VERSION,
+        "code": code,
+        "path": "$",
+        "message": message,
+    }))
+    .unwrap()
 }

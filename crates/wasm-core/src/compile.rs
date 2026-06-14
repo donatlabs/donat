@@ -1,12 +1,12 @@
-//! Compile orchestration (filled in Tasks 2.4–2.7).
-
-#![allow(dead_code)] // items consumed by compile() in Phase 2C
+//! Compile orchestration: parse → session → plan → PlanV1.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use donat_schema::{PlanError, Session};
+use donat_schema::{PlanError, Planner, Session};
+
+use crate::plan::{PlanBody, PlanErrorBody, PlanV1, Statement, PLAN_VERSION};
 
 /// Deserialized engine state held per wasm instance.
 pub struct CoreState {
@@ -59,5 +59,69 @@ pub fn session_from(vars: &HashMap<String, String>) -> Result<Session, PlanError
         role,
         vars: lower,
         backend_request,
+    })
+}
+
+/// Compile a GraphQL request against the loaded engine state, producing a
+/// versioned PlanV1 ready for serialisation to the host.
+///
+/// Query path: one combined SQL statement keyed `"data"`, `transaction:false`.
+/// Mutation path: implemented in Task 2.6.
+/// All error cases (bad role, parse error, planner error) return `PlanV1::Error`.
+pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
+    // 1. Resolve the session (no-admin rule enforced here).
+    let session = match session_from(&input.session_vars) {
+        Ok(s) => s,
+        Err(e) => return error_plan(&e),
+    };
+
+    // 2. Parse the GraphQL document.
+    let doc = match graphql_parser::parse_query::<String>(&input.query) {
+        Ok(d) => d.into_static(),
+        Err(e) => {
+            return PlanV1::Error(PlanErrorBody {
+                version: PLAN_VERSION,
+                code: "validation-failed".into(),
+                path: "$".into(),
+                message: e.to_string(),
+            });
+        }
+    };
+
+    // 3. Plan (permissions woven in, session vars substituted).
+    let planner = Planner::new(&state.metadata, &state.catalog);
+    let plan =
+        match planner.plan(&doc, input.operation_name.as_deref(), &input.variables, &session) {
+            Ok(p) => p,
+            Err(e) => return error_plan(&e),
+        };
+
+    match plan {
+        // 4a. Query: one combined statement aliased "data".
+        donat_schema::Plan::Query(roots) => {
+            let sql =
+                donat_sqlgen::operation_to_sql_opts(&roots, input.stringify_numerics);
+            PlanV1::Query(PlanBody {
+                version: PLAN_VERSION,
+                transaction: false,
+                statements: vec![Statement { alias: "data".into(), sql, params: vec![] }],
+                hooks: vec![],
+            })
+        }
+
+        // 4b. Mutation: implemented in Task 2.6.
+        donat_schema::Plan::Mutation(_) => {
+            todo!("mutation path — implemented in Task 2.6")
+        }
+    }
+}
+
+/// Convert a planner error into a `PlanV1::Error` body.
+fn error_plan(e: &PlanError) -> PlanV1 {
+    PlanV1::Error(PlanErrorBody {
+        version: PLAN_VERSION,
+        code: e.code.to_string(),
+        path: e.path.clone(),
+        message: e.message.clone(),
     })
 }
