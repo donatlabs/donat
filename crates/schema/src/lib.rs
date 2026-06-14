@@ -19,5 +19,5 @@ mod predicate;
 mod v1;
 
 pub use introspection::execute_introspection;
-pub use naming::table_base_name;
+pub use naming::{CrudRoots, crud_roots, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};

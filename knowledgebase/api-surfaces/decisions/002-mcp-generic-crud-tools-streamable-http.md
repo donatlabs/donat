@@ -68,10 +68,17 @@ REST — one deployment, one session-resolution path.
   through `gql::execute_full` — role mandatory, permissions enforced, no admin
   bypass. Only arguments the caller supplied are declared/referenced, because
   the engine requires a value for any referenced variable without a default.
-- **Known limitations (v1):** only the Donat default root-field naming is used
-  (`<t>` for `public`, `<schema>_<t>` otherwise) — `custom_root_fields` /
-  `custom_name` are not honored by the tool layer; `list_tables` matches the
-  session role directly (inherited roles are not expanded).
+- **Table resolution & naming:** the `table` argument is matched against
+  tracked metadata by its GraphQL base name (`custom_name` honored), and the
+  CRUD root fields honor `custom_root_fields` via the shared
+  `donat_schema::crud_roots` helper (the same naming source the schema layer
+  uses). An unknown `table` value matches no entry and is rejected before any
+  GraphQL is built, so a name carrying GraphQL syntax cannot inject an
+  operation. `describe_table` requires a select permission for the role and
+  discloses only the permitted columns (it does not leak the structure of a
+  table the role cannot read).
+- **Known limitations (v1):** `list_tables` matches the session role directly
+  (inherited roles are not expanded).
 - **Conformance:** fixtures under `fixtures/mcp/` driven by
   `tests/mcp_tools.rs`. The harness ignores the JSON-RPC `result.content`
   (a text duplicate) when comparing `/mcp` responses, and also ignores

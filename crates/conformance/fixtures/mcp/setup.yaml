@@ -15,6 +15,18 @@ args:
         (2, 'Milo', 'pending'),
         (3, 'Luna', 'available');
 
+      -- A public table whose own name contains an underscore. Its Donat base
+      -- name is `order_item`; resolving it must NOT split on the underscore
+      -- into schema `order` / table `item` (the previous mis-resolution).
+      CREATE TABLE order_item (
+        id INT PRIMARY KEY,
+        label TEXT NOT NULL
+      );
+
+      INSERT INTO order_item (id, label) VALUES
+        (1, 'first'),
+        (2, 'second');
+
 - type: track_table
   args:
     schema: public
@@ -68,3 +80,16 @@ args:
     role: user
     permission:
       filter: {}
+
+- type: track_table
+  args:
+    schema: public
+    name: order_item
+
+- type: create_select_permission
+  args:
+    table: order_item
+    role: user
+    permission:
+      filter: {}
+      columns: '*'
