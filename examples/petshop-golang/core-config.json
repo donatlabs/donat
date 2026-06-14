@@ -1,0 +1,726 @@
+{
+  "metadata": {
+    "version": 3,
+    "sources": [
+      {
+        "name": "default",
+        "kind": "postgres",
+        "configuration": {
+          "connection_info": {
+            "database_url": {
+              "from_env": "DONAT_GRAPHQL_DATABASE_URL"
+            },
+            "isolation_level": "read-committed",
+            "use_prepared_statements": false
+          }
+        },
+        "tables": [
+          {
+            "table": {
+              "schema": "public",
+              "name": "category"
+            },
+            "is_enum": false,
+            "object_relationships": [],
+            "array_relationships": [
+              {
+                "name": "pets",
+                "using": {
+                  "foreign_key_constraint_on": {
+                    "table": {
+                      "schema": "public",
+                      "name": "pet"
+                    },
+                    "column": "category_id"
+                  }
+                }
+              }
+            ],
+            "computed_fields": [],
+            "insert_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "check": {},
+                  "columns": [
+                    "name"
+                  ],
+                  "backend_only": false
+                }
+              }
+            ],
+            "select_permissions": [
+              {
+                "role": "anonymous",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": true
+                }
+              },
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": true
+                }
+              },
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": true
+                }
+              }
+            ],
+            "update_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": [
+                    "name"
+                  ],
+                  "filter": {},
+                  "check": {}
+                }
+              }
+            ],
+            "delete_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "filter": {}
+                }
+              }
+            ]
+          },
+          {
+            "table": {
+              "schema": "public",
+              "name": "pet"
+            },
+            "is_enum": false,
+            "object_relationships": [
+              {
+                "name": "category",
+                "using": {
+                  "foreign_key_constraint_on": "category_id"
+                }
+              }
+            ],
+            "array_relationships": [],
+            "computed_fields": [],
+            "insert_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "check": {},
+                  "columns": [
+                    "name",
+                    "category_id",
+                    "price",
+                    "status",
+                    "description"
+                  ],
+                  "backend_only": false
+                }
+              }
+            ],
+            "select_permissions": [
+              {
+                "role": "anonymous",
+                "permission": {
+                  "columns": [
+                    "id",
+                    "name",
+                    "category_id",
+                    "price",
+                    "status",
+                    "description"
+                  ],
+                  "filter": {
+                    "status": {
+                      "_eq": "available"
+                    }
+                  },
+                  "allow_aggregations": true
+                }
+              },
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": [
+                    "id",
+                    "name",
+                    "category_id",
+                    "price",
+                    "status",
+                    "description"
+                  ],
+                  "filter": {
+                    "status": {
+                      "_eq": "available"
+                    }
+                  },
+                  "allow_aggregations": true
+                }
+              },
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": true
+                }
+              }
+            ],
+            "update_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": [
+                    "name",
+                    "category_id",
+                    "price",
+                    "status",
+                    "description"
+                  ],
+                  "filter": {},
+                  "check": {}
+                }
+              }
+            ],
+            "delete_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "filter": {}
+                }
+              }
+            ],
+            "event_triggers": [
+              {
+                "name": "on_pet_status",
+                "definition": {
+                  "enable_manual": false,
+                  "update": {
+                    "columns": [
+                      "status"
+                    ]
+                  }
+                },
+                "webhook": "http://handler:8081/events",
+                "retry_conf": {
+                  "num_retries": 3,
+                  "interval_sec": 5,
+                  "timeout_sec": 60
+                }
+              }
+            ]
+          },
+          {
+            "table": {
+              "schema": "public",
+              "name": "customer"
+            },
+            "is_enum": false,
+            "object_relationships": [],
+            "array_relationships": [
+              {
+                "name": "orders",
+                "using": {
+                  "foreign_key_constraint_on": {
+                    "table": {
+                      "schema": "public",
+                      "name": "orders"
+                    },
+                    "column": "customer_id"
+                  }
+                }
+              }
+            ],
+            "computed_fields": [],
+            "insert_permissions": [],
+            "select_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": [
+                    "id",
+                    "name",
+                    "email"
+                  ],
+                  "filter": {
+                    "id": {
+                      "_eq": "X-Donat-User-Id"
+                    }
+                  },
+                  "allow_aggregations": false
+                }
+              },
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": false
+                }
+              }
+            ],
+            "update_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": [
+                    "name",
+                    "email"
+                  ],
+                  "filter": {
+                    "id": {
+                      "_eq": "X-Donat-User-Id"
+                    }
+                  },
+                  "check": {
+                    "id": {
+                      "_eq": "X-Donat-User-Id"
+                    }
+                  }
+                }
+              }
+            ],
+            "delete_permissions": []
+          },
+          {
+            "table": {
+              "schema": "public",
+              "name": "orders"
+            },
+            "is_enum": false,
+            "object_relationships": [
+              {
+                "name": "customer",
+                "using": {
+                  "foreign_key_constraint_on": "customer_id"
+                }
+              }
+            ],
+            "array_relationships": [
+              {
+                "name": "items",
+                "using": {
+                  "foreign_key_constraint_on": {
+                    "table": {
+                      "schema": "public",
+                      "name": "order_item"
+                    },
+                    "column": "order_id"
+                  }
+                }
+              }
+            ],
+            "computed_fields": [],
+            "insert_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "check": {
+                    "customer_id": {
+                      "_eq": "X-Donat-User-Id"
+                    }
+                  },
+                  "set": {
+                    "customer_id": "X-Donat-User-Id"
+                  },
+                  "columns": [
+                    "status"
+                  ],
+                  "backend_only": false
+                }
+              }
+            ],
+            "select_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": "*",
+                  "filter": {
+                    "customer_id": {
+                      "_eq": "X-Donat-User-Id"
+                    }
+                  },
+                  "allow_aggregations": false
+                }
+              },
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": false
+                }
+              }
+            ],
+            "update_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": [
+                    "status"
+                  ],
+                  "filter": {},
+                  "check": {}
+                }
+              }
+            ],
+            "delete_permissions": [
+              {
+                "role": "staff",
+                "permission": {
+                  "filter": {}
+                }
+              }
+            ],
+            "event_triggers": [
+              {
+                "name": "on_order_placed",
+                "definition": {
+                  "enable_manual": false,
+                  "insert": {
+                    "columns": "*"
+                  },
+                  "update": {
+                    "columns": [
+                      "status"
+                    ]
+                  }
+                },
+                "webhook": "http://handler:8081/events",
+                "retry_conf": {
+                  "num_retries": 3,
+                  "interval_sec": 5,
+                  "timeout_sec": 60
+                }
+              }
+            ]
+          },
+          {
+            "table": {
+              "schema": "public",
+              "name": "order_item"
+            },
+            "is_enum": false,
+            "object_relationships": [
+              {
+                "name": "order",
+                "using": {
+                  "foreign_key_constraint_on": "order_id"
+                }
+              },
+              {
+                "name": "pet",
+                "using": {
+                  "foreign_key_constraint_on": "pet_id"
+                }
+              }
+            ],
+            "array_relationships": [],
+            "computed_fields": [],
+            "insert_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "check": {
+                    "order": {
+                      "customer_id": {
+                        "_eq": "X-Donat-User-Id"
+                      }
+                    }
+                  },
+                  "columns": [
+                    "order_id",
+                    "pet_id",
+                    "quantity",
+                    "unit_price"
+                  ],
+                  "backend_only": false
+                }
+              }
+            ],
+            "select_permissions": [
+              {
+                "role": "customer",
+                "permission": {
+                  "columns": "*",
+                  "filter": {
+                    "order": {
+                      "customer_id": {
+                        "_eq": "X-Donat-User-Id"
+                      }
+                    }
+                  },
+                  "allow_aggregations": false
+                }
+              },
+              {
+                "role": "staff",
+                "permission": {
+                  "columns": "*",
+                  "filter": {},
+                  "allow_aggregations": false
+                }
+              }
+            ],
+            "update_permissions": [],
+            "delete_permissions": []
+          }
+        ]
+      }
+    ]
+  },
+  "catalog": {
+    "tables": {
+      "public.category": {
+        "schema": "public",
+        "name": "category",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "name",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": []
+      },
+      "public.customer": {
+        "schema": "public",
+        "name": "customer",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "name",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "email",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": []
+      },
+      "public.order_item": {
+        "schema": "public",
+        "name": "order_item",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "order_id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "pet_id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "quantity",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "unit_price",
+            "pg_type": "numeric",
+            "nullable": false,
+            "has_default": false
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": [
+          {
+            "constraint_name": "order_item_order_id_fkey",
+            "column_mapping": {
+              "order_id": "id"
+            },
+            "referenced_schema": "public",
+            "referenced_table": "orders"
+          },
+          {
+            "constraint_name": "order_item_pet_id_fkey",
+            "column_mapping": {
+              "pet_id": "id"
+            },
+            "referenced_schema": "public",
+            "referenced_table": "pet"
+          }
+        ]
+      },
+      "public.orders": {
+        "schema": "public",
+        "name": "orders",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "customer_id",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "status",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "created_at",
+            "pg_type": "timestamptz",
+            "nullable": false,
+            "has_default": true
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": [
+          {
+            "constraint_name": "orders_customer_id_fkey",
+            "column_mapping": {
+              "customer_id": "id"
+            },
+            "referenced_schema": "public",
+            "referenced_table": "customer"
+          }
+        ]
+      },
+      "public.pet": {
+        "schema": "public",
+        "name": "pet",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "name",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "category_id",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "price",
+            "pg_type": "numeric",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "status",
+            "pg_type": "text",
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "description",
+            "pg_type": "text",
+            "nullable": true,
+            "has_default": false
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": [
+          {
+            "constraint_name": "pet_category_id_fkey",
+            "column_mapping": {
+              "category_id": "id"
+            },
+            "referenced_schema": "public",
+            "referenced_table": "category"
+          }
+        ]
+      },
+      "public.refinery_schema_history": {
+        "schema": "public",
+        "name": "refinery_schema_history",
+        "columns": [
+          {
+            "name": "version",
+            "pg_type": "int4",
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "name",
+            "pg_type": "varchar",
+            "nullable": true,
+            "has_default": false
+          },
+          {
+            "name": "applied_on",
+            "pg_type": "varchar",
+            "nullable": true,
+            "has_default": false
+          },
+          {
+            "name": "checksum",
+            "pg_type": "varchar",
+            "nullable": true,
+            "has_default": false
+          }
+        ],
+        "primary_key": [
+          "version"
+        ],
+        "foreign_keys": []
+      }
+    },
+    "functions": {}
+  }
+}

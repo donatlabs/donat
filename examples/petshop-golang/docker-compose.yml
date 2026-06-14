@@ -1,0 +1,36 @@
+version: "3.9"
+
+# Standalone petshop demo: one database + one Go app (no separate handler service,
+# no Rust binary, no webhook). `docker-compose up` is self-contained.
+#
+# The app self-migrates at boot (donat schema + petshop DDL + seed data) so no
+# separate migrate step is needed.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: petshop_golang
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "petshop_golang"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    # Build context is the repo root so Docker can see both sdk/go and
+    # examples/petshop-golang (the module uses a replace directive).
+    build:
+      context: ../..
+      dockerfile: examples/petshop-golang/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+    ports:
+      - "8080:8080"

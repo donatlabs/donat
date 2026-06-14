@@ -1,102 +1,240 @@
-# petshop-golang — native Go event-trigger handlers
+# petshop-golang — standalone in-memory embedded engine
 
-Handle Donat **event triggers** in a Go program with typed handlers, instead
-of writing a webhook receiver by hand. The engine POSTs event envelopes to
-*your* HTTP server; the [`sdk/go`](../../sdk/go) SDK decodes each envelope into
-a generated row struct and routes it to the handler you registered.
+A self-contained petshop demo that runs the Donat GraphQL engine **in-process**
+inside a single Go binary. The Rust engine executes as a WebAssembly module via
+[wazero](https://wazero.io) — no cgo, no shared libraries, no Rust binary
+needed at runtime. Event triggers fire **registered Go handlers in-process**,
+not over an HTTP webhook.
 
-This reuses the schema and metadata from [`../petshop`](../petshop) — only the
-event-trigger consumer is new.
+## Architecture
 
-## What's here
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Go process (CGO_ENABLED=0, single static binary)           │
+│                                                             │
+│  net/http mux                                               │
+│    /v1/graphql  ──►  donat.Engine.Handler()                 │
+│    /healthz     ──►  your own handler  (composability)      │
+│                           │                                 │
+│                    wazero (wasm runtime, pure Go)           │
+│                    ┌──────────────┐                         │
+│                    │  core.wasm   │  ←  Rust engine         │
+│                    │  (embedded)  │     compiled to wasm    │
+│                    └──────┬───────┘                         │
+│                           │ SQL                             │
+│                       pgxpool ──► Postgres                  │
+│                           │                                 │
+│              post-commit hooks (in-process, no webhook)     │
+│              ┌─────────────────────────────┐               │
+│              │  donat.Registry              │               │
+│              │  "on_order_placed" handler   │               │
+│              │  "on_pet_status"   handler   │               │
+│              └─────────────────────────────┘               │
+└─────────────────────────────────────────────────────────────┘
+```
 
-| File | Purpose |
+**Key difference from the old webhook model:** previously, the engine POSTed
+event envelopes to a separate HTTP handler service; the Go process received
+them over the network. Here the engine embeds the Rust core as wasm, and after
+each mutation commits, the in-process registry dispatches to your Go handlers
+directly — no HTTP round-trip, no separate handler service, no retry queue.
+
+The `webhook:` fields that remain in `metadata/**/*.yaml` are placeholders kept
+for schema compatibility. They are never contacted; the in-process registry
+intercepts every event before any HTTP delivery is attempted.
+
+## What is in this directory
+
+| Path | Purpose |
 |---|---|
-| `gen/donat_gen.go` | Generated row structs — produced by `donat codegen go`, **do not edit** |
-| `main.go` | A plain `net/http` server that decodes envelopes and dispatches to handlers |
-| `go.mod` | Depends on the in-repo SDK via a `replace` directive |
+| `gen/donat_gen.go` | Generated row structs — `donat codegen go` output, do not edit |
+| `main.go` | The full app: migrations, seed, registry, engine, mux |
+| `core-config.json` | Pre-serialised `{metadata, catalog}` snapshot for `core_init` |
+| `metadata/` | Petshop YAML metadata with `event_triggers` declarations |
+| `migrations/` | DDL files applied at boot (V0 = donat schema, V1–V5 = petshop) |
+| `Dockerfile` | Multi-stage, CGO_ENABLED=0, distroless final image |
+| `docker-compose.yml` | `db` (postgres:16) + `app` (this binary); self-migrating |
+| `go.mod` | Module with `replace` to the in-repo SDK |
 
-## 1. Generate the types (don't hand-write them)
-
-The structs in `gen/` are produced from the live database by the engine — run
-this whenever the petshop schema changes:
-
-```bash
-# Postgres with the petshop schema applied (see ../petshop for docker-compose):
-export DONAT_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres
-donat migrate --migrations-dir ../petshop/migrations
-
-# Generate Go structs for the metadata-tracked tables:
-donat codegen go \
-  --metadata-dir ../petshop/metadata \
-  --out ./gen \
-  --package gen
-```
-
-This writes `gen/donat_gen.go` (one struct per tracked table) and runs `gofmt`
-on it. The pg→Go mapping: `serial/integer → int32`, `numeric → decimal.Decimal`
-(lossless), `text → string`, nullable column → pointer, `timestamptz →
-time.Time`.
-
-## 2. Declare the event triggers in metadata
-
-Point each trigger's webhook at this server (add to the relevant table YAML
-under `../petshop/metadata`, then `donat migrate --metadata-dir ../petshop/metadata`
-to reconcile the Postgres triggers):
-
-```yaml
-# in databases/default/tables/public_orders.yaml
-event_triggers:
-  - name: on_order_placed          # must match donat.On(reg, "on_order_placed", ...)
-    definition:
-      insert: { columns: '*' }
-      update: { columns: [status] }
-    retry_conf: { num_retries: 3, interval_sec: 10, timeout_sec: 60 }
-    webhook: 'http://host.docker.internal:8081/events'
-
-# in databases/default/tables/public_pet.yaml
-event_triggers:
-  - name: on_pet_status
-    definition:
-      update: { columns: [status] }
-    retry_conf: { num_retries: 3, interval_sec: 10, timeout_sec: 60 }
-    webhook: 'http://host.docker.internal:8081/events'
-```
-
-## 3. Run the handler server
+## Quick start — docker-compose
 
 ```bash
-go run .          # listens on :8081 (override with ADDR=:9000)
+# From the repository root:
+docker-compose -f examples/petshop-golang/docker-compose.yml up --build
 ```
 
-Then any insert/update on `orders` / `pet` in the engine is delivered here:
+The app:
+1. Connects to Postgres
+2. Applies migrations idempotently at boot (donat schema, petshop DDL, seed data)
+3. Registers the two Go event handlers
+4. Starts the embedded wasm engine
+5. Listens on `:8080`
+
+No Rust binary, no `donat migrate`, no separate handler service needed.
+
+## Demo queries
+
+All requests go to `http://localhost:8080/v1/graphql`. The engine enforces the
+no-admin rule: `X-Donat-Role` is always required.
+
+### Query pets (staff role sees all rows)
+
+```bash
+curl -s -X POST http://localhost:8080/v1/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-Donat-Role: staff" \
+  -d '{"query":"query { pet(limit:3) { id name status price } }"}' | jq .
+```
+
+Expected response:
+
+```json
+{
+  "data": {
+    "pet": [
+      {"id": 1, "name": "Rex",     "status": "available", "price": 350.00},
+      {"id": 2, "name": "Bella",   "status": "available", "price": 420.00},
+      {"id": 3, "name": "Whiskers","status": "available", "price":  90.00}
+    ]
+  }
+}
+```
+
+### Update a pet status — fires `on_pet_status` handler in-process
+
+```bash
+curl -s -X POST http://localhost:8080/v1/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-Donat-Role: staff" \
+  -d '{"query":"mutation { update_pet(where:{id:{_eq:1}}, _set:{status:\"sold\"}) { affected_rows returning { id name status } } }"}' | jq .
+```
+
+Check the app logs — you will see the handler fire immediately after the
+mutation commits (no webhook, no round-trip):
 
 ```
-order #7 placed by customer 1 (status=placed)
-pet "Whiskers" (#3) sold for 90
+[event] on_pet_status fired: op=UPDATE trigger=on_pet_status table=pet
 ```
 
-The HTTP status code drives the engine's **at-least-once** retry contract:
-`2xx` acks the event, `5xx` makes the engine retry per `retry_conf`. Handlers
-must be idempotent.
+### Insert an order — fires `on_order_placed` handler in-process
+
+Customer role requires `X-Donat-User-Id` (the session variable the metadata
+uses as the `customer_id` preset):
+
+```bash
+curl -s -X POST http://localhost:8080/v1/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-Donat-Role: customer" \
+  -H "X-Donat-User-Id: 1" \
+  -d '{"query":"mutation { insert_orders(objects:[{status:\"placed\"}]) { affected_rows returning { id customer_id status } } }"}' | jq .
+```
+
+App log:
+
+```
+[event] on_order_placed fired: op=INSERT trigger=on_order_placed table=orders
+```
+
+### Update an order status — fires `on_order_placed` UPDATE handler
+
+```bash
+curl -s -X POST http://localhost:8080/v1/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-Donat-Role: staff" \
+  -d '{"query":"mutation { update_orders(where:{id:{_eq:1}}, _set:{status:\"shipped\"}) { affected_rows returning { id customer_id status } } }"}' | jq .
+```
+
+App log:
+
+```
+[event] on_order_placed fired: op=UPDATE trigger=on_order_placed table=orders
+```
+
+### Composability — your own route next to the engine
+
+```bash
+curl http://localhost:8080/healthz
+# {"status":"ok"}
+```
+
+`/healthz` is a plain `mux.HandleFunc` registered in `main.go` alongside
+`eng.Handler()`. The engine does not own the server — you do.
 
 ## How it works
 
-`main.go` owns the transport — it's an ordinary `net/http` server. The SDK does
-only two things: decode the envelope (`donat.Event[gen.Orders]`, with
-`Old`/`New` typed row pointers) and route by trigger name
-(`reg.Dispatch(ctx, name, body)`). Registration is one typed call per trigger:
+### Engine construction
 
 ```go
-donat.On(reg, "on_order_placed", func(ctx context.Context, ev donat.Event[gen.Orders]) error {
-    // ev.Op, ev.Old (nil on INSERT), ev.New (nil on DELETE), ev.Session
+//go:embed core-config.json
+var coreConfig []byte
+
+eng, err := donat.New(ctx, donat.Config{
+    Pool:     pool,       // your pgxpool.Pool
+    Metadata: coreConfig, // pre-serialised metadata+catalog snapshot
+    Registry: reg,        // in-process event handler registry
+    PoolSize: 4,          // wasm instance pool
+})
+```
+
+`core-config.json` was produced by:
+
+```bash
+donat dump-core-config \
+  --database-url postgresql://... \
+  --metadata-dir examples/petshop-golang/metadata \
+  --out examples/petshop-golang/core-config.json
+```
+
+Note: `--database-url` is a top-level flag (before the subcommand), not a
+subcommand flag. Regenerate this file whenever the metadata or schema changes.
+
+### Event handler registration
+
+```go
+reg := donat.NewRegistry()
+
+donat.On(reg, "on_pet_status", func(_ context.Context, ev donat.Event[gen.Pet]) error {
+    log.Printf("[event] on_pet_status fired: op=%s table=%s", ev.Op, ev.Table.Name)
     return nil
 })
 ```
 
-No cgo, no engine runtime embedded: `go build` / `go get` and ship one static
-binary (`CGO_ENABLED=0 go build .` works).
+The trigger name (`"on_pet_status"`) must match the `event_triggers[].name`
+in the table YAML. The handler is called synchronously after the mutation's
+Postgres transaction commits — in the same Go process, no network.
 
-> The delivery transport is the webhook receiver you see in `main.go`. A future
-> in-process transport (engine embedded via a pure-Go wasm core) will reuse the
-> exact same `donat.On(...)` handlers — see `knowledgebase/embedded-sdk`.
+### SDK v1 data limitation
+
+In the current SDK v1, the in-process hook envelope carries the mutation result
+shape (e.g. `{"affected_rows":1,"returning":[...]}`) as `ev.New`, not the
+individual captured row. `ev.Table` and `ev.Trigger` are always accurate.
+Full old/new row capture (matching the webhook envelope) is a planned v2
+follow-up. The webhook model carried proper row data via the PG trigger
+(`donat.notify_event()`); the in-process path currently provides the mutation
+result. Handlers should use `ev.Table.Name` / `ev.Op` for routing and query
+the database for row details if needed.
+
+## Building locally (no Docker)
+
+```bash
+# From the repo root:
+cd examples/petshop-golang
+CGO_ENABLED=0 go build -o /tmp/petshop .
+
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang \
+  /tmp/petshop
+```
+
+The binary is fully static — no libc, no cgo, no runtime dependencies other
+than the Postgres connection you point it at.
+
+## Roles and headers
+
+| Role | Header | Capabilities |
+|---|---|---|
+| `staff` | `X-Donat-Role: staff` | Full read/write on all tables |
+| `customer` | `X-Donat-Role: customer` + `X-Donat-User-Id: <id>` | Own orders + available pets |
+| `anonymous` | `X-Donat-Role: anonymous` | Available pets only, read-only |
+
+The engine enforces the no-admin rule: `X-Donat-Role` is always required.
+Requests without it are denied with an `access-denied` error.
