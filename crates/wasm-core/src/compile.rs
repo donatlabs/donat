@@ -51,10 +51,20 @@ pub fn session_from(vars: &HashMap<String, String>) -> Result<Session, PlanError
             ));
         }
     };
-    let backend_request = lower
-        .get("x-donat-use-backend-only-permissions")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let backend_request = match lower.get("x-donat-use-backend-only-permissions") {
+        None => false,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" => true,
+            "false" | "f" | "no" | "n" => false,
+            _ => {
+                return Err(PlanError::new(
+                    "$",
+                    "bad-request",
+                    "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
+                ));
+            }
+        },
+    };
     Ok(Session {
         role,
         vars: lower,
