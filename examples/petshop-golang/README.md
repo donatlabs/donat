@@ -45,16 +45,26 @@ intercepts every event before any HTTP delivery is attempted.
 
 ## What is in this directory
 
+Use it as a **template**. The app code is split by concern so it reads as
+boilerplate:
+
 | Path | Purpose |
 |---|---|
+| `main.go` | Wiring only: config → pool → registry → engine → serve |
+| `config.go` | Environment configuration (`DATABASE_URL`, `ADDR`, pool size) |
+| `handlers.go` | **Your event-trigger handlers** — the business logic you edit |
+| `server.go` | **Your HTTP routes**, mounted next to the engine's GraphQL handler |
 | `gen/donat_gen.go` | Generated row structs — `donat codegen go` output, do not edit |
-| `main.go` | The full app: migrations, seed, registry, engine, mux |
 | `core-config.json` | Pre-serialised `{metadata, catalog}` snapshot for `core_init` |
 | `metadata/` | Petshop YAML metadata with `event_triggers` declarations |
-| `migrations/` | DDL files applied at boot (V0 = donat schema, V1–V5 = petshop) |
-| `Dockerfile` | Multi-stage, CGO_ENABLED=0, distroless final image |
-| `docker-compose.yml` | `db` (postgres:16) + `app` (this binary); self-migrating |
+| `migrations/` | `V{n}__*.sql` — applied by `donat migrate` (V0 = donat helper, V1–V5 = petshop + seed) |
+| `Dockerfile` | Multi-stage, `CGO_ENABLED=0`, distroless final image |
+| `docker-compose.yml` | `db` (postgres:16) → one-shot `migrate` → `app` |
 | `go.mod` | Module with `replace` to the in-repo SDK |
+
+To adapt it: edit `handlers.go` (your event logic), `server.go` (your routes),
+and swap the `metadata/` + `migrations/` for your schema (then regenerate
+`gen/` with `donat codegen go` and `core-config.json` with `donat dump-core-config`).
 
 ## Quick start — docker-compose
 
@@ -63,14 +73,23 @@ intercepts every event before any HTTP delivery is attempted.
 docker-compose -f examples/petshop-golang/docker-compose.yml up --build
 ```
 
-The app:
-1. Connects to Postgres
-2. Applies migrations idempotently at boot (donat schema, petshop DDL, seed data)
-3. Registers the two Go event handlers
-4. Starts the embedded wasm engine
-5. Listens on `:8080`
+Compose runs the project's deploy model: `postgres` → a one-shot
+`donat migrate` (applies the schema + demo seed) → the Go `app` (serves GraphQL
+and fires the in-process hooks). The engine itself never runs DDL.
 
-No Rust binary, no `donat migrate`, no separate handler service needed.
+### Or run locally (no Docker)
+
+```bash
+# 1. Migrate the schema once (the engine never runs DDL):
+donat migrate --migrations-dir migrations \
+  --database-url postgresql://postgres:postgres@localhost:5432/petshop_golang
+
+# 2. Serve (reads DATABASE_URL, default localhost:15432):
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/petshop_golang go run .
+```
+
+(`--database-url` is a top-level flag, before the subcommand.) The app needs no
+Rust binary at runtime — `core-config.json` is embedded.
 
 ## Demo queries
 
@@ -224,6 +243,9 @@ CGO_ENABLED=0 go build -o /tmp/petshop .
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang \
   /tmp/petshop
 ```
+
+Migrate the database first (`donat migrate --migrations-dir migrations
+--database-url <url>`) — the app only serves, it never runs DDL.
 
 The binary is fully static — no libc, no cgo, no runtime dependencies other
 than the Postgres connection you point it at.
