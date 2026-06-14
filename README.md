@@ -37,10 +37,10 @@ backend from it:
   permissions.
 - **Native handlers** *(in progress)* — write trigger logic as **typed
   functions in your own service** via a generated SDK, not only as HTTP
-  webhooks. A Go SDK is landing first (`donat codegen go` generates typed row
-  structs; you register `donat.On("on_order_placed", func(ctx, ev) {...})`),
-  with an in-process WASM runtime and Node.js/Python SDKs to follow — see
-  [Roadmap](#roadmap).
+  webhooks. A Go SDK is landing first — a code generator emits typed row structs
+  from your catalog, and you register handlers like
+  `donat.On("on_order_placed", func(ctx, ev) {...})` — with an in-process WASM
+  runtime and Node.js/Python SDKs to follow. See [Roadmap](#roadmap).
 
 It is **not** another GraphQL server, ORM, or API gateway. It is a
 database-native backend platform: define the data, get the backend.
