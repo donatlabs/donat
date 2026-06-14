@@ -1,0 +1,143 @@
+//! Per-backend feature descriptor.
+//!
+//! Declares which optional SQL features a backend supports so higher layers
+//! can branch on capability rather than backend identity.
+
+/// JSON operator support level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonOps {
+    /// No JSON column/operator support.
+    None,
+    /// `json` only (text-backed, no operator class).
+    Json,
+    /// `jsonb` (binary, indexable operators).
+    Jsonb,
+}
+
+/// Upsert (`INSERT ... ON CONFLICT`) support level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertKind {
+    /// No upsert support.
+    None,
+    /// Conflict rows can be ignored (do nothing).
+    Ignore,
+    /// Conflict rows can be ignored or updated.
+    Update,
+}
+
+/// Feature descriptor for a single backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    pub json_ops: JsonOps,
+    pub geo: bool,
+    pub upsert: UpsertKind,
+    pub returning: bool,
+    pub distinct_on: bool,
+    pub lateral: bool,
+    pub aggregates: bool,
+    pub nested_inserts: bool,
+}
+
+/// Capabilities of the Postgres backend.
+pub fn postgres() -> Capabilities {
+    Capabilities {
+        json_ops: JsonOps::Jsonb,
+        geo: true,
+        upsert: UpsertKind::Update,
+        returning: true,
+        distinct_on: true,
+        lateral: true,
+        aggregates: true,
+        nested_inserts: true,
+    }
+}
+
+/// Capabilities of the SQLite backend.
+pub fn sqlite() -> Capabilities {
+    Capabilities {
+        // json1 builtins (text-backed json, no jsonb operator class).
+        json_ops: JsonOps::Json,
+        geo: false,
+        // ON CONFLICT ... DO UPDATE is supported; no DO NOTHING-only limit.
+        upsert: UpsertKind::Update,
+        returning: true,
+        // No DISTINCT ON in SQLite.
+        distinct_on: false,
+        // No LATERAL joins.
+        lateral: false,
+        aggregates: true,
+        nested_inserts: true,
+    }
+}
+
+/// Capabilities of the MySQL backend (8.0.14+).
+pub fn mysql() -> Capabilities {
+    Capabilities {
+        // MySQL has a real JSON type but no jsonb operator class.
+        json_ops: JsonOps::Json,
+        geo: false,
+        // INSERT ... ON DUPLICATE KEY UPDATE (mutations only; not exercised
+        // by the read-query slice).
+        upsert: UpsertKind::Update,
+        // No RETURNING clause — MySQL mutations are a separate, later slice.
+        returning: false,
+        // No DISTINCT ON in MySQL.
+        distinct_on: false,
+        // LATERAL derived tables since 8.0.14.
+        lateral: true,
+        aggregates: true,
+        // No multi-table nested INSERT (depends on RETURNING).
+        nested_inserts: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_descriptor_is_correct() {
+        let caps = mysql();
+        assert_eq!(caps.json_ops, JsonOps::Json);
+        assert!(!caps.geo);
+        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert!(!caps.returning);
+        assert!(!caps.distinct_on);
+        assert!(caps.lateral);
+        assert!(caps.aggregates);
+        assert!(!caps.nested_inserts);
+    }
+
+    #[test]
+    fn sqlite_descriptor_is_correct() {
+        let caps = sqlite();
+        assert_eq!(caps.json_ops, JsonOps::Json);
+        assert!(!caps.geo);
+        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert!(caps.returning);
+        assert!(!caps.distinct_on);
+        assert!(!caps.lateral);
+        assert!(caps.aggregates);
+        assert!(caps.nested_inserts);
+    }
+
+    #[test]
+    fn postgres_descriptor_is_correct() {
+        let caps = postgres();
+        assert_eq!(caps.json_ops, JsonOps::Jsonb);
+        assert!(caps.geo);
+        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert!(caps.returning);
+        assert!(caps.distinct_on);
+        assert!(caps.lateral);
+        assert!(caps.aggregates);
+        assert!(caps.nested_inserts);
+    }
+
+    #[test]
+    fn enums_have_expected_variants() {
+        // Spelled out so the variant set is part of the test contract.
+        let _ = (JsonOps::None, JsonOps::Json, JsonOps::Jsonb);
+        let _ = (UpsertKind::None, UpsertKind::Ignore, UpsertKind::Update);
+    }
+}

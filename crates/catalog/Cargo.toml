@@ -8,3 +8,5 @@ description = "Postgres introspection: tables, columns, types, PKs and FKs from 
 [dependencies]
 serde = { workspace = true }
 tokio-postgres = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+mysql = { version = "25", default-features = false, features = ["minimal-rust"] }

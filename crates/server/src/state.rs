@@ -5,15 +5,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use donat_backend::{AnyDialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
+use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
 pub struct AppState {
-    /// One (url, pool) per source name; the pool is recreated when the
-    /// source's url changes (e.g. replace_metadata pointing 'default'
+    /// One (url, pool) per Postgres source name; the pool is recreated when
+    /// the source's url changes (e.g. replace_metadata pointing 'default'
     /// at a per-test database).
     pub pools: RwLock<HashMap<String, (String, deadpool_postgres::Pool)>>,
+    /// One db path/url per SQLite source name. SQLite uses no pool: the
+    /// runtime opens a `rusqlite::Connection` per query inside
+    /// `spawn_blocking` (see `execute_query_json`).
+    pub sqlite_paths: RwLock<HashMap<String, String>>,
+    /// One connection url per MySQL source name. Like SQLite, MySQL uses no
+    /// pool: the runtime opens a `mysql::Conn` per query inside
+    /// `spawn_blocking` (see `execute_query_json`). The url carries the
+    /// database name, which is also the tracked schema.
+    pub mysql_urls: RwLock<HashMap<String, String>>,
     pub engine: RwLock<Engine>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
@@ -35,6 +47,43 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Failure of a backend read in `execute_query_json`. The caller maps each
+/// variant to the existing GraphQL error body so the Postgres path keeps
+/// byte-for-byte identical error shaping (`Postgres` carries the real
+/// `tokio_postgres::Error` for `db_error_json`).
+pub enum QueryError {
+    NoDefaultSource,
+    Pool(String),
+    Decode(String),
+    Postgres(tokio_postgres::Error),
+    Sqlite(String),
+}
+
+/// Failure of a SQLite mutation in [`AppState::execute_sqlite_mutations`].
+/// The caller maps each variant to the GraphQL error body; `CheckViolation`
+/// reproduces the same `permission-error` shape the Postgres path emits.
+pub enum SqliteMutationError {
+    NoDefaultSource,
+    /// A row failed its insert/update permission check; the transaction was
+    /// rolled back. `path` is the GraphQL error path for the body.
+    CheckViolation { path: String },
+    Sqlite(String),
+    Other(String),
+}
+
+/// Failure of a MySQL mutation in [`AppState::execute_mysql_mutations`]. Like
+/// the SQLite variant, the caller maps each variant to the GraphQL error body;
+/// `CheckViolation` reproduces the same `permission-error` shape Postgres emits.
+pub enum MysqlMutationError {
+    NoDefaultSource,
+    /// A row failed its insert/update permission check; the transaction was
+    /// rolled back. `path` is the GraphQL error path for the body.
+    CheckViolation { path: String },
+    /// A MySQL driver / SQL error (mapped to `data-exception`).
+    Mysql(String),
+    Other(String),
+}
 
 pub struct Engine {
     pub metadata: Metadata,
@@ -86,48 +135,511 @@ impl AppState {
             .map(|(_, p)| p.clone())
     }
 
+    /// The backend kind of the source the GraphQL schema is built against
+    /// (the "default" source, or the first one) — mirrors
+    /// `Engine::default_catalog`'s selection. Defaults to Postgres when no
+    /// source is declared.
+    pub async fn default_source_kind(&self) -> SourceKind {
+        let engine = self.engine.read().await;
+        engine
+            .metadata
+            .sources
+            .iter()
+            .find(|s| s.name == "default")
+            .or_else(|| engine.metadata.sources.first())
+            .map(|s| s.kind)
+            .unwrap_or(SourceKind::Postgres)
+    }
+
+    /// Run a planned read operation against the default source's backend and
+    /// return the assembled JSON `data` object. Dispatches on the source's
+    /// backend kind so the Postgres path is byte-for-byte identical to the
+    /// pre-multi-backend behavior (same SQL, same client call, same error
+    /// shaping — the caller maps `QueryError` back to the existing bodies).
+    pub async fn execute_query_json(&self, roots: &[RootField]) -> Result<Json, QueryError> {
+        match self.default_source_kind().await {
+            SourceKind::Postgres => {
+                let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
+                let pool = self
+                    .default_pool()
+                    .await
+                    .ok_or(QueryError::NoDefaultSource)?;
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|e| QueryError::Pool(e.to_string()))?;
+                let row = client
+                    .query_one(&sql, &[])
+                    .await
+                    .map_err(QueryError::Postgres)?;
+                row.try_get::<_, Json>(0)
+                    .map_err(|e| QueryError::Decode(e.to_string()))
+            }
+            SourceKind::Sqlite => {
+                let sql =
+                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Sqlite(SqliteDialect));
+                let path = {
+                    let paths = self.sqlite_paths.read().await;
+                    paths
+                        .get("default")
+                        .or_else(|| paths.values().next())
+                        .cloned()
+                        .ok_or(QueryError::NoDefaultSource)?
+                };
+                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
+                    let conn = rusqlite::Connection::open(&path)
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    conn.query_row(&sql, [], |r| r.get::<_, String>(0))
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))
+                })
+                .await
+                .map_err(|e| QueryError::Pool(format!("sqlite task panicked: {e}")))??;
+                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+            }
+            SourceKind::Mysql => {
+                use mysql::prelude::Queryable;
+
+                let sql =
+                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Mysql(MySqlDialect));
+                let url = {
+                    let urls = self.mysql_urls.read().await;
+                    urls.get("default")
+                        .or_else(|| urls.values().next())
+                        .cloned()
+                        .ok_or(QueryError::NoDefaultSource)?
+                };
+                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
+                    let mut conn = mysql::Conn::new(url.as_str())
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    // The engine emits Postgres-style `"ident"` quoting; MySQL
+                    // reads double quotes as string literals unless ANSI_QUOTES
+                    // is enabled for the session.
+                    conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    let row: Option<String> = conn
+                        .query_first(&sql)
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    row.ok_or_else(|| QueryError::Sqlite("mysql returned no rows".to_string()))
+                })
+                .await
+                .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
+                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+            }
+        }
+    }
+
+    /// Execute a planned mutation against the default SQLite source.
+    ///
+    /// SQLite forbids DML in a CTE/subquery, so the Postgres "one statement
+    /// assembles the whole response" shape is impossible (see ADR 003). Each
+    /// root is one top-level DML with `RETURNING <node> AS node, <flag> AS
+    /// violated`; this runs them in a transaction, folds the rows into the
+    /// response in Rust, and ROLLs BACK if any row violated its permission
+    /// check — returning [`SqliteMutationError::CheckViolation`] so the caller
+    /// can render the exact permission-error body. The check is computed in
+    /// the same DML and the rollback is in the same transaction, so the
+    /// permission is still enforced atomically (no bypass).
+    pub async fn execute_sqlite_mutations(
+        &self,
+        roots: &[donat_ir::MutationRoot],
+    ) -> Result<Json, SqliteMutationError> {
+        use donat_sqlgen::SqliteMutationPlan;
+
+        // Plan every root up front (alias + SQLite mutation plan), preserving
+        // selection order for the response map.
+        let planned: Vec<(String, SqliteMutationPlan)> = roots
+            .iter()
+            .map(|m| {
+                let alias = match m {
+                    donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Insert { alias, .. }
+                    | donat_ir::MutationRoot::Update { alias, .. }
+                    | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                };
+                (alias, donat_sqlgen::sqlite_mutation_plan(m))
+            })
+            .collect();
+
+        let path = {
+            let paths = self.sqlite_paths.read().await;
+            paths
+                .get("default")
+                .or_else(|| paths.values().next())
+                .cloned()
+                .ok_or(SqliteMutationError::NoDefaultSource)?
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<Json, SqliteMutationError> {
+            let mut conn = rusqlite::Connection::open(&path)
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+
+            let mut data = serde_json::Map::new();
+            for (alias, plan) in &planned {
+                // A `__typename`-only mutation root has no DML.
+                if let Some((_, value)) = &plan.root_typename {
+                    data.insert(alias.clone(), Json::String(value.clone()));
+                    continue;
+                }
+
+                let mut returning: Vec<Json> = vec![];
+                let mut affected_rows: i64 = 0;
+                let mut violated = false;
+                {
+                    let mut stmt = tx
+                        .prepare(&plan.dml_sql)
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                    let mut rows = stmt
+                        .query([])
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                    while let Some(row) = rows
+                        .next()
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?
+                    {
+                        affected_rows += 1;
+                        let node_text: String = row
+                            .get("node")
+                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                        let flag: i64 = row
+                            .get("violated")
+                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                        if flag != 0 {
+                            violated = true;
+                        }
+                        let node: Json = serde_json::from_str(&node_text)
+                            .map_err(|e| SqliteMutationError::Other(e.to_string()))?;
+                        returning.push(node);
+                    }
+                }
+
+                if violated {
+                    // Drop without commit rolls the whole transaction back.
+                    let _ = tx.rollback();
+                    return Err(SqliteMutationError::CheckViolation {
+                        path: plan.check_path.clone(),
+                    });
+                }
+
+                // Assemble this root's response object from the plan's aliases,
+                // mirroring the Postgres `Plan::Mutation` response shape.
+                let mut obj = serde_json::Map::new();
+                if let Some(ret_alias) = &plan.returning_alias {
+                    obj.insert(ret_alias.clone(), Json::Array(returning));
+                }
+                if let Some(ar_alias) = &plan.affected_rows_alias {
+                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
+                }
+                if let Some((tn_alias, tn_value)) = &plan.typename {
+                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                }
+                data.insert(alias.clone(), Json::Object(obj));
+            }
+
+            tx.commit()
+                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+            Ok(Json::Object(data))
+        })
+        .await
+        .map_err(|e| SqliteMutationError::Other(format!("sqlite task panicked: {e}")))?
+    }
+
+    /// Execute a planned mutation against the default MySQL source.
+    ///
+    /// MySQL has no `RETURNING` and read-only CTEs, so the `returning` set is
+    /// recovered with a COMPANION SELECT in the same transaction (ADR 004): for
+    /// insert/update the SELECT runs AFTER the DML; for delete it runs BEFORE.
+    /// `affected_rows` is the DML's row count. The companion SELECT also emits a
+    /// `violated` flag (1 when a row fails its insert/update check); any set flag
+    /// rolls the whole transaction back and yields
+    /// [`MysqlMutationError::CheckViolation`] — the same atomic enforcement the
+    /// Postgres/SQLite paths give.
+    pub async fn execute_mysql_mutations(
+        &self,
+        roots: &[donat_ir::MutationRoot],
+    ) -> Result<Json, MysqlMutationError> {
+        use donat_sqlgen::{MySqlMutationKind, MySqlMutationPlan};
+        use mysql::prelude::Queryable;
+
+        // Plan every root up front (alias + MySQL mutation plan), resolving each
+        // table's primary key from the catalog (the IR mutation does not carry
+        // it, but the insert companion SELECT needs it for last_insert_id()
+        // recovery / the supplied-PK predicate). Preserve selection order.
+        let planned: Vec<(String, MySqlMutationPlan)> = {
+            let engine = self.engine.read().await;
+            let catalog = engine.default_catalog();
+            let pk_of = |t: &donat_ir::Table| -> Vec<String> {
+                catalog
+                    .tables
+                    .get(&format!("{}.{}", t.schema, t.name))
+                    .map(|info| info.primary_key.clone())
+                    .unwrap_or_default()
+            };
+            roots
+                .iter()
+                .map(|m| {
+                    let (alias, pk) = match m {
+                        donat_ir::MutationRoot::Insert { alias, insert } => {
+                            (alias.clone(), pk_of(&insert.table))
+                        }
+                        donat_ir::MutationRoot::Update { alias, update } => {
+                            (alias.clone(), pk_of(&update.table))
+                        }
+                        donat_ir::MutationRoot::Delete { alias, delete } => {
+                            (alias.clone(), pk_of(&delete.table))
+                        }
+                        donat_ir::MutationRoot::FunctionCall { alias, .. }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => {
+                            (alias.clone(), vec![])
+                        }
+                    };
+                    (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
+                })
+                .collect()
+        };
+
+        let url = {
+            let urls = self.mysql_urls.read().await;
+            urls.get("default")
+                .or_else(|| urls.values().next())
+                .cloned()
+                .ok_or(MysqlMutationError::NoDefaultSource)?
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
+            let mut conn = mysql::Conn::new(url.as_str())
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            // The engine emits Postgres-style `"ident"` quoting in the few places
+            // that bypass the dialect; MySQL needs ANSI_QUOTES to read those.
+            // The mutation path itself renders backtick identifiers, but stay
+            // consistent with the read path's session setup.
+            conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            let mut tx = conn
+                .start_transaction(mysql::TxOpts::default())
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+
+            let mut data = serde_json::Map::new();
+            for (alias, plan) in &planned {
+                // A `__typename`-only mutation root has no DML.
+                if let Some((_, value)) = &plan.root_typename {
+                    data.insert(alias.clone(), Json::String(value.clone()));
+                    continue;
+                }
+
+                // Build the companion-SELECT WHERE + ordering of DML vs SELECT
+                // from the recovery strategy.
+                let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
+                    MySqlMutationKind::Insert { pk_col, pk_in_predicate } => {
+                        // INSERT first, then recover the new rows.
+                        tx.query_drop(&plan.dml_sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        let affected = tx.affected_rows() as i64;
+                        let where_clause = match pk_in_predicate {
+                            // Supplied PK: restrict by the exact values.
+                            Some(pred) => pred.clone(),
+                            None => {
+                                // last_insert_id() recovery: requires a single
+                                // AUTO_INCREMENT PK. The N rows occupy
+                                // [last_id, last_id + affected - 1].
+                                let col = pk_col.as_ref().ok_or_else(|| {
+                                    MysqlMutationError::Other(
+                                        "mysql insert returning needs a single \
+                                         auto-increment primary key or supplied pk values"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let last = tx.last_insert_id().unwrap_or(0) as i64;
+                                if affected <= 0 {
+                                    // Nothing inserted: an always-false restriction.
+                                    format!("{col} IS NULL AND {col} IS NOT NULL")
+                                } else {
+                                    let hi = last + affected - 1;
+                                    format!("{col} BETWEEN {last} AND {hi}")
+                                }
+                            }
+                        };
+                        (Some(format!("{} WHERE {where_clause}", plan.companion_select)), affected)
+                    }
+                    MySqlMutationKind::Update { where_clause } => {
+                        // UPDATE first, then re-select by the same predicate.
+                        tx.query_drop(&plan.dml_sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        let affected = tx.affected_rows() as i64;
+                        let sql = match where_clause {
+                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                            None => plan.companion_select.clone(),
+                        };
+                        (Some(sql), affected)
+                    }
+                    MySqlMutationKind::Delete { where_clause } => {
+                        // SELECT first (capture returning), then DELETE.
+                        let sql = match where_clause {
+                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                            None => plan.companion_select.clone(),
+                        };
+                        (Some(sql), 0) // affected filled after the DELETE below.
+                    }
+                    MySqlMutationKind::Typename => (None, 0),
+                };
+
+                // Run the companion SELECT, folding node rows + violated flags.
+                let mut returning: Vec<Json> = vec![];
+                let mut violated = false;
+                let mut captured_rows: i64 = 0;
+                if let Some(sql) = &companion_sql {
+                    let rows: Vec<(String, i64)> = tx
+                        .query(sql)
+                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                    for (node_text, flag) in rows {
+                        captured_rows += 1;
+                        if flag != 0 {
+                            violated = true;
+                        }
+                        let node: Json = serde_json::from_str(&node_text)
+                            .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
+                        returning.push(node);
+                    }
+                }
+
+                // For delete, the DML runs AFTER the capturing SELECT.
+                let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
+                    tx.query_drop(&plan.dml_sql)
+                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                    tx.affected_rows() as i64
+                } else {
+                    affected_rows
+                };
+                let _ = captured_rows;
+
+                if violated {
+                    let _ = tx.rollback();
+                    return Err(MysqlMutationError::CheckViolation {
+                        path: plan.check_path.clone(),
+                    });
+                }
+
+                // Assemble this root's response object from the plan's aliases,
+                // mirroring the Postgres/SQLite `Plan::Mutation` response shape.
+                let mut obj = serde_json::Map::new();
+                if let Some(ret_alias) = &plan.returning_alias {
+                    obj.insert(ret_alias.clone(), Json::Array(returning));
+                }
+                if let Some(ar_alias) = &plan.affected_rows_alias {
+                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
+                }
+                if let Some((tn_alias, tn_value)) = &plan.typename {
+                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                }
+                data.insert(alias.clone(), Json::Object(obj));
+            }
+
+            tx.commit()
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            Ok(Json::Object(data))
+        })
+        .await
+        .map_err(|e| MysqlMutationError::Other(format!("mysql task panicked: {e}")))?
+    }
+
     /// Reconcile pools and catalogs with the current metadata sources,
     /// pruning metadata that refers to dropped objects (run_sql untracks
     /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         // Later same-named sources override earlier ones (the harness
         // appends a second 'default' pointing at a per-test database).
-        let sources: Vec<(String, String)> = {
+        let sources: Vec<(String, SourceKind, String)> = {
             let engine = self.engine.read().await;
-            let mut resolved: Vec<(String, String)> = vec![];
+            let mut resolved: Vec<(String, SourceKind, String)> = vec![];
             for s in &engine.metadata.sources {
                 let url = resolve_source_url(s, &self.default_url);
-                match resolved.iter_mut().find(|(n, _)| n == &s.name) {
-                    Some(entry) => entry.1 = url,
-                    None => resolved.push((s.name.clone(), url)),
+                match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
+                    Some(entry) => {
+                        entry.1 = s.kind;
+                        entry.2 = url;
+                    }
+                    None => resolved.push((s.name.clone(), s.kind, url)),
                 }
             }
             resolved
         };
 
         let mut new_catalogs = HashMap::new();
-        for (name, url) in &sources {
-            let existing = {
-                let pools = self.pools.read().await;
-                pools
-                    .get(name)
-                    .filter(|(u, _)| u == url)
-                    .map(|(_, p)| p.clone())
-            };
-            let pool = match existing {
-                Some(pool) => pool,
-                None => {
-                    let pool = make_pool(url)?;
-                    self.pools
+        for (name, kind, url) in &sources {
+            let catalog = match kind {
+                SourceKind::Postgres => {
+                    let existing = {
+                        let pools = self.pools.read().await;
+                        pools
+                            .get(name)
+                            .filter(|(u, _)| u == url)
+                            .map(|(_, p)| p.clone())
+                    };
+                    let pool = match existing {
+                        Some(pool) => pool,
+                        None => {
+                            let pool = make_pool(url)?;
+                            self.pools
+                                .write()
+                                .await
+                                .insert(name.clone(), (url.clone(), pool.clone()));
+                            pool
+                        }
+                    };
+                    let client = pool.get().await?;
+                    ensure_check_violation_helper(&client).await?;
+                    donat_catalog::introspect(&client).await?
+                }
+                SourceKind::Sqlite => {
+                    // SQLite uses no pool and no PL/pgSQL helper: introspect
+                    // once at boot via a blocking connection, then remember
+                    // the path for per-query connections in
+                    // `execute_query_json`.
+                    let path = url.clone();
+                    let catalog = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<Catalog> {
+                            let conn = rusqlite::Connection::open(&path)?;
+                            Ok(donat_catalog::sqlite_introspect(&conn)?)
+                        },
+                    )
+                    .await??;
+                    self.sqlite_paths
                         .write()
                         .await
-                        .insert(name.clone(), (url.clone(), pool.clone()));
-                    pool
+                        .insert(name.clone(), url.clone());
+                    catalog
+                }
+                SourceKind::Mysql => {
+                    // MySQL uses no pool and no PL/pgSQL helper: introspect once
+                    // at boot via a blocking connection, then remember the url
+                    // for per-query connections in `execute_query_json`. The
+                    // tracked schema is the database name from the url.
+                    let conn_url = url.clone();
+                    let catalog = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<Catalog> {
+                            let opts = mysql::Opts::from_url(&conn_url)?;
+                            let db = opts
+                                .get_db_name()
+                                .map(|s| s.to_string())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "mysql source url has no database name: {conn_url}"
+                                    )
+                                })?;
+                            let mut conn = mysql::Conn::new(opts)?;
+                            Ok(donat_catalog::mysql_introspect(&mut conn, &db)?)
+                        },
+                    )
+                    .await??;
+                    self.mysql_urls
+                        .write()
+                        .await
+                        .insert(name.clone(), url.clone());
+                    catalog
                 }
             };
-            let client = pool.get().await?;
-            ensure_check_violation_helper(&client).await?;
-            let catalog = donat_catalog::introspect(&client).await?;
             new_catalogs.insert(name.clone(), catalog);
         }
 
