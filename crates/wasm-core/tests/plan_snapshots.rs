@@ -219,6 +219,93 @@ fn permission_error_plan_v1() {
     insta::assert_json_snapshot!(plan);
 }
 
+// -----------------------------------------------------------------------
+// Task 3.0: mutation emits event hooks from table event_triggers
+// -----------------------------------------------------------------------
+
+/// Metadata variant that adds an event trigger on `author` (insert only).
+/// Used only in `mutation_emits_event_hook` so that `mutation_plan_v1`
+/// (which uses plain `metadata()`) remains hook-free and the two tests stay
+/// orthogonal.
+fn metadata_with_author_trigger() -> Metadata {
+    serde_json::from_value(serde_json::json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": { "connection_info": { "database_url": "postgres://unused" } },
+            "tables": [
+                {
+                    "table": { "schema": "public", "name": "author" },
+                    "array_relationships": [{
+                        "name": "articles",
+                        "using": { "foreign_key_constraint_on": {
+                            "table": { "schema": "public", "name": "article" },
+                            "column": "author_id"
+                        }}
+                    }],
+                    "insert_permissions": [
+                        { "role": "user", "permission": { "check": {}, "columns": ["name"] } }
+                    ],
+                    "select_permissions": [
+                        { "role": "user", "permission": {
+                            "columns": ["id", "name"],
+                            "filter": { "id": { "_eq": "X-Donat-User-Id" } }
+                        }}
+                    ],
+                    "update_permissions": [
+                        { "role": "user", "permission": { "columns": ["name"], "filter": {} } }
+                    ],
+                    "event_triggers": [
+                        {
+                            "name": "on_author_change",
+                            "definition": {
+                                "insert": { "columns": "*" }
+                            },
+                            "webhook": "http://unused"
+                        }
+                    ]
+                },
+                {
+                    "table": { "schema": "public", "name": "article" },
+                    "object_relationships": [{
+                        "name": "author",
+                        "using": { "foreign_key_constraint_on": "author_id" }
+                    }],
+                    "select_permissions": [
+                        { "role": "user", "permission": {
+                            "columns": "*", "filter": {}, "limit": 100, "allow_aggregations": true
+                        }}
+                    ],
+                    "delete_permissions": [
+                        { "role": "p1", "permission": { "filter": { "published": { "_eq": true } } } },
+                        { "role": "p2", "permission": { "filter": { "published": { "_eq": false } } } }
+                    ]
+                }
+            ]
+        }],
+        "inherited_roles": []
+    }))
+    .expect("metadata_with_author_trigger deserializes")
+}
+
+/// An insert into `author` as role `user` must emit one post-commit Hook for
+/// the `on_author_change` event trigger (INSERT op only).
+#[test]
+fn mutation_emits_event_hook() {
+    let state = CoreState { metadata: metadata_with_author_trigger(), catalog: catalog() };
+    let input = CompileInput {
+        query: r#"mutation { insert_author(objects: [{ name: "Bob" }]) { affected_rows } }"#
+            .to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("user"),
+        stringify_numerics: false,
+    };
+    let plan = compile(&state, &input);
+    insta::assert_json_snapshot!(plan);
+}
+
 /// A request with no x-donat-role must be denied with the exact no-admin
 /// message produced by session_from() (copied from server/gql.rs).
 #[test]

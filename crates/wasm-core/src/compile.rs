@@ -112,28 +112,28 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
 
         // 4b. Mutation: one statement per root, wrapped in a transaction.
         donat_schema::Plan::Mutation(roots) => {
-            let statements = roots
-                .into_iter()
-                .map(|root| {
-                    let alias = match &root {
-                        donat_ir::MutationRoot::FunctionCall { alias, .. }
-                        | donat_ir::MutationRoot::Insert { alias, .. }
-                        | donat_ir::MutationRoot::Update { alias, .. }
-                        | donat_ir::MutationRoot::Delete { alias, .. }
-                        | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
-                    };
-                    Statement {
-                        alias,
-                        sql: donat_sqlgen::mutation_to_sql_opts(&root, input.stringify_numerics),
-                        params: vec![],
-                    }
-                })
-                .collect();
+            let mut statements = Vec::new();
+            let mut hooks = Vec::new();
+            for root in &roots {
+                let alias = match root {
+                    donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Insert { alias, .. }
+                    | donat_ir::MutationRoot::Update { alias, .. }
+                    | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                };
+                statements.push(Statement {
+                    alias,
+                    sql: donat_sqlgen::mutation_to_sql_opts(root, input.stringify_numerics),
+                    params: vec![],
+                });
+                hooks.extend(hooks_for_root(root, &state.metadata));
+            }
             PlanV1::Mutation(PlanBody {
                 version: PLAN_VERSION,
                 transaction: true,
                 statements,
-                hooks: vec![],
+                hooks,
                 error_map: crate::plan::default_error_map(),
             })
         }
@@ -148,4 +148,58 @@ fn error_plan(e: &PlanError) -> PlanV1 {
         path: e.path.clone(),
         message: e.message.clone(),
     })
+}
+
+/// Derive the post-commit hooks a single mutation root should fire.
+///
+/// For each mutation root that targets a table, scan all sources in metadata
+/// for a matching `TableEntry` and collect any `EventTrigger`s whose
+/// definition covers the operation.  `FunctionCall` and `Typename` roots
+/// produce no hooks.
+fn hooks_for_root(
+    root: &donat_ir::MutationRoot,
+    metadata: &donat_metadata::Metadata,
+) -> Vec<crate::plan::Hook> {
+    // Resolve (schema, table, op_string) for this root.
+    let (schema, table, op): (&str, &str, &str) = match root {
+        donat_ir::MutationRoot::Insert { insert, .. } => {
+            (&insert.table.schema, &insert.table.name, "INSERT")
+        }
+        donat_ir::MutationRoot::Update { update, .. } => {
+            (&update.table.schema, &update.table.name, "UPDATE")
+        }
+        donat_ir::MutationRoot::Delete { delete, .. } => {
+            (&delete.table.schema, &delete.table.name, "DELETE")
+        }
+        // FunctionCall and Typename carry no table reference → no hooks.
+        donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::Typename { .. } => return vec![],
+    };
+
+    let mut out = Vec::new();
+    for source in &metadata.sources {
+        for entry in &source.tables {
+            if entry.table.schema() != schema || entry.table.name() != table {
+                continue;
+            }
+            for et in &entry.event_triggers {
+                let covers = match op {
+                    "INSERT" => et.definition.insert.is_some(),
+                    "UPDATE" => et.definition.update.is_some(),
+                    "DELETE" => et.definition.delete.is_some(),
+                    _ => false,
+                };
+                if covers {
+                    out.push(crate::plan::Hook {
+                        phase: "post_commit".into(),
+                        trigger: et.name.clone(),
+                        schema: schema.to_string(),
+                        table: table.to_string(),
+                        op: op.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
