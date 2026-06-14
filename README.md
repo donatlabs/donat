@@ -149,17 +149,17 @@ No resolvers, no event-bus glue, no admin console.
 
 ```mermaid
 flowchart LR
-  subgraph Deploy-time
-    M[SQL migrations] -->|donat migrate| DB[(Postgres)]
-    Y[YAML metadata] -->|donat validate| DB
+  subgraph deploy["Deploy-time"]
+    M["SQL migrations"] -->|donat migrate| DB[("Postgres")]
+    Y["YAML metadata"] -->|donat validate| DB
   end
-  DB --> ENG{{Donat engine}}
+  DB --> ENG{{"Donat engine"}}
   Y --> ENG
-  ENG --> GQL[/v1/graphql + ws]
-  ENG --> REST[/api/rest/]
-  ENG --> MCP[/mcp/]
-  ENG --> EVT[event & cron triggers → webhooks]
-  ENG --> ACT[actions → webhooks]
+  ENG --> GQL["/v1/graphql + ws"]
+  ENG --> REST["/api/rest/"]
+  ENG --> MCP["/mcp"]
+  ENG --> EVT["event & cron triggers → webhooks"]
+  ENG --> ACT["actions → webhooks"]
 ```
 
 A request becomes an intermediate representation (IR), which compiles to **one
@@ -278,12 +278,16 @@ longer feature list.
   cross-check; mixed local+remote root queries remain incomplete.
 - **Event-trigger session-variable capture** and column-filtered payloads.
 
-**Not planned (by design):**
-- **OpenAPI / Swagger export** — not implemented; REST endpoints are declared
-  in YAML.
-- **Admin role / runtime admin API** (`run_sql`, metadata mutation) — a
-  deliberate exclusion, not a gap.
-- **Event streaming** (Kafka/NATS) — delivery is webhook-based.
+**Planned:**
+- **OpenAPI / Swagger export** — generate an OpenAPI document from the declared
+  REST endpoints. Not implemented yet; REST endpoints are declared in YAML
+  today.
+- **Event streaming** — first-class delivery to streaming backends
+  (Kafka/NATS) alongside today's webhook delivery.
+
+> Note: there is intentionally **no admin role and no runtime admin API**
+> (`run_sql`, metadata mutation). That is a permanent design stance, not a
+> roadmap item — see [Security](#security).
 
 ---
 
