@@ -87,6 +87,8 @@ func (c *wasmCore) initState(ctx context.Context, cfgJSON []byte) error {
 	if err != nil {
 		return fmt.Errorf("initState alloc: %w", err)
 	}
+	// Free the input buffer once core_init has consumed it.
+	defer c.dealloc(ctx, ptr, n) //nolint:errcheck
 	if ok := c.mod.Memory().Write(ptr, cfgJSON); !ok {
 		return fmt.Errorf("initState memory write out of range")
 	}
@@ -101,18 +103,20 @@ func (c *wasmCore) initState(ctx context.Context, cfgJSON []byte) error {
 }
 
 // compile sends inputJSON to the wasm core and returns the PlanV1 JSON.
-// The wasm-side buffer is dealloc'd before returning; the returned slice is
-// owned by the caller.
+// Both the input buffer and the wasm-side output buffer are dealloc'd before
+// returning; the returned slice is owned by the caller.
 func (c *wasmCore) compile(ctx context.Context, inputJSON []byte) ([]byte, error) {
 	n := uint32(len(inputJSON))
-	ptr, err := c.alloc(ctx, n)
+	inPtr, err := c.alloc(ctx, n)
 	if err != nil {
 		return nil, fmt.Errorf("compile alloc: %w", err)
 	}
-	if ok := c.mod.Memory().Write(ptr, inputJSON); !ok {
+	// Free the input buffer once core_compile has consumed it (fires at return).
+	defer c.dealloc(ctx, inPtr, n) //nolint:errcheck
+	if ok := c.mod.Memory().Write(inPtr, inputJSON); !ok {
 		return nil, fmt.Errorf("compile memory write out of range")
 	}
-	res, err := c.compileFn.Call(ctx, uint64(ptr), uint64(n))
+	res, err := c.compileFn.Call(ctx, uint64(inPtr), uint64(n))
 	if err != nil {
 		return nil, fmt.Errorf("core_compile call: %w", err)
 	}
@@ -123,11 +127,11 @@ func (c *wasmCore) compile(ctx context.Context, inputJSON []byte) ([]byte, error
 	if !ok {
 		return nil, fmt.Errorf("compile: cannot read output at ptr=%d len=%d", outPtr, outLen)
 	}
-	// Copy the bytes out before dealloc.
+	// Copy the bytes out before dealloc-ing the output buffer.
 	out := make([]byte, outLen)
 	copy(out, data)
 	if err := c.dealloc(ctx, outPtr, outLen); err != nil {
-		return nil, fmt.Errorf("compile dealloc: %w", err)
+		return nil, fmt.Errorf("compile dealloc output: %w", err)
 	}
 	return out, nil
 }

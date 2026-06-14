@@ -22,58 +22,58 @@ func TestEngineRequiresPool(t *testing.T) {
 // Metadata v3 shape mirrors donat_metadata::Metadata; Catalog shape mirrors
 // donat_catalog_types::Catalog (BTreeMap keyed by "schema.table").
 func fixtureMetaCatalog() []byte {
-	v := map[string]interface{}{
-		"metadata": map[string]interface{}{
+	v := map[string]any{
+		"metadata": map[string]any{
 			"version": 3,
-			"sources": []interface{}{
-				map[string]interface{}{
+			"sources": []any{
+				map[string]any{
 					"name":          "default",
 					"kind":          "postgres",
-					"configuration": map[string]interface{}{"connection_info": map[string]interface{}{"database_url": "postgres://unused"}},
-					"tables": []interface{}{
-						map[string]interface{}{
-							"table": map[string]interface{}{"schema": "public", "name": "author"},
-							"array_relationships": []interface{}{
-								map[string]interface{}{
+					"configuration": map[string]any{"connection_info": map[string]any{"database_url": "postgres://unused"}},
+					"tables": []any{
+						map[string]any{
+							"table": map[string]any{"schema": "public", "name": "author"},
+							"array_relationships": []any{
+								map[string]any{
 									"name": "articles",
-									"using": map[string]interface{}{
-										"foreign_key_constraint_on": map[string]interface{}{
-											"table":  map[string]interface{}{"schema": "public", "name": "article"},
+									"using": map[string]any{
+										"foreign_key_constraint_on": map[string]any{
+											"table":  map[string]any{"schema": "public", "name": "article"},
 											"column": "author_id",
 										},
 									},
 								},
 							},
-							"insert_permissions": []interface{}{
-								map[string]interface{}{"role": "user", "permission": map[string]interface{}{"check": map[string]interface{}{}, "columns": []interface{}{"name"}}},
+							"insert_permissions": []any{
+								map[string]any{"role": "user", "permission": map[string]any{"check": map[string]any{}, "columns": []any{"name"}}},
 							},
-							"select_permissions": []interface{}{
-								map[string]interface{}{
+							"select_permissions": []any{
+								map[string]any{
 									"role": "user",
-									"permission": map[string]interface{}{
-										"columns": []interface{}{"id", "name"},
-										"filter":  map[string]interface{}{"id": map[string]interface{}{"_eq": "X-Donat-User-Id"}},
+									"permission": map[string]any{
+										"columns": []any{"id", "name"},
+										"filter":  map[string]any{"id": map[string]any{"_eq": "X-Donat-User-Id"}},
 									},
 								},
 							},
-							"update_permissions": []interface{}{
-								map[string]interface{}{"role": "user", "permission": map[string]interface{}{"columns": []interface{}{"name"}, "filter": map[string]interface{}{}}},
+							"update_permissions": []any{
+								map[string]any{"role": "user", "permission": map[string]any{"columns": []any{"name"}, "filter": map[string]any{}}},
 							},
 						},
-						map[string]interface{}{
-							"table": map[string]interface{}{"schema": "public", "name": "article"},
-							"object_relationships": []interface{}{
-								map[string]interface{}{
+						map[string]any{
+							"table": map[string]any{"schema": "public", "name": "article"},
+							"object_relationships": []any{
+								map[string]any{
 									"name":  "author",
-									"using": map[string]interface{}{"foreign_key_constraint_on": "author_id"},
+									"using": map[string]any{"foreign_key_constraint_on": "author_id"},
 								},
 							},
-							"select_permissions": []interface{}{
-								map[string]interface{}{
+							"select_permissions": []any{
+								map[string]any{
 									"role": "user",
-									"permission": map[string]interface{}{
+									"permission": map[string]any{
 										"columns":            "*",
-										"filter":             map[string]interface{}{},
+										"filter":             map[string]any{},
 										"limit":              100,
 										"allow_aggregations": true,
 									},
@@ -83,42 +83,42 @@ func fixtureMetaCatalog() []byte {
 					},
 				},
 			},
-			"inherited_roles": []interface{}{},
+			"inherited_roles": []any{},
 		},
-		"catalog": map[string]interface{}{
-			"tables": map[string]interface{}{
-				"public.author": map[string]interface{}{
+		"catalog": map[string]any{
+			"tables": map[string]any{
+				"public.author": map[string]any{
 					"schema": "public",
 					"name":   "author",
-					"columns": []interface{}{
-						map[string]interface{}{"name": "id", "pg_type": "int4", "nullable": false, "has_default": false},
-						map[string]interface{}{"name": "name", "pg_type": "text", "nullable": false, "has_default": false},
-						map[string]interface{}{"name": "secret", "pg_type": "text", "nullable": false, "has_default": false},
+					"columns": []any{
+						map[string]any{"name": "id", "pg_type": "int4", "nullable": false, "has_default": false},
+						map[string]any{"name": "name", "pg_type": "text", "nullable": false, "has_default": false},
+						map[string]any{"name": "secret", "pg_type": "text", "nullable": false, "has_default": false},
 					},
-					"primary_key":  []interface{}{"id"},
-					"foreign_keys": []interface{}{},
+					"primary_key":  []any{"id"},
+					"foreign_keys": []any{},
 				},
-				"public.article": map[string]interface{}{
+				"public.article": map[string]any{
 					"schema": "public",
 					"name":   "article",
-					"columns": []interface{}{
-						map[string]interface{}{"name": "id", "pg_type": "int4", "nullable": false, "has_default": false},
-						map[string]interface{}{"name": "title", "pg_type": "text", "nullable": false, "has_default": false},
-						map[string]interface{}{"name": "author_id", "pg_type": "int4", "nullable": false, "has_default": false},
-						map[string]interface{}{"name": "published", "pg_type": "bool", "nullable": false, "has_default": false},
+					"columns": []any{
+						map[string]any{"name": "id", "pg_type": "int4", "nullable": false, "has_default": false},
+						map[string]any{"name": "title", "pg_type": "text", "nullable": false, "has_default": false},
+						map[string]any{"name": "author_id", "pg_type": "int4", "nullable": false, "has_default": false},
+						map[string]any{"name": "published", "pg_type": "bool", "nullable": false, "has_default": false},
 					},
-					"primary_key": []interface{}{"id"},
-					"foreign_keys": []interface{}{
-						map[string]interface{}{
+					"primary_key": []any{"id"},
+					"foreign_keys": []any{
+						map[string]any{
 							"constraint_name":   "article_author_id_fkey",
-							"column_mapping":    map[string]interface{}{"author_id": "id"},
+							"column_mapping":    map[string]any{"author_id": "id"},
 							"referenced_schema": "public",
 							"referenced_table":  "author",
 						},
 					},
 				},
 			},
-			"functions": map[string]interface{}{},
+			"functions": map[string]any{},
 		},
 	}
 	b, err := json.Marshal(v)
