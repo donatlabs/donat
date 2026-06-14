@@ -548,18 +548,19 @@ pub async fn execute_full(
                     Err(e) => ok(sqlite_mutation_error_json(e)),
                 };
             }
-            // MySQL has no `RETURNING`, so the in-DB-assembled mutation shape
-            // is not yet supported. Queries work; mutations are guarded with a
-            // clear error rather than emitting Postgres SQL against MySQL.
+            // MySQL has no `RETURNING` and read-only CTEs, so it has its own
+            // executor too: each root runs a DML plus a COMPANION SELECT in one
+            // transaction to recover `returning`, rolling back on a check
+            // violation (see ADR 004). The Postgres path below is unchanged.
             if matches!(
                 state.default_source_kind().await,
                 donat_metadata::SourceKind::Mysql
             ) {
                 drop(engine);
-                return ok(error_json(
-                    "not-supported",
-                    "mutations are not yet supported on mysql sources",
-                ));
+                return match state.execute_mysql_mutations(&roots).await {
+                    Ok(data) => ok(json!({ "data": data })),
+                    Err(e) => ok(mysql_mutation_error_json(e)),
+                };
             }
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
@@ -931,6 +932,24 @@ fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
             }]
         }),
         E::Sqlite(msg) => error_json("data-exception", msg),
+        E::Other(msg) => error_json("unexpected", msg),
+    }
+}
+
+/// Map a MySQL mutation failure to the GraphQL error body. `CheckViolation`
+/// reproduces the exact `permission-error` shape the Postgres/SQLite paths
+/// produce, so a violated check looks identical regardless of backend.
+fn mysql_mutation_error_json(e: crate::state::MysqlMutationError) -> Json {
+    use crate::state::MysqlMutationError as E;
+    match e {
+        E::NoDefaultSource => error_json("unexpected", "no default source"),
+        E::CheckViolation { path } => json!({
+            "errors": [{
+                "extensions": { "path": path, "code": "permission-error" },
+                "message": "check constraint of an insert/update permission has failed"
+            }]
+        }),
+        E::Mysql(msg) => error_json("data-exception", msg),
         E::Other(msg) => error_json("unexpected", msg),
     }
 }

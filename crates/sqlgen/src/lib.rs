@@ -1166,23 +1166,31 @@ impl Ctx {
 
     /// Build a `json_object(...)` over the requested returning fields using
     /// BARE column names. Only column / typename leaves are expressible in a
-    /// SQLite top-level RETURNING; nested relationships/computed/aggregate
-    /// fields cannot be (they require correlated subqueries the grammar
-    /// rejects), so they are refused explicitly.
+    /// SQLite top-level RETURNING (and in a MySQL companion SELECT); nested
+    /// relationships/computed/aggregate fields cannot be (they require
+    /// correlated subqueries the SQLite grammar rejects / the carve-out does not
+    /// model), so they are refused explicitly. Quoting goes through the active
+    /// dialect: the SQLite dialect's identifier/literal syntax is byte-identical
+    /// to the free `quote_ident`/`quote_lit`, so the SQLite output is unchanged,
+    /// while MySQL gets its backtick-quoted identifiers.
     fn sqlite_node_json(&mut self, fields: &[OutputField]) -> String {
+        use donat_backend::Dialect;
         let dialect = self.dialect;
         let pairs: Vec<(String, String)> = fields
             .iter()
             .map(|f| {
                 let value = match &f.value {
-                    FieldValue::Column { column, .. } => quote_ident(column),
+                    FieldValue::Column { column, .. } => dialect.quote_ident(column),
                     FieldValue::ColumnGuarded { column, guard, .. } => {
                         let cond = self.sqlite_bare_bool(guard);
-                        format!("CASE WHEN {cond} THEN {} ELSE NULL END", quote_ident(column))
+                        format!(
+                            "CASE WHEN {cond} THEN {} ELSE NULL END",
+                            dialect.quote_ident(column)
+                        )
                     }
-                    FieldValue::Typename { value } => quote_lit(value),
+                    FieldValue::Typename { value } => dialect.quote_literal(value),
                     other => panic!(
-                        "field {:?} is not expressible in a sqlite top-level RETURNING",
+                        "field {:?} is not expressible in a sqlite/mysql bare RETURNING",
                         std::mem::discriminant(other)
                     ),
                 };
@@ -1193,11 +1201,14 @@ impl Ctx {
     }
 
     /// Render a permission BoolExp over BARE column names for use inside a
-    /// SQLite RETURNING `CASE`. Covers the connectives plus the scalar
-    /// comparison operators a permission check uses; constructs that need an
-    /// alias-qualified subquery (relationship/exists/computed/column-to-column)
-    /// are rejected — a SQLite check carve-out does not support them.
+    /// SQLite RETURNING `CASE` (or a MySQL companion-SELECT `CASE`). Covers the
+    /// connectives plus the scalar comparison operators a permission check uses;
+    /// constructs that need an alias-qualified subquery
+    /// (relationship/exists/computed/column-to-column) are rejected — this
+    /// carve-out does not support them. Identifier/literal quoting goes through
+    /// the active dialect (byte-identical for SQLite, backticks for MySQL).
     fn sqlite_bare_bool(&mut self, exp: &BoolExp) -> String {
+        use donat_backend::Dialect;
         let dialect = self.dialect;
         match exp {
             BoolExp::And(exps) => {
@@ -1218,7 +1229,7 @@ impl Ctx {
             }
             BoolExp::Not(inner) => format!("(NOT {})", self.sqlite_bare_bool(inner)),
             BoolExp::Compare { column, pg_type, op } => {
-                let col = quote_ident(column);
+                let col = dialect.quote_ident(column);
                 let lit = |s: &Scalar| scalar_sql(&dialect, s, pg_type);
                 match op {
                     CompareOp::Eq(v) => format!("{col} = {}", lit(v)),
@@ -1258,6 +1269,324 @@ impl Ctx {
                 std::mem::discriminant(other)
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// MySQL mutation path (companion SELECT, see ADR 004)
+// ---------------------------------------------------------------------
+
+/// How the MySQL executor recovers the `returning` set for a mutation root and
+/// how it orders the DML vs. the companion SELECT. MySQL has no `RETURNING`, so
+/// every variant pairs the DML with a companion `SELECT` whose `WHERE` the
+/// executor builds at runtime (the executor knows `last_insert_id()` /
+/// `affected_rows`, which sqlgen cannot).
+#[derive(Debug, Clone)]
+pub enum MySqlMutationKind {
+    /// `INSERT`, then companion SELECT recovering the new rows. When the insert
+    /// supplied the PK column(s), `pk_in_predicate` restricts the SELECT to the
+    /// supplied values; otherwise the executor restricts by the
+    /// `last_insert_id()` range over a single AUTO_INCREMENT PK (`pk_col`).
+    Insert {
+        /// Backtick-quoted PK column, used for the `last_insert_id()`-range
+        /// `WHERE` when the insert omitted the PK (auto-increment recovery).
+        pk_col: Option<String>,
+        /// `<pk> IN (..)` predicate when the insert explicitly supplied the
+        /// single PK column; the executor uses it verbatim as the companion
+        /// `WHERE` and skips `last_insert_id()` recovery.
+        pk_in_predicate: Option<String>,
+    },
+    /// `UPDATE ... WHERE <pred>`, then re-`SELECT ... WHERE <pred>`.
+    Update { where_clause: Option<String> },
+    /// `SELECT ... WHERE <pred>` FIRST (capture returning), then
+    /// `DELETE ... WHERE <pred>`.
+    Delete { where_clause: Option<String> },
+    /// A `__typename`-only mutation root: no DML, no companion SELECT.
+    Typename,
+}
+
+/// A planned MySQL mutation: the DML statement plus the companion SELECT that
+/// recovers `returning` + the permission-`violated` flag (MySQL has no
+/// `RETURNING`; see ADR 004). The executor runs these inside one transaction,
+/// builds the companion `WHERE` from `kind` + runtime row-counts/ids, folds the
+/// rows into the response, and rolls back if any row's `violated` flag is set.
+#[derive(Debug, Clone)]
+pub struct MySqlMutationPlan {
+    /// The single DML to execute (`INSERT`/`UPDATE`/`DELETE`), no trailing
+    /// `RETURNING` (MySQL has none). Empty for a `__typename` root.
+    pub dml_sql: String,
+    /// The companion `SELECT <node> AS node, <flag> AS violated FROM `s`.`t``,
+    /// WITHOUT the trailing `WHERE` — the executor appends the restriction it
+    /// derives from `kind`. Empty for a `__typename` root.
+    pub companion_select: String,
+    /// Recovery strategy + companion-`WHERE` building blocks.
+    pub kind: MySqlMutationKind,
+    /// Response key for the `returning` array, when selected.
+    pub returning_alias: Option<String>,
+    /// Response key for `affected_rows`, when selected.
+    pub affected_rows_alias: Option<String>,
+    /// `(alias, value)` for a `__typename` field on the mutation response.
+    pub typename: Option<(String, String)>,
+    /// `(alias, value)` when the root is a `__typename` mutation root itself.
+    pub root_typename: Option<(String, String)>,
+    /// Error path reported on a check violation.
+    pub check_path: String,
+}
+
+/// Build the [`MySqlMutationPlan`] for an insert/update/delete mutation root.
+/// `pk` is the table's primary-key column names (from the catalog) — needed for
+/// `last_insert_id()` recovery and for the supplied-PK `IN` predicate, which
+/// the IR mutation does not carry. `on_conflict` is DEFERRED on MySQL (ADR 004)
+/// and triggers a panic by design; the planner does not surface it on this path.
+pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationPlan {
+    use donat_backend::Dialect;
+    let dialect = donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect);
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics: false, dialect };
+    match root {
+        MutationRoot::Typename { value, .. } => MySqlMutationPlan {
+            dml_sql: String::new(),
+            companion_select: String::new(),
+            kind: MySqlMutationKind::Typename,
+            returning_alias: None,
+            affected_rows_alias: None,
+            typename: None,
+            root_typename: Some((String::new(), value.clone())),
+            check_path: "$".into(),
+        },
+        MutationRoot::FunctionCall { .. } => {
+            panic!("volatile function mutations are not supported on mysql")
+        }
+        MutationRoot::Insert { insert, .. } => {
+            assert!(
+                insert.on_conflict.is_none(),
+                "on_conflict is not yet supported on mysql mutations"
+            );
+            let table = format!(
+                "{}.{}",
+                dialect.quote_ident(&insert.table.schema),
+                dialect.quote_ident(&insert.table.name)
+            );
+            let cols: Vec<String> = insert
+                .columns
+                .iter()
+                .map(|(name, _)| dialect.quote_ident(name))
+                .collect();
+            let rows: Vec<String> = insert
+                .rows
+                .iter()
+                .map(|row| {
+                    let values: Vec<String> = row
+                        .iter()
+                        .zip(&insert.columns)
+                        .map(|(v, (_, pg_type))| match v {
+                            None => "DEFAULT".to_string(),
+                            Some(s) => scalar_sql(&dialect, s, pg_type),
+                        })
+                        .collect();
+                    format!("({})", values.join(", "))
+                })
+                .collect();
+            let dml = format!(
+                "INSERT INTO {table} ({}) VALUES {}",
+                cols.join(", "),
+                rows.join(", ")
+            );
+
+            // Recovery: supplied single PK -> IN (values); else last_insert_id().
+            let single_pk = if pk.len() == 1 { Some(&pk[0]) } else { None };
+            let pk_col = single_pk.map(|c| dialect.quote_ident(c));
+            // Which IR column index, if any, holds the (single) PK?
+            let pk_idx = single_pk.and_then(|pkname| {
+                insert.columns.iter().position(|(name, _)| name == pkname)
+            });
+            // A supplied-PK IN predicate is usable only when every row gave a
+            // non-DEFAULT value for that PK column.
+            let pk_in_predicate = match (pk_col.as_ref(), pk_idx) {
+                (Some(col), Some(idx)) => {
+                    let mut vals = Vec::with_capacity(insert.rows.len());
+                    let mut all_present = true;
+                    for row in &insert.rows {
+                        match &row[idx] {
+                            Some(s) => {
+                                let (_, ty) = &insert.columns[idx];
+                                vals.push(scalar_sql(&dialect, s, ty));
+                            }
+                            None => {
+                                all_present = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_present && !vals.is_empty() {
+                        Some(format!("{col} IN ({})", vals.join(", ")))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let companion = ctx.mysql_companion_select(
+                &table,
+                insert.check.as_ref(),
+                &insert.output,
+            );
+            MySqlMutationPlan {
+                dml_sql: dml,
+                companion_select: companion.select,
+                kind: MySqlMutationKind::Insert { pk_col, pk_in_predicate },
+                returning_alias: companion.returning_alias,
+                affected_rows_alias: companion.affected_rows_alias,
+                typename: companion.typename,
+                root_typename: None,
+                check_path: insert.check_path.clone(),
+            }
+        }
+        MutationRoot::Update { update, .. } => {
+            let table = format!(
+                "{}.{}",
+                dialect.quote_ident(&update.table.schema),
+                dialect.quote_ident(&update.table.name)
+            );
+            let sets: Vec<String> = update
+                .sets
+                .iter()
+                .map(|s| match s {
+                    SetOp::Set { column, pg_type, value } => format!(
+                        "{} = {}",
+                        dialect.quote_ident(column),
+                        scalar_sql(&dialect, value, pg_type)
+                    ),
+                    SetOp::Inc { column, pg_type, value } => format!(
+                        "{} = {} + {}",
+                        dialect.quote_ident(column),
+                        dialect.quote_ident(column),
+                        scalar_sql(&dialect, value, pg_type)
+                    ),
+                })
+                .collect();
+            // The predicate is rendered over BARE columns so it is valid both in
+            // the unaliased UPDATE and in the companion SELECT.
+            let where_clause = update
+                .predicate
+                .as_ref()
+                .map(|p| ctx.mysql_bare_bool(p));
+            let mut dml = format!("UPDATE {table} SET {}", sets.join(", "));
+            if let Some(w) = &where_clause {
+                dml.push_str(&format!(" WHERE {w}"));
+            }
+            let companion = ctx.mysql_companion_select(
+                &table,
+                update.check.as_ref(),
+                &update.output,
+            );
+            MySqlMutationPlan {
+                dml_sql: dml,
+                companion_select: companion.select,
+                kind: MySqlMutationKind::Update { where_clause },
+                returning_alias: companion.returning_alias,
+                affected_rows_alias: companion.affected_rows_alias,
+                typename: companion.typename,
+                root_typename: None,
+                check_path: update.check_path.clone(),
+            }
+        }
+        MutationRoot::Delete { delete, .. } => {
+            let table = format!(
+                "{}.{}",
+                dialect.quote_ident(&delete.table.schema),
+                dialect.quote_ident(&delete.table.name)
+            );
+            let where_clause = delete
+                .predicate
+                .as_ref()
+                .map(|p| ctx.mysql_bare_bool(p));
+            let mut dml = format!("DELETE FROM {table}");
+            if let Some(w) = &where_clause {
+                dml.push_str(&format!(" WHERE {w}"));
+            }
+            let companion = ctx.mysql_companion_select(&table, None, &delete.output);
+            MySqlMutationPlan {
+                dml_sql: dml,
+                companion_select: companion.select,
+                kind: MySqlMutationKind::Delete { where_clause },
+                returning_alias: companion.returning_alias,
+                affected_rows_alias: companion.affected_rows_alias,
+                typename: companion.typename,
+                root_typename: None,
+                check_path: "$".into(),
+            }
+        }
+    }
+}
+
+/// Intermediate result of [`Ctx::mysql_companion_select`].
+struct MySqlCompanion {
+    select: String,
+    returning_alias: Option<String>,
+    affected_rows_alias: Option<String>,
+    typename: Option<(String, String)>,
+}
+
+impl Ctx {
+    /// Build the companion `SELECT <node> AS node, <violated> AS violated FROM
+    /// <table>` (no `WHERE`; the executor appends the restriction). Reuses the
+    /// BARE-column renderers (`sqlite_node_json` / `sqlite_bare_bool`) — the
+    /// MySQL companion SELECT references columns by bare name exactly like a
+    /// SQLite RETURNING — under the MySQL dialect (backtick quoting,
+    /// `JSON_OBJECT`).
+    fn mysql_companion_select(
+        &mut self,
+        table: &str,
+        check: Option<&BoolExp>,
+        output: &MutationOutput,
+    ) -> MySqlCompanion {
+        let mut returning_alias = None;
+        let mut affected_rows_alias = None;
+        let mut typename = None;
+        let node_fields: Vec<OutputField> = match output {
+            MutationOutput::Response(fields) => {
+                let mut node_fields = vec![];
+                for f in fields {
+                    match f {
+                        MutationResponseField::AffectedRows { alias } => {
+                            affected_rows_alias = Some(alias.clone());
+                        }
+                        MutationResponseField::Typename { alias, value } => {
+                            typename = Some((alias.clone(), value.clone()));
+                        }
+                        MutationResponseField::Returning { alias, fields } => {
+                            returning_alias = Some(alias.clone());
+                            node_fields = fields.clone();
+                        }
+                    }
+                }
+                node_fields
+            }
+            MutationOutput::SingleRow(fields) => {
+                returning_alias = Some("returning".to_string());
+                fields.clone()
+            }
+        };
+        let node_expr = self.sqlite_node_json(&node_fields);
+        let violated = match check {
+            Some(check) => {
+                format!("CASE WHEN NOT ({}) THEN 1 ELSE 0 END", self.sqlite_bare_bool(check))
+            }
+            None => "0".to_string(),
+        };
+        MySqlCompanion {
+            select: format!("SELECT {node_expr} AS node, {violated} AS violated FROM {table}"),
+            returning_alias,
+            affected_rows_alias,
+            typename,
+        }
+    }
+
+    /// Alias for [`Ctx::sqlite_bare_bool`] used by the MySQL update/delete
+    /// predicate: the same bare-column rendering, under the MySQL dialect.
+    fn mysql_bare_bool(&mut self, exp: &BoolExp) -> String {
+        self.sqlite_bare_bool(exp)
     }
 }
 

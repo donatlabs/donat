@@ -72,6 +72,19 @@ pub enum SqliteMutationError {
     Other(String),
 }
 
+/// Failure of a MySQL mutation in [`AppState::execute_mysql_mutations`]. Like
+/// the SQLite variant, the caller maps each variant to the GraphQL error body;
+/// `CheckViolation` reproduces the same `permission-error` shape Postgres emits.
+pub enum MysqlMutationError {
+    NoDefaultSource,
+    /// A row failed its insert/update permission check; the transaction was
+    /// rolled back. `path` is the GraphQL error path for the body.
+    CheckViolation { path: String },
+    /// A MySQL driver / SQL error (mapped to `data-exception`).
+    Mysql(String),
+    Other(String),
+}
+
 pub struct Engine {
     pub metadata: Metadata,
     /// Catalog snapshot per source name.
@@ -331,6 +344,204 @@ impl AppState {
         })
         .await
         .map_err(|e| SqliteMutationError::Other(format!("sqlite task panicked: {e}")))?
+    }
+
+    /// Execute a planned mutation against the default MySQL source.
+    ///
+    /// MySQL has no `RETURNING` and read-only CTEs, so the `returning` set is
+    /// recovered with a COMPANION SELECT in the same transaction (ADR 004): for
+    /// insert/update the SELECT runs AFTER the DML; for delete it runs BEFORE.
+    /// `affected_rows` is the DML's row count. The companion SELECT also emits a
+    /// `violated` flag (1 when a row fails its insert/update check); any set flag
+    /// rolls the whole transaction back and yields
+    /// [`MysqlMutationError::CheckViolation`] — the same atomic enforcement the
+    /// Postgres/SQLite paths give.
+    pub async fn execute_mysql_mutations(
+        &self,
+        roots: &[donat_ir::MutationRoot],
+    ) -> Result<Json, MysqlMutationError> {
+        use donat_sqlgen::{MySqlMutationKind, MySqlMutationPlan};
+        use mysql::prelude::Queryable;
+
+        // Plan every root up front (alias + MySQL mutation plan), resolving each
+        // table's primary key from the catalog (the IR mutation does not carry
+        // it, but the insert companion SELECT needs it for last_insert_id()
+        // recovery / the supplied-PK predicate). Preserve selection order.
+        let planned: Vec<(String, MySqlMutationPlan)> = {
+            let engine = self.engine.read().await;
+            let catalog = engine.default_catalog();
+            let pk_of = |t: &donat_ir::Table| -> Vec<String> {
+                catalog
+                    .tables
+                    .get(&format!("{}.{}", t.schema, t.name))
+                    .map(|info| info.primary_key.clone())
+                    .unwrap_or_default()
+            };
+            roots
+                .iter()
+                .map(|m| {
+                    let (alias, pk) = match m {
+                        donat_ir::MutationRoot::Insert { alias, insert } => {
+                            (alias.clone(), pk_of(&insert.table))
+                        }
+                        donat_ir::MutationRoot::Update { alias, update } => {
+                            (alias.clone(), pk_of(&update.table))
+                        }
+                        donat_ir::MutationRoot::Delete { alias, delete } => {
+                            (alias.clone(), pk_of(&delete.table))
+                        }
+                        donat_ir::MutationRoot::FunctionCall { alias, .. }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => {
+                            (alias.clone(), vec![])
+                        }
+                    };
+                    (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
+                })
+                .collect()
+        };
+
+        let url = {
+            let urls = self.mysql_urls.read().await;
+            urls.get("default")
+                .or_else(|| urls.values().next())
+                .cloned()
+                .ok_or(MysqlMutationError::NoDefaultSource)?
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
+            let mut conn = mysql::Conn::new(url.as_str())
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            // The engine emits Postgres-style `"ident"` quoting in the few places
+            // that bypass the dialect; MySQL needs ANSI_QUOTES to read those.
+            // The mutation path itself renders backtick identifiers, but stay
+            // consistent with the read path's session setup.
+            conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            let mut tx = conn
+                .start_transaction(mysql::TxOpts::default())
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+
+            let mut data = serde_json::Map::new();
+            for (alias, plan) in &planned {
+                // A `__typename`-only mutation root has no DML.
+                if let Some((_, value)) = &plan.root_typename {
+                    data.insert(alias.clone(), Json::String(value.clone()));
+                    continue;
+                }
+
+                // Build the companion-SELECT WHERE + ordering of DML vs SELECT
+                // from the recovery strategy.
+                let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
+                    MySqlMutationKind::Insert { pk_col, pk_in_predicate } => {
+                        // INSERT first, then recover the new rows.
+                        tx.query_drop(&plan.dml_sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        let affected = tx.affected_rows() as i64;
+                        let where_clause = match pk_in_predicate {
+                            // Supplied PK: restrict by the exact values.
+                            Some(pred) => pred.clone(),
+                            None => {
+                                // last_insert_id() recovery: requires a single
+                                // AUTO_INCREMENT PK. The N rows occupy
+                                // [last_id, last_id + affected - 1].
+                                let col = pk_col.as_ref().ok_or_else(|| {
+                                    MysqlMutationError::Other(
+                                        "mysql insert returning needs a single \
+                                         auto-increment primary key or supplied pk values"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let last = tx.last_insert_id().unwrap_or(0) as i64;
+                                if affected <= 0 {
+                                    // Nothing inserted: an always-false restriction.
+                                    format!("{col} IS NULL AND {col} IS NOT NULL")
+                                } else {
+                                    let hi = last + affected - 1;
+                                    format!("{col} BETWEEN {last} AND {hi}")
+                                }
+                            }
+                        };
+                        (Some(format!("{} WHERE {where_clause}", plan.companion_select)), affected)
+                    }
+                    MySqlMutationKind::Update { where_clause } => {
+                        // UPDATE first, then re-select by the same predicate.
+                        tx.query_drop(&plan.dml_sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        let affected = tx.affected_rows() as i64;
+                        let sql = match where_clause {
+                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                            None => plan.companion_select.clone(),
+                        };
+                        (Some(sql), affected)
+                    }
+                    MySqlMutationKind::Delete { where_clause } => {
+                        // SELECT first (capture returning), then DELETE.
+                        let sql = match where_clause {
+                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                            None => plan.companion_select.clone(),
+                        };
+                        (Some(sql), 0) // affected filled after the DELETE below.
+                    }
+                    MySqlMutationKind::Typename => (None, 0),
+                };
+
+                // Run the companion SELECT, folding node rows + violated flags.
+                let mut returning: Vec<Json> = vec![];
+                let mut violated = false;
+                let mut captured_rows: i64 = 0;
+                if let Some(sql) = &companion_sql {
+                    let rows: Vec<(String, i64)> = tx
+                        .query(sql)
+                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                    for (node_text, flag) in rows {
+                        captured_rows += 1;
+                        if flag != 0 {
+                            violated = true;
+                        }
+                        let node: Json = serde_json::from_str(&node_text)
+                            .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
+                        returning.push(node);
+                    }
+                }
+
+                // For delete, the DML runs AFTER the capturing SELECT.
+                let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
+                    tx.query_drop(&plan.dml_sql)
+                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                    tx.affected_rows() as i64
+                } else {
+                    affected_rows
+                };
+                let _ = captured_rows;
+
+                if violated {
+                    let _ = tx.rollback();
+                    return Err(MysqlMutationError::CheckViolation {
+                        path: plan.check_path.clone(),
+                    });
+                }
+
+                // Assemble this root's response object from the plan's aliases,
+                // mirroring the Postgres/SQLite `Plan::Mutation` response shape.
+                let mut obj = serde_json::Map::new();
+                if let Some(ret_alias) = &plan.returning_alias {
+                    obj.insert(ret_alias.clone(), Json::Array(returning));
+                }
+                if let Some(ar_alias) = &plan.affected_rows_alias {
+                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
+                }
+                if let Some((tn_alias, tn_value)) = &plan.typename {
+                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                }
+                data.insert(alias.clone(), Json::Object(obj));
+            }
+
+            tx.commit()
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            Ok(Json::Object(data))
+        })
+        .await
+        .map_err(|e| MysqlMutationError::Other(format!("mysql task panicked: {e}")))?
     }
 
     /// Reconcile pools and catalogs with the current metadata sources,
