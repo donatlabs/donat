@@ -188,10 +188,10 @@ curl http://localhost:8080/healthz
 var coreConfig []byte
 
 eng, err := donat.New(ctx, donat.Config{
-    Pool:     pool,       // your pgxpool.Pool
-    Metadata: coreConfig, // pre-serialised metadata+catalog snapshot
-    Registry: reg,        // in-process event handler registry
-    PoolSize: 4,          // wasm instance pool
+    Backend:  donat.Postgres(pool), // your database, behind the Backend interface
+    Metadata: coreConfig,           // pre-serialised metadata+catalog snapshot
+    Registry: reg,                  // in-process event handler registry
+    PoolSize: 4,                    // wasm instance pool
 })
 ```
 

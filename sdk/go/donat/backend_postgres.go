@@ -17,6 +17,13 @@ type postgresBackend struct {
 	pool *pgxpool.Pool
 }
 
+// Compile-time checks that the postgres backend satisfies both the core
+// Backend interface and the optional txRunner (ExecuteTx) capability.
+var (
+	_ Backend  = (*postgresBackend)(nil)
+	_ txRunner = (*postgresBackend)(nil)
+)
+
 // Postgres returns a Backend backed by the supplied pgxpool.Pool.
 // The pool is caller-owned and must outlive the Engine.
 func Postgres(pool *pgxpool.Pool) Backend {
@@ -76,14 +83,20 @@ func (b *postgresBackend) MapError(err error, errorMap map[string]string) []byte
 // caller-provided pgx.Tx. Neither commit nor rollback is issued — that is the
 // caller's responsibility. Returns the per-alias data map or a driver error.
 func (b *postgresBackend) runMutationTx(ctx context.Context, tx any, plan Plan) (map[string]json.RawMessage, error) {
-	pgxTx := tx.(pgx.Tx)
+	pgxTx, ok := tx.(pgx.Tx)
+	if !ok {
+		return nil, fmt.Errorf("postgres backend: ExecuteTx requires a pgx.Tx, got %T", tx)
+	}
 	return runStmtsInTx(ctx, pgxTx, plan)
 }
 
 // runQueryTx implements txRunner: execute the single query statement inside the
 // caller-provided pgx.Tx and return the raw JSON data value.
 func (b *postgresBackend) runQueryTx(ctx context.Context, tx any, plan Plan) (json.RawMessage, error) {
-	pgxTx := tx.(pgx.Tx)
+	pgxTx, ok := tx.(pgx.Tx)
+	if !ok {
+		return nil, fmt.Errorf("postgres backend: ExecuteTx requires a pgx.Tx, got %T", tx)
+	}
 	if len(plan.Statements) == 0 {
 		return nil, fmt.Errorf("runQueryTx: plan has no statements")
 	}
