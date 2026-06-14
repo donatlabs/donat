@@ -180,7 +180,7 @@ func TestMutationExecute(t *testing.T) {
 	setupMutationTables(t, pool)
 
 	eng, err := New(ctx, Config{
-		Pool:     pool,
+		Backend:  Postgres(pool),
 		Metadata: fixtureMetaCatalogWithTrigger(),
 	})
 	if err != nil {
@@ -237,7 +237,7 @@ func TestExecuteTxSharedTransaction(t *testing.T) {
 	setupMutationTables(t, pool)
 
 	eng, err := New(ctx, Config{
-		Pool:     pool,
+		Backend:  Postgres(pool),
 		Metadata: fixtureMetaCatalogWithTrigger(),
 	})
 	if err != nil {
@@ -354,7 +354,7 @@ func TestEventHookFires(t *testing.T) {
 	})
 
 	eng, err := New(ctx, Config{
-		Pool:     pool,
+		Backend:  Postgres(pool),
 		Metadata: fixtureMetaCatalogWithTrigger(),
 		Registry: reg,
 	})

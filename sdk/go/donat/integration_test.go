@@ -100,7 +100,7 @@ func testEngine(t *testing.T) (*Engine, *pgxpool.Pool) {
 	})
 
 	eng, err := New(ctx, Config{
-		Pool:     pool,
+		Backend:  Postgres(pool),
 		Metadata: fixtureMetaCatalog(),
 	})
 	if err != nil {

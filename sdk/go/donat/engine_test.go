@@ -7,12 +7,12 @@ import (
 	"testing"
 )
 
-// TestEngineRequiresPool confirms New returns an error when Config.Pool is nil.
-func TestEngineRequiresPool(t *testing.T) {
+// TestEngineRequiresBackend confirms New returns an error when Config.Backend is nil.
+func TestEngineRequiresBackend(t *testing.T) {
 	ctx := context.Background()
-	_, err := New(ctx, Config{Pool: nil, Metadata: []byte("{}")})
+	_, err := New(ctx, Config{Backend: nil, Metadata: []byte("{}")})
 	if err == nil {
-		t.Fatal("expected error for nil Pool, got nil")
+		t.Fatal("expected error for nil Backend, got nil")
 	}
 }
 

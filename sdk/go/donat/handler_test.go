@@ -35,7 +35,7 @@ func denialEngine(t *testing.T) *Engine {
 	ctx := context.Background()
 	pool := noopPool(t)
 	eng, err := New(ctx, Config{
-		Pool:     pool,
+		Backend:  Postgres(pool),
 		Metadata: fixtureMetaCatalog(),
 	})
 	if err != nil {

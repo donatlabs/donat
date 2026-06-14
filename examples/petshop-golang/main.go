@@ -76,7 +76,7 @@ func main() {
 
 	// Build the embedded engine over your pool + the serialised config.
 	eng, err := donat.New(ctx, donat.Config{
-		Pool:     pool,
+		Backend:  donat.Postgres(pool),
 		Metadata: coreConfig,
 		Registry: reg,
 		PoolSize: cfg.PoolSize,
