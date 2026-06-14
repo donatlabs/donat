@@ -1,0 +1,58 @@
+table:
+  name: order_item
+  schema: public
+# Per-column documentation for the MCP `describe_table` tool.
+configuration:
+  column_config:
+    id:
+      comment: "Primary key of the line item: an auto-generated integer."
+    order_id:
+      comment: >-
+        Foreign key to orders.id — the order this line item belongs to. Use the
+        `order` object relationship to read the parent order.
+    pet_id:
+      comment: >-
+        Foreign key to pet.id — the pet being purchased on this line. Use the
+        `pet` object relationship to read the pet's details.
+    quantity:
+      comment: >-
+        Number of units of the pet on this line. Integer greater than 0
+        (defaults to 1).
+    unit_price:
+      comment: >-
+        Price per unit in US dollars at the time of sale (SQL numeric with two
+        decimals, e.g. 350.00). May differ from the pet's current price.
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+  - name: pet
+    using:
+      foreign_key_constraint_on: pet_id
+# A shopper may add line items only to an order that belongs to them; the check
+# walks the `order` relationship back to the owning customer.
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+      columns:
+        - order_id
+        - pet_id
+        - quantity
+        - unit_price
+# A shopper reads line items of their own orders; staff read all.
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}

@@ -15,8 +15,10 @@ mod cron;
 mod events;
 mod gql;
 mod jwt;
+mod mcp;
 mod migrate;
 mod remote;
+mod rest;
 mod state;
 mod ws;
 
@@ -29,12 +31,70 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use clap::Parser;
 use serde_json::{Value, json};
 
 use state::{AppState, Engine, SharedState, ensure_default_source};
+
+/// Which API surfaces are mounted in the router. Selected at deploy time by
+/// `DONAT_GRAPHQL_ENABLED_APIS` / `--enabled-apis` (see ADR
+/// `api-surfaces/decisions/003-enabled-apis-flag.md`). A disabled surface's
+/// routes are simply not registered (so requests get a plain 404); there is
+/// no per-request gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnabledApis {
+    graphql: bool,
+    rest: bool,
+    mcp: bool,
+}
+
+/// Parse the enabled-apis list flag.
+///
+/// - `None` (flag absent: neither CLI nor env set) => default = all three on.
+/// - `Some(s)` => exactly the recognized, comma-separated tokens listed
+///   (case-insensitive, trimmed): `graphql`, `rest`, `mcp`. Unknown tokens are
+///   warned about and ignored (not fatal). An explicitly empty value enables no
+///   data API (warned about).
+fn parse_enabled_apis(raw: Option<&str>) -> EnabledApis {
+    let raw = match raw {
+        None => {
+            return EnabledApis {
+                graphql: true,
+                rest: true,
+                mcp: true,
+            };
+        }
+        Some(s) => s,
+    };
+
+    let mut apis = EnabledApis {
+        graphql: false,
+        rest: false,
+        mcp: false,
+    };
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "graphql" => apis.graphql = true,
+            "rest" => apis.rest = true,
+            "mcp" => apis.mcp = true,
+            other => {
+                tracing::warn!(token = %other, "ignoring unknown enabled-apis token");
+            }
+        }
+    }
+    if !apis.graphql && !apis.rest && !apis.mcp {
+        tracing::warn!(
+            "DONAT_GRAPHQL_ENABLED_APIS selects no data API; all data surfaces (graphql/rest/mcp) are disabled"
+        );
+    }
+    apis
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "donat", about = "GraphQL engine over Postgres (Donat v2-compatible)")]
@@ -57,6 +117,12 @@ struct Args {
     /// If set, metadata endpoints require X-Donat-Admin-Secret.
     #[arg(long, env = "DONAT_GRAPHQL_ADMIN_SECRET")]
     admin_secret: Option<String>,
+
+    /// Comma-separated list of API surfaces to expose: `graphql`, `rest`,
+    /// `mcp` (case-insensitive). Absent => all three. Unknown tokens are
+    /// ignored with a warning.
+    #[arg(long, env = "DONAT_GRAPHQL_ENABLED_APIS")]
+    enabled_apis: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -119,6 +185,9 @@ struct ServeArgs {
     stringify_numeric_types: bool,
     #[arg(long)]
     admin_secret: Option<String>,
+    /// CLI override of `--enabled-apis` (wins over the global flag / env).
+    #[arg(long)]
+    enabled_apis: Option<String>,
 }
 
 #[tokio::main]
@@ -189,6 +258,14 @@ async fn main() -> anyhow::Result<()> {
     let admin_secret = serve
         .and_then(|s| s.admin_secret.clone())
         .or(args.admin_secret);
+    // CLI override (serve) wins over the global flag / env, mirroring
+    // admin_secret. `None` (truly unset) => default all surfaces on.
+    let enabled_apis = parse_enabled_apis(
+        serve
+            .and_then(|s| s.enabled_apis.clone())
+            .or(args.enabled_apis)
+            .as_deref(),
+    );
     let stringify_numerics = serve.map(|s| s.stringify_numeric_types).unwrap_or(false);
     let unauthorized_role = std::env::var("DONAT_GRAPHQL_UNAUTHORIZED_ROLE").ok();
     let allowlist_enabled = std::env::var("DONAT_GRAPHQL_ENABLE_ALLOWLIST")
@@ -222,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
             actions: vec![],
             custom_types: Default::default(),
             cron_triggers: vec![],
+            rest_endpoints: vec![],
         },
     };
     ensure_default_source(&mut metadata);
@@ -231,6 +309,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let state: SharedState = Arc::new(AppState {
         pools: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        sqlite_paths: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        mysql_urls: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         engine: tokio::sync::RwLock::new(Engine {
             metadata,
             catalogs: std::collections::HashMap::new(),
@@ -278,14 +358,32 @@ async fn main() -> anyhow::Result<()> {
     // triggers that capture events are created by `migrate --metadata-dir`.
     events::spawn(state.clone());
 
-    let app = Router::new()
+    // Liveness/version are not data APIs — always mounted.
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/version", get(version))
-        .route("/v1/graphql", post(graphql).get(ws::upgrade))
-        .route("/v1alpha1/graphql", post(graphql_legacy).get(ws::upgrade))
-        .route("/v1/relay", post(relay).get(ws::upgrade_relay))
-        .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay))
-        .with_state(state);
+        .route("/v1/version", get(version));
+    // Data APIs are mounted only when enabled (deploy-time flag); a disabled
+    // surface's routes are simply absent => plain 404.
+    if enabled_apis.graphql {
+        app = app
+            .route("/v1/graphql", post(graphql).get(ws::upgrade))
+            .route("/v1alpha1/graphql", post(graphql_legacy).get(ws::upgrade))
+            .route("/v1/relay", post(relay).get(ws::upgrade_relay))
+            .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay));
+    }
+    if enabled_apis.rest {
+        app = app.route("/api/rest/{*path}", any(rest::dispatch));
+    }
+    if enabled_apis.mcp {
+        app = app.route("/mcp", post(mcp::dispatch).get(mcp::get_not_allowed));
+    }
+    tracing::info!(
+        graphql = enabled_apis.graphql,
+        rest = enabled_apis.rest,
+        mcp = enabled_apis.mcp,
+        "enabled API surfaces"
+    );
+    let app = app.with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
@@ -340,5 +438,53 @@ async fn relay(
     };
     let (status, response) = gql::execute_with(&state, &session, &body, true).await;
     (status, Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnabledApis, parse_enabled_apis};
+
+    fn apis(graphql: bool, rest: bool, mcp: bool) -> EnabledApis {
+        EnabledApis { graphql, rest, mcp }
+    }
+
+    #[test]
+    fn absent_enables_all() {
+        assert_eq!(parse_enabled_apis(None), apis(true, true, true));
+    }
+
+    #[test]
+    fn single_token_enables_only_that() {
+        assert_eq!(parse_enabled_apis(Some("graphql")), apis(true, false, false));
+    }
+
+    #[test]
+    fn two_tokens() {
+        assert_eq!(
+            parse_enabled_apis(Some("graphql,rest")),
+            apis(true, true, false)
+        );
+    }
+
+    #[test]
+    fn case_and_space_tolerant() {
+        assert_eq!(
+            parse_enabled_apis(Some("GraphQL , MCP")),
+            apis(true, false, true)
+        );
+    }
+
+    #[test]
+    fn unknown_token_ignored() {
+        assert_eq!(
+            parse_enabled_apis(Some("graphql,bogus")),
+            apis(true, false, false)
+        );
+    }
+
+    #[test]
+    fn empty_enables_none() {
+        assert_eq!(parse_enabled_apis(Some("")), apis(false, false, false));
+    }
 }
 

@@ -1,0 +1,28 @@
+description: >
+  The initialize handshake returns the protocol version, tools capability,
+  and server info.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 1
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo:
+      name: conformance
+      version: "0"
+response:
+  jsonrpc: "2.0"
+  id: 1
+  result:
+    protocolVersion: "2025-06-18"
+    capabilities:
+      tools: {}
+    serverInfo:
+      name: donat
+      version: "0.1.0"

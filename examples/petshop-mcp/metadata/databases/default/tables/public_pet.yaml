@@ -1,0 +1,98 @@
+table:
+  name: pet
+  schema: public
+# Per-column documentation. Written for an LLM consuming the MCP
+# `describe_table` tool: each comment states what the column means, its type
+# and units, the exact allowed values, and how to use it in filters/joins.
+configuration:
+  column_config:
+    id:
+      comment: >-
+        Primary key of the pet. Auto-generated integer, unique per pet. Use it
+        to fetch a single pet (query with where {id: {_eq: N}}) or as the
+        target of order_item.pet_id.
+    name:
+      comment: >-
+        The pet's display name shown in the catalogue, e.g. "Rex". Free text,
+        not unique — do not use it as an identifier.
+    category_id:
+      comment: >-
+        Foreign key to category.id (integer). The catalogue section this pet
+        belongs to (e.g. Dogs, Cats). Use the `category` object relationship to
+        read the category name instead of joining manually.
+    price:
+      comment: >-
+        Sale price in US dollars as a decimal number with two places, e.g.
+        350.00. Stored as SQL numeric; defaults to 0.
+    status:
+      comment: >-
+        Availability of the pet. Exactly one of: "available" (can be ordered),
+        "pending" (reserved / in someone's cart), or "sold" (no longer for
+        sale). To list buyable pets filter where {status: {_eq: "available"}}.
+    description:
+      comment: >-
+        Optional free-text marketing description shown in the catalogue. May be
+        null. Not meant for filtering.
+object_relationships:
+  - name: category
+    using:
+      foreign_key_constraint_on: category_id
+# Shoppers and the public only see pets that are still available; staff see all.
+select_permissions:
+  - role: anonymous
+    permission:
+      columns:
+        - id
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter:
+        status:
+          _eq: available
+      allow_aggregations: true
+  - role: customer
+    permission:
+      columns:
+        - id
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter:
+        status:
+          _eq: available
+      allow_aggregations: true
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Inventory is managed by staff only.
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - name
+        - category_id
+        - price
+        - status
+        - description
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

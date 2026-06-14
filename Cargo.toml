@@ -6,6 +6,7 @@ members = [
     "crates/schema",
     "crates/ir",
     "crates/sqlgen",
+    "crates/backend",
     "crates/server",
     "crates/conformance",
 ]

@@ -1,0 +1,34 @@
+type: bulk
+args:
+
+- type: run_sql
+  args:
+    sql: |
+      create table person (
+        id serial primary key,
+        name text not null,
+        bio text
+      );
+
+# Track the table with a per-column comment in column_config. The comment
+# becomes the GraphQL-introspection `description` of the column field; columns
+# without a comment have a null description.
+- type: track_table
+  args:
+    schema: public
+    name: person
+    configuration:
+      column_config:
+        bio:
+          comment: A short biography of the person
+
+- type: create_select_permission
+  args:
+    table: person
+    role: user
+    permission:
+      columns:
+      - id
+      - name
+      - bio
+      filter: {}

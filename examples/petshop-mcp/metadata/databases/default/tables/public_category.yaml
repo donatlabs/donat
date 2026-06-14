@@ -1,0 +1,56 @@
+table:
+  name: category
+  schema: public
+# Per-column documentation for the MCP `describe_table` tool.
+configuration:
+  column_config:
+    id:
+      comment: >-
+        Primary key of the category. Auto-generated integer. Referenced by
+        pet.category_id.
+    name:
+      comment: >-
+        Unique catalogue section name, e.g. "Dogs", "Cats", "Birds", "Fish".
+array_relationships:
+  - name: pets
+    using:
+      foreign_key_constraint_on:
+        column: category_id
+        table:
+          name: pet
+          schema: public
+# Everyone may read the catalog of categories.
+select_permissions:
+  - role: anonymous
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+  - role: customer
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Only staff manage the catalog structure.
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - name
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - name
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

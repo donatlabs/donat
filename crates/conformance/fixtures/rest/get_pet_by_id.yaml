@@ -1,0 +1,11 @@
+description: GET pet/:id returns the one pet, with the path param bound to $id.
+url: /api/rest/pet/1
+method: GET
+status: 200
+headers:
+  X-Donat-Role: user
+response:
+  pet_by_pk:
+    id: 1
+    name: Rex
+    status: available

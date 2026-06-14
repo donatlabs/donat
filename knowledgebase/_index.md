@@ -12,6 +12,12 @@ native-function hooks (`pre_insert` / `post_insert` / post-commit) instead of
 Donat-style webhooks. 6 design notes, 1 research report, 5 decisions.
 **Status: idea, deferred until core conformance is done.**
 
+### [[api-surfaces/_index|API Surfaces — REST & MCP]]
+Serving the per-role data plane over Donat v2 RESTified endpoints
+(`rest_endpoints` → saved GraphQL queries) and an MCP server (streamable HTTP,
+generic CRUD tools). Both translate to GraphQL and reuse the execution
+pipeline. 1 design note, 2 decisions. **Status: in progress (June 2026).**
+
 ## Cross-cutting
 
 - [[security-audit|Security & dependency audit]] — SQL-gen injection review, ranked findings (internal-microservice threat model), library assessment (2026-06-13)

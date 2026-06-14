@@ -1,0 +1,16 @@
+description: >
+  GET pets?limit=2 binds the query-string value to $limit (Int coercion),
+  returning the first two pets ordered by id.
+url: /api/rest/pets?limit=2
+method: GET
+status: 200
+headers:
+  X-Donat-Role: user
+response:
+  pet:
+  - id: 1
+    name: Rex
+    status: available
+  - id: 2
+    name: Milo
+    status: pending

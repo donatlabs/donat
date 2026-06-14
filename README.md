@@ -1,7 +1,9 @@
 # donat
 
 A GraphQL engine over Postgres: a declarative v2 metadata format, a
-per-role GraphQL API, and one SQL statement per operation. The conformance
+per-role GraphQL API — also exposed as Donat RESTified endpoints
+(`/api/rest`) and an MCP server (`/mcp`) over the same permissions — and one
+SQL statement per operation. The conformance
 contract is enforced by a native Rust test harness (`crates/conformance`)
 executing fixtures against a real Postgres — no admin role by design: all
 data access goes through explicit role permissions. Rust workspace; see
@@ -16,7 +18,7 @@ data access goes through explicit role permissions. Rust workspace; see
 | `crates/schema` | Per-role GraphQL schema generation |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement |
-| `crates/server` | axum HTTP server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate` subcommands. No runtime admin/`run_sql` API |
+| `crates/server` | axum HTTP server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP), auth; `migrate`/`validate` subcommands. No runtime admin/`run_sql` API |
 | `crates/conformance` | Native conformance harness + fixtures (Apache 2.0; see `crates/conformance/fixtures/LICENSE.hasura`) |
 
 ## Quick start
@@ -45,6 +47,24 @@ YAML (Donat v3 directory: `version.yaml`, `databases/`, `inherited_roles.yaml`,
 `actions.yaml`) loaded at boot; `validate` fails the deploy if it is
 inconsistent with the schema.
 
+### Selecting API surfaces
+
+The engine serves three transports over the same data plane: GraphQL
+(`/v1/graphql` + relay + websockets), REST (`/api/rest`), and MCP (`/mcp`).
+Which surfaces are mounted is a deploy-time choice via a single
+comma-separated list (CLI `--enabled-apis` wins over the env var):
+
+```sh
+DONAT_GRAPHQL_ENABLED_APIS=graphql          # GraphQL only; REST and MCP off
+DONAT_GRAPHQL_ENABLED_APIS=graphql,rest     # GraphQL + REST; MCP off
+```
+
+Tokens (case-insensitive): `graphql`, `rest`, `mcp`. **Omitting the variable
+enables all three.** A surface left out of the list is not registered, so
+requests to it get a plain `404` (there is no per-request gate). Unknown tokens
+(e.g. Hasura's `metadata`/`config`) are warned about and ignored. `/healthz`
+and `/v1/version` are always mounted.
+
 Conformance Postgres: `postgis/postgis:16-3.4` reachable as
 `postgresql://postgres:postgres@127.0.0.1:15432/postgres` (override via
 `PG_URL`). Each suite spawns its own engine on a fresh database, so runs
@@ -55,7 +75,7 @@ release binaries for linux-x86_64 and macos-aarch64 as build artifacts.
 
 ## Roadmap
 
-Status of the GraphQL surface. Every "done" item is backed by a passing
+Status of the API surface. Every "done" item is backed by a passing
 module in the native conformance harness (`crates/conformance/tests/`, run
 with `make conformance`).
 
@@ -82,6 +102,18 @@ with `make conformance`).
 - **Inherited roles** — cell-level NULLing, guarded aggregates/computed
   fields, cycle detection with exact path.
 - **Allowlist / query collections** — `__typename`-insensitive matching.
+- **REST (RESTified endpoints)** — Donat v2 `rest_endpoints`: a method + URL
+  template (`:param` path vars) maps to a saved query in `query_collections`;
+  request path/query/body bind its GraphQL variables (precedence path > query
+  > body, with scalar coercion). Served at `/api/rest`, run through the same
+  per-role pipeline; 404/405/400 handling. Native coverage in
+  `crates/conformance/tests/rest_endpoints.rs`.
+- **MCP server** — Model Context Protocol over streamable HTTP (`/mcp`,
+  JSON-RPC 2.0): `initialize`/`tools/list`/`tools/call` with six generic,
+  table-parameterized CRUD tools (`list_tables`, `describe_table`, `query`,
+  `insert`, `update`, `delete`). Each tool renders a parametrized GraphQL
+  operation (args as variables) and runs under the request's role — no admin
+  bypass. Native coverage in `crates/conformance/tests/mcp_tools.rs`.
 - **Introspection** — real per-role `__schema`/`__type`.
 - **Actions (synchronous)** — webhook handlers, custom type system
   (input/output objects, scalars, enums), full output shaping + Donat's

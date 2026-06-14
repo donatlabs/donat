@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "HTTP server exposing the Donat v2 API surface (/v1/graphql, /healthz, /v1/version)"
 
+[lib]
+name = "donat_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "donat"
 path = "src/main.rs"
@@ -15,6 +19,7 @@ donat-catalog = { path = "../catalog" }
 donat-schema = { path = "../schema" }
 donat-ir = { path = "../ir" }
 donat-sqlgen = { path = "../sqlgen" }
+donat-backend = { path = "../backend" }
 graphql-parser = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
@@ -34,6 +39,8 @@ refinery = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 uuid = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+mysql = { version = "25", default-features = false, features = ["minimal-rust"] }
 
 [dev-dependencies]
 insta = { workspace = true }

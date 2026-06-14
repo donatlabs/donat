@@ -18,7 +18,7 @@ conformance harness (`crates/conformance`).
 | `crates/schema` | Per-role GraphQL schema generation, introspection |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
-| `crates/server` | axum server: `/v1/graphql` (+ws), relay, auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
+| `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
@@ -102,7 +102,12 @@ REJECT fix the issues first.
   status are part of the conformance contract — never invent error formats.
 - **One SQL statement per operation** (M4 invariant): response JSON is
   assembled in Postgres (`json_build_object`/`json_agg`, correlated
-  subqueries). Don't add row-by-row post-processing in Rust.
+  subqueries). Don't add row-by-row post-processing in Rust. Documented
+  carve-out: SQLite *mutations* fold one DML statement's `RETURNING` rows in
+  the Rust executor, because SQLite forbids DML inside a CTE/subquery (so it
+  cannot aggregate `RETURNING` in SQL). The "one statement per root, no N+1"
+  core still holds; see `knowledgebase/multi-backend/decisions/003-*`. Postgres
+  mutations and all SQLite queries keep full in-database assembly.
 - **SQL injection safety.** sqlgen currently renders literals inline with
   strict quote-escaping helpers (parameterized execution is a planned
   refactor — see crates/sqlgen/src/lib.rs header). Never format user input
