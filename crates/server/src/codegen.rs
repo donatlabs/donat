@@ -230,6 +230,35 @@ pub async fn run_codegen(
     Ok(())
 }
 
+/// Emit the serialized `{ "metadata": <Metadata>, "catalog": <Catalog> }`
+/// JSON that the embedded wasm-core host (`donat.New` via `core_init`)
+/// consumes. Introspection happens here, deploy-time and host-side — exactly
+/// the snapshot the Go SDK hands to the wasm core (Spec 004). This is the
+/// "prepare the core config" step a Go host runs before serving.
+pub async fn dump_core_config(database_url: &str, metadata_dir: &Path, out: &Path) -> Result<()> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+
+    let (client, conn) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .context("connecting to database for core-config dump")?;
+    let conn = tokio::spawn(async move { conn.await });
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    conn.abort();
+
+    let cfg = serde_json::json!({ "metadata": metadata, "catalog": catalog });
+    let json = serde_json::to_string_pretty(&cfg).context("serializing core config")?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating out dir {}", parent.display()))?;
+    }
+    std::fs::write(out, json).with_context(|| format!("writing {}", out.display()))?;
+    tracing::info!(path = %out.display(), tables = catalog.tables.len(), "core config written");
+    Ok(())
+}
+
 /// Best-effort `gofmt -w` on the generated file. The generated source is
 /// already valid Go; gofmt only aligns struct columns. If gofmt is not on
 /// PATH we leave the valid-but-unaligned file and log a hint.
