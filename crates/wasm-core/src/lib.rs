@@ -6,6 +6,7 @@
 //!   2. `core_init(ptr, len)` loads serialized metadata + Catalog snapshot.
 //!   3. `core_compile(ptr, len)` -> packed i64 (out_ptr<<32 | out_len);
 //!      host reads `out_len` bytes at `out_ptr`, then `core_dealloc`s it.
+//!
 //! All payloads are JSON byte buffers, so the wire format can evolve without
 //! breaking the numeric ABI. Instances are single-threaded (one per pooled
 //! wazero instance on the host side).
@@ -34,12 +35,14 @@ pub extern "C" fn core_alloc(len: i32) -> *mut u8 {
 }
 
 /// Free a buffer previously returned by `core_alloc`/`core_compile`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
 #[unsafe(no_mangle)]
 pub extern "C" fn core_dealloc(ptr: *mut u8, len: i32) {
     if ptr.is_null() {
         return;
     }
-    // SAFETY: ptr/len originate from `core_alloc` (capacity == len).
+    // SAFETY: ptr/len originate from core_alloc (Vec::with_capacity(len)); wasm32's
+    //         dlmalloc returns exact-size allocations, so capacity == len holds here.
     unsafe {
         drop(Vec::from_raw_parts(ptr, 0, len as usize));
     }
@@ -52,8 +55,11 @@ thread_local! {
 /// Load serialized config into the instance. Input JSON:
 /// `{ "metadata": <Metadata>, "catalog": <Catalog> }`.
 /// Returns 0 on success, 1 on a deserialization error.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
 #[unsafe(no_mangle)]
 pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
+    // SAFETY: ptr/len originate from core_alloc; the host wrote `len` initialised
+    //         bytes before calling core_init; the slice is confined to this call.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     #[derive(serde::Deserialize)]
     struct Cfg {

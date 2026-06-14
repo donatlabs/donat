@@ -1,5 +1,7 @@
 //! Compile orchestration (filled in Tasks 2.4–2.7).
 
+#![allow(dead_code)] // items consumed by compile() in Phase 2C
+
 use std::collections::HashMap;
 
 use serde::Deserialize;

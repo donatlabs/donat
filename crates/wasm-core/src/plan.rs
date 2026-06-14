@@ -16,7 +16,7 @@ pub enum PlanV1 {
 
 #[derive(Debug, Serialize)]
 pub struct PlanBody {
-    pub version: u32,
+    pub version: u32, // always crate::plan::PLAN_VERSION
     /// True for mutations (run statements in one transaction).
     pub transaction: bool,
     pub statements: Vec<Statement>,
@@ -46,7 +46,7 @@ pub struct Hook {
 
 #[derive(Debug, Serialize)]
 pub struct PlanErrorBody {
-    pub version: u32,
+    pub version: u32, // always crate::plan::PLAN_VERSION
     /// The Donat error code (e.g. "validation-failed", "access-denied").
     pub code: String,
     pub path: String,
