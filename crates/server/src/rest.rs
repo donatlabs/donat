@@ -351,9 +351,12 @@ fn percent_decode(s: &str) -> String {
 ///
 /// Path/query values are strings and are coerced to the variable's declared
 /// scalar kind (Int -> number, Float -> number, Boolean -> bool, otherwise
-/// String). Body values are already JSON-typed and pass through as-is. A
-/// variable with no supplied value is omitted (the engine applies defaults or
-/// reports a required-variable error). A failed coercion is an `Err`.
+/// String). Body values are JSON-typed; a body *string* targeting an
+/// Int/Float/Boolean variable is coerced too (see [`coerce_body`]), so the
+/// result does not depend on which source supplied the value, while
+/// already-typed body values pass through. A variable with no supplied value
+/// is omitted (the engine applies defaults or reports a required-variable
+/// error). A failed coercion is an `Err`.
 fn build_variables(
     defs: &[VarDef],
     path: &HashMap<String, String>,
