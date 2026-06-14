@@ -47,9 +47,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Run cargo-audit directly instead of rustsec/audit-check: the latter
+      # creates a GitHub check-run, which fails ("Resource not accessible by
+      # integration") unless the workflow is granted `checks: write`.
+      #
+      # `--deny warnings` keeps the gate strict: any vulnerability or
+      # informational advisory (unsound, unmaintained, yanked) fails the job.
+      - name: cargo audit
+        run: cargo audit --deny warnings
 
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
