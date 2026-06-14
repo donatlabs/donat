@@ -176,6 +176,28 @@ fn query_plan_v1() {
     insta::assert_json_snapshot!(plan);
 }
 
+// -----------------------------------------------------------------------
+// Task 2.6: mutation path snapshot
+// -----------------------------------------------------------------------
+
+/// The "user" role has insert permission on "author" (columns: ["name"],
+/// check: {}).  This insert must produce a `transaction:true` PlanV1::Mutation
+/// with one Statement whose SQL is the engine's `mutation_to_sql_opts` output.
+#[test]
+fn mutation_plan_v1() {
+    let state = fixture_state();
+    let input = CompileInput {
+        query: r#"mutation { insert_author(objects: [{ name: "Alice" }]) { affected_rows } }"#
+            .to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("user"),
+        stringify_numerics: false,
+    };
+    let plan = compile(&state, &input);
+    insta::assert_json_snapshot!(plan);
+}
+
 /// A request with no x-donat-role must be denied with the exact no-admin
 /// message produced by session_from() (copied from server/gql.rs).
 #[test]

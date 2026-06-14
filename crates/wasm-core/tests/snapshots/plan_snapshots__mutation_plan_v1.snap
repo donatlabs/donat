@@ -1,0 +1,17 @@
+---
+source: crates/wasm-core/tests/plan_snapshots.rs
+expression: plan
+---
+{
+  "kind": "mutation",
+  "version": 1,
+  "transaction": true,
+  "statements": [
+    {
+      "alias": "insert_author",
+      "sql": "WITH \"ins\" AS (INSERT INTO \"public\".\"author\" (\"name\") VALUES (('Alice')::\"text\") RETURNING *) SELECT json_build_object('affected_rows', (SELECT count(*) FROM \"ins\")) AS root",
+      "params": []
+    }
+  ],
+  "hooks": []
+}

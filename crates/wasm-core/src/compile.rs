@@ -109,9 +109,31 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
             })
         }
 
-        // 4b. Mutation: implemented in Task 2.6.
-        donat_schema::Plan::Mutation(_) => {
-            todo!("mutation path — implemented in Task 2.6")
+        // 4b. Mutation: one statement per root, wrapped in a transaction.
+        donat_schema::Plan::Mutation(roots) => {
+            let statements = roots
+                .iter()
+                .map(|root| {
+                    let alias = match root {
+                        donat_ir::MutationRoot::FunctionCall { alias, .. }
+                        | donat_ir::MutationRoot::Insert { alias, .. }
+                        | donat_ir::MutationRoot::Update { alias, .. }
+                        | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
+                    };
+                    Statement {
+                        alias,
+                        sql: donat_sqlgen::mutation_to_sql_opts(root, input.stringify_numerics),
+                        params: vec![],
+                    }
+                })
+                .collect();
+            PlanV1::Mutation(PlanBody {
+                version: PLAN_VERSION,
+                transaction: true,
+                statements,
+                hooks: vec![],
+            })
         }
     }
 }
