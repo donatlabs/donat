@@ -1,0 +1,15 @@
+description: >
+  GET pet/featured resolves to the literal `pet/featured` endpoint even though
+  the parameterized `pet/:id` route is declared earlier and also matches the
+  path shape. The literal (more specific) route wins; without the fix the
+  request would hit `pet/:id` and fail to coerce "featured" into Int $id.
+url: /api/rest/pet/featured
+method: GET
+status: 200
+headers:
+  X-Donat-Role: user
+response:
+  pet:
+  - id: 1
+    name: Rex
+    status: available

@@ -15,8 +15,10 @@ fn rest_endpoints() {
 
     for f in [
         "get_pet_by_id.yaml",
+        "get_pet_featured.yaml",
         "list_pets_limit.yaml",
         "create_pet.yaml",
+        "create_pet_string_id.yaml",
         "method_not_allowed.yaml",
         "unknown_endpoint.yaml",
     ] {
