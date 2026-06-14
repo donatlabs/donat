@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 donat-metadata = { path = "../metadata" }
 donat-schema = { path = "../schema" }
 donat-sqlgen = { path = "../sqlgen" }
+donat-backend = { path = "../backend" }
 donat-ir = { path = "../ir" }
 donat-catalog-types = { path = "../catalog-types" }
 graphql-parser = { workspace = true }

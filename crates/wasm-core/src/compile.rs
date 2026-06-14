@@ -26,6 +26,22 @@ pub struct CompileInput {
     pub session_vars: HashMap<String, String>,
     #[serde(default)]
     pub stringify_numerics: bool,
+    /// SQL dialect to target. Accepted values: `"postgres"` (default),
+    /// `"sqlite"`, `"mysql"`. Unknown values fall back to Postgres.
+    #[serde(default)]
+    pub dialect: Option<String>,
+}
+
+/// Map the caller-supplied dialect name to a concrete [`donat_backend::AnyDialect`].
+/// Returns `AnyDialect::Postgres(PostgresDialect)` for `None`, `"postgres"`, or
+/// any unrecognised string — preserving the default Postgres output byte-for-byte.
+fn dialect_of(name: Option<&str>) -> donat_backend::AnyDialect {
+    match name {
+        Some("sqlite") => donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect),
+        Some("mysql") => donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect),
+        // None, "postgres", or anything unknown defaults to Postgres.
+        _ => donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect),
+    }
 }
 
 /// Build a Session from the session-vars map, applying the no-admin rule:
@@ -106,11 +122,23 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
             Err(e) => return error_plan(&e),
         };
 
+    // 3b. Resolve the SQL dialect for this request.
+    let dialect = dialect_of(input.dialect.as_deref());
+
     match plan {
         // 4a. Query: one combined statement aliased "data".
         donat_schema::Plan::Query(roots) => {
-            let sql =
-                donat_sqlgen::operation_to_sql_opts(&roots, input.stringify_numerics);
+            // For Postgres (the default), use operation_to_sql_opts so that
+            // stringify_numerics is honoured and the output is byte-identical
+            // to the previous behaviour. For other dialects, operation_to_sql_with
+            // is used (stringify_numerics is always false for non-Postgres dialects
+            // — the dialect API does not expose it).
+            let sql = match dialect {
+                donat_backend::AnyDialect::Postgres(_) => {
+                    donat_sqlgen::operation_to_sql_opts(&roots, input.stringify_numerics)
+                }
+                _ => donat_sqlgen::operation_to_sql_with(&roots, dialect),
+            };
             PlanV1::Query(PlanBody {
                 version: PLAN_VERSION,
                 transaction: false,
@@ -132,11 +160,14 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     | donat_ir::MutationRoot::Delete { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
-                statements.push(Statement {
-                    alias,
-                    sql: donat_sqlgen::mutation_to_sql_opts(root, input.stringify_numerics),
-                    params: vec![],
-                });
+                // Same dialect/stringify_numerics split as the query path above.
+                let sql = match dialect {
+                    donat_backend::AnyDialect::Postgres(_) => {
+                        donat_sqlgen::mutation_to_sql_opts(root, input.stringify_numerics)
+                    }
+                    _ => donat_sqlgen::mutation_to_sql_with(root, dialect),
+                };
+                statements.push(Statement { alias, sql, params: vec![] });
                 hooks.extend(hooks_for_root(root, &state.metadata));
             }
             PlanV1::Mutation(PlanBody {

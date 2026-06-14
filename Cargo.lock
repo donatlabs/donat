@@ -729,6 +729,7 @@ dependencies = [
 name = "donat-wasm-core"
 version = "0.1.0"
 dependencies = [
+ "donat-backend",
  "donat-catalog-types",
  "donat-ir",
  "donat-metadata",

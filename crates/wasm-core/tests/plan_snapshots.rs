@@ -171,6 +171,7 @@ fn query_plan_v1() {
         variables: Default::default(),
         session_vars: user_session_vars(),
         stringify_numerics: false,
+        dialect: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -193,6 +194,7 @@ fn mutation_plan_v1() {
         variables: Default::default(),
         session_vars: session_vars("user"),
         stringify_numerics: false,
+        dialect: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -214,6 +216,7 @@ fn permission_error_plan_v1() {
         variables: Default::default(),
         session_vars: session_vars("stranger"),
         stringify_numerics: false,
+        dialect: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -301,6 +304,33 @@ fn mutation_emits_event_hook() {
         variables: Default::default(),
         session_vars: session_vars("user"),
         stringify_numerics: false,
+        dialect: None,
+    };
+    let plan = compile(&state, &input);
+    insta::assert_json_snapshot!(plan);
+}
+
+// -----------------------------------------------------------------------
+// Task 1 (dialect): SQLite snapshot — same query as query_plan_v1 but with
+// dialect: Some("sqlite").  The SQL must use SQLite json1 functions
+// (json_object / json_group_array / json_array) instead of Postgres
+// json_build_object / json_agg.
+// -----------------------------------------------------------------------
+
+/// Same fixture/query/role as `query_plan_v1`, but compiled for SQLite.
+/// The `sql` field must differ from the Postgres snapshot in a dialect-specific
+/// way: `json_object(…)` replaces `json_build_object(…)`, `json_group_array`
+/// replaces `json_agg`, and `json_array()` replaces `'[]'::json`.
+#[test]
+fn query_plan_v1_sqlite() {
+    let state = fixture_state();
+    let input = CompileInput {
+        query: "query { article { id title } }".to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: user_session_vars(),
+        stringify_numerics: false,
+        dialect: Some("sqlite".into()),
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -317,6 +347,7 @@ fn missing_role_is_denied() {
         variables: Default::default(),
         session_vars: Default::default(), // no x-donat-role
         stringify_numerics: false,
+        dialect: None,
     };
     match compile(&state, &input) {
         PlanV1::Error(e) => {
