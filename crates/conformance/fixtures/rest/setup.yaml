@@ -1,0 +1,102 @@
+type: bulk
+args:
+
+- type: run_sql
+  args:
+    sql: |
+      CREATE TABLE pet (
+        id INT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL
+      );
+
+      INSERT INTO pet (id, name, status) VALUES
+        (1, 'Rex', 'available'),
+        (2, 'Milo', 'pending'),
+        (3, 'Luna', 'available');
+
+- type: track_table
+  args:
+    schema: public
+    name: pet
+
+- type: create_select_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      filter: {}
+      columns: '*'
+
+- type: create_insert_permission
+  args:
+    table: pet
+    role: user
+    permission:
+      check: {}
+      columns: '*'
+
+- type: create_query_collection
+  args:
+    name: pet_queries
+    definition:
+      queries:
+      - name: PetById
+        query: |
+          query ($id: Int!) {
+            pet_by_pk(id: $id) {
+              id
+              name
+              status
+            }
+          }
+      - name: ListPets
+        query: |
+          query ($limit: Int) {
+            pet(order_by: {id: asc}, limit: $limit) {
+              id
+              name
+              status
+            }
+          }
+      - name: CreatePet
+        query: |
+          mutation ($id: Int!, $name: String!, $status: String!) {
+            insert_pet(objects: {id: $id, name: $name, status: $status}) {
+              returning {
+                id
+                name
+                status
+              }
+            }
+          }
+
+- type: create_rest_endpoint
+  args:
+    name: get_pet_by_id
+    url: pet/:id
+    methods: [GET]
+    definition:
+      query:
+        collection_name: pet_queries
+        query_name: PetById
+
+- type: create_rest_endpoint
+  args:
+    name: list_pets
+    url: pets
+    methods: [GET]
+    definition:
+      query:
+        collection_name: pet_queries
+        query_name: ListPets
+
+- type: create_rest_endpoint
+  args:
+    name: create_pet
+    url: pet
+    methods: [POST]
+    definition:
+      query:
+        collection_name: pet_queries
+        query_name: CreatePet

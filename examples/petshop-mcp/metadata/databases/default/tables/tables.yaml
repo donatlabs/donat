@@ -1,0 +1,5 @@
+- "!include public_category.yaml"
+- "!include public_pet.yaml"
+- "!include public_customer.yaml"
+- "!include public_orders.yaml"
+- "!include public_order_item.yaml"

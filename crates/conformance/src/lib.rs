@@ -239,7 +239,8 @@ use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
     FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
     PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
-    RemoteSchemaPermission, SelectPermission, Source, SourceKind, TableEntry, UpdatePermission,
+    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableConfiguration,
+    TableEntry, UpdatePermission,
 };
 
 fn workspace_root() -> PathBuf {
@@ -322,6 +323,7 @@ fn empty_metadata() -> Metadata {
         actions: vec![],
         custom_types: Default::default(),
         cron_triggers: vec![],
+        rest_endpoints: vec![],
     }
 }
 
@@ -694,13 +696,23 @@ impl Running {
 
             "track_table" => {
                 // The arg is either `{table: <name|{schema,name}>}` or the
-                // bare `{schema, name}` form.
+                // bare `{schema, name}` form. An optional `configuration`
+                // (custom_name, custom_root_fields, column_config, ...) is
+                // applied to the table entry.
                 let table = if args.get("table").is_some() {
                     qualified_from(&args["table"])
                 } else {
                     qualified_from(&args)
                 };
-                self.with_table(&table, |_| {});
+                let configuration: Option<TableConfiguration> = args
+                    .get("configuration")
+                    .filter(|c| !c.is_null())
+                    .map(|c| from_value("table configuration", c));
+                self.with_table(&table, |t| {
+                    if configuration.is_some() {
+                        t.configuration = configuration;
+                    }
+                });
             }
 
             "create_select_permission" => {
@@ -917,6 +929,17 @@ impl Running {
                     collection.definition.queries.retain(|q| q.name != qname);
                 }
             }
+            "create_rest_endpoint" => {
+                let endpoint: RestEndpoint = from_value("rest endpoint", &args);
+                self.metadata.borrow_mut().rest_endpoints.push(endpoint);
+            }
+            "drop_rest_endpoint" => {
+                let name = args["name"].as_str().expect("rest endpoint name").to_string();
+                self.metadata
+                    .borrow_mut()
+                    .rest_endpoints
+                    .retain(|e| e.name != name);
+            }
             "add_collection_to_allowlist" => {
                 let entry: AllowlistEntry = from_value("allowlist entry", &args);
                 self.metadata.borrow_mut().allowlist.push(entry);
@@ -1130,6 +1153,13 @@ impl Running {
             std::fs::write(
                 dir.join("cron_triggers.yaml"),
                 serde_yaml::to_string(&md.cron_triggers).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.rest_endpoints.is_empty() {
+            std::fs::write(
+                dir.join("rest_endpoints.yaml"),
+                serde_yaml::to_string(&md.rest_endpoints).unwrap(),
             )
             .unwrap();
         }
@@ -1421,9 +1451,33 @@ impl Running {
                     serde_json::from_str(&text).unwrap_or(Json::String(text)),
                 )
             }
-            _ => {
+            "POST" => {
                 let body = conf.get("query").or_else(|| conf.get("body")).cloned();
                 self.post(url, &body.unwrap_or(Json::Null), &headers)
+            }
+            // Other verbs (PUT/PATCH/DELETE) are used by REST endpoint
+            // fixtures; issue the real method against the engine. The
+            // admin-API interception only applies to POST paths, so these
+            // always reach the engine.
+            other => {
+                let m = reqwest::Method::from_bytes(other.as_bytes())
+                    .unwrap_or_else(|_| panic!("[{label}] bad method {other}"));
+                let mut req = self
+                    .http
+                    .request(m, format!("{}{url}", self.base_url()));
+                for (k, v) in &headers {
+                    req = req.header(k, v);
+                }
+                if let Some(body) = conf.get("body") {
+                    req = req.json(body);
+                }
+                let r = req.send().expect("http request failed");
+                let code = r.status().as_u16();
+                let text = r.text().unwrap_or_default();
+                (
+                    code,
+                    serde_json::from_str(&text).unwrap_or(Json::String(text)),
+                )
             }
         };
 
@@ -1435,11 +1489,24 @@ impl Running {
             pretty(&resp)
         );
 
+        // MCP (`/mcp`) responses are JSON-RPC: the `result.content` field is a
+        // human/text duplicate of `result.structuredContent` and is NOT part
+        // of the contract. Strip it from both expected and actual before
+        // comparing, so fixtures assert only the structured payload (plus
+        // protocolVersion / serverInfo / tools / isError / ...). GraphQL and
+        // REST comparison is unchanged.
+        let resp = if url == "/mcp" {
+            strip_mcp_content(&resp)
+        } else {
+            resp
+        };
+
         let query_text = conf_query_text(conf);
         if let Some(allowed) = conf.get("allowed_responses").and_then(Json::as_array) {
             let ok = allowed.iter().any(|a| {
                 a.get("response")
-                    .is_some_and(|exp| response_matches(exp, &resp, query_text))
+                    .map(|exp| if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() })
+                    .is_some_and(|exp| response_matches(&exp, &resp, query_text))
             });
             assert!(
                 ok,
@@ -1448,7 +1515,8 @@ impl Running {
                 pretty(&resp)
             );
         } else if let Some(exp) = conf.get("response") {
-            self.assert_response(exp, &resp, query_text, label);
+            let exp = if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() };
+            self.assert_response(&exp, &resp, query_text, label);
         }
     }
 
@@ -1565,6 +1633,29 @@ fn conf_query_text(conf: &Json) -> Option<&str> {
 
 fn pretty(v: &Json) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+/// Normalize a JSON-RPC `result` for MCP comparison by dropping fields that
+/// are not part of the conformance contract:
+///
+/// - `content` (always): a text duplicate of the structured data.
+/// - `structuredContent` *only when* `isError` is true: an error tool result's
+///   structured payload carries engine-dependent GraphQL error details, so the
+///   contract for a failure is just `isError: true`. On success,
+///   `structuredContent` (the real data) is kept and asserted.
+///
+/// Everything else (`isError`, `tools`, `protocolVersion`, `serverInfo`,
+/// `capabilities`, ...) is asserted as-is. GraphQL/REST comparison never calls
+/// this.
+fn strip_mcp_content(v: &Json) -> Json {
+    let mut out = v.clone();
+    if let Some(result) = out.get_mut("result").and_then(Json::as_object_mut) {
+        result.remove("content");
+        if result.get("isError") == Some(&Json::Bool(true)) {
+            result.remove("structuredContent");
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------------- tests

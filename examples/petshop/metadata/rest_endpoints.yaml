@@ -1,0 +1,44 @@
+# RESTified endpoints: each maps an HTTP method + URL template to a saved
+# query in query_collections.yaml. Served under /api/rest/<url>. A `:param`
+# segment binds a path variable; query-string and JSON-body keys bind the
+# remaining GraphQL variables (precedence: path > query string > body). The
+# role is resolved exactly like /v1/graphql — there is no admin bypass.
+- name: get_pet_by_id
+  url: pet/:id
+  methods:
+    - GET
+  definition:
+    query:
+      collection_name: petshop
+      query_name: PetById
+  comment: One pet by id (available-only for anonymous/customer).
+
+- name: list_pets
+  url: pets
+  methods:
+    - GET
+  definition:
+    query:
+      collection_name: petshop
+      query_name: AvailablePets
+  comment: Browse the catalogue; optional ?limit=N.
+
+- name: list_categories
+  url: categories
+  methods:
+    - GET
+  definition:
+    query:
+      collection_name: petshop
+      query_name: Categories
+  comment: Categories with their visible pets nested.
+
+- name: create_pet
+  url: pet
+  methods:
+    - POST
+  definition:
+    query:
+      collection_name: petshop
+      query_name: CreatePet
+  comment: Add an inventory item (staff only); fields from the JSON body.

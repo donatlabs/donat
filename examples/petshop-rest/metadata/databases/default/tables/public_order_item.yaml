@@ -1,0 +1,37 @@
+table:
+  name: order_item
+  schema: public
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+  - name: pet
+    using:
+      foreign_key_constraint_on: pet_id
+# A shopper may add line items only to an order that belongs to them; the check
+# walks the `order` relationship back to the owning customer.
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+      columns:
+        - order_id
+        - pet_id
+        - quantity
+        - unit_price
+# A shopper reads line items of their own orders; staff read all.
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}

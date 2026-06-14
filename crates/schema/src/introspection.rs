@@ -35,10 +35,17 @@ fn list_of(inner: Json) -> Json {
 }
 
 fn field(name: &str, args: Vec<Json>, ty: Json) -> Json {
+    field_desc(name, args, ty, None)
+}
+
+/// Like [`field`] but with an explicit `description` (used for tracked-table
+/// column fields, whose description comes from
+/// `column_config.<col>.comment`). All other fields pass `None`.
+fn field_desc(name: &str, args: Vec<Json>, ty: Json, description: Option<&str>) -> Json {
     json!({
         "__typename": "__Field",
         "name": name,
-        "description": null,
+        "description": description,
         "args": args,
         "type": ty,
         "isDeprecated": false,
@@ -183,7 +190,12 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             } else {
                 non_null(named("SCALAR", &scalar))
             };
-            fields.push(field(&col.name, vec![], ty));
+            let description = entry
+                .configuration
+                .as_ref()
+                .and_then(|c| c.column_config.get(&col.name))
+                .and_then(|cc| cc.comment.as_deref());
+            fields.push(field_desc(&col.name, vec![], ty, description));
             select_columns.push(col.name.clone());
         }
         for rel in &entry.object_relationships {

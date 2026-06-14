@@ -1,0 +1,74 @@
+# Petshop REST example for donat — RESTified endpoints only.
+#
+#   docker compose up
+#
+# Same deploy model as the main petshop example (one-shot `migrate` then
+# `validate`, then the engine serves), but here the engine exposes ONLY the
+# REST surface: DONAT_GRAPHQL_ENABLED_APIS=rest. /v1/graphql and /mcp are not
+# mounted (they return 404). The RESTified endpoints are declared in
+# metadata/rest_endpoints.yaml and back onto saved queries in
+# metadata/query_collections.yaml. See README.md.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: petshop_rest
+    volumes:
+      - petshop-rest-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d petshop_rest"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply versioned V{n}__*.sql migrations, then exit.
+  migrate:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_rest
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+
+  # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
+  validate:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["validate", "--metadata-dir", "/metadata"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_rest
+    volumes:
+      - ./metadata:/metadata:ro
+    restart: "no"
+
+  engine:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    depends_on:
+      validate:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop_rest
+      DONAT_METADATA_DIR: /metadata
+      DONAT_PORT: "8080"
+      # Expose only the REST surface.
+      DONAT_GRAPHQL_ENABLED_APIS: rest
+      # Trusted-request secret; a trusted request must still name a role.
+      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
+      # Role-less requests fall back to the public catalogue role.
+      DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+    volumes:
+      - ./metadata:/metadata:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  petshop-rest-db:

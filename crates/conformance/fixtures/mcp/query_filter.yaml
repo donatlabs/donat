@@ -1,0 +1,34 @@
+description: >
+  tools/call query with a where-filter passed as a GraphQL variable
+  ({status: {_eq: available}}) returns only the matching rows.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 4
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, name, status]
+      where:
+        status:
+          _eq: available
+      order_by:
+        id: asc
+response:
+  jsonrpc: "2.0"
+  id: 4
+  result:
+    isError: false
+    structuredContent:
+    - id: 1
+      name: Rex
+      status: available
+    - id: 3
+      name: Luna
+      status: available

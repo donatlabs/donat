@@ -1,0 +1,24 @@
+description: >
+  A tools/call as a role with no permission on the table fails: the GraphQL
+  pipeline denies it (the table is absent from the role's schema), so the
+  tool result is isError:true carrying the GraphQL errors. Verifies the MCP
+  surface cannot bypass per-role permissions.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: anonymous
+body:
+  jsonrpc: "2.0"
+  id: 8
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, name, status]
+response:
+  jsonrpc: "2.0"
+  id: 8
+  result:
+    isError: true

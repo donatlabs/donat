@@ -1,0 +1,32 @@
+description: >
+  tools/call query selects id/name/status ordered by id with a limit; the
+  structuredContent holds the rows (the unwrapped `pet` field value).
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 3
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, name, status]
+      order_by:
+        id: asc
+      limit: 2
+response:
+  jsonrpc: "2.0"
+  id: 3
+  result:
+    isError: false
+    structuredContent:
+    - id: 1
+      name: Rex
+      status: available
+    - id: 2
+      name: Milo
+      status: pending

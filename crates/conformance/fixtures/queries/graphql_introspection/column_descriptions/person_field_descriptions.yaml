@@ -1,0 +1,31 @@
+description: >
+  Column-field descriptions come from metadata column_config.<col>.comment:
+  `bio` carries its configured comment; `id`/`name` (no comment) are null.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: user
+query:
+  query: |
+    query {
+      __type(name: "person") {
+        name
+        kind
+        fields {
+          name
+          description
+        }
+      }
+    }
+response:
+  data:
+    __type:
+      name: person
+      kind: OBJECT
+      fields:
+      - name: id
+        description: null
+      - name: name
+        description: null
+      - name: bio
+        description: A short biography of the person

@@ -1,0 +1,9 @@
+description: DELETE on a GET-only url whose path matches yields 405.
+url: /api/rest/pet/1
+method: DELETE
+status: 405
+headers:
+  X-Donat-Role: user
+response:
+  code: method-not-allowed
+  error: 'method DELETE not allowed; allowed: GET'

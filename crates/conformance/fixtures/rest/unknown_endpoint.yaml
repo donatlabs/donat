@@ -1,0 +1,9 @@
+description: A path matching no endpoint template yields 404.
+url: /api/rest/does/not/exist
+method: GET
+status: 404
+headers:
+  X-Donat-Role: user
+response:
+  code: not-found
+  error: endpoint not found

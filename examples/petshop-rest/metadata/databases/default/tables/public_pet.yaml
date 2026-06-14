@@ -1,0 +1,66 @@
+table:
+  name: pet
+  schema: public
+object_relationships:
+  - name: category
+    using:
+      foreign_key_constraint_on: category_id
+# Shoppers and the public only see pets that are still available; staff see all.
+select_permissions:
+  - role: anonymous
+    permission:
+      columns:
+        - id
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter:
+        status:
+          _eq: available
+      allow_aggregations: true
+  - role: customer
+    permission:
+      columns:
+        - id
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter:
+        status:
+          _eq: available
+      allow_aggregations: true
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Inventory is managed by staff only.
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - name
+        - category_id
+        - price
+        - status
+        - description
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - name
+        - category_id
+        - price
+        - status
+        - description
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}
