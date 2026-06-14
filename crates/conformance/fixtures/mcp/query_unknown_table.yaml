@@ -1,0 +1,23 @@
+description: >
+  tools/call query with an unknown table name is rejected before any GraphQL
+  is built: the table resolves to no tracked entry, so the tool returns
+  isError:true rather than emitting a query against a non-existent field.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 23
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: no_such_table
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 23
+  result:
+    isError: true

@@ -1,0 +1,21 @@
+description: >
+  POST pet with the Int variable $id supplied in the JSON body AS A STRING
+  ("11"). The body value is coerced to the declared scalar kind (Int), just as
+  a path/query value would be, so the mutation succeeds and returns the
+  inserted row. Without body coercion the string would reach the engine and be
+  rejected as a type error.
+url: /api/rest/pet
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  id: "11"
+  name: Coerced
+  status: available
+response:
+  insert_pet:
+    returning:
+    - id: 11
+      name: Coerced
+      status: available

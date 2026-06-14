@@ -1,0 +1,25 @@
+description: >
+  A `table` argument carrying GraphQL syntax (an attempt to inject a second
+  operation / extra root field) matches no tracked table, so it is rejected
+  with isError:true. The crafted text is never interpolated into an executed
+  GraphQL document — the table allow-list is the tracked metadata, not string
+  shape.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 24
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: "pet) { id } } mutation x { delete_pet(where: {}"
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 24
+  result:
+    isError: true
