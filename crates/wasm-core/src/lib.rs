@@ -11,6 +11,7 @@
 //! breaking the numeric ABI. Instances are single-threaded (one per pooled
 //! wazero instance on the host side).
 
+// public so the integration tests (tests/plan_snapshots.rs) can call compile()/PlanV1 directly
 pub mod compile;
 pub mod plan;
 

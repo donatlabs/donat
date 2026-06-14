@@ -66,7 +66,7 @@ pub fn session_from(vars: &HashMap<String, String>) -> Result<Session, PlanError
 /// versioned PlanV1 ready for serialisation to the host.
 ///
 /// Query path: one combined SQL statement keyed `"data"`, `transaction:false`.
-/// Mutation path: implemented in Task 2.6.
+/// Mutation path: one statement per root, run in a single transaction.
 /// All error cases (bad role, parse error, planner error) return `PlanV1::Error`.
 pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
     // 1. Resolve the session (no-admin rule enforced here).
@@ -113,9 +113,9 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
         // 4b. Mutation: one statement per root, wrapped in a transaction.
         donat_schema::Plan::Mutation(roots) => {
             let statements = roots
-                .iter()
+                .into_iter()
                 .map(|root| {
-                    let alias = match root {
+                    let alias = match &root {
                         donat_ir::MutationRoot::FunctionCall { alias, .. }
                         | donat_ir::MutationRoot::Insert { alias, .. }
                         | donat_ir::MutationRoot::Update { alias, .. }
@@ -124,7 +124,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     };
                     Statement {
                         alias,
-                        sql: donat_sqlgen::mutation_to_sql_opts(root, input.stringify_numerics),
+                        sql: donat_sqlgen::mutation_to_sql_opts(&root, input.stringify_numerics),
                         params: vec![],
                     }
                 })

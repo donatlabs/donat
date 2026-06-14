@@ -66,19 +66,30 @@ pub const PLAN_VERSION: u32 = 1;
 /// the host knows to parse the JSON payload for the nested path/message (the
 /// engine encodes a JSON payload in the PG error message for 23514).
 /// The `"default"` key covers all other SQLSTATE codes.
+///
+/// The map is built once via `LazyLock` and cloned on each call so callers
+/// keep an owned `BTreeMap` (the serde contract for `PlanBody::error_map`
+/// stays unchanged) without the cost of rebuilding on every compile.
+use std::sync::LazyLock;
+
+static ERROR_MAP: LazyLock<std::collections::BTreeMap<String, String>> =
+    LazyLock::new(|| {
+        use std::collections::BTreeMap;
+        let mut m = BTreeMap::new();
+        // 23514: check_violation — our donat.check_violation() stores a JSON
+        // payload { "path": ..., "message": ... } in the PG error message.
+        m.insert("23514".into(), "permission-error-from-payload".into());
+        // 23505: unique_violation
+        m.insert("23505".into(), "constraint-violation:Uniqueness violation. ".into());
+        // 23503: foreign_key_violation
+        m.insert("23503".into(), "constraint-violation:Foreign key violation. ".into());
+        // 23502: not_null_violation
+        m.insert("23502".into(), "constraint-violation:Not-NULL violation. ".into());
+        // All other SQLSTATE codes → data-exception (matches the `_` arm in gql.rs)
+        m.insert("default".into(), "data-exception".into());
+        m
+    });
+
 pub fn default_error_map() -> std::collections::BTreeMap<String, String> {
-    use std::collections::BTreeMap;
-    let mut m = BTreeMap::new();
-    // 23514: check_violation — our donat.check_violation() stores a JSON
-    // payload { "path": ..., "message": ... } in the PG error message.
-    m.insert("23514".into(), "permission-error-from-payload".into());
-    // 23505: unique_violation
-    m.insert("23505".into(), "constraint-violation:Uniqueness violation. ".into());
-    // 23503: foreign_key_violation
-    m.insert("23503".into(), "constraint-violation:Foreign key violation. ".into());
-    // 23502: not_null_violation
-    m.insert("23502".into(), "constraint-violation:Not-NULL violation. ".into());
-    // All other SQLSTATE codes → data-exception (matches the `_` arm in gql.rs)
-    m.insert("default".into(), "data-exception".into());
-    m
+    ERROR_MAP.clone()
 }
