@@ -362,9 +362,24 @@ async fn list_tables(state: &SharedState, session: &Session) -> Json {
     tool_ok(json!({ "tables": tables }))
 }
 
+/// The `selectable_columns` value reported for a select permission, plus the
+/// allow-list used to filter the disclosed columns: `Star` exposes everything
+/// (`"*"`, no filter); `List` exposes only the listed columns.
+fn selectable_for_perm(columns: &donat_metadata::Columns) -> (Json, Option<Vec<String>>) {
+    match columns {
+        donat_metadata::Columns::Star => (Json::String("*".to_string()), None),
+        donat_metadata::Columns::List(cols) => (json!(cols), Some(cols.clone())),
+    }
+}
+
 /// `describe_table`: columns + types (from the catalog), relationships (from
-/// metadata), and the columns the role may select. Errors if the table is
-/// unknown to metadata.
+/// metadata), and the columns the role may select.
+///
+/// The role MUST have a select permission on the table. Without one the table
+/// is absent from the role's GraphQL schema (introspection hides it), so this
+/// discovery tool must refuse rather than leak the physical structure to a
+/// role that cannot read the table. With a column-restricted permission, only
+/// the permitted columns are disclosed.
 async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> Json {
     let Some(base) = args.get("table").and_then(Json::as_str) else {
         return tool_err("missing required argument 'table'", None);
@@ -383,14 +398,28 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
         return tool_err(format!("unknown table '{base}'"), None);
     };
 
-    // Catalog columns + types; per-column description from metadata
-    // `column_config.<col>.comment` (null when absent).
+    // The role must be able to select the table; otherwise it is not visible
+    // to this role and we must not disclose its structure (no admin bypass).
+    let Some(select_perm) = entry.select_permissions.iter().find(|p| p.role == role) else {
+        return tool_err(
+            format!("table '{base}' is not accessible to role '{role}'"),
+            None,
+        );
+    };
+    let (selectable, allowed) = selectable_for_perm(&select_perm.permission.columns);
+
+    // Catalog columns + types, filtered to the columns the role may select;
+    // per-column description from metadata `column_config.<col>.comment`.
     let catalog = engine.default_catalog();
     let columns: Vec<Json> = catalog
         .table(entry.table.schema(), entry.table.name())
         .map(|t| {
             t.columns
                 .iter()
+                .filter(|c| match &allowed {
+                    None => true,
+                    Some(cols) => cols.iter().any(|name| name == &c.name),
+                })
                 .map(|c| {
                     let description = entry
                         .configuration
@@ -413,15 +442,6 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
         entry.object_relationships.iter().map(|r| r.name.as_str()).collect();
     let array_relationships: Vec<&str> =
         entry.array_relationships.iter().map(|r| r.name.as_str()).collect();
-
-    // Columns the role may select (from the select permission).
-    let selectable: Json = match entry.select_permissions.iter().find(|p| p.role == role) {
-        Some(p) => match &p.permission.columns {
-            donat_metadata::Columns::Star => Json::String("*".to_string()),
-            donat_metadata::Columns::List(cols) => json!(cols),
-        },
-        None => Json::Null,
-    };
 
     tool_ok(json!({
         "name": base,
@@ -752,6 +772,21 @@ mod tests {
         let args = json!({ "table": "sales_order", "where": { "id": { "_eq": 1 } } });
         let (q, _) = build_delete_gql(&args, Some(&cols())).unwrap();
         assert!(q.contains("delete_sales_order(where: $where)"), "{q}");
+    }
+
+    #[test]
+    fn selectable_for_perm_star_exposes_all() {
+        let (sel, allowed) = selectable_for_perm(&donat_metadata::Columns::Star);
+        assert_eq!(sel, json!("*"));
+        assert!(allowed.is_none(), "Star must not filter columns");
+    }
+
+    #[test]
+    fn selectable_for_perm_list_filters_to_listed() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let (sel, allowed) = selectable_for_perm(&donat_metadata::Columns::List(cols.clone()));
+        assert_eq!(sel, json!(["id", "name"]));
+        assert_eq!(allowed, Some(cols));
     }
 
     #[test]

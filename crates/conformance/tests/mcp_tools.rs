@@ -25,6 +25,8 @@ fn mcp_tools() {
         "initialize.yaml",
         "tools_list.yaml",
         "describe_table.yaml",
+        "describe_table_denied.yaml",
+        "describe_table_restricted.yaml",
         "permission_denied.yaml",
         "query.yaml",
         "query_filter.yaml",

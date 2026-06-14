@@ -32,6 +32,19 @@ args:
       filter: {}
       columns: '*'
 
+# A column-restricted role: may select only id and name. Used to verify that
+# describe_table reports columns/selectable filtered to the permitted set and
+# does not leak columns the role cannot select (e.g. `status`).
+- type: create_select_permission
+  args:
+    table: pet
+    role: viewer
+    permission:
+      filter: {}
+      columns:
+      - id
+      - name
+
 - type: create_insert_permission
   args:
     table: pet
