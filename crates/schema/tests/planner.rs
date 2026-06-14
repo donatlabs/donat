@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, ForeignKey, TableInfo};
 use donat_ir::{BoolExp, CompareOp, FieldValue, RootField, Scalar, SelectQuery};
 use donat_metadata::Metadata;
 use donat_schema::{Plan, PlanError, Planner, Session};

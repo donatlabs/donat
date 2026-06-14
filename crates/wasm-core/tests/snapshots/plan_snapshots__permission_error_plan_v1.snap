@@ -1,0 +1,11 @@
+---
+source: crates/wasm-core/tests/plan_snapshots.rs
+expression: plan
+---
+{
+  "kind": "error",
+  "version": 1,
+  "code": "validation-failed",
+  "path": "$.selectionSet.article",
+  "message": "field 'article' not found in type: 'query_root'"
+}

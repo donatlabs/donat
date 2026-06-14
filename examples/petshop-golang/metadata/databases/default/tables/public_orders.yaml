@@ -1,0 +1,68 @@
+table:
+  name: orders
+  schema: public
+object_relationships:
+  - name: customer
+    using:
+      foreign_key_constraint_on: customer_id
+array_relationships:
+  - name: items
+    using:
+      foreign_key_constraint_on:
+        column: order_id
+        table:
+          name: order_item
+          schema: public
+# A shopper places orders for themselves: customer_id is forced to their own
+# session id by the preset, and the check rejects anything else.
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+      set:
+        customer_id: X-Donat-User-Id
+      columns:
+        - status
+# A shopper reads only their own orders; staff read all of them.
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+# Order fulfilment (status transitions) belongs to staff.
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - status
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}
+# Native Go handler: fires on every insert and on status changes. Delivered
+# to the `handler` service (see docker-compose.yml); the name must match the
+# donat.On(reg, "on_order_placed", ...) registration in main.go.
+event_triggers:
+  - name: on_order_placed
+    definition:
+      enable_manual: false
+      insert:
+        columns: "*"
+      update:
+        columns:
+          - status
+    retry_conf:
+      num_retries: 3
+      interval_sec: 5
+      timeout_sec: 60
+    webhook: http://handler:8081/events

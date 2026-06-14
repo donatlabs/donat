@@ -613,10 +613,17 @@ dependencies = [
 name = "donat-catalog"
 version = "0.1.0"
 dependencies = [
+ "donat-catalog-types",
  "mysql",
  "rusqlite",
- "serde",
  "tokio-postgres",
+]
+
+[[package]]
+name = "donat-catalog-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -661,7 +668,7 @@ name = "donat-schema"
 version = "0.1.0"
 dependencies = [
  "base64",
- "donat-catalog",
+ "donat-catalog-types",
  "donat-ir",
  "donat-metadata",
  "graphql-parser",
@@ -688,6 +695,7 @@ dependencies = [
  "donat-sqlgen",
  "futures-util",
  "graphql-parser",
+ "insta",
  "jsonwebtoken",
  "mysql",
  "refinery",
@@ -714,6 +722,22 @@ dependencies = [
  "donat-schema",
  "graphql-parser",
  "insta",
+ "serde_json",
+]
+
+[[package]]
+name = "donat-wasm-core"
+version = "0.1.0"
+dependencies = [
+ "donat-backend",
+ "donat-catalog-types",
+ "donat-ir",
+ "donat-metadata",
+ "donat-schema",
+ "donat-sqlgen",
+ "graphql-parser",
+ "insta",
+ "serde",
  "serde_json",
 ]
 

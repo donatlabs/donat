@@ -1,0 +1,56 @@
+version: "3.9"
+
+# Standalone petshop demo: postgres → one-shot `donat migrate` → the Go app.
+#
+#   docker compose up
+#
+# The project's deploy model: schema (and the demo seed) is applied out-of-band
+# by a one-shot `donat migrate` using the prebuilt engine image; the Go app
+# never runs DDL — it only serves GraphQL and fires the in-process event hooks.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: petshop_golang
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # Check over TCP, not the unix socket: on first init the official image
+      # runs a socket-only temp server, so a socket pg_isready reports healthy
+      # before the real TCP listener is up — and the one-shot migrate does not
+      # retry.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d petshop_golang"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply the V{n}__*.sql migrations (donat helper + petshop DDL +
+  # demo seed), then exit. Uses the prebuilt engine image — no local Rust build.
+  migrate:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+
+  app:
+    # Build context is the repo root so Docker can see both sdk/go and
+    # examples/petshop-golang (the module uses a replace directive).
+    build:
+      context: ../..
+      dockerfile: examples/petshop-golang/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+    ports:
+      - "8080:8080"

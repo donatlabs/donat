@@ -1,0 +1,24 @@
+---
+source: crates/wasm-core/tests/plan_snapshots.rs
+expression: plan
+---
+{
+  "kind": "mutation",
+  "version": 1,
+  "transaction": true,
+  "statements": [
+    {
+      "alias": "insert_author",
+      "sql": "WITH \"ins\" AS (INSERT INTO \"public\".\"author\" (\"name\") VALUES (('Alice')::\"text\") RETURNING *) SELECT json_build_object('affected_rows', (SELECT count(*) FROM \"ins\")) AS root",
+      "params": []
+    }
+  ],
+  "hooks": [],
+  "error_map": {
+    "23502": "constraint-violation:Not-NULL violation. ",
+    "23503": "constraint-violation:Foreign key violation. ",
+    "23505": "constraint-violation:Uniqueness violation. ",
+    "23514": "permission-error-from-payload",
+    "default": "data-exception"
+  }
+}

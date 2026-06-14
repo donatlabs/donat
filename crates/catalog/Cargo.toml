@@ -6,7 +6,7 @@ license.workspace = true
 description = "Postgres introspection: tables, columns, types, PKs and FKs from pg_catalog"
 
 [dependencies]
-serde = { workspace = true }
+donat-catalog-types = { path = "../catalog-types" }
 tokio-postgres = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }

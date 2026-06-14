@@ -41,3 +41,6 @@ croner = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+
+[dev-dependencies]
+insta = { workspace = true }

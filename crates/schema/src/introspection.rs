@@ -554,7 +554,7 @@ pub fn execute_introspection(
 /// relationships are always nullable.
 fn object_rel_is_non_null(
     rel: &donat_metadata::ObjectRelationship,
-    info: &donat_catalog::TableInfo,
+    info: &donat_catalog_types::TableInfo,
 ) -> bool {
     use donat_metadata::ObjRelFkColumns;
     let Some(fk) = &rel.using.foreign_key_constraint_on else {
