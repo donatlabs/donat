@@ -106,6 +106,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                 transaction: false,
                 statements: vec![Statement { alias: "data".into(), sql, params: vec![] }],
                 hooks: vec![],
+                error_map: crate::plan::default_error_map(),
             })
         }
 
@@ -133,6 +134,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                 transaction: true,
                 statements,
                 hooks: vec![],
+                error_map: crate::plan::default_error_map(),
             })
         }
     }

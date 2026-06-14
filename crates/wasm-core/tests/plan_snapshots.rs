@@ -198,6 +198,27 @@ fn mutation_plan_v1() {
     insta::assert_json_snapshot!(plan);
 }
 
+// -----------------------------------------------------------------------
+// Task 2.7: permission-error path + no-admin denial
+// -----------------------------------------------------------------------
+
+/// The "stranger" role has no permissions on any table, so querying "article"
+/// returns PlanV1::Error with code "validation-failed" (field not found in
+/// query_root) — identical to what the server's Planner returns.
+#[test]
+fn permission_error_plan_v1() {
+    let state = fixture_state();
+    let input = CompileInput {
+        query: "{ article { id } }".to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("stranger"),
+        stringify_numerics: false,
+    };
+    let plan = compile(&state, &input);
+    insta::assert_json_snapshot!(plan);
+}
+
 /// A request with no x-donat-role must be denied with the exact no-admin
 /// message produced by session_from() (copied from server/gql.rs).
 #[test]

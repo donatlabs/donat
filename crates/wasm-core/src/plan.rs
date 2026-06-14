@@ -21,6 +21,9 @@ pub struct PlanBody {
     /// Post-commit hooks the executor must fire (Spec 003 Registry.Dispatch).
     /// v1: emitted empty until event_trigger wiring is added.
     pub hooks: Vec<Hook>,
+    /// SQLSTATE -> Donat error directive; the host applies these to runtime
+    /// pg errors (Spec 004). Static in v1 (matches gql.rs error table).
+    pub error_map: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,3 +56,29 @@ pub struct PlanErrorBody {
 
 /// PlanV1 wire major. Bump with `ABI_VERSION` on a breaking change.
 pub const PLAN_VERSION: u32 = 1;
+
+/// Static SQLSTATE -> Donat error code/message mapping.
+///
+/// Values copied verbatim from `crates/server/src/gql.rs:884-917`
+/// (`db_error_json` match arms) — these are the conformance contract strings.
+///
+/// Key `"23514"` (check_violation) sets `"permission-error-from-payload"` so
+/// the host knows to parse the JSON payload for the nested path/message (the
+/// engine encodes a JSON payload in the PG error message for 23514).
+/// The `"default"` key covers all other SQLSTATE codes.
+pub fn default_error_map() -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    // 23514: check_violation — our donat.check_violation() stores a JSON
+    // payload { "path": ..., "message": ... } in the PG error message.
+    m.insert("23514".into(), "permission-error-from-payload".into());
+    // 23505: unique_violation
+    m.insert("23505".into(), "constraint-violation:Uniqueness violation. ".into());
+    // 23503: foreign_key_violation
+    m.insert("23503".into(), "constraint-violation:Foreign key violation. ".into());
+    // 23502: not_null_violation
+    m.insert("23502".into(), "constraint-violation:Not-NULL violation. ".into());
+    // All other SQLSTATE codes → data-exception (matches the `_` arm in gql.rs)
+    m.insert("default".into(), "data-exception".into());
+    m
+}
