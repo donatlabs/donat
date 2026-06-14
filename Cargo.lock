@@ -715,6 +715,7 @@ dependencies = [
 name = "donat-catalog"
 version = "0.1.0"
 dependencies = [
+ "donat-catalog-types",
  "mysql",
  "rusqlite",
  "serde",
