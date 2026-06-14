@@ -45,6 +45,20 @@ jobs:
   go-sdk:
     name: Go SDK (cgo-free, tests)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: sdk/go
@@ -58,8 +72,13 @@ jobs:
       # go-get-able and statically buildable with no cgo.
       - name: Build with cgo disabled
         run: CGO_ENABLED=0 go build ./...
-      - name: Test
-        run: go test ./...
+      - name: Test (unit + integration + conformance subset)
+        run: CGO_ENABLED=0 go test ./...
+        env:
+          # DONAT_TEST_PG enables integration tests (executor, handler, conformance
+          # subset) against the postgres service defined above. The service is mapped
+          # to host port 15432 so the default pgTestDSN() works unchanged.
+          DONAT_TEST_PG: "1"
       - name: Vet
         run: go vet ./...
       - name: gofmt (must be clean)
