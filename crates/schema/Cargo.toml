@@ -7,7 +7,7 @@ description = "Planner: GraphQL operation + metadata + catalog -> IR, with permi
 
 [dependencies]
 donat-metadata = { path = "../metadata" }
-donat-catalog = { path = "../catalog" }
+donat-catalog-types = { path = "../catalog-types" }
 donat-ir = { path = "../ir" }
 graphql-parser = { workspace = true }
 serde = { workspace = true }
