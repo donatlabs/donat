@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use donat_catalog_types::{Catalog, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, FunctionInfo, TableInfo};
 use donat_ir::*;
 use donat_metadata::{
     Columns, Metadata, QualifiedTable, SelectPermission, TableEntry,
@@ -185,7 +185,7 @@ impl<'a> TableCtx<'a> {
         }
     }
 
-    pub(crate) fn column_info(&self, name: &str) -> Option<&'a donat_catalog_types::ColumnInfo> {
+    pub(crate) fn column_info(&self, name: &str) -> Option<&'a ColumnInfo> {
         self.info.column(name)
     }
 }
@@ -604,7 +604,7 @@ impl<'a> Planner<'a> {
     /// row, the session json, and any extra user-provided `args`.
     pub(crate) fn computed_field_args(
         &self,
-        finfo: &donat_catalog_types::FunctionInfo,
+        finfo: &FunctionInfo,
         def: &donat_metadata::ComputedFieldDefinition,
         session: &Session,
         user_args: Option<&JsonMap<String, Json>>,
@@ -660,7 +660,7 @@ impl<'a> Planner<'a> {
         &self,
         schema: &str,
         name: &str,
-    ) -> Option<&'a donat_catalog_types::FunctionInfo> {
+    ) -> Option<&'a FunctionInfo> {
         self.catalog.function(schema, name)
     }
 
@@ -871,7 +871,7 @@ impl<'a> Planner<'a> {
     fn function_from(
         &self,
         fentry: &donat_metadata::FunctionEntry,
-        finfo: &donat_catalog_types::FunctionInfo,
+        finfo: &FunctionInfo,
         field: &GqlField<'static, String>,
         vars: &JsonMap<String, Json>,
         session: &Session,

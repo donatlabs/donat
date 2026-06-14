@@ -718,7 +718,6 @@ dependencies = [
  "donat-catalog-types",
  "mysql",
  "rusqlite",
- "serde",
  "tokio-postgres",
 ]
 
