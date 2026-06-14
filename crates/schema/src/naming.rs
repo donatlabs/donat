@@ -46,12 +46,64 @@ pub fn root_names(entry: &TableEntry) -> RootNames {
     }
 }
 
+/// The CRUD root field names for a table — the `select` query root and the
+/// `insert`/`update`/`delete` mutation roots — honoring `custom_root_fields`.
+/// The type-name base (for `<base>_bool_exp` etc.) is [`table_base_name`].
+pub struct CrudRoots {
+    pub query: String,
+    pub insert: String,
+    pub update: String,
+    pub delete: String,
+}
+
+pub fn crud_roots(entry: &TableEntry) -> CrudRoots {
+    let base = table_base_name(entry);
+    let custom = entry.configuration.as_ref().map(|c| &c.custom_root_fields);
+    let get = |key: &str, default: String| -> String {
+        custom.and_then(|m| m.get(key).cloned()).unwrap_or(default)
+    };
+    CrudRoots {
+        query: get("select", base.clone()),
+        insert: get("insert", format!("insert_{base}")),
+        update: get("update", format!("update_{base}")),
+        delete: get("delete", format!("delete_{base}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn entry(value: serde_json::Value) -> TableEntry {
         serde_json::from_value(value).expect("table entry deserializes")
+    }
+
+    #[test]
+    fn crud_roots_default_naming() {
+        let e = entry(serde_json::json!({ "table": "pet" }));
+        let r = crud_roots(&e);
+        assert_eq!(r.query, "pet");
+        assert_eq!(r.insert, "insert_pet");
+        assert_eq!(r.update, "update_pet");
+        assert_eq!(r.delete, "delete_pet");
+    }
+
+    #[test]
+    fn crud_roots_honor_custom_root_fields_and_custom_name() {
+        let e = entry(serde_json::json!({
+            "table": { "schema": "public", "name": "gadget" },
+            "configuration": {
+                "custom_name": "widget",
+                "custom_root_fields": { "select": "all_widgets", "insert": "add_widget" },
+            },
+        }));
+        let r = crud_roots(&e);
+        // Overridden roots keep the custom field name verbatim...
+        assert_eq!(r.query, "all_widgets");
+        assert_eq!(r.insert, "add_widget");
+        // ...the rest derive from the custom table name (custom_name).
+        assert_eq!(r.update, "update_widget");
+        assert_eq!(r.delete, "delete_widget");
     }
 
     #[test]

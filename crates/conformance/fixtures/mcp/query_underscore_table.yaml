@@ -1,0 +1,30 @@
+description: >
+  tools/call query on `order_item` — a public table whose name contains an
+  underscore. Resolving the table must match the tracked entry by its base
+  name (not split `order_item` into schema `order` / table `item`), so column
+  resolution succeeds and the rows are returned.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 22
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: order_item
+      order_by:
+        id: asc
+response:
+  jsonrpc: "2.0"
+  id: 22
+  result:
+    isError: false
+    structuredContent:
+    - id: 1
+      label: first
+    - id: 2
+      label: second

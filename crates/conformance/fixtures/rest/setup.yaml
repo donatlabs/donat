@@ -59,6 +59,15 @@ args:
               status
             }
           }
+      - name: FeaturedPet
+        query: |
+          query {
+            pet(where: {id: {_eq: 1}}) {
+              id
+              name
+              status
+            }
+          }
       - name: CreatePet
         query: |
           mutation ($id: Int!, $name: String!, $status: String!) {
@@ -90,6 +99,19 @@ args:
       query:
         collection_name: pet_queries
         query_name: ListPets
+
+# A literal route declared AFTER `pet/:id`. `GET pet/featured` must resolve to
+# this endpoint (more specific) rather than being captured by `pet/:id` and
+# failing to coerce "featured" into the Int $id.
+- type: create_rest_endpoint
+  args:
+    name: pet_featured
+    url: pet/featured
+    methods: [GET]
+    definition:
+      query:
+        collection_name: pet_queries
+        query_name: FeaturedPet
 
 - type: create_rest_endpoint
   args:

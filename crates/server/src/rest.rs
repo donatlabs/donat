@@ -55,31 +55,17 @@ pub async fn dispatch(
 
     let engine = state.engine.read().await;
 
-    // Resolve the matching endpoint. Collect methods across endpoints whose
-    // URL matched, so we can tell 404 (no url match) from 405 (wrong method).
-    let mut url_matched = false;
-    let mut allowed_methods: Vec<String> = Vec::new();
-    let mut chosen: Option<(RestEndpoint, HashMap<String, String>)> = None;
-    for ep in &engine.metadata.rest_endpoints {
-        if let Some(params) = match_template(&ep.url, rest_path) {
-            url_matched = true;
-            allowed_methods.extend(ep.methods.iter().cloned());
-            if ep
-                .methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(method.as_str()))
-            {
-                chosen = Some((ep.clone(), params));
-                break;
-            }
-        }
-    }
+    // Resolve the matching endpoint. The most specific (most literal) URL
+    // template wins, so a literal route is not shadowed by an earlier
+    // parameterized one; 404 (no url match) is distinguished from 405 (url
+    // matched, wrong method).
+    let routing = select_endpoint(&engine.metadata.rest_endpoints, method.as_str(), rest_path);
 
-    let (endpoint, path_params) = match chosen {
-        Some(c) => c,
+    let (endpoint, path_params) = match routing.chosen {
+        Some((ep, params)) => (ep.clone(), params),
         None => {
-            if url_matched {
-                let allow = allowed_methods.join(", ");
+            if routing.url_matched {
+                let allow = routing.allowed_methods.join(", ");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     axum::Json(rest_error(
@@ -239,6 +225,57 @@ fn variable_definitions(query: &str) -> Result<Vec<VarDef>, String> {
     Ok(vec![])
 }
 
+/// The outcome of resolving a request against the `rest_endpoints` table.
+struct Routing<'a> {
+    /// The endpoint whose URL template and method both match (most specific).
+    chosen: Option<(&'a RestEndpoint, HashMap<String, String>)>,
+    /// At least one endpoint's URL template matched the path.
+    url_matched: bool,
+    /// Methods allowed across all URL-matching endpoints (for the 405 body).
+    allowed_methods: Vec<String>,
+}
+
+/// Higher = more specific: the count of literal (non-`:param`) segments.
+fn template_specificity(template: &str) -> usize {
+    template
+        .trim_matches('/')
+        .split('/')
+        .filter(|seg| !seg.starts_with(':'))
+        .count()
+}
+
+/// Resolve the endpoint for a `(method, path)`. Among endpoints whose URL
+/// template matches the path and whose methods include `method`, the most
+/// specific (most literal segments) is chosen, so a literal route (e.g.
+/// `pet/featured`) is never shadowed by an earlier parameterized one (e.g.
+/// `pet/:id`) regardless of declaration order.
+fn select_endpoint<'a>(
+    endpoints: &'a [RestEndpoint],
+    method: &str,
+    path: &str,
+) -> Routing<'a> {
+    let mut url_matched = false;
+    let mut allowed_methods: Vec<String> = Vec::new();
+    let mut chosen: Option<(&RestEndpoint, HashMap<String, String>, usize)> = None;
+    for ep in endpoints {
+        if let Some(params) = match_template(&ep.url, path) {
+            url_matched = true;
+            allowed_methods.extend(ep.methods.iter().cloned());
+            if ep.methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
+                let score = template_specificity(&ep.url);
+                if chosen.as_ref().is_none_or(|(_, _, best)| score > *best) {
+                    chosen = Some((ep, params, score));
+                }
+            }
+        }
+    }
+    Routing {
+        chosen: chosen.map(|(ep, params, _)| (ep, params)),
+        url_matched,
+        allowed_methods,
+    }
+}
+
 /// Match a URL template against a concrete path. A `:param` template segment
 /// binds the corresponding path segment; literal segments must be equal; the
 /// segment count must match. Returns the bound path variables, or `None` if
@@ -314,9 +351,12 @@ fn percent_decode(s: &str) -> String {
 ///
 /// Path/query values are strings and are coerced to the variable's declared
 /// scalar kind (Int -> number, Float -> number, Boolean -> bool, otherwise
-/// String). Body values are already JSON-typed and pass through as-is. A
-/// variable with no supplied value is omitted (the engine applies defaults or
-/// reports a required-variable error). A failed coercion is an `Err`.
+/// String). Body values are JSON-typed; a body *string* targeting an
+/// Int/Float/Boolean variable is coerced too (see [`coerce_body`]), so the
+/// result does not depend on which source supplied the value, while
+/// already-typed body values pass through. A variable with no supplied value
+/// is omitted (the engine applies defaults or reports a required-variable
+/// error). A failed coercion is an `Err`.
 fn build_variables(
     defs: &[VarDef],
     path: &HashMap<String, String>,
@@ -330,11 +370,26 @@ fn build_variables(
         } else if let Some(raw) = query.get(&def.name) {
             out.insert(def.name.clone(), coerce_scalar(raw, def.kind, &def.name)?);
         } else if let Some(v) = body.get(&def.name) {
-            out.insert(def.name.clone(), v.clone());
+            out.insert(def.name.clone(), coerce_body(v, def.kind, &def.name)?);
         }
         // else: omitted — let the engine decide (default / required error).
     }
     Ok(out)
+}
+
+/// Coerce a JSON body value to the variable's declared scalar kind. Body
+/// values are already JSON-typed, but clients commonly send numbers/booleans
+/// as JSON strings; a string destined for an Int/Float/Boolean variable is
+/// coerced (matching the path/query behaviour), so the result does not depend
+/// on which source supplied the value. Any non-string value (or a String/ID/
+/// custom-scalar target) passes through unchanged.
+fn coerce_body(v: &Json, kind: ScalarKind, var: &str) -> Result<Json, String> {
+    match (v, kind) {
+        (Json::String(s), ScalarKind::Int | ScalarKind::Float | ScalarKind::Boolean) => {
+            coerce_scalar(s, kind, var)
+        }
+        _ => Ok(v.clone()),
+    }
 }
 
 /// Coerce a stringly-typed path/query value to a JSON value of the variable's
@@ -364,6 +419,60 @@ mod tests {
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn ep(name: &str, url: &str, methods: &[&str]) -> RestEndpoint {
+        serde_json::from_value(json!({
+            "name": name,
+            "url": url,
+            "methods": methods,
+            "definition": { "query": { "collection_name": "c", "query_name": name } },
+        }))
+        .expect("rest endpoint deserializes")
+    }
+
+    #[test]
+    fn select_endpoint_prefers_literal_over_param() {
+        // `pet/:id` declared BEFORE the literal `pet/featured`. A request for
+        // `pet/featured` must route to the literal endpoint, not be captured
+        // by the earlier parameterized route.
+        let endpoints = vec![
+            ep("get_pet_by_id", "pet/:id", &["GET"]),
+            ep("pet_featured", "pet/featured", &["GET"]),
+        ];
+        let r = select_endpoint(&endpoints, "GET", "pet/featured");
+        let (chosen, params) = r.chosen.expect("an endpoint matches");
+        assert_eq!(chosen.name, "pet_featured");
+        assert!(params.is_empty(), "literal route binds no path params");
+    }
+
+    #[test]
+    fn select_endpoint_param_still_matches_non_literal() {
+        let endpoints = vec![
+            ep("get_pet_by_id", "pet/:id", &["GET"]),
+            ep("pet_featured", "pet/featured", &["GET"]),
+        ];
+        let r = select_endpoint(&endpoints, "GET", "pet/7");
+        let (chosen, params) = r.chosen.expect("an endpoint matches");
+        assert_eq!(chosen.name, "get_pet_by_id");
+        assert_eq!(params.get("id").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn select_endpoint_405_when_url_matches_but_method_does_not() {
+        let endpoints = vec![ep("get_pet_by_id", "pet/:id", &["GET"])];
+        let r = select_endpoint(&endpoints, "DELETE", "pet/1");
+        assert!(r.chosen.is_none());
+        assert!(r.url_matched, "url matched, only the method differs");
+        assert_eq!(r.allowed_methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
+    fn select_endpoint_404_when_no_url_matches() {
+        let endpoints = vec![ep("get_pet_by_id", "pet/:id", &["GET"])];
+        let r = select_endpoint(&endpoints, "GET", "owner/1");
+        assert!(r.chosen.is_none());
+        assert!(!r.url_matched, "no template matched -> 404, not 405");
     }
 
     #[test]
@@ -448,6 +557,46 @@ mod tests {
         assert_eq!(vars.get("limit"), Some(&json!(10)));
         // body value passes through untouched (object)
         assert_eq!(vars.get("obj"), Some(&json!({"k": "v"})));
+    }
+
+    #[test]
+    fn build_variables_coerces_body_string_to_scalar_kind() {
+        // A JSON body value that arrives as a string for an Int/Float/Boolean
+        // variable is coerced just like a path/query value, so behavior does
+        // not depend on which source supplied the value.
+        let defs = vec![
+            VarDef { name: "id".into(), kind: ScalarKind::Int },
+            VarDef { name: "ratio".into(), kind: ScalarKind::Float },
+            VarDef { name: "on".into(), kind: ScalarKind::Boolean },
+            VarDef { name: "note".into(), kind: ScalarKind::Other },
+        ];
+        let mut body = JsonMap::new();
+        body.insert("id".into(), json!("11"));
+        body.insert("ratio".into(), json!("1.5"));
+        body.insert("on".into(), json!("true"));
+        body.insert("note".into(), json!("hi"));
+        let vars =
+            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        assert_eq!(vars.get("id"), Some(&json!(11)));
+        assert_eq!(vars.get("ratio"), Some(&json!(1.5)));
+        assert_eq!(vars.get("on"), Some(&json!(true)));
+        assert_eq!(vars.get("note"), Some(&json!("hi")));
+    }
+
+    #[test]
+    fn build_variables_passes_through_already_typed_body() {
+        // A correctly-typed JSON body value (number/object) is left untouched.
+        let defs = vec![
+            VarDef { name: "id".into(), kind: ScalarKind::Int },
+            VarDef { name: "obj".into(), kind: ScalarKind::Other },
+        ];
+        let mut body = JsonMap::new();
+        body.insert("id".into(), json!(7));
+        body.insert("obj".into(), json!({ "k": "v" }));
+        let vars =
+            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        assert_eq!(vars.get("id"), Some(&json!(7)));
+        assert_eq!(vars.get("obj"), Some(&json!({ "k": "v" })));
     }
 
     #[test]

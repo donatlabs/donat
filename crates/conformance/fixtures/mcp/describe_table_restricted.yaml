@@ -1,0 +1,40 @@
+description: >
+  describe_table for a role with a column-restricted select permission
+  (`viewer` may select only id, name) reports only the permitted columns and
+  selectable_columns; the unpermitted `status` column is not disclosed. The
+  narrowing matches what GraphQL introspection exposes for the same role.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 21
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: pet
+response:
+  jsonrpc: "2.0"
+  id: 21
+  result:
+    isError: false
+    structuredContent:
+      name: pet
+      schema: public
+      columns:
+      - name: id
+        type: int4
+        nullable: false
+        description: null
+      - name: name
+        type: text
+        nullable: false
+        description: null
+      object_relationships: []
+      array_relationships: []
+      selectable_columns:
+      - id
+      - name

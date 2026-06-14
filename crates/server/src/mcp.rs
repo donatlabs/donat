@@ -13,10 +13,12 @@
 //! like GraphQL via [`crate::gql::resolve_session`]). Tool arguments are
 //! passed as GraphQL *variables* (JSON), never rendered as GraphQL literals.
 //!
+//! The `table` argument is resolved against tracked metadata by its GraphQL
+//! base name (`custom_name`/default naming), and the CRUD root fields honor
+//! `custom_root_fields` (via [`donat_schema::crud_roots`]); an unknown table
+//! name matches nothing and is rejected before any GraphQL text is built.
+//!
 //! Known limitations (v1):
-//! - Only the Donat default root-field naming is used (`<t>` for the `public`
-//!   schema, `<schema>_<t>` otherwise). `custom_root_fields` / `custom_name`
-//!   are not honored by the tool layer.
 //! - `list_tables` matches the session role directly; inherited roles are not
 //!   expanded.
 //! - `GET /mcp` returns 405 (SSE streaming is out of scope).
@@ -254,15 +256,37 @@ async fn call_tool(
     }
 }
 
-/// Resolve the table columns from the default catalog for `base` (the
-/// Donat base name). Returns `None` if the table is unknown.
-async fn table_columns(state: &SharedState, base: &str) -> Option<Vec<String>> {
+/// The resolved naming/columns context for a CRUD operation on a tracked
+/// table. `type_base` is the GraphQL type-name base (for `<base>_bool_exp`
+/// etc.); `roots` are the CRUD root field names (honoring
+/// `custom_root_fields`); `catalog_cols` is the default selection/returning set.
+struct BuildCtx<'a> {
+    type_base: &'a str,
+    roots: &'a donat_schema::CrudRoots,
+    catalog_cols: Option<&'a [String]>,
+}
+
+/// Resolve and VALIDATE a tool's `table` argument against tracked metadata,
+/// returning the GraphQL type-name base, the CRUD root names, and the catalog
+/// columns. Returns `None` if the table is not tracked — an unknown name (or
+/// an injection-crafted value) matches no entry and is rejected by the caller
+/// before any GraphQL text is built.
+async fn resolve_table(
+    state: &SharedState,
+    base: &str,
+) -> Option<(String, donat_schema::CrudRoots, Option<Vec<String>>)> {
     let engine = state.engine.read().await;
-    let catalog = engine.default_catalog();
-    let (schema, name) = base_to_qualified(base);
-    catalog
-        .table(&schema, &name)
-        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+    let entry = engine
+        .metadata
+        .sources
+        .iter()
+        .flat_map(|s| &s.tables)
+        .find(|t| donat_schema::table_base_name(t) == base)?;
+    let cols = engine
+        .default_catalog()
+        .table(entry.table.schema(), entry.table.name())
+        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect());
+    Some((donat_schema::table_base_name(entry), donat_schema::crud_roots(entry), cols))
 }
 
 /// Run a CRUD tool: build the GraphQL `(query, variables)` from the tool
@@ -278,17 +302,25 @@ async fn crud_tool<F>(
     builder: F,
 ) -> Json
 where
-    F: FnOnce(&Json, Option<&[String]>) -> Result<(String, JsonMap<String, Json>), String>,
+    F: FnOnce(&Json, &BuildCtx) -> Result<(String, JsonMap<String, Json>), String>,
 {
     let Some(base) = args.get("table").and_then(Json::as_str) else {
         return tool_err("missing required argument 'table'", None);
     };
 
-    // Resolve the table's columns (used as the default selection / returning
-    // set when the caller did not specify them).
-    let columns = table_columns(state, base).await;
+    // Resolve + validate the table against tracked metadata. This both rejects
+    // unknown/injection-crafted `table` values and yields the root-field names
+    // and the default column set.
+    let Some((type_base, roots, catalog_cols)) = resolve_table(state, base).await else {
+        return tool_err(format!("unknown table '{base}'"), None);
+    };
 
-    let (query, variables) = match builder(args, columns.as_deref()) {
+    let ctx = BuildCtx {
+        type_base: &type_base,
+        roots: &roots,
+        catalog_cols: catalog_cols.as_deref(),
+    };
+    let (query, variables) = match builder(args, &ctx) {
         Ok(qv) => qv,
         Err(msg) => return tool_err(msg, None),
     };
@@ -362,9 +394,24 @@ async fn list_tables(state: &SharedState, session: &Session) -> Json {
     tool_ok(json!({ "tables": tables }))
 }
 
+/// The `selectable_columns` value reported for a select permission, plus the
+/// allow-list used to filter the disclosed columns: `Star` exposes everything
+/// (`"*"`, no filter); `List` exposes only the listed columns.
+fn selectable_for_perm(columns: &donat_metadata::Columns) -> (Json, Option<Vec<String>>) {
+    match columns {
+        donat_metadata::Columns::Star => (Json::String("*".to_string()), None),
+        donat_metadata::Columns::List(cols) => (json!(cols), Some(cols.clone())),
+    }
+}
+
 /// `describe_table`: columns + types (from the catalog), relationships (from
-/// metadata), and the columns the role may select. Errors if the table is
-/// unknown to metadata.
+/// metadata), and the columns the role may select.
+///
+/// The role MUST have a select permission on the table. Without one the table
+/// is absent from the role's GraphQL schema (introspection hides it), so this
+/// discovery tool must refuse rather than leak the physical structure to a
+/// role that cannot read the table. With a column-restricted permission, only
+/// the permitted columns are disclosed.
 async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> Json {
     let Some(base) = args.get("table").and_then(Json::as_str) else {
         return tool_err("missing required argument 'table'", None);
@@ -383,14 +430,28 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
         return tool_err(format!("unknown table '{base}'"), None);
     };
 
-    // Catalog columns + types; per-column description from metadata
-    // `column_config.<col>.comment` (null when absent).
+    // The role must be able to select the table; otherwise it is not visible
+    // to this role and we must not disclose its structure (no admin bypass).
+    let Some(select_perm) = entry.select_permissions.iter().find(|p| p.role == role) else {
+        return tool_err(
+            format!("table '{base}' is not accessible to role '{role}'"),
+            None,
+        );
+    };
+    let (selectable, allowed) = selectable_for_perm(&select_perm.permission.columns);
+
+    // Catalog columns + types, filtered to the columns the role may select;
+    // per-column description from metadata `column_config.<col>.comment`.
     let catalog = engine.default_catalog();
     let columns: Vec<Json> = catalog
         .table(entry.table.schema(), entry.table.name())
         .map(|t| {
             t.columns
                 .iter()
+                .filter(|c| match &allowed {
+                    None => true,
+                    Some(cols) => cols.iter().any(|name| name == &c.name),
+                })
                 .map(|c| {
                     let description = entry
                         .configuration
@@ -414,15 +475,6 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
     let array_relationships: Vec<&str> =
         entry.array_relationships.iter().map(|r| r.name.as_str()).collect();
 
-    // Columns the role may select (from the select permission).
-    let selectable: Json = match entry.select_permissions.iter().find(|p| p.role == role) {
-        Some(p) => match &p.permission.columns {
-            donat_metadata::Columns::Star => Json::String("*".to_string()),
-            donat_metadata::Columns::List(cols) => json!(cols),
-        },
-        None => Json::Null,
-    };
-
     tool_ok(json!({
         "name": base,
         "schema": entry.table.schema(),
@@ -437,18 +489,6 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
 //
 // Pure helpers: tool arguments -> (GraphQL operation text, variables). They
 // pass user data as GraphQL *variables* (JSON), never as inline literals.
-
-/// Map a Donat base name back to a (schema, name) pair for catalog lookup:
-/// `s_table` -> (s, table), a bare name -> (public, name). This is a
-/// best-effort inverse of the default naming (`<t>` for `public`,
-/// `<schema>_<t>` otherwise); a table in `public` whose own name contains `_`
-/// is mis-split, which is the documented default-naming-only limitation.
-fn base_to_qualified(base: &str) -> (String, String) {
-    match base.split_once('_') {
-        Some((schema, name)) if !name.is_empty() => (schema.to_string(), name.to_string()),
-        _ => ("public".to_string(), base.to_string()),
-    }
-}
 
 /// Render a selection set body from an optional explicit column list, falling
 /// back to the catalog columns. Returns `Err` if neither is available.
@@ -477,18 +517,16 @@ fn string_list(args: &Json, key: &str) -> Option<Vec<String>> {
     })
 }
 
-/// `query` -> `query (...) { <t>(where, order_by, limit, offset) { cols } }`.
+/// `query` -> `query (...) { <root>(where, order_by, limit, offset) { cols } }`.
 fn build_query_gql(
     args: &Json,
-    catalog_cols: Option<&[String]>,
+    ctx: &BuildCtx,
 ) -> Result<(String, JsonMap<String, Json>), String> {
-    let base = args
-        .get("table")
-        .and_then(Json::as_str)
-        .ok_or("missing 'table'")?;
+    let base = ctx.type_base;
+    let root = &ctx.roots.query;
 
     let explicit = string_list(args, "columns");
-    let cols = selection_columns(explicit.as_ref(), catalog_cols)?;
+    let cols = selection_columns(explicit.as_ref(), ctx.catalog_cols)?;
     let selection = cols.join(" ");
 
     // Only declare/reference the arguments the caller actually supplied: the
@@ -525,31 +563,29 @@ fn build_query_gql(
         format!("({})", field_args.join(", "))
     };
     let query =
-        format!("query {var_decls} {{ {base}{field_args} {{ {selection} }} }}");
+        format!("query {var_decls} {{ {root}{field_args} {{ {selection} }} }}");
     Ok((query, vars))
 }
 
-/// `insert` -> `mutation ($objects: [<t>_insert_input!]!) { insert_<t>(objects: $objects) { affected_rows returning { cols } } }`.
+/// `insert` -> `mutation ($objects: [<t>_insert_input!]!) { <insert_root>(objects: $objects) { affected_rows returning { cols } } }`.
 fn build_insert_gql(
     args: &Json,
-    catalog_cols: Option<&[String]>,
+    ctx: &BuildCtx,
 ) -> Result<(String, JsonMap<String, Json>), String> {
-    let base = args
-        .get("table")
-        .and_then(Json::as_str)
-        .ok_or("missing 'table'")?;
+    let base = ctx.type_base;
+    let root = &ctx.roots.insert;
     let objects = args
         .get("objects")
         .filter(|v| v.is_array())
         .ok_or("missing required argument 'objects' (a list of rows)")?;
 
     let explicit = string_list(args, "returning");
-    let cols = selection_columns(explicit.as_ref(), catalog_cols)?;
+    let cols = selection_columns(explicit.as_ref(), ctx.catalog_cols)?;
     let selection = cols.join(" ");
 
     let query = format!(
         "mutation ($objects: [{base}_insert_input!]!) \
-         {{ insert_{base}(objects: $objects) {{ affected_rows returning {{ {selection} }} }} }}"
+         {{ {root}(objects: $objects) {{ affected_rows returning {{ {selection} }} }} }}"
     );
 
     let mut vars = JsonMap::new();
@@ -557,15 +593,13 @@ fn build_insert_gql(
     Ok((query, vars))
 }
 
-/// `update` -> `mutation ($where: <t>_bool_exp!, $set: <t>_set_input) { update_<t>(where: $where, _set: $set) { affected_rows returning { cols } } }`.
+/// `update` -> `mutation ($where: <t>_bool_exp!, $set: <t>_set_input) { <update_root>(where: $where, _set: $set) { affected_rows returning { cols } } }`.
 fn build_update_gql(
     args: &Json,
-    catalog_cols: Option<&[String]>,
+    ctx: &BuildCtx,
 ) -> Result<(String, JsonMap<String, Json>), String> {
-    let base = args
-        .get("table")
-        .and_then(Json::as_str)
-        .ok_or("missing 'table'")?;
+    let base = ctx.type_base;
+    let root = &ctx.roots.update;
     let where_arg = args
         .get("where")
         .filter(|v| !v.is_null())
@@ -576,12 +610,12 @@ fn build_update_gql(
         .ok_or("missing required argument 'set'")?;
 
     let explicit = string_list(args, "returning");
-    let cols = selection_columns(explicit.as_ref(), catalog_cols)?;
+    let cols = selection_columns(explicit.as_ref(), ctx.catalog_cols)?;
     let selection = cols.join(" ");
 
     let query = format!(
         "mutation ($where: {base}_bool_exp!, $set: {base}_set_input) \
-         {{ update_{base}(where: $where, _set: $set) {{ affected_rows returning {{ {selection} }} }} }}"
+         {{ {root}(where: $where, _set: $set) {{ affected_rows returning {{ {selection} }} }} }}"
     );
 
     let mut vars = JsonMap::new();
@@ -590,27 +624,25 @@ fn build_update_gql(
     Ok((query, vars))
 }
 
-/// `delete` -> `mutation ($where: <t>_bool_exp!) { delete_<t>(where: $where) { affected_rows returning { cols } } }`.
+/// `delete` -> `mutation ($where: <t>_bool_exp!) { <delete_root>(where: $where) { affected_rows returning { cols } } }`.
 fn build_delete_gql(
     args: &Json,
-    catalog_cols: Option<&[String]>,
+    ctx: &BuildCtx,
 ) -> Result<(String, JsonMap<String, Json>), String> {
-    let base = args
-        .get("table")
-        .and_then(Json::as_str)
-        .ok_or("missing 'table'")?;
+    let base = ctx.type_base;
+    let root = &ctx.roots.delete;
     let where_arg = args
         .get("where")
         .filter(|v| !v.is_null())
         .ok_or("missing required argument 'where'")?;
 
     let explicit = string_list(args, "returning");
-    let cols = selection_columns(explicit.as_ref(), catalog_cols)?;
+    let cols = selection_columns(explicit.as_ref(), ctx.catalog_cols)?;
     let selection = cols.join(" ");
 
     let query = format!(
         "mutation ($where: {base}_bool_exp!) \
-         {{ delete_{base}(where: $where) {{ affected_rows returning {{ {selection} }} }} }}"
+         {{ {root}(where: $where) {{ affected_rows returning {{ {selection} }} }} }}"
     );
 
     let mut vars = JsonMap::new();
@@ -626,13 +658,23 @@ mod tests {
         vec!["id".to_string(), "name".to_string(), "status".to_string()]
     }
 
-    #[test]
-    fn base_to_qualified_public_and_schema() {
-        assert_eq!(base_to_qualified("pet"), ("public".to_string(), "pet".to_string()));
-        assert_eq!(
-            base_to_qualified("sales_order"),
-            ("sales".to_string(), "order".to_string())
-        );
+    /// Default-naming CRUD roots for a base name (no custom_root_fields).
+    fn roots(base: &str) -> donat_schema::CrudRoots {
+        donat_schema::CrudRoots {
+            query: base.to_string(),
+            insert: format!("insert_{base}"),
+            update: format!("update_{base}"),
+            delete: format!("delete_{base}"),
+        }
+    }
+
+    /// A BuildCtx for `base` with the given (optional) catalog columns.
+    fn ctx<'a>(
+        base: &'a str,
+        roots: &'a donat_schema::CrudRoots,
+        cols: Option<&'a [String]>,
+    ) -> BuildCtx<'a> {
+        BuildCtx { type_base: base, roots, catalog_cols: cols }
     }
 
     #[test]
@@ -644,7 +686,8 @@ mod tests {
             "order_by": { "id": "asc" },
             "limit": 2
         });
-        let (q, vars) = build_query_gql(&args, None).unwrap();
+        let r = roots("pet");
+        let (q, vars) = build_query_gql(&args, &ctx("pet", &r, None)).unwrap();
         assert!(q.contains("$where: pet_bool_exp"), "{q}");
         assert!(q.contains("$order_by: [pet_order_by!]"), "{q}");
         assert!(q.contains("$limit: Int"), "{q}");
@@ -662,14 +705,16 @@ mod tests {
     #[test]
     fn query_defaults_to_catalog_columns() {
         let args = json!({ "table": "pet" });
-        let (q, _) = build_query_gql(&args, Some(&cols())).unwrap();
+        let r = roots("pet");
+        let (q, _) = build_query_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap();
         assert!(q.contains("{ id name status }"), "{q}");
     }
 
     #[test]
     fn query_without_columns_or_catalog_errors() {
         let args = json!({ "table": "pet" });
-        let err = build_query_gql(&args, None).unwrap_err();
+        let r = roots("pet");
+        let err = build_query_gql(&args, &ctx("pet", &r, None)).unwrap_err();
         assert!(err.contains("columns"), "{err}");
     }
 
@@ -679,7 +724,8 @@ mod tests {
             "table": "pet",
             "objects": [{ "id": 10, "name": "Biscuit", "status": "available" }]
         });
-        let (q, vars) = build_insert_gql(&args, Some(&cols())).unwrap();
+        let r = roots("pet");
+        let (q, vars) = build_insert_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap();
         assert!(q.contains("$objects: [pet_insert_input!]!"), "{q}");
         assert!(q.contains("insert_pet(objects: $objects)"), "{q}");
         assert!(q.contains("affected_rows returning { id name status }"), "{q}");
@@ -696,14 +742,16 @@ mod tests {
             "objects": [{ "id": 10 }],
             "returning": ["id"]
         });
-        let (q, _) = build_insert_gql(&args, Some(&cols())).unwrap();
+        let r = roots("pet");
+        let (q, _) = build_insert_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap();
         assert!(q.contains("returning { id }"), "{q}");
     }
 
     #[test]
     fn insert_without_objects_errors() {
         let args = json!({ "table": "pet" });
-        let err = build_insert_gql(&args, Some(&cols())).unwrap_err();
+        let r = roots("pet");
+        let err = build_insert_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap_err();
         assert!(err.contains("objects"), "{err}");
     }
 
@@ -714,7 +762,8 @@ mod tests {
             "where": { "id": { "_eq": 1 } },
             "set": { "status": "sold" }
         });
-        let (q, vars) = build_update_gql(&args, Some(&cols())).unwrap();
+        let r = roots("pet");
+        let (q, vars) = build_update_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap();
         assert!(q.contains("$where: pet_bool_exp!"), "{q}");
         assert!(q.contains("$set: pet_set_input"), "{q}");
         assert!(q.contains("update_pet(where: $where, _set: $set)"), "{q}");
@@ -725,16 +774,18 @@ mod tests {
 
     #[test]
     fn update_requires_where_and_set() {
+        let r = roots("pet");
         let no_set = json!({ "table": "pet", "where": { "id": { "_eq": 1 } } });
-        assert!(build_update_gql(&no_set, Some(&cols())).unwrap_err().contains("set"));
+        assert!(build_update_gql(&no_set, &ctx("pet", &r, Some(&cols()))).unwrap_err().contains("set"));
         let no_where = json!({ "table": "pet", "set": { "status": "sold" } });
-        assert!(build_update_gql(&no_where, Some(&cols())).unwrap_err().contains("where"));
+        assert!(build_update_gql(&no_where, &ctx("pet", &r, Some(&cols()))).unwrap_err().contains("where"));
     }
 
     #[test]
     fn delete_builds_where() {
         let args = json!({ "table": "pet", "where": { "id": { "_eq": 2 } } });
-        let (q, vars) = build_delete_gql(&args, Some(&cols())).unwrap();
+        let r = roots("pet");
+        let (q, vars) = build_delete_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap();
         assert!(q.contains("$where: pet_bool_exp!"), "{q}");
         assert!(q.contains("delete_pet(where: $where)"), "{q}");
         assert!(q.contains("affected_rows returning { id name status }"), "{q}");
@@ -744,14 +795,58 @@ mod tests {
     #[test]
     fn delete_requires_where() {
         let args = json!({ "table": "pet" });
-        assert!(build_delete_gql(&args, Some(&cols())).unwrap_err().contains("where"));
+        let r = roots("pet");
+        assert!(build_delete_gql(&args, &ctx("pet", &r, Some(&cols()))).unwrap_err().contains("where"));
     }
 
     #[test]
     fn non_public_schema_in_root_names() {
+        // A non-public table's GraphQL base is `<schema>_<name>`; the root
+        // names come from the resolved CrudRoots, not from splitting the base.
         let args = json!({ "table": "sales_order", "where": { "id": { "_eq": 1 } } });
-        let (q, _) = build_delete_gql(&args, Some(&cols())).unwrap();
+        let r = roots("sales_order");
+        let (q, _) = build_delete_gql(&args, &ctx("sales_order", &r, Some(&cols()))).unwrap();
         assert!(q.contains("delete_sales_order(where: $where)"), "{q}");
+    }
+
+    #[test]
+    fn builders_honor_custom_root_fields() {
+        // custom_root_fields rename the ROOT fields; the type-name base
+        // (custom_name) still drives `<base>_bool_exp` / `<base>_insert_input`.
+        let r = donat_schema::CrudRoots {
+            query: "all_widgets".to_string(),
+            insert: "add_widget".to_string(),
+            update: "update_widget".to_string(),
+            delete: "delete_widget".to_string(),
+        };
+        let select = json!({ "table": "widget" });
+        let (q, _) = build_query_gql(&select, &ctx("widget", &r, Some(&cols()))).unwrap();
+        assert!(q.contains("{ all_widgets {"), "{q}");
+
+        let ins = json!({ "table": "widget", "objects": [{ "id": 1 }] });
+        let (q, _) = build_insert_gql(&ins, &ctx("widget", &r, Some(&cols()))).unwrap();
+        assert!(q.contains("add_widget(objects: $objects)"), "{q}");
+        assert!(q.contains("$objects: [widget_insert_input!]!"), "{q}");
+
+        let del = json!({ "table": "widget", "where": { "id": { "_eq": 1 } } });
+        let (q, _) = build_delete_gql(&del, &ctx("widget", &r, Some(&cols()))).unwrap();
+        assert!(q.contains("delete_widget(where: $where)"), "{q}");
+        assert!(q.contains("$where: widget_bool_exp!"), "{q}");
+    }
+
+    #[test]
+    fn selectable_for_perm_star_exposes_all() {
+        let (sel, allowed) = selectable_for_perm(&donat_metadata::Columns::Star);
+        assert_eq!(sel, json!("*"));
+        assert!(allowed.is_none(), "Star must not filter columns");
+    }
+
+    #[test]
+    fn selectable_for_perm_list_filters_to_listed() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let (sel, allowed) = selectable_for_perm(&donat_metadata::Columns::List(cols.clone()));
+        assert_eq!(sel, json!(["id", "name"]));
+        assert_eq!(allowed, Some(cols));
     }
 
     #[test]

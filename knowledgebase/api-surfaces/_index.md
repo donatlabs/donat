@@ -22,6 +22,10 @@ separate branches and merge independently).
 - [[decisions/002-mcp-generic-crud-tools-streamable-http]] — MCP exposes a
   small set of generic CRUD tools over streamable HTTP, not per-table tools
   and not stdio
+- [[decisions/005-allowlist-and-jsonrpc-notification-semantics]] — why the
+  query allowlist applies to REST/MCP without bypass, why `id`-less JSON-RPC
+  requests are no-op notifications, and why a `:param`-match method mismatch
+  is a correct `405`
 
 ## Cross-cutting
 
