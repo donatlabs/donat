@@ -722,6 +722,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-catalog-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "donat-conformance"
 version = "0.1.0"
 dependencies = [

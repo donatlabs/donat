@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/metadata",
     "crates/catalog",
+    "crates/catalog-types",
     "crates/schema",
     "crates/ir",
     "crates/sqlgen",
