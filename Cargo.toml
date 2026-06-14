@@ -7,6 +7,7 @@ members = [
     "crates/schema",
     "crates/ir",
     "crates/sqlgen",
+    "crates/wasm-core",
     "crates/backend",
     "crates/server",
     "crates/conformance",

@@ -1,0 +1,22 @@
+[package]
+name = "donat-wasm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Donat conformance core compiled to wasm: (query,vars,session) -> PlanV1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+donat-metadata = { path = "../metadata" }
+donat-schema = { path = "../schema" }
+donat-sqlgen = { path = "../sqlgen" }
+donat-ir = { path = "../ir" }
+donat-catalog-types = { path = "../catalog-types" }
+graphql-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

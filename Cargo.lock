@@ -828,6 +828,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-wasm-core"
+version = "0.1.0"
+dependencies = [
+ "donat-catalog-types",
+ "donat-ir",
+ "donat-metadata",
+ "donat-schema",
+ "donat-sqlgen",
+ "graphql-parser",
+ "insta",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
