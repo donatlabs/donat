@@ -186,6 +186,34 @@ so a role can never see a row or column it isn't granted.
 
 ---
 
+## Performance
+
+Because the engine compiles each request to **one SQL statement** and lets
+Postgres assemble the JSON, it holds almost no data itself — the working set
+lives in the database, and the engine just translates and streams. That shows
+up as a tiny footprint:
+
+| | Idle | Under load |
+|---|---|---|
+| **Engine memory** | ~2 MiB | ~7 MiB |
+| **Engine CPU** | 0% | ~⅓ of one core |
+
+Driving the `examples/petshop` stack with ApacheBench (20,000 GraphQL queries
+joining `pet → category`, concurrency 50):
+
+- **3,257 req/s**, **0 failed** requests
+- **p50 15 ms · p95 21 ms · p99 25 ms** (max 32 ms)
+
+The container image is **168 MB** (a single static-ish binary plus a minimal
+base).
+
+> Measured on a single engine instance with Postgres in the same Docker network
+> on a developer laptop — not a tuned multi-pod deployment. Treat it as an
+> order-of-magnitude footprint, not a max-throughput benchmark. Reproduce it
+> with `examples/petshop` + `ab` (or any HTTP load tool).
+
+---
+
 ## Capabilities
 
 All of the following are verified by a passing module in the native
