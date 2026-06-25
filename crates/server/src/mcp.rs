@@ -1385,12 +1385,36 @@ fn mcp_accept_header(headers: &HeaderMap) -> Result<(), String> {
         ));
     }
     let accept = values.join(", ");
+    validate_accept_header(&accept)?;
     if accept_supports(&accept, "application/json") && accept_supports(&accept, "text/event-stream")
     {
         Ok(())
     } else {
         Err("MCP accept header must include application/json and text/event-stream".to_string())
     }
+}
+
+fn validate_accept_header(accept: &str) -> Result<(), String> {
+    for range in accept.split(',') {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim();
+        let Some((typ, subtype)) = media.split_once('/') else {
+            return Err("invalid MCP accept header".to_string());
+        };
+        if !is_http_token(typ) || !is_http_token(subtype) {
+            return Err("invalid MCP accept header".to_string());
+        }
+        for param in parts {
+            let param = param.trim();
+            let Some((name, value)) = param.split_once('=') else {
+                return Err("invalid MCP accept header".to_string());
+            };
+            if !is_http_token(name.trim()) || value.trim().is_empty() {
+                return Err("invalid MCP accept header".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn accept_supports(accept: &str, expected: &str) -> bool {
@@ -1435,6 +1459,30 @@ fn accept_quality(accept: &str, expected: &str) -> Option<f32> {
     }
 
     best.map(|(_, q)| q)
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn mcp_content_type_header(headers: &HeaderMap) -> Result<(), String> {
@@ -7022,6 +7070,19 @@ mod tests {
                 err,
                 "MCP accept header must include application/json and text/event-stream"
             );
+        }
+
+        for accept in [
+            "application/json, , text/event-stream",
+            "application/json; charset, text/event-stream",
+            "application/json; q=, text/event-stream",
+            "application json, text/event-stream",
+            "application/json, text/event-stream; bad",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_HEADER, accept.parse().unwrap());
+            let err = mcp_accept_header(&headers).unwrap_err();
+            assert_eq!(err, "invalid MCP accept header", "{accept}");
         }
 
         let mut headers = HeaderMap::new();

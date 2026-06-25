@@ -797,6 +797,30 @@ fn mcp_rejects_wildcard_accept_header() {
 }
 
 #[test]
+fn mcp_rejects_malformed_accept_header_before_dispatch() {
+    let s = Suite::new("mcp_malformed_accept").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{}/mcp", s.base_url()))
+        .header("Accept", "application/json, , text/event-stream")
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":96,"method":"tools/list"}"#)
+        .send()
+        .expect("http request failed");
+
+    assert_eq!(resp.status().as_u16(), 406);
+    let body: Json = resp.json().expect("json body");
+    assert_eq!(body["id"], json!(null));
+    assert_eq!(body["error"]["code"], json!(-32600));
+    assert_eq!(body["error"]["message"], json!("invalid MCP accept header"));
+    assert!(body.get("result").is_none(), "{body}");
+    assert!(!body.to_string().contains("list_tables"), "{body}");
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
 fn mcp_rejects_oversized_accept_header_without_reflection() {
     let s = Suite::new("mcp_oversized_accept").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
