@@ -27,6 +27,15 @@ args:
         (1, 'first'),
         (2, 'second');
 
+      -- Write-only MCP table: `writer` may insert rows but has no select
+      -- permission, so MCP must discover the insert operation without leaking
+      -- columns through describe_table/query, and mutation tools must request
+      -- affected_rows only (no returning).
+      CREATE TABLE audit_log (
+        id INT PRIMARY KEY,
+        message TEXT NOT NULL
+      );
+
 - type: track_table
   args:
     schema: public
@@ -57,6 +66,37 @@ args:
       - id
       - name
 
+- type: create_select_permission
+  args:
+    table: pet
+    role: status_viewer
+    permission:
+      filter: {}
+      columns:
+      - status
+
+- type: create_select_permission
+  args:
+    table: pet
+    role: limited_viewer
+    permission:
+      filter: {}
+      columns: '*'
+      limit: 1
+
+- type: add_inherited_role
+  args:
+    role_name: inherited_user
+    role_set:
+    - user
+
+- type: add_inherited_role
+  args:
+    role_name: viewer_status
+    role_set:
+    - viewer
+    - status_viewer
+
 - type: create_insert_permission
   args:
     table: pet
@@ -64,6 +104,15 @@ args:
     permission:
       check: {}
       columns: '*'
+
+- type: create_insert_permission
+  args:
+    table: pet
+    role: name_inserter
+    permission:
+      check: {}
+      columns:
+      - name
 
 - type: create_update_permission
   args:
@@ -74,10 +123,57 @@ args:
       filter: {}
       check: {}
 
+- type: create_update_permission
+  args:
+    table: pet
+    role: status_updater
+    permission:
+      columns:
+      - status
+      filter: {}
+      check: {}
+
+- type: create_select_permission
+  args:
+    table: pet
+    role: status_editor
+    permission:
+      filter: {}
+      columns:
+      - id
+      - name
+
+- type: create_update_permission
+  args:
+    table: pet
+    role: status_editor
+    permission:
+      columns:
+      - status
+      filter: {}
+      check: {}
+
 - type: create_delete_permission
   args:
     table: pet
     role: user
+    permission:
+      filter: {}
+
+- type: create_select_permission
+  args:
+    table: pet
+    role: restricted_deleter
+    permission:
+      filter: {}
+      columns:
+      - id
+      - name
+
+- type: create_delete_permission
+  args:
+    table: pet
+    role: restricted_deleter
     permission:
       filter: {}
 
@@ -92,4 +188,17 @@ args:
     role: user
     permission:
       filter: {}
+      columns: '*'
+
+- type: track_table
+  args:
+    schema: public
+    name: audit_log
+
+- type: create_insert_permission
+  args:
+    table: audit_log
+    role: writer
+    permission:
+      check: {}
       columns: '*'

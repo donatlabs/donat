@@ -1,0 +1,21 @@
+description: >
+  describe_table.table must not be empty. Empty table identifiers are rejected
+  by MCP argument validation before metadata lookup.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 63
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: ""
+response:
+  jsonrpc: "2.0"
+  id: 63
+  result:
+    isError: true

@@ -1,0 +1,123 @@
+description: >
+  insert.objects above the MCP batch cap is rejected before GraphQL execution.
+  This keeps one MCP tool call from becoming an unbounded mutation batch.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 48
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - {id: 1000, name: Pet1000, status: available}
+      - {id: 1001, name: Pet1001, status: available}
+      - {id: 1002, name: Pet1002, status: available}
+      - {id: 1003, name: Pet1003, status: available}
+      - {id: 1004, name: Pet1004, status: available}
+      - {id: 1005, name: Pet1005, status: available}
+      - {id: 1006, name: Pet1006, status: available}
+      - {id: 1007, name: Pet1007, status: available}
+      - {id: 1008, name: Pet1008, status: available}
+      - {id: 1009, name: Pet1009, status: available}
+      - {id: 1010, name: Pet1010, status: available}
+      - {id: 1011, name: Pet1011, status: available}
+      - {id: 1012, name: Pet1012, status: available}
+      - {id: 1013, name: Pet1013, status: available}
+      - {id: 1014, name: Pet1014, status: available}
+      - {id: 1015, name: Pet1015, status: available}
+      - {id: 1016, name: Pet1016, status: available}
+      - {id: 1017, name: Pet1017, status: available}
+      - {id: 1018, name: Pet1018, status: available}
+      - {id: 1019, name: Pet1019, status: available}
+      - {id: 1020, name: Pet1020, status: available}
+      - {id: 1021, name: Pet1021, status: available}
+      - {id: 1022, name: Pet1022, status: available}
+      - {id: 1023, name: Pet1023, status: available}
+      - {id: 1024, name: Pet1024, status: available}
+      - {id: 1025, name: Pet1025, status: available}
+      - {id: 1026, name: Pet1026, status: available}
+      - {id: 1027, name: Pet1027, status: available}
+      - {id: 1028, name: Pet1028, status: available}
+      - {id: 1029, name: Pet1029, status: available}
+      - {id: 1030, name: Pet1030, status: available}
+      - {id: 1031, name: Pet1031, status: available}
+      - {id: 1032, name: Pet1032, status: available}
+      - {id: 1033, name: Pet1033, status: available}
+      - {id: 1034, name: Pet1034, status: available}
+      - {id: 1035, name: Pet1035, status: available}
+      - {id: 1036, name: Pet1036, status: available}
+      - {id: 1037, name: Pet1037, status: available}
+      - {id: 1038, name: Pet1038, status: available}
+      - {id: 1039, name: Pet1039, status: available}
+      - {id: 1040, name: Pet1040, status: available}
+      - {id: 1041, name: Pet1041, status: available}
+      - {id: 1042, name: Pet1042, status: available}
+      - {id: 1043, name: Pet1043, status: available}
+      - {id: 1044, name: Pet1044, status: available}
+      - {id: 1045, name: Pet1045, status: available}
+      - {id: 1046, name: Pet1046, status: available}
+      - {id: 1047, name: Pet1047, status: available}
+      - {id: 1048, name: Pet1048, status: available}
+      - {id: 1049, name: Pet1049, status: available}
+      - {id: 1050, name: Pet1050, status: available}
+      - {id: 1051, name: Pet1051, status: available}
+      - {id: 1052, name: Pet1052, status: available}
+      - {id: 1053, name: Pet1053, status: available}
+      - {id: 1054, name: Pet1054, status: available}
+      - {id: 1055, name: Pet1055, status: available}
+      - {id: 1056, name: Pet1056, status: available}
+      - {id: 1057, name: Pet1057, status: available}
+      - {id: 1058, name: Pet1058, status: available}
+      - {id: 1059, name: Pet1059, status: available}
+      - {id: 1060, name: Pet1060, status: available}
+      - {id: 1061, name: Pet1061, status: available}
+      - {id: 1062, name: Pet1062, status: available}
+      - {id: 1063, name: Pet1063, status: available}
+      - {id: 1064, name: Pet1064, status: available}
+      - {id: 1065, name: Pet1065, status: available}
+      - {id: 1066, name: Pet1066, status: available}
+      - {id: 1067, name: Pet1067, status: available}
+      - {id: 1068, name: Pet1068, status: available}
+      - {id: 1069, name: Pet1069, status: available}
+      - {id: 1070, name: Pet1070, status: available}
+      - {id: 1071, name: Pet1071, status: available}
+      - {id: 1072, name: Pet1072, status: available}
+      - {id: 1073, name: Pet1073, status: available}
+      - {id: 1074, name: Pet1074, status: available}
+      - {id: 1075, name: Pet1075, status: available}
+      - {id: 1076, name: Pet1076, status: available}
+      - {id: 1077, name: Pet1077, status: available}
+      - {id: 1078, name: Pet1078, status: available}
+      - {id: 1079, name: Pet1079, status: available}
+      - {id: 1080, name: Pet1080, status: available}
+      - {id: 1081, name: Pet1081, status: available}
+      - {id: 1082, name: Pet1082, status: available}
+      - {id: 1083, name: Pet1083, status: available}
+      - {id: 1084, name: Pet1084, status: available}
+      - {id: 1085, name: Pet1085, status: available}
+      - {id: 1086, name: Pet1086, status: available}
+      - {id: 1087, name: Pet1087, status: available}
+      - {id: 1088, name: Pet1088, status: available}
+      - {id: 1089, name: Pet1089, status: available}
+      - {id: 1090, name: Pet1090, status: available}
+      - {id: 1091, name: Pet1091, status: available}
+      - {id: 1092, name: Pet1092, status: available}
+      - {id: 1093, name: Pet1093, status: available}
+      - {id: 1094, name: Pet1094, status: available}
+      - {id: 1095, name: Pet1095, status: available}
+      - {id: 1096, name: Pet1096, status: available}
+      - {id: 1097, name: Pet1097, status: available}
+      - {id: 1098, name: Pet1098, status: available}
+      - {id: 1099, name: Pet1099, status: available}
+      - {id: 1100, name: Pet1100, status: available}
+response:
+  jsonrpc: "2.0"
+  id: 48
+  result:
+    isError: true

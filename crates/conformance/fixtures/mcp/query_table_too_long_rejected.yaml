@@ -1,0 +1,22 @@
+description: >
+  query.table is capped before metadata lookup. Very long structural table
+  names are rejected as malformed tool arguments and are not reflected.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 72
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 72
+  result:
+    isError: true

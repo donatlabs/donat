@@ -1,0 +1,31 @@
+description: >
+  A column-restricted role can omit `columns`; MCP defaults the selection set
+  to the role-visible columns only. `viewer` may select id/name but not status,
+  so the generated query must not ask GraphQL for the hidden status column.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 30
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      order_by:
+        id: asc
+response:
+  jsonrpc: "2.0"
+  id: 30
+  result:
+    isError: false
+    structuredContent:
+    - id: 1
+      name: Rex
+    - id: 2
+      name: Milo
+    - id: 3
+      name: Luna

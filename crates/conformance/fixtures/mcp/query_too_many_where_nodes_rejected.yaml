@@ -1,0 +1,74 @@
+description: >
+  A wide query.where boolean expression is rejected before GraphQL execution.
+  MCP bounds filter breadth/amount to reduce single-request planner DoS risk.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 52
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      where:
+        _or:
+        - {id: {_eq: 1000}}
+        - {id: {_eq: 1001}}
+        - {id: {_eq: 1002}}
+        - {id: {_eq: 1003}}
+        - {id: {_eq: 1004}}
+        - {id: {_eq: 1005}}
+        - {id: {_eq: 1006}}
+        - {id: {_eq: 1007}}
+        - {id: {_eq: 1008}}
+        - {id: {_eq: 1009}}
+        - {id: {_eq: 1010}}
+        - {id: {_eq: 1011}}
+        - {id: {_eq: 1012}}
+        - {id: {_eq: 1013}}
+        - {id: {_eq: 1014}}
+        - {id: {_eq: 1015}}
+        - {id: {_eq: 1016}}
+        - {id: {_eq: 1017}}
+        - {id: {_eq: 1018}}
+        - {id: {_eq: 1019}}
+        - {id: {_eq: 1020}}
+        - {id: {_eq: 1021}}
+        - {id: {_eq: 1022}}
+        - {id: {_eq: 1023}}
+        - {id: {_eq: 1024}}
+        - {id: {_eq: 1025}}
+        - {id: {_eq: 1026}}
+        - {id: {_eq: 1027}}
+        - {id: {_eq: 1028}}
+        - {id: {_eq: 1029}}
+        - {id: {_eq: 1030}}
+        - {id: {_eq: 1031}}
+        - {id: {_eq: 1032}}
+        - {id: {_eq: 1033}}
+        - {id: {_eq: 1034}}
+        - {id: {_eq: 1035}}
+        - {id: {_eq: 1036}}
+        - {id: {_eq: 1037}}
+        - {id: {_eq: 1038}}
+        - {id: {_eq: 1039}}
+        - {id: {_eq: 1040}}
+        - {id: {_eq: 1041}}
+        - {id: {_eq: 1042}}
+        - {id: {_eq: 1043}}
+        - {id: {_eq: 1044}}
+        - {id: {_eq: 1045}}
+        - {id: {_eq: 1046}}
+        - {id: {_eq: 1047}}
+        - {id: {_eq: 1048}}
+        - {id: {_eq: 1049}}
+response:
+  jsonrpc: "2.0"
+  id: 52
+  result:
+    isError: true

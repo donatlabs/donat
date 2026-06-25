@@ -1,0 +1,27 @@
+description: >
+  A write-only role can use the MCP insert tool. Because `writer` has no select
+  permission on audit_log, the tool must not request returning rows; the result
+  contains affected_rows only.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: writer
+body:
+  jsonrpc: "2.0"
+  id: 30
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: audit_log
+      objects:
+      - id: 1
+        message: created by write-only role
+response:
+  jsonrpc: "2.0"
+  id: 30
+  result:
+    isError: false
+    structuredContent:
+      affected_rows: 1

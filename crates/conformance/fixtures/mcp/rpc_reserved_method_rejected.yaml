@@ -1,0 +1,16 @@
+description: >
+  JSON-RPC reserves method names beginning with rpc. for system extensions.
+  MCP rejects such methods before normal method dispatch.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 70
+  method: rpc.discover
+response:
+  jsonrpc: "2.0"
+  id: 70
+  error:
+    code: -32600
+    message: "'method' must not use reserved rpc. prefix"

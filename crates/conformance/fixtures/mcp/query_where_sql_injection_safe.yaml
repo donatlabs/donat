@@ -1,0 +1,27 @@
+description: >
+  A classic SQL boolean-injection payload in a MCP query where-filter is
+  treated as a literal GraphQL variable value. It must match no rows and must
+  not broaden the predicate to all pets.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 36
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, name, status]
+      where:
+        status:
+          _eq: "available' OR '1'='1"
+response:
+  jsonrpc: "2.0"
+  id: 36
+  result:
+    isError: false
+    structuredContent: []

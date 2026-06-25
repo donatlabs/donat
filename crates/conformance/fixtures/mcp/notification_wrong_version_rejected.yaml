@@ -1,0 +1,15 @@
+description: >
+  MCP notifications are non-request messages, but still must be valid JSON-RPC
+  2.0 messages before the transport accepts them.
+url: /mcp
+method: POST
+status: 400
+body:
+  jsonrpc: "1.0"
+  method: notifications/initialized
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "'jsonrpc' must be \"2.0\""

@@ -1,0 +1,20 @@
+description: >
+  tools/call params.name must be a string. Non-string tool names are rejected
+  before tool routing instead of being coerced to an unknown tool.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 65
+  method: tools/call
+  params:
+    name: 123
+    arguments: {}
+response:
+  jsonrpc: "2.0"
+  id: 65
+  result:
+    isError: true

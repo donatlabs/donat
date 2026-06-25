@@ -1,0 +1,14 @@
+description: >
+  MCP JSON-RPC requests must be JSON objects. A non-object request is rejected
+  with a JSON-RPC invalid-request error instead of being treated as a
+  notification.
+url: /mcp
+method: POST
+status: 200
+body: "not an object"
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: invalid request

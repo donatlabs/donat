@@ -1326,6 +1326,12 @@ impl Running {
         self.ensure_engine();
         let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
         let mut req = self.http.post(format!("{base}{path}")).json(body);
+        let has_accept = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept"));
+        if path == "/mcp" && !has_accept {
+            req = req.header("Accept", "application/json, text/event-stream");
+        }
         for (k, v) in headers {
             req = req.header(k, v);
         }

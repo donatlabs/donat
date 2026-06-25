@@ -1,0 +1,23 @@
+description: >
+  An explicit query.offset above the MCP offset cap is rejected before GraphQL
+  execution. This limits expensive deep offset pagination scans from MCP tools.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 60
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      offset: 10001
+response:
+  jsonrpc: "2.0"
+  id: 60
+  result:
+    isError: true

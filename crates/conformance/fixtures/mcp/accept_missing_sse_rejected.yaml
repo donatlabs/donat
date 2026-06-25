@@ -1,0 +1,18 @@
+description: >
+  MCP Streamable HTTP POST requests that explicitly send Accept without
+  text/event-stream are rejected before request execution.
+url: /mcp
+method: POST
+status: 406
+headers:
+  Accept: "application/json"
+body:
+  jsonrpc: "2.0"
+  id: 90
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "MCP accept header must include application/json and text/event-stream"

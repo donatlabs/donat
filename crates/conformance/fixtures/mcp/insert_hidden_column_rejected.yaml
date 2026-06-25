@@ -1,0 +1,25 @@
+description: >
+  A role with column-restricted insert permission cannot insert a physical
+  column outside its insert mask. MCP rejects `status` before GraphQL execution
+  because `name_inserter` may only write `name`.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: name_inserter
+body:
+  jsonrpc: "2.0"
+  id: 32
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - name: Scout
+        status: available
+response:
+  jsonrpc: "2.0"
+  id: 32
+  result:
+    isError: true

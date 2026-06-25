@@ -1,0 +1,25 @@
+description: >
+  tools/call update rejects an empty set object before GraphQL execution.
+  MCP update calls must specify at least one writable column to change.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 55
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        id:
+          _eq: 1
+      set: {}
+response:
+  jsonrpc: "2.0"
+  id: 55
+  result:
+    isError: true

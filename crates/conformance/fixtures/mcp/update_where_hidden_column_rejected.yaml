@@ -1,0 +1,30 @@
+description: >
+  A role with select access only to id/name cannot use the hidden status
+  column in update.where. Otherwise affected_rows would expose a destructive
+  side-channel over unreadable values.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: status_editor
+body:
+  jsonrpc: "2.0"
+  id: 74
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        status:
+          _eq: available
+      set:
+        status: sold
+response:
+  jsonrpc: "2.0"
+  id: 74
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "'where' contains non-selectable column"

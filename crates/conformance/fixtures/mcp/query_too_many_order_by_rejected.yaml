@@ -1,0 +1,40 @@
+description: >
+  query.order_by arrays above the MCP sort-term cap are rejected before GraphQL
+  execution. This is a breadth/amount limit for generated GraphQL operations.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 59
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      order_by:
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+      - id: asc
+response:
+  jsonrpc: "2.0"
+  id: 59
+  result:
+    isError: true

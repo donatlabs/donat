@@ -1,0 +1,23 @@
+description: >
+  Duplicate query.columns entries are rejected before GraphQL generation. MCP
+  column selection is set-like; repeated fields only inflate the generated
+  selection set and add DoS surface.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 53
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, id]
+response:
+  jsonrpc: "2.0"
+  id: 53
+  result:
+    isError: true

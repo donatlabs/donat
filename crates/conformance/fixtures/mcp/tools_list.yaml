@@ -1,7 +1,8 @@
 description: >
   tools/list returns the six generic CRUD + discovery tools, each with a
-  name, description, and JSON-Schema inputSchema. The full array is asserted
-  so all six tools (and their schemas) are verified to exist.
+  name, description, JSON-Schema input/output schemas, and MCP risk
+  annotations. The full array is asserted so all six tools are verified to
+  exist with their contracts.
 url: /mcp
 method: POST
 status: 200
@@ -18,88 +19,363 @@ response:
   result:
     tools:
     - name: list_tables
+      annotations:
+        title: List Tables
+        readOnlyHint: true
+        destructiveHint: false
+        idempotentHint: true
+        openWorldHint: false
       description: List the tables the current role may access, with the operations (select/insert/update/delete) permitted on each.
       inputSchema:
         type: object
         properties: {}
         additionalProperties: false
+      outputSchema:
+        type: object
+        properties:
+          tables:
+            type: array
+            items:
+              type: object
+              properties:
+                name:
+                  type: string
+                schema:
+                  type: string
+                operations:
+                  type: array
+                  items:
+                    type: string
+                    enum: [select, insert, update, delete]
+              required: [name, schema, operations]
+              additionalProperties: false
+        required: [tables]
+        additionalProperties: false
     - name: describe_table
+      annotations:
+        title: Describe Table
+        readOnlyHint: true
+        destructiveHint: false
+        idempotentHint: true
+        openWorldHint: false
       description: "Describe a table: its columns and types, relationships, and the columns the current role may select."
       inputSchema:
         type: object
         properties:
           table:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
             description: Base table name.
         required: [table]
         additionalProperties: false
+      outputSchema:
+        type: object
+        properties:
+          name:
+            type: string
+          schema:
+            type: string
+          columns:
+            type: array
+            items:
+              type: object
+              properties:
+                name:
+                  type: string
+                type:
+                  type: string
+                nullable:
+                  type: boolean
+                description:
+                  type: [string, "null"]
+              required: [name, type, nullable, description]
+              additionalProperties: false
+          object_relationships:
+            type: array
+            items:
+              type: string
+          array_relationships:
+            type: array
+            items:
+              type: string
+          selectable_columns:
+            oneOf:
+            - type: string
+              enum: ["*"]
+            - type: array
+              items:
+                type: string
+          select_limit:
+            type: [integer, "null"]
+            minimum: 0
+          insertable_columns:
+            oneOf:
+            - type: string
+              enum: ["*"]
+            - type: array
+              items:
+                type: string
+            - type: "null"
+          updatable_columns:
+            oneOf:
+            - type: string
+              enum: ["*"]
+            - type: array
+              items:
+                type: string
+            - type: "null"
+        required: [name, schema, columns, object_relationships, array_relationships, selectable_columns, select_limit, insertable_columns, updatable_columns]
+        additionalProperties: false
     - name: query
+      annotations:
+        title: Query Rows
+        readOnlyHint: true
+        destructiveHint: false
+        idempotentHint: true
+        openWorldHint: false
       description: Read rows from a table with optional column selection, where-filter, order_by, limit and offset.
       inputSchema:
         type: object
         properties:
           table:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           columns:
             type: array
             items:
               type: string
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+            minItems: 1
+            maxItems: 64
           where:
             type: object
+            maxProperties: 100
+            propertyNames:
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           order_by:
-            description: An order_by object or array of objects.
+            description: A column order_by object or array of column order_by objects.
+            oneOf:
+            - type: object
+              minProperties: 1
+              maxProperties: 16
+              propertyNames:
+                maxLength: 64
+                pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+              additionalProperties:
+                type: string
+                enum: [asc, asc_nulls_first, asc_nulls_last, desc, desc_nulls_first, desc_nulls_last]
+            - type: array
+              minItems: 1
+              maxItems: 16
+              items:
+                type: object
+                minProperties: 1
+                maxProperties: 16
+                propertyNames:
+                  maxLength: 64
+                  pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+                additionalProperties:
+                  type: string
+                  enum: [asc, asc_nulls_first, asc_nulls_last, desc, desc_nulls_first, desc_nulls_last]
           limit:
             type: integer
+            minimum: 0
+            maximum: 1000
+            default: 100
           offset:
             type: integer
+            minimum: 0
+            maximum: 10000
         required: [table]
         additionalProperties: false
+      outputSchema:
+        oneOf:
+        - type: array
+          items:
+            type: object
+            additionalProperties: true
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+          required: [errors]
+          additionalProperties: true
     - name: insert
-      description: Insert one or more rows into a table. Returns affected_rows and the returning rows.
+      annotations:
+        title: Insert Rows
+        readOnlyHint: false
+        destructiveHint: false
+        idempotentHint: false
+        openWorldHint: false
+      description: Insert one or more rows into a table. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.
       inputSchema:
         type: object
         properties:
           table:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           objects:
             type: array
             items:
               type: object
+              minProperties: 1
+              maxProperties: 64
+              propertyNames:
+                maxLength: 64
+                pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+            minItems: 1
+            maxItems: 100
           returning:
             type: array
             items:
               type: string
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+            minItems: 1
+            maxItems: 64
         required: [table, objects]
         additionalProperties: false
+      outputSchema:
+        oneOf:
+        - type: object
+          properties:
+            affected_rows:
+              type: integer
+            returning:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+          required: [affected_rows]
+          additionalProperties: false
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+          required: [errors]
+          additionalProperties: true
     - name: update
-      description: Update rows matching a where-filter by setting columns. Returns affected_rows and the returning rows.
+      annotations:
+        title: Update Rows
+        readOnlyHint: false
+        destructiveHint: true
+        idempotentHint: true
+        openWorldHint: false
+      description: Update rows matching a where-filter by setting columns. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.
       inputSchema:
         type: object
         properties:
           table:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           where:
             type: object
+            maxProperties: 100
+            propertyNames:
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           set:
             type: object
+            minProperties: 1
+            maxProperties: 64
+            propertyNames:
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           returning:
             type: array
             items:
               type: string
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+            minItems: 1
+            maxItems: 64
         required: [table, where, set]
         additionalProperties: false
+      outputSchema:
+        oneOf:
+        - type: object
+          properties:
+            affected_rows:
+              type: integer
+            returning:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+          required: [affected_rows]
+          additionalProperties: false
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+          required: [errors]
+          additionalProperties: true
     - name: delete
-      description: Delete rows matching a where-filter. Returns affected_rows and the returning rows.
+      annotations:
+        title: Delete Rows
+        readOnlyHint: false
+        destructiveHint: true
+        idempotentHint: true
+        openWorldHint: false
+      description: Delete rows matching a where-filter. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.
       inputSchema:
         type: object
         properties:
           table:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           where:
             type: object
+            maxProperties: 100
+            propertyNames:
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           returning:
             type: array
             items:
               type: string
+              maxLength: 64
+              pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
+            minItems: 1
+            maxItems: 64
         required: [table, where]
         additionalProperties: false
+      outputSchema:
+        oneOf:
+        - type: object
+          properties:
+            affected_rows:
+              type: integer
+            returning:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+          required: [affected_rows]
+          additionalProperties: false
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+          required: [errors]
+          additionalProperties: true

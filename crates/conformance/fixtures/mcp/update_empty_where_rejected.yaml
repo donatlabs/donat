@@ -1,0 +1,25 @@
+description: >
+  tools/call update rejects an empty where-filter before GraphQL execution.
+  MCP destructive tools require a meaningful filter so accidental LLM calls do
+  not update every visible row.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 49
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where: {}
+      set:
+        status: sold
+response:
+  jsonrpc: "2.0"
+  id: 49
+  result:
+    isError: true

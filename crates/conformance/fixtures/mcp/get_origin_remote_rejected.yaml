@@ -1,0 +1,14 @@
+description: >
+  MCP Streamable HTTP validates Origin on every incoming connection, including
+  GET requests that this server otherwise rejects because SSE is unsupported.
+url: /mcp
+method: GET
+status: 403
+headers:
+  Origin: "https://evil.example"
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "forbidden MCP origin"

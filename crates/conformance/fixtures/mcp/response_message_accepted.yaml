@@ -1,0 +1,10 @@
+description: >
+  Streamable HTTP MCP accepts JSON-RPC response messages with HTTP 202 and no
+  JSON-RPC response body.
+url: /mcp
+method: POST
+status: 202
+body:
+  jsonrpc: "2.0"
+  id: "server-request-1"
+  result: {}
