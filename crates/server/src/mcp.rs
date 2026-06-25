@@ -1255,8 +1255,8 @@ fn mcp_fetch_metadata_headers(headers: &HeaderMap) -> Result<(), (StatusCode, St
         "invalid MCP fetch mode header",
     )? {
         match mode.as_str() {
-            "cors" | "same-origin" | "no-cors" => {}
-            "navigate" | "nested-navigate" | "websocket" => {
+            "cors" | "same-origin" => {}
+            "no-cors" | "navigate" | "nested-navigate" | "websocket" => {
                 return Err((
                     StatusCode::FORBIDDEN,
                     "forbidden MCP fetch mode".to_string(),
@@ -6795,13 +6795,13 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "duplicate MCP fetch site header");
 
-        for value in ["cors", "same-origin", "no-cors", "Cors"] {
+        for value in ["cors", "same-origin", "Cors"] {
             let mut headers = HeaderMap::new();
             headers.insert(SEC_FETCH_MODE_HEADER, value.parse().unwrap());
             mcp_fetch_metadata_headers(&headers).unwrap();
         }
 
-        for value in ["navigate", "nested-navigate", "websocket"] {
+        for value in ["no-cors", "navigate", "nested-navigate", "websocket"] {
             let mut headers = HeaderMap::new();
             headers.insert(SEC_FETCH_MODE_HEADER, value.parse().unwrap());
             let err = mcp_fetch_metadata_headers(&headers).unwrap_err();

@@ -1006,6 +1006,7 @@ fn mcp_rejects_navigation_fetch_metadata_before_dispatch() {
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
 
     for (header, value, message) in [
+        ("Sec-Fetch-Mode", "no-cors", "forbidden MCP fetch mode"),
         ("Sec-Fetch-Mode", "navigate", "forbidden MCP fetch mode"),
         (
             "Sec-Fetch-Dest",
