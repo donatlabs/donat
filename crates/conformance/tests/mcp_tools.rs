@@ -1206,6 +1206,33 @@ fn mcp_rejects_duplicate_content_type_header() {
 }
 
 #[test]
+fn mcp_rejects_malformed_content_type_header_before_dispatch() {
+    let s = Suite::new("mcp_malformed_content_type").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{}/mcp", s.base_url()))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json; charset=\"utf-8")
+        .body(r#"{"jsonrpc":"2.0","id":97,"method":"tools/list"}"#)
+        .send()
+        .expect("http request failed");
+
+    assert_eq!(resp.status().as_u16(), 415);
+    let body: Json = resp.json().expect("json body");
+    assert_eq!(body["id"], json!(null));
+    assert_eq!(body["error"]["code"], json!(-32600));
+    assert_eq!(
+        body["error"]["message"],
+        json!("invalid MCP content-type header")
+    );
+    assert!(body.get("result").is_none(), "{body}");
+    assert!(!body.to_string().contains("list_tables"), "{body}");
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
 fn mcp_rejects_unsupported_content_encoding_before_jsonrpc_handling() {
     let s = Suite::new("mcp_content_encoding").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));

@@ -1510,7 +1510,7 @@ fn mcp_content_type_header(headers: &HeaderMap) -> Result<(), String> {
             let Some((name, value)) = param.trim().split_once('=') else {
                 return Err("MCP content-type must be application/json".to_string());
             };
-            let value = value.trim().trim_matches('"');
+            let value = mcp_content_type_param_value(value.trim())?;
             if !name.trim().eq_ignore_ascii_case("charset") || !value.eq_ignore_ascii_case("utf-8")
             {
                 return Err("MCP content-type must be application/json".to_string());
@@ -1519,6 +1519,27 @@ fn mcp_content_type_header(headers: &HeaderMap) -> Result<(), String> {
         Ok(())
     } else {
         Err("MCP content-type must be application/json".to_string())
+    }
+}
+
+fn mcp_content_type_param_value(value: &str) -> Result<&str, String> {
+    if value.is_empty() {
+        return Err("MCP content-type must be application/json".to_string());
+    }
+    if value.starts_with('"') || value.ends_with('"') {
+        if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+            return Err("invalid MCP content-type header".to_string());
+        }
+        let inner = &value[1..value.len() - 1];
+        if inner.is_empty() || inner.contains(['"', '\\']) {
+            return Err("invalid MCP content-type header".to_string());
+        }
+        Ok(inner)
+    } else {
+        if !is_http_token(value) {
+            return Err("invalid MCP content-type header".to_string());
+        }
+        Ok(value)
     }
 }
 
@@ -7160,6 +7181,18 @@ mod tests {
             headers.insert(CONTENT_TYPE_HEADER, content_type.parse().unwrap());
             let err = mcp_content_type_header(&headers).unwrap_err();
             assert_eq!(err, "MCP content-type must be application/json");
+        }
+
+        for content_type in [
+            "application/json; charset=\"utf-8",
+            "application/json; charset=utf-8\"",
+            "application/json; charset=\"utf-8\\\"",
+            "application/json; charset=utf 8",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE_HEADER, content_type.parse().unwrap());
+            let err = mcp_content_type_header(&headers).unwrap_err();
+            assert_eq!(err, "invalid MCP content-type header", "{content_type}");
         }
 
         let mut headers = HeaderMap::new();
