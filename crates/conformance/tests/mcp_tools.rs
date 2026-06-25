@@ -1933,6 +1933,12 @@ fn mcp_method_not_allowed_sets_security_headers() {
             .and_then(|value| value.to_str().ok()),
         Some("no-referrer")
     );
+    assert_eq!(
+        resp.headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("same-origin")
+    );
     let text = resp.text().expect("response text");
     assert!(text.contains("GET /mcp is not supported"), "{text}");
 
@@ -2173,6 +2179,12 @@ fn mcp_json_responses_set_security_headers() {
             .and_then(|value| value.to_str().ok()),
         Some("no-referrer")
     );
+    assert_eq!(
+        resp.headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("same-origin")
+    );
     let body: Json = resp.json().expect("json response");
     assert_eq!(body["id"], json!(92));
     assert_eq!(body["result"]["protocolVersion"], json!("2025-06-18"));
@@ -2362,6 +2374,12 @@ fn mcp_accepted_responses_set_security_headers() {
             .get("referrer-policy")
             .and_then(|value| value.to_str().ok()),
         Some("no-referrer")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("same-origin")
     );
     let text = resp.text().expect("response text");
     assert!(text.is_empty(), "{text}");

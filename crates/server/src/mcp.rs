@@ -93,6 +93,8 @@ const CONTENT_SECURITY_POLICY_HEADER: &str = "Content-Security-Policy";
 const X_CONTENT_TYPE_OPTIONS_HEADER: &str = "X-Content-Type-Options";
 /// Prevent leaking local MCP endpoint paths through browser Referer headers.
 const REFERRER_POLICY_HEADER: &str = "Referrer-Policy";
+/// Prevent cross-origin no-cors loads from embedding or reusing MCP responses.
+const CROSS_ORIGIN_RESOURCE_POLICY_HEADER: &str = "Cross-Origin-Resource-Policy";
 /// Default MCP query page size when the caller omits `limit`.
 const MCP_DEFAULT_QUERY_LIMIT: i64 = 100;
 /// Bound explicit MCP query page sizes so tool calls cannot request huge row
@@ -378,6 +380,7 @@ fn mcp_json_response(status: StatusCode, body: Json) -> axum::response::Response
             (CONTENT_SECURITY_POLICY_HEADER, "frame-ancestors 'none'"),
             (X_CONTENT_TYPE_OPTIONS_HEADER, "nosniff"),
             (REFERRER_POLICY_HEADER, "no-referrer"),
+            (CROSS_ORIGIN_RESOURCE_POLICY_HEADER, "same-origin"),
         ],
         axum::Json(body),
     )
@@ -391,6 +394,7 @@ fn mcp_empty_response(status: StatusCode) -> axum::response::Response {
         .header(CONTENT_SECURITY_POLICY_HEADER, "frame-ancestors 'none'")
         .header(X_CONTENT_TYPE_OPTIONS_HEADER, "nosniff")
         .header(REFERRER_POLICY_HEADER, "no-referrer")
+        .header(CROSS_ORIGIN_RESOURCE_POLICY_HEADER, "same-origin")
         .body(Body::empty())
         .expect("static MCP empty response headers are valid")
 }
@@ -403,6 +407,7 @@ fn mcp_text_response(status: StatusCode, body: String) -> axum::response::Respon
             (CONTENT_SECURITY_POLICY_HEADER, "frame-ancestors 'none'"),
             (X_CONTENT_TYPE_OPTIONS_HEADER, "nosniff"),
             (REFERRER_POLICY_HEADER, "no-referrer"),
+            (CROSS_ORIGIN_RESOURCE_POLICY_HEADER, "same-origin"),
         ],
         body,
     )
@@ -6337,6 +6342,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("no-referrer")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(CROSS_ORIGIN_RESOURCE_POLICY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("same-origin")
+        );
     }
 
     #[test]
@@ -6372,6 +6384,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("no-referrer")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(CROSS_ORIGIN_RESOURCE_POLICY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("same-origin")
+        );
     }
 
     #[test]
@@ -6405,6 +6424,13 @@ mod tests {
                 .get(REFERRER_POLICY_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("no-referrer")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CROSS_ORIGIN_RESOURCE_POLICY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("same-origin")
         );
     }
 
