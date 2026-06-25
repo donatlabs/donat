@@ -1,0 +1,28 @@
+description: >
+  tools/call delete keeps SQL-looking filter values in GraphQL variables, so
+  the payload is matched literally and does not widen the destructive mutation.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 40
+  method: tools/call
+  params:
+    name: delete
+    arguments:
+      table: pet
+      where:
+        name:
+          _eq: "Rex' OR '1'='1"
+      returning: [id, name, status]
+response:
+  jsonrpc: "2.0"
+  id: 40
+  result:
+    isError: false
+    structuredContent:
+      affected_rows: 0
+      returning: []

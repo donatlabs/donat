@@ -1,0 +1,25 @@
+description: >
+  A column-restricted role cannot order by a hidden physical column. `viewer`
+  may select id/name but not status, so MCP rejects order_by.status before
+  GraphQL execution.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 38
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, name]
+      order_by:
+        status: asc
+response:
+  jsonrpc: "2.0"
+  id: 38
+  result:
+    isError: true

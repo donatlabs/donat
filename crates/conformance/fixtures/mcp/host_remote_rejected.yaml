@@ -1,0 +1,18 @@
+description: >
+  MCP Streamable HTTP rejects non-local Host headers as defense-in-depth DNS
+  rebinding protection for local unauthenticated endpoints.
+url: /mcp
+method: POST
+status: 421
+headers:
+  Host: "evil.example"
+body:
+  jsonrpc: "2.0"
+  id: 90
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "forbidden MCP host"

@@ -1,0 +1,34 @@
+description: >
+  list_tables for an inherited role must reflect the same permission
+  resolution as GraphQL. `inherited_user` has no direct table permissions; it
+  inherits `user`, so pet exposes full CRUD and order_item exposes select.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: inherited_user
+body:
+  jsonrpc: "2.0"
+  id: 27
+  method: tools/call
+  params:
+    name: list_tables
+    arguments: {}
+response:
+  jsonrpc: "2.0"
+  id: 27
+  result:
+    isError: false
+    structuredContent:
+      tables:
+      - name: pet
+        schema: public
+        operations:
+        - select
+        - insert
+        - update
+        - delete
+      - name: order_item
+        schema: public
+        operations:
+        - select

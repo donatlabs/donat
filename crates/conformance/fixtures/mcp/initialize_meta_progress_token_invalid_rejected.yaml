@@ -1,0 +1,24 @@
+description: >
+  initialize rejects fractional MCP request metadata progressToken values before
+  protocol negotiation.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 87
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo:
+      name: conformance
+      version: "0"
+    _meta:
+      progressToken: 1.5
+response:
+  jsonrpc: "2.0"
+  id: 87
+  error:
+    code: -32602
+    message: "'progressToken' must be a string or integer"

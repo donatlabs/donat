@@ -1,0 +1,44 @@
+description: >
+  describe_table reports the effective select permission row fetch limit.
+  `limited_viewer` can select all pet columns, but its select permission caps
+  visible rows at 1; MCP discovery must expose that limit to clients.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: limited_viewer
+body:
+  jsonrpc: "2.0"
+  id: 29
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: pet
+response:
+  jsonrpc: "2.0"
+  id: 29
+  result:
+    isError: false
+    structuredContent:
+      name: pet
+      schema: public
+      columns:
+      - name: id
+        type: int4
+        nullable: false
+        description: null
+      - name: name
+        type: text
+        nullable: false
+        description: null
+      - name: status
+        type: text
+        nullable: false
+        description: Availability status of the pet
+      object_relationships: []
+      array_relationships: []
+      selectable_columns: "*"
+      select_limit: 1
+      insertable_columns: null
+      updatable_columns: null

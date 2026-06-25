@@ -16,3 +16,6 @@ run:
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux
+
+codex:
+	codex --sandbox danger-full-access

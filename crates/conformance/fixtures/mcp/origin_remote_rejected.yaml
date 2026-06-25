@@ -1,0 +1,18 @@
+description: >
+  MCP Streamable HTTP rejects non-local browser Origins to reduce DNS rebinding
+  exposure for local MCP endpoints.
+url: /mcp
+method: POST
+status: 403
+headers:
+  Origin: "https://evil.example"
+body:
+  jsonrpc: "2.0"
+  id: 89
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "forbidden MCP origin"

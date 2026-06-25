@@ -1,0 +1,14 @@
+description: >
+  MCP validates Origin before rejecting unsupported HTTP methods, so arbitrary
+  verbs cannot bypass the Streamable HTTP DNS rebinding guard.
+url: /mcp
+method: PUT
+status: 403
+headers:
+  Origin: "https://evil.example"
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "forbidden MCP origin"

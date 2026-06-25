@@ -1,0 +1,24 @@
+description: >
+  An unknown MCP tool name carrying GraphQL-looking text is rejected as an
+  unknown tool. Tool names are structural identifiers, not executable GraphQL
+  fragments.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 45
+  method: tools/call
+  params:
+    name: "query } mutation x { delete_pet(where: {}) { affected_rows } }"
+    arguments: {}
+response:
+  jsonrpc: "2.0"
+  id: 45
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "unknown tool"

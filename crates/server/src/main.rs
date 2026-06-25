@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{any, get, post},
@@ -347,7 +347,14 @@ async fn main() -> anyhow::Result<()> {
         app = app.route("/api/rest/{*path}", any(rest::dispatch));
     }
     if enabled_apis.mcp {
-        app = app.route("/mcp", post(mcp::dispatch).get(mcp::get_not_allowed));
+        app = app.route(
+            "/mcp",
+            any(mcp::method_not_allowed)
+                .post(mcp::dispatch)
+                .get(mcp::get_not_allowed)
+                .delete(mcp::delete_not_allowed)
+                .layer(DefaultBodyLimit::max(mcp::MCP_MAX_REQUEST_BYTES)),
+        );
     }
     tracing::info!(
         graphql = enabled_apis.graphql,
@@ -459,4 +466,3 @@ mod tests {
         assert_eq!(parse_enabled_apis(Some("")), apis(false, false, false));
     }
 }
-

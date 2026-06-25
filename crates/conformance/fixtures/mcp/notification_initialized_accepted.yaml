@@ -1,0 +1,9 @@
+description: >
+  Streamable HTTP MCP notifications are accepted with HTTP 202 and no JSON-RPC
+  response body.
+url: /mcp
+method: POST
+status: 202
+body:
+  jsonrpc: "2.0"
+  method: notifications/initialized

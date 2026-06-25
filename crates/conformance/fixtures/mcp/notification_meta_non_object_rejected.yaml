@@ -1,0 +1,17 @@
+description: >
+  MCP notification params may include arbitrary `_meta`, but the transport must
+  still reject scalar metadata before accepting a non-request message.
+url: /mcp
+method: POST
+status: 400
+body:
+  jsonrpc: "2.0"
+  method: notifications/initialized
+  params:
+    _meta: trace
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "'_meta' must be an object"

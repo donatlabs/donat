@@ -1,0 +1,25 @@
+description: >
+  query rejects an explicit empty columns list before generating GraphQL, so
+  MCP cannot produce an empty object selection set.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 128
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: []
+      limit: 1
+response:
+  jsonrpc: "2.0"
+  id: 128
+  result:
+    isError: true
+    structuredContent:
+      errors: []

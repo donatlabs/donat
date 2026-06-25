@@ -1,0 +1,22 @@
+description: >
+  describe_table rejects a GraphQL-looking table argument before any schema
+  disclosure. Invalid names are treated as unknown tracked-table identifiers,
+  not as GraphQL text.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 44
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: "pet } query x { pet { id } }"
+response:
+  jsonrpc: "2.0"
+  id: 44
+  result:
+    isError: true

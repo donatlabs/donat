@@ -1,0 +1,17 @@
+description: >
+  MCP JSON-RPC request params must be an object when present. tools/list must
+  reject array params instead of silently ignoring them.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 69
+  method: tools/list
+  params: []
+response:
+  jsonrpc: "2.0"
+  id: 69
+  error:
+    code: -32600
+    message: "'params' must be an object"

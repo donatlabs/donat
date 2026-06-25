@@ -1,0 +1,24 @@
+description: >
+  A negative `limit` is rejected as an MCP tool input-validation error before
+  the query is sent to GraphQL. Pagination arguments must be non-negative
+  GraphQL Int values.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 27
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      limit: -1
+response:
+  jsonrpc: "2.0"
+  id: 27
+  result:
+    isError: true

@@ -1,0 +1,14 @@
+description: >
+  MCP Streamable HTTP validates Origin on DELETE session-termination attempts
+  before this stateless server returns method-not-allowed.
+url: /mcp
+method: DELETE
+status: 403
+headers:
+  Origin: "https://evil.example"
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "forbidden MCP origin"

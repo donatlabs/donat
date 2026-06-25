@@ -1,0 +1,17 @@
+description: >
+  initialize params are required by MCP. The server rejects a request that
+  omits the handshake payload instead of silently accepting an incomplete
+  protocol negotiation.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 79
+  method: initialize
+response:
+  jsonrpc: "2.0"
+  id: 79
+  error:
+    code: -32602
+    message: "missing required parameter 'params'"

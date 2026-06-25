@@ -1,0 +1,23 @@
+description: >
+  A column-restricted role cannot explicitly request a hidden column through
+  MCP `columns`. The request is rejected before GraphQL execution because
+  `status` exists physically but is not selectable by `viewer`.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 31
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id, status]
+response:
+  jsonrpc: "2.0"
+  id: 31
+  result:
+    isError: true

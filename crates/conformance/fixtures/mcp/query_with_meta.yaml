@@ -1,0 +1,36 @@
+description: >
+  tools/call accepts reserved MCP params._meta as protocol metadata. The server
+  ignores it for execution, so the query result matches the same call without
+  _meta.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 74
+  method: tools/call
+  params:
+    name: query
+    _meta:
+      trace: conformance
+      progressToken: query-74
+    arguments:
+      table: pet
+      columns: [id, name, status]
+      order_by:
+        id: asc
+      limit: 2
+response:
+  jsonrpc: "2.0"
+  id: 74
+  result:
+    isError: false
+    structuredContent:
+    - id: 1
+      name: Rex
+      status: available
+    - id: 2
+      name: Milo
+      status: pending

@@ -1,0 +1,23 @@
+description: >
+  tools/call params._meta is reserved MCP protocol metadata and must be an
+  object when present. Scalar _meta values are rejected before tool routing.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 75
+  method: tools/call
+  params:
+    name: query
+    _meta: trace
+    arguments:
+      table: pet
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 75
+  result:
+    isError: true
