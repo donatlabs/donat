@@ -972,13 +972,26 @@ fn is_sensitive_mcp_connection_token(token: &str, custom_jwt_header: Option<&str
         || is_mcp_identity_override_header(token)
         || matches!(
             token,
-            "authorization"
+            "accept"
+                | "authorization"
+                | "content-encoding"
+                | "content-length"
+                | "content-type"
                 | "cookie"
+                | "early-data"
                 | "host"
                 | "mcp-protocol-version"
                 | "mcp-session-id"
                 | "origin"
                 | "proxy-authorization"
+                | "sec-fetch-dest"
+                | "sec-fetch-mode"
+                | "sec-fetch-site"
+                | "sec-fetch-user"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
         )
 }
 
@@ -7040,15 +7053,28 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.append(CONNECTION_HEADER, "keep-alive".parse().unwrap());
-        headers.append(CONNECTION_HEADER, "upgrade".parse().unwrap());
+        headers.append(CONNECTION_HEADER, "close".parse().unwrap());
         mcp_connection_header(&headers, None).unwrap();
 
         for value in [
+            "Accept",
             "Authorization",
+            "Content-Encoding",
+            "Content-Length",
+            "Content-Type",
             "Cookie",
+            "Early-Data",
             "X-Donat-Role",
             "Mcp-Session-Id",
             "X-Authenticated-User",
+            "Sec-Fetch-Site",
+            "Sec-Fetch-Mode",
+            "Sec-Fetch-Dest",
+            "Sec-Fetch-User",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
             "keep-alive, Authorization",
         ] {
             let mut headers = HeaderMap::new();

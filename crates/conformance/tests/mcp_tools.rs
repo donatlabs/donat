@@ -1896,6 +1896,37 @@ X-Donat-Role: user\r\n\
     assert!(!response.contains("Rex"), "{response}");
     assert!(!response.contains(r#""result""#), "{response}");
 
+    let response = send_raw_http(
+        &s.base_url(),
+        &format!(
+            "POST /mcp HTTP/1.1\r\n\
+Host: localhost\r\n\
+Accept: application/json, text/event-stream\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: Content-Type\r\n\
+\r\n\
+{body}",
+            body.len()
+        ),
+    );
+
+    assert!(
+        response.is_empty() || response.starts_with("HTTP/1.1 400"),
+        "raw response: {:?}",
+        response
+    );
+    if !response.is_empty() {
+        assert!(
+            response.contains(r#""id":null"#)
+                && response.contains(r#""code":-32600"#)
+                && response.contains(r#""message":"forbidden MCP connection header""#),
+            "{response}"
+        );
+    }
+    assert!(!response.contains("Rex"), "{response}");
+    assert!(!response.contains(r#""result""#), "{response}");
+
     s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
 }
 
