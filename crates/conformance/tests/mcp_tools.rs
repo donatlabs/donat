@@ -1063,6 +1063,43 @@ fn mcp_rejects_user_fetch_metadata_before_dispatch() {
 }
 
 #[test]
+fn mcp_rejects_cors_preflight_headers_before_dispatch() {
+    let s = Suite::new("mcp_cors_preflight_headers").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    for (header, value) in [
+        ("Access-Control-Request-Method", "POST"),
+        ("Access-Control-Request-Headers", "content-type"),
+        ("Access-Control-Request-Private-Network", "true"),
+        ("Access-Control-Request-Local-Network", "true"),
+    ] {
+        let resp = reqwest::blocking::Client::new()
+            .post(format!("{}/mcp", s.base_url()))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("Origin", "http://localhost:3000")
+            .header(header, value)
+            .body(r#"{"jsonrpc":"2.0","id":108,"method":"tools/list"}"#)
+            .send()
+            .expect("http request failed");
+
+        assert_eq!(resp.status().as_u16(), 403, "{header}");
+        let body: Json = resp.json().expect("json body");
+        assert_eq!(body["id"], json!(null), "{header}");
+        assert_eq!(body["error"]["code"], json!(-32600), "{header}");
+        assert_eq!(
+            body["error"]["message"],
+            json!("forbidden MCP CORS preflight header"),
+            "{header}"
+        );
+        assert!(body.get("result").is_none(), "{body}");
+        assert!(!body.to_string().contains("list_tables"), "{body}");
+    }
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
 fn mcp_rejects_client_ip_override_headers_before_dispatch() {
     let s = Suite::new("mcp_client_ip_override_headers").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));

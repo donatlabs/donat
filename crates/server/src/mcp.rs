@@ -83,6 +83,15 @@ const SEC_FETCH_MODE_HEADER: &str = "Sec-Fetch-Mode";
 const SEC_FETCH_DEST_HEADER: &str = "Sec-Fetch-Dest";
 /// Browser Fetch Metadata header indicating a user-activated navigation.
 const SEC_FETCH_USER_HEADER: &str = "Sec-Fetch-User";
+/// CORS preflight request header listing the intended non-preflight method.
+const ACCESS_CONTROL_REQUEST_METHOD_HEADER: &str = "Access-Control-Request-Method";
+/// CORS preflight request header listing intended non-simple request headers.
+const ACCESS_CONTROL_REQUEST_HEADERS_HEADER: &str = "Access-Control-Request-Headers";
+/// Private Network Access preflight request header for private/local targets.
+const ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK_HEADER: &str =
+    "Access-Control-Request-Private-Network";
+/// Earlier Local Network Access draft spelling of the PNA preflight header.
+const ACCESS_CONTROL_REQUEST_LOCAL_NETWORK_HEADER: &str = "Access-Control-Request-Local-Network";
 /// Prevent MCP JSON-RPC responses, which may include sensitive database rows
 /// or validation details, from being stored in browser/shared caches.
 const CACHE_CONTROL_HEADER: &str = "Cache-Control";
@@ -867,6 +876,9 @@ fn mcp_connection_headers(headers: &HeaderMap) -> Result<(), (StatusCode, i64, S
     if let Err((status, msg)) = mcp_fetch_metadata_headers(headers) {
         return Err((status, -32600, msg));
     }
+    if let Err((status, msg)) = mcp_cors_preflight_headers(headers) {
+        return Err((status, -32600, msg));
+    }
     if let Err(msg) = mcp_forwarded_headers(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
@@ -973,6 +985,10 @@ fn is_sensitive_mcp_connection_token(token: &str, custom_jwt_header: Option<&str
         || matches!(
             token,
             "accept"
+                | "access-control-request-headers"
+                | "access-control-request-local-network"
+                | "access-control-request-method"
+                | "access-control-request-private-network"
                 | "authorization"
                 | "content-encoding"
                 | "content-length"
@@ -1347,6 +1363,23 @@ fn fetch_metadata_header_value(
         .to_str()
         .map(|value| Some(value.to_ascii_lowercase()))
         .map_err(|_| (StatusCode::BAD_REQUEST, invalid_message.to_string()))
+}
+
+fn mcp_cors_preflight_headers(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    for name in [
+        ACCESS_CONTROL_REQUEST_METHOD_HEADER,
+        ACCESS_CONTROL_REQUEST_HEADERS_HEADER,
+        ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK_HEADER,
+        ACCESS_CONTROL_REQUEST_LOCAL_NETWORK_HEADER,
+    ] {
+        if headers.contains_key(name) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "forbidden MCP CORS preflight header".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mcp_forwarded_headers(headers: &HeaderMap) -> Result<(), String> {
@@ -6881,6 +6914,25 @@ mod tests {
     }
 
     #[test]
+    fn mcp_cors_preflight_headers_are_forbidden() {
+        let headers = HeaderMap::new();
+        mcp_cors_preflight_headers(&headers).unwrap();
+
+        for name in [
+            ACCESS_CONTROL_REQUEST_METHOD_HEADER,
+            ACCESS_CONTROL_REQUEST_HEADERS_HEADER,
+            ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK_HEADER,
+            ACCESS_CONTROL_REQUEST_LOCAL_NETWORK_HEADER,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, "true".parse().unwrap());
+            let err = mcp_cors_preflight_headers(&headers).unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "forbidden MCP CORS preflight header");
+        }
+    }
+
+    #[test]
     fn mcp_forwarded_headers_are_forbidden() {
         let headers = HeaderMap::new();
         mcp_forwarded_headers(&headers).unwrap();
@@ -7058,6 +7110,10 @@ mod tests {
 
         for value in [
             "Accept",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Local-Network",
+            "Access-Control-Request-Method",
+            "Access-Control-Request-Private-Network",
             "Authorization",
             "Content-Encoding",
             "Content-Length",
