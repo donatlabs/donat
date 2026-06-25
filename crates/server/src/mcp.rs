@@ -74,6 +74,9 @@ const CONNECTION_HEADER: &str = "Connection";
 /// HTTP forwarding provenance headers. These are set by trusted reverse
 /// proxies, not direct MCP clients.
 const FORWARDED_HEADER: &str = "forwarded";
+/// Browser Fetch Metadata header. When present, it gives a reliable browser
+/// signal for whether a request came from a cross-site context.
+const SEC_FETCH_SITE_HEADER: &str = "Sec-Fetch-Site";
 /// Prevent MCP JSON-RPC responses, which may include sensitive database rows
 /// or validation details, from being stored in browser/shared caches.
 const CACHE_CONTROL_HEADER: &str = "Cache-Control";
@@ -850,6 +853,9 @@ fn mcp_connection_headers(headers: &HeaderMap) -> Result<(), (StatusCode, i64, S
     if let Err(msg) = mcp_trace_context_headers(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
+    if let Err((status, msg)) = mcp_fetch_metadata_headers(headers) {
+        return Err((status, -32600, msg));
+    }
     if let Err(msg) = mcp_forwarded_headers(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
@@ -1205,6 +1211,34 @@ fn mcp_trace_context_headers(headers: &HeaderMap) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn mcp_fetch_metadata_headers(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let value = singleton_header_value(headers, SEC_FETCH_SITE_HEADER, "MCP fetch site header")
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let site = value
+        .to_str()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid MCP fetch site header".to_string(),
+            )
+        })?
+        .to_ascii_lowercase();
+    match site.as_str() {
+        "same-origin" | "same-site" | "none" => Ok(()),
+        "cross-site" => Err((
+            StatusCode::FORBIDDEN,
+            "forbidden MCP fetch site".to_string(),
+        )),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "invalid MCP fetch site header".to_string(),
+        )),
+    }
 }
 
 fn mcp_forwarded_headers(headers: &HeaderMap) -> Result<(), String> {
@@ -6607,6 +6641,46 @@ mod tests {
     }
 
     #[test]
+    fn mcp_fetch_metadata_headers_reject_cross_site() {
+        let headers = HeaderMap::new();
+        mcp_fetch_metadata_headers(&headers).unwrap();
+
+        for value in ["same-origin", "same-site", "none", "Same-Origin"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SEC_FETCH_SITE_HEADER, value.parse().unwrap());
+            mcp_fetch_metadata_headers(&headers).unwrap();
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_SITE_HEADER, "cross-site".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "forbidden MCP fetch site");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_SITE_HEADER, "evil".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid MCP fetch site header");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_FETCH_SITE_HEADER,
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid MCP fetch site header");
+
+        let mut headers = HeaderMap::new();
+        headers.append(SEC_FETCH_SITE_HEADER, "same-origin".parse().unwrap());
+        headers.append(SEC_FETCH_SITE_HEADER, "cross-site".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "duplicate MCP fetch site header");
+    }
+
+    #[test]
     fn mcp_forwarded_headers_are_forbidden() {
         let headers = HeaderMap::new();
         mcp_forwarded_headers(&headers).unwrap();
@@ -7071,6 +7145,14 @@ mod tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert_eq!(err.1, -32600);
         assert_eq!(err.2, "forbidden MCP origin");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert(SEC_FETCH_SITE_HEADER, "cross-site".parse().unwrap());
+        let err = mcp_connection_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, -32600);
+        assert_eq!(err.2, "forbidden MCP fetch site");
 
         let mut headers = HeaderMap::new();
         headers.insert(HOST_HEADER, "localhost".parse().unwrap());
