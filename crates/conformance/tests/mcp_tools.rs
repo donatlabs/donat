@@ -1019,6 +1019,48 @@ fn mcp_rejects_client_ip_override_headers_before_dispatch() {
 }
 
 #[test]
+fn mcp_rejects_identity_override_headers_before_dispatch() {
+    let s = Suite::new("mcp_identity_override_headers").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    for (header, value) in [
+        ("X-Authenticated-User", "admin@example.test"),
+        ("X-Auth-Request-User", "admin@example.test"),
+        ("X-Forwarded-User", "admin@example.test"),
+        ("X-Forwarded-Client-Cert", "By=spiffe://evil"),
+        ("SSL-Client-Cert", "-----BEGIN CERTIFICATE-----"),
+    ] {
+        let resp = reqwest::blocking::Client::new()
+            .post(format!("{}/mcp", s.base_url()))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header(header, value)
+            .body(r#"{"jsonrpc":"2.0","id":109,"method":"tools/list"}"#)
+            .send()
+            .expect("http request failed");
+
+        assert_eq!(resp.status().as_u16(), 400, "{header}");
+        let body: Json = resp.json().expect("json body");
+        assert_eq!(body["id"], json!(null), "{header}");
+        assert_eq!(body["error"]["code"], json!(-32600), "{header}");
+        assert_eq!(
+            body["error"]["message"],
+            json!("forbidden MCP identity override header"),
+            "{header}"
+        );
+        assert!(body.get("result").is_none(), "{body}");
+        let response_text = body.to_string();
+        assert!(
+            !response_text.contains("admin@example.test"),
+            "{response_text}"
+        );
+        assert!(!response_text.contains("CERTIFICATE"), "{response_text}");
+    }
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
 fn mcp_rejects_early_data_before_dispatch() {
     let s = Suite::new("mcp_early_data").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));

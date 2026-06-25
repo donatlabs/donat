@@ -856,6 +856,9 @@ fn mcp_connection_headers(headers: &HeaderMap) -> Result<(), (StatusCode, i64, S
     if let Err(msg) = mcp_client_ip_override_headers(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
+    if let Err(msg) = mcp_identity_override_headers(headers) {
+        return Err((StatusCode::BAD_REQUEST, -32600, msg));
+    }
     if let Err(msg) = mcp_host_override_headers(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
@@ -949,6 +952,7 @@ fn mcp_connection_header(
 fn is_sensitive_mcp_connection_token(token: &str, custom_jwt_header: Option<&str>) -> bool {
     token.starts_with("x-donat-")
         || custom_jwt_header.is_some_and(|header| token == header)
+        || is_mcp_identity_override_header(token)
         || matches!(
             token,
             "authorization"
@@ -1241,6 +1245,33 @@ fn mcp_client_ip_override_headers(headers: &HeaderMap) -> Result<(), String> {
                 | "x-true-client-ip"
         ) {
             return Err("forbidden MCP client IP override header".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn is_mcp_identity_override_header(name: &str) -> bool {
+    matches!(
+        name,
+        "remote-user"
+            | "ssl-client-cert"
+            | "x-auth-request-email"
+            | "x-auth-request-user"
+            | "x-authenticated-email"
+            | "x-authenticated-user"
+            | "x-client-cert"
+            | "x-forwarded-client-cert"
+            | "x-forwarded-email"
+            | "x-forwarded-user"
+            | "x-remote-user"
+            | "x-ssl-client-cert"
+    )
+}
+
+fn mcp_identity_override_headers(headers: &HeaderMap) -> Result<(), String> {
+    for (name, _) in headers {
+        if is_mcp_identity_override_header(name.as_str()) {
+            return Err("forbidden MCP identity override header".to_string());
         }
     }
     Ok(())
@@ -6631,6 +6662,36 @@ mod tests {
     }
 
     #[test]
+    fn mcp_identity_override_headers_are_forbidden() {
+        let headers = HeaderMap::new();
+        mcp_identity_override_headers(&headers).unwrap();
+
+        for name in [
+            "Remote-User",
+            "SSL-Client-Cert",
+            "X-Auth-Request-Email",
+            "X-Auth-Request-User",
+            "X-Authenticated-Email",
+            "X-Authenticated-User",
+            "X-Client-Cert",
+            "X-Forwarded-Client-Cert",
+            "X-Forwarded-Email",
+            "X-Forwarded-User",
+            "X-Remote-User",
+            "X-SSL-Client-Cert",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, "admin@example.test".parse().unwrap());
+            let err = mcp_identity_override_headers(&headers).unwrap_err();
+            assert_eq!(err, "forbidden MCP identity override header");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Request-Id", "trace-1".parse().unwrap());
+        mcp_identity_override_headers(&headers).unwrap();
+    }
+
+    #[test]
     fn mcp_host_override_headers_are_forbidden() {
         let headers = HeaderMap::new();
         mcp_host_override_headers(&headers).unwrap();
@@ -6726,6 +6787,7 @@ mod tests {
             "Cookie",
             "X-Donat-Role",
             "Mcp-Session-Id",
+            "X-Authenticated-User",
             "keep-alive, Authorization",
         ] {
             let mut headers = HeaderMap::new();
