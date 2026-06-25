@@ -77,6 +77,10 @@ const FORWARDED_HEADER: &str = "forwarded";
 /// Browser Fetch Metadata header. When present, it gives a reliable browser
 /// signal for whether a request came from a cross-site context.
 const SEC_FETCH_SITE_HEADER: &str = "Sec-Fetch-Site";
+/// Browser Fetch Metadata header describing how the request was initiated.
+const SEC_FETCH_MODE_HEADER: &str = "Sec-Fetch-Mode";
+/// Browser Fetch Metadata header describing the request destination.
+const SEC_FETCH_DEST_HEADER: &str = "Sec-Fetch-Dest";
 /// Prevent MCP JSON-RPC responses, which may include sensitive database rows
 /// or validation details, from being stored in browser/shared caches.
 const CACHE_CONTROL_HEADER: &str = "Cache-Control";
@@ -1214,31 +1218,93 @@ fn mcp_trace_context_headers(headers: &HeaderMap) -> Result<(), String> {
 }
 
 fn mcp_fetch_metadata_headers(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    let value = singleton_header_value(headers, SEC_FETCH_SITE_HEADER, "MCP fetch site header")
+    if let Some(site) = fetch_metadata_header_value(
+        headers,
+        SEC_FETCH_SITE_HEADER,
+        "MCP fetch site header",
+        "invalid MCP fetch site header",
+    )? {
+        match site.as_str() {
+            "same-origin" | "same-site" | "none" => {}
+            "cross-site" => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "forbidden MCP fetch site".to_string(),
+                ));
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid MCP fetch site header".to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(mode) = fetch_metadata_header_value(
+        headers,
+        SEC_FETCH_MODE_HEADER,
+        "MCP fetch mode header",
+        "invalid MCP fetch mode header",
+    )? {
+        match mode.as_str() {
+            "cors" | "same-origin" | "no-cors" => {}
+            "navigate" | "nested-navigate" | "websocket" => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "forbidden MCP fetch mode".to_string(),
+                ));
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid MCP fetch mode header".to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(dest) = fetch_metadata_header_value(
+        headers,
+        SEC_FETCH_DEST_HEADER,
+        "MCP fetch dest header",
+        "invalid MCP fetch dest header",
+    )? {
+        match dest.as_str() {
+            "empty" => {}
+            "document" | "embed" | "frame" | "iframe" | "object" => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "forbidden MCP fetch destination".to_string(),
+                ));
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid MCP fetch dest header".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn fetch_metadata_header_value(
+    headers: &HeaderMap,
+    name: &str,
+    duplicate_label: &str,
+    invalid_message: &str,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let value = singleton_header_value(headers, name, duplicate_label)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let Some(value) = value else {
-        return Ok(());
+        return Ok(None);
     };
-    let site = value
+    value
         .to_str()
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid MCP fetch site header".to_string(),
-            )
-        })?
-        .to_ascii_lowercase();
-    match site.as_str() {
-        "same-origin" | "same-site" | "none" => Ok(()),
-        "cross-site" => Err((
-            StatusCode::FORBIDDEN,
-            "forbidden MCP fetch site".to_string(),
-        )),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            "invalid MCP fetch site header".to_string(),
-        )),
-    }
+        .map(|value| Some(value.to_ascii_lowercase()))
+        .map_err(|_| (StatusCode::BAD_REQUEST, invalid_message.to_string()))
 }
 
 fn mcp_forwarded_headers(headers: &HeaderMap) -> Result<(), String> {
@@ -6678,6 +6744,58 @@ mod tests {
         let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "duplicate MCP fetch site header");
+
+        for value in ["cors", "same-origin", "no-cors", "Cors"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SEC_FETCH_MODE_HEADER, value.parse().unwrap());
+            mcp_fetch_metadata_headers(&headers).unwrap();
+        }
+
+        for value in ["navigate", "nested-navigate", "websocket"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SEC_FETCH_MODE_HEADER, value.parse().unwrap());
+            let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "forbidden MCP fetch mode");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_MODE_HEADER, "evil".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid MCP fetch mode header");
+
+        let mut headers = HeaderMap::new();
+        headers.append(SEC_FETCH_MODE_HEADER, "cors".parse().unwrap());
+        headers.append(SEC_FETCH_MODE_HEADER, "navigate".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "duplicate MCP fetch mode header");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_DEST_HEADER, "empty".parse().unwrap());
+        mcp_fetch_metadata_headers(&headers).unwrap();
+
+        for value in ["document", "embed", "frame", "iframe", "object"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(SEC_FETCH_DEST_HEADER, value.parse().unwrap());
+            let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "forbidden MCP fetch destination");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_DEST_HEADER, "script".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid MCP fetch dest header");
+
+        let mut headers = HeaderMap::new();
+        headers.append(SEC_FETCH_DEST_HEADER, "empty".parse().unwrap());
+        headers.append(SEC_FETCH_DEST_HEADER, "document".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "duplicate MCP fetch dest header");
     }
 
     #[test]
