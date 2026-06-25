@@ -1036,6 +1036,32 @@ fn mcp_rejects_navigation_fetch_metadata_before_dispatch() {
 }
 
 #[test]
+fn mcp_rejects_user_fetch_metadata_before_dispatch() {
+    let s = Suite::new("mcp_user_fetch_metadata").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{}/mcp", s.base_url()))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Sec-Fetch-User", "?1")
+        .body(r#"{"jsonrpc":"2.0","id":107,"method":"tools/list"}"#)
+        .send()
+        .expect("http request failed");
+
+    assert_eq!(resp.status().as_u16(), 403);
+    let body: Json = resp.json().expect("json body");
+    assert_eq!(body["id"], json!(null));
+    assert_eq!(body["error"]["code"], json!(-32600));
+    assert_eq!(body["error"]["message"], json!("forbidden MCP fetch user"));
+    assert!(body.get("result").is_none(), "{body}");
+    assert!(!body.to_string().contains("list_tables"), "{body}");
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
 fn mcp_rejects_client_ip_override_headers_before_dispatch() {
     let s = Suite::new("mcp_client_ip_override_headers").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));

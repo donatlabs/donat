@@ -81,6 +81,8 @@ const SEC_FETCH_SITE_HEADER: &str = "Sec-Fetch-Site";
 const SEC_FETCH_MODE_HEADER: &str = "Sec-Fetch-Mode";
 /// Browser Fetch Metadata header describing the request destination.
 const SEC_FETCH_DEST_HEADER: &str = "Sec-Fetch-Dest";
+/// Browser Fetch Metadata header indicating a user-activated navigation.
+const SEC_FETCH_USER_HEADER: &str = "Sec-Fetch-User";
 /// Prevent MCP JSON-RPC responses, which may include sensitive database rows
 /// or validation details, from being stored in browser/shared caches.
 const CACHE_CONTROL_HEADER: &str = "Cache-Control";
@@ -1282,6 +1284,28 @@ fn mcp_fetch_metadata_headers(headers: &HeaderMap) -> Result<(), (StatusCode, St
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "invalid MCP fetch dest header".to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(user) = fetch_metadata_header_value(
+        headers,
+        SEC_FETCH_USER_HEADER,
+        "MCP fetch user header",
+        "invalid MCP fetch user header",
+    )? {
+        match user.as_str() {
+            "?1" => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "forbidden MCP fetch user".to_string(),
+                ));
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid MCP fetch user header".to_string(),
                 ));
             }
         }
@@ -6796,6 +6820,25 @@ mod tests {
         let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "duplicate MCP fetch dest header");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_USER_HEADER, "?1".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "forbidden MCP fetch user");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SEC_FETCH_USER_HEADER, "?0".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid MCP fetch user header");
+
+        let mut headers = HeaderMap::new();
+        headers.append(SEC_FETCH_USER_HEADER, "?1".parse().unwrap());
+        headers.append(SEC_FETCH_USER_HEADER, "?1".parse().unwrap());
+        let err = mcp_fetch_metadata_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "duplicate MCP fetch user header");
     }
 
     #[test]
