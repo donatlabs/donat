@@ -15,8 +15,8 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::naming::{root_names, table_base_name};
 
-/// Per-request session: an explicit role + X-Donat-* variables (keys
-/// lower-cased). There is no admin role — every access goes through an
+/// Per-request session: an explicit role + X-Donat-*/X-Hasura-* variables
+/// (keys lower-cased). There is no admin role — every access goes through an
 /// explicit per-role permission.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -31,6 +31,14 @@ impl Session {
     pub fn var(&self, name: &str) -> Option<&str> {
         self.vars.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
     }
+}
+
+pub(crate) fn is_session_var_name(name: &str) -> bool {
+    name.get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-donat-"))
+        || name
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-hasura-"))
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -10,7 +10,7 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::plan::{
     Fragments, MutationKind, PlanError, Planner, Session, TableCtx, field_not_found, flatten,
-    unexpected_arg, value_to_json,
+    is_session_var_name, unexpected_arg, value_to_json,
 };
 
 impl<'a> Planner<'a> {
@@ -211,7 +211,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
+                Json::String(s) if is_session_var_name(s) => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",
@@ -340,9 +340,7 @@ impl<'a> Planner<'a> {
                 for (col, value) in &update_perm.set {
                     let Some(info) = ctx.info.column(col) else { continue };
                     let resolved = match value {
-                        Json::String(s)
-                            if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
-                        {
+                        Json::String(s) if is_session_var_name(s) => {
                             let v = session.var(s).ok_or_else(|| {
                                 PlanError::new(
                                     "$",
@@ -479,7 +477,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let resolved = match value {
-                Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
+                Json::String(s) if is_session_var_name(s) => {
                     let v = session.var(s).ok_or_else(|| {
                         PlanError::new(
                             "$",

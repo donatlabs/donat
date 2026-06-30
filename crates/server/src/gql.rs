@@ -47,6 +47,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn is_session_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
+}
+
+fn is_reserved_session_secret(name: &str) -> bool {
+    name == "x-donat-admin-secret" || name == "x-hasura-admin-secret"
+}
+
 /// A planning-level GraphQL error (shared with remote validation).
 #[derive(Debug)]
 pub struct GqlError {
@@ -80,16 +88,19 @@ pub fn session_from_headers(
             })),
         };
     }
-    let mut role = None;
+    let mut donat_role = None;
+    let mut hasura_role = None;
     let mut vars = std::collections::HashMap::new();
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
-        if !name.starts_with("x-donat-") || name == "x-donat-admin-secret" {
+        if !is_session_header(&name) || is_reserved_session_secret(&name) {
             continue;
         }
         let Ok(value) = value.to_str() else { continue };
         if name == "x-donat-role" {
-            role = Some(value.to_string());
+            donat_role = Some(value.to_string());
+        } else if name == "x-hasura-role" {
+            hasura_role = Some(value.to_string());
         }
         vars.insert(name, value.to_string());
     }
@@ -110,12 +121,19 @@ pub fn session_from_headers(
     };
     // No admin role: a trusted request must name an explicit role (an
     // unauthorized-role fallback applies only to the untrusted branch above).
-    match role.or_else(|| unauthorized_role.map(str::to_string)) {
-        Some(role) => Ok(Session {
-            role,
-            vars,
-            backend_request,
-        }),
+    match donat_role
+        .or(hasura_role)
+        .or_else(|| unauthorized_role.map(str::to_string))
+    {
+        Some(role) => {
+            vars.insert("x-donat-role".to_string(), role.clone());
+            vars.insert("x-hasura-role".to_string(), role.clone());
+            Ok(Session {
+                role,
+                vars,
+                backend_request,
+            })
+        }
         None => Err(json!({
             "errors": [{
                 "extensions": { "path": "$", "code": "access-denied" },
@@ -190,6 +208,7 @@ pub async fn resolve_session(
         };
         let requested = headers
             .get("x-donat-role")
+            .or_else(|| headers.get("x-hasura-role"))
             .and_then(|v| v.to_str().ok());
         let backend = headers
             .get("x-donat-use-backend-only-permissions")
@@ -292,7 +311,7 @@ async fn webhook_session(
     if let Some(map) = vars_raw.as_object() {
         for (k, v) in map {
             let key = k.to_ascii_lowercase();
-            if !key.starts_with("x-donat-") {
+            if !is_session_header(&key) || is_reserved_session_secret(&key) {
                 continue;
             }
             let value = match v {
@@ -302,7 +321,7 @@ async fn webhook_session(
             vars.insert(key, value);
         }
     }
-    let Some(role) = vars.get("x-donat-role").cloned() else {
+    let Some(role) = vars.get("x-donat-role").or_else(|| vars.get("x-hasura-role")).cloned() else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -313,6 +332,8 @@ async fn webhook_session(
             }),
         ));
     };
+    vars.insert("x-donat-role".to_string(), role.clone());
+    vars.insert("x-hasura-role".to_string(), role.clone());
     Ok(Session {
         role,
         vars,
@@ -1035,6 +1056,33 @@ mod tests {
         assert!(!s.vars.contains_key("x-donat-admin-secret"));
         assert!(!s.vars.contains_key("content-type"));
         assert!(!s.backend_request);
+    }
+
+    #[test]
+    fn trusted_request_collects_x_hasura_vars() {
+        let h = headers(&[
+            ("X-Hasura-Role", "editor"),
+            ("X-Hasura-User-Id", "7"),
+            ("X-Hasura-Admin-Secret", "ignored"),
+        ]);
+        let s = session_from_headers(&h, None, true).unwrap();
+        assert_eq!(s.role, "editor");
+        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
+        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("editor"));
+        assert_eq!(s.vars.get("x-donat-role").map(String::as_str), Some("editor"));
+        assert!(!s.vars.contains_key("x-donat-admin-secret"));
+        assert!(!s.vars.contains_key("x-hasura-admin-secret"));
+    }
+
+    #[test]
+    fn x_donat_role_wins_over_x_hasura_role() {
+        let h = headers(&[
+            ("X-Hasura-Role", "hasura_user"),
+            ("X-Donat-Role", "donat_user"),
+        ]);
+        let s = session_from_headers(&h, None, true).unwrap();
+        assert_eq!(s.role, "donat_user");
+        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("donat_user"));
     }
 
     #[test]

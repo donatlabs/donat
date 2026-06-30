@@ -979,7 +979,7 @@ fn mcp_connection_header(
 }
 
 fn is_sensitive_mcp_connection_token(token: &str, custom_jwt_header: Option<&str>) -> bool {
-    token.starts_with("x-donat-")
+    is_mcp_session_variable_header(token)
         || custom_jwt_header.is_some_and(|header| token == header)
         || is_mcp_identity_override_header(token)
         || matches!(
@@ -1016,7 +1016,7 @@ fn is_safe_mcp_jwt_custom_header_name(name: &str) -> bool {
         return false;
     }
     let name = name.to_ascii_lowercase();
-    if name.starts_with("x-donat-") {
+    if is_mcp_session_variable_header(&name) {
         return false;
     }
     !matches!(
@@ -1549,7 +1549,7 @@ fn mcp_session_variable_headers(headers: &HeaderMap) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for (name, value) in headers {
         let name = name.as_str();
-        if name.starts_with("x-donat-") {
+        if is_mcp_session_variable_header(name) {
             if !seen.insert(name.to_string()) {
                 return Err("duplicate MCP session variable header".to_string());
             }
@@ -1569,6 +1569,10 @@ fn mcp_session_variable_headers(headers: &HeaderMap) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn is_mcp_session_variable_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
 }
 
 fn mcp_accept_header(headers: &HeaderMap) -> Result<(), String> {
@@ -7329,6 +7333,13 @@ mod tests {
         .unwrap();
         let err = mcp_jwt_custom_header(&HeaderMap::new(), Some(&jwt)).unwrap_err();
         assert_eq!(err, "invalid MCP JWT custom header name");
+
+        let jwt = crate::jwt::JwtConfig::from_env_value(
+            r#"{"type":"HS256","key":"secret","header":{"type":"CustomHeader","name":"X-Hasura-Role"}}"#,
+        )
+        .unwrap();
+        let err = mcp_jwt_custom_header(&HeaderMap::new(), Some(&jwt)).unwrap_err();
+        assert_eq!(err, "invalid MCP JWT custom header name");
     }
 
     #[test]
@@ -7339,6 +7350,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("X-Donat-Role", "user".parse().unwrap());
         headers.insert("X-Donat-User-Id", "7".parse().unwrap());
+        headers.insert("X-Hasura-User-Id", "7".parse().unwrap());
         headers.insert("Content-Type", "application/json".parse().unwrap());
         mcp_session_variable_headers(&headers).unwrap();
 
@@ -7398,6 +7410,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append("X-Donat-Admin-Secret", "secret-1".parse().unwrap());
         headers.append("x-donat-admin-secret", "secret-2".parse().unwrap());
+        let err = mcp_session_variable_headers(&headers).unwrap_err();
+        assert_eq!(err, "duplicate MCP session variable header");
+
+        let mut headers = HeaderMap::new();
+        headers.append("X-Hasura-Admin-Secret", "secret-1".parse().unwrap());
+        headers.append("x-hasura-admin-secret", "secret-2".parse().unwrap());
         let err = mcp_session_variable_headers(&headers).unwrap_err();
         assert_eq!(err, "duplicate MCP session variable header");
     }

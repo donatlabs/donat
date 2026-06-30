@@ -38,6 +38,10 @@ fn metadata() -> Metadata {
                             "columns": ["id", "name"],
                             "filter": { "id": { "_eq": "X-Donat-User-Id" } }
                         }},
+                        { "role": "hasura_user", "permission": {
+                            "columns": ["id", "name"],
+                            "filter": { "id": { "_eq": "X-Hasura-User-Id" } }
+                        }},
                         { "role": "nopk", "permission": { "columns": ["name"], "filter": {} } },
                         { "role": "s1", "permission": {
                             "columns": ["id"], "filter": { "id": { "_eq": 1 } }, "limit": 10
@@ -282,6 +286,28 @@ fn session_var_substituted_in_permission_filter() {
     };
     assert_eq!(column, "id");
     assert_eq!(v, json!("7"));
+}
+
+#[test]
+fn hasura_session_var_substituted_in_permission_filter() {
+    let q = gql_select(
+        "query { author { id } }",
+        &session("hasura_user", &[("x-hasura-user-id", "42")]),
+    );
+    let Some(BoolExp::Compare { column, op: CompareOp::Eq(Scalar::Json(v)), .. }) = q.predicate
+    else {
+        panic!("expected the permission filter as the only predicate")
+    };
+    assert_eq!(column, "id");
+    assert_eq!(v, json!("42"));
+}
+
+#[test]
+fn missing_hasura_session_var_error_shape() {
+    let err = gql_err("query { author { id } }", &session("hasura_user", &[]));
+    assert_eq!(err.code, "not-found");
+    assert_eq!(err.path, "$");
+    assert_eq!(err.message, "missing session variable: \"x-hasura-user-id\"");
 }
 
 #[test]

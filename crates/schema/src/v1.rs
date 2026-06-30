@@ -7,7 +7,7 @@ use donat_ir::*;
 use donat_metadata::Columns;
 use serde_json::Value as Json;
 
-use crate::plan::{PlanError, Planner, Session, TableCtx};
+use crate::plan::{PlanError, Planner, Session, TableCtx, is_session_var_name};
 
 fn parse_table(args: &Json, path: &str) -> Result<donat_metadata::QualifiedTable, PlanError> {
     let table = args
@@ -684,7 +684,7 @@ fn ctx_ref<'b, 'a>(ctx: &'b TableCtx<'a>) -> &'b TableCtx<'a> {
 
 fn resolve_preset(value: &Json, session: &Session) -> Result<Json, PlanError> {
     match value {
-        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
+        Json::String(s) if is_session_var_name(s) => {
             let v = session.var(s).ok_or_else(|| {
                 PlanError::new(
                     "$",

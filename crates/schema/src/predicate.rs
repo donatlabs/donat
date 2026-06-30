@@ -1,14 +1,14 @@
 //! Boolean expression parsing: Donat bool_exp JSON -> IR predicate.
 //!
 //! Used for both the user's `where` argument and role row filters from
-//! metadata. Session variables (string values starting with "x-donat-")
-//! are substituted only in permission filters; clients cannot reference
-//! them in `where`.
+//! metadata. Session variables (string values starting with "x-donat-" or
+//! "x-hasura-") are substituted only in permission filters; clients cannot
+//! reference them in `where`.
 
 use donat_ir::{BoolExp, CompareOp, Scalar, Table};
 use serde_json::Value as Json;
 
-use crate::plan::{PlanError, Planner, Session, TableCtx};
+use crate::plan::{PlanError, Planner, Session, TableCtx, is_session_var_name};
 
 impl Planner<'_> {
     /// Parse a bool_exp against `ctx`'s table. `is_permission` enables
@@ -485,8 +485,8 @@ fn parse_array_literal(s: &str) -> Option<Vec<Json>> {
     )
 }
 
-/// In permission filters, string values starting with "x-donat-"
-/// (case-insensitive) refer to session variables.
+/// In permission filters, string values starting with "x-donat-" or
+/// "x-hasura-" (case-insensitive) refer to session variables.
 fn resolve_session(
     value: &Json,
     session: &Session,
@@ -497,7 +497,7 @@ fn resolve_session(
         return Ok(value.clone());
     }
     match value {
-        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
+        Json::String(s) if is_session_var_name(s) => {
             let _ = path;
             match session.var(s) {
                 Some(v) => Ok(Json::String(v.to_string())),

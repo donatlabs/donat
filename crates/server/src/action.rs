@@ -22,6 +22,10 @@ use donat_schema::Session;
 use crate::remote::resolve_url_template;
 use crate::state::SharedState;
 
+fn is_session_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
+}
+
 /// Cloned slice of metadata needed to resolve an action operation after the
 /// engine read-lock is dropped.
 pub struct ActionContext {
@@ -146,9 +150,10 @@ async fn call_action(
         input.insert(name.clone(), value_to_json(value, variables));
     }
 
-    // Session variables, as Donat passes them (x-donat-* lowercased).
+    // Session variables, as Donat passes them (lowercased).
     let mut session_vars = JsonMap::new();
     session_vars.insert("x-donat-role".into(), Json::String(session.role.clone()));
+    session_vars.insert("x-hasura-role".into(), Json::String(session.role.clone()));
     for (k, v) in &session.vars {
         session_vars.insert(k.clone(), Json::String(v.clone()));
     }
@@ -164,7 +169,7 @@ async fn call_action(
     if action.definition.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-donat-") || name == "authorization" {
+            if is_session_header(name) || name == "authorization" {
                 if let Ok(value) = value.to_str() {
                     req = req.header(name, value);
                 }

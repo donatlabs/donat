@@ -14,6 +14,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -293,11 +294,25 @@ fn create_suite_db(name: &str) -> Result<String> {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+    if NEXT_PORT.load(Ordering::Relaxed) == 0 {
+        let _ = NEXT_PORT.compare_exchange(
+            0,
+            49152 + (std::process::id() % 10_000),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    for _ in 0..16_000 {
+        let raw = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        let port = 49152 + (raw % 16_000);
+        if TcpListener::bind(("0.0.0.0", port as u16)).is_ok() {
+            return port as u16;
+        }
+    }
+    panic!("could not find a free port for conformance engine");
 }
 
 /// A fresh `Metadata` with version 3 and a single empty "default" source
