@@ -26,6 +26,9 @@ separate branches and merge independently).
   query allowlist applies to REST/MCP without bypass, why `id`-less JSON-RPC
   requests are no-op notifications, and why a `:param`-match method mismatch
   is a correct `405`
+- [[decisions/006-hasura-session-variable-compatibility]] — why `x-hasura-*`
+  is accepted as a session-variable compatibility namespace without adding
+  Hasura admin-secret or permission-bypass semantics
 
 ## Cross-cutting
 

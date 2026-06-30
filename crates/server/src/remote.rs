@@ -17,6 +17,18 @@ use donat_schema::Session;
 
 use crate::state::AppState;
 
+fn is_session_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
+}
+
+fn is_session_var_name(name: &str) -> bool {
+    name.get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-donat-"))
+        || name
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-hasura-"))
+}
+
 pub struct RemoteTarget {
     pub url: String,
     pub forward_client_headers: bool,
@@ -625,9 +637,7 @@ fn apply_presets(
                     continue;
                 };
                 let value = match raw {
-                    graphql_parser::schema::Value::String(s)
-                        if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
-                    {
+                    graphql_parser::schema::Value::String(s) if is_session_var_name(s) => {
                         let Some(found) = session.var(s) else {
                             return Err(crate::gql::GqlError {
                                 path: "$".to_string(),
@@ -757,7 +767,7 @@ pub async fn forward(
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-donat-") || name == "authorization" || name == "cookie" {
+            if is_session_header(name) || name == "authorization" || name == "cookie" {
                 if let Ok(value) = value.to_str() {
                     request = request.header(name, value);
                 }
