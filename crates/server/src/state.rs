@@ -67,7 +67,9 @@ pub enum SqliteMutationError {
     NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
-    CheckViolation { path: String },
+    CheckViolation {
+        path: String,
+    },
     Sqlite(String),
     Other(String),
 }
@@ -79,7 +81,9 @@ pub enum MysqlMutationError {
     NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
-    CheckViolation { path: String },
+    CheckViolation {
+        path: String,
+    },
     /// A MySQL driver / SQL error (mapped to `data-exception`).
     Mysql(String),
     Other(String),
@@ -118,7 +122,10 @@ pub fn make_pool(url: &str) -> anyhow::Result<deadpool_postgres::Pool> {
 }
 
 fn resolve_source_url(source: &Source, default_url: &str) -> String {
-    match &source.configuration.connection_info.database_url {
+    let Some(connection_info) = &source.configuration.connection_info else {
+        return default_url.to_string();
+    };
+    match &connection_info.database_url {
         DatabaseUrl::Url(url) => url.clone(),
         DatabaseUrl::FromEnv { from_env } => {
             std::env::var(from_env).unwrap_or_else(|_| default_url.to_string())
@@ -225,6 +232,7 @@ impl AppState {
                 .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
+            SourceKind::Clickhouse => Err(QueryError::NoDefaultSource),
         }
     }
 
@@ -391,9 +399,7 @@ impl AppState {
                             (alias.clone(), pk_of(&delete.table))
                         }
                         donat_ir::MutationRoot::FunctionCall { alias, .. }
-                        | donat_ir::MutationRoot::Typename { alias, .. } => {
-                            (alias.clone(), vec![])
-                        }
+                        | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
                     };
                     (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
                 })
@@ -432,7 +438,10 @@ impl AppState {
                 // Build the companion-SELECT WHERE + ordering of DML vs SELECT
                 // from the recovery strategy.
                 let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
-                    MySqlMutationKind::Insert { pk_col, pk_in_predicate } => {
+                    MySqlMutationKind::Insert {
+                        pk_col,
+                        pk_in_predicate,
+                    } => {
                         // INSERT first, then recover the new rows.
                         tx.query_drop(&plan.dml_sql)
                             .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
@@ -461,7 +470,10 @@ impl AppState {
                                 }
                             }
                         };
-                        (Some(format!("{} WHERE {where_clause}", plan.companion_select)), affected)
+                        (
+                            Some(format!("{} WHERE {where_clause}", plan.companion_select)),
+                            affected,
+                        )
                     }
                     MySqlMutationKind::Update { where_clause } => {
                         // UPDATE first, then re-select by the same predicate.
@@ -554,6 +566,9 @@ impl AppState {
             let engine = self.engine.read().await;
             let mut resolved: Vec<(String, SourceKind, String)> = vec![];
             for s in &engine.metadata.sources {
+                if s.kind == SourceKind::Clickhouse {
+                    continue;
+                }
                 let url = resolve_source_url(s, &self.default_url);
                 match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
                     Some(entry) => {
@@ -598,13 +613,12 @@ impl AppState {
                     // the path for per-query connections in
                     // `execute_query_json`.
                     let path = url.clone();
-                    let catalog = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<Catalog> {
+                    let catalog =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<Catalog> {
                             let conn = rusqlite::Connection::open(&path)?;
                             Ok(donat_catalog::sqlite_introspect(&conn)?)
-                        },
-                    )
-                    .await??;
+                        })
+                        .await??;
                     self.sqlite_paths
                         .write()
                         .await
@@ -617,28 +631,26 @@ impl AppState {
                     // for per-query connections in `execute_query_json`. The
                     // tracked schema is the database name from the url.
                     let conn_url = url.clone();
-                    let catalog = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<Catalog> {
+                    let catalog =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<Catalog> {
                             let opts = mysql::Opts::from_url(&conn_url)?;
-                            let db = opts
-                                .get_db_name()
-                                .map(|s| s.to_string())
-                                .ok_or_else(|| {
+                            let db =
+                                opts.get_db_name().map(|s| s.to_string()).ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "mysql source url has no database name: {conn_url}"
                                     )
                                 })?;
                             let mut conn = mysql::Conn::new(opts)?;
                             Ok(donat_catalog::mysql_introspect(&mut conn, &db)?)
-                        },
-                    )
-                    .await??;
+                        })
+                        .await??;
                     self.mysql_urls
                         .write()
                         .await
                         .insert(name.clone(), url.clone());
                     catalog
                 }
+                SourceKind::Clickhouse => continue,
             };
             new_catalogs.insert(name.clone(), catalog);
         }

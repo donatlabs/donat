@@ -4,9 +4,7 @@ use std::collections::HashMap;
 
 use donat_catalog::{Catalog, TableInfo};
 use donat_ir::*;
-use donat_metadata::{
-    Columns, Metadata, QualifiedTable, SelectPermission, TableEntry,
-};
+use donat_metadata::{Columns, Metadata, QualifiedTable, SelectPermission, TableEntry};
 use graphql_parser::query::{
     Definition, Document, Field as GqlField, OperationDefinition, Selection, SelectionSet,
     Value as GqlValue,
@@ -29,7 +27,9 @@ pub struct Session {
 
 impl Session {
     pub fn var(&self, name: &str) -> Option<&str> {
-        self.vars.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+        self.vars
+            .get(&name.to_ascii_lowercase())
+            .map(|s| s.as_str())
     }
 }
 
@@ -106,7 +106,8 @@ pub(crate) enum MutationKind {
     DeleteByPk,
 }
 
-pub(crate) type Fragments<'a> = HashMap<String, &'a graphql_parser::query::FragmentDefinition<'static, String>>;
+pub(crate) type Fragments<'a> =
+    HashMap<String, &'a graphql_parser::query::FragmentDefinition<'static, String>>;
 
 /// Planning context for a tracked table resolved against the catalog.
 /// `perm: None` marks a permission-filter context: the bool_exp being
@@ -270,9 +271,7 @@ impl<'a> Planner<'a> {
             let base = table_base_name(entry);
             let custom = entry.configuration.as_ref().map(|c| &c.custom_root_fields);
             let get = |key: &str, default: String| -> String {
-                custom
-                    .and_then(|m| m.get(key).cloned())
-                    .unwrap_or(default)
+                custom.and_then(|m| m.get(key).cloned()).unwrap_or(default)
             };
             mutation_roots.insert(
                 get("insert", format!("insert_{base}")),
@@ -337,20 +336,12 @@ impl<'a> Planner<'a> {
     /// The select permissions a (possibly inherited) role has on a table:
     /// a direct permission overrides the inherited combination.
     fn role_select_perms(&self, entry: &'a TableEntry, role: &str) -> Vec<&'a SelectPermission> {
-        if let Some(p) = entry
-            .select_permissions
-            .iter()
-            .find(|p| p.role == role)
-        {
+        if let Some(p) = entry.select_permissions.iter().find(|p| p.role == role) {
             return vec![&p.permission];
         }
         let mut out = vec![];
         for parent in self.expand_role(role) {
-            if let Some(p) = entry
-                .select_permissions
-                .iter()
-                .find(|p| p.role == parent)
-            {
+            if let Some(p) = entry.select_permissions.iter().find(|p| p.role == parent) {
                 out.push(&p.permission);
             }
         }
@@ -379,7 +370,10 @@ impl<'a> Planner<'a> {
         applies: &impl Fn(&T) -> bool,
         visiting: &mut std::collections::HashSet<String>,
     ) -> Option<&'x T> {
-        if let Some(p) = list.iter().find(|p| p.role == role && applies(&p.permission)) {
+        if let Some(p) = list
+            .iter()
+            .find(|p| p.role == role && applies(&p.permission))
+        {
             return Some(&p.permission);
         }
         if !visiting.insert(role.to_string()) {
@@ -398,10 +392,7 @@ impl<'a> Planner<'a> {
             1 => Some(found[0]),
             _ => {
                 let first = serde_json::to_value(found[0]).ok();
-                if found
-                    .iter()
-                    .all(|p| serde_json::to_value(p).ok() == first)
-                {
+                if found.iter().all(|p| serde_json::to_value(p).ok() == first) {
                     Some(found[0])
                 } else {
                     None
@@ -454,7 +445,16 @@ impl<'a> Planner<'a> {
         let ctx = self.table_ctx_by_name(&remote, &session.role)?;
         Some((|| {
             let from = self.function_from(fentry, finfo, field, vars, session, path)?;
-            self.build_select(&ctx, RootKind::Select, from, field, fragments, vars, session, path)
+            self.build_select(
+                &ctx,
+                RootKind::Select,
+                from,
+                field,
+                fragments,
+                vars,
+                session,
+                path,
+            )
         })())
     }
 
@@ -472,13 +472,25 @@ impl<'a> Planner<'a> {
         for role in self.inherited_roles {
             for entry in self.tables {
                 if self.conflicts_in(&entry.insert_permissions, &role.role_name) {
-                    out.push((role.role_name.clone(), entry.table.name().to_string(), "insert"));
+                    out.push((
+                        role.role_name.clone(),
+                        entry.table.name().to_string(),
+                        "insert",
+                    ));
                 }
                 if self.conflicts_in(&entry.update_permissions, &role.role_name) {
-                    out.push((role.role_name.clone(), entry.table.name().to_string(), "update"));
+                    out.push((
+                        role.role_name.clone(),
+                        entry.table.name().to_string(),
+                        "update",
+                    ));
                 }
                 if self.conflicts_in(&entry.delete_permissions, &role.role_name) {
-                    out.push((role.role_name.clone(), entry.table.name().to_string(), "delete"));
+                    out.push((
+                        role.role_name.clone(),
+                        entry.table.name().to_string(),
+                        "delete",
+                    ));
                 }
             }
         }
@@ -493,23 +505,19 @@ impl<'a> Planner<'a> {
         if list.iter().any(|p| p.role == role) {
             return false; // a direct permission overrides the parents
         }
-        let Some(inherited) = self.inherited_roles.iter().find(|r| r.role_name == role)
-        else {
+        let Some(inherited) = self.inherited_roles.iter().find(|r| r.role_name == role) else {
             return false;
         };
         let mut found = vec![];
         for parent in &inherited.role_set {
             let mut visiting = std::collections::HashSet::new();
-            if let Some(p) = self.resolve_role_perm_rec(list, parent, &|_| true, &mut visiting)
-            {
+            if let Some(p) = self.resolve_role_perm_rec(list, parent, &|_| true, &mut visiting) {
                 found.push(p);
             }
         }
         found.len() > 1 && {
             let first = serde_json::to_value(found[0]).ok();
-            !found
-                .iter()
-                .all(|p| serde_json::to_value(p).ok() == first)
+            !found.iter().all(|p| serde_json::to_value(p).ok() == first)
         }
     }
 
@@ -539,11 +547,7 @@ impl<'a> Planner<'a> {
             if !seen.insert(current.clone()) {
                 continue;
             }
-            match self
-                .inherited_roles
-                .iter()
-                .find(|r| r.role_name == current)
-            {
+            match self.inherited_roles.iter().find(|r| r.role_name == current) {
                 Some(inherited) => {
                     for parent in &inherited.role_set {
                         stack.push(parent.clone());
@@ -573,7 +577,11 @@ impl<'a> Planner<'a> {
         })
     }
 
-    pub(crate) fn table_ctx_by_name(&self, table: &QualifiedTable, role: &str) -> Option<TableCtx<'a>> {
+    pub(crate) fn table_ctx_by_name(
+        &self,
+        table: &QualifiedTable,
+        role: &str,
+    ) -> Option<TableCtx<'a>> {
         let idx = *self
             .by_table
             .get(&format!("{}.{}", table.schema(), table.name()))?;
@@ -768,7 +776,9 @@ impl<'a> Planner<'a> {
                 )
             };
             if self.relay {
-                if let Some(root) = self.plan_relay_root(field, &fragments, &vars, session, &path)? {
+                if let Some(root) =
+                    self.plan_relay_root(field, &fragments, &vars, session, &path)?
+                {
                     out.push(root);
                     continue;
                 }
@@ -798,16 +808,11 @@ impl<'a> Planner<'a> {
                 RootSource::Function(fidx) => {
                     let fentry = &self.functions[fidx];
                     if !self.infer_function_permissions {
-                        let direct = fentry
-                            .permissions
-                            .iter()
-                            .any(|p| p.role == session.role);
+                        let direct = fentry.permissions.iter().any(|p| p.role == session.role);
                         let inherited = self
                             .expand_role(&session.role)
                             .iter()
-                            .any(|parent| {
-                                fentry.permissions.iter().any(|p| &p.role == parent)
-                            });
+                            .any(|parent| fentry.permissions.iter().any(|p| &p.role == parent));
                         if !direct && !inherited {
                             return Err(not_found());
                         }
@@ -1017,9 +1022,9 @@ impl<'a> Planner<'a> {
             let mut prefix: Vec<OrderBy> = distinct_on
                 .iter()
                 .filter(|c| {
-                    !order_by.iter().any(
-                        |ob| matches!(&ob.target, OrderByTarget::Column(col) if col == *c),
-                    )
+                    !order_by
+                        .iter()
+                        .any(|ob| matches!(&ob.target, OrderByTarget::Column(col) if col == *c))
                 })
                 .map(|c| OrderBy {
                     target: OrderByTarget::Column(c.clone()),
@@ -1061,10 +1066,22 @@ impl<'a> Planner<'a> {
         }
 
         let fields = match kind {
-            RootKind::Aggregate => {
-                self.walk_aggregate_selection(ctx, &field.selection_set, fragments, vars, session, path)?
-            }
-            _ => self.walk_table_selection(ctx, &field.selection_set, fragments, vars, session, path)?,
+            RootKind::Aggregate => self.walk_aggregate_selection(
+                ctx,
+                &field.selection_set,
+                fragments,
+                vars,
+                session,
+                path,
+            )?,
+            _ => self.walk_table_selection(
+                ctx,
+                &field.selection_set,
+                fragments,
+                vars,
+                session,
+                path,
+            )?,
         };
 
         Ok(SelectQuery {
@@ -1079,7 +1096,6 @@ impl<'a> Planner<'a> {
             single: kind == RootKind::ByPk,
         })
     }
-
 
     /// The role's row filter as an IR predicate (session vars substituted).
     /// Parsed in a permission-filter context: the filter may reference
@@ -1179,8 +1195,7 @@ impl<'a> Planner<'a> {
                         .find(|r| r.name == base)
                     {
                         let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
-                        let Some(remote) =
-                            self.table_ctx_by_name(&remote_table, &session.role)
+                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
                         else {
                             return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
                         };
@@ -1241,7 +1256,12 @@ impl<'a> Planner<'a> {
                     return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
                 };
                 let fields = self.walk_table_selection(
-                    &remote, &field.selection_set, fragments, vars, session, &fpath,
+                    &remote,
+                    &field.selection_set,
+                    fragments,
+                    vars,
+                    session,
+                    &fpath,
                 )?;
                 let predicate = self.permission_predicate(&remote, session, &fpath)?;
                 out.push(OutputField {
@@ -1269,13 +1289,7 @@ impl<'a> Planner<'a> {
 
             // Array relationship (plain or _aggregate)?
             let (rel_name, aggregate) = match field.name.strip_suffix("_aggregate") {
-                Some(base)
-                    if ctx
-                        .entry
-                        .array_relationships
-                        .iter()
-                        .any(|r| r.name == base) =>
-                {
+                Some(base) if ctx.entry.array_relationships.iter().any(|r| r.name == base) => {
                     (base.to_string(), true)
                 }
                 _ => (field.name.clone(), false),
@@ -1353,10 +1367,8 @@ impl<'a> Planner<'a> {
                     }
                 }
                 // Build `query($v0: T!) { <root>(arg: $v0, lit: x) {sel} }`.
-                let Some((root_field, spec)) = rel
-                    .remote_field
-                    .as_object()
-                    .and_then(|m| m.iter().next())
+                let Some((root_field, spec)) =
+                    rel.remote_field.as_object().and_then(|m| m.iter().next())
                 else {
                     return Err(PlanError::validation(&fpath, "invalid remote_field"));
                 };
@@ -1365,12 +1377,7 @@ impl<'a> Planner<'a> {
                 let mut variables = vec![];
                 if let Some(arguments) = spec.get("arguments").and_then(|a| a.as_object()) {
                     for (arg, value) in arguments {
-                        let rendered = render_remote_arg(
-                            value,
-                            ctx,
-                            &mut var_defs,
-                            &mut variables,
-                        );
+                        let rendered = render_remote_arg(value, ctx, &mut var_defs, &mut variables);
                         args_sdl.push(format!("{arg}: {rendered}"));
                     }
                 }
@@ -1385,9 +1392,7 @@ impl<'a> Planner<'a> {
                 } else {
                     format!("({})", var_defs.join(", "))
                 };
-                let query = format!(
-                    "query{var_part} {{ {root_field}{args_part} {selection} }}"
-                );
+                let query = format!("query{var_part} {{ {root_field}{args_part} {selection} }}");
                 out.push(OutputField {
                     alias,
                     value: FieldValue::RemoteJoin {
@@ -1433,8 +1438,7 @@ impl<'a> Planner<'a> {
                         schema: rschema.clone(),
                         name: rname.clone(),
                     };
-                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                    else {
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
                         return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
                     };
                     let from = FromSource::RowFunction {
@@ -1519,8 +1523,14 @@ impl<'a> Planner<'a> {
                     },
                 }),
                 "aggregate" => {
-                    let aggs =
-                        self.parse_aggregate_fields(ctx, &field.selection_set, fragments, vars, session, &fpath)?;
+                    let aggs = self.parse_aggregate_fields(
+                        ctx,
+                        &field.selection_set,
+                        fragments,
+                        vars,
+                        session,
+                        &fpath,
+                    )?;
                     out.push(OutputField {
                         alias,
                         value: FieldValue::Aggregate { fields: aggs },
@@ -1528,7 +1538,12 @@ impl<'a> Planner<'a> {
                 }
                 "nodes" => {
                     let nodes = self.walk_table_selection(
-                        ctx, &field.selection_set, fragments, vars, session, &fpath,
+                        ctx,
+                        &field.selection_set,
+                        fragments,
+                        vars,
+                        session,
+                        &fpath,
                     )?;
                     out.push(OutputField {
                         alias,
@@ -1604,8 +1619,7 @@ impl<'a> Planner<'a> {
                         }
                         let info = ctx.info.column(&col_field.name).unwrap();
                         let granting = ctx.granting_perms(&col_field.name);
-                        let guard = if ctx.perms.len() > 1 && granting.len() < ctx.perms.len()
-                        {
+                        let guard = if ctx.perms.len() > 1 && granting.len() < ctx.perms.len() {
                             self.combined_filter(ctx, &granting, session, &fpath)?
                         } else {
                             None
@@ -1669,8 +1683,7 @@ impl<'a> Planner<'a> {
                         .find(|r| r.name == base)
                     {
                         let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
-                        let Some(remote) =
-                            self.table_ctx_by_name(&remote_table, &session.role)
+                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
                         else {
                             return Err(field_not_found(path, key, &ctx.type_name));
                         };
@@ -1678,10 +1691,7 @@ impl<'a> Planner<'a> {
                             .permission_predicate(&remote, session, path)?
                             .map(Box::new);
                         let Json::Object(inner) = dir_value else {
-                            return Err(PlanError::validation(
-                                path,
-                                "expected an order_by object",
-                            ));
+                            return Err(PlanError::validation(path, "expected an order_by object"));
                         };
                         let remote_ir_table = Table {
                             schema: remote.info.schema.clone(),
@@ -1689,8 +1699,7 @@ impl<'a> Planner<'a> {
                         };
                         for (agg, agg_value) in inner {
                             if agg == "count" {
-                                let (direction, nulls) =
-                                    parse_order_direction(agg_value, path)?;
+                                let (direction, nulls) = parse_order_direction(agg_value, path)?;
                                 out.push(OrderBy {
                                     target: OrderByTarget::RelationshipAggregate {
                                         table: remote_ir_table.clone(),
@@ -1722,11 +1731,7 @@ impl<'a> Planner<'a> {
                                 };
                                 for (col, dir_value) in cols {
                                     if !remote.column_allowed(col) {
-                                        return Err(field_not_found(
-                                            path,
-                                            col,
-                                            &remote.type_name,
-                                        ));
+                                        return Err(field_not_found(path, col, &remote.type_name));
                                     }
                                     let (direction, nulls) =
                                         parse_order_direction(dir_value, path)?;
@@ -1755,8 +1760,7 @@ impl<'a> Planner<'a> {
                     .find(|r| r.name == *key)
                 {
                     let (remote_table, join) = self.object_rel_target(ctx, rel, path)?;
-                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                    else {
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
                         return Err(field_not_found(path, key, &ctx.type_name));
                     };
                     let predicate = self
@@ -1811,6 +1815,9 @@ impl<'a> Planner<'a> {
             let cols: Vec<String> = match fk_cols {
                 donat_metadata::ObjRelFkColumns::Single(c) => vec![c.clone()],
                 donat_metadata::ObjRelFkColumns::Multiple(cs) => cs.clone(),
+                donat_metadata::ObjRelFkColumns::Remote(remote) => {
+                    return self.remote_fk_object_rel_target(ctx, remote, rel, path);
+                }
             };
             let fk = ctx
                 .info
@@ -1849,6 +1856,61 @@ impl<'a> Planner<'a> {
         ))
     }
 
+    fn remote_fk_object_rel_target(
+        &self,
+        ctx: &TableCtx,
+        remote: &donat_metadata::ArrRelFkConstraint,
+        rel: &donat_metadata::ObjectRelationship,
+        path: &str,
+    ) -> Result<(QualifiedTable, Vec<(String, String)>), PlanError> {
+        let remote_table = remote.table.clone();
+        let mut fk_cols: Vec<String> = vec![];
+        if let Some(c) = &remote.column {
+            fk_cols.push(c.clone());
+        }
+        if let Some(cs) = &remote.columns {
+            fk_cols.extend(cs.iter().cloned());
+        }
+        let remote_info = self
+            .catalog
+            .table(remote_table.schema(), remote_table.name())
+            .ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    format!(
+                        "table '{remote_table}' not found for relationship '{}'",
+                        rel.name
+                    ),
+                )
+            })?;
+        let fk = remote_info
+            .foreign_keys
+            .iter()
+            .find(|fk| {
+                fk.referenced_schema == ctx.entry.table.schema()
+                    && fk.referenced_table == ctx.entry.table.name()
+                    && fk.column_mapping.len() == fk_cols.len()
+                    && fk_cols.iter().all(|c| fk.column_mapping.contains_key(c))
+            })
+            .ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    format!(
+                        "no foreign key from '{remote_table}' on ({}) to '{}' for relationship '{}'",
+                        fk_cols.join(", "),
+                        ctx.entry.table,
+                        rel.name
+                    ),
+                )
+            })?;
+        let join = fk
+            .column_mapping
+            .iter()
+            .map(|(remote_col, local_col)| (local_col.clone(), remote_col.clone()))
+            .collect();
+        Ok((remote_table, join))
+    }
+
     /// Resolve an array relationship to (remote table, join pairs);
     /// join pairs are (local column, remote column).
     fn array_rel_target(
@@ -1880,7 +1942,10 @@ impl<'a> Planner<'a> {
                 .ok_or_else(|| {
                     PlanError::validation(
                         path,
-                        format!("table '{remote_table}' not found for relationship '{}'", rel.name),
+                        format!(
+                            "table '{remote_table}' not found for relationship '{}'",
+                            rel.name
+                        ),
                     )
                 })?;
             let constraint = remote_info
@@ -1948,9 +2013,7 @@ fn render_remote_arg(
         Json::Object(map) => {
             let inner: Vec<String> = map
                 .iter()
-                .map(|(k, v)| {
-                    format!("{k}: {}", render_remote_arg(v, ctx, var_defs, variables))
-                })
+                .map(|(k, v)| format!("{k}: {}", render_remote_arg(v, ctx, var_defs, variables)))
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -2126,8 +2189,7 @@ impl<'a> Planner<'a> {
         let Some(ctx) = self.table_ctx(idx, &session.role) else {
             return Ok(None);
         };
-        let conn =
-            self.build_connection(&ctx, field, fragments, vars, session, path, vec![])?;
+        let conn = self.build_connection(&ctx, field, fragments, vars, session, path, vec![])?;
         Ok(Some(RootField::Connection { alias, conn }))
     }
 
@@ -2325,12 +2387,23 @@ fn op_name<'o>(op: &'o OperationDefinition<'static, String>) -> Option<&'o str> 
 /// `order_by` over a relationship aggregate — the function name reaches SQL
 /// verbatim, so it must never be taken from unvalidated input.
 pub(crate) const AGGREGATE_COLUMN_OPS: &[&str] = &[
-    "sum", "avg", "max", "min", "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp",
+    "sum",
+    "avg",
+    "max",
+    "min",
+    "stddev",
+    "stddev_samp",
+    "stddev_pop",
+    "variance",
+    "var_samp",
     "var_pop",
 ];
 
 pub(crate) fn field_not_found(path: &str, field: &str, type_name: &str) -> PlanError {
-    PlanError::validation(path, format!("field '{field}' not found in type: '{type_name}'"))
+    PlanError::validation(
+        path,
+        format!("field '{field}' not found in type: '{type_name}'"),
+    )
 }
 
 pub(crate) fn unexpected_arg(path: &str, arg: &str) -> PlanError {
@@ -2338,9 +2411,9 @@ pub(crate) fn unexpected_arg(path: &str, arg: &str) -> PlanError {
 }
 
 pub(crate) fn parse_non_negative(value: &Json, path: &str, what: &str) -> Result<u64, PlanError> {
-    value
-        .as_u64()
-        .ok_or_else(|| PlanError::validation(path, format!("expects a non-negative integer for {what}")))
+    value.as_u64().ok_or_else(|| {
+        PlanError::validation(path, format!("expects a non-negative integer for {what}"))
+    })
 }
 
 /// `distinct_on` / `count(columns:)`: single enum or list of enums.
@@ -2362,9 +2435,15 @@ fn parse_columns_arg(value: &Json, ctx: &TableCtx, path: &str) -> Result<Vec<Str
     Ok(out)
 }
 
-fn parse_order_direction(value: &Json, path: &str) -> Result<(OrderDirection, NullsOrder), PlanError> {
+fn parse_order_direction(
+    value: &Json,
+    path: &str,
+) -> Result<(OrderDirection, NullsOrder), PlanError> {
     let Some(s) = value.as_str() else {
-        return Err(PlanError::validation(path, "expected an order_by direction"));
+        return Err(PlanError::validation(
+            path,
+            "expected an order_by direction",
+        ));
     };
     let res = match s {
         "asc" => (OrderDirection::Asc, NullsOrder::Last),
@@ -2390,12 +2469,12 @@ pub(crate) fn value_to_json(
     path: &str,
 ) -> Result<Json, PlanError> {
     Ok(match value {
-        GqlValue::Variable(name) => vars
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                PlanError::validation(path, format!("expecting a value for non-nullable variable: \"{name}\""))
-            })?,
+        GqlValue::Variable(name) => vars.get(name).cloned().ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!("expecting a value for non-nullable variable: \"{name}\""),
+            )
+        })?,
         GqlValue::Int(n) => Json::from(n.as_i64().unwrap_or_default()),
         GqlValue::Float(f) => serde_json::Number::from_f64(*f)
             .map(Json::Number)
@@ -2463,7 +2542,10 @@ pub(crate) fn flatten_into<'s>(
                     if on != tn {
                         return Err(PlanError::validation(
                             "$",
-                            format!("fragment \"{}\" is defined on '{on}', not '{tn}'", spread.fragment_name),
+                            format!(
+                                "fragment \"{}\" is defined on '{on}', not '{tn}'",
+                                spread.fragment_name
+                            ),
                         ));
                     }
                 }

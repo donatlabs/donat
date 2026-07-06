@@ -39,12 +39,18 @@ pub async fn reconcile(database_url: &str, metadata: &Metadata) -> anyhow::Resul
     let mut desired: HashMap<String, (String, String, String)> = HashMap::new();
     let mut creates: Vec<String> = vec![];
     for source in &metadata.sources {
+        if source.kind != donat_metadata::SourceKind::Postgres {
+            continue;
+        }
         for table in &source.tables {
             let schema = table.table.schema().to_string();
             let name = table.table.name().to_string();
             for et in &table.event_triggers {
                 for stmt in create_statements(et, &schema, &name) {
-                    desired.insert(stmt.pg_name.clone(), (stmt.pg_name.clone(), schema.clone(), name.clone()));
+                    desired.insert(
+                        stmt.pg_name.clone(),
+                        (stmt.pg_name.clone(), schema.clone(), name.clone()),
+                    );
                     creates.push(stmt.sql);
                 }
             }
@@ -179,7 +185,10 @@ async fn run(state: SharedState) {
         .unwrap_or(10)
         .max(1);
     let interval = Duration::from_secs(interval);
-    tracing::info!(poll_seconds = interval.as_secs(), "event delivery loop started");
+    tracing::info!(
+        poll_seconds = interval.as_secs(),
+        "event delivery loop started"
+    );
     loop {
         if let Err(e) = tick(&state).await {
             tracing::warn!(error = %e, "event tick failed");
@@ -262,7 +271,9 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         });
 
         let (http_status, response_body) = deliver(state, trigger, &envelope).await;
-        let success = http_status.map(|s| (200..300).contains(&s)).unwrap_or(false);
+        let success = http_status
+            .map(|s| (200..300).contains(&s))
+            .unwrap_or(false);
 
         tx.execute(
             "INSERT INTO donat.event_invocation_logs (event_id, status, request, response) \
@@ -287,8 +298,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                let next_retry =
-                    Utc::now() + chrono::Duration::seconds(retry.interval_sec as i64);
+                let next_retry = Utc::now() + chrono::Duration::seconds(retry.interval_sec as i64);
                 tx.execute(
                     "UPDATE donat.event_log SET tries = $2, next_retry_at = $3 WHERE id = $1",
                     &[&id, &new_tries, &next_retry],
@@ -310,7 +320,11 @@ fn webhook_url(trigger: &EventTrigger) -> String {
     }
 }
 
-async fn deliver(state: &SharedState, trigger: &EventTrigger, envelope: &Json) -> (Option<i32>, Json) {
+async fn deliver(
+    state: &SharedState,
+    trigger: &EventTrigger,
+    envelope: &Json,
+) -> (Option<i32>, Json) {
     let url = webhook_url(trigger);
     let timeout = trigger
         .retry_conf
@@ -356,16 +370,26 @@ mod tests {
     fn create_statements_cover_enabled_ops() {
         let def = EventTriggerDefinition {
             enable_manual: false,
-            insert: Some(OperationSpec { columns: Columns::Star, payload: None }),
+            insert: Some(OperationSpec {
+                columns: Columns::Star,
+                payload: None,
+            }),
             update: Some(OperationSpec {
                 columns: Columns::List(vec!["c2".into()]),
                 payload: None,
             }),
-            delete: Some(OperationSpec { columns: Columns::Star, payload: None }),
+            delete: Some(OperationSpec {
+                columns: Columns::Star,
+                payload: None,
+            }),
         };
         let stmts = create_statements(&trig("t1_all", def), "hge_tests", "test_t1");
         assert_eq!(stmts.len(), 3);
-        let joined = stmts.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = stmts
+            .iter()
+            .map(|s| s.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("AFTER INSERT ON \"hge_tests\".\"test_t1\""));
         // Selected-column update fires only on that column.
         assert!(joined.contains("AFTER UPDATE OF \"c2\" ON"));
@@ -378,7 +402,10 @@ mod tests {
         let def = EventTriggerDefinition {
             enable_manual: false,
             insert: None,
-            update: Some(OperationSpec { columns: Columns::Star, payload: None }),
+            update: Some(OperationSpec {
+                columns: Columns::Star,
+                payload: None,
+            }),
             delete: None,
         };
         let stmts = create_statements(&trig("t", def), "public", "x");

@@ -69,6 +69,7 @@ pub struct ActionDefinition {
     )]
     pub arguments: Vec<ArgumentDefinition>,
     /// GraphQL type reference for the result, e.g. `UserId` or `[UserId]`.
+    #[serde(default = "default_action_output_type")]
     pub output_type: String,
     /// Webhook URL ({{ENV}} templates allowed).
     pub handler: String,
@@ -88,6 +89,10 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn default_action_output_type() -> String {
+    "jsonb".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -205,6 +210,7 @@ impl CustomTypes {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputObjectType {
     pub name: String,
+    #[serde(default)]
     pub fields: Vec<CustomTypeField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -213,6 +219,7 @@ pub struct InputObjectType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ObjectType {
     pub name: String,
+    #[serde(default)]
     pub fields: Vec<CustomTypeField>,
     /// Relationships from this output object to tracked tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -428,11 +435,16 @@ pub enum SourceKind {
     Postgres,
     Sqlite,
     Mysql,
+    Clickhouse,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceConfiguration {
-    pub connection_info: ConnectionInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_info: Option<ConnectionInfo>,
+    /// Unsupported source kinds can carry connector-specific configuration.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -459,6 +471,7 @@ pub enum DatabaseUrl {
 pub enum QualifiedTable {
     Name(String),
     Qualified { schema: String, name: String },
+    Parts(Vec<String>),
 }
 
 impl QualifiedTable {
@@ -466,6 +479,7 @@ impl QualifiedTable {
         match self {
             QualifiedTable::Name(_) => "public",
             QualifiedTable::Qualified { schema, .. } => schema,
+            QualifiedTable::Parts(parts) => parts.first().map(String::as_str).unwrap_or("public"),
         }
     }
 
@@ -473,6 +487,7 @@ impl QualifiedTable {
         match self {
             QualifiedTable::Name(name) => name,
             QualifiedTable::Qualified { name, .. } => name,
+            QualifiedTable::Parts(parts) => parts.last().map(String::as_str).unwrap_or(""),
         }
     }
 }
@@ -638,6 +653,7 @@ pub struct ObjRelUsing {
 pub enum ObjRelFkColumns {
     Single(String),
     Multiple(Vec<String>),
+    Remote(ArrRelFkConstraint),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

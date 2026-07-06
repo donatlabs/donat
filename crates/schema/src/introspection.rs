@@ -7,8 +7,8 @@ use serde_json::{Map as JsonMap, Value as Json, json};
 
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
-use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 use crate::naming::{root_names, table_base_name};
+use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 
 /// GraphQL scalar name for a Postgres type (Donat naming).
 fn scalar_name(pg_type: &str) -> &str {
@@ -201,10 +201,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         for rel in &entry.object_relationships {
             if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
                 if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner
-                        .table_ctx_by_name(&remote, &session.role)
-                        .is_some()
-                    {
+                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
                         // Donat makes an FK-based object relationship
                         // non-nullable when the local FK column(s) are NOT
                         // NULL (the related row always exists).
@@ -222,10 +219,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         for rel in &entry.array_relationships {
             if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
                 if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner
-                        .table_ctx_by_name(&remote, &session.role)
-                        .is_some()
-                    {
+                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
                         let remote_base = table_base_name(remote_entry);
                         fields.push(field(
                             &rel.name,
@@ -265,8 +259,14 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             ));
             order_by_fields.push(input_value(&col.name, named("ENUM", "order_by")));
         }
-        types.push(input_object_type(&format!("{base}_bool_exp"), bool_exp_fields));
-        types.push(input_object_type(&format!("{base}_order_by"), order_by_fields));
+        types.push(input_object_type(
+            &format!("{base}_bool_exp"),
+            bool_exp_fields,
+        ));
+        types.push(input_object_type(
+            &format!("{base}_order_by"),
+            order_by_fields,
+        ));
 
         // Query roots.
         query_fields.push(field(
@@ -275,20 +275,20 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             non_null(list_of(non_null(named("OBJECT", &base)))),
         ));
         if !ctx.info.primary_key.is_empty()
-            && ctx
-                .info
-                .primary_key
-                .iter()
-                .all(|pk| ctx.column_allowed(pk))
+            && ctx.info.primary_key.iter().all(|pk| ctx.column_allowed(pk))
         {
             let pk_args: Vec<Json> = ctx
                 .info
                 .primary_key
                 .iter()
                 .map(|pk| {
-                    let scalar =
-                        scalar_name(&ctx.info.column(pk).map(|c| c.pg_type.clone()).unwrap_or_default())
-                            .to_string();
+                    let scalar = scalar_name(
+                        &ctx.info
+                            .column(pk)
+                            .map(|c| c.pg_type.clone())
+                            .unwrap_or_default(),
+                    )
+                    .to_string();
                     input_value(pk, non_null(named("SCALAR", &scalar)))
                 })
                 .collect();
@@ -322,9 +322,10 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         }
 
         // Mutations for the role.
-        let insert_perm = planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
-            !p.backend_only || session.backend_request
-        });
+        let insert_perm =
+            planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
+                !p.backend_only || session.backend_request
+            });
         if insert_perm.is_some() {
             types.push(input_object_type(
                 &format!("{base}_insert_input"),
@@ -509,12 +510,10 @@ pub fn execute_introspection(
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());
         let value = match root.name.as_str() {
             "__typename" => Json::String("query_root".to_string()),
-            "__schema" => {
-                match project(&schema, &root.selection_set, &fragments, variables) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                }
-            }
+            "__schema" => match project(&schema, &root.selection_set, &fragments, variables) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            },
             "__type" => {
                 let name = root
                     .arguments
@@ -563,6 +562,7 @@ fn object_rel_is_non_null(
     let cols: Vec<&str> = match fk {
         ObjRelFkColumns::Single(c) => vec![c.as_str()],
         ObjRelFkColumns::Multiple(cs) => cs.iter().map(String::as_str).collect(),
+        ObjRelFkColumns::Remote(_) => return false,
     };
     !cols.is_empty()
         && cols

@@ -40,9 +40,14 @@ fn write(path: &Path, content: &str) {
 
 /// Run a donat subcommand; returns (success, combined output).
 fn run(db_url: &str, args: &[&str]) -> (bool, String) {
+    run_with_env(db_url, args, &[])
+}
+
+fn run_with_env(db_url: &str, args: &[&str], envs: &[(&str, &str)]) -> (bool, String) {
     let out = Command::new(engine_binary())
         .args(args)
         .env("DONAT_DATABASE_URL", db_url)
+        .envs(envs.iter().copied())
         .output()
         .expect("spawn donat");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -55,29 +60,138 @@ fn migrate_applies_sql_and_is_idempotent() {
     let db = fresh_db("conf_migrate_apply");
     let migrations = tmpdir("apply");
     write(
-        &migrations.join("V1__create_widget.sql"),
+        &migrations.join("V1771800240000__create_widget.sql"),
         "CREATE TABLE widget (id serial primary key, name text not null);\n\
          INSERT INTO widget (name) VALUES ('a'), ('b');\n",
     );
 
-    let (ok, out) = run(&db, &["migrate", "--migrations-dir", migrations.to_str().unwrap()]);
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+    );
     assert!(ok, "first migrate failed:\n{out}");
-    assert!(out.contains("applied migration"), "expected applied log:\n{out}");
+    assert!(
+        out.contains("applied migration"),
+        "expected applied log:\n{out}"
+    );
 
     // Idempotent: a second run applies nothing.
-    let (ok, out) = run(&db, &["migrate", "--migrations-dir", migrations.to_str().unwrap()]);
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+    );
     assert!(ok, "second migrate failed:\n{out}");
-    assert!(out.contains("up to date"), "expected up-to-date log:\n{out}");
+    assert!(
+        out.contains("up to date"),
+        "expected up-to-date log:\n{out}"
+    );
 
     // The table exists with the seeded rows, and refinery tracked the version.
     let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
-    let n: i64 = client.query_one("SELECT count(*) FROM widget", &[]).unwrap().get(0);
-    assert_eq!(n, 2, "seeded rows");
-    let v: i32 = client
-        .query_one("SELECT version FROM refinery_schema_history ORDER BY version DESC LIMIT 1", &[])
+    let n: i64 = client
+        .query_one("SELECT count(*) FROM widget", &[])
         .unwrap()
         .get(0);
-    assert_eq!(v, 1, "tracked migration version");
+    assert_eq!(n, 2, "seeded rows");
+    let v: i64 = client
+        .query_one(
+            "SELECT version FROM refinery_schema_history ORDER BY version DESC LIMIT 1",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(v, 1_771_800_240_000, "tracked migration version");
+}
+
+#[test]
+fn migrate_preinstalls_pgcrypto_for_uuid_defaults() {
+    let db = fresh_db("conf_migrate_pgcrypto");
+    let migrations = tmpdir("pgcrypto");
+    write(
+        &migrations.join("V1__create_uuid_widget.sql"),
+        "CREATE TABLE widget (id uuid primary key default gen_random_uuid());\n",
+    );
+
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+    );
+    assert!(ok, "pgcrypto migrate failed:\n{out}");
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let ext: String = client
+        .query_one(
+            "SELECT extname FROM pg_extension WHERE extname = 'pgcrypto'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(ext, "pgcrypto");
+}
+
+#[test]
+fn migrate_accepts_hasura_directory_migrations() {
+    let db = fresh_db("conf_migrate_hasura_dirs");
+    let migrations = tmpdir("hasura_dirs");
+    write(
+        &migrations.join("1771800240000_create_widget/up.sql"),
+        "CREATE TABLE widget (id serial primary key, name text not null);\n",
+    );
+
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+    );
+    assert!(ok, "directory migrate failed:\n{out}");
+    assert!(
+        out.contains("applied migration"),
+        "expected applied log:\n{out}"
+    );
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let v: i64 = client
+        .query_one(
+            "SELECT version FROM refinery_schema_history ORDER BY version DESC LIMIT 1",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(v, 1_771_800_240_000, "tracked migration version");
+}
+
+#[test]
+fn migrate_can_adopt_existing_schema_when_enabled() {
+    let db = fresh_db("conf_migrate_adopt_existing");
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    client
+        .batch_execute("CREATE TABLE widget (id serial primary key);\n")
+        .unwrap();
+
+    let migrations = tmpdir("adopt");
+    write(
+        &migrations.join("V1__create_widget.sql"),
+        "CREATE TABLE widget (id serial primary key);\n",
+    );
+
+    let (ok, out) = run_with_env(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+        &[("DONAT_ADOPT_EXISTING_SCHEMA", "true")],
+    );
+    assert!(ok, "adopt migrate failed:\n{out}");
+    assert!(
+        out.contains("adopted existing database schema") || out.contains("up to date"),
+        "expected adoption log:\n{out}"
+    );
+
+    let v: i64 = client
+        .query_one(
+            "SELECT version FROM refinery_schema_history ORDER BY version DESC LIMIT 1",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(v, 1);
 }
 
 #[test]
@@ -88,7 +202,10 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         &migrations.join("V1__create_widget.sql"),
         "CREATE TABLE widget (id serial primary key, name text not null);\n",
     );
-    let (ok, out) = run(&db, &["migrate", "--migrations-dir", migrations.to_str().unwrap()]);
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", migrations.to_str().unwrap()],
+    );
     assert!(ok, "migrate failed:\n{out}");
 
     // Metadata tracking the migrated table -> consistent.
@@ -103,11 +220,17 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         "- \"!include public_widget.yaml\"\n",
     );
     let widget = "table:\n  name: widget\n  schema: public\nselect_permissions:\n  - role: user\n    permission:\n      columns: \"*\"\n      filter: {}\n";
-    write(&md.join("databases/default/tables/public_widget.yaml"), widget);
+    write(
+        &md.join("databases/default/tables/public_widget.yaml"),
+        widget,
+    );
 
     let (ok, out) = run(&db, &["validate", "--metadata-dir", md.to_str().unwrap()]);
     assert!(ok, "validate should pass for consistent metadata:\n{out}");
-    assert!(out.contains("consistent"), "expected consistent log:\n{out}");
+    assert!(
+        out.contains("consistent"),
+        "expected consistent log:\n{out}"
+    );
 
     // Metadata tracking a non-existent table -> inconsistent, non-zero exit.
     write(
