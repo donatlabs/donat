@@ -195,8 +195,9 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 .as_ref()
                 .and_then(|c| c.column_config.get(&col.name))
                 .and_then(|cc| cc.comment.as_deref());
-            fields.push(field_desc(&col.name, vec![], ty, description));
-            select_columns.push(col.name.clone());
+            let gql_name = ctx.column_graphql_name(&col.name);
+            fields.push(field_desc(&gql_name, vec![], ty, description));
+            select_columns.push(gql_name);
         }
         for rel in &entry.object_relationships {
             if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
@@ -253,11 +254,12 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 continue;
             }
             let scalar = scalar_name(&col.pg_type).to_string();
+            let gql_name = ctx.column_graphql_name(&col.name);
             bool_exp_fields.push(input_value(
-                &col.name,
+                &gql_name,
                 named("INPUT_OBJECT", &format!("{scalar}_comparison_exp")),
             ));
-            order_by_fields.push(input_value(&col.name, named("ENUM", "order_by")));
+            order_by_fields.push(input_value(&gql_name, named("ENUM", "order_by")));
         }
         types.push(input_object_type(
             &format!("{base}_bool_exp"),
@@ -289,7 +291,10 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                             .unwrap_or_default(),
                     )
                     .to_string();
-                    input_value(pk, non_null(named("SCALAR", &scalar)))
+                    input_value(
+                        &ctx.column_graphql_name(pk),
+                        non_null(named("SCALAR", &scalar)),
+                    )
                 })
                 .collect();
             query_fields.push(field(&names.select_by_pk, pk_args, named("OBJECT", &base)));
@@ -334,7 +339,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     .iter()
                     .map(|c| {
                         let scalar = scalar_name(&c.pg_type).to_string();
-                        input_value(&c.name, named("SCALAR", &scalar))
+                        input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
                     })
                     .collect(),
             ));
@@ -383,7 +388,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     .iter()
                     .map(|c| {
                         let scalar = scalar_name(&c.pg_type).to_string();
-                        input_value(&c.name, named("SCALAR", &scalar))
+                        input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
                     })
                     .collect(),
             ));

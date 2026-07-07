@@ -11,7 +11,7 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::naming::{root_names, table_base_name};
+use crate::naming::{column_db_name, column_graphql_name, root_names, table_base_name};
 
 /// Per-request session: an explicit role + X-Donat-*/X-Hasura-* variables
 /// (keys lower-cased). There is no admin role — every access goes through an
@@ -187,15 +187,39 @@ impl<'a> TableCtx<'a> {
     }
 
     pub(crate) fn column_allowed_for_filter(&self, name: &str, is_permission: bool) -> bool {
-        if is_permission {
-            self.info.column(name).is_some()
-        } else {
-            self.column_allowed(name)
-        }
+        self.column_db_name_for_filter(name, is_permission)
+            .is_some_and(|db_name| {
+                if is_permission {
+                    self.info.column(&db_name).is_some()
+                } else {
+                    self.column_allowed(&db_name)
+                }
+            })
     }
 
     pub(crate) fn column_info(&self, name: &str) -> Option<&'a donat_catalog::ColumnInfo> {
         self.info.column(name)
+    }
+
+    pub(crate) fn column_graphql_name(&self, db_name: &str) -> String {
+        column_graphql_name(self.entry, db_name)
+    }
+
+    pub(crate) fn column_db_name(&self, graphql_name: &str) -> Option<String> {
+        let db_name = column_db_name(self.entry, graphql_name);
+        self.info.column(&db_name).map(|_| db_name)
+    }
+
+    pub(crate) fn column_db_name_for_filter(
+        &self,
+        name: &str,
+        is_permission: bool,
+    ) -> Option<String> {
+        if is_permission && self.info.column(name).is_some() {
+            Some(name.to_string())
+        } else {
+            self.column_db_name(name)
+        }
     }
 }
 
@@ -971,12 +995,17 @@ impl<'a> Planner<'a> {
             let value = value_to_json(arg_value, vars, path)?;
             match (kind, arg_name.as_str()) {
                 (RootKind::ByPk, col) => {
-                    if !ctx.info.primary_key.iter().any(|c| c == col) || !ctx.column_allowed(col) {
+                    let Some(db_col) = ctx.column_db_name(col) else {
+                        return Err(unexpected_arg(path, col));
+                    };
+                    if !ctx.info.primary_key.iter().any(|c| c == &db_col)
+                        || !ctx.column_allowed(&db_col)
+                    {
                         return Err(unexpected_arg(path, col));
                     }
-                    let pg_type = ctx.info.column(col).unwrap().pg_type.clone();
+                    let pg_type = ctx.info.column(&db_col).unwrap().pg_type.clone();
                     pk_predicate.push(BoolExp::Compare {
-                        column: col.to_string(),
+                        column: db_col,
                         pg_type,
                         op: CompareOp::Eq(Scalar::Json(value)),
                     });
@@ -1011,7 +1040,10 @@ impl<'a> Planner<'a> {
                 {
                     return Err(PlanError::validation(
                         path,
-                        format!("missing required field argument: \"{pk}\""),
+                        format!(
+                            "missing required field argument: \"{}\"",
+                            ctx.column_graphql_name(pk)
+                        ),
                     ));
                 }
             }
@@ -1214,14 +1246,17 @@ impl<'a> Planner<'a> {
             }
 
             // Plain column?
-            if ctx.column_allowed(&field.name) {
+            if let Some(db_name) = ctx
+                .column_db_name(&field.name)
+                .filter(|c| ctx.column_allowed(c))
+            {
                 if !field.arguments.is_empty() {
                     return Err(unexpected_arg(&fpath, &field.arguments[0].0));
                 }
-                let col = ctx.info.column(&field.name).unwrap();
+                let col = ctx.info.column(&db_name).unwrap();
                 // Inherited roles: when only SOME parents grant the column,
                 // it is NULLed on rows those parents cannot see.
-                let granting = ctx.granting_perms(&field.name);
+                let granting = ctx.granting_perms(&db_name);
                 let guard = if ctx.perms.len() > 1 && granting.len() < ctx.perms.len() {
                     self.combined_filter(ctx, &granting, session, &fpath)?
                 } else {
@@ -1614,11 +1649,14 @@ impl<'a> Planner<'a> {
                             .alias
                             .clone()
                             .unwrap_or_else(|| col_field.name.clone());
-                        if !ctx.column_allowed(&col_field.name) {
+                        let Some(db_name) = ctx
+                            .column_db_name(&col_field.name)
+                            .filter(|c| ctx.column_allowed(c))
+                        else {
                             return Err(field_not_found(&fpath, &col_field.name, &ctx.type_name));
-                        }
-                        let info = ctx.info.column(&col_field.name).unwrap();
-                        let granting = ctx.granting_perms(&col_field.name);
+                        };
+                        let info = ctx.info.column(&db_name).unwrap();
+                        let granting = ctx.granting_perms(&db_name);
                         let guard = if ctx.perms.len() > 1 && granting.len() < ctx.perms.len() {
                             self.combined_filter(ctx, &granting, session, &fpath)?
                         } else {
@@ -1664,10 +1702,10 @@ impl<'a> Planner<'a> {
                 return Err(PlanError::validation(path, "expected an order_by object"));
             };
             for (key, dir_value) in map {
-                if ctx.column_allowed(key) {
+                if let Some(db_key) = ctx.column_db_name(key).filter(|c| ctx.column_allowed(c)) {
                     let (direction, nulls) = parse_order_direction(dir_value, path)?;
                     out.push(OrderBy {
-                        target: OrderByTarget::Column(key.clone()),
+                        target: OrderByTarget::Column(db_key),
                         direction,
                         nulls,
                     });
@@ -1730,9 +1768,12 @@ impl<'a> Planner<'a> {
                                     ));
                                 };
                                 for (col, dir_value) in cols {
-                                    if !remote.column_allowed(col) {
+                                    let Some(db_col) = remote
+                                        .column_db_name(col)
+                                        .filter(|c| remote.column_allowed(c))
+                                    else {
                                         return Err(field_not_found(path, col, &remote.type_name));
-                                    }
+                                    };
                                     let (direction, nulls) =
                                         parse_order_direction(dir_value, path)?;
                                     out.push(OrderBy {
@@ -1740,7 +1781,7 @@ impl<'a> Planner<'a> {
                                             table: remote_ir_table.clone(),
                                             join: join.clone(),
                                             function: agg.clone(),
-                                            column: Some(col.clone()),
+                                            column: Some(db_col),
                                             predicate: predicate.clone(),
                                         },
                                         direction,
@@ -1770,9 +1811,12 @@ impl<'a> Planner<'a> {
                         return Err(PlanError::validation(path, "expected an order_by object"));
                     };
                     for (col, dir_value) in inner {
-                        if !remote.column_allowed(col) {
+                        let Some(db_col) = remote
+                            .column_db_name(col)
+                            .filter(|c| remote.column_allowed(c))
+                        else {
                             return Err(field_not_found(path, col, &remote.type_name));
-                        }
+                        };
                         let (direction, nulls) = parse_order_direction(dir_value, path)?;
                         out.push(OrderBy {
                             target: OrderByTarget::Relationship {
@@ -1781,7 +1825,7 @@ impl<'a> Planner<'a> {
                                     name: remote.info.name.clone(),
                                 },
                                 join: join.clone(),
-                                column: col.clone(),
+                                column: db_col,
                                 predicate: predicate.clone(),
                             },
                             direction,
@@ -2427,10 +2471,10 @@ fn parse_columns_arg(value: &Json, ctx: &TableCtx, path: &str) -> Result<Vec<Str
         let Some(name) = item.as_str() else {
             return Err(PlanError::validation(path, "expected a column name"));
         };
-        if !ctx.column_allowed(name) {
+        let Some(db_name) = ctx.column_db_name(name).filter(|c| ctx.column_allowed(c)) else {
             return Err(field_not_found(path, name, &ctx.type_name));
-        }
-        out.push(name.to_string());
+        };
+        out.push(db_name);
     }
     Ok(out)
 }

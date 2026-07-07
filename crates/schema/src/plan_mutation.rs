@@ -88,40 +88,19 @@ impl<'a> Planner<'a> {
             match kind {
                 MutationKind::Insert | MutationKind::InsertOne => {
                     let insert = self.plan_insert(
-                        &ctx,
-                        kind,
-                        field,
-                        fragments,
-                        vars,
-                        session,
-                        &path,
-                        not_found,
+                        &ctx, kind, field, fragments, vars, session, &path, not_found,
                     )?;
                     out.push(MutationRoot::Insert { alias, insert });
                 }
                 MutationKind::Update | MutationKind::UpdateByPk => {
                     let update = self.plan_update(
-                        &ctx,
-                        kind,
-                        field,
-                        fragments,
-                        vars,
-                        session,
-                        &path,
-                        not_found,
+                        &ctx, kind, field, fragments, vars, session, &path, not_found,
                     )?;
                     out.push(MutationRoot::Update { alias, update });
                 }
                 MutationKind::Delete | MutationKind::DeleteByPk => {
                     let delete = self.plan_delete(
-                        &ctx,
-                        kind,
-                        field,
-                        fragments,
-                        vars,
-                        session,
-                        &path,
-                        not_found,
+                        &ctx, kind, field, fragments, vars, session, &path, not_found,
                     )?;
                     out.push(MutationRoot::Delete { alias, delete });
                 }
@@ -189,17 +168,28 @@ impl<'a> Planner<'a> {
                 return Err(PlanError::validation(path, "objects must be objects"));
             };
             for key in map.keys() {
+                let Some(db_key) = ctx.column_db_name(key) else {
+                    return Err(field_not_found(
+                        path,
+                        key,
+                        &format!("{}_insert_input", ctx.type_name),
+                    ));
+                };
                 let allowed = match &perm.columns {
-                    Columns::Star => ctx.info.column(key).is_some(),
+                    Columns::Star => ctx.info.column(&db_key).is_some(),
                     Columns::List(cols) => {
-                        cols.iter().any(|c| c == key) && ctx.info.column(key).is_some()
+                        cols.iter().any(|c| c == &db_key) && ctx.info.column(&db_key).is_some()
                     }
                 };
                 if !allowed {
-                    return Err(field_not_found(path, key, &format!("{}_insert_input", ctx.type_name)));
+                    return Err(field_not_found(
+                        path,
+                        key,
+                        &format!("{}_insert_input", ctx.type_name),
+                    ));
                 }
-                if !columns.contains(key) {
-                    columns.push(key.clone());
+                if !columns.contains(&db_key) {
+                    columns.push(db_key);
                 }
             }
         }
@@ -244,19 +234,19 @@ impl<'a> Planner<'a> {
                 typed_columns
                     .iter()
                     .map(|(col, _)| {
-                        if let Some((_, preset)) =
-                            preset_values.iter().find(|(c, _)| c == col)
-                        {
+                        if let Some((_, preset)) = preset_values.iter().find(|(c, _)| c == col) {
                             return Some(preset.clone());
                         }
-                        map.get(col).map(|v| Scalar::Json(v.clone()))
+                        let gql_col = ctx.column_graphql_name(col);
+                        map.get(&gql_col).map(|v| Scalar::Json(v.clone()))
                     })
                     .collect()
             })
             .collect();
 
         let check = self.parse_check_exp(&perm.check, ctx, session, path)?;
-        let output = self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
+        let output =
+            self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
         Ok(InsertMutation {
             table: Table {
@@ -292,9 +282,23 @@ impl<'a> Planner<'a> {
             .and_then(Json::as_array)
             .map(|cols| {
                 cols.iter()
-                    .filter_map(|c| c.as_str().map(str::to_string))
-                    .collect()
+                    .map(|c| {
+                        let Some(name) = c.as_str() else {
+                            return Err(PlanError::validation(
+                                &format!("{path}.args.on_conflict"),
+                                "erroneous column name",
+                            ));
+                        };
+                        ctx.column_db_name(name).ok_or_else(|| {
+                            PlanError::validation(
+                                &format!("{path}.args.on_conflict"),
+                                "erroneous column name",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
             })
+            .transpose()?
             .unwrap_or_default();
         for col in &update_columns {
             if ctx.info.column(col).is_none() {
@@ -325,20 +329,17 @@ impl<'a> Planner<'a> {
                     && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
                 {
                     let filter_ctx = self.filter_ctx_of(ctx);
-                    let filter = self.parse_bool_exp(
-                        &update_perm.filter,
-                        &filter_ctx,
-                        session,
-                        true,
-                        path,
-                    )?;
+                    let filter =
+                        self.parse_bool_exp(&update_perm.filter, &filter_ctx, session, true, path)?;
                     predicate = Some(match predicate.take() {
                         Some(p) => BoolExp::And(vec![p, filter]),
                         None => filter,
                     });
                 }
                 for (col, value) in &update_perm.set {
-                    let Some(info) = ctx.info.column(col) else { continue };
+                    let Some(info) = ctx.info.column(col) else {
+                        continue;
+                    };
                     let resolved = match value {
                         Json::String(s) if is_session_var_name(s) => {
                             let v = session.var(s).ok_or_else(|| {
@@ -390,10 +391,13 @@ impl<'a> Planner<'a> {
             .ok_or_else(&not_found)?;
 
         let allowed = |col: &str| -> bool {
-            ctx.info.column(col).is_some()
+            let Some(db_col) = ctx.column_db_name(col) else {
+                return false;
+            };
+            ctx.info.column(&db_col).is_some()
                 && match &perm.columns {
                     Columns::Star => true,
-                    Columns::List(cols) => cols.iter().any(|c| c == col),
+                    Columns::List(cols) => cols.iter().any(|c| c == &db_col),
                 }
         };
 
@@ -411,11 +415,16 @@ impl<'a> Planner<'a> {
                         .ok_or_else(|| PlanError::validation(path, "_set must be an object"))?;
                     for (col, v) in map {
                         if !allowed(col) {
-                            return Err(field_not_found(path, col, &format!("{}_set_input", ctx.type_name)));
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_set_input", ctx.type_name),
+                            ));
                         }
+                        let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Set {
-                            column: col.clone(),
-                            pg_type: ctx.info.column(col).unwrap().pg_type.clone(),
+                            column: db_col.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
@@ -426,11 +435,16 @@ impl<'a> Planner<'a> {
                         .ok_or_else(|| PlanError::validation(path, "_inc must be an object"))?;
                     for (col, v) in map {
                         if !allowed(col) {
-                            return Err(field_not_found(path, col, &format!("{}_inc_input", ctx.type_name)));
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_inc_input", ctx.type_name),
+                            ));
                         }
+                        let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Inc {
-                            column: col.clone(),
-                            pg_type: ctx.info.column(col).unwrap().pg_type.clone(),
+                            column: db_col.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
@@ -444,11 +458,14 @@ impl<'a> Planner<'a> {
                         PlanError::validation(path, "pk_columns must be an object")
                     })?;
                     for (col, v) in map {
-                        let Some(info) = ctx.info.column(col) else {
+                        let Some(db_col) = ctx.column_db_name(col) else {
+                            return Err(field_not_found(path, col, &ctx.type_name));
+                        };
+                        let Some(info) = ctx.info.column(&db_col) else {
                             return Err(field_not_found(path, col, &ctx.type_name));
                         };
                         pk_predicate.push(BoolExp::Compare {
-                            column: col.clone(),
+                            column: db_col,
                             pg_type: info.pg_type.clone(),
                             op: CompareOp::Eq(Scalar::Json(v.clone())),
                         });
@@ -522,7 +539,8 @@ impl<'a> Planner<'a> {
             Some(check) => self.parse_check_exp(check, ctx, session, path)?,
             None => None,
         };
-        let output = self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
+        let output =
+            self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
         Ok(UpdateMutation {
             table: Table {
@@ -564,14 +582,17 @@ impl<'a> Planner<'a> {
                     user_where = Some(self.parse_bool_exp(&value, ctx, session, false, path)?);
                 }
                 (MutationKind::DeleteByPk, col) => {
-                    let Some(info) = ctx.info.column(col) else {
+                    let Some(db_col) = ctx.column_db_name(col) else {
                         return Err(unexpected_arg(path, col));
                     };
-                    if !ctx.info.primary_key.iter().any(|c| c == col) {
+                    let Some(info) = ctx.info.column(&db_col) else {
+                        return Err(unexpected_arg(path, col));
+                    };
+                    if !ctx.info.primary_key.iter().any(|c| c == &db_col) {
                         return Err(unexpected_arg(path, col));
                     }
                     pk_predicate.push(BoolExp::Compare {
-                        column: col.to_string(),
+                        column: db_col,
                         pg_type: info.pg_type.clone(),
                         op: CompareOp::Eq(Scalar::Json(value)),
                     });
@@ -600,7 +621,8 @@ impl<'a> Planner<'a> {
             _ => Some(BoolExp::And(predicates)),
         };
 
-        let output = self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
+        let output =
+            self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
         Ok(DeleteMutation {
             table: Table {
@@ -624,7 +646,13 @@ impl<'a> Planner<'a> {
             return Ok(None);
         }
         let filter_ctx = self.filter_ctx_of(ctx);
-        Ok(Some(self.parse_bool_exp(check, &filter_ctx, session, true, path)?))
+        Ok(Some(self.parse_bool_exp(
+            check,
+            &filter_ctx,
+            session,
+            true,
+            path,
+        )?))
     }
 
     /// The mutation's selection set: `{ affected_rows, returning }` or the

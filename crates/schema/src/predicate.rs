@@ -22,7 +22,10 @@ impl Planner<'_> {
         path: &str,
     ) -> Result<BoolExp, PlanError> {
         let Json::Object(map) = value else {
-            return Err(PlanError::validation(path, "expected a bool expression object"));
+            return Err(PlanError::validation(
+                path,
+                "expected a bool expression object",
+            ));
         };
 
         let mut conjuncts = vec![];
@@ -62,18 +65,17 @@ impl Planner<'_> {
                     )?)));
                 }
                 "_exists" => {
-                    let table_value = sub.get("_table").ok_or_else(|| {
-                        PlanError::validation(path, "_exists needs a _table")
-                    })?;
+                    let table_value = sub
+                        .get("_table")
+                        .ok_or_else(|| PlanError::validation(path, "_exists needs a _table"))?;
                     let table: donat_metadata::QualifiedTable =
                         serde_json::from_value(table_value.clone()).map_err(|e| {
                             PlanError::validation(path, format!("bad _exists table: {e}"))
                         })?;
-                    let where_value = sub.get("_where").ok_or_else(|| {
-                        PlanError::validation(path, "_exists needs a _where")
-                    })?;
-                    let Some(remote) = self.relationship_ctx(&table, session, is_permission)
-                    else {
+                    let where_value = sub
+                        .get("_where")
+                        .ok_or_else(|| PlanError::validation(path, "_exists needs a _where"))?;
+                    let Some(remote) = self.relationship_ctx(&table, session, is_permission) else {
                         return Err(PlanError::validation(
                             path,
                             format!("table \"{table}\" not found in _exists"),
@@ -90,13 +92,15 @@ impl Planner<'_> {
                     });
                 }
                 column if ctx.column_allowed_for_filter(column, is_permission) => {
-                    let info = ctx.column_info(column).unwrap();
-                    let ops =
-                        self.parse_ops(ctx, column, sub, session, is_permission, path)?;
+                    let db_column = ctx
+                        .column_db_name_for_filter(column, is_permission)
+                        .expect("column existence checked by column_allowed_for_filter");
+                    let info = ctx.column_info(&db_column).unwrap();
+                    let ops = self.parse_ops(ctx, &db_column, sub, session, is_permission, path)?;
                     let mut parsed: Vec<BoolExp> = ops
                         .into_iter()
                         .map(|op| BoolExp::Compare {
-                            column: column.to_string(),
+                            column: db_column.clone(),
                             pg_type: info.pg_type.clone(),
                             op,
                         })
@@ -139,13 +143,8 @@ impl Planner<'_> {
                                     ),
                                 ));
                             };
-                            let mut inner = self.parse_bool_exp(
-                                sub,
-                                &remote,
-                                session,
-                                is_permission,
-                                path,
-                            )?;
+                            let mut inner =
+                                self.parse_bool_exp(sub, &remote, session, is_permission, path)?;
                             // In user filters the remote table's own row
                             // filter applies too, so relationships can't
                             // leak invisible rows.
@@ -227,11 +226,13 @@ impl Planner<'_> {
                 schema: rschema.clone(),
                 name: rname.clone(),
             };
-            let Some(remote) = self.relationship_ctx(&remote_table, session, is_permission)
-            else {
+            let Some(remote) = self.relationship_ctx(&remote_table, session, is_permission) else {
                 return Err(PlanError::validation(
                     path,
-                    format!("field '{}' not found in type: '{}_bool_exp'", cf.name, ctx.type_name),
+                    format!(
+                        "field '{}' not found in type: '{}_bool_exp'",
+                        cf.name, ctx.type_name
+                    ),
                 ));
             };
             let mut inner = self.parse_bool_exp(value, &remote, session, is_permission, path)?;
@@ -247,7 +248,10 @@ impl Planner<'_> {
                 predicate: Box::new(inner),
             })
         } else {
-            let pg_type = finfo.returns_scalar.clone().unwrap_or_else(|| "text".into());
+            let pg_type = finfo
+                .returns_scalar
+                .clone()
+                .unwrap_or_else(|| "text".into());
             let ops = self.parse_ops(ctx, &cf.name, value, session, is_permission, path)?;
             let mut out: Vec<BoolExp> = ops
                 .into_iter()
@@ -282,112 +286,117 @@ impl Planner<'_> {
             return Ok(vec![CompareOp::Eq(Scalar::Json(resolved))]);
         };
 
-    let mut out = vec![];
-    for (raw_op_name, op_value) in ops {
-        // Legacy `$op` spelling -> `_op`.
-        let normalized;
-        let op_name: &str = if let Some(rest) = raw_op_name.strip_prefix('$') {
-            normalized = format!("_{rest}");
-            &normalized
-        } else {
-            raw_op_name
-        };
-        let scalar = |v: &Json| -> Result<Scalar, PlanError> {
-            Ok(Scalar::Json(resolve_session(v, session, is_permission, path)?))
-        };
-        let list = |v: &Json| -> Result<Vec<Scalar>, PlanError> {
-            // A session variable may itself hold an array, as JSON
-            // ("[1,2]") or as a Postgres array literal ("{a,b}").
-            let resolved = resolve_session(v, session, is_permission, path)?;
-            match resolved {
-                Json::Array(items) => items.into_iter().map(|i| Ok(Scalar::Json(i))).collect(),
-                Json::String(s) => parse_array_literal(&s)
-                    .ok_or_else(|| PlanError::validation(path, "expected an array of values"))
-                    .map(|items| items.into_iter().map(Scalar::Json).collect()),
-                _ => Err(PlanError::validation(path, "expected an array of values")),
-            }
-        };
-        let string_list = |v: &Json| -> Result<Vec<String>, PlanError> {
-            list(v).map(|items| {
-                items
-                    .into_iter()
-                    .map(|s| match s.as_json() {
-                        Json::String(s) => s.clone(),
-                        other => other.to_string(),
-                    })
-                    .collect()
-            })
-        };
-
-        let op = match op_name {
-            "_eq" => CompareOp::Eq(scalar(op_value)?),
-            "_neq" | "_ne" => CompareOp::Neq(scalar(op_value)?),
-            "_gt" => CompareOp::Gt(scalar(op_value)?),
-            "_lt" => CompareOp::Lt(scalar(op_value)?),
-            "_gte" => CompareOp::Gte(scalar(op_value)?),
-            "_lte" => CompareOp::Lte(scalar(op_value)?),
-            "_in" => CompareOp::In(list(op_value)?),
-            "_nin" => CompareOp::Nin(list(op_value)?),
-            "_like" => CompareOp::Like(scalar(op_value)?),
-            "_nlike" => CompareOp::Nlike(scalar(op_value)?),
-            "_ilike" => CompareOp::Ilike(scalar(op_value)?),
-            "_nilike" => CompareOp::Nilike(scalar(op_value)?),
-            "_similar" => CompareOp::Similar(scalar(op_value)?),
-            "_nsimilar" => CompareOp::Nsimilar(scalar(op_value)?),
-            "_regex" => CompareOp::Regex(scalar(op_value)?),
-            "_iregex" => CompareOp::Iregex(scalar(op_value)?),
-            "_nregex" => CompareOp::Nregex(scalar(op_value)?),
-            "_niregex" => CompareOp::Niregex(scalar(op_value)?),
-            "_is_null" => {
-                let v = resolve_session(op_value, session, is_permission, path)?;
-                CompareOp::IsNull(v.as_bool().unwrap_or(false))
-            }
-            // Column-to-column comparisons.
-            "_ceq" => self.column_compare("=", op_value, ctx, path)?,
-            "_cne" | "_cneq" => self.column_compare("<>", op_value, ctx, path)?,
-            "_cgt" => self.column_compare(">", op_value, ctx, path)?,
-            "_clt" => self.column_compare("<", op_value, ctx, path)?,
-            "_cgte" => self.column_compare(">=", op_value, ctx, path)?,
-            "_clte" => self.column_compare("<=", op_value, ctx, path)?,
-            // jsonb operators.
-            "_has_key" => CompareOp::HasKey(scalar(op_value)?),
-            "_has_keys_any" => CompareOp::HasKeysAny(string_list(op_value)?),
-            "_has_keys_all" => CompareOp::HasKeysAll(string_list(op_value)?),
-            "_contains" => CompareOp::Contains(scalar(op_value)?),
-            "_contained_in" => CompareOp::ContainedIn(scalar(op_value)?),
-            // PostGIS operators.
-            "_st_contains" => st_op("ST_Contains", op_value, &scalar)?,
-            "_st_crosses" => st_op("ST_Crosses", op_value, &scalar)?,
-            "_st_equals" => st_op("ST_Equals", op_value, &scalar)?,
-            "_st_intersects" => st_op("ST_Intersects", op_value, &scalar)?,
-            "_st_overlaps" => st_op("ST_Overlaps", op_value, &scalar)?,
-            "_st_touches" => st_op("ST_Touches", op_value, &scalar)?,
-            "_st_within" => st_op("ST_Within", op_value, &scalar)?,
-            "_st_3d_intersects" => st_op("ST_3DIntersects", op_value, &scalar)?,
-            "_st_d_within" | "_st_3d_d_within" => {
-                let obj = op_value.as_object().ok_or_else(|| {
-                    PlanError::validation(path, "expected { distance, from } for _st_d_within")
-                })?;
-                let distance = obj.get("distance").ok_or_else(|| {
-                    PlanError::validation(path, "missing 'distance' in _st_d_within")
-                })?;
-                let from = obj.get("from").ok_or_else(|| {
-                    PlanError::validation(path, "missing 'from' in _st_d_within")
-                })?;
-                CompareOp::StDWithin {
-                    distance: scalar(distance)?,
-                    from: scalar(from)?,
-                    three_d: op_name == "_st_3d_d_within",
-                }
-            }
-            other => {
-                return Err(PlanError::validation(
+        let mut out = vec![];
+        for (raw_op_name, op_value) in ops {
+            // Legacy `$op` spelling -> `_op`.
+            let normalized;
+            let op_name: &str = if let Some(rest) = raw_op_name.strip_prefix('$') {
+                normalized = format!("_{rest}");
+                &normalized
+            } else {
+                raw_op_name
+            };
+            let scalar = |v: &Json| -> Result<Scalar, PlanError> {
+                Ok(Scalar::Json(resolve_session(
+                    v,
+                    session,
+                    is_permission,
                     path,
-                    format!("unexpected operator \"{other}\" for column '{column}'"),
-                ));
-            }
-        };
-        out.push(op);
+                )?))
+            };
+            let list = |v: &Json| -> Result<Vec<Scalar>, PlanError> {
+                // A session variable may itself hold an array, as JSON
+                // ("[1,2]") or as a Postgres array literal ("{a,b}").
+                let resolved = resolve_session(v, session, is_permission, path)?;
+                match resolved {
+                    Json::Array(items) => items.into_iter().map(|i| Ok(Scalar::Json(i))).collect(),
+                    Json::String(s) => parse_array_literal(&s)
+                        .ok_or_else(|| PlanError::validation(path, "expected an array of values"))
+                        .map(|items| items.into_iter().map(Scalar::Json).collect()),
+                    _ => Err(PlanError::validation(path, "expected an array of values")),
+                }
+            };
+            let string_list = |v: &Json| -> Result<Vec<String>, PlanError> {
+                list(v).map(|items| {
+                    items
+                        .into_iter()
+                        .map(|s| match s.as_json() {
+                            Json::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect()
+                })
+            };
+
+            let op = match op_name {
+                "_eq" => CompareOp::Eq(scalar(op_value)?),
+                "_neq" | "_ne" => CompareOp::Neq(scalar(op_value)?),
+                "_gt" => CompareOp::Gt(scalar(op_value)?),
+                "_lt" => CompareOp::Lt(scalar(op_value)?),
+                "_gte" => CompareOp::Gte(scalar(op_value)?),
+                "_lte" => CompareOp::Lte(scalar(op_value)?),
+                "_in" => CompareOp::In(list(op_value)?),
+                "_nin" => CompareOp::Nin(list(op_value)?),
+                "_like" => CompareOp::Like(scalar(op_value)?),
+                "_nlike" => CompareOp::Nlike(scalar(op_value)?),
+                "_ilike" => CompareOp::Ilike(scalar(op_value)?),
+                "_nilike" => CompareOp::Nilike(scalar(op_value)?),
+                "_similar" => CompareOp::Similar(scalar(op_value)?),
+                "_nsimilar" => CompareOp::Nsimilar(scalar(op_value)?),
+                "_regex" => CompareOp::Regex(scalar(op_value)?),
+                "_iregex" => CompareOp::Iregex(scalar(op_value)?),
+                "_nregex" => CompareOp::Nregex(scalar(op_value)?),
+                "_niregex" => CompareOp::Niregex(scalar(op_value)?),
+                "_is_null" => {
+                    let v = resolve_session(op_value, session, is_permission, path)?;
+                    CompareOp::IsNull(v.as_bool().unwrap_or(false))
+                }
+                // Column-to-column comparisons.
+                "_ceq" => self.column_compare("=", op_value, ctx, path)?,
+                "_cne" | "_cneq" => self.column_compare("<>", op_value, ctx, path)?,
+                "_cgt" => self.column_compare(">", op_value, ctx, path)?,
+                "_clt" => self.column_compare("<", op_value, ctx, path)?,
+                "_cgte" => self.column_compare(">=", op_value, ctx, path)?,
+                "_clte" => self.column_compare("<=", op_value, ctx, path)?,
+                // jsonb operators.
+                "_has_key" => CompareOp::HasKey(scalar(op_value)?),
+                "_has_keys_any" => CompareOp::HasKeysAny(string_list(op_value)?),
+                "_has_keys_all" => CompareOp::HasKeysAll(string_list(op_value)?),
+                "_contains" => CompareOp::Contains(scalar(op_value)?),
+                "_contained_in" => CompareOp::ContainedIn(scalar(op_value)?),
+                // PostGIS operators.
+                "_st_contains" => st_op("ST_Contains", op_value, &scalar)?,
+                "_st_crosses" => st_op("ST_Crosses", op_value, &scalar)?,
+                "_st_equals" => st_op("ST_Equals", op_value, &scalar)?,
+                "_st_intersects" => st_op("ST_Intersects", op_value, &scalar)?,
+                "_st_overlaps" => st_op("ST_Overlaps", op_value, &scalar)?,
+                "_st_touches" => st_op("ST_Touches", op_value, &scalar)?,
+                "_st_within" => st_op("ST_Within", op_value, &scalar)?,
+                "_st_3d_intersects" => st_op("ST_3DIntersects", op_value, &scalar)?,
+                "_st_d_within" | "_st_3d_d_within" => {
+                    let obj = op_value.as_object().ok_or_else(|| {
+                        PlanError::validation(path, "expected { distance, from } for _st_d_within")
+                    })?;
+                    let distance = obj.get("distance").ok_or_else(|| {
+                        PlanError::validation(path, "missing 'distance' in _st_d_within")
+                    })?;
+                    let from = obj.get("from").ok_or_else(|| {
+                        PlanError::validation(path, "missing 'from' in _st_d_within")
+                    })?;
+                    CompareOp::StDWithin {
+                        distance: scalar(distance)?,
+                        from: scalar(from)?,
+                        three_d: op_name == "_st_3d_d_within",
+                    }
+                }
+                other => {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("unexpected operator \"{other}\" for column '{column}'"),
+                    ));
+                }
+            };
+            out.push(op);
         }
 
         Ok(out)
@@ -404,7 +413,9 @@ impl Planner<'_> {
     ) -> Result<CompareOp, PlanError> {
         let local = |column: &str| CompareOp::CompareColumn {
             sql_op: sql_op.to_string(),
-            column: column.to_string(),
+            column: ctx
+                .column_db_name(column)
+                .unwrap_or_else(|| column.to_string()),
             root: false,
         };
         match value {
@@ -418,12 +429,13 @@ impl Planner<'_> {
                     [column] => Ok(local(column)),
                     ["$", column] => Ok(CompareOp::CompareColumn {
                         sql_op: sql_op.to_string(),
-                        column: column.to_string(),
+                        column: ctx
+                            .column_db_name(column)
+                            .unwrap_or_else(|| column.to_string()),
                         root: true,
                     }),
                     [rel, column] => {
-                        let Some((remote_table, join)) =
-                            self.relationship_target(ctx, rel, path)
+                        let Some((remote_table, join)) = self.relationship_target(ctx, rel, path)
                         else {
                             return Err(PlanError::validation(
                                 path,
