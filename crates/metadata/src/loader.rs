@@ -56,11 +56,10 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
 
     let databases_path = dir.join("databases").join("databases.yaml");
     let sources_value = load_yaml_resolved(&databases_path)?;
-    let sources =
-        serde_yaml::from_value(sources_value).map_err(|source| LoadError::Yaml {
-            path: databases_path,
-            source,
-        })?;
+    let sources = serde_yaml::from_value(sources_value).map_err(|source| LoadError::Yaml {
+        path: databases_path,
+        source,
+    })?;
 
     // Actions and their custom type system live together in `actions.yaml`,
     // which has two top-level keys: `actions:` (a list) and `custom_types:`
@@ -175,12 +174,9 @@ fn resolve_includes(
         }
         // ...but accept the genuine YAML-tag form too: !include foo.yaml
         Value::Tagged(tagged) if is_include_tag(&tagged.tag) => {
-            let rel = tagged
-                .value
-                .as_str()
-                .ok_or_else(|| LoadError::BadInclude {
-                    path: file.to_path_buf(),
-                })?;
+            let rel = tagged.value.as_str().ok_or_else(|| LoadError::BadInclude {
+                path: file.to_path_buf(),
+            })?;
             load_yaml_tracked(&base.join(rel), seen)
         }
         Value::Mapping(map) => {

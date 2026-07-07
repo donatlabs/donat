@@ -124,7 +124,10 @@ pub async fn dispatch(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(rest_error(
                     "unexpected",
-                    format!("rest endpoint '{}' has an unparsable saved query: {e}", endpoint.name),
+                    format!(
+                        "rest endpoint '{}' has an unparsable saved query: {e}",
+                        endpoint.name
+                    ),
                 )),
             )
                 .into_response();
@@ -249,11 +252,7 @@ fn template_specificity(template: &str) -> usize {
 /// specific (most literal segments) is chosen, so a literal route (e.g.
 /// `pet/featured`) is never shadowed by an earlier parameterized one (e.g.
 /// `pet/:id`) regardless of declaration order.
-fn select_endpoint<'a>(
-    endpoints: &'a [RestEndpoint],
-    method: &str,
-    path: &str,
-) -> Routing<'a> {
+fn select_endpoint<'a>(endpoints: &'a [RestEndpoint], method: &str, path: &str) -> Routing<'a> {
     let mut url_matched = false;
     let mut allowed_methods: Vec<String> = Vec::new();
     let mut chosen: Option<(&RestEndpoint, HashMap<String, String>, usize)> = None;
@@ -418,7 +417,10 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn ep(name: &str, url: &str, methods: &[&str]) -> RestEndpoint {
@@ -522,12 +524,27 @@ mod tests {
     #[test]
     fn coerce_int_float_bool_string() {
         assert_eq!(coerce_scalar("5", ScalarKind::Int, "x").unwrap(), json!(5));
-        assert_eq!(coerce_scalar("1.5", ScalarKind::Float, "x").unwrap(), json!(1.5));
-        assert_eq!(coerce_scalar("true", ScalarKind::Boolean, "x").unwrap(), json!(true));
-        assert_eq!(coerce_scalar("false", ScalarKind::Boolean, "x").unwrap(), json!(false));
-        assert_eq!(coerce_scalar("abc", ScalarKind::Other, "x").unwrap(), json!("abc"));
+        assert_eq!(
+            coerce_scalar("1.5", ScalarKind::Float, "x").unwrap(),
+            json!(1.5)
+        );
+        assert_eq!(
+            coerce_scalar("true", ScalarKind::Boolean, "x").unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            coerce_scalar("false", ScalarKind::Boolean, "x").unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            coerce_scalar("abc", ScalarKind::Other, "x").unwrap(),
+            json!("abc")
+        );
         // A numeric-looking string stays a string for String/ID/custom.
-        assert_eq!(coerce_scalar("123", ScalarKind::Other, "x").unwrap(), json!("123"));
+        assert_eq!(
+            coerce_scalar("123", ScalarKind::Other, "x").unwrap(),
+            json!("123")
+        );
     }
 
     #[test]
@@ -539,9 +556,18 @@ mod tests {
     #[test]
     fn build_variables_precedence_path_over_query_over_body() {
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "limit".into(), kind: ScalarKind::Int },
-            VarDef { name: "obj".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "limit".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "obj".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let path = map(&[("id", "1")]);
         let query = map(&[("id", "2"), ("limit", "10")]);
@@ -565,18 +591,29 @@ mod tests {
         // variable is coerced just like a path/query value, so behavior does
         // not depend on which source supplied the value.
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "ratio".into(), kind: ScalarKind::Float },
-            VarDef { name: "on".into(), kind: ScalarKind::Boolean },
-            VarDef { name: "note".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "ratio".into(),
+                kind: ScalarKind::Float,
+            },
+            VarDef {
+                name: "on".into(),
+                kind: ScalarKind::Boolean,
+            },
+            VarDef {
+                name: "note".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let mut body = JsonMap::new();
         body.insert("id".into(), json!("11"));
         body.insert("ratio".into(), json!("1.5"));
         body.insert("on".into(), json!("true"));
         body.insert("note".into(), json!("hi"));
-        let vars =
-            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        let vars = build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
         assert_eq!(vars.get("id"), Some(&json!(11)));
         assert_eq!(vars.get("ratio"), Some(&json!(1.5)));
         assert_eq!(vars.get("on"), Some(&json!(true)));
@@ -587,21 +624,29 @@ mod tests {
     fn build_variables_passes_through_already_typed_body() {
         // A correctly-typed JSON body value (number/object) is left untouched.
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "obj".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "obj".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let mut body = JsonMap::new();
         body.insert("id".into(), json!(7));
         body.insert("obj".into(), json!({ "k": "v" }));
-        let vars =
-            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        let vars = build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
         assert_eq!(vars.get("id"), Some(&json!(7)));
         assert_eq!(vars.get("obj"), Some(&json!({ "k": "v" })));
     }
 
     #[test]
     fn build_variables_omits_unsupplied() {
-        let defs = vec![VarDef { name: "id".into(), kind: ScalarKind::Int }];
+        let defs = vec![VarDef {
+            name: "id".into(),
+            kind: ScalarKind::Int,
+        }];
         let vars =
             build_variables(&defs, &HashMap::new(), &HashMap::new(), &JsonMap::new()).unwrap();
         assert!(vars.is_empty(), "unsupplied variable must be omitted");
@@ -609,10 +654,12 @@ mod tests {
 
     #[test]
     fn build_variables_reports_coercion_failure() {
-        let defs = vec![VarDef { name: "id".into(), kind: ScalarKind::Int }];
+        let defs = vec![VarDef {
+            name: "id".into(),
+            kind: ScalarKind::Int,
+        }];
         let path = map(&[("id", "notanint")]);
-        let err =
-            build_variables(&defs, &path, &HashMap::new(), &JsonMap::new()).unwrap_err();
+        let err = build_variables(&defs, &path, &HashMap::new(), &JsonMap::new()).unwrap_err();
         assert!(err.contains("Int"), "got: {err}");
     }
 

@@ -25,25 +25,23 @@ impl<'a> Planner<'a> {
         path: &str,
     ) -> Result<(donat_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
         let table = parse_table(args, path)?;
-        let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
-            PlanError::new(
-                path,
-                "permission-denied",
-                format!(
-                    "role \"{}\" does not have permission to select from table \"{table}\"",
-                    session.role
-                ),
-            )
-        })?;
+        let ctx = self
+            .table_ctx_by_name(&table, &session.role)
+            .ok_or_else(|| {
+                PlanError::new(
+                    path,
+                    "permission-denied",
+                    format!(
+                        "role \"{}\" does not have permission to select from table \"{table}\"",
+                        session.role
+                    ),
+                )
+            })?;
         Ok((table, ctx))
     }
 
     /// v1 `select`: returns the rows array directly.
-    pub fn plan_v1_select(
-        &self,
-        args: &Json,
-        session: &Session,
-    ) -> Result<SelectQuery, PlanError> {
+    pub fn plan_v1_select(&self, args: &Json, session: &Session) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let (_, ctx) = self.v1_table_ctx(args, session, path)?;
         self.v1_select_on(&ctx, args, session, path)
@@ -153,23 +151,17 @@ impl<'a> Planner<'a> {
                     });
                 }
                 Json::Object(obj) => {
-                    let name = obj
-                        .get("name")
-                        .and_then(Json::as_str)
-                        .ok_or_else(|| {
-                            PlanError::validation(path, "relationship column needs a name")
-                        })?;
-                    let Some((remote_table, join)) =
-                        self.relationship_target(ctx, name, path)
+                    let name = obj.get("name").and_then(Json::as_str).ok_or_else(|| {
+                        PlanError::validation(path, "relationship column needs a name")
+                    })?;
+                    let Some((remote_table, join)) = self.relationship_target(ctx, name, path)
                     else {
                         return Err(PlanError::validation(
                             path,
                             format!("relationship \"{name}\" not found"),
                         ));
                     };
-                    let Some(remote) =
-                        self.relationship_ctx(&remote_table, session, false)
-                    else {
+                    let Some(remote) = self.relationship_ctx(&remote_table, session, false) else {
                         return Err(PlanError::new(
                             path,
                             "permission-denied",
@@ -220,11 +212,7 @@ impl<'a> Planner<'a> {
     }
 
     /// v1 `count`: `{ count: N }`.
-    pub fn plan_v1_count(
-        &self,
-        args: &Json,
-        session: &Session,
-    ) -> Result<SelectQuery, PlanError> {
+    pub fn plan_v1_count(&self, args: &Json, session: &Session) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let table = parse_table(args, path)?;
         // Donat's count op reports the permission failure with its own shape.
@@ -344,7 +332,10 @@ impl<'a> Planner<'a> {
                         return Err(PlanError::new(
                             &format!("{path}.args[\"{key}\"]"),
                             "permission-denied",
-                            format!("role \"{}\" does not have permission to update column \"{col}\"", session.role),
+                            format!(
+                                "role \"{}\" does not have permission to update column \"{col}\"",
+                                session.role
+                            ),
                         ));
                     }
                     let pg_type = ctx.info.column(col).unwrap().pg_type.clone();
@@ -366,7 +357,9 @@ impl<'a> Planner<'a> {
         }
         // Update-permission presets are applied on every v1 update.
         for (col, value) in &perm.set {
-            let Some(info) = ctx.info.column(col) else { continue };
+            let Some(info) = ctx.info.column(col) else {
+                continue;
+            };
             sets.push(SetOp::Set {
                 column: col.clone(),
                 pg_type: info.pg_type.clone(),
@@ -475,8 +468,7 @@ impl<'a> Planner<'a> {
             .insert_permissions
             .iter()
             .find(|p| {
-                p.role == session.role
-                    && (!p.permission.backend_only || session.backend_request)
+                p.role == session.role && (!p.permission.backend_only || session.backend_request)
             })
             .map(|p| &p.permission)
             .ok_or_else(|| {
@@ -516,7 +508,10 @@ impl<'a> Planner<'a> {
                     return Err(PlanError::new(
                         path,
                         "permission-denied",
-                        format!("role \"{}\" does not have permission to insert column \"{key}\"", session.role),
+                        format!(
+                            "role \"{}\" does not have permission to insert column \"{key}\"",
+                            session.role
+                        ),
                     ));
                 }
                 if !columns.contains(key) {
@@ -557,8 +552,7 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let check = if perm.check.is_null()
-            || perm.check.as_object().is_some_and(|o| o.is_empty())
+        let check = if perm.check.is_null() || perm.check.as_object().is_some_and(|o| o.is_empty())
         {
             None
         } else {
@@ -572,9 +566,7 @@ impl<'a> Planner<'a> {
                 let constraint = oc
                     .get("constraint")
                     .and_then(Json::as_str)
-                    .ok_or_else(|| {
-                        PlanError::validation(path, "on_conflict needs a constraint")
-                    })?
+                    .ok_or_else(|| PlanError::validation(path, "on_conflict needs a constraint"))?
                     .to_string();
                 let action = oc.get("action").and_then(Json::as_str).unwrap_or("update");
                 let update_columns = if action == "ignore" {
@@ -607,7 +599,9 @@ impl<'a> Planner<'a> {
                             )?);
                         }
                         for (col, value) in &update_perm.set {
-                            let Some(info) = ctx.info.column(col) else { continue };
+                            let Some(info) = ctx.info.column(col) else {
+                                continue;
+                            };
                             set_ops.push(SetOp::Set {
                                 column: col.clone(),
                                 pg_type: info.pg_type.clone(),

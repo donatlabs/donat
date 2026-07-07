@@ -84,9 +84,7 @@ pub fn match_remote_with<'m>(
     }
     // Introspection roots are answered locally; only the data fields
     // must belong to the remote schema.
-    let is_intro = |name: &str| {
-        name == "__schema" || name == "__type" || name == "__typename"
-    };
+    let is_intro = |name: &str| name == "__schema" || name == "__type" || name == "__typename";
     let data_fields: Vec<_> = root_fields
         .iter()
         .filter(|f| !is_intro(&f.name))
@@ -99,11 +97,7 @@ pub fn match_remote_with<'m>(
 
     let mut decustomized_storage: Option<QDoc<'static, String>> = None;
     for schema in &metadata.remote_schemas {
-        let Some(permission) = schema
-            .permissions
-            .iter()
-            .find(|p| p.role == session.role)
-        else {
+        let Some(permission) = schema.permissions.iter().find(|p| p.role == session.role) else {
             continue;
         };
         // Customized schemas: unwrap the namespace root and translate
@@ -134,10 +128,7 @@ pub fn match_remote_with<'m>(
                 };
                 for item in &set.items {
                     if let Selection::Field(f) = item {
-                        if f.name != "__schema"
-                            && f.name != "__type"
-                            && f.name != "__typename"
-                        {
+                        if f.name != "__schema" && f.name != "__type" && f.name != "__typename" {
                             root_fields.push(f);
                         }
                     }
@@ -147,8 +138,7 @@ pub fn match_remote_with<'m>(
         if root_fields.is_empty() {
             continue;
         }
-        let Ok(sdl) = graphql_parser::parse_schema::<String>(&permission.definition.schema)
-        else {
+        let Ok(sdl) = graphql_parser::parse_schema::<String>(&permission.definition.schema) else {
             continue;
         };
         let sdl = sdl.into_static();
@@ -172,7 +162,10 @@ pub fn match_remote_with<'m>(
                 "$.selectionSet.{ns}.selectionSet.{}",
                 display_field(field, customizer.as_ref())
             ),
-            None => format!("$.selectionSet.{}", display_field(field, customizer.as_ref())),
+            None => format!(
+                "$.selectionSet.{}",
+                display_field(field, customizer.as_ref())
+            ),
         };
         for field in &root_fields {
             if field.name == "__typename" {
@@ -366,14 +359,16 @@ fn validate_field(
         // Arguments carrying @preset are hidden from the role's schema
         // (but server-built join queries may use them).
         let visible = def.arguments.iter().any(|a| {
-            &a.name == arg
-                && (internal || !a.directives.iter().any(|d| d.name == "preset"))
+            &a.name == arg && (internal || !a.directives.iter().any(|d| d.name == "preset"))
         });
         if !visible {
             return Err(crate::gql::GqlError {
                 path: path.to_string(),
                 code: "validation-failed",
-                message: format!("'{}' has no argument named '{arg}'", display_field(field, cust)),
+                message: format!(
+                    "'{}' has no argument named '{arg}'",
+                    display_field(field, cust)
+                ),
             });
         }
     }
@@ -604,9 +599,7 @@ fn apply_presets(
             SV::Boolean(b) => QValue::Boolean(*b),
             SV::Null => QValue::Null,
             SV::Enum(e) => QValue::Enum(e.clone()),
-            SV::List(items) => {
-                QValue::List(items.iter().map(schema_value_to_query).collect())
-            }
+            SV::List(items) => QValue::List(items.iter().map(schema_value_to_query).collect()),
             SV::Object(map) => QValue::Object(
                 map.iter()
                     .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
@@ -686,10 +679,7 @@ fn apply_presets(
             if presets.is_empty() {
                 continue;
             }
-            let existing = field
-                .arguments
-                .iter_mut()
-                .find(|(n, _)| n == &arg.name);
+            let existing = field.arguments.iter_mut().find(|(n, _)| n == &arg.name);
             match existing {
                 Some((_, QValue::Variable(var))) => {
                     let entry = variables
@@ -714,12 +704,13 @@ fn apply_presets(
                 }
                 Some(_) => {}
                 None => {
-                    let map: std::collections::BTreeMap<String, QValue<'static, String>> =
-                        presets
-                            .iter()
-                            .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
-                            .collect();
-                    field.arguments.push((arg.name.clone(), QValue::Object(map)));
+                    let map: std::collections::BTreeMap<String, QValue<'static, String>> = presets
+                        .iter()
+                        .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
+                        .collect();
+                    field
+                        .arguments
+                        .push((arg.name.clone(), QValue::Object(map)));
                     *changed = true;
                 }
             }
@@ -842,7 +833,10 @@ mod tests {
             "http://remote:4000/graphql"
         );
         // Unset variables substitute as empty.
-        assert_eq!(resolve_url_template("{{DONAT_TEST_UNSET_VAR}}/graphql"), "/graphql");
+        assert_eq!(
+            resolve_url_template("{{DONAT_TEST_UNSET_VAR}}/graphql"),
+            "/graphql"
+        );
     }
 
     #[test]
@@ -856,10 +850,7 @@ mod tests {
             std::env::set_var("DONAT_T_A", "A");
             std::env::set_var("DONAT_T_B", "B");
         }
-        assert_eq!(
-            resolve_url_template("{{DONAT_T_A}}-{{DONAT_T_B}}"),
-            "A-B"
-        );
+        assert_eq!(resolve_url_template("{{DONAT_T_A}}-{{DONAT_T_B}}"), "A-B");
     }
 
     #[test]
@@ -965,10 +956,16 @@ mod tests {
         let mut stripped = doc.clone();
         strip_introspection_roots(&mut stripped);
         let r = format!("{stripped}");
-        assert!(!r.contains("__schema") && !r.contains("__typename") && r.contains("user"), "{r}");
+        assert!(
+            !r.contains("__schema") && !r.contains("__typename") && r.contains("user"),
+            "{r}"
+        );
         let mut kept = doc.clone();
         keep_introspection_roots(&mut kept);
         let r = format!("{kept}");
-        assert!(r.contains("__schema") && r.contains("__typename") && !r.contains("user"), "{r}");
+        assert!(
+            r.contains("__schema") && r.contains("__typename") && !r.contains("user"),
+            "{r}"
+        );
     }
 }

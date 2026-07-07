@@ -90,8 +90,9 @@ pub fn mysql_scalar(native: &str) -> ScalarType {
         "double" | "double precision" | "real" => ScalarType::Double,
         "decimal" | "numeric" | "dec" | "fixed" => ScalarType::Numeric,
         "bool" | "boolean" => ScalarType::Bool,
-        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum"
-        | "set" => ScalarType::Text,
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
+            ScalarType::Text
+        }
         "json" => ScalarType::Json,
         "datetime" | "timestamp" => ScalarType::Timestamp,
         "date" => ScalarType::Date,

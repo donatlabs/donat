@@ -96,7 +96,10 @@ fn parse_enabled_apis(raw: Option<&str>) -> EnabledApis {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "donat", about = "GraphQL engine over Postgres (Donat v2-compatible)")]
+#[command(
+    name = "donat",
+    about = "GraphQL engine over Postgres (Donat v2-compatible)"
+)]
 struct Args {
     /// Donat v2 metadata directory (version: 3 format). Optional.
     #[arg(long, env = "DONAT_METADATA_DIR")]
@@ -222,7 +225,10 @@ async fn main() -> anyhow::Result<()> {
             for p in &problems {
                 tracing::error!("inconsistency: {p}");
             }
-            anyhow::bail!("metadata validation failed: {} inconsistency(ies)", problems.len());
+            anyhow::bail!(
+                "metadata validation failed: {} inconsistency(ies)",
+                problems.len()
+            );
         }
         _ => {}
     }
@@ -244,8 +250,8 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let auth_hook = std::env::var("DONAT_GRAPHQL_AUTH_HOOK").ok().map(|url| {
-        let mode = std::env::var("DONAT_GRAPHQL_AUTH_HOOK_MODE")
-            .unwrap_or_else(|_| "GET".to_string());
+        let mode =
+            std::env::var("DONAT_GRAPHQL_AUTH_HOOK_MODE").unwrap_or_else(|_| "GET".to_string());
         (url, mode)
     });
     let jwt = std::env::var("DONAT_GRAPHQL_JWT_SECRET")
@@ -434,7 +440,10 @@ mod tests {
 
     #[test]
     fn single_token_enables_only_that() {
-        assert_eq!(parse_enabled_apis(Some("graphql")), apis(true, false, false));
+        assert_eq!(
+            parse_enabled_apis(Some("graphql")),
+            apis(true, false, false)
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use donat_schema::Session;
 use donat_server::gql;
 use donat_server::state::{AppState, Engine};
 use mysql::prelude::Queryable;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 const MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
 

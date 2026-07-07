@@ -10,7 +10,7 @@
 //! Webhook handlers that call back into the engine run under the same role.
 
 use donat_conformance::{Running, Suite, Transport};
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 const SYNC: &str = "queries/actions/sync";
 
@@ -43,28 +43,40 @@ fn sync_suite(name: &str) -> Running {
         "get_users_by_email",
         "get_user_by_email_nested",
     ] {
-        op(&s, json!({
-            "type": "create_action_permission",
-            "args": { "action": action, "role": "tester" }
-        }));
+        op(
+            &s,
+            json!({
+                "type": "create_action_permission",
+                "args": { "action": action, "role": "tester" }
+            }),
+        );
     }
 
     // user/article table permissions for the role the callbacks run as.
-    op(&s, json!({
-        "type": "create_select_permission",
-        "args": { "table": "user", "role": "tester",
-                  "permission": { "columns": "*", "filter": {} } }
-    }));
-    op(&s, json!({
-        "type": "create_insert_permission",
-        "args": { "table": "user", "role": "tester",
-                  "permission": { "columns": ["email", "name"], "check": {} } }
-    }));
-    op(&s, json!({
-        "type": "create_select_permission",
-        "args": { "table": "article", "role": "tester",
-                  "permission": { "columns": "*", "filter": {} } }
-    }));
+    op(
+        &s,
+        json!({
+            "type": "create_select_permission",
+            "args": { "table": "user", "role": "tester",
+                      "permission": { "columns": "*", "filter": {} } }
+        }),
+    );
+    op(
+        &s,
+        json!({
+            "type": "create_insert_permission",
+            "args": { "table": "user", "role": "tester",
+                      "permission": { "columns": ["email", "name"], "check": {} } }
+        }),
+    );
+    op(
+        &s,
+        json!({
+            "type": "create_select_permission",
+            "args": { "table": "article", "role": "tester",
+                      "permission": { "columns": "*", "filter": {} } }
+        }),
+    );
     s
 }
 
@@ -76,19 +88,25 @@ fn op(s: &Running, doc: Json) {
 
 /// Reset the `user` table so auto-increment ids start at 1 again.
 fn reset_users(s: &Running) {
-    op(s, json!({
-        "type": "run_sql",
-        "args": { "sql": "DELETE FROM \"user\"; SELECT setval('user_id_seq', 1, false);" }
-    }));
+    op(
+        s,
+        json!({
+            "type": "run_sql",
+            "args": { "sql": "DELETE FROM \"user\"; SELECT setval('user_id_seq', 1, false);" }
+        }),
+    );
 }
 
 fn seed_user(s: &Running, name: &str, email: &str) {
-    op(s, json!({
-        "type": "run_sql",
-        "args": { "sql": format!(
-            "INSERT INTO \"user\"(name, email) VALUES ('{name}', '{email}')"
-        ) }
-    }));
+    op(
+        s,
+        json!({
+            "type": "run_sql",
+            "args": { "sql": format!(
+                "INSERT INTO \"user\"(name, email) VALUES ('{name}', '{email}')"
+            ) }
+        }),
+    );
 }
 
 /// Single-step sync action cases that resolve against the boot-time metadata.
@@ -145,7 +163,10 @@ fn engine_callback_actions() {
 
     // create_users: list output with per-row relationships.
     reset_users(&s);
-    s.check_query_f(&format!("{SYNC}/create_users_success.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{SYNC}/create_users_success.yaml"),
+        Transport::Http,
+    );
 
     reset_users(&s);
     s.check_query_f(&format!("{SYNC}/create_users_fail.yaml"), Transport::Http);
@@ -153,19 +174,31 @@ fn engine_callback_actions() {
     // get_user_by_email: query action returning a single object (seed first).
     reset_users(&s);
     seed_user(&s, "Clarke", "clarke@gmail.com");
-    s.check_query_f(&format!("{SYNC}/get_user_by_email_success.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{SYNC}/get_user_by_email_success.yaml"),
+        Transport::Http,
+    );
 
-    s.check_query_f(&format!("{SYNC}/get_user_by_email_fail.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{SYNC}/get_user_by_email_fail.yaml"),
+        Transport::Http,
+    );
 
     // get_users_by_email: query action returning a list.
     reset_users(&s);
     seed_user(&s, "Clarke 1", "clarke@gmail.com");
     seed_user(&s, "Clarke 2", "clarke@gmail.com");
-    s.check_query_f(&format!("{SYNC}/get_users_by_email_success.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{SYNC}/get_users_by_email_success.yaml"),
+        Transport::Http,
+    );
 
     // get_user_by_email_nested: nested custom objects (no table relationship),
     // shaped from the webhook around the engine-fetched id.
     reset_users(&s);
     seed_user(&s, "Clarke", "clarke@gmail.com");
-    s.check_query_f(&format!("{SYNC}/get_user_by_email_nested_success.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{SYNC}/get_user_by_email_nested_success.yaml"),
+        Transport::Http,
+    );
 }

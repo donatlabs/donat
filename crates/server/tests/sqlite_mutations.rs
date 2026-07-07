@@ -22,7 +22,7 @@ use donat_schema::Session;
 use donat_server::gql;
 use donat_server::state::{AppState, Engine};
 use rusqlite::Connection;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 /// Create the `note` schema on a temp-file database, then close the setup
 /// connection so the runtime opens its own.
@@ -185,11 +185,7 @@ async fn sqlite_mutations_through_runtime() {
     );
 
     // Prove the rollback: row 99 is absent.
-    let (_status, body) = run(
-        &state,
-        "query { note(where: { id: { _eq: 99 } }) { id } }",
-    )
-    .await;
+    let (_status, body) = run(&state, "query { note(where: { id: { _eq: 99 } }) { id } }").await;
     assert_eq!(
         body,
         json!({ "data": { "note": [] } }),

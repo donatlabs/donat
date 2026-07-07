@@ -3,17 +3,25 @@
 //! DEFAULT/on_conflict rendering, stringify-numerics, and quoting rules.
 
 use donat_ir::*;
-use donat_sqlgen::{mutation_to_sql, operation_to_sql, operation_to_sql_opts, quote_ident, quote_lit};
+use donat_sqlgen::{
+    mutation_to_sql, operation_to_sql, operation_to_sql_opts, quote_ident, quote_lit,
+};
 use serde_json::json;
 
 fn table(schema: &str, name: &str) -> Table {
-    Table { schema: schema.into(), name: name.into() }
+    Table {
+        schema: schema.into(),
+        name: name.into(),
+    }
 }
 
 fn column(alias: &str, column: &str, pg_type: &str) -> OutputField {
     OutputField {
         alias: alias.to_string(),
-        value: FieldValue::Column { column: column.to_string(), pg_type: pg_type.to_string() },
+        value: FieldValue::Column {
+            column: column.to_string(),
+            pg_type: pg_type.to_string(),
+        },
     }
 }
 
@@ -51,7 +59,10 @@ fn by_pk_single_select_is_one_scalar_subquery() {
     }]);
     // Single rows render LIMIT 1 with no json_agg wrapping.
     assert!(sql.contains("LIMIT 1"), "missing LIMIT 1 in: {sql}");
-    assert!(!sql.contains("json_agg"), "single row must not aggregate: {sql}");
+    assert!(
+        !sql.contains("json_agg"),
+        "single row must not aggregate: {sql}"
+    );
     insta::assert_snapshot!(sql);
 }
 
@@ -100,7 +111,10 @@ fn aggregate_column_guard_wraps_case() {
         None,
         false,
     );
-    let sql = operation_to_sql(&[RootField::Select { alias: "author_aggregate".into(), query }]);
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "author_aggregate".into(),
+        query,
+    }]);
     insta::assert_snapshot!(sql);
 }
 
@@ -121,10 +135,16 @@ fn insert_check_expression_wraps_check_violation() {
             alias: "affected_rows".into(),
         }]),
     };
-    let sql = mutation_to_sql(&MutationRoot::Insert { alias: "insert_author".into(), insert });
+    let sql = mutation_to_sql(&MutationRoot::Insert {
+        alias: "insert_author".into(),
+        insert,
+    });
     // The check is enforced in-statement via donat.check_violation,
     // whose payload carries the GraphQL error path.
-    assert!(sql.contains("donat.check_violation"), "missing check wrap in: {sql}");
+    assert!(
+        sql.contains("donat.check_violation"),
+        "missing check wrap in: {sql}"
+    );
     assert!(
         sql.contains("$.selectionSet.insert_author.args.objects"),
         "check payload must carry the error path: {sql}"
@@ -152,8 +172,14 @@ fn update_check_expression_wraps_check_violation() {
             alias: "affected_rows".into(),
         }]),
     };
-    let sql = mutation_to_sql(&MutationRoot::Update { alias: "update_author".into(), update });
-    assert!(sql.contains("donat.check_violation"), "missing check wrap in: {sql}");
+    let sql = mutation_to_sql(&MutationRoot::Update {
+        alias: "update_author".into(),
+        update,
+    });
+    assert!(
+        sql.contains("donat.check_violation"),
+        "missing check wrap in: {sql}"
+    );
     insta::assert_snapshot!(sql);
 }
 
@@ -179,7 +205,10 @@ fn insert_missing_values_render_default_and_do_nothing() {
             alias: "affected_rows".into(),
         }]),
     };
-    let sql = mutation_to_sql(&MutationRoot::Insert { alias: "insert_author".into(), insert });
+    let sql = mutation_to_sql(&MutationRoot::Insert {
+        alias: "insert_author".into(),
+        insert,
+    });
     insta::assert_snapshot!(sql);
 }
 
@@ -188,7 +217,10 @@ fn on_conflict_do_update_applies_filter_and_presets() {
     let insert = InsertMutation {
         table: table("public", "author"),
         columns: vec![("id".into(), "int4".into()), ("name".into(), "text".into())],
-        rows: vec![vec![Some(Scalar::Json(json!(1))), Some(Scalar::Json(json!("a")))]],
+        rows: vec![vec![
+            Some(Scalar::Json(json!(1))),
+            Some(Scalar::Json(json!("a"))),
+        ]],
         on_conflict: Some(OnConflict {
             constraint: "author_pkey".into(),
             update_columns: vec!["name".into()],
@@ -207,7 +239,10 @@ fn on_conflict_do_update_applies_filter_and_presets() {
             alias: "affected_rows".into(),
         }]),
     };
-    let sql = mutation_to_sql(&MutationRoot::Insert { alias: "insert_author".into(), insert });
+    let sql = mutation_to_sql(&MutationRoot::Insert {
+        alias: "insert_author".into(),
+        insert,
+    });
     insta::assert_snapshot!(sql);
 }
 
@@ -233,7 +268,10 @@ fn empty_in_and_nin_render_constants() {
         ),
     }]);
     // `_in: []` matches nothing, `_nin: []` matches everything.
-    assert!(sql.contains("(FALSE AND TRUE)"), "wrong empty-list rendering: {sql}");
+    assert!(
+        sql.contains("(FALSE AND TRUE)"),
+        "wrong empty-list rendering: {sql}"
+    );
 }
 
 #[test]
@@ -251,12 +289,24 @@ fn stringify_numerics_casts_bigint_and_numeric_to_text() {
         ),
     }];
     let sql = operation_to_sql_opts(&roots, true);
-    assert!(sql.contains("(\"_t0\".\"big\")::text"), "int8 not stringified: {sql}");
-    assert!(sql.contains("(\"_t0\".\"price\")::text"), "numeric not stringified: {sql}");
-    assert!(sql.contains("'name', \"_t0\".\"name\""), "text must stay uncast: {sql}");
+    assert!(
+        sql.contains("(\"_t0\".\"big\")::text"),
+        "int8 not stringified: {sql}"
+    );
+    assert!(
+        sql.contains("(\"_t0\".\"price\")::text"),
+        "numeric not stringified: {sql}"
+    );
+    assert!(
+        sql.contains("'name', \"_t0\".\"name\""),
+        "text must stay uncast: {sql}"
+    );
     // Without the option the casts must not appear.
     let plain = operation_to_sql_opts(&roots, false);
-    assert!(!plain.contains("::text"), "unexpected stringify cast: {plain}");
+    assert!(
+        !plain.contains("::text"),
+        "unexpected stringify cast: {plain}"
+    );
 }
 
 #[test]
@@ -285,7 +335,10 @@ fn st_dwithin_renders_2d_and_3d_functions() {
         query: select(vec![column("id", "id", "integer")], Some(st(false)), false),
     }]);
     assert!(sql.contains("ST_DWithin("), "missing 2D function: {sql}");
-    assert!(!sql.contains("ST_3DDWithin("), "unexpected 3D function: {sql}");
+    assert!(
+        !sql.contains("ST_3DDWithin("),
+        "unexpected 3D function: {sql}"
+    );
 
     let sql = operation_to_sql(&[RootField::Select {
         alias: "rows".to_string(),

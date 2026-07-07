@@ -14,8 +14,8 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -238,10 +238,10 @@ use std::cell::RefCell;
 
 use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
-    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
-    PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
-    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableConfiguration,
-    TableEntry, UpdatePermission,
+    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
+    ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship,
+    RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind,
+    TableConfiguration, TableEntry, UpdatePermission,
 };
 
 fn workspace_root() -> PathBuf {
@@ -404,8 +404,10 @@ impl Suite {
     /// poll interval so tests observe delivery quickly.
     pub fn with_event_webhook(mut self) -> Self {
         let stub = cron_webhook::spawn();
-        self.env
-            .push(("EVENT_WEBHOOK_HANDLER".to_string(), stub.base_url().to_string()));
+        self.env.push((
+            "EVENT_WEBHOOK_HANDLER".to_string(),
+            stub.base_url().to_string(),
+        ));
         self.env
             .push(("DONAT_EVENTS_POLL_SECONDS".to_string(), "1".to_string()));
         self.event = Some(stub);
@@ -436,10 +438,8 @@ impl Suite {
     /// header (mirroring tests-py `add_auth`).
     pub fn admin_secret(mut self, secret: &str) -> Self {
         self.admin_secret = Some(secret.to_string());
-        self.env.push((
-            "DONAT_GRAPHQL_ADMIN_SECRET".to_string(),
-            secret.to_string(),
-        ));
+        self.env
+            .push(("DONAT_GRAPHQL_ADMIN_SECRET".to_string(), secret.to_string()));
         self
     }
 
@@ -551,8 +551,7 @@ impl Drop for Running {
 
 /// A `postgres::Client` on the suite database (for run_sql / seed inserts).
 fn pg_client(db_url: &str) -> postgres::Client {
-    postgres::Client::connect(db_url, postgres::NoTls)
-        .expect("connecting to the suite database")
+    postgres::Client::connect(db_url, postgres::NoTls).expect("connecting to the suite database")
 }
 
 /// Render a JSON scalar as a SQL literal for seed `insert` ops.
@@ -667,13 +666,15 @@ impl Running {
                 let sql = args["sql"]
                     .as_str()
                     .unwrap_or_else(|| panic!("run_sql without sql: {op}"));
-                pg_client(&self.db_url).batch_execute(sql).unwrap_or_else(|e| {
-                    let detail = e
-                        .as_db_error()
-                        .map(|d| format!("{}: {}", d.code().code(), d.message()))
-                        .unwrap_or_else(|| e.to_string());
-                    panic!("[{}] run_sql failed: {detail}\nSQL:\n{sql}", self.name)
-                });
+                pg_client(&self.db_url)
+                    .batch_execute(sql)
+                    .unwrap_or_else(|e| {
+                        let detail = e
+                            .as_db_error()
+                            .map(|d| format!("{}: {}", d.code().code(), d.message()))
+                            .unwrap_or_else(|| e.to_string());
+                        panic!("[{}] run_sql failed: {detail}\nSQL:\n{sql}", self.name)
+                    });
             }
 
             "insert" => {
@@ -733,7 +734,8 @@ impl Running {
             "create_select_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: SelectPermission = from_value("select permission", &args["permission"]);
+                let permission: SelectPermission =
+                    from_value("select permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.select_permissions.push(PermissionEntry {
                         role,
@@ -745,7 +747,8 @@ impl Running {
             "create_insert_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: InsertPermission = from_value("insert permission", &args["permission"]);
+                let permission: InsertPermission =
+                    from_value("insert permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.insert_permissions.push(PermissionEntry {
                         role,
@@ -757,7 +760,8 @@ impl Running {
             "create_update_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: UpdatePermission = from_value("update permission", &args["permission"]);
+                let permission: UpdatePermission =
+                    from_value("update permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.update_permissions.push(PermissionEntry {
                         role,
@@ -769,7 +773,8 @@ impl Running {
             "create_delete_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: DeletePermission = from_value("delete permission", &args["permission"]);
+                let permission: DeletePermission =
+                    from_value("delete permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.delete_permissions.push(PermissionEntry {
                         role,
@@ -812,7 +817,11 @@ impl Running {
                 };
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                if !source.functions.iter().any(|f| same_object(&f.function, &function)) {
+                if !source
+                    .functions
+                    .iter()
+                    .any(|f| same_object(&f.function, &function))
+                {
                     source.functions.push(FunctionEntry {
                         function,
                         configuration: args
@@ -903,7 +912,10 @@ impl Running {
 
             "create_query_collection" => {
                 let collection: QueryCollection = from_value("query collection", &args);
-                self.metadata.borrow_mut().query_collections.push(collection);
+                self.metadata
+                    .borrow_mut()
+                    .query_collections
+                    .push(collection);
             }
             "drop_query_collection" => {
                 let name = args["collection"]
@@ -949,7 +961,10 @@ impl Running {
                 self.metadata.borrow_mut().rest_endpoints.push(endpoint);
             }
             "drop_rest_endpoint" => {
-                let name = args["name"].as_str().expect("rest endpoint name").to_string();
+                let name = args["name"]
+                    .as_str()
+                    .expect("rest endpoint name")
+                    .to_string();
                 self.metadata
                     .borrow_mut()
                     .rest_endpoints
@@ -985,11 +1000,16 @@ impl Running {
                 };
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                source.functions.retain(|f| !same_object(&f.function, &function));
+                source
+                    .functions
+                    .retain(|f| !same_object(&f.function, &function));
             }
             "drop_relationship" => {
                 let table = qualified_from(&args["table"]);
-                let name = args["relationship"].as_str().expect("relationship").to_string();
+                let name = args["relationship"]
+                    .as_str()
+                    .expect("relationship")
+                    .to_string();
                 self.with_table(&table, |t| {
                     t.object_relationships.retain(|r| r.name != name);
                     t.array_relationships.retain(|r| r.name != name);
@@ -1003,7 +1023,9 @@ impl Running {
             "drop_remote_relationship" => {
                 let table = qualified_from(&args["table"]);
                 let name = args["name"].as_str().expect("name").to_string();
-                self.with_table(&table, |t| t.remote_relationships.retain(|r| r.name != name));
+                self.with_table(&table, |t| {
+                    t.remote_relationships.retain(|r| r.name != name)
+                });
             }
             "drop_select_permission" => {
                 let table = qualified_from(&args["table"]);
@@ -1034,15 +1056,20 @@ impl Running {
                 let role = args["role"].as_str().expect("role").to_string();
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                if let Some(f) = source.functions.iter_mut().find(|f| same_object(&f.function, &function)) {
+                if let Some(f) = source
+                    .functions
+                    .iter_mut()
+                    .find(|f| same_object(&f.function, &function))
+                {
                     f.permissions.retain(|p| p.role != role);
                 }
             }
 
             "set_custom_types" => {
                 let custom_types: donat_metadata::CustomTypes =
-                    serde_json::from_value(args.clone())
-                        .unwrap_or_else(|e| panic!("[{}] bad set_custom_types: {e}\n{op}", self.name));
+                    serde_json::from_value(args.clone()).unwrap_or_else(|e| {
+                        panic!("[{}] bad set_custom_types: {e}\n{op}", self.name)
+                    });
                 self.metadata.borrow_mut().custom_types = custom_types;
             }
 
@@ -1066,12 +1093,18 @@ impl Running {
                     .map(|a| a.permissions.clone())
                     .unwrap_or_default();
                 md.actions.retain(|a| a.name != entry.name);
-                md.actions.push(donat_metadata::ActionEntry { permissions, ..entry });
+                md.actions.push(donat_metadata::ActionEntry {
+                    permissions,
+                    ..entry
+                });
             }
 
             "drop_action" => {
                 let name = args["name"].as_str().expect("action name").to_string();
-                self.metadata.borrow_mut().actions.retain(|a| a.name != name);
+                self.metadata
+                    .borrow_mut()
+                    .actions
+                    .retain(|a| a.name != name);
             }
 
             "create_action_permission" => {
@@ -1080,7 +1113,8 @@ impl Running {
                 let mut md = self.metadata.borrow_mut();
                 if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
                     if !a.permissions.iter().any(|p| p.role == role) {
-                        a.permissions.push(donat_metadata::ActionPermission { role });
+                        a.permissions
+                            .push(donat_metadata::ActionPermission { role });
                     }
                 }
             }
@@ -1121,11 +1155,8 @@ impl Running {
 
     /// Serialize the accumulated metadata to a temp `version: 3` directory.
     fn write_metadata_dir(&self) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dist_conf_md_{}_{}",
-            self.name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dist_conf_md_{}_{}", self.name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("databases")).unwrap();
 
@@ -1213,7 +1244,11 @@ impl Running {
                 .env("DONAT_DATABASE_URL", &self.db_url)
                 .status()
                 .expect("running donat migrate");
-            assert!(status.success(), "donat migrate failed for suite {}", self.name);
+            assert!(
+                status.success(),
+                "donat migrate failed for suite {}",
+                self.name
+            );
         }
         let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
@@ -1483,9 +1518,7 @@ impl Running {
             other => {
                 let m = reqwest::Method::from_bytes(other.as_bytes())
                     .unwrap_or_else(|_| panic!("[{label}] bad method {other}"));
-                let mut req = self
-                    .http
-                    .request(m, format!("{}{url}", self.base_url()));
+                let mut req = self.http.request(m, format!("{}{url}", self.base_url()));
                 for (k, v) in &headers {
                     req = req.header(k, v);
                 }
@@ -1526,7 +1559,13 @@ impl Running {
         if let Some(allowed) = conf.get("allowed_responses").and_then(Json::as_array) {
             let ok = allowed.iter().any(|a| {
                 a.get("response")
-                    .map(|exp| if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() })
+                    .map(|exp| {
+                        if url == "/mcp" {
+                            strip_mcp_content(exp)
+                        } else {
+                            exp.clone()
+                        }
+                    })
                     .is_some_and(|exp| response_matches(&exp, &resp, query_text))
             });
             assert!(
@@ -1536,7 +1575,11 @@ impl Running {
                 pretty(&resp)
             );
         } else if let Some(exp) = conf.get("response") {
-            let exp = if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() };
+            let exp = if url == "/mcp" {
+                strip_mcp_content(exp)
+            } else {
+                exp.clone()
+            };
             self.assert_response(&exp, &resp, query_text, label);
         }
     }

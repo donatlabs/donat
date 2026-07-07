@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 /// Shared handle to the running engine, so callback endpoints (which run a
 /// GraphQL query back against the engine) can reach it once it has spawned.
@@ -132,9 +132,7 @@ fn write_response(stream: &mut std::net::TcpStream, status: u16, payload: &Json)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Route a webhook request to its handler, mirroring `ActionsWebhookHandler`
@@ -160,10 +158,7 @@ fn dispatch(
         }
 
         // Return the request body's `blob` as a 400 error.
-        "/intentional-error" => (
-            400,
-            input.get("blob").cloned().unwrap_or(Json::Null),
-        ),
+        "/intentional-error" => (400, input.get("blob").cloned().unwrap_or(Json::Null)),
 
         // Whole response is null.
         "/null-response" => (200, Json::Null),
@@ -245,14 +240,20 @@ fn valid_email(email: &str) -> bool {
 }
 
 fn gql_failed() -> (u16, Json) {
-    (400, json!({ "message": "GraphQL query execution failed", "code": "unexpected" }))
+    (
+        400,
+        json!({ "message": "GraphQL query execution failed", "code": "unexpected" }),
+    )
 }
 
 fn create_user(input: &Json, engine: &EngineHandle) -> (u16, Json) {
     let email = input.get("email").and_then(Json::as_str).unwrap_or("");
     let name = input.get("name").and_then(Json::as_str).unwrap_or("");
     if !valid_email(email) {
-        return (400, json!({ "message": "Given email address is not valid", "code": "invalid-email" }));
+        return (
+            400,
+            json!({ "message": "Given email address is not valid", "code": "invalid-email" }),
+        );
     }
     let query = "mutation ($email: String! $name: String!) { \
         insert_user_one(object: {email: $email, name: $name}){ id } }";
@@ -266,7 +267,11 @@ fn create_user(input: &Json, engine: &EngineHandle) -> (u16, Json) {
 }
 
 fn create_users(input: &Json, engine: &EngineHandle) -> (u16, Json) {
-    let users = input.get("users").and_then(Json::as_array).cloned().unwrap_or_default();
+    let users = input
+        .get("users")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
     for u in &users {
         let email = u.get("email").and_then(Json::as_str).unwrap_or("");
         if !valid_email(email) {
@@ -290,7 +295,10 @@ fn create_users(input: &Json, engine: &EngineHandle) -> (u16, Json) {
 fn get_users_by_email(input: &Json, engine: &EngineHandle, single: bool) -> (u16, Json) {
     let email = input.get("email").and_then(Json::as_str).unwrap_or("");
     if !valid_email(email) {
-        return (400, json!({ "message": "Given email address is not valid", "code": "invalid-email" }));
+        return (
+            400,
+            json!({ "message": "Given email address is not valid", "code": "invalid-email" }),
+        );
     }
     let query = "query get_user($email:String!) { \
         user(where:{email:{_eq:$email}}, order_by: {id: asc}) { id } }";
@@ -330,7 +338,10 @@ fn get_users_by_email_nested(input: &Json, engine: &EngineHandle, single: bool) 
     if single {
         (200, nest(&body))
     } else {
-        let list = body.as_array().map(|a| a.iter().map(nest).collect()).unwrap_or_default();
+        let list = body
+            .as_array()
+            .map(|a| a.iter().map(nest).collect())
+            .unwrap_or_default();
         (200, Json::Array(list))
     }
 }

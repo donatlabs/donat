@@ -87,7 +87,11 @@ impl Dialect for PostgresDialect {
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
             serde_json::Value::Bool(b) => {
-                if *b { "TRUE".into() } else { "FALSE".into() }
+                if *b {
+                    "TRUE".into()
+                } else {
+                    "FALSE".into()
+                }
             }
             serde_json::Value::Number(n) => format!("({n})::{ty}"),
             serde_json::Value::String(s) => format!("({})::{ty}", self.quote_literal(s)),
@@ -179,7 +183,11 @@ impl Dialect for SqliteDialect {
             serde_json::Value::Null => "NULL".into(),
             // No boolean type in SQLite: TRUE/FALSE are 1/0.
             serde_json::Value::Bool(b) => {
-                if *b { "1".into() } else { "0".into() }
+                if *b {
+                    "1".into()
+                } else {
+                    "0".into()
+                }
             }
             // No cast: bare numeric literal.
             serde_json::Value::Number(n) => format!("{n}"),
@@ -212,9 +220,9 @@ impl Dialect for SqliteDialect {
         // row in `json(...)` reparses the text so the nested structure is
         // preserved as real JSON. (validated against real sqlite)
         match order_by {
-            Some(ob) => format!(
-                "coalesce(json_group_array(json({row_expr}) ORDER BY {ob}), json_array())"
-            ),
+            Some(ob) => {
+                format!("coalesce(json_group_array(json({row_expr}) ORDER BY {ob}), json_array())")
+            }
             None => format!("coalesce(json_group_array(json({row_expr})), json_array())"),
         }
     }
@@ -282,7 +290,11 @@ impl Dialect for MySqlDialect {
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
             serde_json::Value::Bool(b) => {
-                if *b { "TRUE".into() } else { "FALSE".into() }
+                if *b {
+                    "TRUE".into()
+                } else {
+                    "FALSE".into()
+                }
             }
             serde_json::Value::Number(n) => format!("{n}"),
             serde_json::Value::String(s) => self.quote_literal(s),
@@ -473,13 +485,19 @@ mod tests {
     #[test]
     fn render_scalar_bool_false() {
         let d = PostgresDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "bool"), "FALSE");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "bool"),
+            "FALSE"
+        );
     }
 
     #[test]
     fn render_scalar_number() {
         let d = PostgresDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!(42)), "int4"), "(42)::\"int4\"");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "int4"),
+            "(42)::\"int4\""
+        );
     }
 
     #[test]
@@ -513,10 +531,7 @@ mod tests {
         // geometry_sql casts via quote_ident(pg_type), i.e. `::"geometry"`.
         assert_eq!(
             d.render_scalar(&s(geo.clone()), "geometry"),
-            format!(
-                "(ST_GeomFromGeoJSON('{}'))::\"geometry\"",
-                geo.to_string()
-            )
+            format!("(ST_GeomFromGeoJSON('{}'))::\"geometry\"", geo.to_string())
         );
     }
 
@@ -627,7 +642,10 @@ mod tests {
         let d = SqliteDialect;
         // SQLite has no boolean type: TRUE/FALSE are 1/0.
         assert_eq!(d.render_scalar(&s(serde_json::json!(true)), "INTEGER"), "1");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "INTEGER"), "0");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "INTEGER"),
+            "0"
+        );
     }
 
     #[test]
@@ -723,12 +741,18 @@ mod tests {
         assert_eq!(d.quote_ident("users"), "\"users\"");
         assert_eq!(d.quote_literal("x"), "'x'");
         assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int4"), "(1)::\"int4\"");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(1)), "int4"),
+            "(1)::\"int4\""
+        );
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
             "json_build_object('k', v)"
         );
-        assert_eq!(d.json_array_agg("x", None), "coalesce(json_agg(x), '[]'::json)");
+        assert_eq!(
+            d.json_array_agg("x", None),
+            "coalesce(json_agg(x), '[]'::json)"
+        );
         assert_eq!(d.to_json_text("x"), "to_json(x::text)");
     }
 
@@ -737,7 +761,10 @@ mod tests {
         let d = AnyDialect::Sqlite(SqliteDialect);
         assert_eq!(d.quote_ident("users"), "\"users\"");
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "INTEGER"), "1");
-        assert_eq!(d.json_object(&[("k".into(), "v".into())]), "json_object('k', v)");
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "json_object('k', v)"
+        );
         assert_eq!(
             d.json_array_agg("x", None),
             "coalesce(json_group_array(json(x)), json_array())"
@@ -787,16 +814,28 @@ mod tests {
     fn mysql_render_scalar_null_bool_number() {
         let d = MySqlDialect;
         assert_eq!(d.render_scalar(&s(serde_json::Value::Null), "int"), "NULL");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(true)), "tinyint"), "TRUE");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "tinyint"), "FALSE");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(true)), "tinyint"),
+            "TRUE"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "tinyint"),
+            "FALSE"
+        );
         assert_eq!(d.render_scalar(&s(serde_json::json!(42)), "int"), "42");
     }
 
     #[test]
     fn mysql_render_scalar_string_escapes() {
         let d = MySqlDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!("O'Hara")), "varchar"), "'O''Hara'");
-        assert_eq!(d.render_scalar(&s(serde_json::json!("a\\b")), "varchar"), "'a\\\\b'");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("O'Hara")), "varchar"),
+            "'O''Hara'"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("a\\b")), "varchar"),
+            "'a\\\\b'"
+        );
     }
 
     #[test]
@@ -869,7 +908,10 @@ mod tests {
         assert_eq!(d.quote_literal("x"), "'x'");
         assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int"), "1");
-        assert_eq!(d.json_object(&[("k".into(), "v".into())]), "JSON_OBJECT('k', v)");
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "JSON_OBJECT('k', v)"
+        );
         assert_eq!(
             d.json_array_agg("x", None),
             "COALESCE(JSON_ARRAYAGG(x), JSON_ARRAY())"

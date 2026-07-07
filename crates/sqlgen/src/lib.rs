@@ -38,13 +38,15 @@ fn operation_to_sql_full(
     stringify_numerics: bool,
     dialect: donat_backend::AnyDialect,
 ) -> String {
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics, dialect };
+    let mut ctx = Ctx {
+        next_alias: 0,
+        stringify_numerics,
+        dialect,
+    };
     let pairs: Vec<(String, String)> = roots
         .iter()
         .map(|r| match r {
-            RootField::Select { alias, query } => {
-                (alias.clone(), ctx.select_expr(query, None))
-            }
+            RootField::Select { alias, query } => (alias.clone(), ctx.select_expr(query, None)),
             RootField::Connection { alias, conn } => {
                 (alias.clone(), ctx.connection_expr(conn, None))
             }
@@ -106,9 +108,7 @@ impl Ctx {
         table: &str,
         pk: &[(String, String)],
     ) -> String {
-        let mut parts = vec![format!(
-            "'[1, \"{schema}\", \"{table}\"'"
-        )];
+        let mut parts = vec![format!("'[1, \"{schema}\", \"{table}\"'")];
         for (col, _) in pk {
             parts.push(format!("', ' || to_json({})::text", qualified(alias, col)));
         }
@@ -127,9 +127,11 @@ impl Ctx {
         let mut q = conn.query.clone();
         let backward = conn.page.as_ref().is_some_and(|p| p.backward);
         for (col, _) in &conn.pk {
-            if !q.order_by.iter().any(
-                |ob| matches!(&ob.target, OrderByTarget::Column(c) if c == col),
-            ) {
+            if !q
+                .order_by
+                .iter()
+                .any(|ob| matches!(&ob.target, OrderByTarget::Column(c) if c == col))
+            {
                 q.order_by.push(OrderBy {
                     target: OrderByTarget::Column(col.clone()),
                     direction: if backward {
@@ -232,10 +234,19 @@ impl Ctx {
 
         // The relay edges array (json_agg of cursor/node objects, coalesced to
         // []) is a clean array-agg leaf; the cursor/node object is a leaf too.
-        let edge_obj = json_object(&dialect, &[
-            ("cursor".to_string(), format!("{ed}.c", ed = quote_ident(&format!("{arr}_e")))),
-            ("node".to_string(), format!("{ed}.n", ed = quote_ident(&format!("{arr}_e")))),
-        ]);
+        let edge_obj = json_object(
+            &dialect,
+            &[
+                (
+                    "cursor".to_string(),
+                    format!("{ed}.c", ed = quote_ident(&format!("{arr}_e"))),
+                ),
+                (
+                    "node".to_string(),
+                    format!("{ed}.n", ed = quote_ident(&format!("{arr}_e"))),
+                ),
+            ],
+        );
         format!(
             "(SELECT {obj} FROM (SELECT {agg} AS a FROM (SELECT {cursor} AS c, {row_json} AS n {tail}) AS {ed}) AS {arr_q})",
             obj = json_object(&dialect, &pairs),
@@ -247,10 +258,12 @@ impl Ctx {
 
     /// A parenthesized scalar subquery producing this select's JSON value.
     fn select_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
-        if q.fields
-            .iter()
-            .any(|f| matches!(f.value, FieldValue::Aggregate { .. } | FieldValue::Nodes { .. }))
-        {
+        if q.fields.iter().any(|f| {
+            matches!(
+                f.value,
+                FieldValue::Aggregate { .. } | FieldValue::Nodes { .. }
+            )
+        }) {
             return self.aggregate_expr(q, outer);
         }
 
@@ -332,10 +345,8 @@ impl Ctx {
                         if columns.is_empty() {
                             "COUNT(*)".to_string()
                         } else {
-                            let cols: Vec<String> = columns
-                                .iter()
-                                .map(|c| qualified(table_alias, c))
-                                .collect();
+                            let cols: Vec<String> =
+                                columns.iter().map(|c| qualified(table_alias, c)).collect();
                             let d = if *distinct { "DISTINCT " } else { "" };
                             // Multiple columns need a row constructor.
                             let expr = if cols.len() == 1 {
@@ -353,8 +364,7 @@ impl Ctx {
                                 let col = qualified(table_alias, &c.column);
                                 let expr = match &c.guard {
                                     Some(guard) => {
-                                        let cond =
-                                            self.bool_exp(guard, table_alias, table_alias);
+                                        let cond = self.bool_exp(guard, table_alias, table_alias);
                                         format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                                     }
                                     None => col,
@@ -445,7 +455,12 @@ impl Ctx {
                 .map(|ob| {
                     let target = match &ob.target {
                         OrderByTarget::Column(c) => qualified(alias, c),
-                        OrderByTarget::Relationship { table, join, column, predicate } => {
+                        OrderByTarget::Relationship {
+                            table,
+                            join,
+                            column,
+                            predicate,
+                        } => {
                             let ra = self.alias();
                             let mut conds: Vec<String> = join
                                 .iter()
@@ -533,7 +548,11 @@ impl Ctx {
             .iter()
             .map(|f| {
                 let value = match &f.value {
-                    FieldValue::ColumnGuarded { column, pg_type, guard } => {
+                    FieldValue::ColumnGuarded {
+                        column,
+                        pg_type,
+                        guard,
+                    } => {
                         let col = self.column_output(table_alias, column, pg_type);
                         let cond = self.bool_exp(guard, table_alias, table_alias);
                         format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
@@ -569,7 +588,12 @@ impl Ctx {
                         self.connection_expr(conn, Some((&conn.join, table_alias)))
                     }
                     FieldValue::RemoteJoin { .. } => "NULL::json".to_string(),
-                    FieldValue::ComputedScalar { schema, name, args, guard } => {
+                    FieldValue::ComputedScalar {
+                        schema,
+                        name,
+                        args,
+                        guard,
+                    } => {
                         let rendered: Vec<String> = args
                             .iter()
                             .map(|a| row_function_arg(&dialect, a, table_alias))
@@ -582,8 +606,7 @@ impl Ctx {
                         );
                         match guard {
                             Some(guard) => {
-                                let cond =
-                                    self.bool_exp(guard, table_alias, table_alias);
+                                let cond = self.bool_exp(guard, table_alias, table_alias);
                                 format!("CASE WHEN {cond} THEN {call} ELSE NULL END")
                             }
                             None => call,
@@ -631,11 +654,19 @@ impl Ctx {
                 }
             }
             BoolExp::Not(inner) => format!("(NOT {})", self.bool_exp(inner, alias, root)),
-            BoolExp::Compare { column, pg_type, op } => {
+            BoolExp::Compare {
+                column,
+                pg_type,
+                op,
+            } => {
                 let col = qualified(alias, column);
                 self.compare(&col, pg_type, op, alias, root)
             }
-            BoolExp::Relationship { table, join, predicate } => {
+            BoolExp::Relationship {
+                table,
+                join,
+                predicate,
+            } => {
                 let ra = self.alias();
                 let mut conds: Vec<String> = join
                     .iter()
@@ -652,9 +683,17 @@ impl Ctx {
                     conds.join(" AND ")
                 )
             }
-            BoolExp::ComputedCompare { schema, name, args, pg_type, op } => {
-                let rendered: Vec<String> =
-                    args.iter().map(|a| row_function_arg(&dialect, a, alias)).collect();
+            BoolExp::ComputedCompare {
+                schema,
+                name,
+                args,
+                pg_type,
+                op,
+            } => {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|a| row_function_arg(&dialect, a, alias))
+                    .collect();
                 let expr = format!(
                     "{}.{}({})",
                     quote_ident(schema),
@@ -674,10 +713,17 @@ impl Ctx {
                     pred
                 )
             }
-            BoolExp::RowFunctionExists { schema, name, args, predicate } => {
+            BoolExp::RowFunctionExists {
+                schema,
+                name,
+                args,
+                predicate,
+            } => {
                 let ra = self.alias();
-                let rendered: Vec<String> =
-                    args.iter().map(|a| row_function_arg(&dialect, a, alias)).collect();
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|a| row_function_arg(&dialect, a, alias))
+                    .collect();
                 let pred = self.bool_exp(predicate, &ra, root);
                 format!(
                     "EXISTS (SELECT 1 FROM {}.{}({}) AS {} WHERE {})",
@@ -691,7 +737,14 @@ impl Ctx {
         }
     }
 
-    fn compare(&mut self, col: &str, pg_type: &str, op: &CompareOp, alias: &str, root: &str) -> String {
+    fn compare(
+        &mut self,
+        col: &str,
+        pg_type: &str,
+        op: &CompareOp,
+        alias: &str,
+        root: &str,
+    ) -> String {
         let dialect = self.dialect;
         let lit = |s: &Scalar| scalar_sql(&dialect, s, pg_type);
         match op {
@@ -729,11 +782,20 @@ impl Ctx {
             CompareOp::Niregex(v) => format!("{col} !~* {}", lit(v)),
             CompareOp::IsNull(true) => format!("{col} IS NULL"),
             CompareOp::IsNull(false) => format!("{col} IS NOT NULL"),
-            CompareOp::CompareColumn { sql_op, column, root: use_root } => {
+            CompareOp::CompareColumn {
+                sql_op,
+                column,
+                root: use_root,
+            } => {
                 let base = if *use_root { root } else { alias };
                 format!("{col} {sql_op} {}", qualified(base, column))
             }
-            CompareOp::CompareColumnRel { sql_op, table, join, column } => {
+            CompareOp::CompareColumnRel {
+                sql_op,
+                table,
+                join,
+                column,
+            } => {
                 let ra = self.alias();
                 let conds: Vec<String> = join
                     .iter()
@@ -763,7 +825,11 @@ impl Ctx {
                 from,
                 three_d,
             } => {
-                let func = if *three_d { "ST_3DDWithin" } else { "ST_DWithin" };
+                let func = if *three_d {
+                    "ST_3DDWithin"
+                } else {
+                    "ST_DWithin"
+                };
                 format!(
                     "{func}({col}, {}, {})",
                     geometry_sql(from, pg_type),
@@ -824,7 +890,11 @@ fn mutation_to_sql_full(
     stringify_numerics: bool,
     dialect: donat_backend::AnyDialect,
 ) -> String {
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics, dialect };
+    let mut ctx = Ctx {
+        next_alias: 0,
+        stringify_numerics,
+        dialect,
+    };
     let dialect = ctx.dialect;
     match root {
         MutationRoot::Typename { value, .. } => {
@@ -875,12 +945,20 @@ fn mutation_to_sql_full(
                         .collect();
                     for op in &oc.set_ops {
                         match op {
-                            SetOp::Set { column, pg_type, value } => sets.push(format!(
+                            SetOp::Set {
+                                column,
+                                pg_type,
+                                value,
+                            } => sets.push(format!(
                                 "{} = {}",
                                 quote_ident(column),
                                 scalar_sql(&dialect, value, pg_type)
                             )),
-                            SetOp::Inc { column, pg_type, value } => sets.push(format!(
+                            SetOp::Inc {
+                                column,
+                                pg_type,
+                                value,
+                            } => sets.push(format!(
                                 "{} = {}.{} + {}",
                                 quote_ident(column),
                                 quote_ident(&insert.table.name),
@@ -916,10 +994,22 @@ fn mutation_to_sql_full(
                 .sets
                 .iter()
                 .map(|s| match s {
-                    SetOp::Set { column, pg_type, value } => {
-                        format!("{} = {}", quote_ident(column), scalar_sql(&dialect, value, pg_type))
+                    SetOp::Set {
+                        column,
+                        pg_type,
+                        value,
+                    } => {
+                        format!(
+                            "{} = {}",
+                            quote_ident(column),
+                            scalar_sql(&dialect, value, pg_type)
+                        )
                     }
-                    SetOp::Inc { column, pg_type, value } => format!(
+                    SetOp::Inc {
+                        column,
+                        pg_type,
+                        value,
+                    } => format!(
                         "{} = {} + {}",
                         quote_ident(column),
                         quote_ident(column),
@@ -999,7 +1089,11 @@ pub struct SqliteMutationPlan {
 /// planner does not surface it on this path and the carve-out defers it.
 pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     let dialect = donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect);
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics: false, dialect };
+    let mut ctx = Ctx {
+        next_alias: 0,
+        stringify_numerics: false,
+        dialect,
+    };
     match root {
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
@@ -1056,10 +1150,22 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
                 .sets
                 .iter()
                 .map(|s| match s {
-                    SetOp::Set { column, pg_type, value } => {
-                        format!("{} = {}", quote_ident(column), scalar_sql(&dialect, value, pg_type))
+                    SetOp::Set {
+                        column,
+                        pg_type,
+                        value,
+                    } => {
+                        format!(
+                            "{} = {}",
+                            quote_ident(column),
+                            scalar_sql(&dialect, value, pg_type)
+                        )
                     }
-                    SetOp::Inc { column, pg_type, value } => format!(
+                    SetOp::Inc {
+                        column,
+                        pg_type,
+                        value,
+                    } => format!(
                         "{} = {} + {}",
                         quote_ident(column),
                         quote_ident(column),
@@ -1078,7 +1184,12 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
             if let Some(pred) = &update.predicate {
                 dml.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
             }
-            ctx.sqlite_finish(dml, update.check.as_ref(), &update.check_path, &update.output)
+            ctx.sqlite_finish(
+                dml,
+                update.check.as_ref(),
+                &update.check_path,
+                &update.output,
+            )
         }
         MutationRoot::Delete { delete, .. } => {
             let alias = "_t".to_string();
@@ -1148,7 +1259,10 @@ impl Ctx {
         let node_expr = self.sqlite_node_json(&node_fields);
         let violated = match check {
             Some(check) => {
-                format!("CASE WHEN NOT ({}) THEN 1 ELSE 0 END", self.sqlite_bare_bool(check))
+                format!(
+                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    self.sqlite_bare_bool(check)
+                )
             }
             None => "0".to_string(),
         };
@@ -1215,7 +1329,8 @@ impl Ctx {
                 if exps.is_empty() {
                     "1".into()
                 } else {
-                    let parts: Vec<String> = exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
+                    let parts: Vec<String> =
+                        exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
                     format!("({})", parts.join(" AND "))
                 }
             }
@@ -1223,12 +1338,17 @@ impl Ctx {
                 if exps.is_empty() {
                     "0".into()
                 } else {
-                    let parts: Vec<String> = exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
+                    let parts: Vec<String> =
+                        exps.iter().map(|e| self.sqlite_bare_bool(e)).collect();
                     format!("({})", parts.join(" OR "))
                 }
             }
             BoolExp::Not(inner) => format!("(NOT {})", self.sqlite_bare_bool(inner)),
-            BoolExp::Compare { column, pg_type, op } => {
+            BoolExp::Compare {
+                column,
+                pg_type,
+                op,
+            } => {
                 let col = dialect.quote_ident(column);
                 let lit = |s: &Scalar| scalar_sql(&dialect, s, pg_type);
                 match op {
@@ -1341,7 +1461,11 @@ pub struct MySqlMutationPlan {
 pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationPlan {
     use donat_backend::Dialect;
     let dialect = donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect);
-    let mut ctx = Ctx { next_alias: 0, stringify_numerics: false, dialect };
+    let mut ctx = Ctx {
+        next_alias: 0,
+        stringify_numerics: false,
+        dialect,
+    };
     match root {
         MutationRoot::Typename { value, .. } => MySqlMutationPlan {
             dml_sql: String::new(),
@@ -1396,9 +1520,8 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
             let single_pk = if pk.len() == 1 { Some(&pk[0]) } else { None };
             let pk_col = single_pk.map(|c| dialect.quote_ident(c));
             // Which IR column index, if any, holds the (single) PK?
-            let pk_idx = single_pk.and_then(|pkname| {
-                insert.columns.iter().position(|(name, _)| name == pkname)
-            });
+            let pk_idx = single_pk
+                .and_then(|pkname| insert.columns.iter().position(|(name, _)| name == pkname));
             // A supplied-PK IN predicate is usable only when every row gave a
             // non-DEFAULT value for that PK column.
             let pk_in_predicate = match (pk_col.as_ref(), pk_idx) {
@@ -1426,15 +1549,15 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 _ => None,
             };
 
-            let companion = ctx.mysql_companion_select(
-                &table,
-                insert.check.as_ref(),
-                &insert.output,
-            );
+            let companion =
+                ctx.mysql_companion_select(&table, insert.check.as_ref(), &insert.output);
             MySqlMutationPlan {
                 dml_sql: dml,
                 companion_select: companion.select,
-                kind: MySqlMutationKind::Insert { pk_col, pk_in_predicate },
+                kind: MySqlMutationKind::Insert {
+                    pk_col,
+                    pk_in_predicate,
+                },
                 returning_alias: companion.returning_alias,
                 affected_rows_alias: companion.affected_rows_alias,
                 typename: companion.typename,
@@ -1452,12 +1575,20 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 .sets
                 .iter()
                 .map(|s| match s {
-                    SetOp::Set { column, pg_type, value } => format!(
+                    SetOp::Set {
+                        column,
+                        pg_type,
+                        value,
+                    } => format!(
                         "{} = {}",
                         dialect.quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
                     ),
-                    SetOp::Inc { column, pg_type, value } => format!(
+                    SetOp::Inc {
+                        column,
+                        pg_type,
+                        value,
+                    } => format!(
                         "{} = {} + {}",
                         dialect.quote_ident(column),
                         dialect.quote_ident(column),
@@ -1467,19 +1598,13 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 .collect();
             // The predicate is rendered over BARE columns so it is valid both in
             // the unaliased UPDATE and in the companion SELECT.
-            let where_clause = update
-                .predicate
-                .as_ref()
-                .map(|p| ctx.mysql_bare_bool(p));
+            let where_clause = update.predicate.as_ref().map(|p| ctx.mysql_bare_bool(p));
             let mut dml = format!("UPDATE {table} SET {}", sets.join(", "));
             if let Some(w) = &where_clause {
                 dml.push_str(&format!(" WHERE {w}"));
             }
-            let companion = ctx.mysql_companion_select(
-                &table,
-                update.check.as_ref(),
-                &update.output,
-            );
+            let companion =
+                ctx.mysql_companion_select(&table, update.check.as_ref(), &update.output);
             MySqlMutationPlan {
                 dml_sql: dml,
                 companion_select: companion.select,
@@ -1497,10 +1622,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 dialect.quote_ident(&delete.table.schema),
                 dialect.quote_ident(&delete.table.name)
             );
-            let where_clause = delete
-                .predicate
-                .as_ref()
-                .map(|p| ctx.mysql_bare_bool(p));
+            let where_clause = delete.predicate.as_ref().map(|p| ctx.mysql_bare_bool(p));
             let mut dml = format!("DELETE FROM {table}");
             if let Some(w) = &where_clause {
                 dml.push_str(&format!(" WHERE {w}"));
@@ -1571,7 +1693,10 @@ impl Ctx {
         let node_expr = self.sqlite_node_json(&node_fields);
         let violated = match check {
             Some(check) => {
-                format!("CASE WHEN NOT ({}) THEN 1 ELSE 0 END", self.sqlite_bare_bool(check))
+                format!(
+                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    self.sqlite_bare_bool(check)
+                )
             }
             None => "0".to_string(),
         };
@@ -1608,10 +1733,9 @@ impl Ctx {
                 let pairs: Vec<(String, String)> = fields
                     .iter()
                     .map(|f| match f {
-                        MutationResponseField::AffectedRows { alias } => (
-                            alias.clone(),
-                            format!("(SELECT count(*) FROM {cte_ident})"),
-                        ),
+                        MutationResponseField::AffectedRows { alias } => {
+                            (alias.clone(), format!("(SELECT count(*) FROM {cte_ident})"))
+                        }
                         MutationResponseField::Typename { alias, value } => {
                             (alias.clone(), format!("{}::text", quote_lit(value)))
                         }
@@ -1739,15 +1863,24 @@ mod dialect_dispatch_tests {
         let cols = vec![
             OutputField {
                 alias: "id".into(),
-                value: FieldValue::Column { column: "id".into(), pg_type: "int4".into() },
+                value: FieldValue::Column {
+                    column: "id".into(),
+                    pg_type: "int4".into(),
+                },
             },
             OutputField {
                 alias: "name".into(),
-                value: FieldValue::Column { column: "name".into(), pg_type: "text".into() },
+                value: FieldValue::Column {
+                    column: "name".into(),
+                    pg_type: "text".into(),
+                },
             },
         ];
         let query = |single: bool| SelectQuery {
-            from: FromSource::Table(Table { schema: "public".into(), name: "author".into() }),
+            from: FromSource::Table(Table {
+                schema: "public".into(),
+                name: "author".into(),
+            }),
             fields: cols.clone(),
             predicate: Some(BoolExp::Compare {
                 column: "id".into(),
@@ -1762,8 +1895,14 @@ mod dialect_dispatch_tests {
             single,
         };
         vec![
-            RootField::Select { alias: "author_by_pk".into(), query: query(true) },
-            RootField::Select { alias: "authors".into(), query: query(false) },
+            RootField::Select {
+                alias: "author_by_pk".into(),
+                query: query(true),
+            },
+            RootField::Select {
+                alias: "authors".into(),
+                query: query(false),
+            },
         ]
     }
 
@@ -1774,8 +1913,7 @@ mod dialect_dispatch_tests {
         // point. Guards the dispatch refactor: the Postgres path is unchanged.
         let roots = sample_roots();
         let default = operation_to_sql(&roots);
-        let explicit =
-            operation_to_sql_with(&roots, AnyDialect::Postgres(PostgresDialect));
+        let explicit = operation_to_sql_with(&roots, AnyDialect::Postgres(PostgresDialect));
         assert_eq!(default, explicit);
     }
 
@@ -1784,19 +1922,27 @@ mod dialect_dispatch_tests {
         let root = MutationRoot::Insert {
             alias: "insert_author".into(),
             insert: InsertMutation {
-                table: Table { schema: "public".into(), name: "author".into() },
+                table: Table {
+                    schema: "public".into(),
+                    name: "author".into(),
+                },
                 columns: vec![("name".into(), "text".into())],
                 rows: vec![vec![Some(Scalar::Json(serde_json::json!("Ada")))]],
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
                 output: MutationOutput::Response(vec![
-                    MutationResponseField::AffectedRows { alias: "affected_rows".into() },
+                    MutationResponseField::AffectedRows {
+                        alias: "affected_rows".into(),
+                    },
                     MutationResponseField::Returning {
                         alias: "returning".into(),
                         fields: vec![OutputField {
                             alias: "id".into(),
-                            value: FieldValue::Column { column: "id".into(), pg_type: "int4".into() },
+                            value: FieldValue::Column {
+                                column: "id".into(),
+                                pg_type: "int4".into(),
+                            },
                         }],
                     },
                 ]),

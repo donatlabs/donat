@@ -48,7 +48,10 @@ fn scalar_json_passthrough() {
     assert_ne!(scalar, Scalar::Json(json!(null)));
 
     // Externally tagged: {"Json": <value>} — the shape sqlgen snapshots see.
-    assert_eq!(serde_json::to_value(&scalar).unwrap(), json!({"Json": value}));
+    assert_eq!(
+        serde_json::to_value(&scalar).unwrap(),
+        json!({"Json": value})
+    );
 }
 
 #[test]
@@ -168,7 +171,10 @@ fn order_by_and_direction_serialize_as_variant_names() {
         nulls: NullsOrder::First,
     };
     let v = serde_json::to_value(&ob).unwrap();
-    assert_eq!(v, json!({"target": {"Column": "id"}, "direction": "Desc", "nulls": "First"}));
+    assert_eq!(
+        v,
+        json!({"target": {"Column": "id"}, "direction": "Desc", "nulls": "First"})
+    );
     assert_eq!(OrderDirection::Asc, OrderDirection::Asc);
     assert_ne!(NullsOrder::First, NullsOrder::Last);
 }
@@ -179,7 +185,10 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
     // insertion column; None serializes to JSON null (rendered DEFAULT).
     let insert = InsertMutation {
         table: table("author"),
-        columns: vec![("id".into(), "integer".into()), ("name".into(), "text".into())],
+        columns: vec![
+            ("id".into(), "integer".into()),
+            ("name".into(), "text".into()),
+        ],
         rows: vec![
             vec![Some(Scalar::Json(json!(1))), Some(Scalar::Json(json!("a")))],
             vec![None, Some(Scalar::Json(json!("b")))],

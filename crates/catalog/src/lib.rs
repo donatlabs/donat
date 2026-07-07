@@ -464,8 +464,7 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
          ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
         (schema,),
     )?;
-    for ((conname, table, from_col, ref_schema, ref_table), to_col) in
-        fks.into_iter().zip(fk_refs)
+    for ((conname, table, from_col, ref_schema, ref_table), to_col) in fks.into_iter().zip(fk_refs)
     {
         let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) else {
             continue;
@@ -506,8 +505,9 @@ fn mysql_type_to_pg(data_type: &str) -> &'static str {
         "double" | "double precision" | "real" => "float8",
         "decimal" | "numeric" | "dec" | "fixed" => "numeric",
         "bool" | "boolean" => "bool",
-        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum"
-        | "set" => "text",
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
+            "text"
+        }
         "json" => "json",
         "datetime" | "timestamp" => "timestamp",
         "date" => "date",
