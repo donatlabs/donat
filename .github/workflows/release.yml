@@ -1,8 +1,8 @@
 name: Release image
 
-# Build and publish the engine Docker image to the GitHub Container Registry
-# on every release tag (e.g. v1.2.3). The package is public, so examples and
-# users can `docker pull ghcr.io/donatlabs/donat` without authentication.
+# Build and publish the engine Docker image to Docker Hub on every release tag
+# (e.g. v1.2.3). The repository is public, so deployments can pull it without
+# registry authentication.
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/donatlabs/donat
+  IMAGE: docker.io/partyproject/donat
 
 jobs:
   image:
@@ -20,16 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Derive image tags
         id: meta

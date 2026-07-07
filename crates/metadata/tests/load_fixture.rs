@@ -19,7 +19,12 @@ fn loads_v2_metadata_directory() {
     let source = &md.sources[0];
     assert_eq!(source.name, "default");
     assert_eq!(source.kind, SourceKind::Postgres);
-    match &source.configuration.connection_info.database_url {
+    let connection_info = source
+        .configuration
+        .connection_info
+        .as_ref()
+        .expect("fixture source should include connection_info");
+    match &connection_info.database_url {
         DatabaseUrl::FromEnv { from_env } => {
             assert_eq!(from_env, "DONAT_GRAPHQL_DATABASE_URL")
         }
