@@ -222,6 +222,55 @@ fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returni
 }
 
 #[test]
+fn after_parent_nested_check_reads_parent_from_insert_cte() {
+    let insert = InsertMutation {
+        table: table("public", "author"),
+        columns: vec![
+            ("name".into(), "text".into()),
+            ("company_id".into(), "int4".into()),
+        ],
+        rows: vec![vec![
+            Some(Scalar::Json(json!("Ada"))),
+            Some(Scalar::Json(json!(1))),
+        ]],
+        nested_object_inserts: vec![NestedObjectInsert {
+            relationship_name: "profile".into(),
+            table: table("public", "profile"),
+            column_mapping: vec![("id".into(), "author_id".into())],
+            columns: vec![("bio".into(), "text".into())],
+            row: vec![Some(Scalar::Json(json!("math")))],
+            check: Some(BoolExp::Relationship {
+                table: table("public", "author"),
+                join: vec![("author_id".into(), "id".into())],
+                predicate: Box::new(BoolExp::Compare {
+                    column: "company_id".into(),
+                    pg_type: "int4".into(),
+                    op: CompareOp::Eq(Scalar::Json(json!(1))),
+                }),
+            }),
+            check_path: "$.selectionSet.insert_author_one.args.object.profile.data".into(),
+        }],
+        on_conflict: None,
+        check: None,
+        check_path: "$.selectionSet.insert_author_one.args.object".into(),
+        output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
+    };
+    let sql = mutation_to_sql(&MutationRoot::Insert {
+        alias: "insert_author_one".into(),
+        insert,
+    });
+
+    assert!(
+        sql.contains(r#"EXISTS (SELECT 1 FROM "ins" AS"#),
+        "after-parent check must read the inserted parent from the parent CTE: {sql}"
+    );
+    assert!(
+        !sql.contains(r#"EXISTS (SELECT 1 FROM "public"."author" AS"#),
+        "after-parent check must not query the base parent table in the same CTE statement: {sql}"
+    );
+}
+
+#[test]
 fn insert_missing_values_render_default_and_do_nothing() {
     let insert = InsertMutation {
         table: table("public", "author"),

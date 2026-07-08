@@ -73,6 +73,15 @@ struct Ctx {
     dialect: donat_backend::AnyDialect,
 }
 
+#[derive(Debug, Clone)]
+struct RelationshipCteOverride {
+    table: Table,
+    /// Join condition pairs: (local column on the outer row, remote column on
+    /// the relationship target).
+    join: Vec<(String, String)>,
+    cte: String,
+}
+
 /// Join condition pairs against an enclosing table alias:
 /// (local column on the outer table, remote column on the inner table).
 type OuterJoin<'a> = (&'a [(String, String)], &'a str);
@@ -633,14 +642,28 @@ impl Ctx {
     }
 
     fn bool_exp(&mut self, exp: &BoolExp, alias: &str, root: &str) -> String {
+        self.bool_exp_with_relationship_ctes(exp, alias, root, &[])
+    }
+
+    fn bool_exp_with_relationship_ctes(
+        &mut self,
+        exp: &BoolExp,
+        alias: &str,
+        root: &str,
+        relationship_ctes: &[RelationshipCteOverride],
+    ) -> String {
         let dialect = self.dialect;
         match exp {
             BoolExp::And(exps) => {
                 if exps.is_empty() {
                     "TRUE".into()
                 } else {
-                    let parts: Vec<String> =
-                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    let parts: Vec<String> = exps
+                        .iter()
+                        .map(|e| {
+                            self.bool_exp_with_relationship_ctes(e, alias, root, relationship_ctes)
+                        })
+                        .collect();
                     format!("({})", parts.join(" AND "))
                 }
             }
@@ -648,12 +671,19 @@ impl Ctx {
                 if exps.is_empty() {
                     "FALSE".into()
                 } else {
-                    let parts: Vec<String> =
-                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    let parts: Vec<String> = exps
+                        .iter()
+                        .map(|e| {
+                            self.bool_exp_with_relationship_ctes(e, alias, root, relationship_ctes)
+                        })
+                        .collect();
                     format!("({})", parts.join(" OR "))
                 }
             }
-            BoolExp::Not(inner) => format!("(NOT {})", self.bool_exp(inner, alias, root)),
+            BoolExp::Not(inner) => format!(
+                "(NOT {})",
+                self.bool_exp_with_relationship_ctes(inner, alias, root, relationship_ctes)
+            ),
             BoolExp::Compare {
                 column,
                 pg_type,
@@ -668,17 +698,31 @@ impl Ctx {
                 predicate,
             } => {
                 let ra = self.alias();
+                let from = relationship_ctes
+                    .iter()
+                    .find(|override_| override_.table == *table && override_.join == *join)
+                    .map(|override_| quote_ident(&override_.cte))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}.{}",
+                            quote_ident(&table.schema),
+                            quote_ident(&table.name)
+                        )
+                    });
                 let mut conds: Vec<String> = join
                     .iter()
                     .map(|(local, remote)| {
                         format!("{} = {}", qualified(&ra, remote), qualified(alias, local))
                     })
                     .collect();
-                conds.push(self.bool_exp(predicate, &ra, root));
+                conds.push(self.bool_exp_with_relationship_ctes(
+                    predicate,
+                    &ra,
+                    root,
+                    relationship_ctes,
+                ));
                 format!(
-                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
-                    quote_ident(&table.schema),
-                    quote_ident(&table.name),
+                    "EXISTS (SELECT 1 FROM {from} AS {} WHERE {})",
                     quote_ident(&ra),
                     conds.join(" AND ")
                 )
@@ -1013,7 +1057,21 @@ fn mutation_to_sql_full(
                     quote_ident("ins")
                 ));
                 if let Some(check) = &nested.check {
-                    extra_checks.push((cte, check, nested.check_path.clone()));
+                    let parent_join = nested
+                        .column_mapping
+                        .iter()
+                        .map(|(parent, child)| (child.clone(), parent.clone()))
+                        .collect();
+                    extra_checks.push((
+                        cte,
+                        check,
+                        nested.check_path.clone(),
+                        vec![RelationshipCteOverride {
+                            table: insert.table.clone(),
+                            join: parent_join,
+                            cte: "ins".to_string(),
+                        }],
+                    ));
                 }
             }
             ctx.mutation_select_with_extra_ctes(
@@ -1781,7 +1839,7 @@ impl Ctx {
         check: Option<&BoolExp>,
         check_path: &str,
         extra_ctes: Vec<String>,
-        extra_checks: Vec<(String, &BoolExp, String)>,
+        extra_checks: Vec<(String, &BoolExp, String, Vec<RelationshipCteOverride>)>,
         output: &MutationOutput,
     ) -> String {
         let dialect = self.dialect;
@@ -1820,11 +1878,16 @@ impl Ctx {
         };
 
         let mut guarded = result;
-        for (check_cte, check, check_path) in extra_checks.into_iter().rev() {
+        for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
             let check_cte_ident = quote_ident(&check_cte);
             let violated = format!(
                 "(SELECT count(*) FROM {check_cte_ident} WHERE NOT ({}))",
-                self.bool_exp(check, &check_cte, &check_cte)
+                self.bool_exp_with_relationship_ctes(
+                    check,
+                    &check_cte,
+                    &check_cte,
+                    &relationship_ctes,
+                )
             );
             let payload = serde_json::json!({
                 "path": check_path,
