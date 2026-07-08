@@ -124,6 +124,7 @@ fn insert_check_expression_wraps_check_violation() {
         table: table("public", "author"),
         columns: vec![("name".into(), "text".into())],
         rows: vec![vec![Some(Scalar::Json(json!("bob")))]],
+        nested_object_inserts: vec![],
         on_conflict: None,
         check: Some(BoolExp::Compare {
             column: "name".into(),
@@ -184,6 +185,43 @@ fn update_check_expression_wraps_check_violation() {
 }
 
 #[test]
+fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returning() {
+    let insert = InsertMutation {
+        table: table("public", "author"),
+        columns: vec![("name".into(), "text".into())],
+        rows: vec![vec![Some(Scalar::Json(json!("Ada")))]],
+        nested_object_inserts: vec![NestedObjectInsert {
+            relationship_name: "profile".into(),
+            table: table("public", "profile"),
+            column_mapping: vec![("id".into(), "author_id".into())],
+            columns: vec![("bio".into(), "text".into())],
+            row: vec![Some(Scalar::Json(json!("math")))],
+            check: None,
+            check_path: "$.selectionSet.insert_author_one.args.object.profile.data".into(),
+        }],
+        on_conflict: None,
+        check: None,
+        check_path: "$.selectionSet.insert_author_one.args.object".into(),
+        output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
+    };
+    let sql = mutation_to_sql(&MutationRoot::Insert {
+        alias: "insert_author_one".into(),
+        insert,
+    });
+
+    assert!(
+        sql.contains(
+            r#""profile__nested_0" AS (INSERT INTO "public"."profile" ("author_id", "bio") SELECT "ins"."id", ('math')::"text" FROM "ins" RETURNING *)"#
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"json_build_object('id', "ins"."id")"#),
+        "{sql}"
+    );
+}
+
+#[test]
 fn insert_missing_values_render_default_and_do_nothing() {
     let insert = InsertMutation {
         table: table("public", "author"),
@@ -193,6 +231,7 @@ fn insert_missing_values_render_default_and_do_nothing() {
             vec![None, Some(Scalar::Json(json!("a")))],
             vec![Some(Scalar::Json(json!(2))), None],
         ],
+        nested_object_inserts: vec![],
         on_conflict: Some(OnConflict {
             constraint: "author_pkey".into(),
             update_columns: vec![],
@@ -221,6 +260,7 @@ fn on_conflict_do_update_applies_filter_and_presets() {
             Some(Scalar::Json(json!(1))),
             Some(Scalar::Json(json!("a"))),
         ]],
+        nested_object_inserts: vec![],
         on_conflict: Some(OnConflict {
             constraint: "author_pkey".into(),
             update_columns: vec!["name".into()],

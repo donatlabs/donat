@@ -419,12 +419,29 @@ pub struct InsertMutation {
     pub columns: Vec<(String, String)>,
     /// Row values aligned with `columns`; None renders DEFAULT.
     pub rows: Vec<Vec<Option<Scalar>>>,
+    /// Object relationships inserted after the parent row, using values
+    /// returned from the parent INSERT for the relationship column mapping.
+    pub nested_object_inserts: Vec<NestedObjectInsert>,
     pub on_conflict: Option<OnConflict>,
     /// The role's insert check expression, evaluated over inserted rows.
     pub check: Option<BoolExp>,
     /// Error path reported on check violation.
     pub check_path: String,
     pub output: MutationOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NestedObjectInsert {
+    pub relationship_name: String,
+    pub table: Table,
+    /// (parent column, child column) pairs.
+    pub column_mapping: Vec<(String, String)>,
+    /// Child insertion columns supplied by the user, excluding mapped columns.
+    pub columns: Vec<(String, String)>,
+    /// Child row values aligned with `columns`.
+    pub row: Vec<Option<Scalar>>,
+    pub check: Option<BoolExp>,
+    pub check_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -981,11 +981,48 @@ fn mutation_to_sql_full(
                 }
             }
             stmt.push_str(" RETURNING *");
-            ctx.mutation_select(
+            let mut extra_ctes = vec![];
+            let mut extra_checks = vec![];
+            for (idx, nested) in insert.nested_object_inserts.iter().enumerate() {
+                let cte = format!("{}__nested_{idx}", nested.relationship_name);
+                let mut cols: Vec<String> = nested
+                    .column_mapping
+                    .iter()
+                    .map(|(_, child)| quote_ident(child))
+                    .collect();
+                cols.extend(nested.columns.iter().map(|(name, _)| quote_ident(name)));
+
+                let mut values: Vec<String> = nested
+                    .column_mapping
+                    .iter()
+                    .map(|(parent, _)| qualified("ins", parent))
+                    .collect();
+                values.extend(nested.row.iter().zip(&nested.columns).map(
+                    |(value, (_, pg_type))| match value {
+                        None => "DEFAULT".to_string(),
+                        Some(s) => scalar_sql(&dialect, s, pg_type),
+                    },
+                ));
+                extra_ctes.push(format!(
+                    "{} AS (INSERT INTO {}.{} ({}) SELECT {} FROM {} RETURNING *)",
+                    quote_ident(&cte),
+                    quote_ident(&nested.table.schema),
+                    quote_ident(&nested.table.name),
+                    cols.join(", "),
+                    values.join(", "),
+                    quote_ident("ins")
+                ));
+                if let Some(check) = &nested.check {
+                    extra_checks.push((cte, check, nested.check_path.clone()));
+                }
+            }
+            ctx.mutation_select_with_extra_ctes(
                 "ins",
                 &stmt,
                 insert.check.as_ref(),
                 &insert.check_path,
+                extra_ctes,
+                extra_checks,
                 &insert.output,
             )
         }
@@ -1107,6 +1144,10 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
             panic!("volatile function mutations are not supported on sqlite")
         }
         MutationRoot::Insert { insert, .. } => {
+            assert!(
+                insert.nested_object_inserts.is_empty(),
+                "nested object inserts are not supported on sqlite mutations"
+            );
             assert!(
                 insert.on_conflict.is_none(),
                 "on_conflict is not supported on sqlite mutations"
@@ -1482,6 +1523,10 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
         }
         MutationRoot::Insert { insert, .. } => {
             assert!(
+                insert.nested_object_inserts.is_empty(),
+                "nested object inserts are not supported on mysql mutations"
+            );
+            assert!(
                 insert.on_conflict.is_none(),
                 "on_conflict is not yet supported on mysql mutations"
             );
@@ -1726,6 +1771,19 @@ impl Ctx {
         check_path: &str,
         output: &MutationOutput,
     ) -> String {
+        self.mutation_select_with_extra_ctes(cte, dml, check, check_path, vec![], vec![], output)
+    }
+
+    fn mutation_select_with_extra_ctes(
+        &mut self,
+        cte: &str,
+        dml: &str,
+        check: Option<&BoolExp>,
+        check_path: &str,
+        extra_ctes: Vec<String>,
+        extra_checks: Vec<(String, &BoolExp, String)>,
+        output: &MutationOutput,
+    ) -> String {
         let dialect = self.dialect;
         let cte_ident = quote_ident(cte);
         let result = match output {
@@ -1761,27 +1819,43 @@ impl Ctx {
             }
         };
 
-        let guarded = match check {
-            Some(check) => {
-                let violated = format!(
-                    "(SELECT count(*) FROM {cte_ident} WHERE NOT ({}))",
-                    self.bool_exp(check, cte, cte)
-                );
-                // The message carries the GraphQL error path as JSON; the
-                // executor unpacks it into the Donat error shape.
-                let payload = serde_json::json!({
-                    "path": check_path,
-                    "message": "check constraint of an insert/update permission has failed",
-                })
-                .to_string();
-                format!(
-                    "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {result} END",
-                    quote_lit(&payload)
-                )
-            }
-            None => result,
-        };
-        format!("WITH {cte_ident} AS ({dml}) SELECT {guarded} AS root")
+        let mut guarded = result;
+        for (check_cte, check, check_path) in extra_checks.into_iter().rev() {
+            let check_cte_ident = quote_ident(&check_cte);
+            let violated = format!(
+                "(SELECT count(*) FROM {check_cte_ident} WHERE NOT ({}))",
+                self.bool_exp(check, &check_cte, &check_cte)
+            );
+            let payload = serde_json::json!({
+                "path": check_path,
+                "message": "check constraint of an insert/update permission has failed",
+            })
+            .to_string();
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {guarded} END",
+                quote_lit(&payload)
+            );
+        }
+        if let Some(check) = check {
+            let violated = format!(
+                "(SELECT count(*) FROM {cte_ident} WHERE NOT ({}))",
+                self.bool_exp(check, cte, cte)
+            );
+            // The message carries the GraphQL error path as JSON; the
+            // executor unpacks it into the Donat error shape.
+            let payload = serde_json::json!({
+                "path": check_path,
+                "message": "check constraint of an insert/update permission has failed",
+            })
+            .to_string();
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {guarded} END",
+                quote_lit(&payload)
+            );
+        }
+        let mut ctes = vec![format!("{cte_ident} AS ({dml})")];
+        ctes.extend(extra_ctes);
+        format!("WITH {} SELECT {guarded} AS root", ctes.join(", "))
     }
 }
 
@@ -1928,6 +2002,7 @@ mod dialect_dispatch_tests {
                 },
                 columns: vec![("name".into(), "text".into())],
                 rows: vec![vec![Some(Scalar::Json(serde_json::json!("Ada")))]],
+                nested_object_inserts: vec![],
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),

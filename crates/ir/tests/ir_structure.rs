@@ -193,6 +193,7 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
             vec![Some(Scalar::Json(json!(1))), Some(Scalar::Json(json!("a")))],
             vec![None, Some(Scalar::Json(json!("b")))],
         ],
+        nested_object_inserts: vec![],
         on_conflict: None,
         check: Some(BoolExp::Compare {
             column: "id".into(),

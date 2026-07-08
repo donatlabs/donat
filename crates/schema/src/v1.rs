@@ -628,6 +628,7 @@ impl<'a> Planner<'a> {
             },
             columns: typed_columns,
             rows,
+            nested_object_inserts: vec![],
             on_conflict,
             check,
             check_path: "$".to_string(),

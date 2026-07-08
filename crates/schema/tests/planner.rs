@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
-use donat_ir::{BoolExp, CompareOp, FieldValue, OrderByTarget, RootField, Scalar, SelectQuery};
+use donat_ir::{
+    BoolExp, CompareOp, FieldValue, MutationRoot, OrderByTarget, RootField, Scalar, SelectQuery,
+};
 use donat_metadata::Metadata;
 use donat_schema::{Plan, PlanError, Planner, Session, execute_introspection};
 use serde_json::{Map as JsonMap, Value as Json, json};
@@ -34,6 +36,14 @@ fn metadata() -> Metadata {
                         "using": { "foreign_key_constraint_on": {
                             "table": { "schema": "public", "name": "article" },
                             "column": "author_id"
+                        }}
+                    }],
+                    "object_relationships": [{
+                        "name": "profile",
+                        "using": { "manual_configuration": {
+                            "remote_table": { "schema": "public", "name": "profile" },
+                            "column_mapping": { "id": "author_id" },
+                            "insertion_order": "after_parent"
                         }}
                     }],
                     "insert_permissions": [
@@ -62,6 +72,19 @@ fn metadata() -> Metadata {
                         { "role": "preset_user", "permission": {
                             "columns": ["name"], "filter": {}, "set": { "name": "preset" }
                         }}
+                    ]
+                },
+                {
+                    "table": { "schema": "public", "name": "profile" },
+                    "object_relationships": [{
+                        "name": "author",
+                        "using": { "foreign_key_constraint_on": "author_id" }
+                    }],
+                    "insert_permissions": [
+                        { "role": "user", "permission": { "check": {}, "columns": ["author_id", "bio"] } }
+                    ],
+                    "select_permissions": [
+                        { "role": "user", "permission": { "columns": ["author_id", "bio"], "filter": {} } }
                     ]
                 },
                 {
@@ -127,6 +150,21 @@ fn catalog() -> Catalog {
             ],
             primary_key: vec!["id".into()],
             foreign_keys: vec![],
+        },
+    );
+    tables.insert(
+        "public.profile".to_string(),
+        TableInfo {
+            schema: "public".into(),
+            name: "profile".into(),
+            columns: vec![col("author_id", "int4"), col("bio", "text")],
+            primary_key: vec!["author_id".into()],
+            foreign_keys: vec![ForeignKey {
+                constraint_name: "profile_author_id_fkey".into(),
+                column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
+                referenced_schema: "public".into(),
+                referenced_table: "author".into(),
+            }],
         },
     );
     tables.insert(
@@ -269,6 +307,65 @@ fn custom_column_names_plan_to_physical_columns() {
             matches!(item, BoolExp::Compare { column, .. } if column == "display_name")
         })
     ));
+}
+
+#[test]
+fn insert_input_exposes_after_parent_object_relationships() {
+    let md = metadata();
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"{ __type(name: "author_insert_input") { inputFields { name type { name } } } }"#,
+    )
+    .expect("query parses")
+    .into_static();
+    let data = execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds");
+
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields array")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(fields.contains(&"profile"), "{fields:?}");
+}
+
+#[test]
+fn insert_one_accepts_after_parent_object_relationship_data() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          insert_author_one(object: { name: "Ada", profile: { data: { bio: "math" } } }) {
+            id
+            name
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("nested object insert plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected mutation plan")
+    };
+    let [MutationRoot::Insert { insert, .. }] = roots.as_slice() else {
+        panic!("expected one insert root, got {roots:?}")
+    };
+    assert_eq!(insert.nested_object_inserts.len(), 1);
+    let nested = &insert.nested_object_inserts[0];
+    assert_eq!(nested.relationship_name, "profile");
+    assert_eq!(nested.table.name, "profile");
+    assert_eq!(
+        nested.column_mapping,
+        vec![("id".to_string(), "author_id".to_string())]
+    );
+    assert_eq!(
+        nested.columns,
+        vec![("bio".to_string(), "text".to_string())]
+    );
 }
 
 // ---------------------------------------------------------------------
