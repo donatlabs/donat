@@ -185,6 +185,32 @@ fn update_check_expression_wraps_check_violation() {
 }
 
 #[test]
+fn update_jsonb_append_uses_concat_and_null_coalesce() {
+    let update = UpdateMutation {
+        table: table("public", "author"),
+        sets: vec![SetOp::JsonbAppend {
+            column: "system_meta".into(),
+            value: Scalar::Json(json!({ "deleted": { "by": "user-1" } })),
+        }],
+        predicate: Some(eq("id", "int4", json!(1))),
+        check: None,
+        check_path: "$".into(),
+        output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
+    };
+    let sql = mutation_to_sql(&MutationRoot::Update {
+        alias: "update_author_by_pk".into(),
+        update,
+    });
+
+    assert!(
+        sql.contains(
+            r#""system_meta" = COALESCE("system_meta", '{}'::jsonb) || ('{"deleted":{"by":"user-1"}}')::"jsonb""#
+        ),
+        "{sql}"
+    );
+}
+
+#[test]
 fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returning() {
     let insert = InsertMutation {
         table: table("public", "author"),

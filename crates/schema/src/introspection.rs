@@ -448,6 +448,10 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                         non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
                     ),
                     input_value("_set", named("INPUT_OBJECT", &format!("{base}_set_input"))),
+                    input_value(
+                        "_append",
+                        named("INPUT_OBJECT", &format!("{base}_append_input")),
+                    ),
                 ],
                 named("OBJECT", &format!("{base}_mutation_response")),
             ));
@@ -459,6 +463,17 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     .map(|c| {
                         let scalar = scalar_name(&c.pg_type).to_string();
                         input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
+                    })
+                    .collect(),
+            ));
+            types.push(input_object_type(
+                &format!("{base}_append_input"),
+                ctx.info
+                    .columns
+                    .iter()
+                    .filter(|c| c.pg_type == "jsonb")
+                    .map(|c| {
+                        input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", "jsonb"))
                     })
                     .collect(),
             ));

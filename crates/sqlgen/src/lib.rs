@@ -1009,6 +1009,13 @@ fn mutation_to_sql_full(
                                 quote_ident(column),
                                 scalar_sql(&dialect, value, pg_type)
                             )),
+                            SetOp::JsonbAppend { column, value } => sets.push(format!(
+                                "{} = COALESCE({}.{}, '{{}}'::jsonb) || {}",
+                                quote_ident(column),
+                                quote_ident(&insert.table.name),
+                                quote_ident(column),
+                                scalar_sql(&dialect, value, "jsonb")
+                            )),
                         }
                     }
                     stmt.push_str(&format!(
@@ -1109,6 +1116,12 @@ fn mutation_to_sql_full(
                         quote_ident(column),
                         quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
+                    ),
+                    SetOp::JsonbAppend { column, value } => format!(
+                        "{} = COALESCE({}, '{{}}'::jsonb) || {}",
+                        quote_ident(column),
+                        quote_ident(column),
+                        scalar_sql(&dialect, value, "jsonb")
                     ),
                 })
                 .collect();
@@ -1270,6 +1283,9 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
                         quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
                     ),
+                    SetOp::JsonbAppend { .. } => {
+                        panic!("jsonb append updates are not supported by sqlite sqlgen")
+                    }
                 })
                 .collect();
             let alias = "_t".to_string();
@@ -1697,6 +1713,9 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                         dialect.quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
                     ),
+                    SetOp::JsonbAppend { .. } => {
+                        panic!("jsonb append updates are not supported by mysql sqlgen")
+                    }
                 })
                 .collect();
             // The predicate is rendered over BARE columns so it is valid both in

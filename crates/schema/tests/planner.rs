@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
 use donat_ir::{
     BoolExp, CompareOp, FieldValue, MutationRoot, OrderByTarget, RootField, Scalar, SelectQuery,
+    SetOp,
 };
 use donat_metadata::Metadata;
 use donat_schema::{Plan, PlanError, Planner, Session, execute_introspection};
@@ -68,7 +69,7 @@ fn metadata() -> Metadata {
                         { "role": "s3", "permission": { "columns": ["id"], "filter": {} } }
                     ],
                     "update_permissions": [
-                        { "role": "user", "permission": { "columns": ["name"], "filter": {} } },
+                        { "role": "user", "permission": { "columns": ["name", "system_meta"], "filter": {} } },
                         { "role": "preset_user", "permission": {
                             "columns": ["name"], "filter": {}, "set": { "name": "preset" }
                         }}
@@ -147,6 +148,7 @@ fn catalog() -> Catalog {
                 col("name", "text"),
                 col("display_name", "text"),
                 col("secret", "text"),
+                col("system_meta", "jsonb"),
             ],
             primary_key: vec!["id".into()],
             foreign_keys: vec![],
@@ -366,6 +368,69 @@ fn insert_one_accepts_after_parent_object_relationship_data() {
         nested.columns,
         vec![("bio".to_string(), "text".to_string())]
     );
+}
+
+#[test]
+fn update_by_pk_accepts_jsonb_append_input() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          update_author_by_pk(
+            pk_columns: { id: 1 }
+            _append: { system_meta: { deleted: { by: "user-1" } } }
+          ) {
+            id
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("jsonb append update plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected mutation plan")
+    };
+    let [MutationRoot::Update { update, .. }] = roots.as_slice() else {
+        panic!("expected one update root, got {roots:?}")
+    };
+    assert!(
+        update.sets.iter().any(|op| matches!(
+            op,
+            SetOp::JsonbAppend { column, .. } if column == "system_meta"
+        )),
+        "{:?}",
+        update.sets
+    );
+}
+
+#[test]
+fn update_introspection_exposes_jsonb_append_input() {
+    let md = metadata();
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"
+        {
+          __type(name: "author_append_input") {
+            inputFields { name }
+          }
+        }
+        "#,
+    )
+    .expect("query parses")
+    .into_static();
+    let data = execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds");
+
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields array")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(fields, vec!["system_meta"]);
 }
 
 // ---------------------------------------------------------------------

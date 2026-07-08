@@ -479,6 +479,10 @@ pub enum SetOp {
         pg_type: String,
         value: Scalar,
     },
+    JsonbAppend {
+        column: String,
+        value: Scalar,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

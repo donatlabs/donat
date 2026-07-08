@@ -619,6 +619,33 @@ impl<'a> Planner<'a> {
                         });
                     }
                 }
+                (_, "_append") => {
+                    let map = value
+                        .as_object()
+                        .ok_or_else(|| PlanError::validation(path, "_append must be an object"))?;
+                    for (col, v) in map {
+                        if !allowed(col) {
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_append_input", ctx.type_name),
+                            ));
+                        }
+                        let db_col = ctx.column_db_name(col).unwrap();
+                        let info = ctx.info.column(&db_col).unwrap();
+                        if info.pg_type != "jsonb" {
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_append_input", ctx.type_name),
+                            ));
+                        }
+                        sets.push(SetOp::JsonbAppend {
+                            column: db_col.clone(),
+                            value: Scalar::Json(v.clone()),
+                        });
+                    }
+                }
                 (MutationKind::Update, "where") => {
                     saw_where = true;
                     user_where = Some(self.parse_bool_exp(&value, ctx, session, false, path)?);
@@ -686,7 +713,7 @@ impl<'a> Planner<'a> {
         if sets.is_empty() {
             return Err(PlanError::validation(
                 path,
-                "at least any one of _set, _inc is expected",
+                "at least any one of _set, _inc, _append is expected",
             ));
         }
 
