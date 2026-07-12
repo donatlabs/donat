@@ -338,6 +338,267 @@ impl From<SourceKind> for BackendId {
     }
 }
 
+/// Capabilities used to classify shared conformance cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseCapability {
+    Reads,
+    Transport,
+    Mutations,
+    Relationships,
+    Aggregates,
+    Json,
+    Geo,
+    Relay,
+    Regex,
+    Upsert,
+    Returning,
+    DistinctOn,
+    Lateral,
+    NestedInserts,
+}
+
+impl CaseCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reads => "reads",
+            Self::Transport => "transport",
+            Self::Mutations => "mutations",
+            Self::Relationships => "relationships",
+            Self::Aggregates => "aggregates",
+            Self::Json => "json",
+            Self::Geo => "geo",
+            Self::Relay => "relay",
+            Self::Regex => "regex",
+            Self::Upsert => "upsert",
+            Self::Returning => "returning",
+            Self::DistinctOn => "distinct-on",
+            Self::Lateral => "lateral",
+            Self::NestedInserts => "nested-inserts",
+        }
+    }
+
+    pub fn supported_by(self, backend: BackendId) -> bool {
+        let capabilities = backend.capabilities();
+        match self {
+            Self::Reads | Self::Transport => true,
+            Self::Mutations => capabilities.mutations,
+            Self::Relationships => capabilities.relationships,
+            Self::Aggregates => capabilities.aggregates,
+            Self::Json => {
+                capabilities.json_ops != donat_backend::capabilities::JsonOps::None
+            }
+            Self::Geo => capabilities.geo,
+            Self::Relay => capabilities.relay,
+            Self::Regex => capabilities.regex_ops,
+            Self::Upsert => {
+                capabilities.upsert != donat_backend::capabilities::UpsertKind::None
+            }
+            Self::Returning => capabilities.returning,
+            Self::DistinctOn => capabilities.distinct_on,
+            Self::Lateral => capabilities.lateral,
+            Self::NestedInserts => capabilities.nested_inserts,
+        }
+    }
+}
+
+/// A backend-specific difference that remains visible in the shared matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownDifference {
+    pub backend: BackendId,
+    pub reason: &'static str,
+    pub tracking: &'static str,
+}
+
+/// One single-sourced behavior case and the capabilities required to run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformanceCase {
+    pub name: &'static str,
+    pub requires: &'static [CaseCapability],
+    pub known_differences: &'static [KnownDifference],
+}
+
+impl ConformanceCase {
+    pub const fn new(name: &'static str, requires: &'static [CaseCapability]) -> Self {
+        Self {
+            name,
+            requires,
+            known_differences: &[],
+        }
+    }
+
+    pub const fn with_known_differences(
+        name: &'static str,
+        requires: &'static [CaseCapability],
+        known_differences: &'static [KnownDifference],
+    ) -> Self {
+        Self {
+            name,
+            requires,
+            known_differences,
+        }
+    }
+}
+
+/// Deterministic outcome counts emitted by one shared conformance group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaseSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub unsupported: usize,
+    pub known_differences: usize,
+    pub failed: usize,
+}
+
+/// Run every declared case exactly once for one backend.
+pub fn run_conformance_cases(
+    group: &'static str,
+    backend: BackendId,
+    cases: &'static [ConformanceCase],
+    mut run: impl FnMut(&'static str),
+) -> CaseSummary {
+    validate_case_manifest(group, cases);
+
+    let mut summary = CaseSummary {
+        total: cases.len(),
+        passed: 0,
+        unsupported: 0,
+        known_differences: 0,
+        failed: 0,
+    };
+    let mut first_failure: Option<Box<dyn std::any::Any + Send>> = None;
+
+    for case in cases {
+        let missing = case
+            .requires
+            .iter()
+            .copied()
+            .filter(|capability| !capability.supported_by(backend))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            summary.unsupported += 1;
+            let capabilities = missing
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "conformance backend={} group={group} case={} outcome=unsupported-by-capability capabilities={capabilities}",
+                backend.as_str(),
+                case.name
+            );
+            continue;
+        }
+
+        if let Some(difference) = case
+            .known_differences
+            .iter()
+            .find(|difference| difference.backend == backend)
+        {
+            summary.known_differences += 1;
+            eprintln!(
+                "conformance backend={} group={group} case={} outcome=known-diff reason={} tracking={}",
+                backend.as_str(),
+                case.name,
+                difference.reason,
+                difference.tracking
+            );
+            continue;
+        }
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(case.name))) {
+            Ok(()) => {
+                summary.passed += 1;
+                eprintln!(
+                    "conformance backend={} group={group} case={} outcome=passed",
+                    backend.as_str(),
+                    case.name
+                );
+            }
+            Err(failure) => {
+                summary.failed += 1;
+                eprintln!(
+                    "conformance backend={} group={group} case={} outcome=failed",
+                    backend.as_str(),
+                    case.name
+                );
+                if first_failure.is_none() {
+                    first_failure = Some(failure);
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "conformance backend={} group={group} total={} passed={} unsupported={} known-diff={} failed={}",
+        backend.as_str(),
+        summary.total,
+        summary.passed,
+        summary.unsupported,
+        summary.known_differences,
+        summary.failed
+    );
+
+    if let Some(failure) = first_failure {
+        std::panic::resume_unwind(failure);
+    }
+    summary
+}
+
+fn validate_case_manifest(group: &str, cases: &[ConformanceCase]) {
+    assert!(!group.trim().is_empty(), "conformance group name is empty");
+    assert!(!cases.is_empty(), "conformance group '{group}' has no cases");
+
+    for (case_index, case) in cases.iter().enumerate() {
+        assert!(
+            !case.name.trim().is_empty(),
+            "conformance group '{group}' has an empty case name"
+        );
+        assert!(
+            !cases[..case_index]
+                .iter()
+                .any(|existing| existing.name == case.name),
+            "conformance group '{group}' has duplicate case '{}'",
+            case.name
+        );
+        for (requirement_index, requirement) in case.requires.iter().enumerate() {
+            assert!(
+                !case.requires[..requirement_index].contains(requirement),
+                "conformance case '{group}/{}' repeats capability '{}'",
+                case.name,
+                requirement.as_str()
+            );
+        }
+        for (difference_index, difference) in case.known_differences.iter().enumerate() {
+            assert!(
+                !difference.reason.trim().is_empty(),
+                "known difference '{group}/{}' has no reason",
+                case.name
+            );
+            assert!(
+                !difference.tracking.trim().is_empty(),
+                "known difference '{group}/{}' has no tracking reference",
+                case.name
+            );
+            assert!(
+                !case.known_differences[..difference_index]
+                    .iter()
+                    .any(|existing| existing.backend == difference.backend),
+                "conformance case '{group}/{}' repeats known difference for backend '{}'",
+                case.name,
+                difference.backend.as_str()
+            );
+            assert!(
+                case.requires
+                    .iter()
+                    .all(|capability| capability.supported_by(difference.backend)),
+                "known difference '{group}/{}' hides an unsupported capability for backend '{}'",
+                case.name,
+                difference.backend.as_str()
+            );
+        }
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -346,6 +607,8 @@ fn workspace_root() -> PathBuf {
 }
 
 static BUILD_ENGINE: Once = Once::new();
+const ENGINE_HEALTH_DEADLINE: Duration = Duration::from_secs(30);
+const ENGINE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub fn engine_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DONAT_BIN") {
@@ -363,6 +626,14 @@ pub fn engine_binary() -> PathBuf {
         }
     });
     bin
+}
+
+fn engine_is_healthy(client: &reqwest::blocking::Client, base_url: &str) -> bool {
+    client
+        .get(format!("{base_url}/healthz"))
+        .timeout(ENGINE_HEALTH_PROBE_TIMEOUT)
+        .send()
+        .is_ok_and(|response| response.status().is_success())
 }
 
 pub fn pg_admin_url() -> String {
@@ -1829,7 +2100,7 @@ impl Running {
         }
         let child = cmd.spawn().expect("spawning donat");
 
-        let proc = EngineProc {
+        let mut proc = EngineProc {
             child,
             base_url: format!("http://127.0.0.1:{port}"),
             ws_base: format!("ws://127.0.0.1:{port}"),
@@ -1837,12 +2108,17 @@ impl Running {
         };
 
         // Wait healthy.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
         loop {
-            if let Ok(r) = self.http.get(format!("{}/healthz", proc.base_url)).send()
-                && r.status().is_success()
-            {
+            if engine_is_healthy(&self.http, &proc.base_url) {
                 break;
+            }
+            if let Some(status) = proc.child.try_wait().expect("checking donat process") {
+                panic!(
+                    "engine for suite {} exited before becoming healthy with {status}; see target/conformance-logs/{}.log",
+                    self.name,
+                    self.name
+                );
             }
             assert!(
                 Instant::now() < deadline,
@@ -2311,6 +2587,7 @@ fn strip_mcp_content(v: &Json) -> Json {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
 
     #[test]
     fn backend_registry_has_stable_ci_ids() {
@@ -2318,6 +2595,36 @@ mod tests {
             BackendId::ALL.map(BackendId::as_str),
             ["postgres", "sqlite", "mysql", "clickhouse"]
         );
+    }
+
+    #[test]
+    fn engine_health_probe_timeout_is_bounded_per_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("binding health test server");
+        let address = listener.local_addr().expect("health test address");
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accepting health probe");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("health probe did not time out promptly");
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        assert!(!engine_is_healthy(
+            &client,
+            &format!("http://{address}")
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "one health probe consumed the whole startup deadline"
+        );
+
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -2355,6 +2662,113 @@ mod tests {
         assert_eq!(BackendId::Sqlite.capabilities(), donat_backend::capabilities::sqlite());
         assert_eq!(BackendId::Mysql.capabilities(), donat_backend::capabilities::mysql());
         assert_eq!(BackendId::Clickhouse.capabilities(), donat_backend::capabilities::clickhouse());
+    }
+
+    #[test]
+    fn case_capabilities_follow_backend_registry() {
+        for backend in BackendId::ALL {
+            assert!(CaseCapability::Reads.supported_by(backend));
+            assert_eq!(
+                CaseCapability::Mutations.supported_by(backend),
+                backend.capabilities().mutations
+            );
+            assert_eq!(
+                CaseCapability::Relationships.supported_by(backend),
+                backend.capabilities().relationships
+            );
+            assert_eq!(
+                CaseCapability::Json.supported_by(backend),
+                backend.capabilities().json_ops != donat_backend::capabilities::JsonOps::None
+            );
+        }
+    }
+
+    #[test]
+    fn case_runner_counts_passed_unsupported_and_known_differences() {
+        const KNOWN_DIFFERENCES: &[KnownDifference] = &[KnownDifference {
+            backend: BackendId::Clickhouse,
+            reason: "tracked output difference",
+            tracking: "knowledgebase/multi-backend/decisions/006-mandatory-conformance-backend-matrix.md",
+        }];
+        const CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("read", &[CaseCapability::Reads]),
+            ConformanceCase::new("write", &[CaseCapability::Mutations]),
+            ConformanceCase::with_known_differences(
+                "known-difference",
+                &[CaseCapability::Reads],
+                KNOWN_DIFFERENCES,
+            ),
+        ];
+
+        let mut called = Vec::new();
+        let summary = run_conformance_cases(
+            "runner-unit",
+            BackendId::Clickhouse,
+            CASES,
+            |name| called.push(name),
+        );
+
+        assert_eq!(called, ["read"]);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.unsupported, 1);
+        assert_eq!(summary.known_differences, 1);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn case_runner_rejects_an_invalid_manifest() {
+        const DUPLICATE_CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("duplicate", &[CaseCapability::Reads]),
+            ConformanceCase::new("duplicate", &[CaseCapability::Reads]),
+        ];
+        assert!(
+            std::panic::catch_unwind(|| run_conformance_cases(
+                "duplicates",
+                BackendId::Postgres,
+                DUPLICATE_CASES,
+                |_| {}
+            ))
+            .is_err()
+        );
+
+        const UNTRACKED: &[KnownDifference] = &[KnownDifference {
+            backend: BackendId::Postgres,
+            reason: "",
+            tracking: "",
+        }];
+        const UNTRACKED_CASE: &[ConformanceCase] = &[ConformanceCase::with_known_differences(
+            "untracked",
+            &[CaseCapability::Reads],
+            UNTRACKED,
+        )];
+        assert!(
+            std::panic::catch_unwind(|| run_conformance_cases(
+                "untracked",
+                BackendId::Postgres,
+                UNTRACKED_CASE,
+                |_| {}
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_runner_records_all_failures_before_failing_the_test() {
+        const CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("first", &[CaseCapability::Reads]),
+            ConformanceCase::new("second", &[CaseCapability::Reads]),
+        ];
+        let mut called = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_conformance_cases("failures", BackendId::Postgres, CASES, |name| {
+                called.push(name);
+                panic!("failure in {name}");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(called, ["first", "second"]);
     }
 
     #[test]
@@ -2445,12 +2859,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, BackendId::ALL.map(BackendId::as_str));
+
+        assert_eq!(
+            workflow["jobs"]["backend-core"]["strategy"]["fail-fast"].as_bool(),
+            Some(false)
+        );
+        let steps = workflow["jobs"]["backend-core"]["steps"]
+            .as_sequence()
+            .expect("backend matrix steps");
+        let shared_command = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Shared backend contract"))
+            .and_then(|step| step["run"].as_str())
+            .expect("shared backend command");
+        assert!(
+            shared_command.contains("--test-threads=1 --nocapture"),
+            "shared backend summaries must be visible and deterministic: {shared_command}"
+        );
+        let postgres_command = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Full Postgres reference conformance"))
+            .and_then(|step| step["run"].as_str())
+            .expect("full Postgres conformance command");
+        assert!(
+            postgres_command.contains("--test-threads=4"),
+            "full Postgres conformance must use the reviewed parallelism: {postgres_command}"
+        );
+        assert_eq!(
+            workflow["jobs"]["backend-core-gate"]["name"].as_str(),
+            Some("Conformance matrix")
+        );
     }
 
     #[test]
     fn every_conformance_binary_is_classified() {
         const SHARED: &[&str] = &["backend_matrix"];
-        const BACKEND_SPECIFIC: &[&str] = &["clickhouse"];
+        const BACKEND_SPECIFIC: &[&str] = &[];
         const POSTGRES_REFERENCE: &[&str] = &[
             "actions",
             "agg_relay_introspection",
@@ -2472,10 +2916,23 @@ mod tests {
             "subscriptions",
         ];
 
-        let mut actual = std::fs::read_dir(workspace_root().join("crates/conformance/tests"))
+        let test_dir = workspace_root().join("crates/conformance/tests");
+        let test_files = std::fs::read_dir(&test_dir)
             .expect("reading conformance tests")
             .map(|entry| entry.expect("test entry").path())
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+            .collect::<Vec<_>>();
+        for path in &test_files {
+            let source = std::fs::read_to_string(path).expect("reading conformance test source");
+            assert!(
+                !source.contains("#[ignore"),
+                "ignored conformance cases are forbidden: {}",
+                path.strip_prefix(&test_dir).unwrap_or(path).display()
+            );
+        }
+
+        let mut actual = test_files
+            .into_iter()
             .map(|path| {
                 path.file_stem()
                     .and_then(|stem| stem.to_str())

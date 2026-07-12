@@ -21,7 +21,7 @@ jobs:
         run: cargo test --workspace --exclude donat-conformance
 
   backend-core:
-    name: Core reads (${{ matrix.backend }})
+    name: Shared conformance (${{ matrix.backend }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -68,17 +68,17 @@ jobs:
       - name: Matrix registry and manifest guards
         run: cargo test -p donat-conformance --lib
       - name: Shared backend contract
-        run: cargo test -p donat-conformance --test backend_matrix
+        run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=1 --nocapture
         env:
           RUST_BACKTRACE: "1"
       - name: Full Postgres reference conformance
         if: matrix.backend == 'postgres'
-        run: cargo test -p donat-conformance
+        run: cargo test -p donat-conformance -- --test-threads=4
         env:
           RUST_BACKTRACE: "1"
 
   backend-core-gate:
-    name: Core read matrix
+    name: Conformance matrix
     if: always()
     needs: backend-core
     runs-on: ubuntu-latest
