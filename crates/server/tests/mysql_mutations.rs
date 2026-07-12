@@ -164,7 +164,7 @@ async fn mysql_mutations_through_runtime() {
             insert_note(objects: [
                 { body: "first", owner: "alice" },
                 { body: "second", owner: "alice" }
-            ]) { affected_rows returning { id body __typename } }
+            ]) { returning { id body __typename } __typename affected_rows }
         }"#,
     )
     .await;
@@ -172,13 +172,23 @@ async fn mysql_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "insert_note": {
-            "affected_rows": 2,
             "returning": [
                 { "id": 1, "body": "first", "__typename": "note" },
                 { "id": 2, "body": "second", "__typename": "note" }
-            ]
+            ],
+            "__typename": "note_mutation_response",
+            "affected_rows": 2
         }}}),
         "unexpected insert body: {body}"
+    );
+    assert_eq!(
+        body["data"]["insert_note"]
+            .as_object()
+            .expect("insert response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["returning", "__typename", "affected_rows"]
     );
 
     // 2. Single-row mutation output uses the same ordered node assembler and

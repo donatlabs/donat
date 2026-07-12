@@ -1247,6 +1247,22 @@ impl Running {
         });
     }
 
+    pub fn add_insert_permission_document(&self, table_name: &str, role: &str, document: Json) {
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: table_name.to_string(),
+        };
+        let permission: InsertPermission =
+            serde_json::from_value(document).expect("fixture insert permission");
+        self.with_table(&table, |entry| {
+            entry.insert_permissions.push(PermissionEntry {
+                role: role.to_string(),
+                permission,
+                comment: None,
+            });
+        });
+    }
+
     pub fn add_relationship(
         &self,
         local_table: &str,

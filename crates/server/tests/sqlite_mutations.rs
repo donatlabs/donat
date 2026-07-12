@@ -143,7 +143,7 @@ async fn sqlite_mutations_through_runtime() {
             insert_note(objects: [
                 { id: 1, body: "first", owner: "alice" },
                 { id: 2, body: "second", owner: "alice" }
-            ]) { affected_rows returning { id body } }
+            ]) { returning { id body } __typename affected_rows }
         }"#,
     )
     .await;
@@ -151,13 +151,23 @@ async fn sqlite_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "insert_note": {
-            "affected_rows": 2,
             "returning": [
                 { "id": 1, "body": "first" },
                 { "id": 2, "body": "second" }
-            ]
+            ],
+            "__typename": "note_mutation_response",
+            "affected_rows": 2
         }}}),
         "unexpected insert body: {body}"
+    );
+    assert_eq!(
+        body["data"]["insert_note"]
+            .as_object()
+            .expect("insert response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["returning", "__typename", "affected_rows"]
     );
 
     // 2. Single-row output returns the node directly and preserves typename.

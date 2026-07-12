@@ -292,7 +292,7 @@ impl AppState {
         &self,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, SqliteMutationError> {
-        use donat_sqlgen::SqliteMutationPlan;
+        use donat_sqlgen::{MutationResponseSlot, SqliteMutationPlan};
 
         // Plan every root up front (alias + SQLite mutation plan), preserving
         // selection order for the response map.
@@ -380,17 +380,21 @@ impl AppState {
                     continue;
                 }
 
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres `Plan::Mutation` response shape.
+                // Assemble this root's response object in GraphQL selection order.
                 let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                let returning_value = Json::Array(returning);
+                for slot in &plan.response_slots {
+                    match slot {
+                        MutationResponseSlot::Returning { alias } => {
+                            obj.insert(alias.clone(), returning_value.clone());
+                        }
+                        MutationResponseSlot::AffectedRows { alias } => {
+                            obj.insert(alias.clone(), Json::from(affected_rows));
+                        }
+                        MutationResponseSlot::Typename { alias, value } => {
+                            obj.insert(alias.clone(), Json::String(value.clone()));
+                        }
+                    }
                 }
                 data.insert(alias.clone(), Json::Object(obj));
             }
@@ -417,7 +421,7 @@ impl AppState {
         &self,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
-        use donat_sqlgen::{MySqlMutationKind, MySqlMutationPlan};
+        use donat_sqlgen::{MutationResponseSlot, MySqlMutationKind, MySqlMutationPlan};
         use mysql::prelude::Queryable;
 
         // Plan every root up front (alias + MySQL mutation plan), resolving each
@@ -592,17 +596,21 @@ impl AppState {
                     continue;
                 }
 
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres/SQLite `Plan::Mutation` response shape.
+                // Assemble this root's response object in GraphQL selection order.
                 let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                let returning_value = Json::Array(returning);
+                for slot in &plan.response_slots {
+                    match slot {
+                        MutationResponseSlot::Returning { alias } => {
+                            obj.insert(alias.clone(), returning_value.clone());
+                        }
+                        MutationResponseSlot::AffectedRows { alias } => {
+                            obj.insert(alias.clone(), Json::from(affected_rows));
+                        }
+                        MutationResponseSlot::Typename { alias, value } => {
+                            obj.insert(alias.clone(), Json::String(value.clone()));
+                        }
+                    }
                 }
                 data.insert(alias.clone(), Json::Object(obj));
             }

@@ -424,7 +424,10 @@ impl Ctx {
                                     self.dialect,
                                     donat_backend::AnyDialect::Clickhouse(_)
                                 ) {
-                                    format!("{op}OrNull({expr})")
+                                    format!(
+                                        "{}OrNull({expr})",
+                                        clickhouse_aggregate_function(op)
+                                    )
                                 } else {
                                     format!("{op}({expr})")
                                 };
@@ -1134,6 +1137,18 @@ fn mutation_to_sql_full(
 // SQLite mutation path (M4 carve-out, see ADR 003)
 // ---------------------------------------------------------------------
 
+/// A selected field in a Rust-assembled mutation response object.
+///
+/// SQLite and MySQL cannot use the Postgres in-database mutation response
+/// assembly path, so their executors retain these slots to preserve GraphQL
+/// selection order exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationResponseSlot {
+    Returning { alias: String },
+    AffectedRows { alias: String },
+    Typename { alias: String, value: String },
+}
+
 /// A planned SQLite mutation: one TOP-LEVEL DML statement whose RETURNING
 /// clause yields, per affected row, a `node` JSON object (built from BARE
 /// column names — SQLite RETURNING cannot reference an alias-qualified or
@@ -1149,12 +1164,8 @@ pub struct SqliteMutationPlan {
     /// Whether the GraphQL root returns one node directly instead of a
     /// response object containing a `returning` array.
     pub single_row_output: bool,
-    /// Response key for the `returning` array, when the selection asked for it.
-    pub returning_alias: Option<String>,
-    /// Response key for `affected_rows`, when selected.
-    pub affected_rows_alias: Option<String>,
-    /// `(alias, value)` for a `__typename` field on the mutation response.
-    pub typename: Option<(String, String)>,
+    /// Selected mutation response fields in GraphQL selection order.
+    pub response_slots: Vec<MutationResponseSlot>,
     /// `(alias, value)` when the root is a `__typename` mutation root itself.
     pub root_typename: Option<(String, String)>,
     /// Error path reported on a check violation (carried into the executor's
@@ -1177,9 +1188,7 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
             single_row_output: false,
-            returning_alias: None,
-            affected_rows_alias: None,
-            typename: None,
+            response_slots: vec![],
             root_typename: Some((String::new(), value.clone())),
             check_path: "$".into(),
         },
@@ -1301,11 +1310,8 @@ impl Ctx {
         check_path: &str,
         output: &MutationOutput,
     ) -> SqliteMutationPlan {
-        let dialect = self.dialect;
         let single_row_output = matches!(output, MutationOutput::SingleRow(_));
-        let mut returning_alias = None;
-        let mut affected_rows_alias = None;
-        let mut typename = None;
+        let mut response_slots = vec![];
         // Determine the node fields (the per-row `returning { ... }` selection).
         // A SingleRow output (`insert_one` / `_by_pk`) also produces a node.
         let node_fields: Vec<OutputField> = match output {
@@ -1314,13 +1320,20 @@ impl Ctx {
                 for f in fields {
                     match f {
                         MutationResponseField::AffectedRows { alias } => {
-                            affected_rows_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::AffectedRows {
+                                alias: alias.clone(),
+                            });
                         }
                         MutationResponseField::Typename { alias, value } => {
-                            typename = Some((alias.clone(), value.clone()));
+                            response_slots.push(MutationResponseSlot::Typename {
+                                alias: alias.clone(),
+                                value: value.clone(),
+                            });
                         }
                         MutationResponseField::Returning { alias, fields } => {
-                            returning_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::Returning {
+                                alias: alias.clone(),
+                            });
                             node_fields = fields.clone();
                         }
                     }
@@ -1331,7 +1344,6 @@ impl Ctx {
                 // `insert_<t>_one` / `_by_pk`: the row itself is the node;
                 // there is no affected_rows. The executor folds the returned
                 // row and emits it directly when `single_row_output` is set.
-                returning_alias = Some("returning".to_string());
                 fields.clone()
             }
         };
@@ -1340,20 +1352,17 @@ impl Ctx {
         let violated = match check {
             Some(check) => {
                 format!(
-                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    "CASE WHEN ({}) THEN 0 ELSE 1 END",
                     self.sqlite_bare_bool(check)
                 )
             }
             None => "0".to_string(),
         };
-        let _ = dialect;
         let dml_sql = format!("{dml} RETURNING {node_expr} AS node, {violated} AS violated");
         SqliteMutationPlan {
             dml_sql,
             single_row_output,
-            returning_alias,
-            affected_rows_alias,
-            typename,
+            response_slots,
             root_typename: None,
             check_path: check_path.to_string(),
         }
@@ -1537,12 +1546,8 @@ pub struct MySqlMutationPlan {
     pub companion_select: String,
     /// Recovery strategy + companion-`WHERE` building blocks.
     pub kind: MySqlMutationKind,
-    /// Response key for the `returning` array, when selected.
-    pub returning_alias: Option<String>,
-    /// Response key for `affected_rows`, when selected.
-    pub affected_rows_alias: Option<String>,
-    /// `(alias, value)` for a `__typename` field on the mutation response.
-    pub typename: Option<(String, String)>,
+    /// Selected mutation response fields in GraphQL selection order.
+    pub response_slots: Vec<MutationResponseSlot>,
     /// `(alias, value)` when the root is a `__typename` mutation root itself.
     pub root_typename: Option<(String, String)>,
     /// Error path reported on a check violation.
@@ -1568,9 +1573,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
             single_row_output: false,
             companion_select: String::new(),
             kind: MySqlMutationKind::Typename,
-            returning_alias: None,
-            affected_rows_alias: None,
-            typename: None,
+            response_slots: vec![],
             root_typename: Some((String::new(), value.clone())),
             check_path: "$".into(),
         },
@@ -1656,9 +1659,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                     pk_col,
                     pk_in_predicate,
                 },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: insert.check_path.clone(),
             }
@@ -1708,9 +1709,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Update { where_clause },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: update.check_path.clone(),
             }
@@ -1732,9 +1731,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Delete { where_clause },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: "$".into(),
             }
@@ -1746,9 +1743,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
 struct MySqlCompanion {
     select: String,
     single_row_output: bool,
-    returning_alias: Option<String>,
-    affected_rows_alias: Option<String>,
-    typename: Option<(String, String)>,
+    response_slots: Vec<MutationResponseSlot>,
 }
 
 impl Ctx {
@@ -1765,38 +1760,40 @@ impl Ctx {
         output: &MutationOutput,
     ) -> MySqlCompanion {
         let single_row_output = matches!(output, MutationOutput::SingleRow(_));
-        let mut returning_alias = None;
-        let mut affected_rows_alias = None;
-        let mut typename = None;
+        let mut response_slots = vec![];
         let node_fields: Vec<OutputField> = match output {
             MutationOutput::Response(fields) => {
                 let mut node_fields = vec![];
                 for f in fields {
                     match f {
                         MutationResponseField::AffectedRows { alias } => {
-                            affected_rows_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::AffectedRows {
+                                alias: alias.clone(),
+                            });
                         }
                         MutationResponseField::Typename { alias, value } => {
-                            typename = Some((alias.clone(), value.clone()));
+                            response_slots.push(MutationResponseSlot::Typename {
+                                alias: alias.clone(),
+                                value: value.clone(),
+                            });
                         }
                         MutationResponseField::Returning { alias, fields } => {
-                            returning_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::Returning {
+                                alias: alias.clone(),
+                            });
                             node_fields = fields.clone();
                         }
                     }
                 }
                 node_fields
             }
-            MutationOutput::SingleRow(fields) => {
-                returning_alias = Some("returning".to_string());
-                fields.clone()
-            }
+            MutationOutput::SingleRow(fields) => fields.clone(),
         };
         let node_expr = self.sqlite_node_json(&node_fields);
         let violated = match check {
             Some(check) => {
                 format!(
-                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    "CASE WHEN ({}) THEN 0 ELSE 1 END",
                     self.sqlite_bare_bool(check)
                 )
             }
@@ -1805,9 +1802,7 @@ impl Ctx {
         MySqlCompanion {
             select: format!("SELECT {node_expr} AS node, {violated} AS violated FROM {table}"),
             single_row_output,
-            returning_alias,
-            affected_rows_alias,
-            typename,
+            response_slots,
         }
     }
 
@@ -1867,7 +1862,7 @@ impl Ctx {
         let guarded = match check {
             Some(check) => {
                 let violated = format!(
-                    "(SELECT count(*) FROM {cte_ident} WHERE NOT ({}))",
+                    "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
                     self.bool_exp(check, cte, cte)
                 );
                 // The message carries the GraphQL error path as JSON; the
@@ -2035,6 +2030,14 @@ fn typename_literal(dialect: &donat_backend::AnyDialect, value: &str) -> String 
         }
         donat_backend::AnyDialect::Sqlite(_) => literal,
         donat_backend::AnyDialect::Mysql(_) => format!("JSON_QUOTE(CAST({literal} AS CHAR))"),
+    }
+}
+
+fn clickhouse_aggregate_function(op: &str) -> &str {
+    match op {
+        "stddev" => "stddev_samp",
+        "variance" => "var_samp",
+        other => other,
     }
 }
 
@@ -2367,5 +2370,67 @@ mod dialect_dispatch_tests {
         assert!(!sql.contains("::text"), "Postgres cast leaked: {sql}");
         assert!(sql.contains("query_root"), "root typename missing: {sql}");
         assert!(sql.contains("author"), "row typename missing: {sql}");
+    }
+
+    #[test]
+    fn clickhouse_uses_supported_statistical_aggregate_names() {
+        let fields = [
+            "stddev",
+            "stddev_samp",
+            "stddev_pop",
+            "variance",
+            "var_samp",
+            "var_pop",
+        ]
+        .into_iter()
+        .map(|op| AggregateField {
+            alias: op.to_string(),
+            op: AggregateOp::ColumnOp {
+                op: op.to_string(),
+                columns: vec![AggregateColumn {
+                    alias: "id".into(),
+                    column: "id".into(),
+                    pg_type: "int4".into(),
+                    guard: None,
+                }],
+            },
+        })
+        .collect();
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "analytics".into(),
+                name: "author".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "aggregate".into(),
+                value: FieldValue::Aggregate { fields },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "author_aggregate".into(),
+                query,
+            }],
+            AnyDialect::Clickhouse(ClickhouseDialect),
+        );
+
+        for function in [
+            "stddev_sampOrNull",
+            "stddev_popOrNull",
+            "var_sampOrNull",
+            "var_popOrNull",
+        ] {
+            assert!(sql.contains(function), "missing {function}: {sql}");
+        }
+        assert!(!sql.contains("stddevOrNull"), "unsupported function: {sql}");
+        assert!(!sql.contains("varianceOrNull"), "unsupported function: {sql}");
     }
 }

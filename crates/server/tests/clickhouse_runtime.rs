@@ -55,7 +55,11 @@ fn metadata_for(url: &str, database: &str, mutations: bool) -> Metadata {
                 "configuration": { "custom_name": "author" },
                 "select_permissions": [{
                     "role": "user",
-                    "permission": { "columns": "*", "filter": {} }
+                    "permission": {
+                        "columns": "*",
+                        "filter": {},
+                        "allow_aggregations": true
+                    }
                 }],
                 "insert_permissions": insert_permissions
             }]
@@ -293,7 +297,6 @@ async fn clickhouse_source_is_introspected_and_queried_once() {
         &HeaderMap::new(),
     )
     .await;
-
     assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
     assert_eq!(
         body,
@@ -362,6 +365,43 @@ async fn clickhouse_real_server_when_configured() {
         &HeaderMap::new(),
     )
     .await;
+    let (aggregate_status, aggregate_body) = gql::execute_full(
+        &state,
+        &session(),
+        &json!({ "query": r#"{
+            author_aggregate {
+                aggregate {
+                    sum { id }
+                    avg { id }
+                    max { id }
+                    min { id }
+                    stddev { id }
+                    stddev_samp { id }
+                    stddev_pop { id }
+                    variance { id }
+                    var_samp { id }
+                    var_pop { id }
+                }
+            }
+            empty: author_aggregate(where: {id: {_gt: 100}}) {
+                aggregate {
+                    sum { id }
+                    avg { id }
+                    max { id }
+                    min { id }
+                    stddev { id }
+                    stddev_samp { id }
+                    stddev_pop { id }
+                    variance { id }
+                    var_samp { id }
+                    var_pop { id }
+                }
+            }
+        }"# }),
+        false,
+        &HeaderMap::new(),
+    )
+    .await;
 
     let cleanup = client
         .post(&url)
@@ -379,4 +419,39 @@ async fn clickhouse_real_server_when_configured() {
             { "id": 1, "name": "Alice" }
         ]}})
     );
+    assert_eq!(
+        aggregate_status,
+        axum::http::StatusCode::OK,
+        "body: {aggregate_body}"
+    );
+    assert!(
+        aggregate_body.get("errors").is_none(),
+        "aggregate query failed: {aggregate_body}"
+    );
+    let aggregate = &aggregate_body["data"]["author_aggregate"]["aggregate"];
+    for (op, expected) in [
+        ("sum", 3.0),
+        ("avg", 1.5),
+        ("max", 2.0),
+        ("min", 1.0),
+        ("stddev", std::f64::consts::FRAC_1_SQRT_2),
+        ("stddev_samp", std::f64::consts::FRAC_1_SQRT_2),
+        ("stddev_pop", 0.5),
+        ("variance", 0.5),
+        ("var_samp", 0.5),
+        ("var_pop", 0.25),
+    ] {
+        let actual = aggregate[op]["id"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("missing numeric {op}: {aggregate_body}"));
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "unexpected {op}: {actual}"
+        );
+        assert_eq!(
+            aggregate_body["data"]["empty"]["aggregate"][op]["id"],
+            serde_json::Value::Null,
+            "empty {op} must be null: {aggregate_body}"
+        );
+    }
 }

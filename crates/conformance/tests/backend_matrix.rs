@@ -21,7 +21,10 @@ const CORE_READ_CASES: &[ConformanceCase] = &[
         &[CaseCapability::Reads, CaseCapability::Relationships],
     ),
     ConformanceCase::new("scalar-boundaries", &[CaseCapability::Reads]),
-    ConformanceCase::new("nullable-and-empty-results", &[CaseCapability::Reads]),
+    ConformanceCase::new(
+        "nullable-and-empty-results",
+        &[CaseCapability::Reads, CaseCapability::Aggregates],
+    ),
     ConformanceCase::new(
         "json-and-null",
         &[CaseCapability::Reads, CaseCapability::Json],
@@ -43,6 +46,7 @@ const CORE_MUTATION_CASES: &[ConformanceCase] = &[
     ConformanceCase::new("update", &[CaseCapability::Mutations]),
     ConformanceCase::new("delete", &[CaseCapability::Mutations]),
     ConformanceCase::new("read-after-write", &[CaseCapability::Mutations]),
+    ConformanceCase::new("nullable-check-rollback", &[CaseCapability::Mutations]),
 ];
 
 const TRANSPORT_ROLE_CASES: &[ConformanceCase] = &[
@@ -156,6 +160,21 @@ const STRINGIFIED_NUMBER_COLUMNS: &[FixtureColumn] = &[
     FixtureColumn {
         name: "amount",
         ty: FixtureColumnType::BigInt,
+        nullable: true,
+        primary_key: false,
+    },
+];
+
+const SECURE_NOTE_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "owner",
+        ty: FixtureColumnType::Text,
         nullable: true,
         primary_key: false,
     },
@@ -922,6 +941,23 @@ fn core_mutation_contract() {
             allow_aggregations: false,
             mutations: true,
         });
+        suite.install_table(&TableFixture {
+            name: "secure_note",
+            columns: SECURE_NOTE_COLUMNS,
+            rows: vec![],
+            role: "fixture_owner",
+            allow_aggregations: false,
+            mutations: false,
+        });
+        suite.add_select_permission("secure_note", "user", json!("*"), json!({}), false);
+        suite.add_insert_permission_document(
+            "secure_note",
+            "user",
+            json!({
+                "columns": ["id", "owner"],
+                "check": { "owner": { "_eq": "X-Donat-User-Id" } }
+            }),
+        );
         suite
     });
 
@@ -980,6 +1016,37 @@ fn core_mutation_contract() {
                     post(suite, "{ note(order_by: {id: asc}) { id name } }"),
                     json!({ "data": { "note": [{ "id": 1, "name": "edited" }] } })
                 ),
+                "nullable-check-rollback" => {
+                    for query in [
+                        "mutation { insert_secure_note(objects: [{id: 1}]) { affected_rows } }",
+                        "mutation { insert_secure_note(objects: [{id: 2, owner: null}]) { affected_rows } }",
+                        "mutation { insert_secure_note(objects: [{id: 3, owner: \"alice\"}, {id: 4}]) { affected_rows } }",
+                    ] {
+                        let (status, body) = suite.post(
+                            "/v1/graphql",
+                            &json!({ "query": query }),
+                            &[
+                                ("X-Donat-Role".to_string(), "user".to_string()),
+                                ("X-Donat-User-Id".to_string(), "alice".to_string()),
+                            ],
+                        );
+                        assert_eq!(status, 200, "{body}");
+                        assert_eq!(
+                            body,
+                            json!({ "errors": [{
+                                "extensions": {
+                                    "path": "$.selectionSet.insert_secure_note.args.objects",
+                                    "code": "permission-error"
+                                },
+                                "message": "check constraint of an insert/update permission has failed"
+                            }]})
+                        );
+                        assert_eq!(
+                            post(suite, "{ secure_note { id owner } }"),
+                            json!({ "data": { "secure_note": [] } })
+                        );
+                    }
+                }
                 unknown => panic!("unimplemented core mutation case '{unknown}'"),
             }
         },
