@@ -23,9 +23,10 @@ response:
   result:
     isError: false
     structuredContent:
-    - id: 1
-      name: Rex
-    - id: 2
-      name: Milo
-    - id: 3
-      name: Luna
+      rows:
+      - id: 1
+        name: Rex
+      - id: 2
+        name: Milo
+      - id: 3
+        name: Luna

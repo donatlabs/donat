@@ -24,4 +24,5 @@ response:
   id: 36
   result:
     isError: false
-    structuredContent: []
+    structuredContent:
+      rows: []

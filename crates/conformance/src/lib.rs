@@ -1920,6 +1920,25 @@ impl Running {
     /// the harness never depends on the runtime admin API. All other paths
     /// (graphql, relay, ...) reach the engine.
     pub fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
+        self.post_inner(path, body, headers, true)
+    }
+
+    pub fn post_without_mcp_protocol(
+        &self,
+        path: &str,
+        body: &Json,
+        headers: &[(String, String)],
+    ) -> (u16, Json) {
+        self.post_inner(path, body, headers, false)
+    }
+
+    fn post_inner(
+        &self,
+        path: &str,
+        body: &Json,
+        headers: &[(String, String)],
+        add_mcp_protocol: bool,
+    ) -> (u16, Json) {
         if path == "/v1/query" || path == "/v2/query" || path == "/v1/metadata" {
             // Admin-API paths are applied in-harness rather than POSTed.
             // Before the engine starts they accumulate into the boot
@@ -1939,6 +1958,16 @@ impl Running {
             .any(|(k, _)| k.eq_ignore_ascii_case("accept"));
         if path == "/mcp" && !has_accept {
             req = req.header("Accept", "application/json, text/event-stream");
+        }
+        let has_protocol = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("MCP-Protocol-Version"));
+        if path == "/mcp"
+            && add_mcp_protocol
+            && !has_protocol
+            && body.get("method").and_then(Json::as_str) != Some("initialize")
+        {
+            req = req.header("MCP-Protocol-Version", "2025-06-18");
         }
         for (k, v) in headers {
             req = req.header(k, v);

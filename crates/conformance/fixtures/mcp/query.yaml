@@ -24,9 +24,10 @@ response:
   result:
     isError: false
     structuredContent:
-    - id: 1
-      name: Rex
-      status: available
-    - id: 2
-      name: Milo
-      status: pending
+      rows:
+      - id: 1
+        name: Rex
+        status: available
+      - id: 2
+        name: Milo
+        status: pending

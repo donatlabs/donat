@@ -524,7 +524,15 @@ pub async fn dispatch(
     }
 
     match json_rpc_non_request_message(&req) {
-        Ok(true) => return mcp_empty_response(StatusCode::ACCEPTED),
+        Ok(true) => {
+            if !headers.contains_key(MCP_PROTOCOL_VERSION_HEADER) {
+                return mcp_json_response(
+                    StatusCode::BAD_REQUEST,
+                    rpc_error(Json::Null, -32602, "missing MCP protocol version header"),
+                );
+            }
+            return mcp_empty_response(StatusCode::ACCEPTED);
+        }
         Ok(false) => {}
         Err(msg) => {
             return mcp_json_response(StatusCode::BAD_REQUEST, rpc_error(Json::Null, -32600, &msg));
@@ -551,6 +559,13 @@ pub async fn dispatch(
             return mcp_json_response(StatusCode::OK, rpc_error(id, -32600, &msg));
         }
     };
+
+    if method != "initialize" && !headers.contains_key(MCP_PROTOCOL_VERSION_HEADER) {
+        return mcp_json_response(
+            StatusCode::BAD_REQUEST,
+            rpc_error(Json::Null, -32602, "missing MCP protocol version header"),
+        );
+    }
 
     match method {
         "ping" => {
@@ -2396,10 +2411,18 @@ fn describe_table_output_schema() -> Json {
 
 fn query_output_schema() -> Json {
     json!({
+        "type": "object",
         "oneOf": [
             {
-                "type": "array",
-                "items": { "type": "object", "additionalProperties": true }
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": { "type": "object", "additionalProperties": true }
+                    }
+                },
+                "required": ["rows"],
+                "additionalProperties": false
             },
             error_structured_content_schema()
         ]
@@ -2408,6 +2431,7 @@ fn query_output_schema() -> Json {
 
 fn mutation_output_schema() -> Json {
     json!({
+        "type": "object",
         "oneOf": [
             {
                 "type": "object",
@@ -2540,7 +2564,13 @@ async fn call_tool(
                 Ok(args) => args,
                 Err(msg) => return tool_err(msg, None),
             };
-            crud_tool(state, session, headers, &args, build_query_gql).await
+            let mut result = crud_tool(state, session, headers, &args, build_query_gql).await;
+            if result.get("isError") == Some(&Json::Bool(false)) {
+                if let Some(rows) = result.get_mut("structuredContent").map(Json::take) {
+                    result["structuredContent"] = json!({ "rows": rows });
+                }
+            }
+            result
         }
         "insert" => {
             let args = match tool_arguments(params, &["table", "objects", "returning"]) {
@@ -8527,6 +8557,11 @@ mod tests {
         let defs = tool_defs();
         let tools = defs.as_array().unwrap();
         assert!(tools.iter().all(|tool| tool.get("outputSchema").is_some()));
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["outputSchema"]["type"] == json!("object"))
+        );
 
         let list_tables = tools
             .iter()
@@ -8570,7 +8605,11 @@ mod tests {
         );
 
         let query = tools.iter().find(|tool| tool["name"] == "query").unwrap();
-        assert_eq!(query["outputSchema"]["oneOf"][0]["type"], json!("array"));
+        assert_eq!(query["outputSchema"]["oneOf"][0]["type"], json!("object"));
+        assert_eq!(
+            query["outputSchema"]["oneOf"][0]["required"],
+            json!(["rows"])
+        );
         assert_eq!(
             query["outputSchema"]["oneOf"][1]["required"],
             json!(["errors"])
