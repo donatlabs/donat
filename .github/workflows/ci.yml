@@ -65,6 +65,8 @@ jobs:
           exit 1
       - name: Build engine
         run: cargo build -p donat-server --bin donat
+      - name: Matrix registry and manifest guards
+        run: cargo test -p donat-conformance --lib
       - name: Shared backend contract
         run: cargo test -p donat-conformance --test backend_matrix
         env:

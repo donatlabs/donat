@@ -2352,6 +2352,59 @@ mod tests {
         assert_eq!(actual, BackendId::ALL.map(BackendId::as_str));
     }
 
+    #[test]
+    fn every_conformance_binary_is_classified() {
+        const SHARED: &[&str] = &["backend_matrix"];
+        const BACKEND_SPECIFIC: &[&str] = &["clickhouse"];
+        const POSTGRES_REFERENCE: &[&str] = &[
+            "actions",
+            "agg_relay_introspection",
+            "auth_env",
+            "cron_triggers",
+            "enabled_apis",
+            "event_triggers",
+            "graphql_mutations",
+            "graphql_queries",
+            "introspection_descriptions",
+            "jwk",
+            "jwt",
+            "mcp_tools",
+            "migrate",
+            "remote_schemas",
+            "rest_endpoints",
+            "roles_inheritance",
+            "security",
+            "subscriptions",
+        ];
+
+        let mut actual = std::fs::read_dir(workspace_root().join("crates/conformance/tests"))
+            .expect("reading conformance tests")
+            .map(|entry| entry.expect("test entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+            .map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("UTF-8 test filename")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut classified = SHARED
+            .iter()
+            .chain(BACKEND_SPECIFIC)
+            .chain(POSTGRES_REFERENCE)
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        classified.sort();
+        assert_eq!(actual, classified, "unclassified conformance test binary");
+        eprintln!(
+            "conformance manifest: {} shared / {} backend-specific / {} postgres-reference",
+            SHARED.len(),
+            BACKEND_SPECIFIC.len(),
+            POSTGRES_REFERENCE.len()
+        );
+    }
+
     // ---------------------------------------------------- load_fixture
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
