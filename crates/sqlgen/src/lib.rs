@@ -607,26 +607,7 @@ impl Ctx {
                         format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                     }
                     FieldValue::Column { column, pg_type } => {
-                        let col = qualified(table_alias, column);
-                        match pg_type.as_str() {
-                            // Donat renders geometry as GeoJSON with the
-                            // long CRS form (options bit 4).
-                            "geometry" | "geography" => {
-                                format!("ST_AsGeoJSON({col}, 15, 4)::json")
-                            }
-                            "int8" | "numeric" if self.stringify_numerics => {
-                                format!("({col})::text")
-                            }
-                            "json"
-                                if matches!(
-                                    self.dialect,
-                                    donat_backend::AnyDialect::Sqlite(_)
-                                ) =>
-                            {
-                                format!("json({col})")
-                            }
-                            _ => col,
-                        }
+                        self.column_output(table_alias, column, pg_type)
                     }
                     FieldValue::Typename { value } => typename_literal(&dialect, value),
                     FieldValue::Object { query, join } => {
@@ -682,11 +663,17 @@ impl Ctx {
     /// Column output expression with type-specific casts.
     fn column_output(&mut self, table_alias: &str, column: &str, pg_type: &str) -> String {
         let col = qualified(table_alias, column);
+        if matches!(self.dialect, donat_backend::AnyDialect::Mysql(_)) {
+            return mysql_json_column(&col, pg_type, self.stringify_numerics);
+        }
         match pg_type {
             "geometry" | "geography" => format!("ST_AsGeoJSON({col}, 15, 4)::json"),
             "int8" | "numeric" if self.stringify_numerics => format!("({col})::text"),
+            "bool" if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) => {
+                sqlite_json_column(&col, pg_type)
+            }
             "json" if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) => {
-                format!("json({col})")
+                sqlite_json_column(&col, pg_type)
             }
             _ => col,
         }
@@ -1354,13 +1341,25 @@ impl Ctx {
             .iter()
             .map(|f| {
                 let value = match &f.value {
-                    FieldValue::Column { column, .. } => dialect.quote_ident(column),
-                    FieldValue::ColumnGuarded { column, guard, .. } => {
+                    FieldValue::Column { column, pg_type } => match dialect {
+                        donat_backend::AnyDialect::Mysql(_) => {
+                            mysql_json_column(&dialect.quote_ident(column), pg_type, false)
+                        }
+                        _ => sqlite_json_column(&dialect.quote_ident(column), pg_type),
+                    },
+                    FieldValue::ColumnGuarded {
+                        column,
+                        pg_type,
+                        guard,
+                    } => {
                         let cond = self.sqlite_bare_bool(guard);
-                        format!(
-                            "CASE WHEN {cond} THEN {} ELSE NULL END",
-                            dialect.quote_ident(column)
-                        )
+                        let col = match dialect {
+                            donat_backend::AnyDialect::Mysql(_) => {
+                                mysql_json_column(&dialect.quote_ident(column), pg_type, false)
+                            }
+                            _ => sqlite_json_column(&dialect.quote_ident(column), pg_type),
+                        };
+                        format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                     }
                     FieldValue::Typename { value } => dialect.quote_literal(value),
                     other => panic!(
@@ -1873,6 +1872,32 @@ fn qualified(alias: &str, column: &str) -> String {
     format!("{}.{}", quote_ident(alias), quote_ident(column))
 }
 
+fn sqlite_json_column(expression: &str, pg_type: &str) -> String {
+    match pg_type {
+        "bool" => format!(
+            "CASE WHEN {expression} IS NULL THEN NULL WHEN {expression} THEN json('true') ELSE json('false') END"
+        ),
+        "json" => format!("json({expression})"),
+        _ => expression.to_string(),
+    }
+}
+
+fn mysql_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
+    match pg_type {
+        "bool" => format!(
+            "CASE WHEN {expression} IS NULL THEN NULL WHEN {expression} THEN 'true' ELSE 'false' END"
+        ),
+        "int8" | "numeric" if stringify_numerics => {
+            format!("JSON_QUOTE(CAST({expression} AS CHAR))")
+        }
+        "text" | "varchar" | "bpchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "time"
+        | "bytea" | "inet" | "citext" => {
+            format!("JSON_QUOTE(CAST({expression} AS CHAR))")
+        }
+        _ => format!("CAST({expression} AS CHAR)"),
+    }
+}
+
 pub fn quote_ident(ident: &str) -> String {
     use donat_backend::Dialect;
     donat_backend::PostgresDialect.quote_ident(ident)
@@ -1915,14 +1940,17 @@ fn typename_literal(dialect: &donat_backend::AnyDialect, value: &str) -> String 
     match dialect {
         donat_backend::AnyDialect::Postgres(_) => format!("{literal}::text"),
         donat_backend::AnyDialect::Clickhouse(_) => format!("CAST({literal} AS String)"),
-        donat_backend::AnyDialect::Sqlite(_) | donat_backend::AnyDialect::Mysql(_) => literal,
+        donat_backend::AnyDialect::Sqlite(_) => literal,
+        donat_backend::AnyDialect::Mysql(_) => format!("JSON_QUOTE(CAST({literal} AS CHAR))"),
     }
 }
 
 #[cfg(test)]
 mod dialect_dispatch_tests {
     use super::*;
-    use donat_backend::{AnyDialect, ClickhouseDialect, PostgresDialect};
+    use donat_backend::{
+        AnyDialect, ClickhouseDialect, MySqlDialect, PostgresDialect, SqliteDialect,
+    };
 
     fn sample_roots() -> Vec<RootField> {
         let cols = vec![
@@ -2002,6 +2030,103 @@ mod dialect_dispatch_tests {
         assert!(sql.contains("CAST(7 AS Int32)"), "{sql}");
         assert!(sql.contains(" LIMIT 10 OFFSET 2"), "{sql}");
         assert!(!sql.contains(';'), "one SQL statement only: {sql}");
+    }
+
+    #[test]
+    fn operation_to_sql_with_sqlite_serializes_boolean_columns_as_json_booleans() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "main".into(),
+                name: "article".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "is_published".into(),
+                value: FieldValue::Column {
+                    column: "is_published".into(),
+                    pg_type: "bool".into(),
+                },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "article".into(),
+                query,
+            }],
+            AnyDialect::Sqlite(SqliteDialect),
+        );
+
+        assert!(
+            sql.contains("json('true')"),
+            "true is not JSON boolean: {sql}"
+        );
+        assert!(
+            sql.contains("json('false')"),
+            "false is not JSON boolean: {sql}"
+        );
+        assert!(
+            sql.contains("IS NULL THEN NULL"),
+            "nullable booleans must remain null: {sql}"
+        );
+    }
+
+    #[test]
+    fn operation_to_sql_with_mysql_preserves_field_order_and_boolean_shape() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "app".into(),
+                name: "article".into(),
+            }),
+            fields: vec![
+                OutputField {
+                    alias: "title".into(),
+                    value: FieldValue::Column {
+                        column: "title".into(),
+                        pg_type: "text".into(),
+                    },
+                },
+                OutputField {
+                    alias: "is_published".into(),
+                    value: FieldValue::Column {
+                        column: "is_published".into(),
+                        pg_type: "bool".into(),
+                    },
+                },
+            ],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "article".into(),
+                query,
+            }],
+            AnyDialect::Mysql(MySqlDialect),
+        );
+
+        let title = sql.find("'\"title\":'").expect("title key");
+        let published = sql.find("'\"is_published\":'").expect("is_published key");
+        assert!(title < published, "selection order changed: {sql}");
+        assert!(
+            sql.contains("JSON_QUOTE(CAST(\"_t0\".\"title\" AS CHAR))"),
+            "text column is not JSON-quoted: {sql}"
+        );
+        assert!(sql.contains("THEN 'true' ELSE 'false'"), "{sql}");
+        assert!(
+            !sql.contains("JSON_OBJECT"),
+            "binary JSON reorders keys: {sql}"
+        );
     }
 
     #[test]

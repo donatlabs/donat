@@ -1104,8 +1104,30 @@ pub struct Running {
 #[derive(Debug, Clone, Copy)]
 pub enum FixtureColumnType {
     BigInt,
+    Boolean,
     Text,
     Json,
+}
+
+fn fixture_native_type(backend: BackendId, ty: FixtureColumnType) -> &'static str {
+    match (backend, ty) {
+        (BackendId::Clickhouse, FixtureColumnType::BigInt) => "UInt64",
+        (BackendId::Clickhouse, FixtureColumnType::Boolean) => "Bool",
+        (BackendId::Clickhouse, FixtureColumnType::Text) => "String",
+        (BackendId::Clickhouse, FixtureColumnType::Json) => "JSON",
+        (BackendId::Sqlite, FixtureColumnType::BigInt) => "INTEGER",
+        (BackendId::Sqlite, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Sqlite, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Sqlite, FixtureColumnType::Json) => "JSON",
+        (BackendId::Mysql, FixtureColumnType::BigInt) => "BIGINT",
+        (BackendId::Mysql, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Mysql, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Mysql, FixtureColumnType::Json) => "JSON",
+        (BackendId::Postgres, FixtureColumnType::BigInt) => "BIGINT",
+        (BackendId::Postgres, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Postgres, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Postgres, FixtureColumnType::Json) => "JSONB",
+    }
 }
 
 pub struct FixtureColumn {
@@ -1198,16 +1220,24 @@ impl Running {
         filter: Json,
         allow_aggregations: bool,
     ) {
+        self.add_select_permission_document(
+            table_name,
+            role,
+            json!({
+                "columns": columns,
+                "filter": filter,
+                "allow_aggregations": allow_aggregations
+            }),
+        );
+    }
+
+    pub fn add_select_permission_document(&self, table_name: &str, role: &str, document: Json) {
         let table = QualifiedTable::Qualified {
             schema: self.schema.clone(),
             name: table_name.to_string(),
         };
-        let permission: SelectPermission = serde_json::from_value(json!({
-            "columns": columns,
-            "filter": filter,
-            "allow_aggregations": allow_aggregations
-        }))
-        .expect("fixture select permission");
+        let permission: SelectPermission =
+            serde_json::from_value(document).expect("fixture select permission");
         self.with_table(&table, |entry| {
             entry.select_permissions.push(PermissionEntry {
                 role: role.to_string(),
@@ -1269,25 +1299,11 @@ impl Running {
                 format!("\"{}\"", name.replace('"', "\"\""))
             }
         };
-        let column_type = |column: &FixtureColumn| match (self.backend, column.ty) {
-            (BackendId::Clickhouse, FixtureColumnType::BigInt) => "UInt64",
-            (BackendId::Clickhouse, FixtureColumnType::Text) => "String",
-            (BackendId::Clickhouse, FixtureColumnType::Json) => "JSON",
-            (BackendId::Sqlite, FixtureColumnType::BigInt) => "INTEGER",
-            (BackendId::Sqlite, FixtureColumnType::Text) => "TEXT",
-            (BackendId::Sqlite, FixtureColumnType::Json) => "JSON",
-            (BackendId::Mysql, FixtureColumnType::BigInt) => "BIGINT",
-            (BackendId::Mysql, FixtureColumnType::Text) => "TEXT",
-            (BackendId::Mysql, FixtureColumnType::Json) => "JSON",
-            (BackendId::Postgres, FixtureColumnType::BigInt) => "BIGINT",
-            (BackendId::Postgres, FixtureColumnType::Text) => "TEXT",
-            (BackendId::Postgres, FixtureColumnType::Json) => "JSONB",
-        };
         let columns = fixture
             .columns
             .iter()
             .map(|column| {
-                let base_type = column_type(column);
+                let base_type = fixture_native_type(self.backend, column.ty);
                 let native_type = if self.backend == BackendId::Clickhouse && column.nullable {
                     format!("Nullable({base_type})")
                 } else {
@@ -1303,11 +1319,7 @@ impl Running {
                 } else {
                     ""
                 };
-                format!(
-                    "{} {}{nullable}{primary}",
-                    quote(column.name),
-                    native_type
-                )
+                format!("{} {}{nullable}{primary}", quote(column.name), native_type)
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -2625,6 +2637,26 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn neutral_boolean_fixture_type_is_rendered_for_every_backend() {
+        assert_eq!(
+            fixture_native_type(BackendId::Postgres, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Sqlite, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Mysql, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Clickhouse, FixtureColumnType::Boolean),
+            "Bool"
+        );
     }
 
     #[test]

@@ -35,9 +35,13 @@ SQL backends **except SQL Server**:
 
 | op | Postgres | SQLite (json1) | MySQL 8 | SQL Server |
 |---|---|---|---|---|
-| `object(pairs)` | `json_build_object(…)` | `json_object(…)` | `JSON_OBJECT(…)` | **no row-object function** |
-| `array_agg(row)` | `coalesce(json_agg(x),'[]'::json)` | `coalesce(json_group_array(x),'[]')` | `COALESCE(JSON_ARRAYAGG(x), JSON_ARRAY())` | `… FOR JSON PATH` |
-| `to_json_text(x)` | `to_json(x::text)` | `json_quote(x)` | `JSON_QUOTE(x)` | string in `FOR JSON` |
+| `object(pairs)` | `json_build_object(…)` | `json_object(…)` | ordered `CONCAT('{', …, '}')` text | **no row-object function** |
+| `array_agg(row)` | `coalesce(json_agg(x),'[]'::json)` | `coalesce(json_group_array(x),'[]')` | ordered `GROUP_CONCAT` inside `CONCAT('[', …, ']')` | `… FOR JSON PATH` |
+| `to_json_text(x)` | `to_json(x::text)` | `json_quote(x)` | `JSON_QUOTE(CAST(x AS CHAR))` | string in `FOR JSON` |
+
+MySQL deliberately uses text assembly rather than its binary JSON object type;
+binary JSON canonicalizes keys and loses GraphQL selection order. See
+[[decisions/007-mysql-ordered-text-json-assembly]].
 
 SQL Server has **no `json_build_object` equivalent**: a row becomes JSON only
 via `(SELECT … FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)`, and an array via

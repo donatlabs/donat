@@ -1,9 +1,11 @@
 use donat_backend::capabilities::JsonOps;
 use donat_conformance::{
     BackendId, CaseCapability, ConformanceCase, FixtureColumn, FixtureColumnType, Suite,
-    TableFixture, run_conformance_cases,
+    TableFixture, Transport, run_conformance_cases,
 };
 use serde_json::json;
+
+const QUERY_PERMISSIONS: &str = "queries/graphql_query/permissions";
 
 const CORE_READ_CASES: &[ConformanceCase] = &[
     ConformanceCase::new("introspection", &[CaseCapability::Reads]),
@@ -45,6 +47,36 @@ const TRANSPORT_ROLE_CASES: &[ConformanceCase] = &[
         &[CaseCapability::Transport],
     ),
     ConformanceCase::new("mcp-query", &[CaseCapability::Transport]),
+];
+
+const PORTABLE_PERMISSION_CASES: &[ConformanceCase] = &[
+    ConformanceCase::new("boolean-introspection", &[CaseCapability::Reads]),
+    ConformanceCase::new(
+        "user-unpublished-articles",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "order-by-related-author",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "other-users-published-articles",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "anonymous-published-articles",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "v1alpha1-graphql-alias",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "missing-session-variable",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new("session-list-in-and-nin", &[CaseCapability::Reads]),
+    ConformanceCase::new("hidden-by-primary-key", &[CaseCapability::Reads]),
 ];
 
 const AUTHOR_COLUMNS: &[FixtureColumn] = &[
@@ -119,6 +151,108 @@ const ARTICLE_COLUMNS: &[FixtureColumn] = &[
     },
 ];
 
+const PERMISSION_AUTHOR_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "name",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "is_registered",
+        ty: FixtureColumnType::Boolean,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "remarks_internal",
+        ty: FixtureColumnType::Text,
+        nullable: true,
+        primary_key: false,
+    },
+];
+
+const PERMISSION_ARTICLE_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "title",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "content",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "author_id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "is_published",
+        ty: FixtureColumnType::Boolean,
+        nullable: false,
+        primary_key: false,
+    },
+];
+
+const ARTIST_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "name",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+];
+
+const BOOK_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "author_name",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "book_name",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "published_on",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+];
+
 fn post(suite: &donat_conformance::Running, query: &str) -> serde_json::Value {
     post_as(suite, "user", query)
 }
@@ -135,6 +269,176 @@ fn post_as(
     );
     assert_eq!(status, 200, "response: {body}");
     body
+}
+
+fn install_portable_permission_fixture(suite: &donat_conformance::Running) {
+    suite.install_table(&TableFixture {
+        name: "author",
+        columns: PERMISSION_AUTHOR_COLUMNS,
+        rows: vec![
+            vec![json!(1), json!("Author 1"), json!(false), json!("remark 1")],
+            vec![json!(2), json!("Author 2"), json!(false), json!("remark 2")],
+            vec![json!(3), json!("Author 3"), json!(false), json!("remark 3")],
+        ],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+    suite.install_table(&TableFixture {
+        name: "article",
+        columns: PERMISSION_ARTICLE_COLUMNS,
+        rows: vec![
+            vec![
+                json!(1),
+                json!("Article 1"),
+                json!("Sample article content 1"),
+                json!(1),
+                json!(false),
+            ],
+            vec![
+                json!(2),
+                json!("Article 2"),
+                json!("Sample article content 2"),
+                json!(1),
+                json!(true),
+            ],
+            vec![
+                json!(3),
+                json!("Article 3"),
+                json!("Sample article content 3"),
+                json!(2),
+                json!(true),
+            ],
+            vec![
+                json!(4),
+                json!("Article 4"),
+                json!("Sample article content 4"),
+                json!(3),
+                json!(false),
+            ],
+        ],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+    suite.install_table(&TableFixture {
+        name: "Artist",
+        columns: ARTIST_COLUMNS,
+        rows: vec![
+            vec![json!(1), json!("Camilla")],
+            vec![json!(2), json!("DSP")],
+            vec![json!(3), json!("Akon")],
+        ],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+    suite.install_table(&TableFixture {
+        name: "books",
+        columns: BOOK_COLUMNS,
+        rows: vec![vec![
+            json!(1),
+            json!("J.K. Rowling"),
+            json!("Harry Porter"),
+            json!("1997-06-26"),
+        ]],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+
+    suite.add_select_permission_document(
+        "Artist",
+        "free_user_in",
+        json!({
+            "columns": "*",
+            "filter": { "name": { "_in": "X-Donat-Free-Artists" } }
+        }),
+    );
+    suite.add_select_permission_document(
+        "Artist",
+        "free_user_nin",
+        json!({
+            "columns": "*",
+            "filter": { "name": { "_nin": "X-Donat-Premium-Artists" } }
+        }),
+    );
+    suite.add_select_permission_document(
+        "books",
+        "user",
+        json!({
+            "columns": ["author_name", "book_name", "published_on"],
+            "filter": {}
+        }),
+    );
+    suite.add_select_permission_document(
+        "article",
+        "user",
+        json!({
+            "columns": ["id", "title", "content", "is_published"],
+            "filter": {
+                "_or": [
+                    { "author_id": "X-DONAT-USER-ID" },
+                    { "is_published": true }
+                ]
+            }
+        }),
+    );
+
+    if !CaseCapability::Relationships.supported_by(suite.backend) {
+        return;
+    }
+    suite.add_relationship("article", "author", "author", &[("author_id", "id")], false);
+    suite.add_relationship(
+        "author",
+        "articles",
+        "article",
+        &[("id", "author_id")],
+        true,
+    );
+    suite.add_select_permission_document(
+        "author",
+        "user",
+        json!({
+            "columns": ["id", "name", "is_registered"],
+            "filter": {
+                "_or": [
+                    { "id": "X-DONAT-USER-ID" },
+                    { "articles": { "is_published": { "_eq": true } } }
+                ]
+            },
+            "limit": 10
+        }),
+    );
+    suite.add_select_permission_document(
+        "article",
+        "anonymous",
+        json!({
+            "columns": ["id", "title", "content", "is_published"],
+            "filter": { "is_published": true }
+        }),
+    );
+    suite.add_select_permission_document(
+        "author",
+        "anonymous",
+        json!({
+            "columns": ["id", "name"],
+            "filter": { "articles": { "is_published": { "_eq": true } } }
+        }),
+    );
+    suite.add_select_permission_document(
+        "article",
+        "critic",
+        json!({
+            "columns": ["title", "content", "is_published"],
+            "filter": { "id": { "_eq": "X-Donat-Critic-Id" } }
+        }),
+    );
+    suite.add_select_permission_document(
+        "author",
+        "critic",
+        json!({ "columns": ["name"], "filter": {} }),
+    );
 }
 
 #[test]
@@ -322,6 +626,69 @@ fn core_read_contract() {
         ),
         unknown => panic!("unimplemented core read case '{unknown}'"),
     });
+}
+
+#[test]
+fn portable_query_permission_contract() {
+    let backend = BackendId::selected().expect("selected backend");
+    let suite = Suite::new("matrix_query_permissions").start();
+    install_portable_permission_fixture(&suite);
+
+    run_conformance_cases(
+        "query-permissions",
+        backend,
+        PORTABLE_PERMISSION_CASES,
+        |case| {
+            let (fixture, transport) = match case {
+                "boolean-introspection" => {
+                    let body = post_as(
+                        &suite,
+                        "user",
+                        "{ __type(name: \"article\") { fields { name type { kind name ofType { kind name } } } } }",
+                    );
+                    let field = body["data"]["__type"]["fields"]
+                        .as_array()
+                        .and_then(|fields| {
+                            fields.iter().find(|field| field["name"] == "is_published")
+                        })
+                        .unwrap_or_else(|| panic!("is_published field missing: {body}"));
+                    assert_eq!(field["type"]["kind"], json!("NON_NULL"), "{body}");
+                    assert_eq!(field["type"]["ofType"]["name"], json!("Boolean"), "{body}");
+                    return;
+                }
+                "user-unpublished-articles" => (
+                    "user_select_query_unpublished_articles.yaml",
+                    Transport::Both,
+                ),
+                "order-by-related-author" => {
+                    ("user_select_query_article_author.yaml", Transport::Both)
+                }
+                "other-users-published-articles" => (
+                    "user_can_query_other_users_published_articles.yaml",
+                    Transport::Both,
+                ),
+                "anonymous-published-articles" => (
+                    "anonymous_can_only_get_published_articles.yaml",
+                    Transport::Both,
+                ),
+                "v1alpha1-graphql-alias" => (
+                    "anonymous_can_only_get_published_articles_v1alpha1.yaml",
+                    Transport::Both,
+                ),
+                "missing-session-variable" => (
+                    "select_articles_without_required_headers.yaml",
+                    Transport::Both,
+                ),
+                "session-list-in-and-nin" => ("in_and_nin.yaml", Transport::Both),
+                "hidden-by-primary-key" => (
+                    "user_should_not_be_able_to_access_books_by_pk.yaml",
+                    Transport::Http,
+                ),
+                unknown => panic!("unimplemented portable permission case '{unknown}'"),
+            };
+            suite.check_query_f(&format!("{QUERY_PERMISSIONS}/{fixture}"), transport);
+        },
+    );
 }
 
 #[test]

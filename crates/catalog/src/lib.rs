@@ -407,7 +407,8 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
 /// MySQL database name plays the role Postgres schemas / SQLite's `"main"`
 /// play; pass it explicitly so callers control which database is tracked.
 ///
-/// Column types are read from `information_schema.columns.DATA_TYPE` and
+/// Column types are read from `information_schema.columns.DATA_TYPE` plus
+/// `COLUMN_TYPE` (needed to distinguish `tinyint(1)` booleans) and
 /// normalised to the nearest Postgres type *name* via [`mysql_type_to_pg`] —
 /// the same pragmatic pg-name bridge SQLite uses, because schema-gen still
 /// keys scalar naming off pg type names. MySQL has no stored row-returning
@@ -419,14 +420,14 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
 
     // Columns, ordered by table then ordinal position. COLUMN_DEFAULT is SQL
     // NULL when the column has no default, so deserialize it as Option.
-    let cols: Vec<(String, String, String, String, Option<String>)> = conn.exec(
-        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT \
+    let cols: Vec<(String, String, String, String, String, Option<String>)> = conn.exec(
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT \
          FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = ? \
          ORDER BY TABLE_NAME, ORDINAL_POSITION",
         (schema,),
     )?;
-    for (table, column, data_type, is_nullable, default) in cols {
+    for (table, column, data_type, column_type, is_nullable, default) in cols {
         let key = format!("{schema}.{table}");
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: schema.to_string(),
@@ -437,7 +438,11 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
         });
         entry.columns.push(ColumnInfo {
             name: column,
-            pg_type: mysql_type_to_pg(&data_type).to_string(),
+            pg_type: mysql_type_to_pg(&data_type, &column_type).to_string(),
+            // MySQL scalar rendering is coercion-based and does not need the
+            // physical COLUMN_TYPE. Keeping it out of the transitional
+            // `sql_type()` path ensures logical `bool` reaches SQLgen instead
+            // of `tinyint(1)`.
             native_type: None,
             // IS_NULLABLE is the string 'YES' or 'NO'.
             nullable: is_nullable.eq_ignore_ascii_case("YES"),
@@ -510,7 +515,15 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
 /// no size/precision suffix (that lives in `COLUMN_TYPE`), so no stripping is
 /// needed; matching is case-insensitive. This pg-name mapping is the same
 /// pragmatic bridge SQLite uses (see [`sqlite_type_to_pg`]).
-fn mysql_type_to_pg(data_type: &str) -> &'static str {
+fn mysql_type_to_pg(data_type: &str, column_type: &str) -> &'static str {
+    if data_type.eq_ignore_ascii_case("tinyint")
+        && column_type
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("tinyint(1)")
+    {
+        return "bool";
+    }
     match data_type.to_ascii_lowercase().as_str() {
         "tinyint" | "smallint" => "int2",
         "mediumint" | "int" | "integer" => "int4",
@@ -528,6 +541,19 @@ fn mysql_type_to_pg(data_type: &str) -> &'static str {
         "time" => "time",
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => "bytea",
         _ => "text",
+    }
+}
+
+#[cfg(test)]
+mod mysql_tests {
+    use super::*;
+
+    #[test]
+    fn tinyint_one_maps_to_boolean_without_reclassifying_other_tinyints() {
+        assert_eq!(mysql_type_to_pg("tinyint", "tinyint(1)"), "bool");
+        assert_eq!(mysql_type_to_pg("TINYINT", "tinyint(1) unsigned"), "bool");
+        assert_eq!(mysql_type_to_pg("tinyint", "tinyint(4)"), "int2");
+        assert_eq!(mysql_type_to_pg("smallint", "smallint"), "int2");
     }
 }
 

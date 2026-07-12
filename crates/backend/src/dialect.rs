@@ -236,11 +236,11 @@ impl Dialect for SqliteDialect {
 /// MySQL dialect (8.0.14+). Differs from Postgres/SQLite in three notable
 /// ways: identifiers are quoted with backticks; string literals must escape
 /// backslashes (MySQL processes C-style escapes inside `'...'` by default);
-/// and JSON assembly uses MySQL's native JSON type (`JSON_OBJECT`,
-/// `JSON_ARRAYAGG`). Because MySQL has a real JSON type, nested JSON values do
-/// NOT need the `json(...)` reparse wrapper SQLite requires — `JSON_OBJECT`
-/// returns a genuine JSON value that `JSON_ARRAYAGG` aggregates without
-/// double-encoding. These renderings are validated against a real MySQL 8 in
+/// and JSON assembly uses text concatenation. MySQL's binary JSON object type
+/// reorders keys by key length, which violates GraphQL selection-order output.
+/// SQLgen therefore passes already-serialized JSON values to these leaves;
+/// `CONCAT`/`GROUP_CONCAT` preserve both field and row order without Rust
+/// post-processing. These renderings are validated against a real MySQL 8 in
 /// the e2e harness slice (`crates/server/tests/mysql_e2e.rs`).
 #[derive(Debug, Clone, Copy)]
 pub struct MySqlDialect;
@@ -303,29 +303,36 @@ impl Dialect for MySqlDialect {
     }
 
     fn json_object(&self, pairs: &[(String, String)]) -> String {
-        // MySQL's JSON_OBJECT('k', v, …): keys quoted, values inlined. Values
-        // that are themselves JSON_OBJECT/JSON_ARRAYAGG results are real JSON
-        // values and are embedded as-is (no double-encoding).
-        let body: Vec<String> = pairs
-            .iter()
-            .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
-            .collect();
-        format!("JSON_OBJECT({})", body.join(", "))
+        if pairs.is_empty() {
+            return self.quote_literal("{}");
+        }
+        let mut parts = vec![self.quote_literal("{")];
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                parts.push(self.quote_literal(","));
+            }
+            let key = serde_json::to_string(key).expect("JSON object key");
+            parts.push(self.quote_literal(&format!("{key}:")));
+            parts.push(format!(
+                "COALESCE(CAST({value} AS CHAR), {})",
+                self.quote_literal("null")
+            ));
+        }
+        parts.push(self.quote_literal("}"));
+        format!("CONCAT({})", parts.join(", "))
     }
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
-        match order_by {
-            Some(order) => format!(
-                "CAST(CONCAT('[', COALESCE(GROUP_CONCAT(CAST({row_expr} AS CHAR) ORDER BY {order} SEPARATOR ','), ''), ']') AS JSON)"
-            ),
-            None => format!("COALESCE(JSON_ARRAYAGG({row_expr}), JSON_ARRAY())"),
-        }
+        let order = order_by
+            .map(|order| format!(" ORDER BY {order}"))
+            .unwrap_or_default();
+        format!(
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST({row_expr} AS CHAR){order} SEPARATOR ','), ''), ']')"
+        )
     }
 
     fn to_json_text(&self, expr: &str) -> String {
-        // Render an expression as a JSON string value. CAST(... AS JSON) on a
-        // quoted SQL string literal yields a JSON string scalar.
-        format!("CAST({expr} AS JSON)")
+        format!("JSON_QUOTE(CAST({expr} AS CHAR))")
     }
 
     fn null_ordering(&self, _nulls_first: bool) -> String {
@@ -1022,38 +1029,37 @@ mod tests {
     }
 
     #[test]
-    fn mysql_json_object_alternates_quoted_keys_and_values() {
+    fn mysql_json_object_preserves_declared_key_order() {
         let d = MySqlDialect;
         assert_eq!(
             d.json_object(&[
                 ("id".to_string(), "_t0.id".to_string()),
                 ("name".to_string(), "_t0.name".to_string()),
             ]),
-            "JSON_OBJECT('id', _t0.id, 'name', _t0.name)"
+            "CONCAT('{', '\"id\":', COALESCE(CAST(_t0.id AS CHAR), 'null'), ',', '\"name\":', COALESCE(CAST(_t0.name AS CHAR), 'null'), '}')"
         );
-        assert_eq!(d.json_object(&[]), "JSON_OBJECT()");
+        assert_eq!(d.json_object(&[]), "'{}'");
     }
 
     #[test]
     fn mysql_json_array_agg_preserves_requested_order() {
         let d = MySqlDialect;
-        // No json(...) reparse wrapper (MySQL has a real JSON type), and the
-        // Ordered aggregation uses GROUP_CONCAT because MySQL JSON_ARRAYAGG
-        // does not accept an ORDER BY argument.
+        // Rows are already JSON text. GROUP_CONCAT keeps them raw and avoids
+        // MySQL binary-JSON key canonicalization.
         assert_eq!(
             d.json_array_agg("_e.j", None),
-            "COALESCE(JSON_ARRAYAGG(_e.j), JSON_ARRAY())"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(_e.j AS CHAR) SEPARATOR ','), ''), ']')"
         );
         assert_eq!(
             d.json_array_agg("t.e", Some("t.i ASC")),
-            "CAST(CONCAT('[', COALESCE(GROUP_CONCAT(CAST(t.e AS CHAR) ORDER BY t.i ASC SEPARATOR ','), ''), ']') AS JSON)"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(t.e AS CHAR) ORDER BY t.i ASC SEPARATOR ','), ''), ']')"
         );
     }
 
     #[test]
-    fn mysql_to_json_text_casts_to_json() {
+    fn mysql_to_json_text_quotes_text() {
         let d = MySqlDialect;
-        assert_eq!(d.to_json_text("'User'"), "CAST('User' AS JSON)");
+        assert_eq!(d.to_json_text("'User'"), "JSON_QUOTE(CAST('User' AS CHAR))");
     }
 
     #[test]
@@ -1081,12 +1087,12 @@ mod tests {
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int"), "1");
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
-            "JSON_OBJECT('k', v)"
+            "CONCAT('{', '\"k\":', COALESCE(CAST(v AS CHAR), 'null'), '}')"
         );
         assert_eq!(
             d.json_array_agg("x", None),
-            "COALESCE(JSON_ARRAYAGG(x), JSON_ARRAY())"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(x AS CHAR) SEPARATOR ','), ''), ']')"
         );
-        assert_eq!(d.to_json_text("x"), "CAST(x AS JSON)");
+        assert_eq!(d.to_json_text("x"), "JSON_QUOTE(CAST(x AS CHAR))");
     }
 }

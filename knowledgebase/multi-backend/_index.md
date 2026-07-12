@@ -26,6 +26,9 @@ reasoning never has to be reconstructed.
 - [[decisions/006-mandatory-conformance-backend-matrix]] — every registered
   datasource backend runs the same applicable conformance cases in an isolated
   CI matrix job; Postgres remains the default local and reference target.
+- [[decisions/007-mysql-ordered-text-json-assembly]] — MySQL assembles ordered
+  JSON text in SQL because native binary JSON canonicalizes object keys and
+  cannot preserve the GraphQL selection-order contract.
 
 ## One-paragraph shape
 
