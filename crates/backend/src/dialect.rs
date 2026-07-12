@@ -404,10 +404,7 @@ impl Dialect for ClickhouseDialect {
             }
             let key = format!("{}:", serde_json::to_string(key).expect("JSON object key"));
             parts.push(self.quote_literal(&key));
-            parts.push(format!(
-                "coalesce(CAST({value} AS String), {})",
-                self.quote_literal("null")
-            ));
+            parts.push(format!("coalesce({value}, {})", self.quote_literal("null")));
         }
         parts.push(self.quote_literal("}"));
         format!("concat({})", parts.join(", "))
@@ -574,10 +571,10 @@ mod tests {
         let d = ClickhouseDialect;
         assert_eq!(
             d.json_object(&[
-                ("id".to_string(), "_t0.id".to_string()),
-                ("name".to_string(), "_t0.name".to_string()),
+                ("id".to_string(), "toJSONString(_t0.id)".to_string()),
+                ("name".to_string(), "toJSONString(_t0.name)".to_string()),
             ]),
-            "concat('{', '\"id\":', coalesce(CAST(_t0.id AS String), 'null'), ',', '\"name\":', coalesce(CAST(_t0.name AS String), 'null'), '}')"
+            "concat('{', '\"id\":', coalesce(toJSONString(_t0.id), 'null'), ',', '\"name\":', coalesce(toJSONString(_t0.name), 'null'), '}')"
         );
         assert_eq!(d.json_object(&[]), "'{}'");
         assert_eq!(
@@ -598,8 +595,8 @@ mod tests {
             "CAST(1 AS UInt8)"
         );
         assert_eq!(
-            d.json_object(&[("k".into(), "v".into())]),
-            "concat('{', '\"k\":', coalesce(CAST(v AS String), 'null'), '}')"
+            d.json_object(&[("k".into(), "toJSONString(v)".into())]),
+            "concat('{', '\"k\":', coalesce(toJSONString(v), 'null'), '}')"
         );
         assert_eq!(
             d.json_array_agg("x", None),

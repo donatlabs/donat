@@ -2,6 +2,7 @@
 type: decision
 status: accepted
 date: 2026-07-12
+amended_by: "[[008-clickhouse-ordered-text-json-assembly]]"
 features:
   - "[[multi-backend]]"
 ---
@@ -39,15 +40,14 @@ Introspection maps native ClickHouse types into the catalog's current
 logical/Postgres-compatible type names while retaining the exact native type
 for SQL casts. Foreign keys and functions remain empty.
 
-Query objects use a collision-safe native JSON construction. GraphQL keys are
-JSON-escaped fixed SQL literals, each value is rendered with `toJSONString`,
-and the complete object text is cast to ClickHouse `JSON`. This avoids the
-query-wide alias collisions of nested named tuples while preserving nested
-objects as typed JSON rather than double-encoded strings. Lists are aggregated
-as `Array(JSON)`. Ordered lists carry a `row_number()` ordinal into
-`groupArray`, then sort and project the JSON values inside ClickHouse. Required
-compatibility settings are sent as HTTP query parameters. The final GraphQL
-data object is returned by one `SELECT` using `FORMAT TabSeparatedRaw`.
+Query objects use collision-safe ordered JSON-text construction. GraphQL keys
+are JSON-escaped fixed SQL literals, scalar values use `toJSONString`, and
+nested objects and lists remain serialized JSON text so ClickHouse cannot
+canonicalize their field order. Lists use `groupArray` plus
+`arrayStringConcat`; ordered lists carry a `row_number()` ordinal, then sort
+and project row text inside ClickHouse. The final GraphQL data object is
+returned by one `SELECT` using `FORMAT TabSeparatedRaw`. ADR 008 amends the
+original native-`JSON` cast design after conformance exposed key reordering.
 
 ## Alternatives
 
@@ -56,7 +56,7 @@ data object is returned by one `SELECT` using `FORMAT TabSeparatedRaw`.
 | Dynamic `.so` or wasm plugin | Rust has no stable ABI, wasm complicates native HTTP/database access, and the project owns the supported backends. |
 | Out-of-process NDC connector | Adds a network hop and rowset stitching and conflicts with the one-statement, database-side JSON assembly invariant established by ADR 001. |
 | Add ClickHouse mutations immediately | ClickHouse mutations are asynchronous data-part rewrites and do not match the v2 insert/update/delete response and returning contracts. |
-| Return concatenated JSON as plain strings | String-only assembly would double-encode nested arrays and objects. The selected construction only uses `concat` as an intermediate representation and immediately casts the complete value to native `JSON`; nested values therefore retain their JSON shape. This was verified against ClickHouse 25.8 LTS. |
+| Cast assembled responses to native `JSON` | ClickHouse canonicalizes object keys during the cast and violates GraphQL selection order; ADR 008 records the ordered-text replacement. |
 
 ## Consequences
 
@@ -66,9 +66,9 @@ remains a single binary, and HTTP URLs can carry the standard ClickHouse
 database and basic-auth configuration.
 
 ClickHouse support is intentionally read-only and does not expose relationships
-or relay. It requires a ClickHouse version with the native `JSON` type (25.3 or
-newer); the HTTP request enables the compatibility setting needed by 25.x.
-HTTP and HTTPS are supported through rustls, requests have a five-minute
-timeout, and streamed responses are bounded separately for catalog and data.
-The catalog's remaining `pg_type` compatibility bridge is technical debt until
-the planned logical scalar-type migration reaches catalog and IR.
+or relay. The implementation targets ClickHouse 25.8 LTS and does not cast the
+assembled response to the native `JSON` type. HTTP and HTTPS are supported
+through rustls, requests have a five-minute timeout, and streamed responses are
+bounded separately for catalog and data. The catalog's remaining `pg_type`
+compatibility bridge is technical debt until the planned logical scalar-type
+migration reaches catalog and IR.

@@ -21,6 +21,7 @@ const CORE_READ_CASES: &[ConformanceCase] = &[
         &[CaseCapability::Reads, CaseCapability::Relationships],
     ),
     ConformanceCase::new("scalar-boundaries", &[CaseCapability::Reads]),
+    ConformanceCase::new("nullable-and-empty-results", &[CaseCapability::Reads]),
     ConformanceCase::new(
         "json-and-null",
         &[CaseCapability::Reads, CaseCapability::Json],
@@ -31,6 +32,11 @@ const CORE_READ_CASES: &[ConformanceCase] = &[
         &[CaseCapability::Reads, CaseCapability::Aggregates],
     ),
 ];
+
+const STRINGIFIED_NUMERIC_CASES: &[ConformanceCase] = &[ConformanceCase::new(
+    "nullable-bigint",
+    &[CaseCapability::Reads],
+)];
 
 const CORE_MUTATION_CASES: &[ConformanceCase] = &[
     ConformanceCase::new("insert", &[CaseCapability::Mutations]),
@@ -121,6 +127,36 @@ const SPECIAL_COLUMNS: &[FixtureColumn] = &[
         name: "boundary",
         ty: FixtureColumnType::BigInt,
         nullable: false,
+        primary_key: false,
+    },
+];
+
+const NULLABLE_VALUE_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "optional_text",
+        ty: FixtureColumnType::Text,
+        nullable: true,
+        primary_key: false,
+    },
+];
+
+const STRINGIFIED_NUMBER_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "amount",
+        ty: FixtureColumnType::BigInt,
+        nullable: true,
         primary_key: false,
     },
 ];
@@ -588,6 +624,17 @@ fn core_read_contract() {
         allow_aggregations: false,
         mutations: false,
     });
+    suite.install_table(&TableFixture {
+        name: "nullable_value",
+        columns: NULLABLE_VALUE_COLUMNS,
+        rows: vec![
+            vec![json!(1), json!(null)],
+            vec![json!(2), json!("present")],
+        ],
+        role: "user",
+        allow_aggregations: true,
+        mutations: false,
+    });
     let json_supported = backend.capabilities().json_ops != JsonOps::None;
     if json_supported {
         suite.install_table(&TableFixture {
@@ -697,6 +744,23 @@ fn core_read_contract() {
                 { "id": 2, "text_value": "plain", "boundary": 0 }
             ]}})
         ),
+        "nullable-and-empty-results" => assert_eq!(
+            post(
+                &suite,
+                "{ nullable_value(order_by: {id: asc}) { id optional_text } nullable_value_by_pk(id: 999) { id optional_text } nullable_value_aggregate(where: {id: {_eq: 999}}) { aggregate { count max { id } } nodes { id optional_text } } }"
+            ),
+            json!({ "data": {
+                "nullable_value": [
+                    { "id": 1, "optional_text": null },
+                    { "id": 2, "optional_text": "present" }
+                ],
+                "nullable_value_by_pk": null,
+                "nullable_value_aggregate": {
+                    "aggregate": { "count": 0, "max": { "id": null } },
+                    "nodes": []
+                }
+            }})
+        ),
         "json-and-null" => assert_eq!(
             post(&suite, "{ json_value(order_by: {id: asc}) { id payload } }"),
             json!({ "data": { "json_value": [
@@ -721,6 +785,42 @@ fn core_read_contract() {
         ),
         unknown => panic!("unimplemented core read case '{unknown}'"),
     });
+}
+
+#[test]
+fn stringified_nullable_numeric_contract() {
+    let backend = BackendId::selected().expect("selected backend");
+    let suite = Suite::new("matrix_stringified_numeric")
+        .arg("serve")
+        .arg("--stringify-numeric-types")
+        .start();
+    suite.install_table(&TableFixture {
+        name: "numeric_value",
+        columns: STRINGIFIED_NUMBER_COLUMNS,
+        rows: vec![vec![json!(1), json!(null)], vec![json!(2), json!(42)]],
+        role: "user",
+        allow_aggregations: false,
+        mutations: false,
+    });
+
+    run_conformance_cases(
+        "stringified-numerics",
+        backend,
+        STRINGIFIED_NUMERIC_CASES,
+        |case| match case {
+            "nullable-bigint" => assert_eq!(
+                post(
+                    &suite,
+                    "{ numeric_value(order_by: {id: asc}) { id amount } }"
+                ),
+                json!({ "data": { "numeric_value": [
+                    { "id": "1", "amount": null },
+                    { "id": "2", "amount": "42" }
+                ]}})
+            ),
+            unknown => panic!("unimplemented stringified numeric case '{unknown}'"),
+        },
+    );
 }
 
 #[test]

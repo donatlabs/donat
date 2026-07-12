@@ -26,7 +26,9 @@ ClickHouse query SQL keeps assembled objects and arrays as ordered JSON text.
 SQLgen serializes scalar leaves with `toJSONString`, `json_object` concatenates
 serialized keys and values, and `json_array_agg` uses `groupArray` plus
 `arrayStringConcat`. Ordered arrays continue to sort `(ordinal, row_text)`
-tuples before concatenation.
+tuples before concatenation. Serialized nullable values remain
+`Nullable(String)` until `coalesce(..., 'null')`, and column aggregates use
+ClickHouse's `OrNull` combinator so empty sets match SQL/GraphQL null semantics.
 
 The runtime still executes one ClickHouse statement with `FORMAT
 TabSeparatedRaw` and parses its single JSON-text result. No response fields or

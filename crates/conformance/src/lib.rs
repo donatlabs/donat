@@ -1115,7 +1115,7 @@ fn fixture_native_type(backend: BackendId, ty: FixtureColumnType) -> &'static st
         (BackendId::Clickhouse, FixtureColumnType::Boolean) => "Bool",
         (BackendId::Clickhouse, FixtureColumnType::Text) => "String",
         (BackendId::Clickhouse, FixtureColumnType::Json) => "JSON",
-        (BackendId::Sqlite, FixtureColumnType::BigInt) => "INTEGER",
+        (BackendId::Sqlite, FixtureColumnType::BigInt) => "BIGINT",
         (BackendId::Sqlite, FixtureColumnType::Boolean) => "BOOLEAN",
         (BackendId::Sqlite, FixtureColumnType::Text) => "TEXT",
         (BackendId::Sqlite, FixtureColumnType::Json) => "JSON",
@@ -2656,6 +2656,14 @@ mod tests {
         assert_eq!(
             fixture_native_type(BackendId::Clickhouse, FixtureColumnType::Boolean),
             "Bool"
+        );
+    }
+
+    #[test]
+    fn neutral_bigint_fixture_keeps_bigint_affinity_on_sqlite() {
+        assert_eq!(
+            fixture_native_type(BackendId::Sqlite, FixtureColumnType::BigInt),
+            "BIGINT"
         );
     }
 

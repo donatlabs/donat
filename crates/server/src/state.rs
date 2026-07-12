@@ -198,8 +198,11 @@ impl AppState {
                     .map_err(|e| QueryError::Decode(e.to_string()))
             }
             SourceKind::Sqlite => {
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Sqlite(SqliteDialect));
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Sqlite(SqliteDialect),
+                );
                 let path = {
                     let paths = self.sqlite_paths.read().await;
                     paths
@@ -221,8 +224,11 @@ impl AppState {
             SourceKind::Mysql => {
                 use mysql::prelude::Queryable;
 
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Mysql(MySqlDialect));
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Mysql(MySqlDialect),
+                );
                 let url = {
                     let urls = self.mysql_urls.read().await;
                     urls.get("default")
@@ -250,8 +256,9 @@ impl AppState {
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
             SourceKind::Clickhouse => {
-                let sql = donat_sqlgen::operation_to_sql_with(
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
                     roots,
+                    self.stringify_numerics,
                     AnyDialect::Clickhouse(ClickhouseDialect),
                 );
                 let url = self
@@ -363,6 +370,14 @@ impl AppState {
                     return Err(SqliteMutationError::CheckViolation {
                         path: plan.check_path.clone(),
                     });
+                }
+
+                if plan.single_row_output {
+                    data.insert(
+                        alias.clone(),
+                        returning.into_iter().next().unwrap_or(Json::Null),
+                    );
+                    continue;
                 }
 
                 // Assemble this root's response object from the plan's aliases,
@@ -567,6 +582,14 @@ impl AppState {
                     return Err(MysqlMutationError::CheckViolation {
                         path: plan.check_path.clone(),
                     });
+                }
+
+                if plan.single_row_output {
+                    data.insert(
+                        alias.clone(),
+                        returning.into_iter().next().unwrap_or(Json::Null),
+                    );
+                    continue;
                 }
 
                 // Assemble this root's response object from the plan's aliases,

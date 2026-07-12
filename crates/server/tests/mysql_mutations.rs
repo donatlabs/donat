@@ -26,7 +26,7 @@ use donat_schema::Session;
 use donat_server::gql;
 use donat_server::state::{AppState, Engine};
 use mysql::prelude::Queryable;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 const MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
 
@@ -164,7 +164,7 @@ async fn mysql_mutations_through_runtime() {
             insert_note(objects: [
                 { body: "first", owner: "alice" },
                 { body: "second", owner: "alice" }
-            ]) { affected_rows returning { id body } }
+            ]) { affected_rows returning { id body __typename } }
         }"#,
     )
     .await;
@@ -174,14 +174,35 @@ async fn mysql_mutations_through_runtime() {
         json!({ "data": { "insert_note": {
             "affected_rows": 2,
             "returning": [
-                { "id": 1, "body": "first" },
-                { "id": 2, "body": "second" }
+                { "id": 1, "body": "first", "__typename": "note" },
+                { "id": 2, "body": "second", "__typename": "note" }
             ]
         }}}),
         "unexpected insert body: {body}"
     );
 
-    // 2. Violating insert (owner != session var) -> permission error, and the
+    // 2. Single-row mutation output uses the same ordered node assembler and
+    //    must serialize __typename as a JSON string.
+    let (status, body) = run(
+        &state,
+        r#"mutation {
+            insert_note_one(object: { body: "single", owner: "alice" }) {
+                body __typename
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body,
+        json!({ "data": { "insert_note_one": {
+            "body": "single",
+            "__typename": "note"
+        }}}),
+        "unexpected single-row insert body: {body}"
+    );
+
+    // 3. Violating insert (owner != session var) -> permission error, and the
     //    row must NOT persist (transaction rolled back).
     let (status, body) = run(
         &state,
@@ -217,7 +238,7 @@ async fn mysql_mutations_through_runtime() {
         "violating insert must not have persisted: {body}"
     );
 
-    // 3. Update by predicate; re-select returns the edited row.
+    // 4. Update by predicate; re-select returns the edited row.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -237,7 +258,7 @@ async fn mysql_mutations_through_runtime() {
         "unexpected update body: {body}"
     );
 
-    // 4. Delete by predicate; the companion SELECT (run BEFORE the DELETE)
+    // 5. Delete by predicate; the companion SELECT (run BEFORE the DELETE)
     //    captures the returning row.
     let (status, body) = run(
         &state,
@@ -258,7 +279,7 @@ async fn mysql_mutations_through_runtime() {
         "unexpected delete body: {body}"
     );
 
-    // Final state: only the (edited) row 1 remains.
+    // Final state: the edited row 1 and single-row insert remain.
     let (_status, body) = run(
         &state,
         "query { note(order_by: { id: asc }) { id body owner } }",
@@ -267,7 +288,8 @@ async fn mysql_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "note": [
-            { "id": 1, "body": "edited", "owner": "alice" }
+            { "id": 1, "body": "edited", "owner": "alice" },
+            { "id": 3, "body": "single", "owner": "alice" }
         ]}}),
         "unexpected final state: {body}"
     );

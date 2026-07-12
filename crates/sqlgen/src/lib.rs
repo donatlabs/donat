@@ -33,6 +33,16 @@ pub fn operation_to_sql_with(roots: &[RootField], dialect: donat_backend::AnyDia
     operation_to_sql_full(roots, false, dialect)
 }
 
+/// Compile one operation for an explicit backend while honoring Donat's
+/// `--stringify-numeric-types` response option.
+pub fn operation_to_sql_opts_with(
+    roots: &[RootField],
+    stringify_numerics: bool,
+    dialect: donat_backend::AnyDialect,
+) -> String {
+    operation_to_sql_full(roots, stringify_numerics, dialect)
+}
+
 fn operation_to_sql_full(
     roots: &[RootField],
     stringify_numerics: bool,
@@ -410,7 +420,14 @@ impl Ctx {
                                     }
                                     None => col,
                                 };
-                                let value = format!("{op}({expr})");
+                                let value = if matches!(
+                                    self.dialect,
+                                    donat_backend::AnyDialect::Clickhouse(_)
+                                ) {
+                                    format!("{op}OrNull({expr})")
+                                } else {
+                                    format!("{op}({expr})")
+                                };
                                 let value = match self.dialect {
                                     donat_backend::AnyDialect::Clickhouse(_) => {
                                         clickhouse_json_column(
@@ -681,15 +698,12 @@ impl Ctx {
         if matches!(self.dialect, donat_backend::AnyDialect::Mysql(_)) {
             return mysql_json_column(&col, pg_type, self.stringify_numerics);
         }
+        if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) {
+            return sqlite_json_column(&col, pg_type, self.stringify_numerics);
+        }
         match pg_type {
             "geometry" | "geography" => format!("ST_AsGeoJSON({col}, 15, 4)::json"),
             "int8" | "numeric" if self.stringify_numerics => format!("({col})::text"),
-            "bool" if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) => {
-                sqlite_json_column(&col, pg_type)
-            }
-            "json" if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) => {
-                sqlite_json_column(&col, pg_type)
-            }
             _ => col,
         }
     }
@@ -1132,6 +1146,9 @@ fn mutation_to_sql_full(
 pub struct SqliteMutationPlan {
     /// The single top-level DML to execute.
     pub dml_sql: String,
+    /// Whether the GraphQL root returns one node directly instead of a
+    /// response object containing a `returning` array.
+    pub single_row_output: bool,
     /// Response key for the `returning` array, when the selection asked for it.
     pub returning_alias: Option<String>,
     /// Response key for `affected_rows`, when selected.
@@ -1159,6 +1176,7 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     match root {
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
+            single_row_output: false,
             returning_alias: None,
             affected_rows_alias: None,
             typename: None,
@@ -1284,6 +1302,7 @@ impl Ctx {
         output: &MutationOutput,
     ) -> SqliteMutationPlan {
         let dialect = self.dialect;
+        let single_row_output = matches!(output, MutationOutput::SingleRow(_));
         let mut returning_alias = None;
         let mut affected_rows_alias = None;
         let mut typename = None;
@@ -1310,9 +1329,8 @@ impl Ctx {
             }
             MutationOutput::SingleRow(fields) => {
                 // `insert_<t>_one` / `_by_pk`: the row itself is the node;
-                // there is no affected_rows. Represent it as a returning alias
-                // so the executor still folds rows; the server's SingleRow
-                // handling for sqlite is out of scope for this carve-out.
+                // there is no affected_rows. The executor folds the returned
+                // row and emits it directly when `single_row_output` is set.
                 returning_alias = Some("returning".to_string());
                 fields.clone()
             }
@@ -1332,6 +1350,7 @@ impl Ctx {
         let dml_sql = format!("{dml} RETURNING {node_expr} AS node, {violated} AS violated");
         SqliteMutationPlan {
             dml_sql,
+            single_row_output,
             returning_alias,
             affected_rows_alias,
             typename,
@@ -1360,7 +1379,7 @@ impl Ctx {
                         donat_backend::AnyDialect::Mysql(_) => {
                             mysql_json_column(&dialect.quote_ident(column), pg_type, false)
                         }
-                        _ => sqlite_json_column(&dialect.quote_ident(column), pg_type),
+                        _ => sqlite_json_column(&dialect.quote_ident(column), pg_type, false),
                     },
                     FieldValue::ColumnGuarded {
                         column,
@@ -1372,11 +1391,11 @@ impl Ctx {
                             donat_backend::AnyDialect::Mysql(_) => {
                                 mysql_json_column(&dialect.quote_ident(column), pg_type, false)
                             }
-                            _ => sqlite_json_column(&dialect.quote_ident(column), pg_type),
+                            _ => sqlite_json_column(&dialect.quote_ident(column), pg_type, false),
                         };
                         format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                     }
-                    FieldValue::Typename { value } => dialect.quote_literal(value),
+                    FieldValue::Typename { value } => typename_literal(&dialect, value),
                     other => panic!(
                         "field {:?} is not expressible in a sqlite/mysql bare RETURNING",
                         std::mem::discriminant(other)
@@ -1509,6 +1528,9 @@ pub struct MySqlMutationPlan {
     /// The single DML to execute (`INSERT`/`UPDATE`/`DELETE`), no trailing
     /// `RETURNING` (MySQL has none). Empty for a `__typename` root.
     pub dml_sql: String,
+    /// Whether the GraphQL root returns one node directly instead of a
+    /// response object containing a `returning` array.
+    pub single_row_output: bool,
     /// The companion `SELECT <node> AS node, <flag> AS violated FROM `s`.`t``,
     /// WITHOUT the trailing `WHERE` — the executor appends the restriction it
     /// derives from `kind`. Empty for a `__typename` root.
@@ -1543,6 +1565,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
     match root {
         MutationRoot::Typename { value, .. } => MySqlMutationPlan {
             dml_sql: String::new(),
+            single_row_output: false,
             companion_select: String::new(),
             kind: MySqlMutationKind::Typename,
             returning_alias: None,
@@ -1627,6 +1650,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 ctx.mysql_companion_select(&table, insert.check.as_ref(), &insert.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Insert {
                     pk_col,
@@ -1681,6 +1705,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 ctx.mysql_companion_select(&table, update.check.as_ref(), &update.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Update { where_clause },
                 returning_alias: companion.returning_alias,
@@ -1704,6 +1729,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
             let companion = ctx.mysql_companion_select(&table, None, &delete.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Delete { where_clause },
                 returning_alias: companion.returning_alias,
@@ -1719,6 +1745,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
 /// Intermediate result of [`Ctx::mysql_companion_select`].
 struct MySqlCompanion {
     select: String,
+    single_row_output: bool,
     returning_alias: Option<String>,
     affected_rows_alias: Option<String>,
     typename: Option<(String, String)>,
@@ -1737,6 +1764,7 @@ impl Ctx {
         check: Option<&BoolExp>,
         output: &MutationOutput,
     ) -> MySqlCompanion {
+        let single_row_output = matches!(output, MutationOutput::SingleRow(_));
         let mut returning_alias = None;
         let mut affected_rows_alias = None;
         let mut typename = None;
@@ -1776,6 +1804,7 @@ impl Ctx {
         };
         MySqlCompanion {
             select: format!("SELECT {node_expr} AS node, {violated} AS violated FROM {table}"),
+            single_row_output,
             returning_alias,
             affected_rows_alias,
             typename,
@@ -1887,8 +1916,9 @@ fn qualified(alias: &str, column: &str) -> String {
     format!("{}.{}", quote_ident(alias), quote_ident(column))
 }
 
-fn sqlite_json_column(expression: &str, pg_type: &str) -> String {
+fn sqlite_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
     match pg_type {
+        "int8" | "numeric" if stringify_numerics => format!("CAST({expression} AS TEXT)"),
         "bool" => format!(
             "CASE WHEN {expression} IS NULL THEN NULL WHEN {expression} THEN json('true') ELSE json('false') END"
         ),
@@ -1898,11 +1928,49 @@ fn sqlite_json_column(expression: &str, pg_type: &str) -> String {
 }
 
 fn clickhouse_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
-    if stringify_numerics && matches!(pg_type, "int8" | "numeric") {
-        format!("toJSONString(CAST({expression} AS String))")
+    if stringify_numerics && clickhouse_stringified_numeric_type(pg_type) {
+        format!("toJSONString(toString({expression}))")
     } else {
         format!("toJSONString({expression})")
     }
+}
+
+fn clickhouse_stringified_numeric_type(native_type: &str) -> bool {
+    let mut native_type = native_type.trim();
+    loop {
+        let inner = ["Nullable", "LowCardinality"]
+            .into_iter()
+            .find_map(|wrapper| {
+                native_type
+                    .strip_prefix(wrapper)
+                    .and_then(|rest| rest.strip_prefix('('))
+                    .and_then(|rest| rest.strip_suffix(')'))
+            });
+        match inner {
+            Some(inner) => native_type = inner,
+            None => break,
+        }
+    }
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(family, _)| family)
+        .to_ascii_lowercase();
+    matches!(
+        family.as_str(),
+        "int8"
+            | "numeric"
+            | "int64"
+            | "uint64"
+            | "int128"
+            | "uint128"
+            | "int256"
+            | "uint256"
+            | "decimal"
+            | "decimal32"
+            | "decimal64"
+            | "decimal128"
+            | "decimal256"
+    )
 }
 
 fn mysql_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
@@ -2064,6 +2132,25 @@ mod dialect_dispatch_tests {
     }
 
     #[test]
+    fn clickhouse_stringify_numerics_recognizes_wrapped_native_types() {
+        for numeric in [
+            "int8",
+            "numeric",
+            "UInt64",
+            "Nullable(UInt128)",
+            "LowCardinality(Nullable(Decimal256(76)))",
+        ] {
+            assert!(clickhouse_stringified_numeric_type(numeric), "{numeric}");
+        }
+        for non_numeric in ["UInt32", "Float64", "Nullable(String)"] {
+            assert!(
+                !clickhouse_stringified_numeric_type(non_numeric),
+                "{non_numeric}"
+            );
+        }
+    }
+
+    #[test]
     fn operation_to_sql_with_sqlite_serializes_boolean_columns_as_json_booleans() {
         let query = SelectQuery {
             from: FromSource::Table(Table {
@@ -2158,6 +2245,52 @@ mod dialect_dispatch_tests {
             !sql.contains("JSON_OBJECT"),
             "binary JSON reorders keys: {sql}"
         );
+    }
+
+    #[test]
+    fn mysql_mutation_nodes_json_quote_typenames() {
+        let typename_field = || OutputField {
+            alias: "__typename".into(),
+            value: FieldValue::Typename {
+                value: "note".into(),
+            },
+        };
+        let insert = |output| MutationRoot::Insert {
+            alias: "insert_note".into(),
+            insert: InsertMutation {
+                table: Table {
+                    schema: "donat".into(),
+                    name: "note".into(),
+                },
+                columns: vec![("body".into(), "text".into())],
+                rows: vec![vec![Some(Scalar::Json(serde_json::json!("hello")))]],
+                on_conflict: None,
+                check: None,
+                check_path: "$".into(),
+                output,
+            },
+        };
+
+        let returning = mysql_mutation_plan(
+            &insert(MutationOutput::Response(vec![
+                MutationResponseField::Returning {
+                    alias: "returning".into(),
+                    fields: vec![typename_field()],
+                },
+            ])),
+            &["id".into()],
+        );
+        let single = mysql_mutation_plan(
+            &insert(MutationOutput::SingleRow(vec![typename_field()])),
+            &["id".into()],
+        );
+
+        for sql in [returning.companion_select, single.companion_select] {
+            assert!(
+                sql.contains("JSON_QUOTE(CAST('note' AS CHAR))"),
+                "typename is not valid JSON text: {sql}"
+            );
+        }
     }
 
     #[test]

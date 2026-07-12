@@ -22,7 +22,7 @@ use donat_schema::Session;
 use donat_server::gql;
 use donat_server::state::{AppState, Engine};
 use rusqlite::Connection;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 /// Create the `note` schema on a temp-file database, then close the setup
 /// connection so the runtime opens its own.
@@ -160,7 +160,27 @@ async fn sqlite_mutations_through_runtime() {
         "unexpected insert body: {body}"
     );
 
-    // 2. Violating insert (owner != session var) -> permission error, and the
+    // 2. Single-row output returns the node directly and preserves typename.
+    let (status, body) = run(
+        &state,
+        r#"mutation {
+            insert_note_one(object: { id: 3, body: "single", owner: "alice" }) {
+                body __typename
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body,
+        json!({ "data": { "insert_note_one": {
+            "body": "single",
+            "__typename": "note"
+        }}}),
+        "unexpected single-row insert body: {body}"
+    );
+
+    // 3. Violating insert (owner != session var) -> permission error, and the
     //    row must NOT persist (transaction rolled back).
     let (status, body) = run(
         &state,
@@ -196,7 +216,7 @@ async fn sqlite_mutations_through_runtime() {
         "violating insert must not have persisted: {body}"
     );
 
-    // 3. Update.
+    // 4. Update.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -216,7 +236,7 @@ async fn sqlite_mutations_through_runtime() {
         "unexpected update body: {body}"
     );
 
-    // 4. Delete.
+    // 5. Delete.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -231,7 +251,7 @@ async fn sqlite_mutations_through_runtime() {
         "unexpected delete body: {body}"
     );
 
-    // Final state: only the (edited) row 1 remains.
+    // Final state: the edited row 1 and single-row insert remain.
     let (_status, body) = run(
         &state,
         "query { note(order_by: { id: asc }) { id body owner } }",
@@ -240,7 +260,8 @@ async fn sqlite_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "note": [
-            { "id": 1, "body": "edited", "owner": "alice" }
+            { "id": 1, "body": "edited", "owner": "alice" },
+            { "id": 3, "body": "single", "owner": "alice" }
         ]}}),
         "unexpected final state: {body}"
     );
