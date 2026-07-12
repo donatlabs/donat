@@ -33,15 +33,19 @@ against reality, not guessed.
 The leaf ops (`object`, `array_agg`, `to_json_text`) map cleanly across most
 SQL backends **except SQL Server**:
 
-| op | Postgres | SQLite (json1) | MySQL 8 | SQL Server |
-|---|---|---|---|---|
-| `object(pairs)` | `json_build_object(…)` | `json_object(…)` | ordered `CONCAT('{', …, '}')` text | **no row-object function** |
-| `array_agg(row)` | `coalesce(json_agg(x),'[]'::json)` | `coalesce(json_group_array(x),'[]')` | ordered `GROUP_CONCAT` inside `CONCAT('[', …, ']')` | `… FOR JSON PATH` |
-| `to_json_text(x)` | `to_json(x::text)` | `json_quote(x)` | `JSON_QUOTE(CAST(x AS CHAR))` | string in `FOR JSON` |
+| op | Postgres | SQLite (json1) | MySQL 8 | ClickHouse 25.8 | SQL Server |
+|---|---|---|---|---|---|
+| `object(pairs)` | `json_build_object(…)` | `json_object(…)` | ordered `CONCAT('{', …, '}')` text | ordered `concat('{', …, '}')` text | **no row-object function** |
+| `array_agg(row)` | `coalesce(json_agg(x),'[]'::json)` | `coalesce(json_group_array(x),'[]')` | ordered `GROUP_CONCAT` inside `CONCAT('[', …, ']')` | `groupArray` plus `arrayStringConcat` | `… FOR JSON PATH` |
+| `to_json_text(x)` | `to_json(x::text)` | `json_quote(x)` | `JSON_QUOTE(CAST(x AS CHAR))` | `toJSONString(x)` | string in `FOR JSON` |
 
 MySQL deliberately uses text assembly rather than its binary JSON object type;
 binary JSON canonicalizes keys and loses GraphQL selection order. See
 [[decisions/007-mysql-ordered-text-json-assembly]].
+
+ClickHouse also keeps assembled responses as text: casting an object to its
+experimental `JSON` type canonicalizes keys before the HTTP response is read.
+See [[decisions/008-clickhouse-ordered-text-json-assembly]].
 
 SQL Server has **no `json_build_object` equivalent**: a row becomes JSON only
 via `(SELECT … FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)`, and an array via

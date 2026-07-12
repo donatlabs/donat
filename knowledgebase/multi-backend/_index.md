@@ -29,6 +29,9 @@ reasoning never has to be reconstructed.
 - [[decisions/007-mysql-ordered-text-json-assembly]] — MySQL assembles ordered
   JSON text in SQL because native binary JSON canonicalizes object keys and
   cannot preserve the GraphQL selection-order contract.
+- [[decisions/008-clickhouse-ordered-text-json-assembly]] — ClickHouse keeps
+  response objects and arrays as ordered JSON text because casting them to its
+  native `JSON` type canonicalizes object keys.
 
 ## One-paragraph shape
 

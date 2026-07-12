@@ -343,6 +343,11 @@ impl Dialect for MySqlDialect {
 }
 
 /// ClickHouse read-query dialect.
+///
+/// ClickHouse's experimental `JSON` type canonicalizes object keys, so GraphQL
+/// response objects stay as ordered JSON text. SQLgen passes serialized scalar
+/// and nested JSON values to these leaves; `concat`/`arrayStringConcat` keep
+/// field and row order without Rust post-processing.
 #[derive(Debug, Clone, Copy)]
 pub struct ClickhouseDialect;
 
@@ -390,7 +395,7 @@ impl Dialect for ClickhouseDialect {
 
     fn json_object(&self, pairs: &[(String, String)]) -> String {
         if pairs.is_empty() {
-            return "CAST('{}' AS JSON)".into();
+            return self.quote_literal("{}");
         }
         let mut parts = vec![self.quote_literal("{")];
         for (index, (key, value)) in pairs.iter().enumerate() {
@@ -399,18 +404,23 @@ impl Dialect for ClickhouseDialect {
             }
             let key = format!("{}:", serde_json::to_string(key).expect("JSON object key"));
             parts.push(self.quote_literal(&key));
-            parts.push(format!("coalesce(toJSONString({value}), 'null')"));
+            parts.push(format!(
+                "coalesce(CAST({value} AS String), {})",
+                self.quote_literal("null")
+            ));
         }
         parts.push(self.quote_literal("}"));
-        format!("CAST(concat({}) AS JSON)", parts.join(", "))
+        format!("concat({})", parts.join(", "))
     }
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
         match order_by {
             Some(order) => format!(
-                "arrayMap(item -> item.2, arraySort(item -> item.1, groupArray(({order}, CAST({row_expr} AS JSON)))))"
+                "concat('[', arrayStringConcat(arrayMap(item -> item.2, arraySort(item -> item.1, groupArray(({order}, CAST({row_expr} AS String))))), ','), ']')"
             ),
-            None => format!("groupArray(CAST({row_expr} AS JSON))"),
+            None => format!(
+                "concat('[', arrayStringConcat(groupArray(CAST({row_expr} AS String)), ','), ']')"
+            ),
         }
     }
 
@@ -560,19 +570,19 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_assembles_json_without_double_encoding() {
+    fn clickhouse_assembles_ordered_json_text_without_double_encoding() {
         let d = ClickhouseDialect;
         assert_eq!(
             d.json_object(&[
                 ("id".to_string(), "_t0.id".to_string()),
                 ("name".to_string(), "_t0.name".to_string()),
             ]),
-            "CAST(concat('{', '\"id\":', coalesce(toJSONString(_t0.id), 'null'), ',', '\"name\":', coalesce(toJSONString(_t0.name), 'null'), '}') AS JSON)"
+            "concat('{', '\"id\":', coalesce(CAST(_t0.id AS String), 'null'), ',', '\"name\":', coalesce(CAST(_t0.name AS String), 'null'), '}')"
         );
-        assert_eq!(d.json_object(&[]), "CAST('{}' AS JSON)");
+        assert_eq!(d.json_object(&[]), "'{}'");
         assert_eq!(
             d.json_array_agg("_e.j", Some("_e.__donat_ord")),
-            "arrayMap(item -> item.2, arraySort(item -> item.1, groupArray((_e.__donat_ord, CAST(_e.j AS JSON)))))"
+            "concat('[', arrayStringConcat(arrayMap(item -> item.2, arraySort(item -> item.1, groupArray((_e.__donat_ord, CAST(_e.j AS String))))), ','), ']')"
         );
         assert_eq!(d.to_json_text("'User'"), "toJSONString('User')");
     }
@@ -589,9 +599,12 @@ mod tests {
         );
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
-            "CAST(concat('{', '\"k\":', coalesce(toJSONString(v), 'null'), '}') AS JSON)"
+            "concat('{', '\"k\":', coalesce(CAST(v AS String), 'null'), '}')"
         );
-        assert_eq!(d.json_array_agg("x", None), "groupArray(CAST(x AS JSON))");
+        assert_eq!(
+            d.json_array_agg("x", None),
+            "concat('[', arrayStringConcat(groupArray(CAST(x AS String)), ','), ']')"
+        );
         assert_eq!(d.to_json_text("x"), "toJSONString(x)");
     }
 

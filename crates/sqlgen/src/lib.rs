@@ -264,8 +264,7 @@ impl Ctx {
                 FieldValue::Aggregate { .. } | FieldValue::Nodes { .. }
             )
         }) {
-            let expr = self.aggregate_expr(q, outer);
-            return self.clickhouse_json_object(expr);
+            return self.aggregate_expr(q, outer);
         }
 
         let alias = self.alias();
@@ -274,8 +273,7 @@ impl Ctx {
         let distinct = distinct_clause(q, &alias);
 
         if q.single {
-            let expr = format!("(SELECT {distinct}{row_json} {tail} LIMIT 1)");
-            self.clickhouse_json_object(expr)
+            format!("(SELECT {distinct}{row_json} {tail} LIMIT 1)")
         } else {
             let elem = self.alias();
             let e = quote_ident(&elem);
@@ -317,14 +315,6 @@ impl Ctx {
         }
     }
 
-    fn clickhouse_json_object(&self, expr: String) -> String {
-        if matches!(self.dialect, donat_backend::AnyDialect::Clickhouse(_)) {
-            format!("CAST({expr} AS JSON)")
-        } else {
-            expr
-        }
-    }
-
     /// `<t>_aggregate` (root or relationship): aggregate + nodes over one
     /// filtered row set.
     fn aggregate_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
@@ -340,10 +330,7 @@ impl Ctx {
             .iter()
             .map(|f| {
                 let value = match &f.value {
-                    FieldValue::Aggregate { fields } => {
-                        let expr = self.aggregate_json(fields, &outer_alias);
-                        self.clickhouse_json_object(expr)
-                    }
+                    FieldValue::Aggregate { fields } => self.aggregate_json(fields, &outer_alias),
                     FieldValue::Nodes { fields } => {
                         if let Some(nodes_limit) = q.nodes_limit {
                             // The permission limit caps visible rows but
@@ -387,7 +374,7 @@ impl Ctx {
                 let value = match &f.op {
                     AggregateOp::Typename { value } => typename_literal(&dialect, value),
                     AggregateOp::Count { distinct, columns } => {
-                        if columns.is_empty() {
+                        let value = if columns.is_empty() {
                             "COUNT(*)".to_string()
                         } else {
                             let cols: Vec<String> =
@@ -400,6 +387,15 @@ impl Ctx {
                                 format!("({})", cols.join(", "))
                             };
                             format!("COUNT({d}{expr})")
+                        };
+                        match self.dialect {
+                            donat_backend::AnyDialect::Clickhouse(_) => {
+                                clickhouse_json_column(&value, "int8", false)
+                            }
+                            donat_backend::AnyDialect::Mysql(_) => {
+                                mysql_json_column(&value, "int8", false)
+                            }
+                            _ => value,
                         }
                     }
                     AggregateOp::ColumnOp { op, columns } => {
@@ -414,7 +410,23 @@ impl Ctx {
                                     }
                                     None => col,
                                 };
-                                (c.alias.clone(), format!("{op}({expr})"))
+                                let value = format!("{op}({expr})");
+                                let value = match self.dialect {
+                                    donat_backend::AnyDialect::Clickhouse(_) => {
+                                        clickhouse_json_column(
+                                            &value,
+                                            &c.pg_type,
+                                            self.stringify_numerics,
+                                        )
+                                    }
+                                    donat_backend::AnyDialect::Mysql(_) => mysql_json_column(
+                                        &value,
+                                        &c.pg_type,
+                                        self.stringify_numerics,
+                                    ),
+                                    _ => value,
+                                };
+                                (c.alias.clone(), value)
                             })
                             .collect();
                         json_object(&dialect, &inner)
@@ -663,6 +675,9 @@ impl Ctx {
     /// Column output expression with type-specific casts.
     fn column_output(&mut self, table_alias: &str, column: &str, pg_type: &str) -> String {
         let col = qualified(table_alias, column);
+        if matches!(self.dialect, donat_backend::AnyDialect::Clickhouse(_)) {
+            return clickhouse_json_column(&col, pg_type, self.stringify_numerics);
+        }
         if matches!(self.dialect, donat_backend::AnyDialect::Mysql(_)) {
             return mysql_json_column(&col, pg_type, self.stringify_numerics);
         }
@@ -1882,6 +1897,14 @@ fn sqlite_json_column(expression: &str, pg_type: &str) -> String {
     }
 }
 
+fn clickhouse_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
+    if stringify_numerics && matches!(pg_type, "int8" | "numeric") {
+        format!("toJSONString(CAST({expression} AS String))")
+    } else {
+        format!("toJSONString({expression})")
+    }
+}
+
 fn mysql_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
     match pg_type {
         "bool" => format!(
@@ -1939,7 +1962,9 @@ fn typename_literal(dialect: &donat_backend::AnyDialect, value: &str) -> String 
     let literal = dialect.quote_literal(value);
     match dialect {
         donat_backend::AnyDialect::Postgres(_) => format!("{literal}::text"),
-        donat_backend::AnyDialect::Clickhouse(_) => format!("CAST({literal} AS String)"),
+        donat_backend::AnyDialect::Clickhouse(_) => {
+            format!("toJSONString(CAST({literal} AS String))")
+        }
         donat_backend::AnyDialect::Sqlite(_) => literal,
         donat_backend::AnyDialect::Mysql(_) => format!("JSON_QUOTE(CAST({literal} AS CHAR))"),
     }
@@ -2015,7 +2040,7 @@ mod dialect_dispatch_tests {
     }
 
     #[test]
-    fn operation_to_sql_with_clickhouse_uses_clickhouse_json_and_casts() {
+    fn operation_to_sql_with_clickhouse_uses_ordered_json_text_and_casts() {
         let mut roots = sample_roots();
         let list_root = roots.pop().expect("list root");
         let sql = operation_to_sql_with(&[list_root], AnyDialect::Clickhouse(ClickhouseDialect));
@@ -2023,10 +2048,16 @@ mod dialect_dispatch_tests {
         // ClickHouse accepts standard double-quoted identifiers as well as
         // backticks; the shared query assembler currently emits the former.
         assert!(sql.contains("\"public\".\"author\""), "{sql}");
-        assert!(sql.contains("CAST(concat('{',"), "{sql}");
+        assert!(sql.contains("concat('{',"), "{sql}");
+        assert!(sql.contains("toJSONString(\"_t0\".\"id\")"), "{sql}");
         assert!(sql.contains("groupArray(("), "{sql}");
+        assert!(sql.contains("arrayStringConcat("), "{sql}");
         assert!(sql.contains("row_number() OVER (ORDER BY"), "{sql}");
         assert!(sql.contains("arraySort("), "{sql}");
+        assert!(
+            !sql.contains(" AS JSON"),
+            "JSON casts reorder object keys: {sql}"
+        );
         assert!(sql.contains("CAST(7 AS Int32)"), "{sql}");
         assert!(sql.contains(" LIMIT 10 OFFSET 2"), "{sql}");
         assert!(!sql.contains(';'), "one SQL statement only: {sql}");

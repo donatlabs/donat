@@ -21,12 +21,9 @@ fn graphql_query_permissions() {
         "user_can_query_geometry_values_filter_session_vars.yaml",
         "user_can_query_jsonb_values_filter.yaml",
         "user_can_query_jsonb_values_filter_session_vars.yaml",
-        "artist_select_query_Track_fail.yaml",
-        "artist_select_query_Track.yaml",
         "artist_search_tracks.yaml",
         "artist_search_tracks_aggregate.yaml",
         "staff_passed_students.yaml",
-        "user_query_auction.yaml",
         // jsonb_has_all is commented out in tests-py as well.
         "jsonb_has_any.yaml",
         "iregex.yaml",

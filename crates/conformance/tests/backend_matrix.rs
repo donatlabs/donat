@@ -51,6 +51,7 @@ const TRANSPORT_ROLE_CASES: &[ConformanceCase] = &[
 
 const PORTABLE_PERMISSION_CASES: &[ConformanceCase] = &[
     ConformanceCase::new("boolean-introspection", &[CaseCapability::Reads]),
+    ConformanceCase::new("boolean-output", &[CaseCapability::Reads]),
     ConformanceCase::new(
         "user-unpublished-articles",
         &[CaseCapability::Reads, CaseCapability::Relationships],
@@ -77,6 +78,15 @@ const PORTABLE_PERMISSION_CASES: &[ConformanceCase] = &[
     ),
     ConformanceCase::new("session-list-in-and-nin", &[CaseCapability::Reads]),
     ConformanceCase::new("hidden-by-primary-key", &[CaseCapability::Reads]),
+    ConformanceCase::new(
+        "artist-tracks-missing-session-variable",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new(
+        "artist-tracks-for-current-artist",
+        &[CaseCapability::Reads, CaseCapability::Relationships],
+    ),
+    ConformanceCase::new("column-comparison-auction", &[CaseCapability::Reads]),
 ];
 
 const AUTHOR_COLUMNS: &[FixtureColumn] = &[
@@ -226,6 +236,48 @@ const ARTIST_COLUMNS: &[FixtureColumn] = &[
     },
 ];
 
+const TRACK_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "name",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "artist_id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: false,
+    },
+];
+
+const AUCTION_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "price",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "bid_price",
+        ty: FixtureColumnType::BigInt,
+        nullable: true,
+        primary_key: false,
+    },
+];
+
 const BOOK_COLUMNS: &[FixtureColumn] = &[
     FixtureColumn {
         name: "id",
@@ -334,6 +386,18 @@ fn install_portable_permission_fixture(suite: &donat_conformance::Running) {
         mutations: false,
     });
     suite.install_table(&TableFixture {
+        name: "Track",
+        columns: TRACK_COLUMNS,
+        rows: vec![
+            vec![json!(1), json!("Keepup"), json!(1)],
+            vec![json!(2), json!("Keepdown"), json!(1)],
+            vec![json!(3), json!("Happy"), json!(2)],
+        ],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+    suite.install_table(&TableFixture {
         name: "books",
         columns: BOOK_COLUMNS,
         rows: vec![vec![
@@ -342,6 +406,19 @@ fn install_portable_permission_fixture(suite: &donat_conformance::Running) {
             json!("Harry Porter"),
             json!("1997-06-26"),
         ]],
+        role: "fixture_owner",
+        allow_aggregations: false,
+        mutations: false,
+    });
+    suite.install_table(&TableFixture {
+        name: "auction",
+        columns: AUCTION_COLUMNS,
+        rows: vec![
+            vec![json!(1), json!(250), json!(100)],
+            vec![json!(2), json!(250), json!(120)],
+            vec![json!(3), json!(250), json!(300)],
+            vec![json!(4), json!(250), json!(260)],
+        ],
         role: "fixture_owner",
         allow_aggregations: false,
         mutations: false,
@@ -384,10 +461,28 @@ fn install_portable_permission_fixture(suite: &donat_conformance::Running) {
             }
         }),
     );
+    suite.add_select_permission_document(
+        "auction",
+        "user",
+        json!({
+            "columns": ["id", "bid_price"],
+            "filter": { "bid_price": { "$cgt": "price" } }
+        }),
+    );
 
     if !CaseCapability::Relationships.supported_by(suite.backend) {
         return;
     }
+    suite.add_relationship("Track", "Artist", "Artist", &[("artist_id", "id")], false);
+    suite.add_select_permission_document(
+        "Track",
+        "Artist",
+        json!({
+            "columns": "*",
+            "filter": { "Artist": { "id": "X-Donat-Artist-Id" } },
+            "allow_aggregations": true
+        }),
+    );
     suite.add_relationship("article", "author", "author", &[("author_id", "id")], false);
     suite.add_relationship(
         "author",
@@ -656,6 +751,22 @@ fn portable_query_permission_contract() {
                     assert_eq!(field["type"]["ofType"]["name"], json!("Boolean"), "{body}");
                     return;
                 }
+                "boolean-output" => {
+                    assert_eq!(
+                        post_as(
+                            &suite,
+                            "fixture_owner",
+                            "{ article(order_by: {id: asc}) { id is_published } }",
+                        ),
+                        json!({ "data": { "article": [
+                            { "id": 1, "is_published": false },
+                            { "id": 2, "is_published": true },
+                            { "id": 3, "is_published": true },
+                            { "id": 4, "is_published": false }
+                        ]}})
+                    );
+                    return;
+                }
                 "user-unpublished-articles" => (
                     "user_select_query_unpublished_articles.yaml",
                     Transport::Both,
@@ -684,6 +795,13 @@ fn portable_query_permission_contract() {
                     "user_should_not_be_able_to_access_books_by_pk.yaml",
                     Transport::Http,
                 ),
+                "artist-tracks-missing-session-variable" => {
+                    ("artist_select_query_Track_fail.yaml", Transport::Both)
+                }
+                "artist-tracks-for-current-artist" => {
+                    ("artist_select_query_Track.yaml", Transport::Both)
+                }
+                "column-comparison-auction" => ("user_query_auction.yaml", Transport::Both),
                 unknown => panic!("unimplemented portable permission case '{unknown}'"),
             };
             suite.check_query_f(&format!("{QUERY_PERMISSIONS}/{fixture}"), transport);
