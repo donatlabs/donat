@@ -20,6 +20,9 @@ reasoning never has to be reconstructed.
 - [[decisions/001-in-process-backend-trait-over-ndc]] — in-process dialect
   trait, NOT an out-of-process NDC-style protocol; performance (preserve the
   one-statement-in-DB invariant, zero IPC hop) is the deciding factor.
+- [[decisions/006-mandatory-conformance-backend-matrix]] — every registered
+  datasource backend runs the same applicable conformance cases in an isolated
+  CI matrix job; Postgres remains the default local and reference target.
 
 ## One-paragraph shape
 
