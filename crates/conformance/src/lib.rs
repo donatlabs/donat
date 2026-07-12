@@ -378,14 +378,156 @@ fn with_db(admin_url: &str, db: &str) -> String {
     format!("{prefix}/{db}")
 }
 
-fn create_suite_db(name: &str) -> Result<String> {
+fn create_suite_db(name: &str) -> Result<(String, String)> {
     let admin = pg_admin_url();
     let mut client = postgres::Client::connect(&admin, postgres::NoTls)
         .with_context(|| format!("connecting to {admin} (is the postgres container up?)"))?;
     client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))?;
     client.batch_execute(&format!("CREATE DATABASE {name}"))?;
-    Ok(with_db(&admin, name))
+    let database_url = with_db(&admin, name);
+    Ok((admin, database_url))
 }
+
+fn suite_database_name(suite: &str) -> String {
+    let sanitized = suite
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .take(24)
+        .collect::<String>();
+    format!(
+        "conf_{}_{}_{}",
+        sanitized,
+        std::process::id(),
+        NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+struct SuiteDatabase {
+    url: String,
+    cleanup: SuiteCleanup,
+}
+
+enum SuiteCleanup {
+    Postgres { admin_url: String, name: String },
+    Sqlite(PathBuf),
+    Mysql { admin_url: String, name: String },
+    Clickhouse { admin_url: String, name: String },
+}
+
+impl SuiteDatabase {
+    fn create(backend: BackendId, name: &str) -> Result<Self> {
+        match backend {
+            BackendId::Postgres => Ok(Self {
+                url: {
+                    let (_, url) = create_suite_db(name)?;
+                    url
+                },
+                cleanup: SuiteCleanup::Postgres {
+                    admin_url: pg_admin_url(),
+                    name: name.to_string(),
+                },
+            }),
+            BackendId::Sqlite => {
+                let path = std::env::temp_dir().join(format!(
+                    "donat_{name}.sqlite"
+                ));
+                let _ = std::fs::remove_file(&path);
+                rusqlite::Connection::open(&path)
+                    .with_context(|| format!("creating SQLite database {}", path.display()))?;
+                Ok(Self {
+                    url: path.to_string_lossy().into_owned(),
+                    cleanup: SuiteCleanup::Sqlite(path),
+                })
+            }
+            BackendId::Mysql => {
+                use mysql::prelude::Queryable;
+
+                let admin_url = std::env::var("MYSQL_URL").context("MYSQL_URL is required")?;
+                let mut client = mysql::Conn::new(admin_url.as_str())
+                    .with_context(|| format!("connecting to MySQL at {admin_url}"))?;
+                client.query_drop(format!("DROP DATABASE IF EXISTS `{name}`"))?;
+                client.query_drop(format!("CREATE DATABASE `{name}`"))?;
+                let mut url = reqwest::Url::parse(&admin_url).context("parsing MYSQL_URL")?;
+                url.set_path(&format!("/{name}"));
+                Ok(Self {
+                    url: url.to_string(),
+                    cleanup: SuiteCleanup::Mysql {
+                        admin_url,
+                        name: name.to_string(),
+                    },
+                })
+            }
+            BackendId::Clickhouse => {
+                let configured = std::env::var("CLICKHOUSE_URL")
+                    .context("CLICKHOUSE_URL is required")?;
+                let mut admin = reqwest::Url::parse(&configured).context("parsing CLICKHOUSE_URL")?;
+                let retained = admin
+                    .query_pairs()
+                    .filter(|(key, _)| key != "database")
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<Vec<_>>();
+                admin.set_query(None);
+                admin.query_pairs_mut().extend_pairs(retained);
+                let admin_url = admin.to_string();
+                let http = reqwest::blocking::Client::new();
+                http.post(&admin_url)
+                    .body(format!("DROP DATABASE IF EXISTS `{name}`"))
+                    .send()?
+                    .error_for_status()?;
+                http.post(&admin_url)
+                    .body(format!("CREATE DATABASE `{name}`"))
+                    .send()?
+                    .error_for_status()?;
+                let mut database = admin;
+                database.query_pairs_mut().append_pair("database", name);
+                Ok(Self {
+                    url: database.to_string(),
+                    cleanup: SuiteCleanup::Clickhouse {
+                        admin_url,
+                        name: name.to_string(),
+                    },
+                })
+            }
+        }
+    }
+}
+
+impl Drop for SuiteDatabase {
+    fn drop(&mut self) {
+        match &self.cleanup {
+            SuiteCleanup::Postgres { admin_url, name } => {
+                if let Ok(mut client) = postgres::Client::connect(admin_url, postgres::NoTls) {
+                    let _ = client.batch_execute(&format!(
+                        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                    ));
+                }
+            }
+            SuiteCleanup::Sqlite(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+            SuiteCleanup::Mysql { admin_url, name } => {
+                use mysql::prelude::Queryable;
+                if let Ok(mut client) = mysql::Conn::new(admin_url.as_str()) {
+                    let _ = client.query_drop(format!("DROP DATABASE IF EXISTS `{name}`"));
+                }
+            }
+            SuiteCleanup::Clickhouse { admin_url, name } => {
+                let _ = reqwest::blocking::Client::new()
+                    .post(admin_url)
+                    .body(format!("DROP DATABASE IF EXISTS `{name}`"))
+                    .send();
+            }
+        }
+    }
+}
+
+static NEXT_DATABASE: AtomicU32 = AtomicU32::new(0);
 
 fn free_port() -> u16 {
     static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
@@ -413,15 +555,35 @@ fn free_port() -> u16 {
 /// (so `track_table` & co. have somewhere to live). The source points at
 /// `DONAT_DATABASE_URL`, which the engine resolves to the suite database.
 fn empty_metadata() -> Metadata {
+    default_metadata_with_configuration(
+        BackendId::Postgres,
+        serde_json::from_value(json!({
+            "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
+        }))
+        .expect("static source configuration"),
+    )
+}
+
+fn default_metadata_for(backend: BackendId, database_url: &str) -> Metadata {
+    default_metadata_with_configuration(
+        backend,
+        serde_json::from_value(json!({
+            "connection_info": { "database_url": database_url }
+        }))
+        .expect("backend source configuration"),
+    )
+}
+
+fn default_metadata_with_configuration(
+    backend: BackendId,
+    configuration: donat_metadata::SourceConfiguration,
+) -> Metadata {
     Metadata {
         version: 3,
         sources: vec![Source {
             name: "default".to_string(),
-            kind: SourceKind::Postgres,
-            configuration: serde_json::from_value(json!({
-                "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
-            }))
-            .expect("static source configuration"),
+            kind: backend.source_kind(),
+            configuration,
             tables: vec![],
             functions: vec![],
         }],
@@ -445,6 +607,7 @@ pub enum Transport {
 
 pub struct Suite {
     name: String,
+    backend: Option<BackendId>,
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
@@ -452,13 +615,14 @@ pub struct Suite {
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
-    initial_metadata: Metadata,
+    initial_metadata: Option<Metadata>,
 }
 
 impl Suite {
     pub fn new(name: &str) -> Self {
         Suite {
             name: name.to_string(),
+            backend: None,
             env: vec![],
             args: vec![],
             admin_secret: None,
@@ -466,12 +630,17 @@ impl Suite {
             cron: None,
             event: None,
             run_migrations: false,
-            initial_metadata: empty_metadata(),
+            initial_metadata: None,
         }
     }
 
+    pub fn backend(mut self, backend: BackendId) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     pub fn initial_metadata(mut self, metadata: Metadata) -> Self {
-        self.initial_metadata = metadata;
+        self.initial_metadata = Some(metadata);
         self
     }
 
@@ -558,15 +727,21 @@ impl Suite {
     /// The engine starts lazily on the first request, once all setup ops
     /// have been accumulated into the in-memory metadata.
     pub fn start(self) -> Running {
-        let db_url =
-            create_suite_db(&format!("conf_{}", self.name)).expect("creating suite database");
+        let backend = self
+            .backend
+            .map(Ok)
+            .unwrap_or_else(BackendId::selected)
+            .expect("selecting conformance backend");
+        let database = SuiteDatabase::create(backend, &suite_database_name(&self.name))
+            .expect("creating suite database");
+        let db_url = database.url.clone();
 
         // Fresh database: postgis is used pervasively by fixtures. Concurrent
         // CREATE EXTENSION across databases races inside Postgres (shared
         // library/template locks) — serialize within this process and retry
         // to cover other test processes.
         static POSTGIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        {
+        if backend == BackendId::Postgres {
             let _guard = POSTGIS_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -593,8 +768,13 @@ impl Suite {
             );
         }
 
+        let metadata = self
+            .initial_metadata
+            .unwrap_or_else(|| default_metadata_for(backend, &db_url));
+
         Running {
             name: self.name,
+            backend,
             env: self.env,
             args: self.args,
             admin_secret: self.admin_secret,
@@ -603,7 +783,8 @@ impl Suite {
             event: self.event,
             run_migrations: self.run_migrations,
             db_url,
-            metadata: RefCell::new(self.initial_metadata),
+            _database: database,
+            metadata: RefCell::new(metadata),
             engine: RefCell::new(None),
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -624,6 +805,7 @@ struct EngineProc {
 
 pub struct Running {
     pub name: String,
+    pub backend: BackendId,
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
@@ -632,6 +814,7 @@ pub struct Running {
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
     db_url: String,
+    _database: SuiteDatabase,
     /// Accumulated metadata, applied lazily when the engine is spawned.
     metadata: RefCell<Metadata>,
     /// The spawned engine, started on first request (`ensure_engine`).
@@ -1857,6 +2040,53 @@ mod tests {
                 (key == "CLICKHOUSE_URL").then(|| "http://clickhouse".into())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn default_metadata_tracks_selected_backend_and_url() {
+        for backend in BackendId::ALL {
+            let url = format!("{}://suite", backend.as_str());
+            let metadata = default_metadata_for(backend, &url);
+            let source = metadata.sources.first().unwrap();
+            assert_eq!(source.name, "default");
+            assert_eq!(source.kind, backend.source_kind());
+            let encoded = serde_json::to_value(&source.configuration).unwrap();
+            assert_eq!(
+                encoded.pointer("/connection_info/database_url"),
+                Some(&json!(url))
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_suite_owns_file_and_default_source() {
+        let path = {
+            let suite = Suite::new("sqlite_lifecycle")
+                .backend(BackendId::Sqlite)
+                .start();
+            assert_eq!(suite.backend, BackendId::Sqlite);
+            let path = PathBuf::from(&suite.db_url);
+            assert!(path.exists(), "SQLite database was not created");
+            let metadata = suite.metadata.borrow();
+            assert_eq!(metadata.sources[0].kind, SourceKind::Sqlite);
+            path
+        };
+        assert!(!path.exists(), "SQLite database was not cleaned up");
+    }
+
+    #[test]
+    fn suite_database_names_are_unique_and_safe() {
+        let first = suite_database_name("Reads / weird name");
+        let second = suite_database_name("Reads / weird name");
+        assert_ne!(first, second);
+        for name in [first, second] {
+            assert!(name.len() <= 63, "database name too long: {name}");
+            assert!(
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+                "unsafe database name: {name}"
+            );
+        }
     }
 
     // ---------------------------------------------------- load_fixture

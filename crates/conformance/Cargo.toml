@@ -13,6 +13,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
 tungstenite = { workspace = true }
 postgres = { workspace = true }
 graphql-parser = { workspace = true }
