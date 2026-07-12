@@ -53,11 +53,40 @@ const JSON_COLUMNS: &[FixtureColumn] = &[
     },
 ];
 
+const ARTICLE_COLUMNS: &[FixtureColumn] = &[
+    FixtureColumn {
+        name: "id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: true,
+    },
+    FixtureColumn {
+        name: "title",
+        ty: FixtureColumnType::Text,
+        nullable: false,
+        primary_key: false,
+    },
+    FixtureColumn {
+        name: "author_id",
+        ty: FixtureColumnType::BigInt,
+        nullable: false,
+        primary_key: false,
+    },
+];
+
 fn post(suite: &donat_conformance::Running, query: &str) -> serde_json::Value {
+    post_as(suite, "user", query)
+}
+
+fn post_as(
+    suite: &donat_conformance::Running,
+    role: &str,
+    query: &str,
+) -> serde_json::Value {
     let (status, body) = suite.post(
         "/v1/graphql",
         &json!({ "query": query }),
-        &[("X-Donat-Role".to_string(), "user".to_string())],
+        &[("X-Donat-Role".to_string(), role.to_string())],
     );
     assert_eq!(status, 200, "response: {body}");
     body
@@ -76,6 +105,35 @@ fn core_read_contract() {
         allow_aggregations: true,
         mutations: false,
     });
+    suite.install_table(&TableFixture {
+        name: "article",
+        columns: ARTICLE_COLUMNS,
+        rows: vec![
+            vec![json!(10), json!("A"), json!(1)],
+            vec![json!(11), json!("B"), json!(1)],
+            vec![json!(12), json!("C"), json!(2)],
+        ],
+        role: "user",
+        allow_aggregations: true,
+        mutations: false,
+    });
+    suite.add_select_permission(
+        "article",
+        "limited",
+        json!(["id", "title"]),
+        json!({ "author_id": { "_eq": 1 } }),
+        false,
+    );
+    let relationships_supported = backend.capabilities().relationships;
+    if relationships_supported {
+        suite.add_relationship("article", "author", "author", &[("author_id", "id")], false);
+        suite.add_relationship("author", "articles", "article", &[("id", "author_id")], true);
+    } else {
+        eprintln!(
+            "backend={} unsupported-by-capability: relationships",
+            backend.as_str()
+        );
+    }
     suite.install_table(&TableFixture {
         name: "special_value",
         columns: SPECIAL_COLUMNS,
@@ -134,6 +192,61 @@ fn core_read_contract() {
             "__typename": "query_root"
         }})
     );
+    assert_eq!(
+        post(
+            &suite,
+            "{ article(where: {title: {_in: [\"A\", \"C\"]}}, order_by: {id: asc}, limit: 1, offset: 1) { id title } }"
+        ),
+        json!({ "data": { "article": [{ "id": 12, "title": "C" }] } })
+    );
+    assert_eq!(
+        post_as(
+            &suite,
+            "limited",
+            "{ article(order_by: {id: asc}) { id title } }"
+        ),
+        json!({ "data": { "article": [
+            { "id": 10, "title": "A" },
+            { "id": 11, "title": "B" }
+        ]}})
+    );
+    let hidden = post_as(&suite, "limited", "{ article { author_id } }");
+    assert_eq!(
+        hidden,
+        json!({ "errors": [{
+            "extensions": {
+                "path": "$.selectionSet.article.selectionSet.author_id",
+                "code": "validation-failed"
+            },
+            "message": "field 'author_id' not found in type: 'article'"
+        }]})
+    );
+    if relationships_supported {
+        assert_eq!(
+            post(
+                &suite,
+                "{ article(order_by: {id: asc}) { id author { name } } }"
+            ),
+            json!({ "data": { "article": [
+                { "id": 10, "author": { "name": "Alice" } },
+                { "id": 11, "author": { "name": "Alice" } },
+                { "id": 12, "author": { "name": "Bob" } }
+            ]}})
+        );
+        assert_eq!(
+            post(
+                &suite,
+                "{ author(order_by: {id: asc}) { id articles(order_by: {id: asc}) { id title } } }"
+            ),
+            json!({ "data": { "author": [
+                { "id": 1, "articles": [
+                    { "id": 10, "title": "A" },
+                    { "id": 11, "title": "B" }
+                ]},
+                { "id": 2, "articles": [{ "id": 12, "title": "C" }] }
+            ]}})
+        );
+    }
     assert_eq!(
         post(
             &suite,

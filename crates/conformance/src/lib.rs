@@ -919,6 +919,72 @@ fn same_object(a: &QualifiedTable, b: &QualifiedTable) -> bool {
 }
 
 impl Running {
+    pub fn add_select_permission(
+        &self,
+        table_name: &str,
+        role: &str,
+        columns: Json,
+        filter: Json,
+        allow_aggregations: bool,
+    ) {
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: table_name.to_string(),
+        };
+        let permission: SelectPermission = serde_json::from_value(json!({
+            "columns": columns,
+            "filter": filter,
+            "allow_aggregations": allow_aggregations
+        }))
+        .expect("fixture select permission");
+        self.with_table(&table, |entry| {
+            entry.select_permissions.push(PermissionEntry {
+                role: role.to_string(),
+                permission,
+                comment: None,
+            });
+        });
+    }
+
+    pub fn add_relationship(
+        &self,
+        local_table: &str,
+        name: &str,
+        remote_table: &str,
+        column_mapping: &[(&str, &str)],
+        array: bool,
+    ) {
+        let local = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: local_table.to_string(),
+        };
+        let remote = json!({ "schema": self.schema, "name": remote_table });
+        let mapping = column_mapping
+            .iter()
+            .map(|(local, remote)| ((*local).to_string(), json!(remote)))
+            .collect::<serde_json::Map<_, _>>();
+        let relationship = json!({
+            "name": name,
+            "using": {
+                "manual_configuration": {
+                    "remote_table": remote,
+                    "column_mapping": mapping
+                }
+            }
+        });
+        self.with_table(&local, |entry| {
+            if array {
+                entry.array_relationships.push(
+                    serde_json::from_value(relationship).expect("fixture array relationship"),
+                );
+            } else {
+                entry.object_relationships.push(
+                    serde_json::from_value(relationship).expect("fixture object relationship"),
+                );
+            }
+        });
+    }
+
     pub fn install_table(&self, fixture: &TableFixture) {
         assert!(
             self.engine.borrow().is_none(),
