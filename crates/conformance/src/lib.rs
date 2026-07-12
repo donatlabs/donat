@@ -850,6 +850,7 @@ pub struct TableFixture {
     pub rows: Vec<Vec<Json>>,
     pub role: &'static str,
     pub allow_aggregations: bool,
+    pub mutations: bool,
 }
 
 impl Drop for Running {
@@ -1035,6 +1036,33 @@ impl Running {
                 permission,
                 comment: None,
             });
+            if fixture.mutations {
+                entry.insert_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({
+                        "columns": "*",
+                        "check": {}
+                    }))
+                    .expect("fixture insert permission"),
+                    comment: None,
+                });
+                entry.update_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({
+                        "columns": "*",
+                        "filter": {},
+                        "check": {}
+                    }))
+                    .expect("fixture update permission"),
+                    comment: None,
+                });
+                entry.delete_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({ "filter": {} }))
+                        .expect("fixture delete permission"),
+                    comment: None,
+                });
+            }
         });
     }
 

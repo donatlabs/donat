@@ -74,6 +74,7 @@ fn core_read_contract() {
         rows: vec![vec![json!(1), json!("Alice")], vec![json!(2), json!("Bob")]],
         role: "user",
         allow_aggregations: true,
+        mutations: false,
     });
     suite.install_table(&TableFixture {
         name: "special_value",
@@ -88,6 +89,7 @@ fn core_read_contract() {
         ],
         role: "user",
         allow_aggregations: false,
+        mutations: false,
     });
     let json_supported = backend.capabilities().json_ops != JsonOps::None;
     if json_supported {
@@ -100,6 +102,7 @@ fn core_read_contract() {
             ],
             role: "user",
             allow_aggregations: false,
+            mutations: false,
         });
     } else {
         eprintln!(
@@ -168,5 +171,74 @@ fn core_read_contract() {
             "aggregate": { "__typename": "author_aggregate_fields", "count": 2 },
             "nodes": [{ "id": 1 }, { "id": 2 }]
         }}})
+    );
+}
+
+#[test]
+fn core_mutation_contract() {
+    let backend = BackendId::selected().expect("selected backend");
+    if !backend.capabilities().mutations {
+        eprintln!(
+            "backend={} unsupported-by-capability: mutations",
+            backend.as_str()
+        );
+        return;
+    }
+
+    let suite = Suite::new("matrix_core_mutations").start();
+    suite.install_table(&TableFixture {
+        name: "note",
+        columns: AUTHOR_COLUMNS,
+        rows: vec![],
+        role: "user",
+        allow_aggregations: false,
+        mutations: true,
+    });
+
+    assert_eq!(
+        post(
+            &suite,
+            r#"mutation {
+                insert_note(objects: [
+                    { id: 1, name: "first" },
+                    { id: 2, name: "second" }
+                ]) { affected_rows returning { id name } }
+            }"#
+        ),
+        json!({ "data": { "insert_note": {
+            "affected_rows": 2,
+            "returning": [
+                { "id": 1, "name": "first" },
+                { "id": 2, "name": "second" }
+            ]
+        }}})
+    );
+    assert_eq!(
+        post(
+            &suite,
+            r#"mutation {
+                update_note(where: {id: {_eq: 1}}, _set: {name: "edited"}) {
+                    affected_rows returning { id name }
+                }
+            }"#
+        ),
+        json!({ "data": { "update_note": {
+            "affected_rows": 1,
+            "returning": [{ "id": 1, "name": "edited" }]
+        }}})
+    );
+    assert_eq!(
+        post(
+            &suite,
+            "mutation { delete_note(where: {id: {_eq: 2}}) { affected_rows returning { id } } }"
+        ),
+        json!({ "data": { "delete_note": {
+            "affected_rows": 1,
+            "returning": [{ "id": 2 }]
+        }}})
+    );
+    assert_eq!(
+        post(&suite, "{ note(order_by: {id: asc}) { id name } }"),
+        json!({ "data": { "note": [{ "id": 1, "name": "edited" }] } })
     );
 }
