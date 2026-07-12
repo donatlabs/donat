@@ -1273,9 +1273,8 @@ pub struct SqliteMutationPlan {
 }
 
 /// Build the [`SqliteMutationPlan`] for an insert/update/delete mutation root.
-/// Renders with the SQLite dialect; `on_conflict` is not supported on SQLite
-/// (different `ON CONFLICT` grammar) and triggers a panic by design — the
-/// planner does not surface it on this path and the carve-out defers it.
+/// Renders with the SQLite dialect. Unsupported mutation features are rejected
+/// by the planner; the assertions below defend the SQL-generation boundary.
 pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     let dialect = donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect);
     let mut ctx = Ctx {
@@ -1663,8 +1662,8 @@ pub struct MySqlMutationPlan {
 /// Build the [`MySqlMutationPlan`] for an insert/update/delete mutation root.
 /// `pk` is the table's primary-key column names (from the catalog) — needed for
 /// `last_insert_id()` recovery and for the supplied-PK `IN` predicate, which
-/// the IR mutation does not carry. `on_conflict` is DEFERRED on MySQL (ADR 004)
-/// and triggers a panic by design; the planner does not surface it on this path.
+/// the IR mutation does not carry. Unsupported mutation features are rejected
+/// by the planner; the assertions below defend the SQL-generation boundary.
 pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationPlan {
     use donat_backend::Dialect;
     let dialect = donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect);

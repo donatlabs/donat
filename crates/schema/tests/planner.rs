@@ -12,7 +12,7 @@ use donat_ir::{
     BoolExp, CompareOp, FieldValue, MutationRoot, OrderByTarget, RootField, Scalar, SelectQuery,
     SetOp,
 };
-use donat_metadata::Metadata;
+use donat_metadata::{Metadata, SourceKind};
 use donat_schema::{Plan, PlanError, Planner, Session, execute_introspection};
 use serde_json::{Map as JsonMap, Value as Json, json};
 
@@ -212,7 +212,17 @@ fn user() -> Session {
 }
 
 fn plan_gql(query: &str, sess: &Session, variables: Json) -> Result<Plan, PlanError> {
-    let md = metadata();
+    plan_gql_for_source(SourceKind::Postgres, query, sess, variables)
+}
+
+fn plan_gql_for_source(
+    source_kind: SourceKind,
+    query: &str,
+    sess: &Session,
+    variables: Json,
+) -> Result<Plan, PlanError> {
+    let mut md = metadata();
+    md.sources[0].kind = source_kind;
     let cat = catalog();
     let planner = Planner::new(&md, &cat);
     let doc = graphql_parser::parse_query::<String>(query)
@@ -220,6 +230,19 @@ fn plan_gql(query: &str, sess: &Session, variables: Json) -> Result<Plan, PlanEr
         .into_static();
     let vars = variables.as_object().cloned().unwrap_or_default();
     planner.plan(&doc, None, &vars, sess)
+}
+
+fn introspect_for_source(source_kind: SourceKind, query: &str) -> Json {
+    let mut md = metadata();
+    md.sources[0].kind = source_kind;
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("query parses")
+        .into_static();
+    execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds")
 }
 
 fn first_select(plan: Plan) -> SelectQuery {
@@ -372,6 +395,38 @@ fn insert_one_accepts_after_parent_object_relationship_data() {
 }
 
 #[test]
+fn sqlite_and_mysql_hide_and_reject_after_parent_nested_inserts() {
+    let nested_insert = r#"
+        mutation {
+          insert_author_one(object: { name: "Ada", profile: { data: { bio: "math" } } }) {
+            id
+          }
+        }
+    "#;
+
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let data = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "author_insert_input") { inputFields { name } } }"#,
+        );
+        let fields = data["__type"]["inputFields"]
+            .as_array()
+            .expect("insert input fields")
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!fields.contains(&"profile"), "{source_kind:?}: {fields:?}");
+
+        let error = plan_gql_for_source(source_kind, nested_insert, &user(), json!({}))
+            .expect_err("unsupported nested insert must fail during planning");
+        assert_eq!(
+            error.message, "field 'profile' not found in type: 'author_insert_input'",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
 fn update_by_pk_accepts_jsonb_append_input() {
     let plan = plan_gql(
         r#"
@@ -432,6 +487,105 @@ fn update_introspection_exposes_jsonb_append_input() {
         .filter_map(|f| f["name"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(fields, vec!["system_meta"]);
+}
+
+#[test]
+fn sqlite_and_mysql_hide_and_reject_jsonb_append_updates() {
+    let append_update = r#"
+        mutation {
+          update_author_by_pk(
+            pk_columns: { id: 1 }
+            _append: { system_meta: { deleted: true } }
+          ) { id }
+        }
+    "#;
+
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let mutation = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "mutation_root") { fields { name args { name } } } }"#,
+        );
+        let update = mutation["__type"]["fields"]
+            .as_array()
+            .expect("mutation fields")
+            .iter()
+            .find(|field| field["name"] == "update_author")
+            .expect("update_author field");
+        let args = update["args"]
+            .as_array()
+            .expect("update arguments")
+            .iter()
+            .filter_map(|arg| arg["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!args.contains(&"_append"), "{source_kind:?}: {args:?}");
+
+        let append_type = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "author_append_input") { name } }"#,
+        );
+        assert_eq!(append_type["__type"], Json::Null, "{source_kind:?}");
+
+        let error = plan_gql_for_source(source_kind, append_update, &user(), json!({}))
+            .expect_err("unsupported jsonb append must fail during planning");
+        assert_eq!(
+            error.message, "unexpected argument: \"_append\"",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
+fn sqlite_and_mysql_reject_deferred_upserts_during_planning() {
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let error = plan_gql_for_source(
+            source_kind,
+            r#"
+            mutation {
+              insert_author(
+                objects: [{ name: "Ada" }]
+                on_conflict: { constraint: author_pkey, update_columns: [name] }
+              ) {
+                affected_rows
+              }
+            }
+            "#,
+            &user(),
+            json!({}),
+        )
+        .expect_err("deferred upsert must be rejected by the planner");
+
+        assert_eq!(
+            error.message, "unexpected argument: \"on_conflict\"",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_still_plans_upserts() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          insert_author(
+            objects: [{ name: "Ada" }]
+            on_conflict: { constraint: author_pkey, update_columns: [name] }
+          ) {
+            affected_rows
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("Postgres upsert plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected a mutation plan")
+    };
+    let MutationRoot::Insert { insert, .. } = &roots[0] else {
+        panic!("expected an insert root")
+    };
+    assert!(insert.on_conflict.is_some());
 }
 
 // ---------------------------------------------------------------------
@@ -1053,6 +1207,35 @@ fn v1_insert_not_allowed_shape_keeps_trailing_space() {
         err.message,
         "insert on \"author\" for role \"stranger\" is not allowed. "
     );
+}
+
+#[test]
+fn sqlite_and_mysql_v1_reject_deferred_upserts_during_planning() {
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let mut md = metadata();
+        md.sources[0].kind = source_kind;
+        let cat = catalog();
+        let error = Planner::new(&md, &cat)
+            .plan_v1_insert(
+                &json!({
+                    "table": "author",
+                    "objects": [{ "name": "Ada" }],
+                    "on_conflict": {
+                        "constraint": "author_pkey",
+                        "action": "update"
+                    }
+                }),
+                &user(),
+            )
+            .expect_err("deferred v1 upsert must be rejected by the planner");
+
+        assert_eq!(error.code, "validation-failed", "{source_kind:?}");
+        assert_eq!(error.path, "$", "{source_kind:?}");
+        assert_eq!(
+            error.message, "on_conflict is not supported by this backend",
+            "{source_kind:?}"
+        );
+    }
 }
 
 #[test]

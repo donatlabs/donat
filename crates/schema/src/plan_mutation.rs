@@ -3,6 +3,7 @@
 //! everywhere, there is no admin bypass: the mutation root only exists for
 //! a role that has the corresponding permission.
 
+use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
 use donat_metadata::Columns;
 use graphql_parser::query::{Field as GqlField, SelectionSet};
@@ -152,7 +153,7 @@ impl<'a> Planner<'a> {
                     };
                 }
                 (MutationKind::InsertOne, "object") => objects = vec![value],
-                (_, "on_conflict") => {
+                (_, "on_conflict") if self.capabilities.upsert != UpsertKind::None => {
                     if !value.is_null() {
                         on_conflict = Some(self.parse_on_conflict(&value, ctx, session, path)?);
                     }
@@ -178,17 +179,19 @@ impl<'a> Planner<'a> {
             for key in map.keys() {
                 let Some(db_key) = ctx.column_db_name(key) else {
                     let value = map.get(key).expect("key came from map");
-                    if let Some(nested) =
-                        self.parse_nested_object_insert(ctx, key, value, session, path)?
-                    {
-                        if objects.len() != 1 {
-                            return Err(PlanError::validation(
-                                path,
-                                "nested object inserts support a single object",
-                            ));
+                    if self.capabilities.nested_inserts {
+                        if let Some(nested) =
+                            self.parse_nested_object_insert(ctx, key, value, session, path)?
+                        {
+                            if objects.len() != 1 {
+                                return Err(PlanError::validation(
+                                    path,
+                                    "nested object inserts support a single object",
+                                ));
+                            }
+                            nested_object_inserts.push(nested);
+                            continue;
                         }
-                        nested_object_inserts.push(nested);
-                        continue;
                     }
                     return Err(field_not_found(
                         path,
@@ -629,7 +632,7 @@ impl<'a> Planner<'a> {
                         });
                     }
                 }
-                (_, "_append") => {
+                (_, "_append") if self.capabilities.json_ops == JsonOps::Jsonb => {
                     let map = value
                         .as_object()
                         .ok_or_else(|| PlanError::validation(path, "_append must be an object"))?;

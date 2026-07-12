@@ -3,6 +3,7 @@
 //! GraphQL; only the argument syntax differs. As everywhere: no admin
 //! role — these planners always run as the request's explicit role.
 
+use donat_backend::capabilities::UpsertKind;
 use donat_ir::*;
 use donat_metadata::Columns;
 use serde_json::Value as Json;
@@ -567,6 +568,12 @@ impl<'a> Planner<'a> {
         // v1 on_conflict: { constraint | constraint_on, action: update|ignore }.
         let on_conflict = match args.get("on_conflict") {
             None | Some(Json::Null) => None,
+            Some(_) if self.capabilities.upsert == UpsertKind::None => {
+                return Err(PlanError::validation(
+                    path,
+                    "on_conflict is not supported by this backend",
+                ));
+            }
             Some(oc) => {
                 let constraint = oc
                     .get("constraint")

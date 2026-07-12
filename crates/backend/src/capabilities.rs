@@ -70,15 +70,17 @@ pub fn sqlite() -> Capabilities {
         relay: false,
         relationships: true,
         regex_ops: false,
-        // ON CONFLICT ... DO UPDATE is supported; no DO NOTHING-only limit.
-        upsert: UpsertKind::Update,
+        // The mutation planner does not yet translate named constraints to
+        // SQLite's ON CONFLICT(column-list) grammar (ADR 003).
+        upsert: UpsertKind::None,
         returning: true,
         // No DISTINCT ON in SQLite.
         distinct_on: false,
         // No LATERAL joins.
         lateral: false,
         aggregates: true,
-        nested_inserts: true,
+        // The SQLite mutation path cannot compose after-parent DML CTEs.
+        nested_inserts: false,
     }
 }
 
@@ -92,9 +94,9 @@ pub fn mysql() -> Capabilities {
         relay: false,
         relationships: true,
         regex_ops: false,
-        // INSERT ... ON DUPLICATE KEY UPDATE (mutations only; not exercised
-        // by the read-query slice).
-        upsert: UpsertKind::Update,
+        // ON DUPLICATE KEY UPDATE is deferred in the MySQL mutation path
+        // (ADR 004).
+        upsert: UpsertKind::None,
         // No RETURNING clause — MySQL mutations are a separate, later slice.
         returning: false,
         // No DISTINCT ON in MySQL.
@@ -153,7 +155,7 @@ mod tests {
         assert!(!caps.geo);
         assert!(caps.mutations);
         assert!(!caps.regex_ops);
-        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert_eq!(caps.upsert, UpsertKind::None);
         assert!(!caps.returning);
         assert!(!caps.distinct_on);
         assert!(caps.lateral);
@@ -168,12 +170,12 @@ mod tests {
         assert!(!caps.geo);
         assert!(caps.mutations);
         assert!(!caps.regex_ops);
-        assert_eq!(caps.upsert, UpsertKind::Update);
+        assert_eq!(caps.upsert, UpsertKind::None);
         assert!(caps.returning);
         assert!(!caps.distinct_on);
         assert!(!caps.lateral);
         assert!(caps.aggregates);
-        assert!(caps.nested_inserts);
+        assert!(!caps.nested_inserts);
     }
 
     #[test]
