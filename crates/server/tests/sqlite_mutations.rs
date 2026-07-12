@@ -215,11 +215,7 @@ async fn sqlite_mutations_through_runtime() {
     );
 
     // Prove the rollback: row 99 is absent.
-    let (_status, body) = run(
-        &state,
-        "query { note(where: { id: { _eq: 99 } }) { id } }",
-    )
-    .await;
+    let (_status, body) = run(&state, "query { note(where: { id: { _eq: 99 } }) { id } }").await;
     assert_eq!(
         body,
         json!({ "data": { "note": [] } }),

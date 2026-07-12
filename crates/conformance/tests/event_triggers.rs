@@ -122,7 +122,10 @@ fn assert_event(received: &[Received], op: &str, exp_data: Json) {
         .unwrap_or_else(|| panic!("no {op} event among {} received", received.len()));
     let body = &ev.body;
     assert_eq!(ev.path, "/", "webhook path");
-    assert_eq!(body["table"], json!({ "schema": "hge_tests", "name": TABLE }));
+    assert_eq!(
+        body["table"],
+        json!({ "schema": "hge_tests", "name": TABLE })
+    );
     assert_eq!(body["trigger"]["name"], json!("t1_all"));
     assert_eq!(body["event"]["op"], json!(op));
     assert_eq!(body["event"]["data"], exp_data, "event data for {op}");
@@ -142,12 +145,22 @@ fn event_trigger_fires_on_insert_update_delete() {
     let stub = r.event_webhook().clone();
 
     // INSERT
-    gql(&r, r#"mutation { insert_hge_tests_test_t1(objects: [{c1: 1, c2: "hello"}]) { affected_rows } }"#);
+    gql(
+        &r,
+        r#"mutation { insert_hge_tests_test_t1(objects: [{c1: 1, c2: "hello"}]) { affected_rows } }"#,
+    );
     let got = wait_events(&stub, 1, Duration::from_secs(15));
-    assert_event(&got, "INSERT", json!({ "old": null, "new": { "c1": 1, "c2": "hello" } }));
+    assert_event(
+        &got,
+        "INSERT",
+        json!({ "old": null, "new": { "c1": 1, "c2": "hello" } }),
+    );
 
     // UPDATE
-    gql(&r, r#"mutation { update_hge_tests_test_t1(where: {c1: {_eq: 1}}, _set: {c2: "world"}) { affected_rows } }"#);
+    gql(
+        &r,
+        r#"mutation { update_hge_tests_test_t1(where: {c1: {_eq: 1}}, _set: {c2: "world"}) { affected_rows } }"#,
+    );
     let got = wait_events(&stub, 2, Duration::from_secs(15));
     assert_event(
         &got,
@@ -156,9 +169,16 @@ fn event_trigger_fires_on_insert_update_delete() {
     );
 
     // DELETE
-    gql(&r, r#"mutation { delete_hge_tests_test_t1(where: {c1: {_eq: 1}}) { affected_rows } }"#);
+    gql(
+        &r,
+        r#"mutation { delete_hge_tests_test_t1(where: {c1: {_eq: 1}}) { affected_rows } }"#,
+    );
     let got = wait_events(&stub, 3, Duration::from_secs(15));
-    assert_event(&got, "DELETE", json!({ "old": { "c1": 1, "c2": "world" }, "new": null }));
+    assert_event(
+        &got,
+        "DELETE",
+        json!({ "old": { "c1": 1, "c2": "world" }, "new": null }),
+    );
 }
 
 #[test]
@@ -175,7 +195,10 @@ fn event_trigger_retries_then_errors_on_failing_webhook() {
     );
     let stub = r.event_webhook().clone();
 
-    gql(&r, r#"mutation { insert_hge_tests_test_t1(objects: [{c1: 1, c2: "hello"}]) { affected_rows } }"#);
+    gql(
+        &r,
+        r#"mutation { insert_hge_tests_test_t1(objects: [{c1: 1, c2: "hello"}]) { affected_rows } }"#,
+    );
 
     // 3 delivery attempts to /fail.
     let deadline = Instant::now() + Duration::from_secs(20);

@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use donat_metadata::{
-    Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
-    QualifiedTable, RemoteSchema, RestEndpoint, SelectPermission, SourceKind, TableConfiguration,
+    Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
+    RemoteSchema, RestEndpoint, SelectPermission, SourceKind, TableConfiguration,
     load_metadata_dir,
 };
 use serde_json::json;
@@ -56,7 +56,8 @@ fn columns_star_vs_list() {
 fn columns_arbitrary_string_is_rejected() {
     let err = serde_yaml::from_str::<Columns>("\"id\"").unwrap_err();
     assert!(
-        err.to_string().contains("expected \"*\" or a list of columns"),
+        err.to_string()
+            .contains("expected \"*\" or a list of columns"),
         "unexpected error: {err}"
     );
 }
@@ -106,10 +107,21 @@ definition:
 
     let out = serde_json::to_value(&rs).unwrap();
     let obj = out.as_object().unwrap();
-    assert!(!obj.contains_key("comment"), "comment must be omitted when None");
-    assert!(!obj.contains_key("permissions"), "empty permissions omitted");
+    assert!(
+        !obj.contains_key("comment"),
+        "comment must be omitted when None"
+    );
+    assert!(
+        !obj.contains_key("permissions"),
+        "empty permissions omitted"
+    );
     // url_from_env is None and must be skipped too.
-    assert!(!out["definition"].as_object().unwrap().contains_key("url_from_env"));
+    assert!(
+        !out["definition"]
+            .as_object()
+            .unwrap()
+            .contains_key("url_from_env")
+    );
 }
 
 #[test]
@@ -146,8 +158,7 @@ fn qualified_table_accepts_bare_name_and_qualified_form() {
     assert_eq!(bare.name(), "author");
     assert_eq!(bare.to_string(), "public.author");
 
-    let qual: QualifiedTable =
-        serde_yaml::from_str("{ schema: app, name: author }").unwrap();
+    let qual: QualifiedTable = serde_yaml::from_str("{ schema: app, name: author }").unwrap();
     assert_eq!(qual.schema(), "app");
     assert_eq!(qual.to_string(), "app.author");
 }
@@ -201,7 +212,10 @@ column_config:
     assert_eq!(name_back.custom_name.as_deref(), Some("full_name"));
     assert_eq!(name_back.comment.as_deref(), Some("The person's name"));
     assert_eq!(name_back.extra.get("some_future_key"), Some(&json!(42)));
-    assert_eq!(back.column_config["id"].comment.as_deref(), Some("The primary key"));
+    assert_eq!(
+        back.column_config["id"].comment.as_deref(),
+        Some("The primary key")
+    );
 }
 
 #[test]
@@ -300,7 +314,10 @@ schedule: '* * * * *'
 ";
     let ct: CronTrigger = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(ct.payload, serde_json::Value::Null);
-    assert!(ct.include_in_metadata, "include_in_metadata defaults to true");
+    assert!(
+        ct.include_in_metadata,
+        "include_in_metadata defaults to true"
+    );
     assert!(ct.retry_conf.is_none());
     assert!(ct.headers.is_empty());
     assert!(ct.comment.is_none());
@@ -406,7 +423,10 @@ webhook_from_env: MY_HOOK
     assert!(et.retry_conf.is_none());
     // RetryConf defaults (Donat): num_retries=0, interval_sec=10, timeout_sec=60.
     let rc = donat_metadata::EventRetryConf::default();
-    assert_eq!((rc.num_retries, rc.interval_sec, rc.timeout_sec), (0, 10, 60));
+    assert_eq!(
+        (rc.num_retries, rc.interval_sec, rc.timeout_sec),
+        (0, 10, 60)
+    );
 }
 
 #[test]
@@ -523,7 +543,10 @@ fn rest_endpoint_round_trips_omitting_none_comment() {
 fn rest_endpoints_absent_from_directory_yields_empty_vec() {
     // The canonical fixture has no rest_endpoints.yaml; load_section must
     // treat the absent file as an empty section.
-    let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/metadata"));
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert!(md.rest_endpoints.is_empty());
 }
@@ -555,7 +578,10 @@ tables: []
 fn existing_fixture_directory_still_loads() {
     // Guard: the canonical on-disk fixture (string-spelled includes, the
     // donat-cli layout) keeps loading through the public entry point.
-    let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/metadata"));
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert_eq!(md.sources.len(), 1);
     assert_eq!(md.sources[0].tables.len(), 2);

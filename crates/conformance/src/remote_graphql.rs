@@ -19,14 +19,17 @@ use graphql_parser::query::{
     Definition, Field, FragmentDefinition, OperationDefinition, Selection, SelectionSet,
     Value as GqlValue,
 };
-use serde_json::{json, Map, Value as Json};
+use serde_json::{Map, Value as Json, json};
 
 type Fragments<'a> = HashMap<String, &'a FragmentDefinition<'static, String>>;
 
 /// Flatten a selection set into its concrete fields, expanding fragment
 /// spreads and inline fragments (the upstream stub ignores type conditions —
 /// the engine has already validated and rewritten the query).
-fn fields<'a>(set: &'a SelectionSet<'static, String>, frags: &Fragments<'a>) -> Vec<&'a Field<'static, String>> {
+fn fields<'a>(
+    set: &'a SelectionSet<'static, String>,
+    frags: &Fragments<'a>,
+) -> Vec<&'a Field<'static, String>> {
     let mut out = Vec::new();
     for item in &set.items {
         match item {
@@ -105,7 +108,13 @@ fn execute(body: &Json) -> Json {
 }
 
 /// Resolve a top-level query field.
-fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>, frags: &Fragments) -> Json {
+fn resolve_root(
+    name: &str,
+    args: &Map<String, Json>,
+    sel: &SelectionSet<'static, String>,
+    vars: &Map<String, Json>,
+    frags: &Fragments,
+) -> Json {
     match name {
         "hello" => Json::String("world".into()),
         "user" => {
@@ -113,12 +122,24 @@ fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static
             project_user(&uid, sel, vars, frags)
         }
         "users" => {
-            let ids = args.get("user_ids").and_then(Json::as_array).cloned().unwrap_or_default();
-            Json::Array(ids.iter().map(|id| project_user(id, sel, vars, frags)).collect())
+            let ids = args
+                .get("user_ids")
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Json::Array(
+                ids.iter()
+                    .map(|id| project_user(id, sel, vars, frags))
+                    .collect(),
+            )
         }
         "messages" => {
             let rows = filter_messages(all_messages(), args);
-            Json::Array(rows.iter().map(|m| project_message(m, sel, frags)).collect())
+            Json::Array(
+                rows.iter()
+                    .map(|m| project_message(m, sel, frags))
+                    .collect(),
+            )
         }
         "communications" => {
             let mut rows = all_messages();
@@ -127,7 +148,11 @@ fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static
                     rows.retain(|m| &m["id"] == id);
                 }
             }
-            Json::Array(rows.iter().map(|m| project_message(m, sel, frags)).collect())
+            Json::Array(
+                rows.iter()
+                    .map(|m| project_message(m, sel, frags))
+                    .collect(),
+            )
         }
         "message" => {
             let id = args.get("id").cloned().unwrap_or(Json::Null);
@@ -146,7 +171,12 @@ fn resolve_root(name: &str, args: &Map<String, Json>, sel: &SelectionSet<'static
 }
 
 /// Project the `User` type: `user_id`, `gimmeText(text)`, `userMessages(...)`.
-fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<String, Json>, frags: &Fragments) -> Json {
+fn project_user(
+    user_id: &Json,
+    sel: &SelectionSet<'static, String>,
+    vars: &Map<String, Json>,
+    frags: &Fragments,
+) -> Json {
     if user_id.is_null() {
         return Json::Null;
     }
@@ -158,7 +188,9 @@ fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<
             "__typename" => Json::String("User".into()),
             "gimmeText" => {
                 let args = arg_map(&field.arguments, vars);
-                args.get("text").cloned().filter(|t| !t.is_null())
+                args.get("text")
+                    .cloned()
+                    .filter(|t| !t.is_null())
                     .unwrap_or_else(|| Json::String("no text".into()))
             }
             "userMessages" => {
@@ -168,7 +200,11 @@ fn project_user(user_id: &Json, sel: &SelectionSet<'static, String>, vars: &Map<
                     .filter(|m| m["id"] == *user_id)
                     .collect();
                 rows = filter_user_messages(rows, &args);
-                Json::Array(rows.iter().map(|m| project_message(m, &field.selection_set, frags)).collect())
+                Json::Array(
+                    rows.iter()
+                        .map(|m| project_message(m, &field.selection_set, frags))
+                        .collect(),
+                )
             }
             _ => Json::Null,
         };
@@ -192,7 +228,11 @@ fn project_message(row: &Json, sel: &SelectionSet<'static, String>, frags: &Frag
 }
 
 /// Project an arbitrary object (e.g. Photo) by copying selected fields.
-fn project_passthrough(value: &Json, sel: &SelectionSet<'static, String>, frags: &Fragments) -> Json {
+fn project_passthrough(
+    value: &Json,
+    sel: &SelectionSet<'static, String>,
+    frags: &Fragments,
+) -> Json {
     if value.is_null() {
         return Json::Null;
     }
@@ -252,23 +292,32 @@ fn cmp_int(field: &Json, op: &str, v: &Json) -> bool {
 }
 
 /// Resolve a field's arguments into a JSON map, substituting variables.
-fn arg_map(args: &[(String, GqlValue<'static, String>)], vars: &Map<String, Json>) -> Map<String, Json> {
-    args.iter().map(|(k, v)| (k.clone(), gql_to_json(v, vars))).collect()
+fn arg_map(
+    args: &[(String, GqlValue<'static, String>)],
+    vars: &Map<String, Json>,
+) -> Map<String, Json> {
+    args.iter()
+        .map(|(k, v)| (k.clone(), gql_to_json(v, vars)))
+        .collect()
 }
 
 fn gql_to_json(value: &GqlValue<'static, String>, vars: &Map<String, Json>) -> Json {
     match value {
         GqlValue::Variable(n) => vars.get(n).cloned().unwrap_or(Json::Null),
         GqlValue::Int(n) => Json::from(n.as_i64().unwrap_or_default()),
-        GqlValue::Float(f) => serde_json::Number::from_f64(*f).map(Json::Number).unwrap_or(Json::Null),
+        GqlValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
         GqlValue::String(s) => Json::String(s.clone()),
         GqlValue::Boolean(b) => Json::Bool(*b),
         GqlValue::Null => Json::Null,
         GqlValue::Enum(e) => Json::String(e.clone()),
         GqlValue::List(items) => Json::Array(items.iter().map(|v| gql_to_json(v, vars)).collect()),
-        GqlValue::Object(map) => {
-            Json::Object(map.iter().map(|(k, v)| (k.clone(), gql_to_json(v, vars))).collect())
-        }
+        GqlValue::Object(map) => Json::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), gql_to_json(v, vars)))
+                .collect(),
+        ),
     }
 }
 

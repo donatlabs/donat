@@ -83,6 +83,15 @@ struct Ctx {
     dialect: donat_backend::AnyDialect,
 }
 
+#[derive(Debug, Clone)]
+struct RelationshipCteOverride {
+    table: Table,
+    /// Join condition pairs: (local column on the outer row, remote column on
+    /// the relationship target).
+    join: Vec<(String, String)>,
+    cte: String,
+}
+
 /// Join condition pairs against an enclosing table alias:
 /// (local column on the outer table, remote column on the inner table).
 type OuterJoin<'a> = (&'a [(String, String)], &'a str);
@@ -287,18 +296,16 @@ impl Ctx {
         } else {
             let elem = self.alias();
             let e = quote_ident(&elem);
-            let stable_order =
-                if matches!(
-                    self.dialect,
-                    donat_backend::AnyDialect::Clickhouse(_)
-                        | donat_backend::AnyDialect::Mysql(_)
-                ) {
-                    rendered_order
-                        .as_ref()
-                        .map(|_| format!("{e}.{}", quote_ident("__donat_ord")))
-                } else {
-                    None
-                };
+            let stable_order = if matches!(
+                self.dialect,
+                donat_backend::AnyDialect::Clickhouse(_) | donat_backend::AnyDialect::Mysql(_)
+            ) {
+                rendered_order
+                    .as_ref()
+                    .map(|_| format!("{e}.{}", quote_ident("__donat_ord")))
+            } else {
+                None
+            };
             let row_projection = match rendered_order.as_deref() {
                 Some(order)
                     if matches!(
@@ -316,11 +323,7 @@ impl Ctx {
             };
             format!(
                 "(SELECT {agg} FROM (SELECT {distinct}{row_projection} {tail}) AS {e})",
-                agg = json_array_agg(
-                    &self.dialect,
-                    &format!("{e}.j"),
-                    stable_order.as_deref()
-                ),
+                agg = json_array_agg(&self.dialect, &format!("{e}.j"), stable_order.as_deref()),
             )
         }
     }
@@ -424,10 +427,7 @@ impl Ctx {
                                     self.dialect,
                                     donat_backend::AnyDialect::Clickhouse(_)
                                 ) {
-                                    format!(
-                                        "{}OrNull({expr})",
-                                        clickhouse_aggregate_function(op)
-                                    )
+                                    format!("{}OrNull({expr})", clickhouse_aggregate_function(op))
                                 } else {
                                     format!("{op}({expr})")
                                 };
@@ -712,14 +712,28 @@ impl Ctx {
     }
 
     fn bool_exp(&mut self, exp: &BoolExp, alias: &str, root: &str) -> String {
+        self.bool_exp_with_relationship_ctes(exp, alias, root, &[])
+    }
+
+    fn bool_exp_with_relationship_ctes(
+        &mut self,
+        exp: &BoolExp,
+        alias: &str,
+        root: &str,
+        relationship_ctes: &[RelationshipCteOverride],
+    ) -> String {
         let dialect = self.dialect;
         match exp {
             BoolExp::And(exps) => {
                 if exps.is_empty() {
                     "TRUE".into()
                 } else {
-                    let parts: Vec<String> =
-                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    let parts: Vec<String> = exps
+                        .iter()
+                        .map(|e| {
+                            self.bool_exp_with_relationship_ctes(e, alias, root, relationship_ctes)
+                        })
+                        .collect();
                     format!("({})", parts.join(" AND "))
                 }
             }
@@ -727,12 +741,19 @@ impl Ctx {
                 if exps.is_empty() {
                     "FALSE".into()
                 } else {
-                    let parts: Vec<String> =
-                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    let parts: Vec<String> = exps
+                        .iter()
+                        .map(|e| {
+                            self.bool_exp_with_relationship_ctes(e, alias, root, relationship_ctes)
+                        })
+                        .collect();
                     format!("({})", parts.join(" OR "))
                 }
             }
-            BoolExp::Not(inner) => format!("(NOT {})", self.bool_exp(inner, alias, root)),
+            BoolExp::Not(inner) => format!(
+                "(NOT {})",
+                self.bool_exp_with_relationship_ctes(inner, alias, root, relationship_ctes)
+            ),
             BoolExp::Compare {
                 column,
                 pg_type,
@@ -747,17 +768,31 @@ impl Ctx {
                 predicate,
             } => {
                 let ra = self.alias();
+                let from = relationship_ctes
+                    .iter()
+                    .find(|override_| override_.table == *table && override_.join == *join)
+                    .map(|override_| quote_ident(&override_.cte))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}.{}",
+                            quote_ident(&table.schema),
+                            quote_ident(&table.name)
+                        )
+                    });
                 let mut conds: Vec<String> = join
                     .iter()
                     .map(|(local, remote)| {
                         format!("{} = {}", qualified(&ra, remote), qualified(alias, local))
                     })
                     .collect();
-                conds.push(self.bool_exp(predicate, &ra, root));
+                conds.push(self.bool_exp_with_relationship_ctes(
+                    predicate,
+                    &ra,
+                    root,
+                    relationship_ctes,
+                ));
                 format!(
-                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
-                    quote_ident(&table.schema),
-                    quote_ident(&table.name),
+                    "EXISTS (SELECT 1 FROM {from} AS {} WHERE {})",
                     quote_ident(&ra),
                     conds.join(" AND ")
                 )
@@ -1044,6 +1079,13 @@ fn mutation_to_sql_full(
                                 quote_ident(column),
                                 scalar_sql(&dialect, value, pg_type)
                             )),
+                            SetOp::JsonbAppend { column, value } => sets.push(format!(
+                                "{} = COALESCE({}.{}, '{{}}'::jsonb) || {}",
+                                quote_ident(column),
+                                quote_ident(&insert.table.name),
+                                quote_ident(column),
+                                scalar_sql(&dialect, value, "jsonb")
+                            )),
                         }
                     }
                     stmt.push_str(&format!(
@@ -1060,11 +1102,62 @@ fn mutation_to_sql_full(
                 }
             }
             stmt.push_str(" RETURNING *");
-            ctx.mutation_select(
+            let mut extra_ctes = vec![];
+            let mut extra_checks = vec![];
+            for (idx, nested) in insert.nested_object_inserts.iter().enumerate() {
+                let cte = format!("{}__nested_{idx}", nested.relationship_name);
+                let mut cols: Vec<String> = nested
+                    .column_mapping
+                    .iter()
+                    .map(|(_, child)| quote_ident(child))
+                    .collect();
+                cols.extend(nested.columns.iter().map(|(name, _)| quote_ident(name)));
+
+                let mut values: Vec<String> = nested
+                    .column_mapping
+                    .iter()
+                    .map(|(parent, _)| qualified("ins", parent))
+                    .collect();
+                values.extend(nested.row.iter().zip(&nested.columns).map(
+                    |(value, (_, pg_type))| match value {
+                        None => "DEFAULT".to_string(),
+                        Some(s) => scalar_sql(&dialect, s, pg_type),
+                    },
+                ));
+                extra_ctes.push(format!(
+                    "{} AS (INSERT INTO {}.{} ({}) SELECT {} FROM {} RETURNING *)",
+                    quote_ident(&cte),
+                    quote_ident(&nested.table.schema),
+                    quote_ident(&nested.table.name),
+                    cols.join(", "),
+                    values.join(", "),
+                    quote_ident("ins")
+                ));
+                if let Some(check) = &nested.check {
+                    let parent_join = nested
+                        .column_mapping
+                        .iter()
+                        .map(|(parent, child)| (child.clone(), parent.clone()))
+                        .collect();
+                    extra_checks.push((
+                        cte,
+                        check,
+                        nested.check_path.clone(),
+                        vec![RelationshipCteOverride {
+                            table: insert.table.clone(),
+                            join: parent_join,
+                            cte: "ins".to_string(),
+                        }],
+                    ));
+                }
+            }
+            ctx.mutation_select_with_extra_ctes(
                 "ins",
                 &stmt,
                 insert.check.as_ref(),
                 &insert.check_path,
+                extra_ctes,
+                extra_checks,
                 &insert.output,
             )
         }
@@ -1093,6 +1186,12 @@ fn mutation_to_sql_full(
                         quote_ident(column),
                         quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
+                    ),
+                    SetOp::JsonbAppend { column, value } => format!(
+                        "{} = COALESCE({}, '{{}}'::jsonb) || {}",
+                        quote_ident(column),
+                        quote_ident(column),
+                        scalar_sql(&dialect, value, "jsonb")
                     ),
                 })
                 .collect();
@@ -1197,6 +1296,10 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
         }
         MutationRoot::Insert { insert, .. } => {
             assert!(
+                insert.nested_object_inserts.is_empty(),
+                "nested object inserts are not supported on sqlite mutations"
+            );
+            assert!(
                 insert.on_conflict.is_none(),
                 "on_conflict is not supported on sqlite mutations"
             );
@@ -1260,6 +1363,9 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
                         quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
                     ),
+                    SetOp::JsonbAppend { .. } => {
+                        panic!("jsonb append updates are not supported by sqlite sqlgen")
+                    }
                 })
                 .collect();
             let alias = "_t".to_string();
@@ -1582,6 +1688,10 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
         }
         MutationRoot::Insert { insert, .. } => {
             assert!(
+                insert.nested_object_inserts.is_empty(),
+                "nested object inserts are not supported on mysql mutations"
+            );
+            assert!(
                 insert.on_conflict.is_none(),
                 "on_conflict is not yet supported on mysql mutations"
             );
@@ -1693,6 +1803,9 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                         dialect.quote_ident(column),
                         scalar_sql(&dialect, value, pg_type)
                     ),
+                    SetOp::JsonbAppend { .. } => {
+                        panic!("jsonb append updates are not supported by mysql sqlgen")
+                    }
                 })
                 .collect();
             // The predicate is rendered over BARE columns so it is valid both in
@@ -1824,6 +1937,19 @@ impl Ctx {
         check_path: &str,
         output: &MutationOutput,
     ) -> String {
+        self.mutation_select_with_extra_ctes(cte, dml, check, check_path, vec![], vec![], output)
+    }
+
+    fn mutation_select_with_extra_ctes(
+        &mut self,
+        cte: &str,
+        dml: &str,
+        check: Option<&BoolExp>,
+        check_path: &str,
+        extra_ctes: Vec<String>,
+        extra_checks: Vec<(String, &BoolExp, String, Vec<RelationshipCteOverride>)>,
+        output: &MutationOutput,
+    ) -> String {
         let dialect = self.dialect;
         let cte_ident = quote_ident(cte);
         let result = match output {
@@ -1859,27 +1985,48 @@ impl Ctx {
             }
         };
 
-        let guarded = match check {
-            Some(check) => {
-                let violated = format!(
-                    "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
-                    self.bool_exp(check, cte, cte)
-                );
-                // The message carries the GraphQL error path as JSON; the
-                // executor unpacks it into the Donat error shape.
-                let payload = serde_json::json!({
-                    "path": check_path,
-                    "message": "check constraint of an insert/update permission has failed",
-                })
-                .to_string();
-                format!(
-                    "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {result} END",
-                    quote_lit(&payload)
+        let mut guarded = result;
+        for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
+            let check_cte_ident = quote_ident(&check_cte);
+            let violated = format!(
+                "(SELECT count(*) FROM {check_cte_ident} WHERE ({}) IS NOT TRUE)",
+                self.bool_exp_with_relationship_ctes(
+                    check,
+                    &check_cte,
+                    &check_cte,
+                    &relationship_ctes,
                 )
-            }
-            None => result,
-        };
-        format!("WITH {cte_ident} AS ({dml}) SELECT {guarded} AS root")
+            );
+            let payload = serde_json::json!({
+                "path": check_path,
+                "message": "check constraint of an insert/update permission has failed",
+            })
+            .to_string();
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {guarded} END",
+                quote_lit(&payload)
+            );
+        }
+        if let Some(check) = check {
+            let violated = format!(
+                "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
+                self.bool_exp(check, cte, cte)
+            );
+            // The message carries the GraphQL error path as JSON; the
+            // executor unpacks it into the Donat error shape.
+            let payload = serde_json::json!({
+                "path": check_path,
+                "message": "check constraint of an insert/update permission has failed",
+            })
+            .to_string();
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.check_violation({}) ELSE {guarded} END",
+                quote_lit(&payload)
+            );
+        }
+        let mut ctes = vec![format!("{cte_ident} AS ({dml})")];
+        ctes.extend(extra_ctes);
+        format!("WITH {} SELECT {guarded} AS root", ctes.join(", "))
     }
 }
 
@@ -2267,6 +2414,7 @@ mod dialect_dispatch_tests {
                 },
                 columns: vec![("body".into(), "text".into())],
                 rows: vec![vec![Some(Scalar::Json(serde_json::json!("hello")))]],
+                nested_object_inserts: vec![],
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
@@ -2307,6 +2455,7 @@ mod dialect_dispatch_tests {
                 },
                 columns: vec![("name".into(), "text".into())],
                 rows: vec![vec![Some(Scalar::Json(serde_json::json!("Ada")))]],
+                nested_object_inserts: vec![],
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
@@ -2431,6 +2580,9 @@ mod dialect_dispatch_tests {
             assert!(sql.contains(function), "missing {function}: {sql}");
         }
         assert!(!sql.contains("stddevOrNull"), "unsupported function: {sql}");
-        assert!(!sql.contains("varianceOrNull"), "unsupported function: {sql}");
+        assert!(
+            !sql.contains("varianceOrNull"),
+            "unsupported function: {sql}"
+        );
     }
 }

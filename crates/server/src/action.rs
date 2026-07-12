@@ -90,25 +90,44 @@ pub async fn resolve(
         OperationDefinition::Mutation(m) => &m.selection_set,
         OperationDefinition::SelectionSet(s) => s,
         OperationDefinition::Subscription(_) => {
-            return err("$", "validation-failed", "subscriptions are not supported")
+            return err("$", "validation-failed", "subscriptions are not supported");
         }
     };
 
     let mut data = JsonMap::new();
     for item in &set.items {
         let Selection::Field(field) = item else {
-            return err("$", "validation-failed", "fragments are not supported on actions");
+            return err(
+                "$",
+                "validation-failed",
+                "fragments are not supported on actions",
+            );
         };
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         if field.name == "__typename" {
-            data.insert(alias, Json::String(if ctx.is_query { "query_root".into() } else { "mutation_root".into() }));
+            data.insert(
+                alias,
+                Json::String(if ctx.is_query {
+                    "query_root".into()
+                } else {
+                    "mutation_root".into()
+                }),
+            );
             continue;
         }
         let Some(action) = ctx.find(&field.name) else {
             return err(
                 &format!("$.selectionSet.{}", field.name),
                 "validation-failed",
-                format!("field \"{}\" not found in type: '{}'", field.name, if ctx.is_query { "query_root" } else { "mutation_root" }),
+                format!(
+                    "field \"{}\" not found in type: '{}'",
+                    field.name,
+                    if ctx.is_query {
+                        "query_root"
+                    } else {
+                        "mutation_root"
+                    }
+                ),
             );
         };
 
@@ -117,11 +136,29 @@ pub async fn resolve(
             return err(
                 &format!("$.selectionSet.{}", field.name),
                 "validation-failed",
-                format!("field \"{}\" not found in type: '{}'", field.name, if ctx.is_query { "query_root" } else { "mutation_root" }),
+                format!(
+                    "field \"{}\" not found in type: '{}'",
+                    field.name,
+                    if ctx.is_query {
+                        "query_root"
+                    } else {
+                        "mutation_root"
+                    }
+                ),
             );
         }
 
-        match call_action(state, session, action, field, variables, headers, &ctx.custom_types).await {
+        match call_action(
+            state,
+            session,
+            action,
+            field,
+            variables,
+            headers,
+            &ctx.custom_types,
+        )
+        .await
+        {
             Ok(value) => {
                 data.insert(alias, value);
             }
@@ -184,7 +221,7 @@ async fn call_action(
                 &path,
                 "unexpected",
                 format!("http exception when calling webhook: {e}"),
-            ))
+            ));
         }
     };
     let status = response.status();
@@ -204,7 +241,10 @@ async fn call_action(
         let extensions = match body.get("extensions") {
             Some(ext) if !ext.is_null() => ext.clone(),
             _ => {
-                let code = body.get("code").and_then(Json::as_str).unwrap_or("unexpected");
+                let code = body
+                    .get("code")
+                    .and_then(Json::as_str)
+                    .unwrap_or("unexpected");
                 json!({ "path": "$", "code": code })
             }
         };
@@ -255,8 +295,16 @@ fn fill_relationships<'a>(
             TypeRef::List { inner, .. } => {
                 if let (Json::Array(items), Json::Array(raws)) = (&mut *shaped, raw) {
                     for (item, raw_item) in items.iter_mut().zip(raws.iter()) {
-                        fill_relationships(state, session, custom_types, inner, item, raw_item, selection)
-                            .await?;
+                        fill_relationships(
+                            state,
+                            session,
+                            custom_types,
+                            inner,
+                            item,
+                            raw_item,
+                            selection,
+                        )
+                        .await?;
                     }
                 }
                 Ok(())
@@ -266,12 +314,15 @@ fn fill_relationships<'a>(
                     return Ok(());
                 };
                 for item in selection {
-                    let Selection::Field(field) = item else { continue };
+                    let Selection::Field(field) = item else {
+                        continue;
+                    };
                     let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
 
                     if let Some(rel) = obj.relationships.iter().find(|r| r.name == field.name) {
                         let resolved =
-                            resolve_relationship(state, session, rel, raw, &field.selection_set).await?;
+                            resolve_relationship(state, session, rel, raw, &field.selection_set)
+                                .await?;
                         if let Some(map) = shaped.as_object_mut() {
                             map.insert(alias, resolved);
                         }
@@ -378,8 +429,14 @@ fn parse_type(s: &str) -> TypeRef {
     if let Some(stripped) = t.strip_suffix('!') {
         let inner = parse_type(stripped);
         return match inner {
-            TypeRef::Named { name, .. } => TypeRef::Named { name, non_null: true },
-            TypeRef::List { inner, .. } => TypeRef::List { inner, non_null: true },
+            TypeRef::Named { name, .. } => TypeRef::Named {
+                name,
+                non_null: true,
+            },
+            TypeRef::List { inner, .. } => TypeRef::List {
+                inner,
+                non_null: true,
+            },
         };
     }
     if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
@@ -450,7 +507,9 @@ fn project_object(
 ) -> Result<Json, String> {
     let mut out = JsonMap::new();
     for item in selection {
-        let Selection::Field(field) = item else { continue };
+        let Selection::Field(field) = item else {
+            continue;
+        };
         let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
         if field.name == "__typename" {
             out.insert(alias, Json::String(obj.name.clone()));
@@ -607,8 +666,16 @@ mod tests {
             objects: vec![ObjectType {
                 name: "OutObject".into(),
                 fields: vec![
-                    CustomTypeField { name: "id".into(), type_: "ID!".into(), description: None },
-                    CustomTypeField { name: "name".into(), type_: "String".into(), description: None },
+                    CustomTypeField {
+                        name: "id".into(),
+                        type_: "ID!".into(),
+                        description: None,
+                    },
+                    CustomTypeField {
+                        name: "name".into(),
+                        type_: "String".into(),
+                        description: None,
+                    },
                 ],
                 relationships: vec![],
                 description: None,
@@ -632,8 +699,17 @@ mod tests {
 
     #[test]
     fn parses_type_wrappers() {
-        assert!(matches!(parse_type("UserId"), TypeRef::Named { non_null: false, .. }));
-        assert!(matches!(parse_type("UserId!"), TypeRef::Named { non_null: true, .. }));
+        assert!(matches!(
+            parse_type("UserId"),
+            TypeRef::Named {
+                non_null: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_type("UserId!"),
+            TypeRef::Named { non_null: true, .. }
+        ));
         match parse_type("[String!]!") {
             TypeRef::List { inner, non_null } => {
                 assert!(non_null);
@@ -661,48 +737,87 @@ mod tests {
     #[test]
     fn array_for_object_output_errors() {
         let ct = out_object();
-        let err = validate(&ct, &parse_type("OutObject"), &json!([]), &id_name_selection())
-            .unwrap_err();
-        assert_eq!(err, "got array for the action webhook response, expecting OutObject");
+        let err = validate(
+            &ct,
+            &parse_type("OutObject"),
+            &json!([]),
+            &id_name_selection(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "got array for the action webhook response, expecting OutObject"
+        );
     }
 
     #[test]
     fn scalar_for_object_output_errors() {
         let ct = out_object();
-        let err = validate(&ct, &parse_type("OutObject"), &json!("s"), &id_name_selection())
-            .unwrap_err();
-        assert_eq!(err, "got scalar String for the action webhook response, expecting OutObject");
+        let err = validate(
+            &ct,
+            &parse_type("OutObject"),
+            &json!("s"),
+            &id_name_selection(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "got scalar String for the action webhook response, expecting OutObject"
+        );
     }
 
     #[test]
     fn missing_non_null_field_errors() {
         let ct = out_object();
-        let err = validate(&ct, &parse_type("OutObject"), &json!({ "name": "A" }), &id_name_selection())
-            .unwrap_err();
-        assert_eq!(err, "field \"id\" expected in webhook response, but not found");
+        let err = validate(
+            &ct,
+            &parse_type("OutObject"),
+            &json!({ "name": "A" }),
+            &id_name_selection(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "field \"id\" expected in webhook response, but not found"
+        );
     }
 
     #[test]
     fn null_non_null_field_errors() {
         let ct = out_object();
-        let err = validate(&ct, &parse_type("OutObject"), &json!({ "id": null, "name": "A" }), &id_name_selection())
-            .unwrap_err();
+        let err = validate(
+            &ct,
+            &parse_type("OutObject"),
+            &json!({ "id": null, "name": "A" }),
+            &id_name_selection(),
+        )
+        .unwrap_err();
         assert_eq!(err, "expecting not null value for field \"id\"");
     }
 
     #[test]
     fn nullable_field_absent_becomes_null() {
         let ct = out_object();
-        let out = validate(&ct, &parse_type("OutObject"), &json!({ "id": "x" }), &id_name_selection())
-            .unwrap();
+        let out = validate(
+            &ct,
+            &parse_type("OutObject"),
+            &json!({ "id": "x" }),
+            &id_name_selection(),
+        )
+        .unwrap();
         assert_eq!(out, json!({ "id": "x", "name": null }));
     }
 
     #[test]
     fn non_array_for_list_output_errors() {
         let ct = out_object();
-        let err = validate(&ct, &parse_type("[OutObject]"), &json!({}), &id_name_selection())
-            .unwrap_err();
+        let err = validate(
+            &ct,
+            &parse_type("[OutObject]"),
+            &json!({}),
+            &id_name_selection(),
+        )
+        .unwrap_err();
         assert_eq!(err, "expecting array for the action webhook response");
     }
 
@@ -710,13 +825,22 @@ mod tests {
     fn object_for_scalar_output_errors() {
         let ct = CustomTypes::default();
         let err = validate(&ct, &parse_type("String!"), &json!({ "a": 1 }), &[]).unwrap_err();
-        assert_eq!(err, "got object for the action webhook response, expecting String");
+        assert_eq!(
+            err,
+            "got object for the action webhook response, expecting String"
+        );
     }
 
     #[test]
     fn custom_scalar_passes_through_any_json() {
         let ct = CustomTypes::default();
-        let out = validate(&ct, &parse_type("myCustomScalar!"), &json!({ "foo": "bar" }), &[]).unwrap();
+        let out = validate(
+            &ct,
+            &parse_type("myCustomScalar!"),
+            &json!({ "foo": "bar" }),
+            &[],
+        )
+        .unwrap();
         assert_eq!(out, json!({ "foo": "bar" }));
     }
 
@@ -729,7 +853,10 @@ mod tests {
 
     #[test]
     fn table_base_name_handles_schema() {
-        assert_eq!(table_base_name(&QualifiedTable::Name("user".into())), "user");
+        assert_eq!(
+            table_base_name(&QualifiedTable::Name("user".into())),
+            "user"
+        );
         assert_eq!(
             table_base_name(&QualifiedTable::Qualified {
                 schema: "app".into(),

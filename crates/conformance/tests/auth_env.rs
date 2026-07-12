@@ -172,7 +172,11 @@ fn unauthorized_role_permission() {
         .start();
     s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
     // test_unauth_role
-    check_query_f_no_auth(&s, &format!("{UNAUTH}/unauthorized_role.yaml"), Transport::Both);
+    check_query_f_no_auth(
+        &s,
+        &format!("{UNAUTH}/unauthorized_role.yaml"),
+        Transport::Both,
+    );
     s.teardown_v1q(&format!("{UNAUTH}/teardown.yaml"));
 }
 

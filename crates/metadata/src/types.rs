@@ -686,6 +686,8 @@ pub struct ArrRelFkConstraint {
 pub struct ManualConfiguration {
     pub remote_table: QualifiedTable,
     pub column_mapping: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertion_order: Option<String>,
 }
 
 /// A field joined to a remote schema: per-row arguments from columns.

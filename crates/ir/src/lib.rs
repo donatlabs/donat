@@ -18,11 +18,20 @@ pub struct Table {
 /// One root field of a query operation, in selection-set order.
 #[derive(Debug, Clone, Serialize)]
 pub enum RootField {
-    Select { alias: String, query: SelectQuery },
+    Select {
+        alias: String,
+        query: SelectQuery,
+    },
     /// Relay `<table>_connection` root.
-    Connection { alias: String, conn: Connection },
+    Connection {
+        alias: String,
+        conn: Connection,
+    },
     /// `__typename` on the root (e.g. `query_root`).
-    Typename { alias: String, value: String },
+    Typename {
+        alias: String,
+        value: String,
+    },
 }
 
 /// A Relay connection over a table: rows of `query` wrapped in
@@ -56,17 +65,33 @@ pub struct RelayPage {
 #[derive(Debug, Clone, Serialize)]
 pub enum ConnectionField {
     /// (alias, selected pageInfo field names as (alias, name)).
-    PageInfo { alias: String, fields: Vec<(String, String)> },
-    Edges { alias: String, fields: Vec<EdgeField> },
-    Typename { alias: String, value: String },
+    PageInfo {
+        alias: String,
+        fields: Vec<(String, String)>,
+    },
+    Edges {
+        alias: String,
+        fields: Vec<EdgeField>,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub enum EdgeField {
-    Cursor { alias: String },
+    Cursor {
+        alias: String,
+    },
     /// Node renders the connection query's `fields`.
-    Node { alias: String },
-    Typename { alias: String, value: String },
+    Node {
+        alias: String,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
 }
 
 /// What a select reads FROM.
@@ -196,7 +221,10 @@ pub struct AggregateField {
 pub enum AggregateOp {
     /// GraphQL meta-field on `<table>_aggregate_fields`.
     Typename { value: String },
-    Count { distinct: bool, columns: Vec<String> },
+    Count {
+        distinct: bool,
+        columns: Vec<String>,
+    },
     /// sum/avg/min/max over a set of columns.
     ColumnOp {
         op: String,
@@ -342,7 +370,10 @@ pub enum CompareOp {
     Contains(Scalar),
     ContainedIn(Scalar),
     /// PostGIS `ST_<fn>(col, geom)` returning bool.
-    StOp { function: String, value: Scalar },
+    StOp {
+        function: String,
+        value: Scalar,
+    },
     /// PostGIS `ST_DWithin(col, geom, distance)` (or the 3D variant).
     StDWithin {
         distance: Scalar,
@@ -361,11 +392,26 @@ pub enum CompareOp {
 pub enum MutationRoot {
     /// A tracked VOLATILE function exposed as a mutation: executes the
     /// function and returns its rows like a select.
-    FunctionCall { alias: String, query: SelectQuery },
-    Insert { alias: String, insert: InsertMutation },
-    Update { alias: String, update: UpdateMutation },
-    Delete { alias: String, delete: DeleteMutation },
-    Typename { alias: String, value: String },
+    FunctionCall {
+        alias: String,
+        query: SelectQuery,
+    },
+    Insert {
+        alias: String,
+        insert: InsertMutation,
+    },
+    Update {
+        alias: String,
+        update: UpdateMutation,
+    },
+    Delete {
+        alias: String,
+        delete: DeleteMutation,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -375,12 +421,29 @@ pub struct InsertMutation {
     pub columns: Vec<(String, String)>,
     /// Row values aligned with `columns`; None renders DEFAULT.
     pub rows: Vec<Vec<Option<Scalar>>>,
+    /// Object relationships inserted after the parent row, using values
+    /// returned from the parent INSERT for the relationship column mapping.
+    pub nested_object_inserts: Vec<NestedObjectInsert>,
     pub on_conflict: Option<OnConflict>,
     /// The role's insert check expression, evaluated over inserted rows.
     pub check: Option<BoolExp>,
     /// Error path reported on check violation.
     pub check_path: String,
     pub output: MutationOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NestedObjectInsert {
+    pub relationship_name: String,
+    pub table: Table,
+    /// (parent column, child column) pairs.
+    pub column_mapping: Vec<(String, String)>,
+    /// Child insertion columns supplied by the user, excluding mapped columns.
+    pub columns: Vec<(String, String)>,
+    /// Child row values aligned with `columns`.
+    pub row: Vec<Option<Scalar>>,
+    pub check: Option<BoolExp>,
+    pub check_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -408,8 +471,20 @@ pub struct UpdateMutation {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum SetOp {
-    Set { column: String, pg_type: String, value: Scalar },
-    Inc { column: String, pg_type: String, value: Scalar },
+    Set {
+        column: String,
+        pg_type: String,
+        value: Scalar,
+    },
+    Inc {
+        column: String,
+        pg_type: String,
+        value: Scalar,
+    },
+    JsonbAppend {
+        column: String,
+        value: Scalar,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -430,9 +505,17 @@ pub enum MutationOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MutationResponseField {
-    AffectedRows { alias: String },
-    Returning { alias: String, fields: Vec<OutputField> },
-    Typename { alias: String, value: String },
+    AffectedRows {
+        alias: String,
+    },
+    Returning {
+        alias: String,
+        fields: Vec<OutputField>,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
 }
 
 /// A remote-schema join resolved after local execution: for each row,

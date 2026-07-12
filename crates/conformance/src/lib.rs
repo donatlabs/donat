@@ -14,8 +14,8 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -238,10 +238,10 @@ use std::cell::RefCell;
 
 use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
-    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata, ObjectRelationship,
-    PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship, RemoteSchema,
-    RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind, TableConfiguration,
-    TableEntry, UpdatePermission,
+    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
+    ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship,
+    RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind,
+    TableConfiguration, TableEntry, UpdatePermission,
 };
 
 /// Datasource backends covered by the mandatory conformance matrix.
@@ -384,15 +384,11 @@ impl CaseCapability {
             Self::Mutations => capabilities.mutations,
             Self::Relationships => capabilities.relationships,
             Self::Aggregates => capabilities.aggregates,
-            Self::Json => {
-                capabilities.json_ops != donat_backend::capabilities::JsonOps::None
-            }
+            Self::Json => capabilities.json_ops != donat_backend::capabilities::JsonOps::None,
             Self::Geo => capabilities.geo,
             Self::Relay => capabilities.relay,
             Self::Regex => capabilities.regex_ops,
-            Self::Upsert => {
-                capabilities.upsert != donat_backend::capabilities::UpsertKind::None
-            }
+            Self::Upsert => capabilities.upsert != donat_backend::capabilities::UpsertKind::None,
             Self::Returning => capabilities.returning,
             Self::DistinctOn => capabilities.distinct_on,
             Self::Lateral => capabilities.lateral,
@@ -546,7 +542,10 @@ pub fn run_conformance_cases(
 
 fn validate_case_manifest(group: &str, cases: &[ConformanceCase]) {
     assert!(!group.trim().is_empty(), "conformance group name is empty");
-    assert!(!cases.is_empty(), "conformance group '{group}' has no cases");
+    assert!(
+        !cases.is_empty(),
+        "conformance group '{group}' has no cases"
+    );
 
     for (case_index, case) in cases.iter().enumerate() {
         assert!(
@@ -707,9 +706,7 @@ impl SuiteDatabase {
                 },
             }),
             BackendId::Sqlite => {
-                let path = std::env::temp_dir().join(format!(
-                    "donat_{name}.sqlite"
-                ));
+                let path = std::env::temp_dir().join(format!("donat_{name}.sqlite"));
                 let _ = std::fs::remove_file(&path);
                 rusqlite::Connection::open(&path)
                     .with_context(|| format!("creating SQLite database {}", path.display()))?;
@@ -739,9 +736,10 @@ impl SuiteDatabase {
                 })
             }
             BackendId::Clickhouse => {
-                let configured = std::env::var("CLICKHOUSE_URL")
-                    .context("CLICKHOUSE_URL is required")?;
-                let mut admin = reqwest::Url::parse(&configured).context("parsing CLICKHOUSE_URL")?;
+                let configured =
+                    std::env::var("CLICKHOUSE_URL").context("CLICKHOUSE_URL is required")?;
+                let mut admin =
+                    reqwest::Url::parse(&configured).context("parsing CLICKHOUSE_URL")?;
                 let retained = admin
                     .query_pairs()
                     .filter(|(key, _)| key != "database")
@@ -779,9 +777,8 @@ impl Drop for SuiteDatabase {
         match &self.cleanup {
             SuiteCleanup::Postgres { admin_url, name } => {
                 if let Ok(mut client) = postgres::Client::connect(admin_url, postgres::NoTls) {
-                    let _ = client.batch_execute(&format!(
-                        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-                    ));
+                    let _ = client
+                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
                 }
             }
             SuiteCleanup::Sqlite(path) => {
@@ -950,8 +947,10 @@ impl Suite {
     /// poll interval so tests observe delivery quickly.
     pub fn with_event_webhook(mut self) -> Self {
         let stub = cron_webhook::spawn();
-        self.env
-            .push(("EVENT_WEBHOOK_HANDLER".to_string(), stub.base_url().to_string()));
+        self.env.push((
+            "EVENT_WEBHOOK_HANDLER".to_string(),
+            stub.base_url().to_string(),
+        ));
         self.env
             .push(("DONAT_EVENTS_POLL_SECONDS".to_string(), "1".to_string()));
         self.event = Some(stub);
@@ -982,10 +981,8 @@ impl Suite {
     /// header (mirroring tests-py `add_auth`).
     pub fn admin_secret(mut self, secret: &str) -> Self {
         self.admin_secret = Some(secret.to_string());
-        self.env.push((
-            "DONAT_GRAPHQL_ADMIN_SECRET".to_string(),
-            secret.to_string(),
-        ));
+        self.env
+            .push(("DONAT_GRAPHQL_ADMIN_SECRET".to_string(), secret.to_string()));
         self
     }
 
@@ -1159,8 +1156,7 @@ impl Drop for Running {
 
 /// A `postgres::Client` on the suite database (for run_sql / seed inserts).
 fn pg_client(db_url: &str) -> postgres::Client {
-    postgres::Client::connect(db_url, postgres::NoTls)
-        .expect("connecting to the suite database")
+    postgres::Client::connect(db_url, postgres::NoTls).expect("connecting to the suite database")
 }
 
 /// Render a JSON scalar as a SQL literal for seed `insert` ops.
@@ -1433,19 +1429,27 @@ impl Running {
 
     fn execute_fixture_sql(&self, sql: &str) {
         match self.backend {
-            BackendId::Postgres => pg_client(&self.db_url)
-                .batch_execute(sql)
-                .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)),
+            BackendId::Postgres => {
+                pg_client(&self.db_url)
+                    .batch_execute(sql)
+                    .unwrap_or_else(|error| {
+                        panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                    })
+            }
             BackendId::Sqlite => rusqlite::Connection::open(&self.db_url)
                 .and_then(|connection| connection.execute_batch(sql))
-                .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)),
+                .unwrap_or_else(|error| {
+                    panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                }),
             BackendId::Mysql => {
                 use mysql::prelude::Queryable;
-                let mut connection = mysql::Conn::new(self.db_url.as_str())
-                    .unwrap_or_else(|error| panic!("[{}] MySQL connect failed: {error}", self.name));
-                connection
-                    .query_drop(sql)
-                    .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name));
+                let mut connection =
+                    mysql::Conn::new(self.db_url.as_str()).unwrap_or_else(|error| {
+                        panic!("[{}] MySQL connect failed: {error}", self.name)
+                    });
+                connection.query_drop(sql).unwrap_or_else(|error| {
+                    panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                });
             }
             BackendId::Clickhouse => {
                 self.http
@@ -1453,7 +1457,9 @@ impl Running {
                     .body(sql.to_string())
                     .send()
                     .and_then(reqwest::blocking::Response::error_for_status)
-                    .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name));
+                    .unwrap_or_else(|error| {
+                        panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                    });
             }
         }
     }
@@ -1468,9 +1474,7 @@ impl Running {
             BackendId::Postgres => {
                 donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect)
             }
-            BackendId::Sqlite => {
-                donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect)
-            }
+            BackendId::Sqlite => donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect),
             BackendId::Mysql => donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect),
             BackendId::Clickhouse => {
                 donat_backend::AnyDialect::Clickhouse(donat_backend::ClickhouseDialect)
@@ -1559,13 +1563,15 @@ impl Running {
                 let sql = args["sql"]
                     .as_str()
                     .unwrap_or_else(|| panic!("run_sql without sql: {op}"));
-                pg_client(&self.db_url).batch_execute(sql).unwrap_or_else(|e| {
-                    let detail = e
-                        .as_db_error()
-                        .map(|d| format!("{}: {}", d.code().code(), d.message()))
-                        .unwrap_or_else(|| e.to_string());
-                    panic!("[{}] run_sql failed: {detail}\nSQL:\n{sql}", self.name)
-                });
+                pg_client(&self.db_url)
+                    .batch_execute(sql)
+                    .unwrap_or_else(|e| {
+                        let detail = e
+                            .as_db_error()
+                            .map(|d| format!("{}: {}", d.code().code(), d.message()))
+                            .unwrap_or_else(|| e.to_string());
+                        panic!("[{}] run_sql failed: {detail}\nSQL:\n{sql}", self.name)
+                    });
             }
 
             "insert" => {
@@ -1625,7 +1631,8 @@ impl Running {
             "create_select_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: SelectPermission = from_value("select permission", &args["permission"]);
+                let permission: SelectPermission =
+                    from_value("select permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.select_permissions.push(PermissionEntry {
                         role,
@@ -1637,7 +1644,8 @@ impl Running {
             "create_insert_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: InsertPermission = from_value("insert permission", &args["permission"]);
+                let permission: InsertPermission =
+                    from_value("insert permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.insert_permissions.push(PermissionEntry {
                         role,
@@ -1649,7 +1657,8 @@ impl Running {
             "create_update_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: UpdatePermission = from_value("update permission", &args["permission"]);
+                let permission: UpdatePermission =
+                    from_value("update permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.update_permissions.push(PermissionEntry {
                         role,
@@ -1661,7 +1670,8 @@ impl Running {
             "create_delete_permission" => {
                 let table = qualified_from(&args["table"]);
                 let role = args["role"].as_str().expect("role").to_string();
-                let permission: DeletePermission = from_value("delete permission", &args["permission"]);
+                let permission: DeletePermission =
+                    from_value("delete permission", &args["permission"]);
                 self.with_table(&table, |t| {
                     t.delete_permissions.push(PermissionEntry {
                         role,
@@ -1704,7 +1714,11 @@ impl Running {
                 };
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                if !source.functions.iter().any(|f| same_object(&f.function, &function)) {
+                if !source
+                    .functions
+                    .iter()
+                    .any(|f| same_object(&f.function, &function))
+                {
                     source.functions.push(FunctionEntry {
                         function,
                         configuration: args
@@ -1795,7 +1809,10 @@ impl Running {
 
             "create_query_collection" => {
                 let collection: QueryCollection = from_value("query collection", &args);
-                self.metadata.borrow_mut().query_collections.push(collection);
+                self.metadata
+                    .borrow_mut()
+                    .query_collections
+                    .push(collection);
             }
             "drop_query_collection" => {
                 let name = args["collection"]
@@ -1841,7 +1858,10 @@ impl Running {
                 self.metadata.borrow_mut().rest_endpoints.push(endpoint);
             }
             "drop_rest_endpoint" => {
-                let name = args["name"].as_str().expect("rest endpoint name").to_string();
+                let name = args["name"]
+                    .as_str()
+                    .expect("rest endpoint name")
+                    .to_string();
                 self.metadata
                     .borrow_mut()
                     .rest_endpoints
@@ -1877,11 +1897,16 @@ impl Running {
                 };
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                source.functions.retain(|f| !same_object(&f.function, &function));
+                source
+                    .functions
+                    .retain(|f| !same_object(&f.function, &function));
             }
             "drop_relationship" => {
                 let table = qualified_from(&args["table"]);
-                let name = args["relationship"].as_str().expect("relationship").to_string();
+                let name = args["relationship"]
+                    .as_str()
+                    .expect("relationship")
+                    .to_string();
                 self.with_table(&table, |t| {
                     t.object_relationships.retain(|r| r.name != name);
                     t.array_relationships.retain(|r| r.name != name);
@@ -1895,7 +1920,9 @@ impl Running {
             "drop_remote_relationship" => {
                 let table = qualified_from(&args["table"]);
                 let name = args["name"].as_str().expect("name").to_string();
-                self.with_table(&table, |t| t.remote_relationships.retain(|r| r.name != name));
+                self.with_table(&table, |t| {
+                    t.remote_relationships.retain(|r| r.name != name)
+                });
             }
             "drop_select_permission" => {
                 let table = qualified_from(&args["table"]);
@@ -1926,15 +1953,20 @@ impl Running {
                 let role = args["role"].as_str().expect("role").to_string();
                 let mut md = self.metadata.borrow_mut();
                 let source = md.sources.iter_mut().find(|s| s.name == "default").unwrap();
-                if let Some(f) = source.functions.iter_mut().find(|f| same_object(&f.function, &function)) {
+                if let Some(f) = source
+                    .functions
+                    .iter_mut()
+                    .find(|f| same_object(&f.function, &function))
+                {
                     f.permissions.retain(|p| p.role != role);
                 }
             }
 
             "set_custom_types" => {
                 let custom_types: donat_metadata::CustomTypes =
-                    serde_json::from_value(args.clone())
-                        .unwrap_or_else(|e| panic!("[{}] bad set_custom_types: {e}\n{op}", self.name));
+                    serde_json::from_value(args.clone()).unwrap_or_else(|e| {
+                        panic!("[{}] bad set_custom_types: {e}\n{op}", self.name)
+                    });
                 self.metadata.borrow_mut().custom_types = custom_types;
             }
 
@@ -1958,12 +1990,18 @@ impl Running {
                     .map(|a| a.permissions.clone())
                     .unwrap_or_default();
                 md.actions.retain(|a| a.name != entry.name);
-                md.actions.push(donat_metadata::ActionEntry { permissions, ..entry });
+                md.actions.push(donat_metadata::ActionEntry {
+                    permissions,
+                    ..entry
+                });
             }
 
             "drop_action" => {
                 let name = args["name"].as_str().expect("action name").to_string();
-                self.metadata.borrow_mut().actions.retain(|a| a.name != name);
+                self.metadata
+                    .borrow_mut()
+                    .actions
+                    .retain(|a| a.name != name);
             }
 
             "create_action_permission" => {
@@ -1972,7 +2010,8 @@ impl Running {
                 let mut md = self.metadata.borrow_mut();
                 if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
                     if !a.permissions.iter().any(|p| p.role == role) {
-                        a.permissions.push(donat_metadata::ActionPermission { role });
+                        a.permissions
+                            .push(donat_metadata::ActionPermission { role });
                     }
                 }
             }
@@ -2013,11 +2052,8 @@ impl Running {
 
     /// Serialize the accumulated metadata to a temp `version: 3` directory.
     fn write_metadata_dir(&self) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dist_conf_md_{}_{}",
-            self.name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dist_conf_md_{}_{}", self.name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("databases")).unwrap();
 
@@ -2105,7 +2141,11 @@ impl Running {
                 .env("DONAT_DATABASE_URL", &self.db_url)
                 .status()
                 .expect("running donat migrate");
-            assert!(status.success(), "donat migrate failed for suite {}", self.name);
+            assert!(
+                status.success(),
+                "donat migrate failed for suite {}",
+                self.name
+            );
         }
         let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
@@ -2144,8 +2184,7 @@ impl Running {
             if let Some(status) = proc.child.try_wait().expect("checking donat process") {
                 panic!(
                     "engine for suite {} exited before becoming healthy with {status}; see target/conformance-logs/{}.log",
-                    self.name,
-                    self.name
+                    self.name, self.name
                 );
             }
             assert!(
@@ -2409,9 +2448,7 @@ impl Running {
             other => {
                 let m = reqwest::Method::from_bytes(other.as_bytes())
                     .unwrap_or_else(|_| panic!("[{label}] bad method {other}"));
-                let mut req = self
-                    .http
-                    .request(m, format!("{}{url}", self.base_url()));
+                let mut req = self.http.request(m, format!("{}{url}", self.base_url()));
                 for (k, v) in &headers {
                     req = req.header(k, v);
                 }
@@ -2452,7 +2489,13 @@ impl Running {
         if let Some(allowed) = conf.get("allowed_responses").and_then(Json::as_array) {
             let ok = allowed.iter().any(|a| {
                 a.get("response")
-                    .map(|exp| if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() })
+                    .map(|exp| {
+                        if url == "/mcp" {
+                            strip_mcp_content(exp)
+                        } else {
+                            exp.clone()
+                        }
+                    })
                     .is_some_and(|exp| response_matches(&exp, &resp, query_text))
             });
             assert!(
@@ -2462,7 +2505,11 @@ impl Running {
                 pretty(&resp)
             );
         } else if let Some(exp) = conf.get("response") {
-            let exp = if url == "/mcp" { strip_mcp_content(exp) } else { exp.clone() };
+            let exp = if url == "/mcp" {
+                strip_mcp_content(exp)
+            } else {
+                exp.clone()
+            };
             self.assert_response(&exp, &resp, query_text, label);
         }
     }
@@ -2642,10 +2689,7 @@ mod tests {
             .unwrap();
 
         let started = Instant::now();
-        assert!(!engine_is_healthy(
-            &client,
-            &format!("http://{address}")
-        ));
+        assert!(!engine_is_healthy(&client, &format!("http://{address}")));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "one health probe consumed the whole startup deadline"
@@ -2714,10 +2758,22 @@ mod tests {
 
     #[test]
     fn backend_registry_uses_engine_capabilities() {
-        assert_eq!(BackendId::Postgres.capabilities(), donat_backend::capabilities::postgres());
-        assert_eq!(BackendId::Sqlite.capabilities(), donat_backend::capabilities::sqlite());
-        assert_eq!(BackendId::Mysql.capabilities(), donat_backend::capabilities::mysql());
-        assert_eq!(BackendId::Clickhouse.capabilities(), donat_backend::capabilities::clickhouse());
+        assert_eq!(
+            BackendId::Postgres.capabilities(),
+            donat_backend::capabilities::postgres()
+        );
+        assert_eq!(
+            BackendId::Sqlite.capabilities(),
+            donat_backend::capabilities::sqlite()
+        );
+        assert_eq!(
+            BackendId::Mysql.capabilities(),
+            donat_backend::capabilities::mysql()
+        );
+        assert_eq!(
+            BackendId::Clickhouse.capabilities(),
+            donat_backend::capabilities::clickhouse()
+        );
     }
 
     #[test]
@@ -2757,12 +2813,9 @@ mod tests {
         ];
 
         let mut called = Vec::new();
-        let summary = run_conformance_cases(
-            "runner-unit",
-            BackendId::Clickhouse,
-            CASES,
-            |name| called.push(name),
-        );
+        let summary = run_conformance_cases("runner-unit", BackendId::Clickhouse, CASES, |name| {
+            called.push(name)
+        });
 
         assert_eq!(called, ["read"]);
         assert_eq!(summary.total, 3);
@@ -2829,16 +2882,25 @@ mod tests {
 
     #[test]
     fn in_process_and_default_backends_need_no_explicit_url() {
-        BackendId::Postgres.validate_configuration(|_| None).unwrap();
+        BackendId::Postgres
+            .validate_configuration(|_| None)
+            .unwrap();
         BackendId::Sqlite.validate_configuration(|_| None).unwrap();
     }
 
     #[test]
     fn service_backends_require_explicit_urls() {
-        let mysql = BackendId::Mysql.validate_configuration(|_| None).unwrap_err();
+        let mysql = BackendId::Mysql
+            .validate_configuration(|_| None)
+            .unwrap_err();
         assert!(mysql.to_string().contains("MYSQL_URL"), "{mysql}");
-        let clickhouse = BackendId::Clickhouse.validate_configuration(|_| None).unwrap_err();
-        assert!(clickhouse.to_string().contains("CLICKHOUSE_URL"), "{clickhouse}");
+        let clickhouse = BackendId::Clickhouse
+            .validate_configuration(|_| None)
+            .unwrap_err();
+        assert!(
+            clickhouse.to_string().contains("CLICKHOUSE_URL"),
+            "{clickhouse}"
+        );
 
         BackendId::Mysql
             .validate_configuration(|key| (key == "MYSQL_URL").then(|| "mysql://db".into()))
@@ -2908,11 +2970,7 @@ mod tests {
             .expect("conformance matrix.include");
         let actual = include
             .iter()
-            .map(|entry| {
-                entry["backend"]
-                    .as_str()
-                    .expect("matrix backend string")
-            })
+            .map(|entry| entry["backend"].as_str().expect("matrix backend string"))
             .collect::<Vec<_>>();
         assert_eq!(actual, BackendId::ALL.map(BackendId::as_str));
 

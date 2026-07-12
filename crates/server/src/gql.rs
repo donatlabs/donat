@@ -321,7 +321,11 @@ async fn webhook_session(
             vars.insert(key, value);
         }
     }
-    let Some(role) = vars.get("x-donat-role").or_else(|| vars.get("x-hasura-role")).cloned() else {
+    let Some(role) = vars
+        .get("x-donat-role")
+        .or_else(|| vars.get("x-hasura-role"))
+        .cloned()
+    else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -340,7 +344,6 @@ async fn webhook_session(
         backend_request: false,
     })
 }
-
 
 pub async fn execute(
     state: &SharedState,
@@ -367,12 +370,20 @@ pub async fn execute_full(
     headers: &axum::http::HeaderMap,
 ) -> (axum::http::StatusCode, Json) {
     let Some(query) = body.get("query").and_then(Json::as_str) else {
-        return ok(error_json("validation-failed", "the key 'query' is missing"));
+        return ok(error_json(
+            "validation-failed",
+            "the key 'query' is missing",
+        ));
     };
     let variables: JsonMap<String, Json> = match body.get("variables") {
         Some(Json::Object(map)) => map.clone(),
         Some(Json::Null) | None => JsonMap::new(),
-        Some(_) => return ok(error_json("validation-failed", "variables must be an object")),
+        Some(_) => {
+            return ok(error_json(
+                "validation-failed",
+                "variables must be an object",
+            ));
+        }
     };
     let operation_name = body.get("operationName").and_then(Json::as_str);
 
@@ -384,7 +395,12 @@ pub async fn execute_full(
     }
     let doc = match graphql_parser::parse_query::<String>(query) {
         Ok(doc) => doc.into_static(),
-        Err(e) => return ok(error_json("validation-failed", format!("not a valid graphql query: {e}"))),
+        Err(e) => {
+            return ok(error_json(
+                "validation-failed",
+                format!("not a valid graphql query: {e}"),
+            ));
+        }
     };
 
     let engine = state.engine.read().await;
@@ -506,13 +522,9 @@ pub async fn execute_full(
     planner.infer_function_permissions = state.infer_function_permissions;
     planner.relay = relay && planner.supports_relay();
     // Introspection operations are answered from the type system directly.
-    if let Some(result) = donat_schema::execute_introspection(
-        &planner,
-        session,
-        &doc,
-        operation_name,
-        &variables,
-    ) {
+    if let Some(result) =
+        donat_schema::execute_introspection(&planner, session, &doc, operation_name, &variables)
+    {
         return match result {
             Ok(data) => ok(json!({ "data": data })),
             Err(e) => ok(e.to_graphql()),
@@ -595,7 +607,10 @@ pub async fn execute_full(
                         | donat_ir::MutationRoot::Delete { alias, .. }
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
-                    (alias, donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
+                    (
+                        alias,
+                        donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics),
+                    )
                 })
                 .collect();
             drop(engine);
@@ -605,7 +620,12 @@ pub async fn execute_full(
             };
             let mut client = match pool.get().await {
                 Ok(c) => c,
-                Err(e) => return ok(error_json("unexpected", format!("connection pool error: {e}"))),
+                Err(e) => {
+                    return ok(error_json(
+                        "unexpected",
+                        format!("connection pool error: {e}"),
+                    ));
+                }
             };
             let tx = match client.transaction().await {
                 Ok(tx) => tx,
@@ -715,9 +735,8 @@ pub(crate) async fn execute_select_internal(
 fn normalize_for_allowlist(doc: &graphql_parser::query::Document<'static, String>) -> String {
     use graphql_parser::query::{Definition, Selection};
     fn strip(set: &mut graphql_parser::query::SelectionSet<'static, String>) {
-        set.items.retain(|item| {
-            !matches!(item, Selection::Field(f) if f.name == "__typename")
-        });
+        set.items
+            .retain(|item| !matches!(item, Selection::Field(f) if f.name == "__typename"));
         for item in &mut set.items {
             match item {
                 Selection::Field(f) => strip(&mut f.selection_set),
@@ -758,9 +777,8 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
             for item in &set.items {
                 if let Selection::Field(f) = item {
                     let alias = f.alias.clone().unwrap_or_else(|| f.name.clone());
-                    let is_intro = f.name == "__schema"
-                        || f.name == "__type"
-                        || f.name == "__typename";
+                    let is_intro =
+                        f.name == "__schema" || f.name == "__type" || f.name == "__typename";
                     out.push((alias, is_intro));
                 }
             }
@@ -855,8 +873,7 @@ fn resolve_remote_joins<'a>(
                                     // field path, not the join root's.
                                     let client_field =
                                         format!("{path}.selectionSet.{}", field.alias);
-                                    let server_root =
-                                        format!("$.selectionSet.{}", spec.root_field);
+                                    let server_root = format!("$.selectionSet.{}", spec.root_field);
                                     let rewritten = match e.path.strip_prefix(&server_root) {
                                         Some(rest) => format!("{client_field}{rest}"),
                                         None => client_field,
@@ -926,9 +943,18 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
     }
     let (code, message) = match db.code().code() {
         "23514" => ("permission-error", db.message().to_string()),
-        "23505" => ("constraint-violation", format!("Uniqueness violation. {}", db.message())),
-        "23503" => ("constraint-violation", format!("Foreign key violation. {}", db.message())),
-        "23502" => ("constraint-violation", format!("Not-NULL violation. {}", db.message())),
+        "23505" => (
+            "constraint-violation",
+            format!("Uniqueness violation. {}", db.message()),
+        ),
+        "23503" => (
+            "constraint-violation",
+            format!("Foreign key violation. {}", db.message()),
+        ),
+        "23502" => (
+            "constraint-violation",
+            format!("Not-NULL violation. {}", db.message()),
+        ),
         _ => ("data-exception", db.message().to_string()),
     };
     json!({
@@ -1022,7 +1048,9 @@ mod tests {
     }
 
     fn parse(q: &str) -> graphql_parser::query::Document<'static, String> {
-        graphql_parser::parse_query::<String>(q).unwrap().into_static()
+        graphql_parser::parse_query::<String>(q)
+            .unwrap()
+            .into_static()
     }
 
     #[test]
@@ -1036,7 +1064,10 @@ mod tests {
     #[test]
     fn untrusted_request_without_unauthorized_role_is_denied() {
         let e = session_from_headers(&HeaderMap::new(), None, false).unwrap_err();
-        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("access-denied")));
+        assert_eq!(
+            e.pointer("/errors/0/extensions/code"),
+            Some(&json!("access-denied"))
+        );
         assert_eq!(
             e.pointer("/errors/0/message"),
             Some(&json!("x-donat-admin-secret required, but not found"))
@@ -1068,9 +1099,18 @@ mod tests {
         ]);
         let s = session_from_headers(&h, None, true).unwrap();
         assert_eq!(s.role, "editor");
-        assert_eq!(s.vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
-        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("editor"));
-        assert_eq!(s.vars.get("x-donat-role").map(String::as_str), Some("editor"));
+        assert_eq!(
+            s.vars.get("x-hasura-user-id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("editor")
+        );
+        assert_eq!(
+            s.vars.get("x-donat-role").map(String::as_str),
+            Some("editor")
+        );
         assert!(!s.vars.contains_key("x-donat-admin-secret"));
         assert!(!s.vars.contains_key("x-hasura-admin-secret"));
     }
@@ -1083,26 +1123,33 @@ mod tests {
         ]);
         let s = session_from_headers(&h, None, true).unwrap();
         assert_eq!(s.role, "donat_user");
-        assert_eq!(s.vars.get("x-hasura-role").map(String::as_str), Some("donat_user"));
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("donat_user")
+        );
     }
 
     #[test]
     fn trusted_request_requires_a_role() {
         // No admin role: a trusted request with no X-Donat-Role is denied.
-        let e = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
-            .unwrap_err();
+        let e =
+            session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true).unwrap_err();
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-donat-role header is required (this engine has no admin role)"))
+            Some(&json!(
+                "x-donat-role header is required (this engine has no admin role)"
+            ))
         );
     }
-
 
     #[test]
     fn backend_only_permissions_header_parsing() {
         let with = |v: &str| {
             session_from_headers(
-                &headers(&[("x-donat-role", "u"), ("x-donat-use-backend-only-permissions", v)]),
+                &headers(&[
+                    ("x-donat-role", "u"),
+                    ("x-donat-use-backend-only-permissions", v),
+                ]),
                 None,
                 true,
             )
@@ -1110,18 +1157,22 @@ mod tests {
         assert!(with("YES").unwrap().backend_request);
         assert!(!with("f").unwrap().backend_request);
         let e = with("maybe").unwrap_err();
-        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("bad-request")));
+        assert_eq!(
+            e.pointer("/errors/0/extensions/code"),
+            Some(&json!("bad-request"))
+        );
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"))
+            Some(&json!(
+                "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"
+            ))
         );
     }
 
     #[test]
     fn allowlist_comparison_ignores_typename_only() {
         let listed = parse("query getAuthors { author { id name } }");
-        let with_typename =
-            parse("query getAuthors { __typename author { id __typename name } }");
+        let with_typename = parse("query getAuthors { __typename author { id __typename name } }");
         let different = parse("query getAuthors { author { id } }");
         assert_eq!(
             normalize_for_allowlist(&with_typename),

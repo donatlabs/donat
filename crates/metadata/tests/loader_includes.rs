@@ -72,7 +72,11 @@ fn include_as_quoted_string_donat_cli_quirk() {
         "databases/default/tables/tables.yaml",
         "- \"!include public_author.yaml\"\n",
     );
-    write(&dir, "databases/default/tables/public_author.yaml", AUTHOR_TABLE);
+    write(
+        &dir,
+        "databases/default/tables/public_author.yaml",
+        AUTHOR_TABLE,
+    );
 
     let md = load_metadata_dir(&dir).expect("metadata should load");
     assert_eq!(md.version, 3);
@@ -96,15 +100,16 @@ fn include_as_real_yaml_tag() {
         "databases/default/tables/tables.yaml",
         "- !include public_author.yaml\n",
     );
-    write(&dir, "databases/default/tables/public_author.yaml", AUTHOR_TABLE);
+    write(
+        &dir,
+        "databases/default/tables/public_author.yaml",
+        AUTHOR_TABLE,
+    );
 
     let md = load_metadata_dir(&dir).expect("metadata should load");
     assert_eq!(md.sources[0].tables.len(), 1);
     assert_eq!(md.sources[0].tables[0].table.to_string(), "public.author");
-    assert_eq!(
-        md.sources[0].tables[0].select_permissions[0].role,
-        "user"
-    );
+    assert_eq!(md.sources[0].tables[0].select_permissions[0].role, "user");
 }
 
 #[test]
@@ -148,7 +153,11 @@ fn include_string_with_extra_whitespace_is_trimmed() {
         "databases/default/tables/tables.yaml",
         "- \"!include public_author.yaml\"\n",
     );
-    write(&dir, "databases/default/tables/public_author.yaml", AUTHOR_TABLE);
+    write(
+        &dir,
+        "databases/default/tables/public_author.yaml",
+        AUTHOR_TABLE,
+    );
 
     let md = load_metadata_dir(&dir).expect("metadata should load");
     assert_eq!(md.sources[0].tables.len(), 1);
@@ -240,7 +249,11 @@ fn base_dir(tag: &str) -> PathBuf {
         "databases/default/tables/tables.yaml",
         "- \"!include public_author.yaml\"\n",
     );
-    write(&dir, "databases/default/tables/public_author.yaml", AUTHOR_TABLE);
+    write(
+        &dir,
+        "databases/default/tables/public_author.yaml",
+        AUTHOR_TABLE,
+    );
     dir
 }
 
@@ -296,7 +309,11 @@ fn query_collections_and_allow_list_load_from_filesystem() {
 fn remote_schemas_load_from_filesystem_with_include() {
     let dir = base_dir("remotes");
     // The list itself may be an !include, like donat-cli emits.
-    write(&dir, "remote_schemas.yaml", "\"!include remote_schemas/schemas.yaml\"\n");
+    write(
+        &dir,
+        "remote_schemas.yaml",
+        "\"!include remote_schemas/schemas.yaml\"\n",
+    );
     write(
         &dir,
         "remote_schemas/schemas.yaml",

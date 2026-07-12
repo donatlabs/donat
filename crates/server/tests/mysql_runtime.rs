@@ -41,14 +41,10 @@ fn seed_db(conn: &mut mysql::Conn) {
         .expect("drop article");
     conn.query_drop("DROP TABLE IF EXISTS author")
         .expect("drop author");
-    conn.query_drop(
-        "CREATE TABLE author (id INT PRIMARY KEY, name VARCHAR(255))",
-    )
-    .expect("create author");
-    conn.query_drop(
-        "INSERT INTO author (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
-    )
-    .expect("seed author");
+    conn.query_drop("CREATE TABLE author (id INT PRIMARY KEY, name VARCHAR(255))")
+        .expect("create author");
+    conn.query_drop("INSERT INTO author (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')")
+        .expect("seed author");
 }
 
 /// Metadata with one `mysql` source whose `database_url` is the container,

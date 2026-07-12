@@ -58,10 +58,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
         };
         match frame.get("type").and_then(Json::as_str) {
             Some("connection_init") => {
-                if let Some(headers) = frame
-                    .pointer("/payload/headers")
-                    .and_then(Json::as_object)
-                {
+                if let Some(headers) = frame.pointer("/payload/headers").and_then(Json::as_object) {
                     for (key, value) in headers {
                         let (Ok(name), Some(value)) = (
                             HeaderName::try_from(key.to_ascii_lowercase()),
@@ -132,9 +129,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                         let mut last: Option<Json> = None;
                         loop {
                             let response =
-                                gql::execute_with(&state, &session, &payload, relay)
-                                    .await
-                                    .1;
+                                gql::execute_with(&state, &session, &payload, relay).await.1;
                             if last.as_ref() != Some(&response) {
                                 last = Some(response.clone());
                                 if send(
@@ -154,9 +149,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                         old.abort();
                     }
                 } else {
-                    let response = gql::execute_with(&state, &session, &payload, relay)
-                        .await
-                        .1;
+                    let response = gql::execute_with(&state, &session, &payload, relay).await.1;
                     if send(
                         &sender,
                         json!({ "type": "data", "id": id, "payload": response }),
@@ -169,25 +162,23 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                     let _ = send(&sender, json!({ "type": "complete", "id": id })).await;
                 }
             }
-            Some("stop") => {
-                match frame.get("id").and_then(Json::as_str) {
-                    Some(id) => {
-                        if let Some(task) = subscriptions.remove(id) {
-                            task.abort();
-                        }
-                    }
-                    None => {
-                        let _ = send(
-                            &sender,
-                            json!({
-                                "type": "connection_error",
-                                "payload": "Message missing 'id' field",
-                            }),
-                        )
-                        .await;
+            Some("stop") => match frame.get("id").and_then(Json::as_str) {
+                Some(id) => {
+                    if let Some(task) = subscriptions.remove(id) {
+                        task.abort();
                     }
                 }
-            }
+                None => {
+                    let _ = send(
+                        &sender,
+                        json!({
+                            "type": "connection_error",
+                            "payload": "Message missing 'id' field",
+                        }),
+                    )
+                    .await;
+                }
+            },
             Some("connection_terminate") => break,
             // Unknown client message types are protocol errors.
             other => {
@@ -242,7 +233,9 @@ mod tests {
 
     #[test]
     fn subscription_operations_detected() {
-        assert!(is_subscription(&json!({ "query": "subscription { user { id } }" })));
+        assert!(is_subscription(
+            &json!({ "query": "subscription { user { id } }" })
+        ));
         assert!(is_subscription(&json!({
             "query": "query Q { a } subscription S { b }"
         })));
@@ -250,7 +243,9 @@ mod tests {
 
     #[test]
     fn queries_and_mutations_are_not_subscriptions() {
-        assert!(!is_subscription(&json!({ "query": "query { user { id } }" })));
+        assert!(!is_subscription(
+            &json!({ "query": "query { user { id } }" })
+        ));
         assert!(!is_subscription(&json!({ "query": "{ user { id } }" })));
         assert!(!is_subscription(&json!({
             "query": "mutation { delete_user { affected_rows } }"

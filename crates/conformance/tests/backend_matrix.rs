@@ -52,10 +52,7 @@ const CORE_MUTATION_CASES: &[ConformanceCase] = &[
 const TRANSPORT_ROLE_CASES: &[ConformanceCase] = &[
     ConformanceCase::new("missing-role", &[CaseCapability::Transport]),
     ConformanceCase::new("mcp-initialize", &[CaseCapability::Transport]),
-    ConformanceCase::new(
-        "mcp-missing-protocol-version",
-        &[CaseCapability::Transport],
-    ),
+    ConformanceCase::new("mcp-missing-protocol-version", &[CaseCapability::Transport]),
     ConformanceCase::new("mcp-query", &[CaseCapability::Transport]),
 ];
 
@@ -364,11 +361,7 @@ fn post(suite: &donat_conformance::Running, query: &str) -> serde_json::Value {
     post_as(suite, "user", query)
 }
 
-fn post_as(
-    suite: &donat_conformance::Running,
-    role: &str,
-    query: &str,
-) -> serde_json::Value {
+fn post_as(suite: &donat_conformance::Running, role: &str, query: &str) -> serde_json::Value {
     let (status, body) = suite.post(
         "/v1/graphql",
         &json!({ "query": query }),
@@ -626,7 +619,13 @@ fn core_read_contract() {
     let relationships_supported = backend.capabilities().relationships;
     if relationships_supported {
         suite.add_relationship("article", "author", "author", &[("author_id", "id")], false);
-        suite.add_relationship("author", "articles", "article", &[("id", "author_id")], true);
+        suite.add_relationship(
+            "author",
+            "articles",
+            "article",
+            &[("id", "author_id")],
+            true,
+        );
     }
     suite.install_table(&TableFixture {
         name: "special_value",
@@ -660,7 +659,10 @@ fn core_read_contract() {
             name: "json_value",
             columns: JSON_COLUMNS,
             rows: vec![
-                vec![json!(1), json!({ "nested": ["quoted", 1], "enabled": true })],
+                vec![
+                    json!(1),
+                    json!({ "nested": ["quoted", 1], "enabled": true }),
+                ],
                 vec![json!(2), json!(null)],
             ],
             role: "user",
@@ -961,96 +963,91 @@ fn core_mutation_contract() {
         suite
     });
 
-    run_conformance_cases(
-        "core-mutations",
-        backend,
-        CORE_MUTATION_CASES,
-        |case| {
-            let suite = suite
-                .as_ref()
-                .expect("mutation suite exists for every applicable backend");
-            match case {
-                "insert" => assert_eq!(
-                    post(
-                        suite,
-                        r#"mutation {
+    run_conformance_cases("core-mutations", backend, CORE_MUTATION_CASES, |case| {
+        let suite = suite
+            .as_ref()
+            .expect("mutation suite exists for every applicable backend");
+        match case {
+            "insert" => assert_eq!(
+                post(
+                    suite,
+                    r#"mutation {
                             insert_note(objects: [
                                 { id: 1, name: "first" },
                                 { id: 2, name: "second" }
                             ]) { affected_rows returning { id name } }
                         }"#
-                    ),
-                    json!({ "data": { "insert_note": {
-                        "affected_rows": 2,
-                        "returning": [
-                            { "id": 1, "name": "first" },
-                            { "id": 2, "name": "second" }
-                        ]
-                    }}})
                 ),
-                "update" => assert_eq!(
-                    post(
-                        suite,
-                        r#"mutation {
+                json!({ "data": { "insert_note": {
+                    "affected_rows": 2,
+                    "returning": [
+                        { "id": 1, "name": "first" },
+                        { "id": 2, "name": "second" }
+                    ]
+                }}})
+            ),
+            "update" => assert_eq!(
+                post(
+                    suite,
+                    r#"mutation {
                             update_note(where: {id: {_eq: 1}}, _set: {name: "edited"}) {
                                 affected_rows returning { id name }
                             }
                         }"#
-                    ),
-                    json!({ "data": { "update_note": {
-                        "affected_rows": 1,
-                        "returning": [{ "id": 1, "name": "edited" }]
-                    }}})
                 ),
-                "delete" => assert_eq!(
-                    post(
-                        suite,
-                        "mutation { delete_note(where: {id: {_eq: 2}}) { affected_rows returning { id } } }"
-                    ),
-                    json!({ "data": { "delete_note": {
-                        "affected_rows": 1,
-                        "returning": [{ "id": 2 }]
-                    }}})
+                json!({ "data": { "update_note": {
+                    "affected_rows": 1,
+                    "returning": [{ "id": 1, "name": "edited" }]
+                }}})
+            ),
+            "delete" => assert_eq!(
+                post(
+                    suite,
+                    "mutation { delete_note(where: {id: {_eq: 2}}) { affected_rows returning { id } } }"
                 ),
-                "read-after-write" => assert_eq!(
-                    post(suite, "{ note(order_by: {id: asc}) { id name } }"),
-                    json!({ "data": { "note": [{ "id": 1, "name": "edited" }] } })
-                ),
-                "nullable-check-rollback" => {
-                    for query in [
-                        "mutation { insert_secure_note(objects: [{id: 1}]) { affected_rows } }",
-                        "mutation { insert_secure_note(objects: [{id: 2, owner: null}]) { affected_rows } }",
-                        "mutation { insert_secure_note(objects: [{id: 3, owner: \"alice\"}, {id: 4}]) { affected_rows } }",
-                    ] {
-                        let (status, body) = suite.post(
-                            "/v1/graphql",
-                            &json!({ "query": query }),
-                            &[
-                                ("X-Donat-Role".to_string(), "user".to_string()),
-                                ("X-Donat-User-Id".to_string(), "alice".to_string()),
-                            ],
-                        );
-                        assert_eq!(status, 200, "{body}");
-                        assert_eq!(
-                            body,
-                            json!({ "errors": [{
-                                "extensions": {
-                                    "path": "$.selectionSet.insert_secure_note.args.objects",
-                                    "code": "permission-error"
-                                },
-                                "message": "check constraint of an insert/update permission has failed"
-                            }]})
-                        );
-                        assert_eq!(
-                            post(suite, "{ secure_note { id owner } }"),
-                            json!({ "data": { "secure_note": [] } })
-                        );
-                    }
+                json!({ "data": { "delete_note": {
+                    "affected_rows": 1,
+                    "returning": [{ "id": 2 }]
+                }}})
+            ),
+            "read-after-write" => assert_eq!(
+                post(suite, "{ note(order_by: {id: asc}) { id name } }"),
+                json!({ "data": { "note": [{ "id": 1, "name": "edited" }] } })
+            ),
+            "nullable-check-rollback" => {
+                for query in [
+                    "mutation { insert_secure_note(objects: [{id: 1}]) { affected_rows } }",
+                    "mutation { insert_secure_note(objects: [{id: 2, owner: null}]) { affected_rows } }",
+                    "mutation { insert_secure_note(objects: [{id: 3, owner: \"alice\"}, {id: 4}]) { affected_rows } }",
+                ] {
+                    let (status, body) = suite.post(
+                        "/v1/graphql",
+                        &json!({ "query": query }),
+                        &[
+                            ("X-Donat-Role".to_string(), "user".to_string()),
+                            ("X-Donat-User-Id".to_string(), "alice".to_string()),
+                        ],
+                    );
+                    assert_eq!(status, 200, "{body}");
+                    assert_eq!(
+                        body,
+                        json!({ "errors": [{
+                            "extensions": {
+                                "path": "$.selectionSet.insert_secure_note.args.objects",
+                                "code": "permission-error"
+                            },
+                            "message": "check constraint of an insert/update permission has failed"
+                        }]})
+                    );
+                    assert_eq!(
+                        post(suite, "{ secure_note { id owner } }"),
+                        json!({ "data": { "secure_note": [] } })
+                    );
                 }
-                unknown => panic!("unimplemented core mutation case '{unknown}'"),
             }
-        },
-    );
+            unknown => panic!("unimplemented core mutation case '{unknown}'"),
+        }
+    });
 }
 
 #[test]
@@ -1073,11 +1070,8 @@ fn transport_and_role_contract() {
         TRANSPORT_ROLE_CASES,
         |case| match case {
             "missing-role" => {
-                let (status, no_role) = suite.post(
-                    "/v1/graphql",
-                    &json!({ "query": "{ pet { id } }" }),
-                    &[],
-                );
+                let (status, no_role) =
+                    suite.post("/v1/graphql", &json!({ "query": "{ pet { id } }" }), &[]);
                 assert_eq!(status, 200);
                 assert_eq!(
                     no_role,
@@ -1143,10 +1137,7 @@ fn transport_and_role_contract() {
             "mcp-query" => {
                 let headers = [
                     ("X-Donat-Role".to_string(), "user".to_string()),
-                    (
-                        "MCP-Protocol-Version".to_string(),
-                        "2025-06-18".to_string(),
-                    ),
+                    ("MCP-Protocol-Version".to_string(), "2025-06-18".to_string()),
                 ];
                 let (status, query) = suite.post(
                     "/mcp",

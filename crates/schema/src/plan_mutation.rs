@@ -167,6 +167,8 @@ impl<'a> Planner<'a> {
             ));
         }
 
+        let mut nested_object_inserts = vec![];
+
         // Column union across objects, validated against the insert mask.
         let mut columns: Vec<String> = vec![];
         for object in &objects {
@@ -175,6 +177,19 @@ impl<'a> Planner<'a> {
             };
             for key in map.keys() {
                 let Some(db_key) = ctx.column_db_name(key) else {
+                    let value = map.get(key).expect("key came from map");
+                    if let Some(nested) =
+                        self.parse_nested_object_insert(ctx, key, value, session, path)?
+                    {
+                        if objects.len() != 1 {
+                            return Err(PlanError::validation(
+                                path,
+                                "nested object inserts support a single object",
+                            ));
+                        }
+                        nested_object_inserts.push(nested);
+                        continue;
+                    }
                     return Err(field_not_found(
                         path,
                         key,
@@ -265,11 +280,166 @@ impl<'a> Planner<'a> {
             },
             columns: typed_columns,
             rows,
+            nested_object_inserts,
             on_conflict,
             check,
             check_path: format!("{path}.args.objects"),
             output,
         })
+    }
+
+    fn parse_nested_object_insert(
+        &self,
+        ctx: &TableCtx<'a>,
+        key: &str,
+        value: &Json,
+        session: &Session,
+        path: &str,
+    ) -> Result<Option<NestedObjectInsert>, PlanError> {
+        let Some(rel) = ctx
+            .entry
+            .object_relationships
+            .iter()
+            .find(|r| r.name == key)
+        else {
+            return Ok(None);
+        };
+        let Some(manual) = &rel.using.manual_configuration else {
+            return Ok(None);
+        };
+        if manual.insertion_order.as_deref() != Some("after_parent") {
+            return Ok(None);
+        }
+
+        let Some(remote_ctx) = self.table_ctx_by_name(&manual.remote_table, &session.role) else {
+            return Ok(None);
+        };
+        let remote_perm = self
+            .resolve_role_perm(&remote_ctx.entry.insert_permissions, &session.role, |p| {
+                !p.backend_only || session.backend_request
+            })
+            .ok_or_else(|| {
+                field_not_found(path, key, &format!("{}_insert_input", ctx.type_name))
+            })?;
+
+        let obj = value.as_object().ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!(
+                    "field '{key}' must be an object in type: '{}_insert_input'",
+                    ctx.type_name
+                ),
+            )
+        })?;
+        let data = obj.get("data").ok_or_else(|| {
+            PlanError::validation(path, "expecting a value for the argument \"data\"")
+        })?;
+        for arg in obj.keys() {
+            if arg != "data" {
+                return Err(field_not_found(
+                    path,
+                    arg,
+                    &format!("{}_obj_rel_insert_input", remote_ctx.type_name),
+                ));
+            }
+        }
+        let data_obj = data.as_object().ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!(
+                    "field 'data' must be an object in type: '{}_obj_rel_insert_input'",
+                    remote_ctx.type_name
+                ),
+            )
+        })?;
+
+        let mapped_child_cols = manual
+            .column_mapping
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut columns = vec![];
+        let mut row = vec![];
+        for (child_key, child_value) in data_obj {
+            let Some(db_key) = remote_ctx.column_db_name(child_key) else {
+                return Err(field_not_found(
+                    path,
+                    child_key,
+                    &format!("{}_insert_input", remote_ctx.type_name),
+                ));
+            };
+            if mapped_child_cols.contains(&db_key) {
+                return Err(field_not_found(
+                    path,
+                    child_key,
+                    &format!("{}_insert_input", remote_ctx.type_name),
+                ));
+            }
+            let allowed = match &remote_perm.columns {
+                Columns::Star => remote_ctx.info.column(&db_key).is_some(),
+                Columns::List(cols) => {
+                    cols.iter().any(|c| c == &db_key) && remote_ctx.info.column(&db_key).is_some()
+                }
+            };
+            if !allowed {
+                return Err(field_not_found(
+                    path,
+                    child_key,
+                    &format!("{}_insert_input", remote_ctx.type_name),
+                ));
+            }
+            let pg_type = remote_ctx
+                .info
+                .column(&db_key)
+                .map(|i| i.pg_type.clone())
+                .unwrap();
+            columns.push((db_key, pg_type));
+            row.push(Some(Scalar::Json(child_value.clone())));
+        }
+        for (col, value) in &remote_perm.set {
+            if mapped_child_cols.contains(col) || remote_ctx.info.column(col).is_none() {
+                continue;
+            }
+            let resolved = match value {
+                Json::String(s) if is_session_var_name(s) => {
+                    let v = session.var(s).ok_or_else(|| {
+                        PlanError::new(
+                            "$",
+                            "not-found",
+                            format!("missing session variable: \"{}\"", s.to_ascii_lowercase()),
+                        )
+                    })?;
+                    Json::String(v.to_string())
+                }
+                other => other.clone(),
+            };
+            if !columns.iter().any(|(existing, _)| existing == col) {
+                let pg_type = remote_ctx
+                    .info
+                    .column(col)
+                    .map(|i| i.pg_type.clone())
+                    .unwrap();
+                columns.push((col.clone(), pg_type));
+                row.push(Some(Scalar::Json(resolved)));
+            }
+        }
+
+        Ok(Some(NestedObjectInsert {
+            relationship_name: key.to_string(),
+            table: Table {
+                schema: remote_ctx.info.schema.clone(),
+                name: remote_ctx.info.name.clone(),
+            },
+            column_mapping: manual
+                .column_mapping
+                .iter()
+                .map(|(parent, child)| (parent.clone(), child.clone()))
+                .collect(),
+            columns,
+            row,
+            check: self.parse_check_exp(&remote_perm.check, &remote_ctx, session, path)?,
+            check_path: format!("{path}.args.object.{key}.data"),
+        }))
     }
 
     fn parse_on_conflict(
@@ -459,6 +629,33 @@ impl<'a> Planner<'a> {
                         });
                     }
                 }
+                (_, "_append") => {
+                    let map = value
+                        .as_object()
+                        .ok_or_else(|| PlanError::validation(path, "_append must be an object"))?;
+                    for (col, v) in map {
+                        if !allowed(col) {
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_append_input", ctx.type_name),
+                            ));
+                        }
+                        let db_col = ctx.column_db_name(col).unwrap();
+                        let info = ctx.info.column(&db_col).unwrap();
+                        if info.pg_type != "jsonb" {
+                            return Err(field_not_found(
+                                path,
+                                col,
+                                &format!("{}_append_input", ctx.type_name),
+                            ));
+                        }
+                        sets.push(SetOp::JsonbAppend {
+                            column: db_col.clone(),
+                            value: Scalar::Json(v.clone()),
+                        });
+                    }
+                }
                 (MutationKind::Update, "where") => {
                     saw_where = true;
                     user_where = Some(self.parse_bool_exp(&value, ctx, session, false, path)?);
@@ -526,7 +723,7 @@ impl<'a> Planner<'a> {
         if sets.is_empty() {
             return Err(PlanError::validation(
                 path,
-                "at least any one of _set, _inc is expected",
+                "at least any one of _set, _inc, _append is expected",
             ));
         }
 

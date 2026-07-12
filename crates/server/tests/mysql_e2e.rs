@@ -79,10 +79,8 @@ fn seed(conn: &mut Conn) {
         )",
     )
     .unwrap();
-    conn.query_drop(
-        "INSERT INTO author (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
-    )
-    .unwrap();
+    conn.query_drop("INSERT INTO author (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')")
+        .unwrap();
     conn.query_drop(
         "INSERT INTO article (id, title, author_id) VALUES \
             (1, 'A1', 1), (2, 'A2', 1), (3, 'B1', 2), (4, 'B2', 2), (5, 'C1', 3)",
