@@ -358,6 +358,7 @@ pub struct Suite {
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
+    initial_metadata: Metadata,
 }
 
 impl Suite {
@@ -371,7 +372,13 @@ impl Suite {
             cron: None,
             event: None,
             run_migrations: false,
+            initial_metadata: empty_metadata(),
         }
+    }
+
+    pub fn initial_metadata(mut self, metadata: Metadata) -> Self {
+        self.initial_metadata = metadata;
+        self
     }
 
     /// Apply the `migrations/` DDL (the `donat` catalog) to the suite
@@ -502,7 +509,7 @@ impl Suite {
             event: self.event,
             run_migrations: self.run_migrations,
             db_url,
-            metadata: RefCell::new(empty_metadata()),
+            metadata: RefCell::new(self.initial_metadata),
             engine: RefCell::new(None),
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))

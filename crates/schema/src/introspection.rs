@@ -154,7 +154,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
     let mut mutation_fields: Vec<Json> = vec![];
 
     let select_args = |base: &str| -> Vec<Json> {
-        vec![
+        let mut args = vec![
             input_value("where", named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
             input_value(
                 "order_by",
@@ -162,11 +162,14 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             ),
             input_value("limit", named("SCALAR", "Int")),
             input_value("offset", named("SCALAR", "Int")),
-            input_value(
+        ];
+        if planner.capabilities.distinct_on {
+            args.push(input_value(
                 "distinct_on",
                 list_of(non_null(named("ENUM", &format!("{base}_select_column")))),
-            ),
-        ]
+            ));
+        }
+        args
     };
 
     for (idx, entry) in planner.tables().iter().enumerate() {
@@ -428,7 +431,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         types.push(scalar_type(scalar));
     }
 
-    let has_mutations = !mutation_fields.is_empty();
+    let has_mutations = planner.capabilities.mutations && !mutation_fields.is_empty();
     let subscription_fields = query_fields.clone();
     types.push(object_type("query_root", query_fields));
     types.push(object_type("subscription_root", subscription_fields));

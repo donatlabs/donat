@@ -87,7 +87,11 @@ impl Dialect for PostgresDialect {
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
             serde_json::Value::Bool(b) => {
-                if *b { "TRUE".into() } else { "FALSE".into() }
+                if *b {
+                    "TRUE".into()
+                } else {
+                    "FALSE".into()
+                }
             }
             serde_json::Value::Number(n) => format!("({n})::{ty}"),
             serde_json::Value::String(s) => format!("({})::{ty}", self.quote_literal(s)),
@@ -179,7 +183,11 @@ impl Dialect for SqliteDialect {
             serde_json::Value::Null => "NULL".into(),
             // No boolean type in SQLite: TRUE/FALSE are 1/0.
             serde_json::Value::Bool(b) => {
-                if *b { "1".into() } else { "0".into() }
+                if *b {
+                    "1".into()
+                } else {
+                    "0".into()
+                }
             }
             // No cast: bare numeric literal.
             serde_json::Value::Number(n) => format!("{n}"),
@@ -212,9 +220,9 @@ impl Dialect for SqliteDialect {
         // row in `json(...)` reparses the text so the nested structure is
         // preserved as real JSON. (validated against real sqlite)
         match order_by {
-            Some(ob) => format!(
-                "coalesce(json_group_array(json({row_expr}) ORDER BY {ob}), json_array())"
-            ),
+            Some(ob) => {
+                format!("coalesce(json_group_array(json({row_expr}) ORDER BY {ob}), json_array())")
+            }
             None => format!("coalesce(json_group_array(json({row_expr})), json_array())"),
         }
     }
@@ -282,7 +290,11 @@ impl Dialect for MySqlDialect {
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
             serde_json::Value::Bool(b) => {
-                if *b { "TRUE".into() } else { "FALSE".into() }
+                if *b {
+                    "TRUE".into()
+                } else {
+                    "FALSE".into()
+                }
             }
             serde_json::Value::Number(n) => format!("{n}"),
             serde_json::Value::String(s) => self.quote_literal(s),
@@ -326,6 +338,100 @@ impl Dialect for MySqlDialect {
     }
 }
 
+/// ClickHouse read-query dialect.
+#[derive(Debug, Clone, Copy)]
+pub struct ClickhouseDialect;
+
+impl Dialect for ClickhouseDialect {
+    fn quote_ident(&self, ident: &str) -> String {
+        format!("`{}`", ident.replace('\\', "\\\\").replace('`', "\\`"))
+    }
+
+    fn quote_literal(&self, lit: &str) -> String {
+        format!("'{}'", lit.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+
+    fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String {
+        match (limit, offset) {
+            (Some(limit), Some(offset)) => format!(" LIMIT {limit} OFFSET {offset}"),
+            (Some(limit), None) => format!(" LIMIT {limit}"),
+            (None, Some(offset)) => {
+                format!(" LIMIT 18446744073709551615 OFFSET {offset}")
+            }
+            (None, None) => String::new(),
+        }
+    }
+
+    fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String {
+        let native_type = clickhouse_cast_type(native_type);
+        match scalar.as_json() {
+            serde_json::Value::Null => "NULL".into(),
+            serde_json::Value::Bool(value) => {
+                if *value {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
+            serde_json::Value::Number(value) => format!("CAST({value} AS {native_type})"),
+            serde_json::Value::String(value) => {
+                format!("CAST({} AS {native_type})", self.quote_literal(value))
+            }
+            value => format!(
+                "CAST({} AS {native_type})",
+                self.quote_literal(&value.to_string())
+            ),
+        }
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        if pairs.is_empty() {
+            return "CAST('{}' AS JSON)".into();
+        }
+        let mut parts = vec![self.quote_literal("{")];
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                parts.push(self.quote_literal(","));
+            }
+            let key = format!("{}:", serde_json::to_string(key).expect("JSON object key"));
+            parts.push(self.quote_literal(&key));
+            parts.push(format!("toJSONString({value})"));
+        }
+        parts.push(self.quote_literal("}"));
+        format!("CAST(concat({}) AS JSON)", parts.join(", "))
+    }
+
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
+        match order_by {
+            Some(order) => format!(
+                "arrayMap(item -> item.2, arraySort(item -> item.1, groupArray(({order}, CAST({row_expr} AS JSON)))))"
+            ),
+            None => format!("groupArray(CAST({row_expr} AS JSON))"),
+        }
+    }
+
+    fn to_json_text(&self, expr: &str) -> String {
+        format!("toJSONString({expr})")
+    }
+}
+
+fn clickhouse_cast_type(logical_type: &str) -> &str {
+    match logical_type {
+        "int2" => "Int16",
+        "int4" => "Int32",
+        "int8" => "Int64",
+        "float4" => "Float32",
+        "float8" => "Float64",
+        "numeric" => "Decimal(38, 9)",
+        "bool" => "Bool",
+        "text" | "varchar" | "bpchar" | "json" | "jsonb" => "String",
+        "uuid" => "UUID",
+        "timestamp" | "timestamptz" => "DateTime64(3)",
+        "date" => "Date",
+        other => other,
+    }
+}
+
 /// A backend dialect selected at runtime. Implements [`Dialect`] by
 /// delegating every method to the inner concrete dialect, so callers can hold
 /// one value and stay dialect-agnostic.
@@ -334,6 +440,7 @@ pub enum AnyDialect {
     Postgres(PostgresDialect),
     Sqlite(SqliteDialect),
     Mysql(MySqlDialect),
+    Clickhouse(ClickhouseDialect),
 }
 
 impl Dialect for AnyDialect {
@@ -342,6 +449,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.quote_ident(ident),
             AnyDialect::Sqlite(d) => d.quote_ident(ident),
             AnyDialect::Mysql(d) => d.quote_ident(ident),
+            AnyDialect::Clickhouse(d) => d.quote_ident(ident),
         }
     }
 
@@ -350,6 +458,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.quote_literal(lit),
             AnyDialect::Sqlite(d) => d.quote_literal(lit),
             AnyDialect::Mysql(d) => d.quote_literal(lit),
+            AnyDialect::Clickhouse(d) => d.quote_literal(lit),
         }
     }
 
@@ -358,6 +467,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.limit_offset(limit, offset),
             AnyDialect::Sqlite(d) => d.limit_offset(limit, offset),
             AnyDialect::Mysql(d) => d.limit_offset(limit, offset),
+            AnyDialect::Clickhouse(d) => d.limit_offset(limit, offset),
         }
     }
 
@@ -366,6 +476,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.render_scalar(scalar, native_type),
             AnyDialect::Sqlite(d) => d.render_scalar(scalar, native_type),
             AnyDialect::Mysql(d) => d.render_scalar(scalar, native_type),
+            AnyDialect::Clickhouse(d) => d.render_scalar(scalar, native_type),
         }
     }
 
@@ -374,6 +485,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.json_object(pairs),
             AnyDialect::Sqlite(d) => d.json_object(pairs),
             AnyDialect::Mysql(d) => d.json_object(pairs),
+            AnyDialect::Clickhouse(d) => d.json_object(pairs),
         }
     }
 
@@ -382,6 +494,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.json_array_agg(row_expr, order_by),
             AnyDialect::Sqlite(d) => d.json_array_agg(row_expr, order_by),
             AnyDialect::Mysql(d) => d.json_array_agg(row_expr, order_by),
+            AnyDialect::Clickhouse(d) => d.json_array_agg(row_expr, order_by),
         }
     }
 
@@ -390,6 +503,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.to_json_text(expr),
             AnyDialect::Sqlite(d) => d.to_json_text(expr),
             AnyDialect::Mysql(d) => d.to_json_text(expr),
+            AnyDialect::Clickhouse(d) => d.to_json_text(expr),
         }
     }
 
@@ -398,6 +512,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.null_ordering(nulls_first),
             AnyDialect::Sqlite(d) => d.null_ordering(nulls_first),
             AnyDialect::Mysql(d) => d.null_ordering(nulls_first),
+            AnyDialect::Clickhouse(d) => d.null_ordering(nulls_first),
         }
     }
 }
@@ -405,6 +520,76 @@ impl Dialect for AnyDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ClickhouseDialect -----------------------------------------------
+
+    #[test]
+    fn clickhouse_quotes_identifiers_and_literals() {
+        let d = ClickhouseDialect;
+        assert_eq!(d.quote_ident("users"), "`users`");
+        assert_eq!(d.quote_ident("a`b"), "`a\\`b`");
+        assert_eq!(d.quote_literal("O'Hara"), "'O\\'Hara'");
+        assert_eq!(d.quote_literal("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn clickhouse_renders_pagination_and_scalars() {
+        let d = ClickhouseDialect;
+        assert_eq!(d.limit_offset(None, None), "");
+        assert_eq!(d.limit_offset(Some(10), Some(5)), " LIMIT 10 OFFSET 5");
+        assert_eq!(
+            d.limit_offset(None, Some(5)),
+            " LIMIT 18446744073709551615 OFFSET 5"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "UInt64"),
+            "CAST(42 AS UInt64)"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("O'Hara")), "String"),
+            "CAST('O\\'Hara' AS String)"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "int4"),
+            "CAST(42 AS Int32)"
+        );
+    }
+
+    #[test]
+    fn clickhouse_assembles_json_without_double_encoding() {
+        let d = ClickhouseDialect;
+        assert_eq!(
+            d.json_object(&[
+                ("id".to_string(), "_t0.id".to_string()),
+                ("name".to_string(), "_t0.name".to_string()),
+            ]),
+            "CAST(concat('{', '\"id\":', toJSONString(_t0.id), ',', '\"name\":', toJSONString(_t0.name), '}') AS JSON)"
+        );
+        assert_eq!(d.json_object(&[]), "CAST('{}' AS JSON)");
+        assert_eq!(
+            d.json_array_agg("_e.j", Some("_e.__donat_ord")),
+            "arrayMap(item -> item.2, arraySort(item -> item.1, groupArray((_e.__donat_ord, CAST(_e.j AS JSON)))))"
+        );
+        assert_eq!(d.to_json_text("'User'"), "toJSONString('User')");
+    }
+
+    #[test]
+    fn any_dialect_clickhouse_delegates() {
+        let d = AnyDialect::Clickhouse(ClickhouseDialect);
+        assert_eq!(d.quote_ident("users"), "`users`");
+        assert_eq!(d.quote_literal("x"), "'x'");
+        assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(1)), "UInt8"),
+            "CAST(1 AS UInt8)"
+        );
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "CAST(concat('{', '\"k\":', toJSONString(v), '}') AS JSON)"
+        );
+        assert_eq!(d.json_array_agg("x", None), "groupArray(CAST(x AS JSON))");
+        assert_eq!(d.to_json_text("x"), "toJSONString(x)");
+    }
 
     #[test]
     fn quote_ident_wraps_in_double_quotes() {
@@ -473,13 +658,19 @@ mod tests {
     #[test]
     fn render_scalar_bool_false() {
         let d = PostgresDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "bool"), "FALSE");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "bool"),
+            "FALSE"
+        );
     }
 
     #[test]
     fn render_scalar_number() {
         let d = PostgresDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!(42)), "int4"), "(42)::\"int4\"");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "int4"),
+            "(42)::\"int4\""
+        );
     }
 
     #[test]
@@ -513,10 +704,7 @@ mod tests {
         // geometry_sql casts via quote_ident(pg_type), i.e. `::"geometry"`.
         assert_eq!(
             d.render_scalar(&s(geo.clone()), "geometry"),
-            format!(
-                "(ST_GeomFromGeoJSON('{}'))::\"geometry\"",
-                geo.to_string()
-            )
+            format!("(ST_GeomFromGeoJSON('{}'))::\"geometry\"", geo.to_string())
         );
     }
 
@@ -627,7 +815,10 @@ mod tests {
         let d = SqliteDialect;
         // SQLite has no boolean type: TRUE/FALSE are 1/0.
         assert_eq!(d.render_scalar(&s(serde_json::json!(true)), "INTEGER"), "1");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "INTEGER"), "0");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "INTEGER"),
+            "0"
+        );
     }
 
     #[test]
@@ -723,12 +914,18 @@ mod tests {
         assert_eq!(d.quote_ident("users"), "\"users\"");
         assert_eq!(d.quote_literal("x"), "'x'");
         assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int4"), "(1)::\"int4\"");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(1)), "int4"),
+            "(1)::\"int4\""
+        );
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
             "json_build_object('k', v)"
         );
-        assert_eq!(d.json_array_agg("x", None), "coalesce(json_agg(x), '[]'::json)");
+        assert_eq!(
+            d.json_array_agg("x", None),
+            "coalesce(json_agg(x), '[]'::json)"
+        );
         assert_eq!(d.to_json_text("x"), "to_json(x::text)");
     }
 
@@ -737,7 +934,10 @@ mod tests {
         let d = AnyDialect::Sqlite(SqliteDialect);
         assert_eq!(d.quote_ident("users"), "\"users\"");
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "INTEGER"), "1");
-        assert_eq!(d.json_object(&[("k".into(), "v".into())]), "json_object('k', v)");
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "json_object('k', v)"
+        );
         assert_eq!(
             d.json_array_agg("x", None),
             "coalesce(json_group_array(json(x)), json_array())"
@@ -787,16 +987,28 @@ mod tests {
     fn mysql_render_scalar_null_bool_number() {
         let d = MySqlDialect;
         assert_eq!(d.render_scalar(&s(serde_json::Value::Null), "int"), "NULL");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(true)), "tinyint"), "TRUE");
-        assert_eq!(d.render_scalar(&s(serde_json::json!(false)), "tinyint"), "FALSE");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(true)), "tinyint"),
+            "TRUE"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(false)), "tinyint"),
+            "FALSE"
+        );
         assert_eq!(d.render_scalar(&s(serde_json::json!(42)), "int"), "42");
     }
 
     #[test]
     fn mysql_render_scalar_string_escapes() {
         let d = MySqlDialect;
-        assert_eq!(d.render_scalar(&s(serde_json::json!("O'Hara")), "varchar"), "'O''Hara'");
-        assert_eq!(d.render_scalar(&s(serde_json::json!("a\\b")), "varchar"), "'a\\\\b'");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("O'Hara")), "varchar"),
+            "'O''Hara'"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("a\\b")), "varchar"),
+            "'a\\\\b'"
+        );
     }
 
     #[test]
@@ -869,7 +1081,10 @@ mod tests {
         assert_eq!(d.quote_literal("x"), "'x'");
         assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int"), "1");
-        assert_eq!(d.json_object(&[("k".into(), "v".into())]), "JSON_OBJECT('k', v)");
+        assert_eq!(
+            d.json_object(&[("k".into(), "v".into())]),
+            "JSON_OBJECT('k', v)"
+        );
         assert_eq!(
             d.json_array_agg("x", None),
             "COALESCE(JSON_ARRAYAGG(x), JSON_ARRAY())"

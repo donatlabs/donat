@@ -5,12 +5,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use donat_backend::{AnyDialect, MySqlDialect, SqliteDialect};
+use donat_backend::{AnyDialect, ClickhouseDialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
+
+const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct AppState {
     /// One (url, pool) per Postgres source name; the pool is recreated when
@@ -58,6 +61,7 @@ pub enum QueryError {
     Decode(String),
     Postgres(tokio_postgres::Error),
     Sqlite(String),
+    Clickhouse(String),
 }
 
 /// Failure of a SQLite mutation in [`AppState::execute_sqlite_mutations`].
@@ -134,6 +138,17 @@ fn resolve_source_url(source: &Source, default_url: &str) -> String {
 }
 
 impl AppState {
+    async fn default_source_url(&self) -> Option<String> {
+        let engine = self.engine.read().await;
+        engine
+            .metadata
+            .sources
+            .iter()
+            .find(|source| source.name == "default")
+            .or_else(|| engine.metadata.sources.first())
+            .map(|source| resolve_source_url(source, &self.default_url))
+    }
+
     pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
         let pools = self.pools.read().await;
         pools
@@ -232,7 +247,24 @@ impl AppState {
                 .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
-            SourceKind::Clickhouse => Err(QueryError::NoDefaultSource),
+            SourceKind::Clickhouse => {
+                let sql = donat_sqlgen::operation_to_sql_with(
+                    roots,
+                    AnyDialect::Clickhouse(ClickhouseDialect),
+                );
+                let url = self
+                    .default_source_url()
+                    .await
+                    .ok_or(QueryError::NoDefaultSource)?;
+                let text = clickhouse_post_data(
+                    &self.http,
+                    &url,
+                    &format!("{sql} FORMAT TabSeparatedRaw"),
+                )
+                .await
+                .map_err(QueryError::Clickhouse)?;
+                serde_json::from_str(text.trim()).map_err(|e| QueryError::Decode(e.to_string()))
+            }
         }
     }
 
@@ -566,9 +598,6 @@ impl AppState {
             let engine = self.engine.read().await;
             let mut resolved: Vec<(String, SourceKind, String)> = vec![];
             for s in &engine.metadata.sources {
-                if s.kind == SourceKind::Clickhouse {
-                    continue;
-                }
                 let url = resolve_source_url(s, &self.default_url);
                 match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
                     Some(entry) => {
@@ -650,7 +679,18 @@ impl AppState {
                         .insert(name.clone(), url.clone());
                     catalog
                 }
-                SourceKind::Clickhouse => continue,
+                SourceKind::Clickhouse => {
+                    let database = clickhouse_database(url)?;
+                    let sql = "SELECT table, name, type, default_kind, is_in_primary_key \
+                               FROM system.columns \
+                               WHERE database = {database:String} \
+                               ORDER BY table, position \
+                               FORMAT JSONEachRow";
+                    let text = clickhouse_post_with_database_param(&self.http, url, sql, &database)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    donat_catalog::clickhouse_catalog_from_json_each_row(&text, &database)?
+                }
             };
             new_catalogs.insert(name.clone(), catalog);
         }
@@ -681,6 +721,98 @@ impl AppState {
         }
         engine.catalogs = new_catalogs;
         Ok(())
+    }
+}
+
+fn clickhouse_database(url: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(url)?;
+    Ok(url
+        .query_pairs()
+        .find(|(key, _)| key == "database")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| "default".to_string()))
+}
+
+async fn clickhouse_post(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+
+    let response = client
+        .post(url)
+        .body(sql.to_string())
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        append_clickhouse_chunk(&mut body, &chunk, max_bytes)?;
+    }
+    let body = String::from_utf8(body)
+        .map_err(|error| format!("ClickHouse returned non-UTF-8 data: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "ClickHouse returned {status}: {}",
+            body.chars().take(4096).collect::<String>()
+        ));
+    }
+    Ok(body)
+}
+
+fn append_clickhouse_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(format!("ClickHouse response exceeds {max_bytes} bytes"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn clickhouse_post_with_database_param(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    database: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("param_database", database);
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_CATALOG_BYTES).await
+}
+
+async fn clickhouse_post_data(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("enable_named_columns_in_function_tuple", "1")
+        .append_pair("allow_experimental_json_type", "1");
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_DATA_BYTES).await
+}
+
+#[cfg(test)]
+mod clickhouse_transport_tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_response_limit_rejects_the_chunk_that_crosses_it() {
+        let mut body = Vec::new();
+        append_clickhouse_chunk(&mut body, b"1234", 5).unwrap();
+        let error = append_clickhouse_chunk(&mut body, b"56", 5).unwrap_err();
+        assert_eq!(error, "ClickHouse response exceeds 5 bytes");
+        assert_eq!(body, b"1234");
     }
 }
 

@@ -229,6 +229,7 @@ pub struct Planner<'a> {
     pub infer_function_permissions: bool,
     /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
     pub relay: bool,
+    pub(crate) capabilities: donat_backend::Capabilities,
     inherited_roles: &'a [donat_metadata::InheritedRole],
     remote_schemas: &'a [donat_metadata::RemoteSchema],
     catalog: &'a Catalog,
@@ -245,12 +246,29 @@ pub struct Planner<'a> {
 }
 
 impl<'a> Planner<'a> {
+    pub fn supports_relay(&self) -> bool {
+        self.capabilities.relay
+    }
+
     pub fn new(metadata: &'a Metadata, catalog: &'a Catalog) -> Self {
-        let (tables, functions): (&[TableEntry], &[donat_metadata::FunctionEntry]) = metadata
+        let source = metadata
             .sources
-            .first()
+            .iter()
+            .find(|source| source.name == "default")
+            .or_else(|| metadata.sources.first());
+        let (tables, functions): (&[TableEntry], &[donat_metadata::FunctionEntry]) = source
             .map(|s| (s.tables.as_slice(), s.functions.as_slice()))
             .unwrap_or((&[], &[]));
+        let capabilities = match source.map(|source| source.kind) {
+            Some(donat_metadata::SourceKind::Sqlite) => donat_backend::capabilities::sqlite(),
+            Some(donat_metadata::SourceKind::Mysql) => donat_backend::capabilities::mysql(),
+            Some(donat_metadata::SourceKind::Clickhouse) => {
+                donat_backend::capabilities::clickhouse()
+            }
+            Some(donat_metadata::SourceKind::Postgres) | None => {
+                donat_backend::capabilities::postgres()
+            }
+        };
 
         let mut by_table = HashMap::new();
         let mut roots = HashMap::new();
@@ -326,6 +344,7 @@ impl<'a> Planner<'a> {
         Planner {
             infer_function_permissions: true,
             relay: false,
+            capabilities,
             inherited_roles: &metadata.inherited_roles,
             remote_schemas: &metadata.remote_schemas,
             catalog,
@@ -712,6 +731,9 @@ impl<'a> Planner<'a> {
         name: &str,
         path: &str,
     ) -> Option<(QualifiedTable, Vec<(String, String)>)> {
+        if !self.capabilities.relationships {
+            return None;
+        }
         if let Some(rel) = ctx
             .entry
             .object_relationships
@@ -1003,7 +1025,7 @@ impl<'a> Planner<'a> {
                     {
                         return Err(unexpected_arg(path, col));
                     }
-                    let pg_type = ctx.info.column(&db_col).unwrap().pg_type.clone();
+                    let pg_type = ctx.info.column(&db_col).unwrap().sql_type().to_string();
                     pk_predicate.push(BoolExp::Compare {
                         column: db_col,
                         pg_type,
@@ -1018,7 +1040,7 @@ impl<'a> Planner<'a> {
                 }
                 (_, "limit") => limit = Some(parse_non_negative(&value, path, "limit")?),
                 (_, "offset") => offset = Some(parse_non_negative(&value, path, "offset")?),
-                (_, "distinct_on") => {
+                (_, "distinct_on") if self.capabilities.distinct_on => {
                     distinct_on = parse_columns_arg(&value, ctx, path)?;
                 }
                 // Tracked-function / computed-field arguments are consumed
@@ -1267,12 +1289,12 @@ impl<'a> Planner<'a> {
                     value: match guard {
                         Some(guard) => FieldValue::ColumnGuarded {
                             column: col.name.clone(),
-                            pg_type: col.pg_type.clone(),
+                            pg_type: col.sql_type().to_string(),
                             guard,
                         },
                         None => FieldValue::Column {
                             column: col.name.clone(),
-                            pg_type: col.pg_type.clone(),
+                            pg_type: col.sql_type().to_string(),
                         },
                     },
                 });
@@ -1284,6 +1306,7 @@ impl<'a> Planner<'a> {
                 .entry
                 .object_relationships
                 .iter()
+                .filter(|_| self.capabilities.relationships)
                 .find(|r| r.name == field.name)
             {
                 let (remote_table, join) = self.object_rel_target(ctx, rel, &fpath)?;
@@ -1324,7 +1347,10 @@ impl<'a> Planner<'a> {
 
             // Array relationship (plain or _aggregate)?
             let (rel_name, aggregate) = match field.name.strip_suffix("_aggregate") {
-                Some(base) if ctx.entry.array_relationships.iter().any(|r| r.name == base) => {
+                Some(base)
+                    if self.capabilities.relationships
+                        && ctx.entry.array_relationships.iter().any(|r| r.name == base) =>
+                {
                     (base.to_string(), true)
                 }
                 _ => (field.name.clone(), false),
@@ -1333,6 +1359,7 @@ impl<'a> Planner<'a> {
                 .entry
                 .array_relationships
                 .iter()
+                .filter(|_| self.capabilities.relationships)
                 .find(|r| r.name == rel_name)
             {
                 let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
@@ -1395,7 +1422,7 @@ impl<'a> Planner<'a> {
                                 alias: hidden,
                                 value: FieldValue::Column {
                                     column: info.name.clone(),
-                                    pg_type: info.pg_type.clone(),
+                                    pg_type: info.sql_type().to_string(),
                                 },
                             });
                         }
@@ -1606,6 +1633,12 @@ impl<'a> Planner<'a> {
             let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
             let fpath = format!("{path}.selectionSet.{}", field.name);
             match field.name.as_str() {
+                "__typename" => out.push(AggregateField {
+                    alias,
+                    op: AggregateOp::Typename {
+                        value: format!("{}_aggregate_fields", ctx.type_name),
+                    },
+                }),
                 "count" => {
                     let mut distinct = false;
                     let mut columns = vec![];
@@ -1665,7 +1698,7 @@ impl<'a> Planner<'a> {
                         columns.push(AggregateColumn {
                             alias: col_alias,
                             column: info.name.clone(),
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                             guard,
                         });
                     }
@@ -2026,6 +2059,27 @@ impl<'a> Planner<'a> {
     }
 }
 
+#[cfg(test)]
+mod capability_source_tests {
+    use super::*;
+
+    #[test]
+    fn planner_uses_named_default_source_capabilities() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "sources": [
+                { "name": "primary", "kind": "postgres", "configuration": {}, "tables": [] },
+                { "name": "default", "kind": "clickhouse", "configuration": {}, "tables": [] }
+            ]
+        }))
+        .unwrap();
+        let catalog = Catalog::default();
+        let planner = Planner::new(&metadata, &catalog);
+        assert!(!planner.capabilities.mutations);
+        assert!(!planner.capabilities.relay);
+    }
+}
+
 /// Render a remote-relationship argument value as a GraphQL literal,
 /// turning "$column" strings into typed variables bound to hidden row
 /// columns.
@@ -2124,7 +2178,7 @@ impl<'a> Planner<'a> {
             .filter_map(|c| {
                 ctx.info
                     .column(c)
-                    .map(|info| (c.clone(), info.pg_type.clone()))
+                    .map(|info| (c.clone(), info.sql_type().to_string()))
             })
             .collect()
     }

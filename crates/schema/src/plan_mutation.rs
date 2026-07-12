@@ -17,6 +17,9 @@ impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Donat reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
+        if !self.capabilities.mutations {
+            return false;
+        }
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
         // mutation_root ("no mutations exist").
@@ -46,6 +49,9 @@ impl<'a> Planner<'a> {
         vars: &JsonMap<String, Json>,
         session: &Session,
     ) -> Result<Vec<MutationRoot>, PlanError> {
+        if !self.capabilities.mutations {
+            return Err(PlanError::validation("$", "no mutations exist"));
+        }
         let mut out = vec![];
         for field in flatten(selection_set, fragments, vars, None)? {
             let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
@@ -222,7 +228,11 @@ impl<'a> Planner<'a> {
         let typed_columns: Vec<(String, String)> = columns
             .iter()
             .map(|c| {
-                let pg_type = ctx.info.column(c).map(|i| i.pg_type.clone()).unwrap();
+                let pg_type = ctx
+                    .info
+                    .column(c)
+                    .map(|i| i.sql_type().to_string())
+                    .unwrap();
                 (c.clone(), pg_type)
             })
             .collect();
@@ -358,7 +368,7 @@ impl<'a> Planner<'a> {
                     };
                     set_ops.push(SetOp::Set {
                         column: col.clone(),
-                        pg_type: info.pg_type.clone(),
+                        pg_type: info.sql_type().to_string(),
                         value: Scalar::Json(resolved),
                     });
                 }
@@ -424,7 +434,7 @@ impl<'a> Planner<'a> {
                         let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Set {
                             column: db_col.clone(),
-                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().sql_type().to_string(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
@@ -444,7 +454,7 @@ impl<'a> Planner<'a> {
                         let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Inc {
                             column: db_col.clone(),
-                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().sql_type().to_string(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
@@ -466,7 +476,7 @@ impl<'a> Planner<'a> {
                         };
                         pk_predicate.push(BoolExp::Compare {
                             column: db_col,
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                             op: CompareOp::Eq(Scalar::Json(v.clone())),
                         });
                     }
@@ -508,7 +518,7 @@ impl<'a> Planner<'a> {
             };
             sets.push(SetOp::Set {
                 column: col.clone(),
-                pg_type: ctx.info.column(col).unwrap().pg_type.clone(),
+                pg_type: ctx.info.column(col).unwrap().sql_type().to_string(),
                 value: Scalar::Json(resolved),
             });
         }
@@ -593,7 +603,7 @@ impl<'a> Planner<'a> {
                     }
                     pk_predicate.push(BoolExp::Compare {
                         column: db_col,
-                        pg_type: info.pg_type.clone(),
+                        pg_type: info.sql_type().to_string(),
                         op: CompareOp::Eq(Scalar::Json(value)),
                     });
                 }

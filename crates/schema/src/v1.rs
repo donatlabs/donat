@@ -119,7 +119,7 @@ impl<'a> Planner<'a> {
                                 alias: col.name.clone(),
                                 value: FieldValue::Column {
                                     column: col.name.clone(),
-                                    pg_type: col.pg_type.clone(),
+                                    pg_type: col.sql_type().to_string(),
                                 },
                             });
                         }
@@ -148,7 +148,7 @@ impl<'a> Planner<'a> {
                         alias: name.clone(),
                         value: FieldValue::Column {
                             column: info.name.clone(),
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                         },
                     });
                 }
@@ -347,7 +347,7 @@ impl<'a> Planner<'a> {
                             format!("role \"{}\" does not have permission to update column \"{col}\"", session.role),
                         ));
                     }
-                    let pg_type = ctx.info.column(col).unwrap().pg_type.clone();
+                    let pg_type = ctx.info.column(col).unwrap().sql_type().to_string();
                     let value = Scalar::Json(v.clone());
                     sets.push(match kind {
                         "inc" => SetOp::Inc {
@@ -369,7 +369,7 @@ impl<'a> Planner<'a> {
             let Some(info) = ctx.info.column(col) else { continue };
             sets.push(SetOp::Set {
                 column: col.clone(),
-                pg_type: info.pg_type.clone(),
+                pg_type: info.sql_type().to_string(),
                 value: Scalar::Json(resolve_preset(value, session)?),
             });
         }
@@ -539,7 +539,12 @@ impl<'a> Planner<'a> {
 
         let typed_columns: Vec<(String, String)> = columns
             .iter()
-            .map(|c| (c.clone(), ctx.info.column(c).unwrap().pg_type.clone()))
+            .map(|c| {
+                (
+                    c.clone(),
+                    ctx.info.column(c).unwrap().sql_type().to_string(),
+                )
+            })
             .collect();
         let rows: Vec<Vec<Option<Scalar>>> = objects
             .iter()
@@ -610,7 +615,7 @@ impl<'a> Planner<'a> {
                             let Some(info) = ctx.info.column(col) else { continue };
                             set_ops.push(SetOp::Set {
                                 column: col.clone(),
-                                pg_type: info.pg_type.clone(),
+                                pg_type: info.sql_type().to_string(),
                                 value: Scalar::Json(resolve_preset(value, session)?),
                             });
                         }

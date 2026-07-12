@@ -30,6 +30,10 @@ pub enum UpsertKind {
 pub struct Capabilities {
     pub json_ops: JsonOps,
     pub geo: bool,
+    pub mutations: bool,
+    pub relay: bool,
+    pub relationships: bool,
+    pub regex_ops: bool,
     pub upsert: UpsertKind,
     pub returning: bool,
     pub distinct_on: bool,
@@ -43,6 +47,10 @@ pub fn postgres() -> Capabilities {
     Capabilities {
         json_ops: JsonOps::Jsonb,
         geo: true,
+        mutations: true,
+        relay: true,
+        relationships: true,
+        regex_ops: true,
         upsert: UpsertKind::Update,
         returning: true,
         distinct_on: true,
@@ -58,6 +66,10 @@ pub fn sqlite() -> Capabilities {
         // json1 builtins (text-backed json, no jsonb operator class).
         json_ops: JsonOps::Json,
         geo: false,
+        mutations: true,
+        relay: false,
+        relationships: true,
+        regex_ops: false,
         // ON CONFLICT ... DO UPDATE is supported; no DO NOTHING-only limit.
         upsert: UpsertKind::Update,
         returning: true,
@@ -76,6 +88,10 @@ pub fn mysql() -> Capabilities {
         // MySQL has a real JSON type but no jsonb operator class.
         json_ops: JsonOps::Json,
         geo: false,
+        mutations: true,
+        relay: false,
+        relationships: true,
+        regex_ops: false,
         // INSERT ... ON DUPLICATE KEY UPDATE (mutations only; not exercised
         // by the read-query slice).
         upsert: UpsertKind::Update,
@@ -91,15 +107,52 @@ pub fn mysql() -> Capabilities {
     }
 }
 
+/// Capabilities of the read-only ClickHouse backend.
+pub fn clickhouse() -> Capabilities {
+    Capabilities {
+        json_ops: JsonOps::None,
+        geo: false,
+        mutations: false,
+        relay: false,
+        relationships: false,
+        regex_ops: false,
+        upsert: UpsertKind::None,
+        returning: false,
+        distinct_on: false,
+        lateral: false,
+        aggregates: true,
+        nested_inserts: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clickhouse_descriptor_is_read_only() {
+        let caps = clickhouse();
+        assert_eq!(caps.json_ops, JsonOps::None);
+        assert!(!caps.geo);
+        assert!(!caps.mutations);
+        assert!(!caps.relay);
+        assert!(!caps.relationships);
+        assert!(!caps.regex_ops);
+        assert_eq!(caps.upsert, UpsertKind::None);
+        assert!(!caps.returning);
+        assert!(!caps.distinct_on);
+        assert!(!caps.lateral);
+        assert!(caps.aggregates);
+        assert!(!caps.nested_inserts);
+    }
 
     #[test]
     fn mysql_descriptor_is_correct() {
         let caps = mysql();
         assert_eq!(caps.json_ops, JsonOps::Json);
         assert!(!caps.geo);
+        assert!(caps.mutations);
+        assert!(!caps.regex_ops);
         assert_eq!(caps.upsert, UpsertKind::Update);
         assert!(!caps.returning);
         assert!(!caps.distinct_on);
@@ -113,6 +166,8 @@ mod tests {
         let caps = sqlite();
         assert_eq!(caps.json_ops, JsonOps::Json);
         assert!(!caps.geo);
+        assert!(caps.mutations);
+        assert!(!caps.regex_ops);
         assert_eq!(caps.upsert, UpsertKind::Update);
         assert!(caps.returning);
         assert!(!caps.distinct_on);
@@ -126,6 +181,7 @@ mod tests {
         let caps = postgres();
         assert_eq!(caps.json_ops, JsonOps::Jsonb);
         assert!(caps.geo);
+        assert!(caps.mutations);
         assert_eq!(caps.upsert, UpsertKind::Update);
         assert!(caps.returning);
         assert!(caps.distinct_on);

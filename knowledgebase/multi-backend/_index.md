@@ -1,7 +1,7 @@
 # Multi-Backend Data Sources
 
 > Let a tracked data source run on a database other than Postgres (SQLite,
-> MySQL/MariaDB, SQL Server) and serve it over the same GraphQL surface.
+> MySQL/MariaDB, SQL Server, or read-only ClickHouse) and serve it over the same GraphQL surface.
 > Postgres stays the system/default source and the conformance reference.
 
 **Status: design accepted, implementation gated.** The engine is mid-rename
@@ -20,6 +20,9 @@ reasoning never has to be reconstructed.
 - [[decisions/001-in-process-backend-trait-over-ndc]] — in-process dialect
   trait, NOT an out-of-process NDC-style protocol; performance (preserve the
   one-statement-in-DB invariant, zero IPC hop) is the deciding factor.
+- [[decisions/005-clickhouse-read-only-datasource]] — ClickHouse uses the same
+  compiled-in backend boundary and HTTP transport, with read-only capabilities
+  and native database-side JSON assembly.
 - [[decisions/006-mandatory-conformance-backend-matrix]] — every registered
   datasource backend runs the same applicable conformance cases in an isolated
   CI matrix job; Postgres remains the default local and reference target.

@@ -101,7 +101,7 @@ impl Planner<'_> {
                         .into_iter()
                         .map(|op| BoolExp::Compare {
                             column: db_column.clone(),
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                             op,
                         })
                         .collect();
@@ -341,12 +341,14 @@ impl Planner<'_> {
                 "_nlike" => CompareOp::Nlike(scalar(op_value)?),
                 "_ilike" => CompareOp::Ilike(scalar(op_value)?),
                 "_nilike" => CompareOp::Nilike(scalar(op_value)?),
-                "_similar" => CompareOp::Similar(scalar(op_value)?),
-                "_nsimilar" => CompareOp::Nsimilar(scalar(op_value)?),
-                "_regex" => CompareOp::Regex(scalar(op_value)?),
-                "_iregex" => CompareOp::Iregex(scalar(op_value)?),
-                "_nregex" => CompareOp::Nregex(scalar(op_value)?),
-                "_niregex" => CompareOp::Niregex(scalar(op_value)?),
+                "_similar" if self.capabilities.regex_ops => CompareOp::Similar(scalar(op_value)?),
+                "_nsimilar" if self.capabilities.regex_ops => {
+                    CompareOp::Nsimilar(scalar(op_value)?)
+                }
+                "_regex" if self.capabilities.regex_ops => CompareOp::Regex(scalar(op_value)?),
+                "_iregex" if self.capabilities.regex_ops => CompareOp::Iregex(scalar(op_value)?),
+                "_nregex" if self.capabilities.regex_ops => CompareOp::Nregex(scalar(op_value)?),
+                "_niregex" if self.capabilities.regex_ops => CompareOp::Niregex(scalar(op_value)?),
                 "_is_null" => {
                     let v = resolve_session(op_value, session, is_permission, path)?;
                     CompareOp::IsNull(v.as_bool().unwrap_or(false))
@@ -359,21 +361,60 @@ impl Planner<'_> {
                 "_cgte" => self.column_compare(">=", op_value, ctx, path)?,
                 "_clte" => self.column_compare("<=", op_value, ctx, path)?,
                 // jsonb operators.
-                "_has_key" => CompareOp::HasKey(scalar(op_value)?),
-                "_has_keys_any" => CompareOp::HasKeysAny(string_list(op_value)?),
-                "_has_keys_all" => CompareOp::HasKeysAll(string_list(op_value)?),
-                "_contains" => CompareOp::Contains(scalar(op_value)?),
-                "_contained_in" => CompareOp::ContainedIn(scalar(op_value)?),
+                "_has_key"
+                    if matches!(
+                        self.capabilities.json_ops,
+                        donat_backend::capabilities::JsonOps::Jsonb
+                    ) =>
+                {
+                    CompareOp::HasKey(scalar(op_value)?)
+                }
+                "_has_keys_any"
+                    if matches!(
+                        self.capabilities.json_ops,
+                        donat_backend::capabilities::JsonOps::Jsonb
+                    ) =>
+                {
+                    CompareOp::HasKeysAny(string_list(op_value)?)
+                }
+                "_has_keys_all"
+                    if matches!(
+                        self.capabilities.json_ops,
+                        donat_backend::capabilities::JsonOps::Jsonb
+                    ) =>
+                {
+                    CompareOp::HasKeysAll(string_list(op_value)?)
+                }
+                "_contains"
+                    if matches!(
+                        self.capabilities.json_ops,
+                        donat_backend::capabilities::JsonOps::Jsonb
+                    ) =>
+                {
+                    CompareOp::Contains(scalar(op_value)?)
+                }
+                "_contained_in"
+                    if matches!(
+                        self.capabilities.json_ops,
+                        donat_backend::capabilities::JsonOps::Jsonb
+                    ) =>
+                {
+                    CompareOp::ContainedIn(scalar(op_value)?)
+                }
                 // PostGIS operators.
-                "_st_contains" => st_op("ST_Contains", op_value, &scalar)?,
-                "_st_crosses" => st_op("ST_Crosses", op_value, &scalar)?,
-                "_st_equals" => st_op("ST_Equals", op_value, &scalar)?,
-                "_st_intersects" => st_op("ST_Intersects", op_value, &scalar)?,
-                "_st_overlaps" => st_op("ST_Overlaps", op_value, &scalar)?,
-                "_st_touches" => st_op("ST_Touches", op_value, &scalar)?,
-                "_st_within" => st_op("ST_Within", op_value, &scalar)?,
-                "_st_3d_intersects" => st_op("ST_3DIntersects", op_value, &scalar)?,
-                "_st_d_within" | "_st_3d_d_within" => {
+                "_st_contains" if self.capabilities.geo => st_op("ST_Contains", op_value, &scalar)?,
+                "_st_crosses" if self.capabilities.geo => st_op("ST_Crosses", op_value, &scalar)?,
+                "_st_equals" if self.capabilities.geo => st_op("ST_Equals", op_value, &scalar)?,
+                "_st_intersects" if self.capabilities.geo => {
+                    st_op("ST_Intersects", op_value, &scalar)?
+                }
+                "_st_overlaps" if self.capabilities.geo => st_op("ST_Overlaps", op_value, &scalar)?,
+                "_st_touches" if self.capabilities.geo => st_op("ST_Touches", op_value, &scalar)?,
+                "_st_within" if self.capabilities.geo => st_op("ST_Within", op_value, &scalar)?,
+                "_st_3d_intersects" if self.capabilities.geo => {
+                    st_op("ST_3DIntersects", op_value, &scalar)?
+                }
+                "_st_d_within" | "_st_3d_d_within" if self.capabilities.geo => {
                     let obj = op_value.as_object().ok_or_else(|| {
                         PlanError::validation(path, "expected { distance, from } for _st_d_within")
                     })?;

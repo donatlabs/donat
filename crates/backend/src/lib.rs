@@ -11,5 +11,7 @@ pub mod dialect;
 pub mod scalar;
 
 pub use capabilities::Capabilities;
-pub use dialect::{AnyDialect, Dialect, MySqlDialect, PostgresDialect, SqliteDialect};
+pub use dialect::{
+    AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, PostgresDialect, SqliteDialect,
+};
 pub use scalar::ScalarType;

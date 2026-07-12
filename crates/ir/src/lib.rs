@@ -194,6 +194,8 @@ pub struct AggregateField {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum AggregateOp {
+    /// GraphQL meta-field on `<table>_aggregate_fields`.
+    Typename { value: String },
     Count { distinct: bool, columns: Vec<String> },
     /// sum/avg/min/max over a set of columns.
     ColumnOp {

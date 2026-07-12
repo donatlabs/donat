@@ -26,10 +26,12 @@ the system/default source and the conformance reference.
 same GraphQL cases validated against each database (see "Conformance
 matrix").
 
-**Out of scope (for now):** analytical engines (ClickHouse, BigQuery) and
-non-SQL stores (MongoDB) — different data/execution models, deferred until
-the SQL family is proven. Also out of scope: an out-of-process NDC-style
-connector protocol (see [[decisions/001-in-process-backend-trait-over-ndc]]).
+**Additional read-only backend:** ClickHouse is supported after the SQL-family
+abstraction was proven; its analytical execution model and limits are captured
+in [[decisions/005-clickhouse-read-only-datasource]]. BigQuery and non-SQL
+stores (MongoDB) remain out of scope. Also out of scope: an out-of-process
+NDC-style connector protocol (see
+[[decisions/001-in-process-backend-trait-over-ndc]]).
 
 **Direction note:** this reverses the README's "Not planned (by design):
 Non-Postgres backends". The roadmap must be updated when implementation

@@ -504,7 +504,7 @@ pub async fn execute_full(
         catalog_tables = catalog.tables.len(), "graphql request");
     let mut planner = Planner::new(&engine.metadata, &catalog);
     planner.infer_function_permissions = state.infer_function_permissions;
-    planner.relay = relay;
+    planner.relay = relay && planner.supports_relay();
     // Introspection operations are answered from the type system directly.
     if let Some(result) = donat_schema::execute_introspection(
         &planner,
@@ -900,6 +900,7 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Decode(msg) => error_json("unexpected", format!("cannot decode result: {msg}")),
         QueryError::Postgres(err) => db_error_json(&err),
         QueryError::Sqlite(msg) => error_json("data-exception", msg),
+        QueryError::Clickhouse(msg) => error_json("data-exception", msg),
     }
 }
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
