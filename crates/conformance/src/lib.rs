@@ -410,6 +410,7 @@ fn suite_database_name(suite: &str) -> String {
 
 struct SuiteDatabase {
     url: String,
+    schema: String,
     cleanup: SuiteCleanup,
 }
 
@@ -428,6 +429,7 @@ impl SuiteDatabase {
                     let (_, url) = create_suite_db(name)?;
                     url
                 },
+                schema: "public".to_string(),
                 cleanup: SuiteCleanup::Postgres {
                     admin_url: pg_admin_url(),
                     name: name.to_string(),
@@ -442,6 +444,7 @@ impl SuiteDatabase {
                     .with_context(|| format!("creating SQLite database {}", path.display()))?;
                 Ok(Self {
                     url: path.to_string_lossy().into_owned(),
+                    schema: "main".to_string(),
                     cleanup: SuiteCleanup::Sqlite(path),
                 })
             }
@@ -457,6 +460,7 @@ impl SuiteDatabase {
                 url.set_path(&format!("/{name}"));
                 Ok(Self {
                     url: url.to_string(),
+                    schema: name.to_string(),
                     cleanup: SuiteCleanup::Mysql {
                         admin_url,
                         name: name.to_string(),
@@ -488,6 +492,7 @@ impl SuiteDatabase {
                 database.query_pairs_mut().append_pair("database", name);
                 Ok(Self {
                     url: database.to_string(),
+                    schema: name.to_string(),
                     cleanup: SuiteCleanup::Clickhouse {
                         admin_url,
                         name: name.to_string(),
@@ -735,6 +740,7 @@ impl Suite {
         let database = SuiteDatabase::create(backend, &suite_database_name(&self.name))
             .expect("creating suite database");
         let db_url = database.url.clone();
+        let schema = database.schema.clone();
 
         // Fresh database: postgis is used pervasively by fixtures. Concurrent
         // CREATE EXTENSION across databases races inside Postgres (shared
@@ -783,6 +789,7 @@ impl Suite {
             event: self.event,
             run_migrations: self.run_migrations,
             db_url,
+            schema,
             _database: database,
             metadata: RefCell::new(metadata),
             engine: RefCell::new(None),
@@ -814,12 +821,35 @@ pub struct Running {
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
     db_url: String,
+    pub schema: String,
     _database: SuiteDatabase,
     /// Accumulated metadata, applied lazily when the engine is spawned.
     metadata: RefCell<Metadata>,
     /// The spawned engine, started on first request (`ensure_engine`).
     engine: RefCell<Option<EngineProc>>,
     http: reqwest::blocking::Client,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FixtureColumnType {
+    BigInt,
+    Text,
+    Json,
+}
+
+pub struct FixtureColumn {
+    pub name: &'static str,
+    pub ty: FixtureColumnType,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
+pub struct TableFixture {
+    pub name: &'static str,
+    pub columns: &'static [FixtureColumn],
+    pub rows: Vec<Vec<Json>>,
+    pub role: &'static str,
+    pub allow_aggregations: bool,
 }
 
 impl Drop for Running {
@@ -888,6 +918,191 @@ fn same_object(a: &QualifiedTable, b: &QualifiedTable) -> bool {
 }
 
 impl Running {
+    pub fn install_table(&self, fixture: &TableFixture) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "fixtures must be installed before the engine starts"
+        );
+        let quote = |name: &str| match self.backend {
+            BackendId::Mysql | BackendId::Clickhouse => {
+                format!("`{}`", name.replace('`', "``"))
+            }
+            BackendId::Postgres | BackendId::Sqlite => {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+        };
+        let column_type = |column: &FixtureColumn| match (self.backend, column.ty) {
+            (BackendId::Clickhouse, FixtureColumnType::BigInt) => "UInt64",
+            (BackendId::Clickhouse, FixtureColumnType::Text) => "String",
+            (BackendId::Clickhouse, FixtureColumnType::Json) => "JSON",
+            (BackendId::Sqlite, FixtureColumnType::BigInt) => "INTEGER",
+            (BackendId::Sqlite, FixtureColumnType::Text) => "TEXT",
+            (BackendId::Sqlite, FixtureColumnType::Json) => "JSON",
+            (BackendId::Mysql, FixtureColumnType::BigInt) => "BIGINT",
+            (BackendId::Mysql, FixtureColumnType::Text) => "TEXT",
+            (BackendId::Mysql, FixtureColumnType::Json) => "JSON",
+            (BackendId::Postgres, FixtureColumnType::BigInt) => "BIGINT",
+            (BackendId::Postgres, FixtureColumnType::Text) => "TEXT",
+            (BackendId::Postgres, FixtureColumnType::Json) => "JSONB",
+        };
+        let columns = fixture
+            .columns
+            .iter()
+            .map(|column| {
+                let base_type = column_type(column);
+                let native_type = if self.backend == BackendId::Clickhouse && column.nullable {
+                    format!("Nullable({base_type})")
+                } else {
+                    base_type.to_string()
+                };
+                let nullable = if column.nullable || self.backend == BackendId::Clickhouse {
+                    ""
+                } else {
+                    " NOT NULL"
+                };
+                let primary = if column.primary_key && self.backend != BackendId::Clickhouse {
+                    " PRIMARY KEY"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} {}{nullable}{primary}",
+                    quote(column.name),
+                    native_type
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = format!("{}.{}", quote(&self.schema), quote(fixture.name));
+        let engine = if self.backend == BackendId::Clickhouse {
+            let order = fixture
+                .columns
+                .iter()
+                .find(|column| column.primary_key)
+                .map(|column| quote(column.name))
+                .unwrap_or_else(|| "tuple()".to_string());
+            format!(" ENGINE = MergeTree ORDER BY {order}")
+        } else {
+            String::new()
+        };
+        self.execute_fixture_sql(&format!("CREATE TABLE {table} ({columns}){engine}"));
+
+        if !fixture.rows.is_empty() {
+            let column_names = fixture
+                .columns
+                .iter()
+                .map(|column| quote(column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = fixture
+                .rows
+                .iter()
+                .map(|row| {
+                    assert_eq!(row.len(), fixture.columns.len());
+                    format!(
+                        "({})",
+                        row.iter()
+                            .zip(fixture.columns)
+                            .map(|(value, column)| self.fixture_literal(value, column.ty))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.execute_fixture_sql(&format!(
+                "INSERT INTO {table} ({column_names}) VALUES {rows}"
+            ));
+        }
+
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: fixture.name.to_string(),
+        };
+        let permission: SelectPermission = serde_json::from_value(json!({
+            "columns": "*",
+            "filter": {},
+            "allow_aggregations": fixture.allow_aggregations
+        }))
+        .expect("fixture select permission");
+        self.with_table(&table, |entry| {
+            entry.configuration = Some(
+                serde_json::from_value(json!({ "custom_name": fixture.name }))
+                    .expect("fixture table configuration"),
+            );
+            entry.select_permissions.push(PermissionEntry {
+                role: fixture.role.to_string(),
+                permission,
+                comment: None,
+            });
+        });
+    }
+
+    fn execute_fixture_sql(&self, sql: &str) {
+        match self.backend {
+            BackendId::Postgres => pg_client(&self.db_url)
+                .batch_execute(sql)
+                .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)),
+            BackendId::Sqlite => rusqlite::Connection::open(&self.db_url)
+                .and_then(|connection| connection.execute_batch(sql))
+                .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)),
+            BackendId::Mysql => {
+                use mysql::prelude::Queryable;
+                let mut connection = mysql::Conn::new(self.db_url.as_str())
+                    .unwrap_or_else(|error| panic!("[{}] MySQL connect failed: {error}", self.name));
+                connection
+                    .query_drop(sql)
+                    .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name));
+            }
+            BackendId::Clickhouse => {
+                self.http
+                    .post(&self.db_url)
+                    .body(sql.to_string())
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .unwrap_or_else(|error| panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name));
+            }
+        }
+    }
+
+    fn fixture_literal(&self, value: &Json, ty: FixtureColumnType) -> String {
+        use donat_backend::Dialect;
+
+        if value.is_null() {
+            return "NULL".to_string();
+        }
+        let dialect = match self.backend {
+            BackendId::Postgres => {
+                donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect)
+            }
+            BackendId::Sqlite => {
+                donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect)
+            }
+            BackendId::Mysql => donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect),
+            BackendId::Clickhouse => {
+                donat_backend::AnyDialect::Clickhouse(donat_backend::ClickhouseDialect)
+            }
+        };
+        match value {
+            Json::Bool(value) => value.to_string(),
+            Json::Number(value) => value.to_string(),
+            Json::String(value) => dialect.quote_literal(value),
+            Json::Array(_) | Json::Object(_) => {
+                let literal = dialect.quote_literal(&value.to_string());
+                match (self.backend, ty) {
+                    (BackendId::Postgres, FixtureColumnType::Json) => {
+                        format!("{literal}::jsonb")
+                    }
+                    (BackendId::Mysql | BackendId::Clickhouse, FixtureColumnType::Json) => {
+                        format!("CAST({literal} AS JSON)")
+                    }
+                    _ => literal,
+                }
+            }
+            Json::Null => unreachable!(),
+        }
+    }
+
     /// Find (or create) the table entry for `args.table` in the default
     /// source and run `f` against it. Tables are matched by resolved
     /// (schema, name), so the bare-name and qualified forms unify.
@@ -2087,6 +2302,26 @@ mod tests {
                 "unsafe database name: {name}"
             );
         }
+    }
+
+    #[test]
+    fn ci_matrix_covers_backend_registry() {
+        let workflow = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+            .expect("reading CI workflow");
+        let workflow: serde_yaml::Value =
+            serde_yaml::from_str(&workflow).expect("parsing CI workflow");
+        let include = workflow["jobs"]["backend-core"]["strategy"]["matrix"]["include"]
+            .as_sequence()
+            .expect("conformance matrix.include");
+        let actual = include
+            .iter()
+            .map(|entry| {
+                entry["backend"]
+                    .as_str()
+                    .expect("matrix backend string")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, BackendId::ALL.map(BackendId::as_str));
     }
 
     // ---------------------------------------------------- load_fixture

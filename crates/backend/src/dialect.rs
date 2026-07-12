@@ -314,15 +314,12 @@ impl Dialect for MySqlDialect {
     }
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
-        // MySQL's JSON_ARRAYAGG(...), coalesced to an empty JSON array. The row
-        // expression is already a real JSON value (built by JSON_OBJECT), so —
-        // unlike SQLite — no json(...) reparse is needed; aggregating it
-        // directly preserves the nested structure. MySQL's JSON_ARRAYAGG does
-        // not accept an ORDER BY argument, so any requested ordering is applied
-        // by the surrounding query's ORDER BY (the planner emits an ordered
-        // subquery), and the order_by hint is intentionally ignored here.
-        let _ = order_by;
-        format!("COALESCE(JSON_ARRAYAGG({row_expr}), JSON_ARRAY())")
+        match order_by {
+            Some(order) => format!(
+                "CAST(CONCAT('[', COALESCE(GROUP_CONCAT(CAST({row_expr} AS CHAR) ORDER BY {order} SEPARATOR ','), ''), ']') AS JSON)"
+            ),
+            None => format!("COALESCE(JSON_ARRAYAGG({row_expr}), JSON_ARRAY())"),
+        }
     }
 
     fn to_json_text(&self, expr: &str) -> String {
@@ -395,7 +392,7 @@ impl Dialect for ClickhouseDialect {
             }
             let key = format!("{}:", serde_json::to_string(key).expect("JSON object key"));
             parts.push(self.quote_literal(&key));
-            parts.push(format!("toJSONString({value})"));
+            parts.push(format!("coalesce(toJSONString({value}), 'null')"));
         }
         parts.push(self.quote_literal("}"));
         format!("CAST(concat({}) AS JSON)", parts.join(", "))
@@ -563,7 +560,7 @@ mod tests {
                 ("id".to_string(), "_t0.id".to_string()),
                 ("name".to_string(), "_t0.name".to_string()),
             ]),
-            "CAST(concat('{', '\"id\":', toJSONString(_t0.id), ',', '\"name\":', toJSONString(_t0.name), '}') AS JSON)"
+            "CAST(concat('{', '\"id\":', coalesce(toJSONString(_t0.id), 'null'), ',', '\"name\":', coalesce(toJSONString(_t0.name), 'null'), '}') AS JSON)"
         );
         assert_eq!(d.json_object(&[]), "CAST('{}' AS JSON)");
         assert_eq!(
@@ -585,7 +582,7 @@ mod tests {
         );
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
-            "CAST(concat('{', '\"k\":', toJSONString(v), '}') AS JSON)"
+            "CAST(concat('{', '\"k\":', coalesce(toJSONString(v), 'null'), '}') AS JSON)"
         );
         assert_eq!(d.json_array_agg("x", None), "groupArray(CAST(x AS JSON))");
         assert_eq!(d.to_json_text("x"), "toJSONString(x)");
@@ -1038,17 +1035,18 @@ mod tests {
     }
 
     #[test]
-    fn mysql_json_array_agg_no_reparse_and_ignores_order() {
+    fn mysql_json_array_agg_preserves_requested_order() {
         let d = MySqlDialect;
         // No json(...) reparse wrapper (MySQL has a real JSON type), and the
-        // ORDER BY hint is ignored (JSON_ARRAYAGG takes no ORDER BY).
+        // Ordered aggregation uses GROUP_CONCAT because MySQL JSON_ARRAYAGG
+        // does not accept an ORDER BY argument.
         assert_eq!(
             d.json_array_agg("_e.j", None),
             "COALESCE(JSON_ARRAYAGG(_e.j), JSON_ARRAY())"
         );
         assert_eq!(
             d.json_array_agg("t.e", Some("t.i ASC")),
-            "COALESCE(JSON_ARRAYAGG(t.e), JSON_ARRAY())"
+            "CAST(CONCAT('[', COALESCE(GROUP_CONCAT(CAST(t.e AS CHAR) ORDER BY t.i ASC SEPARATOR ','), ''), ']') AS JSON)"
         );
     }
 

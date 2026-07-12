@@ -279,8 +279,12 @@ impl Ctx {
         } else {
             let elem = self.alias();
             let e = quote_ident(&elem);
-            let clickhouse_order =
-                if matches!(self.dialect, donat_backend::AnyDialect::Clickhouse(_)) {
+            let stable_order =
+                if matches!(
+                    self.dialect,
+                    donat_backend::AnyDialect::Clickhouse(_)
+                        | donat_backend::AnyDialect::Mysql(_)
+                ) {
                     rendered_order
                         .as_ref()
                         .map(|_| format!("{e}.{}", quote_ident("__donat_ord")))
@@ -288,7 +292,13 @@ impl Ctx {
                     None
                 };
             let row_projection = match rendered_order.as_deref() {
-                Some(order) if matches!(self.dialect, donat_backend::AnyDialect::Clickhouse(_)) => {
+                Some(order)
+                    if matches!(
+                        self.dialect,
+                        donat_backend::AnyDialect::Clickhouse(_)
+                            | donat_backend::AnyDialect::Mysql(_)
+                    ) =>
+                {
                     format!(
                         "{row_json} AS j, row_number() OVER (ORDER BY {order}) AS {}",
                         quote_ident("__donat_ord")
@@ -301,7 +311,7 @@ impl Ctx {
                 agg = json_array_agg(
                     &self.dialect,
                     &format!("{e}.j"),
-                    clickhouse_order.as_deref()
+                    stable_order.as_deref()
                 ),
             )
         }
@@ -607,6 +617,14 @@ impl Ctx {
                             "int8" | "numeric" if self.stringify_numerics => {
                                 format!("({col})::text")
                             }
+                            "json"
+                                if matches!(
+                                    self.dialect,
+                                    donat_backend::AnyDialect::Sqlite(_)
+                                ) =>
+                            {
+                                format!("json({col})")
+                            }
                             _ => col,
                         }
                     }
@@ -667,6 +685,9 @@ impl Ctx {
         match pg_type {
             "geometry" | "geography" => format!("ST_AsGeoJSON({col}, 15, 4)::json"),
             "int8" | "numeric" if self.stringify_numerics => format!("({col})::text"),
+            "json" if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) => {
+                format!("json({col})")
+            }
             _ => col,
         }
     }

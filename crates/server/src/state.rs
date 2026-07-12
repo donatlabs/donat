@@ -238,6 +238,8 @@ impl AppState {
                     // is enabled for the session.
                     conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    conn.query_drop("SET SESSION group_concat_max_len = 4294967295")
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
                     let row: Option<String> = conn
                         .query_first(&sql)
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
@@ -454,6 +456,8 @@ impl AppState {
             // The mutation path itself renders backtick identifiers, but stay
             // consistent with the read path's session setup.
             conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            conn.query_drop("SET SESSION group_concat_max_len = 4294967295")
                 .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
             let mut tx = conn
                 .start_transaction(mysql::TxOpts::default())

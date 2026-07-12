@@ -298,6 +298,7 @@ fn sqlite_type_to_pg(declared: &str) -> &'static str {
         "BOOLEAN" | "BOOL" => "bool",
         "DATE" => "date",
         "DATETIME" | "TIMESTAMP" => "timestamp",
+        "JSON" => "json",
         _ => "text",
     }
 }
