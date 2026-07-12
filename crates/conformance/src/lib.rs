@@ -244,6 +244,100 @@ use donat_metadata::{
     TableEntry, UpdatePermission,
 };
 
+/// Datasource backends covered by the mandatory conformance matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendId {
+    Postgres,
+    Sqlite,
+    Mysql,
+    Clickhouse,
+}
+
+impl BackendId {
+    pub const ALL: [Self; 4] = [Self::Postgres, Self::Sqlite, Self::Mysql, Self::Clickhouse];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+            Self::Mysql => "mysql",
+            Self::Clickhouse => "clickhouse",
+        }
+    }
+
+    pub const fn source_kind(self) -> SourceKind {
+        match self {
+            Self::Postgres => SourceKind::Postgres,
+            Self::Sqlite => SourceKind::Sqlite,
+            Self::Mysql => SourceKind::Mysql,
+            Self::Clickhouse => SourceKind::Clickhouse,
+        }
+    }
+
+    pub fn capabilities(self) -> donat_backend::Capabilities {
+        match self {
+            Self::Postgres => donat_backend::capabilities::postgres(),
+            Self::Sqlite => donat_backend::capabilities::sqlite(),
+            Self::Mysql => donat_backend::capabilities::mysql(),
+            Self::Clickhouse => donat_backend::capabilities::clickhouse(),
+        }
+    }
+
+    pub const fn required_url_env(self) -> Option<&'static str> {
+        match self {
+            Self::Mysql => Some("MYSQL_URL"),
+            Self::Clickhouse => Some("CLICKHOUSE_URL"),
+            Self::Postgres | Self::Sqlite => None,
+        }
+    }
+
+    pub fn validate_configuration(
+        self,
+        get_env: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<()> {
+        let Some(key) = self.required_url_env() else {
+            return Ok(());
+        };
+        match get_env(key) {
+            Some(value) if !value.trim().is_empty() => Ok(()),
+            _ => Err(anyhow!(
+                "CONF_BACKEND={} requires non-empty {key}",
+                self.as_str()
+            )),
+        }
+    }
+
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        let value = value
+            .filter(|value| !value.is_empty())
+            .unwrap_or("postgres");
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.as_str() == value)
+            .ok_or_else(|| {
+                let supported = Self::ALL.map(Self::as_str).join(", ");
+                anyhow!("unknown CONF_BACKEND '{value}'; expected one of: {supported}")
+            })
+    }
+
+    pub fn selected() -> Result<Self> {
+        let backend = Self::parse(std::env::var("CONF_BACKEND").ok().as_deref())?;
+        backend.validate_configuration(|key| std::env::var(key).ok())?;
+        Ok(backend)
+    }
+}
+
+impl From<SourceKind> for BackendId {
+    fn from(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Postgres => Self::Postgres,
+            SourceKind::Sqlite => Self::Sqlite,
+            SourceKind::Mysql => Self::Mysql,
+            SourceKind::Clickhouse => Self::Clickhouse,
+        }
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -1696,6 +1790,74 @@ fn strip_mcp_content(v: &Json) -> Json {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn backend_registry_has_stable_ci_ids() {
+        assert_eq!(
+            BackendId::ALL.map(BackendId::as_str),
+            ["postgres", "sqlite", "mysql", "clickhouse"]
+        );
+    }
+
+    #[test]
+    fn backend_selection_defaults_to_postgres() {
+        assert_eq!(BackendId::parse(None).unwrap(), BackendId::Postgres);
+        assert_eq!(BackendId::parse(Some("")).unwrap(), BackendId::Postgres);
+    }
+
+    #[test]
+    fn backend_selection_parses_every_registered_backend() {
+        for backend in BackendId::ALL {
+            assert_eq!(BackendId::parse(Some(backend.as_str())).unwrap(), backend);
+        }
+    }
+
+    #[test]
+    fn backend_selection_rejects_unknown_values() {
+        let err = BackendId::parse(Some("oracle")).unwrap_err();
+        assert!(err.to_string().contains("oracle"), "{err}");
+        for backend in BackendId::ALL {
+            assert!(err.to_string().contains(backend.as_str()), "{err}");
+        }
+    }
+
+    #[test]
+    fn backend_registry_covers_every_source_kind() {
+        for backend in BackendId::ALL {
+            assert_eq!(BackendId::from(backend.source_kind()), backend);
+        }
+    }
+
+    #[test]
+    fn backend_registry_uses_engine_capabilities() {
+        assert_eq!(BackendId::Postgres.capabilities(), donat_backend::capabilities::postgres());
+        assert_eq!(BackendId::Sqlite.capabilities(), donat_backend::capabilities::sqlite());
+        assert_eq!(BackendId::Mysql.capabilities(), donat_backend::capabilities::mysql());
+        assert_eq!(BackendId::Clickhouse.capabilities(), donat_backend::capabilities::clickhouse());
+    }
+
+    #[test]
+    fn in_process_and_default_backends_need_no_explicit_url() {
+        BackendId::Postgres.validate_configuration(|_| None).unwrap();
+        BackendId::Sqlite.validate_configuration(|_| None).unwrap();
+    }
+
+    #[test]
+    fn service_backends_require_explicit_urls() {
+        let mysql = BackendId::Mysql.validate_configuration(|_| None).unwrap_err();
+        assert!(mysql.to_string().contains("MYSQL_URL"), "{mysql}");
+        let clickhouse = BackendId::Clickhouse.validate_configuration(|_| None).unwrap_err();
+        assert!(clickhouse.to_string().contains("CLICKHOUSE_URL"), "{clickhouse}");
+
+        BackendId::Mysql
+            .validate_configuration(|key| (key == "MYSQL_URL").then(|| "mysql://db".into()))
+            .unwrap();
+        BackendId::Clickhouse
+            .validate_configuration(|key| {
+                (key == "CLICKHOUSE_URL").then(|| "http://clickhouse".into())
+            })
+            .unwrap();
+    }
 
     // ---------------------------------------------------- load_fixture
 

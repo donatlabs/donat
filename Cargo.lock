@@ -633,6 +633,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "donat-backend",
  "donat-metadata",
  "graphql-parser",
  "jsonwebtoken",
