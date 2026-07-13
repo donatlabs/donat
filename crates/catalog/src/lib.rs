@@ -621,14 +621,10 @@ fn clickhouse_is_nullable(native_type: &str) -> bool {
 
 fn clickhouse_type_to_pg(native_type: &str) -> &'static str {
     let mut native_type = native_type.trim();
-    loop {
-        if let Some(inner) = clickhouse_inner_type(native_type, "Nullable")
-            .or_else(|| clickhouse_inner_type(native_type, "LowCardinality"))
-        {
-            native_type = inner;
-        } else {
-            break;
-        }
+    while let Some(inner) = clickhouse_inner_type(native_type, "Nullable")
+        .or_else(|| clickhouse_inner_type(native_type, "LowCardinality"))
+    {
+        native_type = inner;
     }
 
     let family = native_type
