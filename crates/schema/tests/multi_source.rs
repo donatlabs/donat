@@ -640,7 +640,13 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
             schema: "public".to_string(),
             name: "other".to_string(),
             columns: vec![
-                col("id"),
+                ColumnInfo {
+                    name: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                    native_type: None,
+                    nullable: false,
+                    has_default: false,
+                },
                 ColumnInfo {
                     name: "body".to_string(),
                     pg_type: "text".to_string(),

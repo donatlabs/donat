@@ -12,6 +12,7 @@ use graphql_parser::query::{
 use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::introspection::{build_schema_json, execute_introspection_schema};
+use crate::naming::table_base_name;
 use crate::plan::{Fragments, Plan, PlanError, Planner, Session, flatten, value_to_json};
 
 /// A source-local query IR, ready for exactly one backend request.
@@ -55,6 +56,7 @@ pub struct MultiSourcePlanner<'a> {
     query_owners: HashMap<String, String>,
     mutation_owners: HashMap<String, String>,
     schema_template: Json,
+    relay_id_types: HashSet<String>,
 }
 
 impl std::fmt::Debug for MultiSourcePlanner<'_> {
@@ -118,6 +120,7 @@ impl<'a> MultiSourcePlanner<'a> {
             query_owners,
             mutation_owners,
             schema_template,
+            relay_id_types: HashSet::new(),
         })
     }
 
@@ -135,11 +138,14 @@ impl<'a> MultiSourcePlanner<'a> {
             .iter()
             .map(|child| child.planner.relay)
             .collect();
+        let previous_id_types = self.relay_id_types.clone();
         let mut owners = self.base_query_owners.clone();
+        let mut relay_id_types = HashSet::new();
         let result = (|| {
             for child in &mut self.children {
                 child.planner.relay = enabled && child.planner.supports_relay();
                 if child.planner.relay {
+                    relay_id_types.extend(child.planner.tables().iter().map(table_base_name));
                     for root in child.planner.relay_root_names() {
                         register_owner(&mut owners, &root, &child.source, "query")?;
                     }
@@ -151,9 +157,11 @@ impl<'a> MultiSourcePlanner<'a> {
             for (child, relay) in self.children.iter_mut().zip(previous) {
                 child.planner.relay = relay;
             }
+            self.relay_id_types = previous_id_types;
             return Err(error);
         }
         self.query_owners = owners;
+        self.relay_id_types = relay_id_types;
         Ok(())
     }
 
@@ -192,6 +200,7 @@ impl<'a> MultiSourcePlanner<'a> {
             &vars,
             "$.selectionSet",
             &self.schema_template,
+            &self.relay_id_types,
         )?;
         if fields.is_empty() {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
@@ -623,6 +632,7 @@ fn collect_fields(
     vars: &JsonMap<String, Json>,
     path: &str,
     schema: &Json,
+    relay_id_types: &HashSet<String>,
 ) -> Result<Vec<CollectedField>, PlanError> {
     let mut fields: Vec<CollectedField> = vec![];
     for field in flatten(selection_set, fragments, vars, None)? {
@@ -657,6 +667,7 @@ fn collect_fields(
             vars,
             &nested_path,
             schema,
+            relay_id_types,
         )?;
     }
     Ok(fields)
@@ -674,6 +685,7 @@ fn validate_selection_conflicts(
     vars: &JsonMap<String, Json>,
     path: &str,
     schema: &Json,
+    relay_id_types: &HashSet<String>,
 ) -> Result<(), PlanError> {
     let mut fields = vec![];
     for (selection_set, conditions) in &selection_sets {
@@ -702,7 +714,7 @@ fn validate_selection_conflicts(
             if left_key != right_key {
                 continue;
             }
-            if !scoped_response_shapes_match(left, right, schema) {
+            if !scoped_response_shapes_match(left, right, schema, relay_id_types) {
                 return Err(PlanError::validation(
                     &format!("{path}.{}", right.field.name),
                     format!("fields with response key '{right_key}' conflict"),
@@ -746,12 +758,32 @@ fn validate_selection_conflicts(
             .into_iter()
             .map(|field| (field.field.selection_set, field.conditions))
             .collect();
-        validate_selection_conflicts(nested, fragments, vars, &nested_path, schema)?;
+        validate_selection_conflicts(
+            nested,
+            fragments,
+            vars,
+            &nested_path,
+            schema,
+            relay_id_types,
+        )?;
     }
     Ok(())
 }
 
-fn scoped_response_shapes_match(left: &ScopedField, right: &ScopedField, schema: &Json) -> bool {
+fn scoped_response_shapes_match(
+    left: &ScopedField,
+    right: &ScopedField,
+    schema: &Json,
+    relay_id_types: &HashSet<String>,
+) -> bool {
+    let relay_id = |field: &ScopedField| {
+        field.field.name == "id"
+            && field
+                .conditions
+                .iter()
+                .rev()
+                .any(|condition| relay_id_types.contains(condition))
+    };
     let field_type = |field: &ScopedField| {
         field.conditions.iter().rev().find_map(|condition| {
             schema["types"]
@@ -764,10 +796,28 @@ fn scoped_response_shapes_match(left: &ScopedField, right: &ScopedField, schema:
                 .map(|candidate| &candidate["type"])
         })
     };
+    match (relay_id(left), relay_id(right)) {
+        (true, true) => return true,
+        (true, false) => {
+            return field_type(right)
+                .map(response_type_is_relay_id)
+                .unwrap_or(false);
+        }
+        (false, true) => {
+            return field_type(left)
+                .map(response_type_is_relay_id)
+                .unwrap_or(false);
+        }
+        (false, false) => {}
+    }
     match (field_type(left), field_type(right)) {
         (Some(left), Some(right)) => response_types_match(left, right),
         _ => true,
     }
+}
+
+fn response_type_is_relay_id(ty: &Json) -> bool {
+    ty["kind"] == "NON_NULL" && ty["ofType"]["kind"] == "SCALAR" && ty["ofType"]["name"] == "ID"
 }
 
 fn response_types_match(left: &Json, right: &Json) -> bool {
