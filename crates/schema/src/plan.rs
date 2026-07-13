@@ -1105,7 +1105,9 @@ impl<'a> Planner<'a> {
                     });
                 }
                 (_, "where") => {
-                    user_where = Some(self.parse_bool_exp(&value, ctx, session, false, path)?);
+                    let where_path = format!("{path}.args.where");
+                    user_where =
+                        Some(self.parse_bool_exp(&value, ctx, session, false, &where_path)?);
                 }
                 (_, "order_by") => {
                     order_by = self.parse_order_by(&value, ctx, session, path)?;

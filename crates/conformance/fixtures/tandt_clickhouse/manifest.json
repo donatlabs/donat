@@ -1,0 +1,180 @@
+{
+  "revision": "c780834e50f53e5b4e94f1f33e88748a443f98ec",
+  "source_paths": [
+    "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+    "ui/apps/l3-l4-web-ui/src/shared/api/entities/logs/api.ts",
+    "ui/apps/l3-l4-web-ui/src/shared/api/entities/document/integration-request-api.ts",
+    "ui/packages/l2-api/src/entities/l2-job-event/queries.ts",
+    "ui/packages/l2-api/src/entities/l2-device-event/queries.ts",
+    "ui/packages/l2-api/src/entities/l2-traffic-log/queries.ts",
+    "ui/packages/l2-api/src/entities/l2-production-event/queries.ts"
+  ],
+  "cases": [
+    {
+      "operation": "AnalyticsDashboardStats",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsDashboardStats.graphql",
+      "sha256": "e7f8780b06c05888290aebcb83c256de5758d6764c0bf628d38e9ff96310fe4b",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "company_id": 1 },
+      "expected": "responses/AnalyticsDashboardStats.json",
+      "expect_no_clickhouse_data_sql": true
+    },
+    {
+      "operation": "AnalyticsDocumentDailyStats",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsDocumentDailyStats.graphql",
+      "sha256": "bd2561db68d511d92f7f07b270f3efdaedfc6a98d216510751e06e9160885c67",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 10, "order_by": { "date": "desc" }, "where": { "company_id": { "_eq": 1 } } },
+      "expected": "responses/AnalyticsDocumentDailyStats.json"
+    },
+    {
+      "operation": "AnalyticsWorkflowExecutions",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsWorkflowExecutions.graphql",
+      "sha256": "b1be6724649c863c4219e1b2b26ab0268370acbd87fd3ebde96992ee05fda9be",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 10, "order_by": { "start_time": "desc" }, "where": { "workflow_type": { "_like": "Document%" } } },
+      "expected": "responses/AnalyticsWorkflowExecutions.json"
+    },
+    {
+      "operation": "AnalyticsErrors",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsErrors.graphql",
+      "sha256": "b0679636f0c86dffdcebb1a0286c87ced62e1013d36803557d7835d9c5b098ae",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 10, "order_by": { "error_time": "desc" }, "where": { "_and": [{ "company_id": { "_eq": 1 } }, { "resolved_at": { "_is_null": true } }] } },
+      "expected": "responses/AnalyticsErrors.json"
+    },
+    {
+      "operation": "AnalyticsCodeLifecycleEvents",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsCodeLifecycleEvents.graphql",
+      "sha256": "b7a95bba10f3fd41bb5b5fb6ac58a9378b4fbb2e72804f68644e16287fa9bcc2",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 10, "order_by": { "event_time": "desc" }, "where": { "event_time": { "_gte": "2026-06-01 00:00:00.000" } } },
+      "expected": "responses/AnalyticsCodeLifecycleEvents.json"
+    },
+    {
+      "operation": "AnalyticsAggregationOperations",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "query": "queries/AnalyticsAggregationOperations.graphql",
+      "sha256": "33ac406f9bbb6322ae94a50b5bc7de20099259a59c983d000ab2dbd2ee035631",
+      "pinned": true,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 1, "order_by": { "operation_time": "desc" }, "where": {} },
+      "expected": "responses/AnalyticsAggregationOperations.json"
+    },
+    {
+      "operation": "ApplicationLogsList",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/logs/api.ts",
+      "query": "queries/ApplicationLogsList.graphql",
+      "sha256": "101c544285d9bd8781f17dd2102a6bb35633d3bc9ef321a987f03c0731532afa",
+      "pinned": true,
+      "role": "company-admin",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "limit": 10, "offset": 0, "order_by": { "timestamp": "desc" }, "where": { "level": { "_eq": "INFO" } } },
+      "expected": "responses/ApplicationLogsList.json"
+    },
+    {
+      "operation": "DocumentIntegrationRequests",
+      "source_path": "ui/apps/l3-l4-web-ui/src/shared/api/entities/document/integration-request-api.ts",
+      "query": "queries/DocumentIntegrationRequests.graphql",
+      "sha256": "ea6934aaf714011316dd3e6a41b9a566fc6cb3ea2b0ee921e3eedb2ecc41c6ed",
+      "pinned": true,
+      "role": "company-admin",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "documentId": 42, "limit": 200 },
+      "expected": "responses/DocumentIntegrationRequests.json"
+    },
+    {
+      "operation": "L2JobEvents",
+      "source_path": "ui/packages/l2-api/src/entities/l2-job-event/queries.ts",
+      "query": "queries/L2JobEvents.graphql",
+      "sha256": "ab31fa59d666132795fec98b7577db939c9c2e5bdc619babdb60a2e8f56ed6f9",
+      "pinned": true,
+      "role": "l2-executor",
+      "session": {},
+      "variables": { "limit": 1, "offset": 0, "where": { "_and": [{ "work_order_id": { "_eq": "WO-1" } }, { "event_type": { "_in": ["started", "completed"] } }] }, "order_by": { "event_time": "desc" } },
+      "expected": "responses/L2JobEvents.json"
+    },
+    {
+      "operation": "L2DeviceEvents",
+      "source_path": "ui/packages/l2-api/src/entities/l2-device-event/queries.ts",
+      "query": "queries/L2DeviceEvents.graphql",
+      "sha256": "3641bd918f2f746865c4e467e8495ca69f56cb91e3b06b89b8fe584b0186fa84",
+      "pinned": true,
+      "role": "l2-executor",
+      "session": {},
+      "variables": { "limit": 10, "offset": 0, "where": { "_and": [{ "equipment_id": { "_eq": "EQ-1" } }, { "device_id": { "_eq": "dev-1" } }] }, "order_by": { "event_time": "desc" } },
+      "expected": "responses/L2DeviceEvents.json"
+    },
+    {
+      "operation": "L2TrafficLogs",
+      "source_path": "ui/packages/l2-api/src/entities/l2-traffic-log/queries.ts",
+      "query": "queries/L2TrafficLogs.graphql",
+      "sha256": "e2b79ee0b513b9946e97dd42400774b3b9969f37a38c4fe89615d82bd9994f30",
+      "pinned": true,
+      "role": "l2-executor",
+      "session": {},
+      "variables": { "limit": 1, "offset": 1, "where": { "equipment_id": { "_eq": "EQ-1" } }, "order_by": { "event_time": "desc" } },
+      "expected": "responses/L2TrafficLogs.json"
+    },
+    {
+      "operation": "L2ProductionEvents",
+      "source_path": "ui/packages/l2-api/src/entities/l2-production-event/queries.ts",
+      "query": "queries/L2ProductionEvents.graphql",
+      "sha256": "fad856e9ce935e6a693bb5d555e33ad914aec1fda0c43d514caeb208930eedb0",
+      "pinned": true,
+      "role": "l2-executor",
+      "session": {},
+      "variables": { "limit": 10, "offset": 0, "where": { "work_order_id": { "_eq": "WO-1" } }, "order_by": { "event_time": "desc" } },
+      "expected": "responses/L2ProductionEvents.json"
+    },
+    {
+      "operation": "AnalyticsDashboardStatsSafe",
+      "source_path": null,
+      "query": "queries/AnalyticsDashboardStatsSafe.graphql",
+      "sha256": "f19686aa192b7b8e09222e97509c7680486c491ac5ec8c47394a4078fc701cef",
+      "pinned": false,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": { "company_id": 1, "document_since": "2026-06-01", "code_events_since": "2026-06-01 00:00:00.000" },
+      "expected": "responses/AnalyticsDashboardStatsSafe.json"
+    },
+    {
+      "operation": "ClickHouseComplexValues",
+      "source_path": null,
+      "query": "queries/ClickHouseComplexValues.graphql",
+      "sha256": "433c86b06f26ff96acddab308046c2940eec2c4ce0b31b680207010b67865d2b",
+      "pinned": false,
+      "role": "company",
+      "session": {},
+      "variables": {},
+      "expected": "responses/ClickHouseComplexValues.json"
+    },
+    {
+      "operation": "MixedPostgresClickHouse",
+      "source_path": null,
+      "query": "queries/MixedPostgresClickHouse.graphql",
+      "sha256": "653f4cb0f6ed5df1317f43037b8599eb9837935d5b07d6ee7e00fc40a5143968",
+      "pinned": false,
+      "role": "company",
+      "session": { "x-hasura-company-id": "1" },
+      "variables": {},
+      "expected": "responses/MixedPostgresClickHouse.json"
+    }
+  ]
+}

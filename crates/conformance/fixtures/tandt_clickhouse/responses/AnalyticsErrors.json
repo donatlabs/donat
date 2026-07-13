@@ -1,0 +1,1 @@
+{"data":{"items":[{"error_time":"2026-06-04 09:00:00.000","error_type":"processing","error_code":"E-1","error_message":"validation failed","severity":"high","entity_type":"document","entity_id":42,"resolved_at":null,"resolved_by":null,"resolution_notes":"","company_id":1,"user_id":"user-1","document_id":42,"workflow_id":"wf-1","context":"{\"step\":\"validate\"}"}]}}

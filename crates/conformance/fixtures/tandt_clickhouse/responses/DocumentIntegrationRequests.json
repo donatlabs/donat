@@ -1,0 +1,1 @@
+{"data":{"items":[{"event_time":"2026-06-05 14:00:00.000","integration_type":"oms","operation":"send_document","http_method":"POST","http_url":"https://oms.example/documents","http_status":200,"status":"success","duration_ms":250,"request_id":"req-1","request_body":"{\"lot\":1}","response_body":"{\"ok\":true}","request_size":9,"response_size":11,"error_message":""}]}}

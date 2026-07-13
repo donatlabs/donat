@@ -1,0 +1,19 @@
+query AnalyticsDocumentDailyStats(
+  $limit: Int = 30
+  $order_by: [analytics_document_daily_stats_order_by!] = { date: desc }
+  $where: analytics_document_daily_stats_bool_exp = {}
+) {
+  items: analytics_document_daily_stats(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    date
+    doc_type
+    status
+    doc_count
+    unique_users
+    avg_duration_ms
+    company_id
+  }
+}

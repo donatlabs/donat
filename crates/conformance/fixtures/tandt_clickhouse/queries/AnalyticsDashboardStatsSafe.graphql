@@ -1,0 +1,47 @@
+# Corrected deployment companion; not part of the pinned tandt revision.
+query AnalyticsDashboardStatsSafe(
+  $company_id: int32!
+  $document_since: date!
+  $code_events_since: timestamp!
+) {
+  document_stats: analytics_document_daily_stats_aggregate(
+    where: { company_id: { _eq: $company_id }, date: { _gte: $document_since } }
+  ) {
+    aggregate {
+      sum {
+        doc_count
+      }
+    }
+    nodes {
+      status
+      doc_count
+    }
+  }
+  workflow_stats: analytics_workflow_executions_aggregate(
+    where: { company_id: { _eq: $company_id } }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      status
+    }
+  }
+  error_stats: analytics_errors_aggregate(
+    where: { company_id: { _eq: $company_id }, resolved_at: { _is_null: true } }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      severity
+    }
+  }
+  code_events: analytics_code_lifecycle_events_aggregate(
+    where: { company_id: { _eq: $company_id }, event_time: { _gte: $code_events_since } }
+  ) {
+    aggregate {
+      count
+    }
+  }
+}

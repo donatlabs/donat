@@ -1,0 +1,37 @@
+query ApplicationLogsList(
+  $limit: Int = 10
+  $offset: Int = 0
+  $order_by: [logs_application_logs_order_by!] = {}
+  $where: logs_application_logs_bool_exp = {}
+) {
+  items: logs_application_logs(
+    limit: $limit
+    offset: $offset
+    order_by: $order_by
+    where: $where
+  ) {
+    ...applicationLog
+  }
+}
+
+fragment applicationLog on logs_application_logs {
+  company_id
+  context
+  document_id
+  environment
+  execution_path
+  level
+  log_id
+  log_type
+  message
+  parent_log_id
+  role
+  service
+  source
+  span_id
+  timestamp
+  trace_id
+  user_id
+  version
+  activity_id
+}

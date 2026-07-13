@@ -1,0 +1,24 @@
+query AnalyticsAggregationOperations(
+  $limit: Int = 100
+  $order_by: [analytics_aggregation_operations_order_by!] = { operation_time: desc }
+  $where: analytics_aggregation_operations_bool_exp = {}
+) {
+  items: analytics_aggregation_operations(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    operation_time
+    operation_type
+    parent_code_id
+    parent_cis
+    parent_package_type
+    child_count
+    gtin
+    pg
+    location_id
+    company_id
+    user_id
+    document_id
+  }
+}

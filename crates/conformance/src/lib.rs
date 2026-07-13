@@ -3198,7 +3198,11 @@ mod tests {
     #[test]
     fn every_conformance_binary_is_classified() {
         const SHARED: &[&str] = &["backend_matrix"];
-        const BACKEND_SPECIFIC: &[&str] = &["clickhouse_multi_database", "multi_source"];
+        const BACKEND_SPECIFIC: &[&str] = &[
+            "clickhouse_multi_database",
+            "multi_source",
+            "tandt_clickhouse_contract",
+        ];
         const POSTGRES_REFERENCE: &[&str] = &[
             "actions",
             "agg_relay_introspection",
