@@ -1,12 +1,13 @@
 //! Composition of independently-authoritative source planners.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use donat_catalog::Catalog;
 use donat_ir::{MutationRoot, RootField};
 use donat_metadata::{Columns, Metadata, PermissionEntry, SelectPermission};
 use graphql_parser::query::{
     Definition, Document, Field as GqlField, OperationDefinition, Selection, SelectionSet,
+    TypeCondition,
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -110,6 +111,7 @@ impl<'a> MultiSourcePlanner<'a> {
         }
 
         let schema_template = build_role_independent_schema(metadata, catalogs)?;
+        validate_role_projections(metadata, &children)?;
         Ok(Self {
             children,
             base_query_owners: query_owners.clone(),
@@ -184,7 +186,13 @@ impl<'a> MultiSourcePlanner<'a> {
             ),
         };
         let vars = effective_variables(variables, variable_definitions)?;
-        let fields = collect_fields(selection_set, &fragments, &vars, "$.selectionSet")?;
+        let fields = collect_fields(
+            selection_set,
+            &fragments,
+            &vars,
+            "$.selectionSet",
+            &self.schema_template,
+        )?;
         if fields.is_empty() {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
         }
@@ -313,6 +321,65 @@ impl<'a> MultiSourcePlanner<'a> {
             Some(&self.schema_template),
         )
     }
+}
+
+fn validate_role_projections(
+    metadata: &Metadata,
+    children: &[ChildPlanner<'_>],
+) -> Result<(), PlanError> {
+    let mut roles = BTreeSet::new();
+    for inherited in &metadata.inherited_roles {
+        roles.insert(inherited.role_name.clone());
+        roles.extend(inherited.role_set.iter().cloned());
+    }
+    for source in &metadata.sources {
+        for function in &source.functions {
+            roles.extend(
+                function
+                    .permissions
+                    .iter()
+                    .map(|permission| permission.role.clone()),
+            );
+        }
+        for table in &source.tables {
+            roles.extend(
+                table
+                    .select_permissions
+                    .iter()
+                    .map(|permission| permission.role.clone()),
+            );
+            roles.extend(
+                table
+                    .insert_permissions
+                    .iter()
+                    .map(|permission| permission.role.clone()),
+            );
+            roles.extend(
+                table
+                    .update_permissions
+                    .iter()
+                    .map(|permission| permission.role.clone()),
+            );
+            roles.extend(
+                table
+                    .delete_permissions
+                    .iter()
+                    .map(|permission| permission.role.clone()),
+            );
+        }
+    }
+
+    for role in roles {
+        for backend_request in [false, true] {
+            let session = Session {
+                role: role.clone(),
+                vars: HashMap::new(),
+                backend_request,
+            };
+            compose_schema(children.iter().map(|child| &child.planner), &session, None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Composite equivalent of [`crate::execute_introspection`].
@@ -555,6 +622,7 @@ fn collect_fields(
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
     path: &str,
+    schema: &Json,
 ) -> Result<Vec<CollectedField>, PlanError> {
     let mut fields: Vec<CollectedField> = vec![];
     for field in flatten(selection_set, fragments, vars, None)? {
@@ -581,20 +649,229 @@ fn collect_fields(
             });
         }
     }
-    for collected in &mut fields {
+    for collected in &fields {
         let nested_path = format!("{path}.{}.selectionSet", collected.field.name);
-        let nested = collect_fields(
-            &collected.field.selection_set,
+        validate_selection_conflicts(
+            vec![(collected.field.selection_set.clone(), vec![])],
             fragments,
             vars,
             &nested_path,
+            schema,
         )?;
-        collected.field.selection_set.items = nested
-            .into_iter()
-            .map(|nested| Selection::Field(nested.field))
-            .collect();
     }
     Ok(fields)
+}
+
+#[derive(Clone)]
+struct ScopedField {
+    field: GqlField<'static, String>,
+    conditions: Vec<String>,
+}
+
+fn validate_selection_conflicts(
+    selection_sets: Vec<(SelectionSet<'static, String>, Vec<String>)>,
+    fragments: &Fragments,
+    vars: &JsonMap<String, Json>,
+    path: &str,
+    schema: &Json,
+) -> Result<(), PlanError> {
+    let mut fields = vec![];
+    for (selection_set, conditions) in &selection_sets {
+        collect_scoped_fields(
+            selection_set,
+            fragments,
+            vars,
+            conditions,
+            &mut vec![],
+            &mut fields,
+        )?;
+    }
+
+    for (index, left) in fields.iter().enumerate() {
+        let left_key = left
+            .field
+            .alias
+            .as_deref()
+            .unwrap_or(left.field.name.as_str());
+        for right in fields.iter().skip(index + 1) {
+            let right_key = right
+                .field
+                .alias
+                .as_deref()
+                .unwrap_or(right.field.name.as_str());
+            if left_key != right_key || !scopes_overlap(&left.conditions, &right.conditions, schema)
+            {
+                continue;
+            }
+            if left.field.name != right.field.name || !arguments_match(&left.field, &right.field) {
+                return Err(PlanError::validation(
+                    &format!("{path}.{}", right.field.name),
+                    format!("fields with response key '{right_key}' conflict"),
+                ));
+            }
+        }
+    }
+
+    let mut groups: Vec<(String, Vec<ScopedField>)> = vec![];
+    for field in fields {
+        let key = field
+            .field
+            .alias
+            .clone()
+            .unwrap_or_else(|| field.field.name.clone());
+        if let Some((_, group)) = groups.iter_mut().find(|(candidate, _)| candidate == &key) {
+            group.push(field);
+        } else {
+            groups.push((key, vec![field]));
+        }
+    }
+    for (_, group) in groups {
+        let Some(first) = group.first() else { continue };
+        if group
+            .iter()
+            .all(|field| field.field.selection_set.items.is_empty())
+        {
+            continue;
+        }
+        let nested_path = format!("{path}.{}.selectionSet", first.field.name);
+        let nested = group
+            .into_iter()
+            .map(|field| (field.field.selection_set, field.conditions))
+            .collect();
+        validate_selection_conflicts(nested, fragments, vars, &nested_path, schema)?;
+    }
+    Ok(())
+}
+
+fn collect_scoped_fields(
+    selection_set: &SelectionSet<'static, String>,
+    fragments: &Fragments,
+    vars: &JsonMap<String, Json>,
+    conditions: &[String],
+    fragment_stack: &mut Vec<String>,
+    output: &mut Vec<ScopedField>,
+) -> Result<(), PlanError> {
+    for selection in &selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                if directives_include(&field.directives, vars)? {
+                    output.push(ScopedField {
+                        field: field.clone(),
+                        conditions: conditions.to_vec(),
+                    });
+                }
+            }
+            Selection::FragmentSpread(spread) => {
+                if !directives_include(&spread.directives, vars)? {
+                    continue;
+                }
+                let fragment = fragments.get(&spread.fragment_name).ok_or_else(|| {
+                    PlanError::validation(
+                        "$",
+                        format!("fragment \"{}\" not found", spread.fragment_name),
+                    )
+                })?;
+                if !directives_include(&fragment.directives, vars)? {
+                    continue;
+                }
+                if fragment_stack.contains(&spread.fragment_name) {
+                    return Err(PlanError::validation(
+                        "$",
+                        format!("fragment \"{}\" forms a cycle", spread.fragment_name),
+                    ));
+                }
+                let TypeCondition::On(condition) = &fragment.type_condition;
+                let mut nested_conditions = conditions.to_vec();
+                nested_conditions.push(condition.clone());
+                fragment_stack.push(spread.fragment_name.clone());
+                let result = collect_scoped_fields(
+                    &fragment.selection_set,
+                    fragments,
+                    vars,
+                    &nested_conditions,
+                    fragment_stack,
+                    output,
+                );
+                fragment_stack.pop();
+                result?;
+            }
+            Selection::InlineFragment(inline) => {
+                if !directives_include(&inline.directives, vars)? {
+                    continue;
+                }
+                let mut nested_conditions = conditions.to_vec();
+                if let Some(TypeCondition::On(condition)) = &inline.type_condition {
+                    nested_conditions.push(condition.clone());
+                }
+                collect_scoped_fields(
+                    &inline.selection_set,
+                    fragments,
+                    vars,
+                    &nested_conditions,
+                    fragment_stack,
+                    output,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn directives_include(
+    directives: &[graphql_parser::query::Directive<'static, String>],
+    vars: &JsonMap<String, Json>,
+) -> Result<bool, PlanError> {
+    for directive in directives {
+        let condition = directive
+            .arguments
+            .iter()
+            .find(|(name, _)| name == "if")
+            .map(|(_, value)| value_to_json(value, vars, "$"))
+            .transpose()?
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        match directive.name.as_str() {
+            "include" if !condition => return Ok(false),
+            "skip" if condition => return Ok(false),
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+fn scopes_overlap(left: &[String], right: &[String], schema: &Json) -> bool {
+    left.iter().all(|left| {
+        right
+            .iter()
+            .all(|right| type_conditions_overlap(left, right, schema))
+    })
+}
+
+fn type_conditions_overlap(left: &str, right: &str, schema: &Json) -> bool {
+    if left == right {
+        return true;
+    }
+    let possible_types = |name: &str| -> Option<HashSet<String>> {
+        let ty = schema["types"]
+            .as_array()?
+            .iter()
+            .find(|ty| ty["name"] == name)?;
+        match ty["kind"].as_str()? {
+            "OBJECT" => Some(HashSet::from([name.to_string()])),
+            "INTERFACE" | "UNION" => Some(
+                ty["possibleTypes"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|possible| possible["name"].as_str().map(str::to_string))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+    match (possible_types(left), possible_types(right)) {
+        (Some(left), Some(right)) => !left.is_disjoint(&right),
+        _ => true,
+    }
 }
 
 fn arguments_match(left: &GqlField<'static, String>, right: &GqlField<'static, String>) -> bool {

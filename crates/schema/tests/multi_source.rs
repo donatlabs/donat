@@ -485,6 +485,184 @@ fn rejects_duplicate_root_and_incompatible_type_collisions() {
 }
 
 #[test]
+fn rejects_role_specific_output_and_mutation_type_collisions_at_construction() {
+    let make_metadata = |default_select: &[&str],
+                         secondary_select: &[&str],
+                         default_insert: Option<&[&str]>,
+                         secondary_insert: Option<&[&str]>| {
+        let insert_permissions = default_insert.map(|columns| {
+            json!([{
+                "role": "writer",
+                "permission": {
+                    "columns": columns,
+                    "check": {}
+                }
+            }])
+        });
+        let secondary_insert_permissions = secondary_insert.map(|columns| {
+            json!([{
+                "role": "writer",
+                "permission": {
+                    "columns": columns,
+                    "check": {}
+                }
+            }])
+        });
+        let default_select_permissions = if default_insert.is_some() {
+            json!([
+                {
+                    "role": "user",
+                    "permission": { "columns": default_select, "filter": {} }
+                },
+                {
+                    "role": "writer",
+                    "permission": { "columns": ["id", "name"], "filter": {} }
+                }
+            ])
+        } else {
+            json!([{
+                "role": "user",
+                "permission": { "columns": default_select, "filter": {} }
+            }])
+        };
+        let secondary_select_permissions = if secondary_insert.is_some() {
+            json!([
+                {
+                    "role": "user",
+                    "permission": { "columns": secondary_select, "filter": {} }
+                },
+                {
+                    "role": "writer",
+                    "permission": { "columns": ["id", "name"], "filter": {} }
+                }
+            ])
+        } else {
+            json!([{
+                "role": "user",
+                "permission": { "columns": secondary_select, "filter": {} }
+            }])
+        };
+        serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "postgres",
+                "configuration": { "connection_info": { "database_url": "postgres://unused" } },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": {
+                        "custom_name": "shared_type",
+                        "custom_root_fields": {
+                            "select": "default_shared",
+                            "select_by_pk": "default_shared_by_pk",
+                            "select_aggregate": "default_shared_aggregate",
+                            "insert": "insert_default_shared",
+                            "insert_one": "insert_default_shared_one",
+                            "update": "update_default_shared",
+                            "update_by_pk": "update_default_shared_by_pk",
+                            "delete": "delete_default_shared",
+                            "delete_by_pk": "delete_default_shared_by_pk"
+                        }
+                    },
+                    "select_permissions": default_select_permissions,
+                    "insert_permissions": insert_permissions.unwrap_or_else(|| json!([]))
+                }]
+            }, {
+                "name": "secondary",
+                "kind": "postgres",
+                "configuration": { "connection_info": { "database_url": "postgres://unused" } },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": {
+                        "custom_name": "shared_type",
+                        "custom_root_fields": {
+                            "select": "secondary_shared",
+                            "select_by_pk": "secondary_shared_by_pk",
+                            "select_aggregate": "secondary_shared_aggregate",
+                            "insert": "insert_secondary_shared",
+                            "insert_one": "insert_secondary_shared_one",
+                            "update": "update_secondary_shared",
+                            "update_by_pk": "update_secondary_shared_by_pk",
+                            "delete": "delete_secondary_shared",
+                            "delete_by_pk": "delete_secondary_shared_by_pk"
+                        }
+                    },
+                    "select_permissions": secondary_select_permissions,
+                    "insert_permissions": secondary_insert_permissions.unwrap_or_else(|| json!([]))
+                }]
+            }]
+        }))
+        .expect("role-projection metadata deserializes")
+    };
+    let shared_catalog = catalog("public", "item", &["id", "name"]);
+    let catalogs = HashMap::from([
+        ("default".to_string(), shared_catalog.clone()),
+        ("secondary".to_string(), shared_catalog),
+    ]);
+
+    let output_collision = make_metadata(&["id"], &["name"], None, None);
+    let error = MultiSourcePlanner::new(&output_collision, &catalogs)
+        .expect_err("a real role's incompatible object projection must fail construction");
+    assert!(error.message.contains("shared_type"));
+
+    let mutation_collision = make_metadata(
+        &["id", "name"],
+        &["id", "name"],
+        Some(&["id"]),
+        Some(&["name"]),
+    );
+    let error = MultiSourcePlanner::new(&mutation_collision, &catalogs)
+        .expect_err("a mutation role's incompatible input projection must fail construction");
+    assert!(error.message.contains("shared_type_insert_input"));
+}
+
+#[test]
+fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
+    let mut metadata = metadata();
+    metadata.sources.truncate(1);
+    metadata.sources[0].tables.push(
+        serde_json::from_value(json!({
+            "table": { "schema": "public", "name": "other" },
+            "configuration": { "custom_name": "public_other" },
+            "select_permissions": [{
+                "role": "user",
+                "permission": { "columns": ["id", "body"], "filter": {} }
+            }]
+        }))
+        .expect("second Relay type deserializes"),
+    );
+    let mut catalogs = catalogs();
+    catalogs.remove("clickhouse");
+    catalogs.remove("secondary");
+    catalogs.get_mut("default").unwrap().tables.insert(
+        "public.other".to_string(),
+        TableInfo {
+            schema: "public".to_string(),
+            name: "other".to_string(),
+            columns: vec![col("id"), col("body")],
+            primary_key: vec!["id".to_string()],
+            foreign_keys: vec![],
+        },
+    );
+    let mut planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    planner.set_relay(true).expect("single Relay source");
+    let doc = graphql_parser::parse_query::<String>(
+        r#"{
+          node(id: "WyJkZWZhdWx0IiwicHVibGljIiwiaXRlbSIsMV0=") {
+            ... on public_item { value: id }
+            ... on public_other { value: body }
+          }
+        }"#,
+    )
+    .expect("Relay query parses")
+    .into_static();
+
+    planner
+        .plan(&doc, None, &JsonMap::new(), &session("user"))
+        .expect("mutually exclusive concrete fragments do not conflict");
+}
+
+#[test]
 fn forwards_function_permission_inference_to_children() {
     let mut metadata = metadata();
     metadata.sources[0].functions.push(

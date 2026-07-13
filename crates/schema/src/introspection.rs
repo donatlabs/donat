@@ -6,6 +6,7 @@
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
+use donat_metadata::Columns;
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
 use crate::naming::{root_names, table_base_name};
@@ -335,11 +336,16 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
                 !p.backend_only || session.backend_request
             });
-        if insert_perm.is_some() {
+        if let Some(insert_perm) = insert_perm {
             let mut insert_fields: Vec<Json> = ctx
                 .info
                 .columns
                 .iter()
+                .filter(|column| match &insert_perm.columns {
+                    Columns::Star => true,
+                    Columns::List(columns) => columns.iter().any(|name| name == &column.name),
+                })
+                .filter(|column| !insert_perm.set.contains_key(&column.name))
                 .map(|c| {
                     let scalar = scalar_name(&c.pg_type).to_string();
                     input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
