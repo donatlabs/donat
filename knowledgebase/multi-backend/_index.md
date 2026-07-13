@@ -32,6 +32,9 @@ reasoning never has to be reconstructed.
 - [[decisions/008-clickhouse-ordered-text-json-assembly]] — ClickHouse keeps
   response objects and arrays as ordered JSON text because casting them to its
   native `JSON` type canonicalizes object keys.
+- [[decisions/009-parallel-conformance-engine-startup]] — parallel conformance
+  keeps its test-thread speed while retrying transient per-suite engine
+  startup failures with RAII child cleanup and complete diagnostics.
 
 ## One-paragraph shape
 

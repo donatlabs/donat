@@ -611,6 +611,49 @@ const ENGINE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const ENGINE_START_ATTEMPTS: usize = 3;
 const ENGINE_START_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+#[derive(Debug)]
+struct EngineStartFailure {
+    attempt: usize,
+    reason: String,
+    log_path: PathBuf,
+}
+
+fn retry_engine_start<T>(
+    attempts: usize,
+    retry_delay: Duration,
+    mut start: impl FnMut(usize) -> Result<T, EngineStartFailure>,
+) -> Result<T, Vec<EngineStartFailure>> {
+    assert!(attempts > 0, "engine startup needs at least one attempt");
+    let mut failures = Vec::with_capacity(attempts);
+    for attempt in 1..=attempts {
+        match start(attempt) {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                failures.push(failure);
+                if attempt < attempts {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+    Err(failures)
+}
+
+fn format_engine_start_failures(failures: &[EngineStartFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "attempt {}: {}; see {}",
+                failure.attempt,
+                failure.reason,
+                failure.log_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn engine_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DONAT_BIN") {
         return PathBuf::from(p);
@@ -635,6 +678,31 @@ fn engine_is_healthy(client: &reqwest::blocking::Client, base_url: &str) -> bool
         .timeout(ENGINE_HEALTH_PROBE_TIMEOUT)
         .send()
         .is_ok_and(|response| response.status().is_success())
+}
+
+fn wait_for_engine_health(
+    client: &reqwest::blocking::Client,
+    proc: &mut EngineProc,
+) -> Option<String> {
+    let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
+    loop {
+        if engine_is_healthy(client, &proc.base_url) {
+            return None;
+        }
+        match proc.child.try_wait() {
+            Ok(Some(status)) => {
+                return Some(format!("exited before becoming healthy with {status}"));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Some(format!("could not check engine process status: {error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Some("did not become healthy before the startup deadline".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn pg_admin_url() -> String {
@@ -1080,6 +1148,19 @@ struct EngineProc {
     _metadata_dir: PathBuf,
 }
 
+impl Drop for EngineProc {
+    fn drop(&mut self) {
+        let running = match self.child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) | Err(_) => true,
+        };
+        if running {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 pub struct Running {
     pub name: String,
     pub backend: BackendId,
@@ -1147,10 +1228,7 @@ pub struct TableFixture {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if let Some(mut proc) = self.engine.borrow_mut().take() {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-        }
+        let _ = self.engine.borrow_mut().take();
     }
 }
 
@@ -2151,95 +2229,82 @@ impl Running {
         }
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
-        let mut last_failure = String::new();
-        let mut last_log_path = log_dir.join(format!("{}.log", self.name));
 
         // `free_port` probes a port and then releases it before the child can
         // bind. Under parallel conformance, another process may claim that
         // port in this small window. Retry the whole startup so a transient
         // bind or database initialization failure does not fail an unrelated
-        // suite. Failed children are always reaped before the next attempt.
-        for attempt in 1..=ENGINE_START_ATTEMPTS {
-            let port = free_port();
-            let log_path = if attempt == ENGINE_START_ATTEMPTS {
-                log_dir.join(format!("{}.log", self.name))
-            } else {
-                log_dir.join(format!("{}.attempt-{attempt}.log", self.name))
-            };
-            let log = std::fs::File::create(&log_path).unwrap();
+        // suite. Failed children are always reaped by `EngineProc::drop`
+        // before the next attempt.
+        let start_result =
+            retry_engine_start(ENGINE_START_ATTEMPTS, ENGINE_START_RETRY_DELAY, |attempt| {
+                let port = free_port();
+                let log_path = if attempt == ENGINE_START_ATTEMPTS {
+                    log_dir.join(format!("{}.log", self.name))
+                } else {
+                    log_dir.join(format!("{}.attempt-{attempt}.log", self.name))
+                };
+                let log = std::fs::File::create(&log_path).unwrap();
 
-            let mut cmd = Command::new(engine_binary());
-            cmd.arg("--port")
-                .arg(port.to_string())
-                .arg("--metadata-dir")
-                .arg(&metadata_dir)
-                .env("DONAT_DATABASE_URL", &self.db_url)
-                .stdout(Stdio::from(log.try_clone().unwrap()))
-                .stderr(Stdio::from(log));
-            for a in &self.args {
-                cmd.arg(a);
-            }
-            for (k, v) in &self.env {
-                cmd.env(k, v);
-            }
+                let mut cmd = Command::new(engine_binary());
+                cmd.arg("--port")
+                    .arg(port.to_string())
+                    .arg("--metadata-dir")
+                    .arg(&metadata_dir)
+                    .env("DONAT_DATABASE_URL", &self.db_url)
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log));
+                for a in &self.args {
+                    cmd.arg(a);
+                }
+                for (k, v) in &self.env {
+                    cmd.env(k, v);
+                }
 
-            let child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(error) => {
-                    last_failure = format!("could not spawn donat: {error}");
-                    last_log_path = log_path;
-                    if attempt < ENGINE_START_ATTEMPTS {
-                        std::thread::sleep(ENGINE_START_RETRY_DELAY);
+                let child = match cmd.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return Err(EngineStartFailure {
+                            attempt,
+                            reason: format!("could not spawn donat: {error}"),
+                            log_path,
+                        });
                     }
-                    continue;
-                }
-            };
+                };
 
-            let mut proc = EngineProc {
-                child,
-                base_url: format!("http://127.0.0.1:{port}"),
-                ws_base: format!("ws://127.0.0.1:{port}"),
-                _metadata_dir: metadata_dir.clone(),
-            };
+                let mut proc = EngineProc {
+                    child,
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    ws_base: format!("ws://127.0.0.1:{port}"),
+                    _metadata_dir: metadata_dir.clone(),
+                };
 
-            // Wait healthy.
-            let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
-            let failure = loop {
-                if engine_is_healthy(&self.http, &proc.base_url) {
-                    break None;
+                if let Some(reason) = wait_for_engine_health(&self.http, &mut proc) {
+                    drop(proc);
+                    Err(EngineStartFailure {
+                        attempt,
+                        reason,
+                        log_path,
+                    })
+                } else {
+                    Ok(proc)
                 }
-                if let Some(status) = proc.child.try_wait().expect("checking donat process") {
-                    break Some(format!("exited before becoming healthy with {status}"));
-                }
-                if Instant::now() >= deadline {
-                    break Some("did not become healthy before the startup deadline".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            };
+            });
 
-            let Some(failure) = failure else {
-                // Let webhook callback endpoints reach the now-running engine.
-                if let Some(handle) = &self.webhook {
-                    handle.set(&proc.base_url, self.admin_secret.clone());
-                }
-                *self.engine.borrow_mut() = Some(proc);
-                return;
-            };
+        let proc = match start_result {
+            Ok(proc) => proc,
+            Err(failures) => panic!(
+                "engine for suite {} failed to become healthy after {ENGINE_START_ATTEMPTS} attempts: {}",
+                self.name,
+                format_engine_start_failures(&failures)
+            ),
+        };
 
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-            last_failure = failure;
-            last_log_path = log_path;
-            if attempt < ENGINE_START_ATTEMPTS {
-                std::thread::sleep(ENGINE_START_RETRY_DELAY);
-            }
+        // Let webhook callback endpoints reach the now-running engine.
+        if let Some(handle) = &self.webhook {
+            handle.set(&proc.base_url, self.admin_secret.clone());
         }
-
-        panic!(
-            "engine for suite {} failed to become healthy after {ENGINE_START_ATTEMPTS} attempts: {last_failure}; see {}",
-            self.name,
-            last_log_path.display()
-        );
+        *self.engine.borrow_mut() = Some(proc);
     }
 
     /// The engine's HTTP base URL, spawning it lazily if needed.
@@ -2737,6 +2802,82 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_start_retry_stops_after_success() {
+        let mut calls = 0;
+        let result = retry_engine_start(3, Duration::ZERO, |attempt| {
+            calls += 1;
+            if attempt < 3 {
+                Err(EngineStartFailure {
+                    attempt,
+                    reason: format!("transient failure {attempt}"),
+                    log_path: PathBuf::from(format!("attempt-{attempt}.log")),
+                })
+            } else {
+                Ok(attempt)
+            }
+        });
+
+        assert_eq!(calls, 3);
+        assert_eq!(result.expect("third startup attempt succeeds"), 3);
+    }
+
+    #[test]
+    fn engine_start_failure_diagnostics_include_every_attempt_log() {
+        let failures = retry_engine_start::<()>(3, Duration::ZERO, |attempt| {
+            Err(EngineStartFailure {
+                attempt,
+                reason: format!("startup failure {attempt}"),
+                log_path: PathBuf::from(format!("attempt-{attempt}.log")),
+            })
+        })
+        .expect_err("all startup attempts fail");
+
+        assert_eq!(failures.len(), 3);
+        let diagnostics = format_engine_start_failures(&failures);
+        for attempt in 1..=3 {
+            assert!(diagnostics.contains(&format!("attempt {attempt}")));
+            assert!(diagnostics.contains(&format!("attempt-{attempt}.log")));
+        }
+    }
+
+    #[test]
+    fn free_ports_are_unique_when_allocated_in_parallel() {
+        let handles: Vec<_> = (0..8).map(|_| std::thread::spawn(free_port)).collect();
+        let mut ports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("port allocator thread succeeds"))
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_proc_drop_kills_and_reaps_child() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn cleanup test child");
+        let pid = child.id().to_string();
+        let proc = EngineProc {
+            child,
+            base_url: "http://127.0.0.1:1".to_string(),
+            ws_base: "ws://127.0.0.1:1".to_string(),
+            _metadata_dir: PathBuf::new(),
+        };
+
+        drop(proc);
+
+        let status = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe cleanup test child");
+        assert!(!status.success(), "child {pid} is still running");
     }
 
     #[test]
