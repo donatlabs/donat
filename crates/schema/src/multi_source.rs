@@ -194,6 +194,14 @@ impl<'a> MultiSourcePlanner<'a> {
             ),
         };
         let vars = effective_variables(variables, variable_definitions)?;
+        if is_mutation
+            && !self
+                .children
+                .iter()
+                .any(|child| child.planner.role_has_any_mutation(session))
+        {
+            return Err(PlanError::validation("$", "no mutations exist"));
+        }
         let fields = collect_fields(
             selection_set,
             &fragments,

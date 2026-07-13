@@ -362,6 +362,28 @@ fn plans_one_source_mutation_and_rejects_cross_source_mutation() {
 }
 
 #[test]
+fn read_only_composite_preserves_no_mutations_exist_error() {
+    let mut metadata = metadata();
+    metadata.sources = vec![metadata.sources.remove(1)];
+    let mut catalogs = catalogs();
+    let clickhouse = catalogs.remove("clickhouse").unwrap();
+    let catalogs = HashMap::from([("clickhouse".to_string(), clickhouse)]);
+    let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let doc = graphql_parser::parse_query::<String>(
+        "mutation { insert_logs_event_one(object: { id: 1, message: \"x\" }) { id } }",
+    )
+    .expect("mutation parses")
+    .into_static();
+
+    let error = planner
+        .plan(&doc, None, &JsonMap::new(), &session("user"))
+        .expect_err("read-only composite has no mutation type");
+    assert_eq!(error.path, "$");
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.message, "no mutations exist");
+}
+
+#[test]
 fn child_planners_enforce_role_visibility_admin_and_session_predicates() {
     let hidden = plan("{ public_item { id } logs_event { id } }", "admin")
         .expect_err("admin has no implicit permissions");
