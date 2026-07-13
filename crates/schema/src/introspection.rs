@@ -575,6 +575,22 @@ pub fn execute_introspection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<Result<Json, PlanError>> {
+    execute_introspection_schema(
+        &build_schema_json(planner, session),
+        doc,
+        operation_name,
+        variables,
+    )
+}
+
+/// Project an introspection operation through a prebuilt role schema. This
+/// lets composite planners reuse the exact existing introspection executor.
+pub(crate) fn execute_introspection_schema(
+    schema: &Json,
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<Result<Json, PlanError>> {
     let mut fragments: Fragments = std::collections::HashMap::new();
     let mut operations = vec![];
     for def in &doc.definitions {
@@ -607,7 +623,6 @@ pub fn execute_introspection(
         return None;
     }
 
-    let schema = build_schema_json(planner, session);
     let mut data = JsonMap::new();
     for root in roots {
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use donat_catalog::{Catalog, TableInfo};
 use donat_ir::*;
-use donat_metadata::{Columns, Metadata, QualifiedTable, SelectPermission, TableEntry};
+use donat_metadata::{
+    Columns, Metadata, QualifiedTable, SelectPermission, Source, SourceKind, TableEntry,
+};
 use graphql_parser::query::{
     Definition, Document, Field as GqlField, OperationDefinition, Selection, SelectionSet,
     Value as GqlValue,
@@ -251,25 +253,48 @@ impl<'a> Planner<'a> {
     }
 
     pub fn new(metadata: &'a Metadata, catalog: &'a Catalog) -> Self {
-        let source = metadata
+        if let Some(source) = metadata
             .sources
             .iter()
             .find(|source| source.name == "default")
-            .or_else(|| metadata.sources.first());
-        let (tables, functions): (&[TableEntry], &[donat_metadata::FunctionEntry]) = source
-            .map(|s| (s.tables.as_slice(), s.functions.as_slice()))
-            .unwrap_or((&[], &[]));
-        let capabilities = match source.map(|source| source.kind) {
-            Some(donat_metadata::SourceKind::Sqlite) => donat_backend::capabilities::sqlite(),
-            Some(donat_metadata::SourceKind::Mysql) => donat_backend::capabilities::mysql(),
-            Some(donat_metadata::SourceKind::Clickhouse) => {
-                donat_backend::capabilities::clickhouse()
-            }
-            Some(donat_metadata::SourceKind::Postgres) | None => {
-                donat_backend::capabilities::postgres()
-            }
-        };
+            .or_else(|| metadata.sources.first())
+        {
+            return Self::for_source(metadata, source, catalog);
+        }
+        Self::from_parts(
+            metadata,
+            catalog,
+            &[],
+            &[],
+            donat_backend::capabilities::postgres(),
+        )
+    }
 
+    /// Construct a planner for one exact metadata source. The composite
+    /// planner uses this to preserve all source-local authority.
+    pub fn for_source(metadata: &'a Metadata, source: &'a Source, catalog: &'a Catalog) -> Self {
+        let capabilities = match source.kind {
+            SourceKind::Sqlite => donat_backend::capabilities::sqlite(),
+            SourceKind::Mysql => donat_backend::capabilities::mysql(),
+            SourceKind::Clickhouse => donat_backend::capabilities::clickhouse(),
+            SourceKind::Postgres => donat_backend::capabilities::postgres(),
+        };
+        Self::from_parts(
+            metadata,
+            catalog,
+            source.tables.as_slice(),
+            source.functions.as_slice(),
+            capabilities,
+        )
+    }
+
+    fn from_parts(
+        metadata: &'a Metadata,
+        catalog: &'a Catalog,
+        tables: &'a [TableEntry],
+        functions: &'a [donat_metadata::FunctionEntry],
+        capabilities: donat_backend::Capabilities,
+    ) -> Self {
         let mut by_table = HashMap::new();
         let mut roots = HashMap::new();
         for (idx, entry) in tables.iter().enumerate() {
@@ -355,6 +380,30 @@ impl<'a> Planner<'a> {
             mutation_roots,
             mutation_function_roots,
         }
+    }
+
+    /// All query/subscription roots owned by this source, independent of a
+    /// request role. Role visibility stays enforced by [`Self::plan`].
+    pub fn query_root_names(&self) -> impl Iterator<Item = &str> {
+        self.roots.keys().map(String::as_str)
+    }
+
+    /// All mutation roots owned by this source. Read-only backends expose no
+    /// mutation ownership even though their metadata may contain table CRUD.
+    pub fn mutation_root_names(&self) -> impl Iterator<Item = &str> {
+        let table_roots = self
+            .capabilities
+            .mutations
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| self.mutation_roots.keys().map(String::as_str));
+        let function_roots = self
+            .capabilities
+            .mutations
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| self.mutation_function_roots.keys().map(String::as_str));
+        table_roots.chain(function_roots)
     }
 
     /// Resolve a tracked table for a role: entry + catalog info + select
