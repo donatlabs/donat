@@ -19,19 +19,37 @@ use donat_server::state::{AppState, Engine};
 use mysql::prelude::Queryable;
 use serde_json::json;
 
-const MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
+const DEFAULT_MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
+
+fn mysql_url() -> String {
+    std::env::var("MYSQL_URL").unwrap_or_else(|_| DEFAULT_MYSQL_URL.to_string())
+}
+
+fn external_tests_required() -> bool {
+    std::env::var_os("DONAT_EXTERNAL_DB_TESTS").is_some() || std::env::var_os("MYSQL_URL").is_some()
+}
 
 /// Open a MySQL connection with a short retry loop (the container may still
-/// be starting). Returns `None` if MySQL never becomes reachable, so the
-/// test can skip rather than fail in an environment without the container.
+/// be starting). Strict compose-backed runs fail when the service is absent;
+/// ordinary local unit runs make one quick probe and take the no-service path.
 fn connect_with_retry() -> Option<mysql::Conn> {
-    for _ in 0..30 {
-        match mysql::Conn::new(MYSQL_URL) {
+    let url = mysql_url();
+    let attempts = if external_tests_required() { 30 } else { 1 };
+    for attempt in 0..attempts {
+        match mysql::Conn::new(url.as_str()) {
             Ok(conn) => return Some(conn),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(_) if attempt + 1 < attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(error) => {
+                if external_tests_required() {
+                    panic!("MySQL is required at {url}, but connection failed: {error}");
+                }
+                return None;
+            }
         }
     }
-    None
+    unreachable!("MySQL connection loop always returns")
 }
 
 /// Create + seed the `author` table on a clean slate.
@@ -103,14 +121,15 @@ fn app_state(db_url: &str) -> Arc<AppState> {
 
 #[tokio::test]
 async fn mysql_source_served_through_runtime() {
+    let url = mysql_url();
     let Some(mut conn) = connect_with_retry() else {
-        eprintln!("MySQL not reachable at {MYSQL_URL}; skipping");
+        eprintln!("skipping MySQL runtime test: MySQL is not configured at {url}");
         return;
     };
     seed_db(&mut conn);
     drop(conn);
 
-    let state = app_state(MYSQL_URL);
+    let state = app_state(&url);
 
     // Boot introspection must handle the MySQL source.
     state

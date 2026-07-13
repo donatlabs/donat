@@ -95,7 +95,13 @@ make build
 make test           # unit + snapshot tests (no database needed)
 make run            # serves :8080 with the fixture metadata
 make conformance    # full conformance suite (needs Postgres — see below)
+make conformance-matrix # all backend contract and live runtime tests
 ```
+
+The backend matrix uses the disposable services in
+[`docker-compose.conformance.yml`](docker-compose.conformance.yml). Start
+them with `make db-up` and stop them with `make db-down`; the matrix target
+also starts them automatically.
 
 ---
 

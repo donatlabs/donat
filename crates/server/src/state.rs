@@ -833,13 +833,33 @@ async fn clickhouse_post_data(
     let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
     url.query_pairs_mut()
         .append_pair("enable_named_columns_in_function_tuple", "1")
-        .append_pair("allow_experimental_json_type", "1");
+        .append_pair("allow_experimental_json_type", "1")
+        // Keep GraphQL numeric values numeric in the JSON assembled by
+        // toJSONString. ClickHouse quotes 64-bit integers by default.
+        .append_pair("output_format_json_quote_64bit_integers", "0");
     clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_DATA_BYTES).await
 }
 
 #[cfg(test)]
 mod clickhouse_transport_tests {
     use super::*;
+    use axum::Router;
+    use axum::extract::{Query, State};
+    use axum::routing::post;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct QueryState(Arc<Mutex<Option<HashMap<String, String>>>>);
+
+    async fn capture_query(
+        State(state): State<QueryState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> &'static str {
+        *state.0.lock().await = Some(query);
+        "{}"
+    }
 
     #[test]
     fn clickhouse_response_limit_rejects_the_chunk_that_crosses_it() {
@@ -848,6 +868,41 @@ mod clickhouse_transport_tests {
         let error = append_clickhouse_chunk(&mut body, b"56", 5).unwrap_err();
         assert_eq!(error, "ClickHouse response exceeds 5 bytes");
         assert_eq!(body, b"1234");
+    }
+
+    #[tokio::test]
+    async fn clickhouse_data_request_keeps_64_bit_json_numbers_unquoted() {
+        let state = QueryState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(capture_query))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("query capture server");
+        });
+
+        clickhouse_post_data(
+            &reqwest::Client::new(),
+            &format!("http://{address}/"),
+            "SELECT 1",
+        )
+        .await
+        .expect("ClickHouse request succeeds");
+
+        let query = state
+            .0
+            .lock()
+            .await
+            .clone()
+            .expect("query parameters captured");
+        assert_eq!(
+            query.get("output_format_json_quote_64bit_integers"),
+            Some(&"0".to_string())
+        );
+        server.abort();
     }
 }
 

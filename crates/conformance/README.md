@@ -14,12 +14,28 @@ cargo build -p donat-server --bin donat
 cargo test -p donat-conformance --test jwt
 ```
 
-Requires Postgres (`postgis/postgis:16-3.4`) at `PG_URL`
-(default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
-Every suite gets its own database (`conf_<suite>`) and engine process
-(logs: `target/conformance-logs/<suite>.log`), so suites run in parallel
-and never share state. **Rebuild the engine binary after engine changes** —
-the harness spawns the existing `target/debug/donat`.
+`make conformance` is the complete Postgres reference suite. It requires
+Postgres (`postgis/postgis:16-3.4`) at `PG_URL` (default
+`postgresql://postgres:postgres@127.0.0.1:15432/postgres`). Every suite gets
+its own database (`conf_<suite>`) and engine process (logs:
+`target/conformance-logs/<suite>.log`), so suites run in parallel and never
+share state. **Rebuild the engine binary after engine changes** — the harness
+spawns the existing `target/debug/donat`.
+
+For the full local backend check, including disposable Postgres, MySQL, and
+ClickHouse services:
+
+```sh
+make db-up
+make conformance-matrix
+make db-down
+```
+
+`conformance-matrix` runs the shared contract on Postgres, SQLite, MySQL, and
+ClickHouse, then runs the live MySQL and ClickHouse runtime suites. The
+external runtime tests fail when a configured service is unavailable; ordinary
+workspace tests make only a quick no-service probe so they remain usable
+without Docker.
 
 ## Suites
 

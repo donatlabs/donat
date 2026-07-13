@@ -318,9 +318,14 @@ async fn clickhouse_source_is_introspected_and_queried_once() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLICKHOUSE_URL pointing at ClickHouse 25.8+"]
 async fn clickhouse_real_server_when_configured() {
-    let url = std::env::var("CLICKHOUSE_URL").expect("CLICKHOUSE_URL must be set");
+    let Some(url) = std::env::var("CLICKHOUSE_URL").ok() else {
+        if std::env::var_os("DONAT_EXTERNAL_DB_TESTS").is_some() {
+            panic!("CLICKHOUSE_URL must be set when DONAT_EXTERNAL_DB_TESTS=1");
+        }
+        eprintln!("skipping real ClickHouse test: CLICKHOUSE_URL is not configured");
+        return;
+    };
     let client = reqwest::Client::new();
     let database = format!("donat_clickhouse_test_{}", std::process::id());
     let test_url = with_database(&url, &database);
@@ -336,7 +341,7 @@ async fn clickhouse_real_server_when_configured() {
         .expect("create test database");
     assert!(response.status().is_success(), "create database failed");
     for sql in [
-        "CREATE TABLE author (id Int32, name String) ENGINE = MergeTree ORDER BY id",
+        "CREATE TABLE author (id UInt64, name String) ENGINE = MergeTree ORDER BY id",
         "INSERT INTO author VALUES (1, 'Alice'), (2, 'Bob')",
     ] {
         let response = client

@@ -34,35 +34,15 @@ jobs:
     env:
       CONF_BACKEND: ${{ matrix.backend }}
       PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
-      MYSQL_URL: mysql://root:root@127.0.0.1:13306/mysql
+      MYSQL_URL: mysql://root:root@127.0.0.1:13306/donat
       CLICKHOUSE_URL: http://donat:donat@127.0.0.1:18123
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Start Postgres
-        if: matrix.backend == 'postgres'
-        run: docker run -d --name donat-postgres -e POSTGRES_PASSWORD=postgres -p 15432:5432 postgis/postgis:16-3.4
-      - name: Start MySQL
-        if: matrix.backend == 'mysql'
-        run: docker run -d --name donat-mysql -e MYSQL_ROOT_PASSWORD=root -p 13306:3306 mysql:8.4
-      - name: Start ClickHouse
-        if: matrix.backend == 'clickhouse'
-        run: docker run -d --name donat-clickhouse -e CLICKHOUSE_USER=donat -e CLICKHOUSE_PASSWORD=donat -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 -p 18123:8123 clickhouse/clickhouse-server:25.8
-      - name: Wait for database
+      - name: Start backend service
         if: matrix.backend != 'sqlite'
-        shell: bash
-        run: |
-          for attempt in {1..60}; do
-            case "$CONF_BACKEND" in
-              postgres) pg_isready -h 127.0.0.1 -p 15432 -U postgres && exit 0 ;;
-              mysql) docker exec donat-mysql mysqladmin ping -uroot -proot --silent && exit 0 ;;
-              clickhouse) curl --fail --silent --user donat:donat http://127.0.0.1:18123/ping && exit 0 ;;
-            esac
-            sleep 2
-          done
-          docker logs "donat-$CONF_BACKEND"
-          exit 1
+        run: docker compose -f docker-compose.conformance.yml up -d --wait "${{ matrix.backend }}"
       - name: Build engine
         run: cargo build -p donat-server --bin donat
       - name: Matrix registry and manifest guards
@@ -71,6 +51,20 @@ jobs:
         run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=1 --nocapture
         env:
           RUST_BACKTRACE: "1"
+      - name: Live MySQL runtime tests
+        if: matrix.backend == 'mysql'
+        run: |
+          cargo test -p donat-server \
+            --test mysql_e2e \
+            --test mysql_runtime \
+            --test mysql_mutations -- --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
+      - name: Live ClickHouse runtime tests
+        if: matrix.backend == 'clickhouse'
+        run: cargo test -p donat-server --test clickhouse_runtime -- --include-ignored --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
       - name: Full Postgres reference conformance
         if: matrix.backend == 'postgres'
         run: cargo test -p donat-conformance -- --test-threads=4
