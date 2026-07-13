@@ -126,15 +126,62 @@ pub fn make_pool(url: &str) -> anyhow::Result<deadpool_postgres::Pool> {
 }
 
 fn resolve_source_url(source: &Source, default_url: &str) -> String {
-    let Some(connection_info) = &source.configuration.connection_info else {
-        return default_url.to_string();
-    };
-    match &connection_info.database_url {
-        DatabaseUrl::Url(url) => url.clone(),
-        DatabaseUrl::FromEnv { from_env } => {
-            std::env::var(from_env).unwrap_or_else(|_| default_url.to_string())
+    if let Some(connection_info) = &source.configuration.connection_info {
+        return match &connection_info.database_url {
+            DatabaseUrl::Url(url) => url.clone(),
+            DatabaseUrl::FromEnv { from_env } => {
+                std::env::var(from_env).unwrap_or_else(|_| default_url.to_string())
+            }
+        };
+    }
+    if source.kind == SourceKind::Clickhouse {
+        if let Some(url) = resolve_hasura_clickhouse_template(source) {
+            return url;
         }
     }
+    default_url.to_string()
+}
+
+#[derive(serde::Deserialize)]
+struct HasuraClickhouseConfiguration {
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn resolve_hasura_clickhouse_template(source: &Source) -> Option<String> {
+    let template = source.configuration.extra.get("template")?.as_str()?;
+    let rendered = render_hasura_environment_template(template)?;
+    let configuration: HasuraClickhouseConfiguration = serde_json::from_value(rendered).ok()?;
+    let mut url = reqwest::Url::parse(&configuration.url).ok()?;
+    if let Some(username) = configuration.username {
+        url.set_username(&username).ok()?;
+    }
+    if let Some(password) = configuration.password {
+        url.set_password(Some(&password)).ok()?;
+    }
+    Some(url.to_string())
+}
+
+fn render_hasura_environment_template(template: &str) -> Option<serde_json::Value> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{") {
+        rendered.push_str(&remaining[..start]);
+        let expression_start = start + 2;
+        let expression_end = remaining[expression_start..].find("}}")? + expression_start;
+        let expression = remaining[expression_start..expression_end].trim();
+        let argument = expression
+            .strip_prefix("getEnvironmentVariable(")?
+            .strip_suffix(')')?
+            .trim();
+        let variable: String = serde_json::from_str(argument).ok()?;
+        let value = std::env::var(variable).ok()?;
+        rendered.push_str(&serde_json::to_string(&value).ok()?);
+        remaining = &remaining[expression_end + 2..];
+    }
+    rendered.push_str(remaining);
+    serde_json::from_str(&rendered).ok()
 }
 
 impl AppState {
@@ -849,6 +896,46 @@ mod clickhouse_transport_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn resolves_hasura_clickhouse_template_configuration() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "name": "clickhouse",
+            "kind": "clickhouse",
+            "configuration": {
+                "template": r#"{
+                    "url": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_URL")}},
+                    "username": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_USERNAME")}},
+                    "password": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_PASSWORD")}}
+                }"#,
+                "timeout": null,
+                "value": {}
+            },
+            "tables": []
+        }))
+        .expect("Hasura ClickHouse source should deserialize");
+
+        unsafe {
+            std::env::set_var(
+                "DONAT_TEST_CLICKHOUSE_URL",
+                "http://clickhouse:8123?database=logs",
+            );
+            std::env::set_var("DONAT_TEST_CLICKHOUSE_USERNAME", "clickhouse");
+            std::env::set_var("DONAT_TEST_CLICKHOUSE_PASSWORD", "secret");
+        }
+
+        let resolved = resolve_source_url(&source, "postgres://postgres:5432/tandt");
+
+        unsafe {
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_URL");
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_USERNAME");
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_PASSWORD");
+        }
+        assert_eq!(
+            resolved,
+            "http://clickhouse:secret@clickhouse:8123/?database=logs"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct QueryState(Arc<Mutex<Option<HashMap<String, String>>>>);
