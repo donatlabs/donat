@@ -360,12 +360,21 @@ Include the query documents used by tandt-backend:
 
 `AnalyticsDocumentDailyStats`, `AnalyticsWorkflowExecutions`, `AnalyticsErrors`, `AnalyticsCodeLifecycleEvents`, `AnalyticsAggregationOperations`, `AnalyticsDashboardStats`, `ApplicationLogsList`, `DocumentIntegrationRequests`, `L2JobEvents`, `L2DeviceEvents`, `L2TrafficLogs`, and `L2ProductionEvents`.
 
-Do not normalize or improve the documents. In particular,
+Do not normalize or improve the pinned documents. In particular, the pinned
 `AnalyticsDashboardStats` has only `$company_id: int32!` and retains the exact
 inline scalar values `"now() - interval '30 days'"` and
-`"now() - interval '7 days'"`. `ApplicationLogsList.context` is a String in
-this pinned contract. `AnalyticsWorkflowExecutions` uses `workflow_type`; its
-filter oracle must use `_like` on `workflow_type`, not a nonexistent `name`.
+`"now() - interval '7 days'"`. Preserve it as a negative compatibility fixture:
+Date/DateTime scalar strings are escaped values, never executable SQL, and the
+exact Hasura-compatible validation/backend error is the oracle. Do not add an
+expression parser or raw-SQL escape hatch.
+
+Add a separate corrected `AnalyticsDashboardStatsSafe` query using explicit
+`$document_since: date!` and `$code_events_since: timestamp!` variables and the
+same four aliases/selections. This is the green dashboard execution contract
+and the required shape for a companion tandt UI change; do not claim it came
+from the pinned revision. `ApplicationLogsList.context` is a String in the
+pinned contract. `AnalyticsWorkflowExecutions` uses `workflow_type`; its filter
+oracle must use `_like` on `workflow_type`, not a nonexistent `name`.
 
 Create a case table with exact variables and exact ordered expected JSON:
 
@@ -376,7 +385,8 @@ Create a case table with exact variables and exact ordered expected JSON:
 | `AnalyticsErrors` | unresolved/company predicate and descending `error_time` return the seeded error only |
 | `AnalyticsCodeLifecycleEvents` | DateTime lower bound excludes the old event and returns the new event |
 | `AnalyticsAggregationOperations` | limit/offset and descending time return the second seeded page exactly |
-| `AnalyticsDashboardStats` | four aliased aggregate roots return exact counts, sums, and nodes for Date/DateTime bounds |
+| `AnalyticsDashboardStats` | exact pinned inline-expression request returns the safe scalar error and executes no data SQL |
+| `AnalyticsDashboardStatsSafe` | four aliased aggregate roots return exact counts, sums, and nodes for Date/DateTime variables |
 | `ApplicationLogsList` | exact String `context` and ordered log fields round-trip |
 | `DocumentIntegrationRequests` | document filter and descending request time return the matching OMS row only |
 | `L2JobEvents` | `_and`, pagination, and aggregate `count` return one node and total two |
@@ -404,16 +414,18 @@ explicit sessions and compare each compact raw body byte-for-byte. Provision
 Postgres from mandatory `PG_URL` and run a mixed Postgres/ClickHouse operation;
 missing Postgres must fail when `DONAT_EXTERNAL_DB_TESTS=1`.
 
-The dashboard seed uses rows at `today`, `today - 8 days`, and
-`today - 31 days` (and equivalent DateTime values) so the exact inline
-`now() - interval ...` literals have deterministic inclusion/exclusion oracles.
-Run the separate complex-value case through the same real binary.
+The dashboard seed uses fixed dates around the explicit safe-query variables,
+so inclusion/exclusion is deterministic. Assert the pinned unsafe query returns
+its exact error before any ClickHouse data request, then assert the safe query's
+exact successful body. Run the separate complex-value case through the same
+real binary.
 
 - [ ] **Step 4: Run against ClickHouse and verify RED or uncovered incompatibilities**
 
 Run:
 
 ```bash
+cargo build -p donat-server --bin donat
 DONAT_EXTERNAL_DB_TESTS=1 \
 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
 CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
@@ -431,9 +443,13 @@ rendering in `donat-backend`, planning semantics in `donat-schema`, SQL assembly
 in `donat-sqlgen`, and transport in `donat-server`. A compatibility fix is not
 complete until both its native conformance case and owning-crate test are GREEN.
 
-- [ ] **Step 6: Verify all twelve exact response oracles GREEN**
+- [ ] **Step 6: Verify the exact project contract GREEN**
 
-Re-run the exact contract command and require all operation assertions to pass against real ClickHouse.
+Re-run the exact contract command and require all eleven valid pinned operations,
+the pinned dashboard negative oracle, the safe dashboard replacement, and the
+complex-value case to pass against real ClickHouse. Record the companion tandt
+query change as a deployment prerequisite; Donat must never interpret user
+scalar strings as SQL.
 
 - [ ] **Step 7: Document the contract command and commit**
 
@@ -450,13 +466,33 @@ Dispatch the mandatory judge with the per-operation result map and continue only
 ### Task 4: Full Verification and Pull Request
 
 **Files:**
+- Modify: `.github/workflows/ci.yml`
 - Modify only files required by review findings.
 
 **Interfaces:**
 - Consumes: completed Tasks 1-3.
 - Produces: a pushed feature branch and a GitHub pull request targeting `main`.
 
-- [ ] **Step 1: Format and run static checks**
+- [ ] **Step 1: Add required mixed-backend CI ownership**
+
+Add a required `mixed-backend-conformance` job to `.github/workflows/ci.yml`.
+It starts both `postgres` and `clickhouse` from
+`docker-compose.conformance.yml`, waits for health, builds the debug Donat
+binary, sets `DONAT_EXTERNAL_DB_TESTS=1`, `PG_URL`, and `CLICKHOUSE_URL`, and
+runs these binaries without skip paths:
+
+```bash
+cargo test -p donat-conformance --test clickhouse_multi_database -- --test-threads=1 --nocapture
+cargo test -p donat-conformance --test multi_source -- --test-threads=1 --nocapture
+cargo test -p donat-conformance --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
+```
+
+Make `artifacts` depend on this job in addition to the existing unit and
+backend matrix gates. Keep the ordinary Postgres full-conformance job independent
+of ClickHouse; mandatory mixed tests are owned by the new job and cannot report
+success by skipping external databases.
+
+- [ ] **Step 2: Format and run static checks**
 
 Run:
 
@@ -468,13 +504,13 @@ git diff --check origin/main...HEAD
 
 Expected: all commands exit 0.
 
-- [ ] **Step 2: Run workspace tests**
+- [ ] **Step 3: Run workspace tests**
 
 Run: `cargo test --workspace --exclude donat-conformance`
 
 Expected: all unit, integration, runtime, and doc tests pass.
 
-- [ ] **Step 3: Rebuild and run full Postgres conformance**
+- [ ] **Step 4: Rebuild and run full Postgres conformance**
 
 Run:
 
@@ -485,7 +521,7 @@ cargo test -p donat-conformance
 
 Expected: every conformance module passes after the fresh server build.
 
-- [ ] **Step 4: Run every registered backend matrix leg**
+- [ ] **Step 5: Run every registered backend matrix leg**
 
 Run:
 
@@ -509,20 +545,23 @@ CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
   cargo test -p donat-conformance --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
 ```
 
-Expected: SQLite, MySQL, and ClickHouse matrix legs pass, and all twelve tandt
-operations match their exact response oracles.
+Expected: SQLite, MySQL, and ClickHouse matrix legs pass; eleven valid pinned
+tandt operations match exact success bodies, the pinned dashboard matches its
+safe negative oracle, and `AnalyticsDashboardStatsSafe` matches its exact
+success body.
 
-- [ ] **Step 5: Run final judge review**
+- [ ] **Step 6: Run final judge review**
 
 Provide the judge with the full `origin/main...HEAD` diff, approved design, this plan, all exact verification commands, and fresh outputs. Address every Critical or Important finding with a test-first fix and a reviewed commit.
 
-- [ ] **Step 6: Build and validate the PR body**
+- [ ] **Step 7: Build and validate the PR body**
 
 Create `/tmp/donat-multi-source-pr.md` from the final fresh verification
 outputs. It must contain Summary, Architecture, Security, Compatibility,
-Twelve-operation contract results, exact Commands/Results, and Deployment
-Impact sections. Read the completed file and verify that all four backend
-results and all twelve operation names are present before PR creation.
+Twelve-operation contract results, the safe dashboard replacement, exact
+Commands/Results, and Deployment Impact sections. Read the completed file and
+verify that all four backend results, all twelve pinned operation names, and
+`AnalyticsDashboardStatsSafe` are present before PR creation.
 
 Use `apply_patch` to create the file, then validate it:
 
@@ -534,14 +573,14 @@ done
 for backend in Postgres SQLite MySQL ClickHouse; do
   rg -q "$backend" /tmp/donat-multi-source-pr.md
 done
-for operation in AnalyticsDocumentDailyStats AnalyticsWorkflowExecutions AnalyticsErrors AnalyticsCodeLifecycleEvents AnalyticsAggregationOperations AnalyticsDashboardStats ApplicationLogsList DocumentIntegrationRequests L2JobEvents L2DeviceEvents L2TrafficLogs L2ProductionEvents; do
+for operation in AnalyticsDocumentDailyStats AnalyticsWorkflowExecutions AnalyticsErrors AnalyticsCodeLifecycleEvents AnalyticsAggregationOperations AnalyticsDashboardStats AnalyticsDashboardStatsSafe ApplicationLogsList DocumentIntegrationRequests L2JobEvents L2DeviceEvents L2TrafficLogs L2ProductionEvents; do
   rg -q "$operation" /tmp/donat-multi-source-pr.md
 done
 ```
 
 Expected: every validation command exits 0.
 
-- [ ] **Step 7: Push and create the PR**
+- [ ] **Step 8: Push and create the PR**
 
 ```bash
 git status --short --branch
@@ -552,10 +591,10 @@ gh pr create --repo donatlabs/donat --base main --head feat/hasura-multi-source-
 ```
 
 The PR body must include architecture, compatibility guarantees, all twelve
-tandt operations, exact verification commands/results, security invariants,
-and deployment impact.
+pinned tandt operations, the safe dashboard replacement, exact verification
+commands/results, security invariants, and deployment impact.
 
-- [ ] **Step 8: Verify remote state**
+- [ ] **Step 9: Verify remote state**
 
 Run:
 
