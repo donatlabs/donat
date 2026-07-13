@@ -406,6 +406,14 @@ impl<'a> Planner<'a> {
         table_roots.chain(function_roots)
     }
 
+    pub(crate) fn relay_root_names(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once("node".to_string()).chain(
+            self.tables
+                .iter()
+                .map(|entry| format!("{}_connection", root_names(entry).select)),
+        )
+    }
+
     /// Resolve a tracked table for a role: entry + catalog info + select
     /// permission. `None` means "does not exist for this role".
     pub(crate) fn table_ctx(&self, idx: usize, role: &str) -> Option<TableCtx<'a>> {
@@ -822,18 +830,16 @@ impl<'a> Planner<'a> {
 
         let op = self.pick_operation(&operations, operation_name)?;
 
-        let (selection_set, var_definitions, is_mutation) = match op {
-            OperationDefinition::Query(q) => {
-                (&q.selection_set, q.variable_definitions.as_slice(), false)
-            }
-            OperationDefinition::SelectionSet(s) => (s, [].as_slice(), false),
+        let (selection_set, var_definitions) = match op {
+            OperationDefinition::Query(q) => (&q.selection_set, q.variable_definitions.as_slice()),
+            OperationDefinition::SelectionSet(s) => (s, [].as_slice()),
             OperationDefinition::Mutation(m) => {
-                (&m.selection_set, m.variable_definitions.as_slice(), true)
+                (&m.selection_set, m.variable_definitions.as_slice())
             }
             // Subscriptions plan exactly like queries; the transport layer
             // decides delivery (currently: one snapshot per `start`).
             OperationDefinition::Subscription(s) => {
-                (&s.selection_set, s.variable_definitions.as_slice(), false)
+                (&s.selection_set, s.variable_definitions.as_slice())
             }
         };
 
@@ -847,14 +853,29 @@ impl<'a> Planner<'a> {
             }
         }
 
-        if is_mutation {
+        self.plan_selected(op, selection_set, &fragments, &vars, session)
+    }
+
+    /// Plan an operation that the caller has already selected, using a
+    /// caller-provided source-local selection and effective variables.
+    /// Unlike [`Self::plan`], this does not select an operation or apply
+    /// variable defaults.
+    pub(crate) fn plan_selected(
+        &self,
+        operation: &OperationDefinition<'static, String>,
+        selection_set: &SelectionSet<'static, String>,
+        fragments: &Fragments,
+        variables: &JsonMap<String, Json>,
+        session: &Session,
+    ) -> Result<Plan, PlanError> {
+        if matches!(operation, OperationDefinition::Mutation(_)) {
             return self
-                .plan_mutation(selection_set, &fragments, &vars, session)
+                .plan_mutation(selection_set, fragments, variables, session)
                 .map(Plan::Mutation);
         }
 
         let mut out = vec![];
-        for field in flatten(selection_set, &fragments, &vars, None)? {
+        for field in flatten(selection_set, fragments, variables, None)? {
             let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
             if field.name == "__typename" {
                 out.push(RootField::Typename {
@@ -872,7 +893,7 @@ impl<'a> Planner<'a> {
             };
             if self.relay {
                 if let Some(root) =
-                    self.plan_relay_root(field, &fragments, &vars, session, &path)?
+                    self.plan_relay_root(field, fragments, variables, session, &path)?
                 {
                     out.push(root);
                     continue;
@@ -928,15 +949,17 @@ impl<'a> Planner<'a> {
                     let Some(ctx) = self.table_ctx_by_name(&remote, &session.role) else {
                         return Err(not_found());
                     };
-                    let from = self.function_from(fentry, finfo, field, &vars, session, &path)?;
+                    let from =
+                        self.function_from(fentry, finfo, field, variables, session, &path)?;
                     (ctx, from)
                 }
             };
             if kind == RootKind::Aggregate && !ctx.allow_aggregations() {
                 return Err(not_found());
             }
-            let query =
-                self.build_select(&ctx, kind, from, field, &fragments, &vars, session, &path)?;
+            let query = self.build_select(
+                &ctx, kind, from, field, fragments, variables, session, &path,
+            )?;
             out.push(RootField::Select { alias, query });
         }
         if out.is_empty() {

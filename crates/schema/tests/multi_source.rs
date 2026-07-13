@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 
-use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, TableInfo};
 use donat_ir::{BoolExp, MutationRoot, RootField};
 use donat_metadata::Metadata;
 use donat_schema::{
     MultiSourcePlan, MultiSourcePlanner, PlanError, QueryResponseSlot, Session,
     execute_multi_source_introspection,
 };
-use serde_json::{Map as JsonMap, json};
+use serde_json::{Map as JsonMap, Value as Json, json};
 
 fn metadata() -> Metadata {
     serde_json::from_value(json!({
@@ -114,13 +114,26 @@ fn session(role: &str) -> Session {
 }
 
 fn plan(query: &str, role: &str) -> Result<MultiSourcePlan, PlanError> {
+    plan_with_variables(query, role, json!({}))
+}
+
+fn plan_with_variables(
+    query: &str,
+    role: &str,
+    variables: Json,
+) -> Result<MultiSourcePlan, PlanError> {
     let metadata = metadata();
     let catalogs = catalogs();
     let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
     let doc = graphql_parser::parse_query::<String>(query)
         .expect("query parses")
         .into_static();
-    planner.plan(&doc, None, &JsonMap::new(), &session(role))
+    planner.plan(
+        &doc,
+        None,
+        &variables.as_object().cloned().unwrap_or_default(),
+        &session(role),
+    )
 }
 
 #[test]
@@ -203,6 +216,88 @@ fn rejects_conflicting_aliases_and_arguments_before_delegation() {
         assert_eq!(error.code, "validation-failed");
         assert!(error.path.starts_with("$.selectionSet."));
     }
+}
+
+#[test]
+fn rejects_distinct_variable_arguments_even_when_runtime_values_match() {
+    let error = plan_with_variables(
+        r#"
+        query DifferentVariables($a: Int!, $b: Int!) {
+          public_item(limit: $a) { id }
+          public_item(limit: $b) { name }
+        }
+        "#,
+        "user",
+        json!({ "a": 1, "b": 1 }),
+    )
+    .expect_err("variable identity is part of GraphQL field compatibility");
+
+    assert_eq!(error.code, "validation-failed");
+    assert!(
+        error
+            .message
+            .contains("response key 'public_item' conflict")
+    );
+}
+
+#[test]
+fn accepts_compatible_arguments_in_different_name_order() {
+    let planned = plan(
+        r#"
+        {
+          public_item(limit: 1, where: { id: { _eq: 7 } }) { id }
+          public_item(where: { id: { _eq: 7 } }, limit: 1) { name }
+        }
+        "#,
+        "user",
+    )
+    .expect("argument-name order does not affect compatibility");
+
+    let MultiSourcePlan::Query { sources, .. } = planned else {
+        panic!("query expected")
+    };
+    let [RootField::Select { query, .. }] = sources[0].roots.as_slice() else {
+        panic!("one merged root expected")
+    };
+    assert_eq!(query.fields.len(), 2);
+}
+
+#[test]
+fn rejects_nested_response_key_conflicts_before_child_planning() {
+    let error = plan(
+        r#"
+        {
+          public_item { value: id }
+          public_item { value: name }
+        }
+        "#,
+        "user",
+    )
+    .expect_err("nested response-key conflict must fail in composite collection");
+
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.path, "$.selectionSet.public_item.selectionSet.name");
+    assert!(error.message.contains("response key 'value' conflict"));
+}
+
+#[test]
+fn rejects_nested_conflicts_from_included_fragments() {
+    let error = plan(
+        r#"
+        query NestedFragment($include: Boolean! = true) {
+          public_item {
+            value: id
+            ...ConflictingFields @include(if: $include)
+          }
+        }
+        fragment ConflictingFields on public_item { value: name }
+        "#,
+        "user",
+    )
+    .expect_err("included nested fragment conflicts before child planning");
+
+    assert_eq!(error.path, "$.selectionSet.public_item.selectionSet.name");
+    assert!(error.message.contains("response key 'value' conflict"));
 }
 
 #[test]
@@ -384,14 +479,89 @@ fn rejects_duplicate_root_and_incompatible_type_collisions() {
         }))
         .expect("configuration deserializes"),
     );
-    let catalogs = catalogs();
-    let planner = MultiSourcePlanner::new(&duplicate_type, &catalogs).expect("root names differ");
-    let doc = graphql_parser::parse_query::<String>("{ __schema { queryType { name } } }")
+    let error = MultiSourcePlanner::new(&duplicate_type, &catalogs())
+        .expect_err("type collision must fail construction");
+    assert!(error.message.contains("item"));
+}
+
+#[test]
+fn forwards_function_permission_inference_to_children() {
+    let mut metadata = metadata();
+    metadata.sources[0].functions.push(
+        serde_json::from_value(json!({
+            "function": { "schema": "public", "name": "all_items" },
+            "permissions": [{ "role": "function_user" }]
+        }))
+        .expect("function metadata deserializes"),
+    );
+    let mut catalogs = catalogs();
+    catalogs
+        .get_mut("default")
+        .expect("default catalog")
+        .functions
+        .insert(
+            "public.all_items".to_string(),
+            FunctionInfo {
+                schema: "public".to_string(),
+                name: "all_items".to_string(),
+                args: vec![],
+                returns_table: Some(("public".to_string(), "item".to_string())),
+                returns_set: true,
+                returns_scalar: None,
+            },
+        );
+    let doc = graphql_parser::parse_query::<String>("{ all_items { id } }")
         .expect("query parses")
         .into_static();
-    let error =
-        execute_multi_source_introspection(&planner, &session("user"), &doc, None, &JsonMap::new())
-            .expect("introspection operation")
-            .expect_err("type collision");
-    assert!(error.message.contains("item"));
+    let mut planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+
+    planner
+        .plan(&doc, None, &JsonMap::new(), &session("user"))
+        .expect("inferred function permission is enabled by default");
+    planner.set_infer_function_permissions(false);
+    let error = planner
+        .plan(&doc, None, &JsonMap::new(), &session("user"))
+        .expect_err("explicit function permission is required when inference is disabled");
+    assert_eq!(
+        error.message,
+        "field 'all_items' not found in type: 'query_root'"
+    );
+}
+
+#[test]
+fn forwards_relay_mode_only_to_capable_children() {
+    let mut metadata = metadata();
+    metadata.sources.truncate(2);
+    let mut catalogs = catalogs();
+    catalogs.remove("secondary");
+    let mut planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    planner
+        .set_relay(true)
+        .expect("relay ownership is unambiguous");
+
+    let doc = graphql_parser::parse_query::<String>(
+        "{ public_item_connection(first: 1) { edges { node { id } } } }",
+    )
+    .expect("query parses")
+    .into_static();
+    let planned = planner
+        .plan(&doc, None, &JsonMap::new(), &session("user"))
+        .expect("Postgres relay root plans");
+    let MultiSourcePlan::Query { sources, .. } = planned else {
+        panic!("query expected")
+    };
+    assert_eq!(sources[0].source, "default");
+
+    let clickhouse_doc = graphql_parser::parse_query::<String>(
+        "{ logs_event_connection(first: 1) { edges { node { id } } } }",
+    )
+    .expect("query parses")
+    .into_static();
+    let error = planner
+        .plan(&clickhouse_doc, None, &JsonMap::new(), &session("user"))
+        .expect_err("ClickHouse has no relay roots");
+    assert_eq!(
+        error.message,
+        "field 'logs_event_connection' not found in type: 'query_root'"
+    );
 }

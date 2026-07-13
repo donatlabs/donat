@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use donat_catalog::Catalog;
 use donat_ir::{MutationRoot, RootField};
-use donat_metadata::Metadata;
+use donat_metadata::{Columns, Metadata, PermissionEntry, SelectPermission};
 use graphql_parser::query::{
     Definition, Document, Field as GqlField, OperationDefinition, Selection, SelectionSet,
 };
@@ -50,8 +50,10 @@ struct ChildPlanner<'a> {
 /// Planner facade for Hasura metadata containing multiple data sources.
 pub struct MultiSourcePlanner<'a> {
     children: Vec<ChildPlanner<'a>>,
+    base_query_owners: HashMap<String, String>,
     query_owners: HashMap<String, String>,
     mutation_owners: HashMap<String, String>,
+    schema_template: Json,
 }
 
 impl std::fmt::Debug for MultiSourcePlanner<'_> {
@@ -107,11 +109,50 @@ impl<'a> MultiSourcePlanner<'a> {
             });
         }
 
+        let schema_template = build_role_independent_schema(metadata, catalogs)?;
         Ok(Self {
             children,
+            base_query_owners: query_owners.clone(),
             query_owners,
             mutation_owners,
+            schema_template,
         })
+    }
+
+    pub fn set_infer_function_permissions(&mut self, enabled: bool) {
+        for child in &mut self.children {
+            child.planner.infer_function_permissions = enabled;
+        }
+    }
+
+    /// Apply relay mode to each capable child and rebuild composite relay
+    /// ownership. The update is atomic when relay roots collide.
+    pub fn set_relay(&mut self, enabled: bool) -> Result<(), PlanError> {
+        let previous: Vec<bool> = self
+            .children
+            .iter()
+            .map(|child| child.planner.relay)
+            .collect();
+        let mut owners = self.base_query_owners.clone();
+        let result = (|| {
+            for child in &mut self.children {
+                child.planner.relay = enabled && child.planner.supports_relay();
+                if child.planner.relay {
+                    for root in child.planner.relay_root_names() {
+                        register_owner(&mut owners, &root, &child.source, "query")?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (child, relay) in self.children.iter_mut().zip(previous) {
+                child.planner.relay = relay;
+            }
+            return Err(error);
+        }
+        self.query_owners = owners;
+        Ok(())
     }
 
     pub fn plan(
@@ -143,7 +184,10 @@ impl<'a> MultiSourcePlanner<'a> {
             ),
         };
         let vars = effective_variables(variables, variable_definitions)?;
-        let fields = collect_fields(selection_set, &fragments, &vars)?;
+        let fields = collect_fields(selection_set, &fragments, &vars, "$.selectionSet")?;
+        if fields.is_empty() {
+            return Err(PlanError::validation("$", "selection set cannot be empty"));
+        }
         let owners = if is_mutation {
             &self.mutation_owners
         } else {
@@ -168,32 +212,15 @@ impl<'a> MultiSourcePlanner<'a> {
             .collect();
 
         if is_mutation {
-            return self.plan_mutation(
-                doc,
-                operation,
-                operation_name,
-                &vars,
-                session,
-                collected,
-                response,
-            );
+            return self.plan_mutation(operation, &fragments, &vars, session, collected, response);
         }
-        self.plan_query(
-            doc,
-            operation,
-            operation_name,
-            &vars,
-            session,
-            collected,
-            response,
-        )
+        self.plan_query(operation, &fragments, &vars, session, collected, response)
     }
 
     fn plan_query(
         &self,
-        doc: &Document<'static, String>,
         operation: &OperationDefinition<'static, String>,
-        operation_name: Option<&str>,
+        fragments: &Fragments,
         variables: &JsonMap<String, Json>,
         session: &Session,
         fields: Vec<CollectedField>,
@@ -203,11 +230,14 @@ impl<'a> MultiSourcePlanner<'a> {
         let mut sources = vec![];
         for (source, fields) in partitions {
             let child = self.child(&source)?;
-            let source_doc = source_document(doc, operation, fields);
-            let Plan::Query(roots) =
-                child
-                    .planner
-                    .plan(&source_doc, operation_name, variables, session)?
+            let selection_set = source_selection_set(operation, fields);
+            let Plan::Query(roots) = child.planner.plan_selected(
+                operation,
+                &selection_set,
+                fragments,
+                variables,
+                session,
+            )?
             else {
                 return Err(PlanError::validation("$", "expected a query operation"));
             };
@@ -219,9 +249,8 @@ impl<'a> MultiSourcePlanner<'a> {
     #[allow(clippy::too_many_arguments)]
     fn plan_mutation(
         &self,
-        doc: &Document<'static, String>,
         operation: &OperationDefinition<'static, String>,
-        operation_name: Option<&str>,
+        fragments: &Fragments,
         variables: &JsonMap<String, Json>,
         session: &Session,
         fields: Vec<CollectedField>,
@@ -245,8 +274,7 @@ impl<'a> MultiSourcePlanner<'a> {
             });
         };
         let child = self.child(&source)?;
-        let source_doc = source_document(
-            doc,
+        let selection_set = source_selection_set(
             operation,
             fields
                 .into_iter()
@@ -254,10 +282,13 @@ impl<'a> MultiSourcePlanner<'a> {
                 .map(|field| field.field)
                 .collect(),
         );
-        let Plan::Mutation(roots) =
-            child
-                .planner
-                .plan(&source_doc, operation_name, variables, session)?
+        let Plan::Mutation(roots) = child.planner.plan_selected(
+            operation,
+            &selection_set,
+            fragments,
+            variables,
+            session,
+        )?
         else {
             return Err(PlanError::validation("$", "expected a mutation operation"));
         };
@@ -276,71 +307,11 @@ impl<'a> MultiSourcePlanner<'a> {
     }
 
     fn schema_json(&self, session: &Session) -> Result<Json, PlanError> {
-        let mut types = vec![];
-        let mut by_name = HashMap::<String, Json>::new();
-        let mut query_fields = vec![];
-        let mut subscription_fields = vec![];
-        let mut mutation_fields = vec![];
-        let mut query_names = HashSet::new();
-        let mut subscription_names = HashSet::new();
-        let mut mutation_names = HashSet::new();
-        let mut base_schema = None;
-
-        for child in &self.children {
-            let schema = build_schema_json(&child.planner, session);
-            if base_schema.is_none() {
-                base_schema = Some(schema.clone());
-            }
-            for ty in schema["types"].as_array().into_iter().flatten() {
-                let Some(name) = ty["name"].as_str() else {
-                    continue;
-                };
-                match name {
-                    "query_root" => {
-                        append_root_fields(&mut query_fields, &mut query_names, ty, "query")?
-                    }
-                    "subscription_root" => append_root_fields(
-                        &mut subscription_fields,
-                        &mut subscription_names,
-                        ty,
-                        "subscription",
-                    )?,
-                    "mutation_root" => append_root_fields(
-                        &mut mutation_fields,
-                        &mut mutation_names,
-                        ty,
-                        "mutation",
-                    )?,
-                    _ => {
-                        if let Some(existing) = by_name.get(name) {
-                            if existing != ty {
-                                return Err(PlanError::validation(
-                                    "$",
-                                    format!("incompatible type collision for '{name}'"),
-                                ));
-                            }
-                        } else {
-                            by_name.insert(name.to_string(), ty.clone());
-                            types.push(ty.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut schema = base_schema.unwrap_or_else(|| serde_json::json!({}));
-        types.push(root_type("query_root", query_fields));
-        types.push(root_type("subscription_root", subscription_fields));
-        if !mutation_fields.is_empty() {
-            types.push(root_type("mutation_root", mutation_fields));
-            schema["mutationType"] = serde_json::json!({
-                "__typename": "__Type", "name": "mutation_root", "kind": "OBJECT"
-            });
-        } else {
-            schema["mutationType"] = Json::Null;
-        }
-        schema["types"] = Json::Array(types);
-        Ok(schema)
+        compose_schema(
+            self.children.iter().map(|child| &child.planner),
+            session,
+            Some(&self.schema_template),
+        )
     }
 }
 
@@ -365,16 +336,152 @@ fn register_owners<'a>(
     root_kind: &str,
 ) -> Result<(), PlanError> {
     for root in roots {
-        if let Some(existing) = owners.insert(root.to_string(), source.to_string())
-            && existing != source
-        {
-            return Err(PlanError::validation(
-                "$",
-                format!("{root_kind} root '{root}' is owned by both '{existing}' and '{source}'"),
-            ));
-        }
+        register_owner(owners, root, source, root_kind)?;
     }
     Ok(())
+}
+
+fn register_owner(
+    owners: &mut HashMap<String, String>,
+    root: &str,
+    source: &str,
+    root_kind: &str,
+) -> Result<(), PlanError> {
+    if let Some(existing) = owners.insert(root.to_string(), source.to_string())
+        && existing != source
+    {
+        return Err(PlanError::validation(
+            "$",
+            format!("{root_kind} root '{root}' is owned by both '{existing}' and '{source}'"),
+        ));
+    }
+    Ok(())
+}
+
+fn build_role_independent_schema(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+) -> Result<Json, PlanError> {
+    let mut validation_metadata = metadata.clone();
+    let mut validation_role = "__donat_composite_schema_validation".to_string();
+    while validation_metadata.sources.iter().any(|source| {
+        source.tables.iter().any(|table| {
+            table
+                .select_permissions
+                .iter()
+                .any(|permission| permission.role == validation_role)
+        })
+    }) {
+        validation_role.push('_');
+    }
+    for source in &mut validation_metadata.sources {
+        for table in &mut source.tables {
+            table.select_permissions.push(PermissionEntry {
+                role: validation_role.clone(),
+                permission: SelectPermission {
+                    columns: Columns::Star,
+                    filter: serde_json::json!({}),
+                    limit: None,
+                    allow_aggregations: true,
+                    computed_fields: table
+                        .computed_fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect(),
+                },
+                comment: None,
+            });
+        }
+    }
+    let mut planners = vec![];
+    for source in &validation_metadata.sources {
+        let catalog = catalogs.get(&source.name).ok_or_else(|| {
+            PlanError::new(
+                "$",
+                "not-found",
+                format!("catalog for source '{}' not found", source.name),
+            )
+        })?;
+        planners.push(Planner::for_source(&validation_metadata, source, catalog));
+    }
+    let session = Session {
+        role: validation_role,
+        vars: HashMap::new(),
+        backend_request: false,
+    };
+    compose_schema(planners.iter(), &session, None)
+}
+
+fn compose_schema<'planner, 'data>(
+    planners: impl IntoIterator<Item = &'planner Planner<'data>>,
+    session: &Session,
+    template: Option<&Json>,
+) -> Result<Json, PlanError>
+where
+    'data: 'planner,
+{
+    let mut types = vec![];
+    let mut by_name = HashMap::<String, Json>::new();
+    let mut query_fields = vec![];
+    let mut subscription_fields = vec![];
+    let mut mutation_fields = vec![];
+    let mut query_names = HashSet::new();
+    let mut subscription_names = HashSet::new();
+    let mut mutation_names = HashSet::new();
+    let mut base_schema = template.cloned();
+
+    for planner in planners {
+        let schema = build_schema_json(planner, session);
+        if base_schema.is_none() {
+            base_schema = Some(schema.clone());
+        }
+        for ty in schema["types"].as_array().into_iter().flatten() {
+            let Some(name) = ty["name"].as_str() else {
+                continue;
+            };
+            match name {
+                "query_root" => {
+                    append_root_fields(&mut query_fields, &mut query_names, ty, "query")?
+                }
+                "subscription_root" => append_root_fields(
+                    &mut subscription_fields,
+                    &mut subscription_names,
+                    ty,
+                    "subscription",
+                )?,
+                "mutation_root" => {
+                    append_root_fields(&mut mutation_fields, &mut mutation_names, ty, "mutation")?
+                }
+                _ => {
+                    if let Some(existing) = by_name.get(name) {
+                        if existing != ty {
+                            return Err(PlanError::validation(
+                                "$",
+                                format!("incompatible type collision for '{name}'"),
+                            ));
+                        }
+                    } else {
+                        by_name.insert(name.to_string(), ty.clone());
+                        types.push(ty.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut schema = base_schema.unwrap_or_else(|| serde_json::json!({}));
+    types.push(root_type("query_root", query_fields));
+    types.push(root_type("subscription_root", subscription_fields));
+    if !mutation_fields.is_empty() {
+        types.push(root_type("mutation_root", mutation_fields));
+        schema["mutationType"] = serde_json::json!({
+            "__typename": "__Type", "name": "mutation_root", "kind": "OBJECT"
+        });
+    } else {
+        schema["mutationType"] = Json::Null;
+    }
+    schema["types"] = Json::Array(types);
+    Ok(schema)
 }
 
 fn select_operation<'d>(
@@ -447,15 +554,15 @@ fn collect_fields(
     selection_set: &SelectionSet<'static, String>,
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
+    path: &str,
 ) -> Result<Vec<CollectedField>, PlanError> {
     let mut fields: Vec<CollectedField> = vec![];
     for field in flatten(selection_set, fragments, vars, None)? {
         let key = field.alias.clone().unwrap_or_else(|| field.name.clone());
         if let Some(existing) = fields.iter_mut().find(|existing| existing.key == key) {
-            if existing.field.name != field.name || !arguments_match(&existing.field, field, vars)?
-            {
+            if existing.field.name != field.name || !arguments_match(&existing.field, field) {
                 return Err(PlanError::validation(
-                    &format!("$.selectionSet.{}", field.name),
+                    &format!("{path}.{}", field.name),
                     format!("fields with response key '{key}' conflict"),
                 ));
             }
@@ -465,36 +572,43 @@ fn collect_fields(
                 .items
                 .extend(field.selection_set.items.clone());
         } else {
+            let mut field = field.clone();
+            field.directives.clear();
             fields.push(CollectedField {
                 key,
-                field: field.clone(),
+                field,
                 source: None,
             });
         }
     }
-    if fields.is_empty() {
-        return Err(PlanError::validation("$", "selection set cannot be empty"));
+    for collected in &mut fields {
+        let nested_path = format!("{path}.{}.selectionSet", collected.field.name);
+        let nested = collect_fields(
+            &collected.field.selection_set,
+            fragments,
+            vars,
+            &nested_path,
+        )?;
+        collected.field.selection_set.items = nested
+            .into_iter()
+            .map(|nested| Selection::Field(nested.field))
+            .collect();
     }
     Ok(fields)
 }
 
-fn arguments_match(
-    left: &GqlField<'static, String>,
-    right: &GqlField<'static, String>,
-    vars: &JsonMap<String, Json>,
-) -> Result<bool, PlanError> {
+fn arguments_match(left: &GqlField<'static, String>, right: &GqlField<'static, String>) -> bool {
     if left.arguments.len() != right.arguments.len() {
-        return Ok(false);
+        return false;
     }
-    let normalize =
-        |field: &GqlField<'static, String>| -> Result<BTreeMap<String, Json>, PlanError> {
-            field
-                .arguments
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), value_to_json(value, vars, "$")?)))
-                .collect()
-        };
-    Ok(normalize(left)? == normalize(right)?)
+    let normalize = |field: &GqlField<'static, String>| {
+        field
+            .arguments
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    normalize(left) == normalize(right)
 }
 
 fn assign_owners(
@@ -538,44 +652,14 @@ fn partition_fields(fields: Vec<CollectedField>) -> Vec<(String, Vec<GqlField<'s
     partitions
 }
 
-fn source_document(
-    original: &Document<'static, String>,
+fn source_selection_set(
     operation: &OperationDefinition<'static, String>,
     fields: Vec<GqlField<'static, String>>,
-) -> Document<'static, String> {
-    let selection_set = SelectionSet {
+) -> SelectionSet<'static, String> {
+    SelectionSet {
         span: operation_selection_set(operation).span,
         items: fields.into_iter().map(Selection::Field).collect(),
-    };
-    let operation = match operation {
-        OperationDefinition::SelectionSet(_) => OperationDefinition::SelectionSet(selection_set),
-        OperationDefinition::Query(query) => {
-            let mut query = query.clone();
-            query.selection_set = selection_set;
-            OperationDefinition::Query(query)
-        }
-        OperationDefinition::Mutation(mutation) => {
-            let mut mutation = mutation.clone();
-            mutation.selection_set = selection_set;
-            OperationDefinition::Mutation(mutation)
-        }
-        OperationDefinition::Subscription(subscription) => {
-            let mut subscription = subscription.clone();
-            subscription.selection_set = selection_set;
-            OperationDefinition::Subscription(subscription)
-        }
-    };
-    let mut definitions = vec![Definition::Operation(operation)];
-    definitions.extend(
-        original
-            .definitions
-            .iter()
-            .filter_map(|definition| match definition {
-                Definition::Fragment(fragment) => Some(Definition::Fragment(fragment.clone())),
-                Definition::Operation(_) => None,
-            }),
-    );
-    Document { definitions }
+    }
 }
 
 fn operation_selection_set<'a>(
