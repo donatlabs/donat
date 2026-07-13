@@ -5,12 +5,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use donat_backend::{AnyDialect, MySqlDialect, SqliteDialect};
+use donat_backend::{AnyDialect, ClickhouseDialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
+
+const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct AppState {
     /// One (url, pool) per Postgres source name; the pool is recreated when
@@ -58,6 +61,7 @@ pub enum QueryError {
     Decode(String),
     Postgres(tokio_postgres::Error),
     Sqlite(String),
+    Clickhouse(String),
 }
 
 /// Failure of a SQLite mutation in [`AppState::execute_sqlite_mutations`].
@@ -134,6 +138,17 @@ fn resolve_source_url(source: &Source, default_url: &str) -> String {
 }
 
 impl AppState {
+    async fn default_source_url(&self) -> Option<String> {
+        let engine = self.engine.read().await;
+        engine
+            .metadata
+            .sources
+            .iter()
+            .find(|source| source.name == "default")
+            .or_else(|| engine.metadata.sources.first())
+            .map(|source| resolve_source_url(source, &self.default_url))
+    }
+
     pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
         let pools = self.pools.read().await;
         pools
@@ -183,8 +198,11 @@ impl AppState {
                     .map_err(|e| QueryError::Decode(e.to_string()))
             }
             SourceKind::Sqlite => {
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Sqlite(SqliteDialect));
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Sqlite(SqliteDialect),
+                );
                 let path = {
                     let paths = self.sqlite_paths.read().await;
                     paths
@@ -206,8 +224,11 @@ impl AppState {
             SourceKind::Mysql => {
                 use mysql::prelude::Queryable;
 
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Mysql(MySqlDialect));
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Mysql(MySqlDialect),
+                );
                 let url = {
                     let urls = self.mysql_urls.read().await;
                     urls.get("default")
@@ -223,6 +244,8 @@ impl AppState {
                     // is enabled for the session.
                     conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                    conn.query_drop("SET SESSION group_concat_max_len = 4294967295")
+                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
                     let row: Option<String> = conn
                         .query_first(&sql)
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
@@ -232,7 +255,25 @@ impl AppState {
                 .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
-            SourceKind::Clickhouse => Err(QueryError::NoDefaultSource),
+            SourceKind::Clickhouse => {
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Clickhouse(ClickhouseDialect),
+                );
+                let url = self
+                    .default_source_url()
+                    .await
+                    .ok_or(QueryError::NoDefaultSource)?;
+                let text = clickhouse_post_data(
+                    &self.http,
+                    &url,
+                    &format!("{sql} FORMAT TabSeparatedRaw"),
+                )
+                .await
+                .map_err(QueryError::Clickhouse)?;
+                serde_json::from_str(text.trim()).map_err(|e| QueryError::Decode(e.to_string()))
+            }
         }
     }
 
@@ -251,7 +292,7 @@ impl AppState {
         &self,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, SqliteMutationError> {
-        use donat_sqlgen::SqliteMutationPlan;
+        use donat_sqlgen::{MutationResponseSlot, SqliteMutationPlan};
 
         // Plan every root up front (alias + SQLite mutation plan), preserving
         // selection order for the response map.
@@ -331,17 +372,29 @@ impl AppState {
                     });
                 }
 
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres `Plan::Mutation` response shape.
+                if plan.single_row_output {
+                    data.insert(
+                        alias.clone(),
+                        returning.into_iter().next().unwrap_or(Json::Null),
+                    );
+                    continue;
+                }
+
+                // Assemble this root's response object in GraphQL selection order.
                 let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                let returning_value = Json::Array(returning);
+                for slot in &plan.response_slots {
+                    match slot {
+                        MutationResponseSlot::Returning { alias } => {
+                            obj.insert(alias.clone(), returning_value.clone());
+                        }
+                        MutationResponseSlot::AffectedRows { alias } => {
+                            obj.insert(alias.clone(), Json::from(affected_rows));
+                        }
+                        MutationResponseSlot::Typename { alias, value } => {
+                            obj.insert(alias.clone(), Json::String(value.clone()));
+                        }
+                    }
                 }
                 data.insert(alias.clone(), Json::Object(obj));
             }
@@ -368,7 +421,7 @@ impl AppState {
         &self,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
-        use donat_sqlgen::{MySqlMutationKind, MySqlMutationPlan};
+        use donat_sqlgen::{MutationResponseSlot, MySqlMutationKind, MySqlMutationPlan};
         use mysql::prelude::Queryable;
 
         // Plan every root up front (alias + MySQL mutation plan), resolving each
@@ -422,6 +475,8 @@ impl AppState {
             // The mutation path itself renders backtick identifiers, but stay
             // consistent with the read path's session setup.
             conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
+                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+            conn.query_drop("SET SESSION group_concat_max_len = 4294967295")
                 .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
             let mut tx = conn
                 .start_transaction(mysql::TxOpts::default())
@@ -533,17 +588,29 @@ impl AppState {
                     });
                 }
 
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres/SQLite `Plan::Mutation` response shape.
+                if plan.single_row_output {
+                    data.insert(
+                        alias.clone(),
+                        returning.into_iter().next().unwrap_or(Json::Null),
+                    );
+                    continue;
+                }
+
+                // Assemble this root's response object in GraphQL selection order.
                 let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
+                let returning_value = Json::Array(returning);
+                for slot in &plan.response_slots {
+                    match slot {
+                        MutationResponseSlot::Returning { alias } => {
+                            obj.insert(alias.clone(), returning_value.clone());
+                        }
+                        MutationResponseSlot::AffectedRows { alias } => {
+                            obj.insert(alias.clone(), Json::from(affected_rows));
+                        }
+                        MutationResponseSlot::Typename { alias, value } => {
+                            obj.insert(alias.clone(), Json::String(value.clone()));
+                        }
+                    }
                 }
                 data.insert(alias.clone(), Json::Object(obj));
             }
@@ -566,9 +633,6 @@ impl AppState {
             let engine = self.engine.read().await;
             let mut resolved: Vec<(String, SourceKind, String)> = vec![];
             for s in &engine.metadata.sources {
-                if s.kind == SourceKind::Clickhouse {
-                    continue;
-                }
                 let url = resolve_source_url(s, &self.default_url);
                 match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
                     Some(entry) => {
@@ -650,7 +714,18 @@ impl AppState {
                         .insert(name.clone(), url.clone());
                     catalog
                 }
-                SourceKind::Clickhouse => continue,
+                SourceKind::Clickhouse => {
+                    let database = clickhouse_database(url)?;
+                    let sql = "SELECT table, name, type, default_kind, is_in_primary_key \
+                               FROM system.columns \
+                               WHERE database = {database:String} \
+                               ORDER BY table, position \
+                               FORMAT JSONEachRow";
+                    let text = clickhouse_post_with_database_param(&self.http, url, sql, &database)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    donat_catalog::clickhouse_catalog_from_json_each_row(&text, &database)?
+                }
             };
             new_catalogs.insert(name.clone(), catalog);
         }
@@ -681,6 +756,153 @@ impl AppState {
         }
         engine.catalogs = new_catalogs;
         Ok(())
+    }
+}
+
+fn clickhouse_database(url: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(url)?;
+    Ok(url
+        .query_pairs()
+        .find(|(key, _)| key == "database")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| "default".to_string()))
+}
+
+async fn clickhouse_post(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+
+    let response = client
+        .post(url)
+        .body(sql.to_string())
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        append_clickhouse_chunk(&mut body, &chunk, max_bytes)?;
+    }
+    let body = String::from_utf8(body)
+        .map_err(|error| format!("ClickHouse returned non-UTF-8 data: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "ClickHouse returned {status}: {}",
+            body.chars().take(4096).collect::<String>()
+        ));
+    }
+    Ok(body)
+}
+
+fn append_clickhouse_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(format!("ClickHouse response exceeds {max_bytes} bytes"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn clickhouse_post_with_database_param(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    database: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("param_database", database);
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_CATALOG_BYTES).await
+}
+
+async fn clickhouse_post_data(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("enable_named_columns_in_function_tuple", "1")
+        .append_pair("allow_experimental_json_type", "1")
+        // Keep GraphQL numeric values numeric in the JSON assembled by
+        // toJSONString. ClickHouse quotes 64-bit integers by default.
+        .append_pair("output_format_json_quote_64bit_integers", "0");
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_DATA_BYTES).await
+}
+
+#[cfg(test)]
+mod clickhouse_transport_tests {
+    use super::*;
+    use axum::Router;
+    use axum::extract::{Query, State};
+    use axum::routing::post;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct QueryState(Arc<Mutex<Option<HashMap<String, String>>>>);
+
+    async fn capture_query(
+        State(state): State<QueryState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> &'static str {
+        *state.0.lock().await = Some(query);
+        "{}"
+    }
+
+    #[test]
+    fn clickhouse_response_limit_rejects_the_chunk_that_crosses_it() {
+        let mut body = Vec::new();
+        append_clickhouse_chunk(&mut body, b"1234", 5).unwrap();
+        let error = append_clickhouse_chunk(&mut body, b"56", 5).unwrap_err();
+        assert_eq!(error, "ClickHouse response exceeds 5 bytes");
+        assert_eq!(body, b"1234");
+    }
+
+    #[tokio::test]
+    async fn clickhouse_data_request_keeps_64_bit_json_numbers_unquoted() {
+        let state = QueryState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(capture_query))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("query capture server");
+        });
+
+        clickhouse_post_data(
+            &reqwest::Client::new(),
+            &format!("http://{address}/"),
+            "SELECT 1",
+        )
+        .await
+        .expect("ClickHouse request succeeds");
+
+        let query = state
+            .0
+            .lock()
+            .await
+            .clone()
+            .expect("query parameters captured");
+        assert_eq!(
+            query.get("output_format_json_quote_64bit_integers"),
+            Some(&"0".to_string())
+        );
+        server.abort();
     }
 }
 

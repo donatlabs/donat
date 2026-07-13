@@ -21,6 +21,7 @@ fn col(name: &str, pg_type: &str, nullable: bool) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        native_type: None,
         nullable,
         has_default: false,
     }

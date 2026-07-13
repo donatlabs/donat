@@ -294,6 +294,10 @@ fn after_parent_nested_check_reads_parent_from_insert_cte() {
         !sql.contains(r#"EXISTS (SELECT 1 FROM "public"."author" AS"#),
         "after-parent check must not query the base parent table in the same CTE statement: {sql}"
     );
+    assert!(
+        sql.contains("IS NOT TRUE"),
+        "nested permission checks must reject both FALSE and NULL: {sql}"
+    );
 }
 
 #[test]

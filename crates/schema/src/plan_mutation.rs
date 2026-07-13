@@ -3,6 +3,7 @@
 //! everywhere, there is no admin bypass: the mutation root only exists for
 //! a role that has the corresponding permission.
 
+use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
 use donat_metadata::Columns;
 use graphql_parser::query::{Field as GqlField, SelectionSet};
@@ -17,6 +18,9 @@ impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Donat reports "no mutations exist" when not.
     fn role_has_any_mutation(&self, session: &Session) -> bool {
+        if !self.capabilities.mutations {
+            return false;
+        }
         // backend_only insert permissions don't exist for non-backend
         // requests: a role with only such permissions has an empty
         // mutation_root ("no mutations exist").
@@ -46,6 +50,9 @@ impl<'a> Planner<'a> {
         vars: &JsonMap<String, Json>,
         session: &Session,
     ) -> Result<Vec<MutationRoot>, PlanError> {
+        if !self.capabilities.mutations {
+            return Err(PlanError::validation("$", "no mutations exist"));
+        }
         let mut out = vec![];
         for field in flatten(selection_set, fragments, vars, None)? {
             let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
@@ -146,7 +153,7 @@ impl<'a> Planner<'a> {
                     };
                 }
                 (MutationKind::InsertOne, "object") => objects = vec![value],
-                (_, "on_conflict") => {
+                (_, "on_conflict") if self.capabilities.upsert != UpsertKind::None => {
                     if !value.is_null() {
                         on_conflict = Some(self.parse_on_conflict(&value, ctx, session, path)?);
                     }
@@ -172,17 +179,19 @@ impl<'a> Planner<'a> {
             for key in map.keys() {
                 let Some(db_key) = ctx.column_db_name(key) else {
                     let value = map.get(key).expect("key came from map");
-                    if let Some(nested) =
-                        self.parse_nested_object_insert(ctx, key, value, session, path)?
-                    {
-                        if objects.len() != 1 {
-                            return Err(PlanError::validation(
-                                path,
-                                "nested object inserts support a single object",
-                            ));
+                    if self.capabilities.nested_inserts {
+                        if let Some(nested) =
+                            self.parse_nested_object_insert(ctx, key, value, session, path)?
+                        {
+                            if objects.len() != 1 {
+                                return Err(PlanError::validation(
+                                    path,
+                                    "nested object inserts support a single object",
+                                ));
+                            }
+                            nested_object_inserts.push(nested);
+                            continue;
                         }
-                        nested_object_inserts.push(nested);
-                        continue;
                     }
                     return Err(field_not_found(
                         path,
@@ -237,7 +246,11 @@ impl<'a> Planner<'a> {
         let typed_columns: Vec<(String, String)> = columns
             .iter()
             .map(|c| {
-                let pg_type = ctx.info.column(c).map(|i| i.pg_type.clone()).unwrap();
+                let pg_type = ctx
+                    .info
+                    .column(c)
+                    .map(|i| i.sql_type().to_string())
+                    .unwrap();
                 (c.clone(), pg_type)
             })
             .collect();
@@ -528,7 +541,7 @@ impl<'a> Planner<'a> {
                     };
                     set_ops.push(SetOp::Set {
                         column: col.clone(),
-                        pg_type: info.pg_type.clone(),
+                        pg_type: info.sql_type().to_string(),
                         value: Scalar::Json(resolved),
                     });
                 }
@@ -594,7 +607,7 @@ impl<'a> Planner<'a> {
                         let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Set {
                             column: db_col.clone(),
-                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().sql_type().to_string(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
@@ -614,12 +627,12 @@ impl<'a> Planner<'a> {
                         let db_col = ctx.column_db_name(col).unwrap();
                         sets.push(SetOp::Inc {
                             column: db_col.clone(),
-                            pg_type: ctx.info.column(&db_col).unwrap().pg_type.clone(),
+                            pg_type: ctx.info.column(&db_col).unwrap().sql_type().to_string(),
                             value: Scalar::Json(v.clone()),
                         });
                     }
                 }
-                (_, "_append") => {
+                (_, "_append") if self.capabilities.json_ops == JsonOps::Jsonb => {
                     let map = value
                         .as_object()
                         .ok_or_else(|| PlanError::validation(path, "_append must be an object"))?;
@@ -663,7 +676,7 @@ impl<'a> Planner<'a> {
                         };
                         pk_predicate.push(BoolExp::Compare {
                             column: db_col,
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                             op: CompareOp::Eq(Scalar::Json(v.clone())),
                         });
                     }
@@ -705,7 +718,7 @@ impl<'a> Planner<'a> {
             };
             sets.push(SetOp::Set {
                 column: col.clone(),
-                pg_type: ctx.info.column(col).unwrap().pg_type.clone(),
+                pg_type: ctx.info.column(col).unwrap().sql_type().to_string(),
                 value: Scalar::Json(resolved),
             });
         }
@@ -790,7 +803,7 @@ impl<'a> Planner<'a> {
                     }
                     pk_predicate.push(BoolExp::Compare {
                         column: db_col,
-                        pg_type: info.pg_type.clone(),
+                        pg_type: info.sql_type().to_string(),
                         op: CompareOp::Eq(Scalar::Json(value)),
                     });
                 }

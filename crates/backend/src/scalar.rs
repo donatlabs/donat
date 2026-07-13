@@ -104,9 +104,61 @@ pub fn mysql_scalar(native: &str) -> ScalarType {
     }
 }
 
+/// Map a ClickHouse native type to its logical [`ScalarType`]. Nullable and
+/// LowCardinality wrappers do not change the GraphQL scalar exposed to users.
+pub fn clickhouse_scalar(native: &str) -> ScalarType {
+    let native = native.trim();
+    for wrapper in ["Nullable", "LowCardinality"] {
+        if let Some(inner) = native
+            .strip_prefix(wrapper)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            return clickhouse_scalar(inner);
+        }
+    }
+
+    let family = native.split_once('(').map_or(native, |(name, _)| name);
+    match family.to_ascii_lowercase().as_str() {
+        "int8" | "int16" | "uint8" | "uint16" => ScalarType::SmallInt,
+        "int32" | "uint32" => ScalarType::Int,
+        "int64" | "uint64" => ScalarType::BigInt,
+        "float32" => ScalarType::Float,
+        "float64" => ScalarType::Double,
+        "decimal" | "decimal32" | "decimal64" | "decimal128" | "decimal256" => ScalarType::Numeric,
+        "bool" | "boolean" => ScalarType::Bool,
+        "string" | "fixedstring" | "enum8" | "enum16" | "ipv4" | "ipv6" => ScalarType::Text,
+        "uuid" => ScalarType::Uuid,
+        "json" => ScalarType::Json,
+        "datetime" | "datetime64" => ScalarType::Timestamp,
+        "date" | "date32" => ScalarType::Date,
+        _ => ScalarType::Other(native.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clickhouse_maps_native_and_wrapped_types() {
+        assert_eq!(clickhouse_scalar("UInt8"), ScalarType::SmallInt);
+        assert_eq!(clickhouse_scalar("Int32"), ScalarType::Int);
+        assert_eq!(clickhouse_scalar("UInt64"), ScalarType::BigInt);
+        assert_eq!(clickhouse_scalar("Float64"), ScalarType::Double);
+        assert_eq!(clickhouse_scalar("Decimal(18, 4)"), ScalarType::Numeric);
+        assert_eq!(clickhouse_scalar("String"), ScalarType::Text);
+        assert_eq!(clickhouse_scalar("UUID"), ScalarType::Uuid);
+        assert_eq!(clickhouse_scalar("DateTime64(3)"), ScalarType::Timestamp);
+        assert_eq!(
+            clickhouse_scalar("Nullable(LowCardinality(String))"),
+            ScalarType::Text
+        );
+        assert_eq!(
+            clickhouse_scalar("Array(String)"),
+            ScalarType::Other("Array(String)".to_string())
+        );
+    }
 
     #[test]
     fn maps_integer_family() {

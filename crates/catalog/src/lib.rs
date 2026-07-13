@@ -71,8 +71,18 @@ pub struct ColumnInfo {
     pub name: String,
     /// Postgres type name as reported by pg_catalog (e.g. `int4`, `text`).
     pub pg_type: String,
+    /// Backend-native type used for SQL literal casts when it differs from
+    /// the logical `pg_type` exposed through the GraphQL schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_type: Option<String>,
     pub nullable: bool,
     pub has_default: bool,
+}
+
+impl ColumnInfo {
+    pub fn sql_type(&self) -> &str {
+        self.native_type.as_deref().unwrap_or(&self.pg_type)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +187,7 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
         entry.columns.push(ColumnInfo {
             name: row.get(2),
             pg_type: row.get(3),
+            native_type: None,
             nullable: row.get(4),
             has_default: row.get(5),
         });
@@ -287,6 +298,7 @@ fn sqlite_type_to_pg(declared: &str) -> &'static str {
         "BOOLEAN" | "BOOL" => "bool",
         "DATE" => "date",
         "DATETIME" | "TIMESTAMP" => "timestamp",
+        "JSON" => "json",
         _ => "text",
     }
 }
@@ -332,6 +344,7 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
                 columns.push(ColumnInfo {
                     name,
                     pg_type: sqlite_type_to_pg(&decl_type).to_string(),
+                    native_type: None,
                     nullable: notnull == 0,
                     has_default: dflt.is_some(),
                 });
@@ -394,7 +407,8 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
 /// MySQL database name plays the role Postgres schemas / SQLite's `"main"`
 /// play; pass it explicitly so callers control which database is tracked.
 ///
-/// Column types are read from `information_schema.columns.DATA_TYPE` and
+/// Column types are read from `information_schema.columns.DATA_TYPE` plus
+/// `COLUMN_TYPE` (needed to distinguish `tinyint(1)` booleans) and
 /// normalised to the nearest Postgres type *name* via [`mysql_type_to_pg`] —
 /// the same pragmatic pg-name bridge SQLite uses, because schema-gen still
 /// keys scalar naming off pg type names. MySQL has no stored row-returning
@@ -406,14 +420,14 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
 
     // Columns, ordered by table then ordinal position. COLUMN_DEFAULT is SQL
     // NULL when the column has no default, so deserialize it as Option.
-    let cols: Vec<(String, String, String, String, Option<String>)> = conn.exec(
-        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT \
+    let cols: Vec<(String, String, String, String, String, Option<String>)> = conn.exec(
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT \
          FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = ? \
          ORDER BY TABLE_NAME, ORDINAL_POSITION",
         (schema,),
     )?;
-    for (table, column, data_type, is_nullable, default) in cols {
+    for (table, column, data_type, column_type, is_nullable, default) in cols {
         let key = format!("{schema}.{table}");
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: schema.to_string(),
@@ -424,7 +438,12 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
         });
         entry.columns.push(ColumnInfo {
             name: column,
-            pg_type: mysql_type_to_pg(&data_type).to_string(),
+            pg_type: mysql_type_to_pg(&data_type, &column_type).to_string(),
+            // MySQL scalar rendering is coercion-based and does not need the
+            // physical COLUMN_TYPE. Keeping it out of the transitional
+            // `sql_type()` path ensures logical `bool` reaches SQLgen instead
+            // of `tinyint(1)`.
+            native_type: None,
             // IS_NULLABLE is the string 'YES' or 'NO'.
             nullable: is_nullable.eq_ignore_ascii_case("YES"),
             has_default: default.is_some(),
@@ -496,7 +515,15 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
 /// no size/precision suffix (that lives in `COLUMN_TYPE`), so no stripping is
 /// needed; matching is case-insensitive. This pg-name mapping is the same
 /// pragmatic bridge SQLite uses (see [`sqlite_type_to_pg`]).
-fn mysql_type_to_pg(data_type: &str) -> &'static str {
+fn mysql_type_to_pg(data_type: &str, column_type: &str) -> &'static str {
+    if data_type.eq_ignore_ascii_case("tinyint")
+        && column_type
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("tinyint(1)")
+    {
+        return "bool";
+    }
     match data_type.to_ascii_lowercase().as_str() {
         "tinyint" | "smallint" => "int2",
         "mediumint" | "int" | "integer" => "int4",
@@ -514,6 +541,173 @@ fn mysql_type_to_pg(data_type: &str) -> &'static str {
         "time" => "time",
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => "bytea",
         _ => "text",
+    }
+}
+
+#[cfg(test)]
+mod mysql_tests {
+    use super::*;
+
+    #[test]
+    fn tinyint_one_maps_to_boolean_without_reclassifying_other_tinyints() {
+        assert_eq!(mysql_type_to_pg("tinyint", "tinyint(1)"), "bool");
+        assert_eq!(mysql_type_to_pg("TINYINT", "tinyint(1) unsigned"), "bool");
+        assert_eq!(mysql_type_to_pg("tinyint", "tinyint(4)"), "int2");
+        assert_eq!(mysql_type_to_pg("smallint", "smallint"), "int2");
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ClickhouseColumnRow {
+    table: String,
+    name: String,
+    #[serde(rename = "type")]
+    native_type: String,
+    default_kind: String,
+    is_in_primary_key: u8,
+}
+
+/// Parse ClickHouse `system.columns` output in `JSONEachRow` format into the
+/// shared catalog shape. The caller is responsible for ordering rows by table
+/// and position so column and primary-key order remain stable.
+pub fn clickhouse_catalog_from_json_each_row(
+    input: &str,
+    database: &str,
+) -> Result<Catalog, serde_json::Error> {
+    let mut catalog = Catalog::default();
+
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let row: ClickhouseColumnRow = serde_json::from_str(line)?;
+        let key = format!("{database}.{}", row.table);
+        let table = catalog.tables.entry(key).or_insert_with(|| TableInfo {
+            schema: database.to_string(),
+            name: row.table.clone(),
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+
+        if row.is_in_primary_key != 0 {
+            table.primary_key.push(row.name.clone());
+        }
+        table.columns.push(ColumnInfo {
+            name: row.name,
+            pg_type: clickhouse_type_to_pg(&row.native_type).to_string(),
+            native_type: Some(row.native_type.clone()),
+            nullable: clickhouse_is_nullable(&row.native_type),
+            has_default: !row.default_kind.is_empty(),
+        });
+    }
+
+    Ok(catalog)
+}
+
+fn clickhouse_inner_type<'a>(native_type: &'a str, wrapper: &str) -> Option<&'a str> {
+    native_type
+        .strip_prefix(wrapper)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+}
+
+fn clickhouse_is_nullable(native_type: &str) -> bool {
+    let native_type = native_type.trim();
+    if clickhouse_inner_type(native_type, "Nullable").is_some() {
+        return true;
+    }
+    clickhouse_inner_type(native_type, "LowCardinality").is_some_and(clickhouse_is_nullable)
+}
+
+fn clickhouse_type_to_pg(native_type: &str) -> &'static str {
+    let mut native_type = native_type.trim();
+    loop {
+        if let Some(inner) = clickhouse_inner_type(native_type, "Nullable")
+            .or_else(|| clickhouse_inner_type(native_type, "LowCardinality"))
+        {
+            native_type = inner;
+        } else {
+            break;
+        }
+    }
+
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(name, _)| name);
+    match family.to_ascii_lowercase().as_str() {
+        "int8" | "int16" | "uint8" | "uint16" => "int2",
+        "int32" | "uint32" => "int4",
+        "int64" | "uint64" | "int128" | "uint128" | "int256" | "uint256" => "int8",
+        "float32" => "float4",
+        "float64" => "float8",
+        "decimal" | "decimal32" | "decimal64" | "decimal128" | "decimal256" => "numeric",
+        "bool" | "boolean" => "bool",
+        "uuid" => "uuid",
+        "json" | "object" | "map" | "tuple" | "array" => "json",
+        "datetime" | "datetime64" => "timestamp",
+        "date" | "date32" => "date",
+        "string" | "fixedstring" | "enum8" | "enum16" | "ipv4" | "ipv6" => "text",
+        _ => "text",
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_json_each_row_builds_catalog() {
+        let rows = r#"
+{"table":"events","name":"tenant_id","type":"UInt64","default_kind":"","is_in_primary_key":1}
+{"table":"events","name":"created_at","type":"DateTime64(3)","default_kind":"DEFAULT","is_in_primary_key":1}
+{"table":"events","name":"payload","type":"Nullable(String)","default_kind":"","is_in_primary_key":0}
+{"table":"users","name":"id","type":"UUID","default_kind":"","is_in_primary_key":1}
+"#;
+
+        let catalog = clickhouse_catalog_from_json_each_row(rows, "analytics").unwrap();
+
+        assert!(catalog.functions.is_empty());
+        let events = catalog.table("analytics", "events").unwrap();
+        assert_eq!(events.primary_key, vec!["tenant_id", "created_at"]);
+        assert!(events.foreign_keys.is_empty());
+        assert_eq!(events.column("tenant_id").unwrap().pg_type, "int8");
+        assert_eq!(
+            events.column("tenant_id").unwrap().native_type.as_deref(),
+            Some("UInt64")
+        );
+        assert_eq!(events.column("created_at").unwrap().pg_type, "timestamp");
+        assert_eq!(
+            events.column("created_at").unwrap().native_type.as_deref(),
+            Some("DateTime64(3)")
+        );
+        assert!(events.column("created_at").unwrap().has_default);
+        assert!(events.column("payload").unwrap().nullable);
+        assert_eq!(events.column("payload").unwrap().pg_type, "text");
+
+        let users = catalog.table("analytics", "users").unwrap();
+        assert_eq!(users.column("id").unwrap().pg_type, "uuid");
+    }
+
+    #[test]
+    fn clickhouse_nested_nullable_wrapper_is_nullable() {
+        let rows = concat!(
+            "{\"table\":\"events\",\"name\":\"tag\",",
+            "\"type\":\"LowCardinality(Nullable(String))\",",
+            "\"default_kind\":\"\",\"is_in_primary_key\":0}\n"
+        );
+        let catalog = clickhouse_catalog_from_json_each_row(rows, "analytics").unwrap();
+        assert!(
+            catalog
+                .table("analytics", "events")
+                .unwrap()
+                .column("tag")
+                .unwrap()
+                .nullable
+        );
+    }
+
+    #[test]
+    fn clickhouse_json_each_row_rejects_malformed_input() {
+        let error = clickhouse_catalog_from_json_each_row("not json", "default").unwrap_err();
+        assert!(error.is_syntax());
     }
 }
 

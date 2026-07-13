@@ -1,0 +1,57 @@
+# Disposable database services for the native conformance harness.
+#
+# Start every external backend for local matrix runs:
+#   docker compose -f docker-compose.conformance.yml up -d --wait
+#
+# The harness runs on the host, so the services expose the same ports used by
+# CI and by the documented PG_URL/MYSQL_URL/CLICKHOUSE_URL defaults. Databases
+# are intentionally ephemeral; suite lifecycle creates and drops its own
+# databases inside each service.
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: donat
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/mysql
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: donat
+      CLICKHOUSE_PASSWORD: donat
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "18123:8123"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --user=donat --password=donat http://127.0.0.1:8123/ping | grep -q '^Ok'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/clickhouse

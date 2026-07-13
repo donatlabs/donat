@@ -24,7 +24,8 @@ response:
   result:
     isError: false
     structuredContent:
-    - id: 1
-      label: first
-    - id: 2
-      label: second
+      rows:
+      - id: 1
+        label: first
+      - id: 2
+        label: second

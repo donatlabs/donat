@@ -143,7 +143,7 @@ async fn sqlite_mutations_through_runtime() {
             insert_note(objects: [
                 { id: 1, body: "first", owner: "alice" },
                 { id: 2, body: "second", owner: "alice" }
-            ]) { affected_rows returning { id body } }
+            ]) { returning { id body } __typename affected_rows }
         }"#,
     )
     .await;
@@ -151,16 +151,46 @@ async fn sqlite_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "insert_note": {
-            "affected_rows": 2,
             "returning": [
                 { "id": 1, "body": "first" },
                 { "id": 2, "body": "second" }
-            ]
+            ],
+            "__typename": "note_mutation_response",
+            "affected_rows": 2
         }}}),
         "unexpected insert body: {body}"
     );
+    assert_eq!(
+        body["data"]["insert_note"]
+            .as_object()
+            .expect("insert response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["returning", "__typename", "affected_rows"]
+    );
 
-    // 2. Violating insert (owner != session var) -> permission error, and the
+    // 2. Single-row output returns the node directly and preserves typename.
+    let (status, body) = run(
+        &state,
+        r#"mutation {
+            insert_note_one(object: { id: 3, body: "single", owner: "alice" }) {
+                body __typename
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body,
+        json!({ "data": { "insert_note_one": {
+            "body": "single",
+            "__typename": "note"
+        }}}),
+        "unexpected single-row insert body: {body}"
+    );
+
+    // 3. Violating insert (owner != session var) -> permission error, and the
     //    row must NOT persist (transaction rolled back).
     let (status, body) = run(
         &state,
@@ -192,7 +222,7 @@ async fn sqlite_mutations_through_runtime() {
         "violating insert must not have persisted: {body}"
     );
 
-    // 3. Update.
+    // 4. Update.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -212,7 +242,7 @@ async fn sqlite_mutations_through_runtime() {
         "unexpected update body: {body}"
     );
 
-    // 4. Delete.
+    // 5. Delete.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -227,7 +257,7 @@ async fn sqlite_mutations_through_runtime() {
         "unexpected delete body: {body}"
     );
 
-    // Final state: only the (edited) row 1 remains.
+    // Final state: the edited row 1 and single-row insert remain.
     let (_status, body) = run(
         &state,
         "query { note(order_by: { id: asc }) { id body owner } }",
@@ -236,7 +266,8 @@ async fn sqlite_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "note": [
-            { "id": 1, "body": "edited", "owner": "alice" }
+            { "id": 1, "body": "edited", "owner": "alice" },
+            { "id": 3, "body": "single", "owner": "alice" }
         ]}}),
         "unexpected final state: {body}"
     );

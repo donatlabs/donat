@@ -195,11 +195,17 @@ response:
         required: [table]
         additionalProperties: false
       outputSchema:
+        type: object
         oneOf:
-        - type: array
-          items:
-            type: object
-            additionalProperties: true
+        - type: object
+          properties:
+            rows:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+          required: [rows]
+          additionalProperties: false
         - type: object
           properties:
             errors:
@@ -246,6 +252,7 @@ response:
         required: [table, objects]
         additionalProperties: false
       outputSchema:
+        type: object
         oneOf:
         - type: object
           properties:
@@ -306,6 +313,7 @@ response:
         required: [table, where, set]
         additionalProperties: false
       outputSchema:
+        type: object
         oneOf:
         - type: object
           properties:
@@ -359,6 +367,7 @@ response:
         required: [table, where]
         additionalProperties: false
       outputSchema:
+        type: object
         oneOf:
         - type: object
           properties:

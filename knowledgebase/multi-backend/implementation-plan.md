@@ -90,7 +90,8 @@ capability auto-skips counted.
   literals `'…'`, `LIMIT/OFFSET` same; JSON via `json_object` /
   `json_group_array`; scalar casts via SQLite affinity — no `::type`, use
   `CAST(x AS …)` where needed). `sqlite()` `Capabilities` (json_ops: Json,
-  geo:false, upsert:Update (ON CONFLICT), returning:true (3.35+),
+  geo:false, upsert:None (named-constraint upsert deferred by ADR 003),
+  returning:true (3.35+),
   distinct_on:false, lateral:false (correlated subqueries), aggregates:true).
   `sqlite_scalar(native)` mapping (INTEGER/REAL/TEXT/BLOB/NUMERIC + declared
   types).

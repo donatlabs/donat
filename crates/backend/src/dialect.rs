@@ -12,10 +12,10 @@ pub trait Dialect {
     /// Render the trailing `LIMIT`/`OFFSET` clause (with leading spaces),
     /// or the empty string when neither bound is present.
     fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String;
-    /// Render a JSON scalar as a SQL literal cast to the column's native
-    /// type. Mirrors sqlgen's `scalar_sql`: NULL / TRUE / FALSE, numbers and
-    /// strings cast to `::"ty"`, JSON arrays/objects targeting json/jsonb,
-    /// and the geometry/geography GeoJSON special-case.
+    /// Render a JSON scalar as a SQL literal compatible with the column's
+    /// native type. Mirrors sqlgen's `scalar_sql`: NULL / TRUE / FALSE,
+    /// numbers and strings cast to the backend type, JSON arrays/objects
+    /// targeting json/jsonb, and the geometry/geography GeoJSON special-case.
     fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String;
 
     /// Assemble a JSON object from `(raw key, value expr)` pairs. The key is
@@ -236,11 +236,11 @@ impl Dialect for SqliteDialect {
 /// MySQL dialect (8.0.14+). Differs from Postgres/SQLite in three notable
 /// ways: identifiers are quoted with backticks; string literals must escape
 /// backslashes (MySQL processes C-style escapes inside `'...'` by default);
-/// and JSON assembly uses MySQL's native JSON type (`JSON_OBJECT`,
-/// `JSON_ARRAYAGG`). Because MySQL has a real JSON type, nested JSON values do
-/// NOT need the `json(...)` reparse wrapper SQLite requires — `JSON_OBJECT`
-/// returns a genuine JSON value that `JSON_ARRAYAGG` aggregates without
-/// double-encoding. These renderings are validated against a real MySQL 8 in
+/// and JSON assembly uses text concatenation. MySQL's binary JSON object type
+/// reorders keys by key length, which violates GraphQL selection-order output.
+/// SQLgen therefore passes already-serialized JSON values to these leaves;
+/// `CONCAT`/`GROUP_CONCAT` preserve both field and row order without Rust
+/// post-processing. These renderings are validated against a real MySQL 8 in
 /// the e2e harness slice (`crates/server/tests/mysql_e2e.rs`).
 #[derive(Debug, Clone, Copy)]
 pub struct MySqlDialect;
@@ -303,32 +303,36 @@ impl Dialect for MySqlDialect {
     }
 
     fn json_object(&self, pairs: &[(String, String)]) -> String {
-        // MySQL's JSON_OBJECT('k', v, …): keys quoted, values inlined. Values
-        // that are themselves JSON_OBJECT/JSON_ARRAYAGG results are real JSON
-        // values and are embedded as-is (no double-encoding).
-        let body: Vec<String> = pairs
-            .iter()
-            .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
-            .collect();
-        format!("JSON_OBJECT({})", body.join(", "))
+        if pairs.is_empty() {
+            return self.quote_literal("{}");
+        }
+        let mut parts = vec![self.quote_literal("{")];
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                parts.push(self.quote_literal(","));
+            }
+            let key = serde_json::to_string(key).expect("JSON object key");
+            parts.push(self.quote_literal(&format!("{key}:")));
+            parts.push(format!(
+                "COALESCE(CAST({value} AS CHAR), {})",
+                self.quote_literal("null")
+            ));
+        }
+        parts.push(self.quote_literal("}"));
+        format!("CONCAT({})", parts.join(", "))
     }
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
-        // MySQL's JSON_ARRAYAGG(...), coalesced to an empty JSON array. The row
-        // expression is already a real JSON value (built by JSON_OBJECT), so —
-        // unlike SQLite — no json(...) reparse is needed; aggregating it
-        // directly preserves the nested structure. MySQL's JSON_ARRAYAGG does
-        // not accept an ORDER BY argument, so any requested ordering is applied
-        // by the surrounding query's ORDER BY (the planner emits an ordered
-        // subquery), and the order_by hint is intentionally ignored here.
-        let _ = order_by;
-        format!("COALESCE(JSON_ARRAYAGG({row_expr}), JSON_ARRAY())")
+        let order = order_by
+            .map(|order| format!(" ORDER BY {order}"))
+            .unwrap_or_default();
+        format!(
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST({row_expr} AS CHAR){order} SEPARATOR ','), ''), ']')"
+        )
     }
 
     fn to_json_text(&self, expr: &str) -> String {
-        // Render an expression as a JSON string value. CAST(... AS JSON) on a
-        // quoted SQL string literal yields a JSON string scalar.
-        format!("CAST({expr} AS JSON)")
+        format!("JSON_QUOTE(CAST({expr} AS CHAR))")
     }
 
     fn null_ordering(&self, _nulls_first: bool) -> String {
@@ -336,6 +340,197 @@ impl Dialect for MySqlDialect {
         // clause; MySQL sorts NULLs first for ASC and last for DESC by default.
         String::new()
     }
+}
+
+/// ClickHouse read-query dialect.
+///
+/// ClickHouse's experimental `JSON` type canonicalizes object keys, so GraphQL
+/// response objects stay as ordered JSON text. SQLgen passes serialized scalar
+/// and nested JSON values to these leaves; `concat`/`arrayStringConcat` keep
+/// field and row order without Rust post-processing.
+#[derive(Debug, Clone, Copy)]
+pub struct ClickhouseDialect;
+
+impl Dialect for ClickhouseDialect {
+    fn quote_ident(&self, ident: &str) -> String {
+        format!("`{}`", ident.replace('\\', "\\\\").replace('`', "\\`"))
+    }
+
+    fn quote_literal(&self, lit: &str) -> String {
+        format!("'{}'", lit.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+
+    fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String {
+        match (limit, offset) {
+            (Some(limit), Some(offset)) => format!(" LIMIT {limit} OFFSET {offset}"),
+            (Some(limit), None) => format!(" LIMIT {limit}"),
+            (None, Some(offset)) => {
+                format!(" LIMIT 18446744073709551615 OFFSET {offset}")
+            }
+            (None, None) => String::new(),
+        }
+    }
+
+    fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String {
+        let native_type = native_type.trim();
+        if clickhouse_complex_type(native_type) {
+            // ClickHouse does not support CAST(String AS Map/Tuple/Array),
+            // while JSONExtract's type-name overload parses the same JSON
+            // literal into the native complex value.
+            let value = scalar.as_json();
+            if value.is_null() {
+                return "NULL".into();
+            }
+            let json = match value {
+                serde_json::Value::String(value) => value.clone(),
+                value => value.to_string(),
+            };
+            if let Some((key_type, value_type)) = clickhouse_map_types(native_type)
+                && !key_type.eq_ignore_ascii_case("String")
+            {
+                // JSONExtract only accepts String map keys. Parse the JSON
+                // object as a string-keyed map first, then convert its keys
+                // with ClickHouse's map cast.
+                let string_map_type = format!("Map(String, {value_type})");
+                return format!(
+                    "CAST(JSONExtract({}, {}) AS {native_type})",
+                    self.quote_literal(&json),
+                    self.quote_literal(&string_map_type)
+                );
+            }
+            return format!(
+                "JSONExtract({}, {})",
+                self.quote_literal(&json),
+                self.quote_literal(native_type)
+            );
+        }
+        let native_type = clickhouse_cast_type(native_type);
+        match scalar.as_json() {
+            serde_json::Value::Null => "NULL".into(),
+            serde_json::Value::Bool(value) => {
+                if *value {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
+            serde_json::Value::Number(value) => format!("CAST({value} AS {native_type})"),
+            serde_json::Value::String(value) => {
+                format!("CAST({} AS {native_type})", self.quote_literal(value))
+            }
+            value => format!(
+                "CAST({} AS {native_type})",
+                self.quote_literal(&value.to_string())
+            ),
+        }
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        if pairs.is_empty() {
+            return self.quote_literal("{}");
+        }
+        let mut parts = vec![self.quote_literal("{")];
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                parts.push(self.quote_literal(","));
+            }
+            let key = format!("{}:", serde_json::to_string(key).expect("JSON object key"));
+            parts.push(self.quote_literal(&key));
+            parts.push(format!("coalesce({value}, {})", self.quote_literal("null")));
+        }
+        parts.push(self.quote_literal("}"));
+        format!("concat({})", parts.join(", "))
+    }
+
+    fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
+        match order_by {
+            Some(order) => format!(
+                "concat('[', arrayStringConcat(arrayMap(item -> item.2, arraySort(item -> item.1, groupArray(({order}, CAST({row_expr} AS String))))), ','), ']')"
+            ),
+            None => format!(
+                "concat('[', arrayStringConcat(groupArray(CAST({row_expr} AS String)), ','), ']')"
+            ),
+        }
+    }
+
+    fn to_json_text(&self, expr: &str) -> String {
+        format!("toJSONString({expr})")
+    }
+}
+
+fn clickhouse_cast_type(logical_type: &str) -> &str {
+    match logical_type {
+        "int2" => "Int16",
+        "int4" => "Int32",
+        "int8" => "Int64",
+        "float4" => "Float32",
+        "float8" => "Float64",
+        "numeric" => "Decimal(38, 9)",
+        "bool" => "Bool",
+        "text" | "varchar" | "bpchar" | "json" | "jsonb" => "String",
+        "uuid" => "UUID",
+        "timestamp" | "timestamptz" => "DateTime64(3)",
+        "date" => "Date",
+        other => other,
+    }
+}
+
+fn clickhouse_complex_type(native_type: &str) -> bool {
+    let native_type = clickhouse_unwrap_type(native_type);
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(family, _)| family)
+        .to_ascii_lowercase();
+    matches!(family.as_str(), "array" | "map" | "tuple")
+}
+
+fn clickhouse_unwrap_type(native_type: &str) -> &str {
+    let mut native_type = native_type.trim();
+    loop {
+        let inner = ["Nullable", "LowCardinality"]
+            .into_iter()
+            .find_map(|wrapper| {
+                native_type
+                    .strip_prefix(wrapper)
+                    .and_then(|rest| rest.strip_prefix('('))
+                    .and_then(|rest| rest.strip_suffix(')'))
+            });
+        match inner {
+            Some(inner) => native_type = inner,
+            None => break,
+        }
+    }
+    native_type
+}
+
+fn clickhouse_map_types(native_type: &str) -> Option<(&str, &str)> {
+    let native_type = clickhouse_unwrap_type(native_type);
+    let (family, args) = native_type.split_once('(')?;
+    if !family.trim().eq_ignore_ascii_case("Map") {
+        return None;
+    }
+    let args = args.strip_suffix(')')?;
+    let mut nesting = 0usize;
+    let separator = args.char_indices().find_map(|(index, ch)| match ch {
+        '(' => {
+            nesting += 1;
+            None
+        }
+        ')' => {
+            nesting = nesting.checked_sub(1)?;
+            None
+        }
+        ',' if nesting == 0 => Some(index),
+        _ => None,
+    })?;
+    let (key_type, value_type) = args.split_at(separator);
+    let value_type = value_type.strip_prefix(',')?;
+    let key_type = key_type.trim();
+    let value_type = value_type.trim();
+    if key_type.is_empty() || value_type.is_empty() {
+        return None;
+    }
+    Some((key_type, value_type))
 }
 
 /// A backend dialect selected at runtime. Implements [`Dialect`] by
@@ -346,6 +541,7 @@ pub enum AnyDialect {
     Postgres(PostgresDialect),
     Sqlite(SqliteDialect),
     Mysql(MySqlDialect),
+    Clickhouse(ClickhouseDialect),
 }
 
 impl Dialect for AnyDialect {
@@ -354,6 +550,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.quote_ident(ident),
             AnyDialect::Sqlite(d) => d.quote_ident(ident),
             AnyDialect::Mysql(d) => d.quote_ident(ident),
+            AnyDialect::Clickhouse(d) => d.quote_ident(ident),
         }
     }
 
@@ -362,6 +559,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.quote_literal(lit),
             AnyDialect::Sqlite(d) => d.quote_literal(lit),
             AnyDialect::Mysql(d) => d.quote_literal(lit),
+            AnyDialect::Clickhouse(d) => d.quote_literal(lit),
         }
     }
 
@@ -370,6 +568,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.limit_offset(limit, offset),
             AnyDialect::Sqlite(d) => d.limit_offset(limit, offset),
             AnyDialect::Mysql(d) => d.limit_offset(limit, offset),
+            AnyDialect::Clickhouse(d) => d.limit_offset(limit, offset),
         }
     }
 
@@ -378,6 +577,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.render_scalar(scalar, native_type),
             AnyDialect::Sqlite(d) => d.render_scalar(scalar, native_type),
             AnyDialect::Mysql(d) => d.render_scalar(scalar, native_type),
+            AnyDialect::Clickhouse(d) => d.render_scalar(scalar, native_type),
         }
     }
 
@@ -386,6 +586,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.json_object(pairs),
             AnyDialect::Sqlite(d) => d.json_object(pairs),
             AnyDialect::Mysql(d) => d.json_object(pairs),
+            AnyDialect::Clickhouse(d) => d.json_object(pairs),
         }
     }
 
@@ -394,6 +595,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.json_array_agg(row_expr, order_by),
             AnyDialect::Sqlite(d) => d.json_array_agg(row_expr, order_by),
             AnyDialect::Mysql(d) => d.json_array_agg(row_expr, order_by),
+            AnyDialect::Clickhouse(d) => d.json_array_agg(row_expr, order_by),
         }
     }
 
@@ -402,6 +604,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.to_json_text(expr),
             AnyDialect::Sqlite(d) => d.to_json_text(expr),
             AnyDialect::Mysql(d) => d.to_json_text(expr),
+            AnyDialect::Clickhouse(d) => d.to_json_text(expr),
         }
     }
 
@@ -410,6 +613,7 @@ impl Dialect for AnyDialect {
             AnyDialect::Postgres(d) => d.null_ordering(nulls_first),
             AnyDialect::Sqlite(d) => d.null_ordering(nulls_first),
             AnyDialect::Mysql(d) => d.null_ordering(nulls_first),
+            AnyDialect::Clickhouse(d) => d.null_ordering(nulls_first),
         }
     }
 }
@@ -417,6 +621,100 @@ impl Dialect for AnyDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ClickhouseDialect -----------------------------------------------
+
+    #[test]
+    fn clickhouse_quotes_identifiers_and_literals() {
+        let d = ClickhouseDialect;
+        assert_eq!(d.quote_ident("users"), "`users`");
+        assert_eq!(d.quote_ident("a`b"), "`a\\`b`");
+        assert_eq!(d.quote_literal("O'Hara"), "'O\\'Hara'");
+        assert_eq!(d.quote_literal("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn clickhouse_renders_pagination_and_scalars() {
+        let d = ClickhouseDialect;
+        assert_eq!(d.limit_offset(None, None), "");
+        assert_eq!(d.limit_offset(Some(10), Some(5)), " LIMIT 10 OFFSET 5");
+        assert_eq!(
+            d.limit_offset(None, Some(5)),
+            " LIMIT 18446744073709551615 OFFSET 5"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "UInt64"),
+            "CAST(42 AS UInt64)"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!("O'Hara")), "String"),
+            "CAST('O\\'Hara' AS String)"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(42)), "int4"),
+            "CAST(42 AS Int32)"
+        );
+    }
+
+    #[test]
+    fn clickhouse_renders_complex_literals_with_json_extract() {
+        let d = ClickhouseDialect;
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": 1})), "Map(String, UInt64)"),
+            "JSONExtract('{\"a\":1}', 'Map(String, UInt64)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(["a", "b"])), "Array(String)"),
+            "JSONExtract('[\"a\",\"b\"]', 'Array(String)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": 1})), "Tuple(a UInt64)"),
+            "JSONExtract('{\"a\":1}', 'Tuple(a UInt64)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"1": 2})), "Map(UInt64, UInt64)"),
+            "CAST(JSONExtract('{\"1\":2}', 'Map(String, UInt64)') AS Map(UInt64, UInt64))"
+        );
+    }
+
+    #[test]
+    fn clickhouse_assembles_ordered_json_text_without_double_encoding() {
+        let d = ClickhouseDialect;
+        assert_eq!(
+            d.json_object(&[
+                ("id".to_string(), "toJSONString(_t0.id)".to_string()),
+                ("name".to_string(), "toJSONString(_t0.name)".to_string()),
+            ]),
+            "concat('{', '\"id\":', coalesce(toJSONString(_t0.id), 'null'), ',', '\"name\":', coalesce(toJSONString(_t0.name), 'null'), '}')"
+        );
+        assert_eq!(d.json_object(&[]), "'{}'");
+        assert_eq!(
+            d.json_array_agg("_e.j", Some("_e.__donat_ord")),
+            "concat('[', arrayStringConcat(arrayMap(item -> item.2, arraySort(item -> item.1, groupArray((_e.__donat_ord, CAST(_e.j AS String))))), ','), ']')"
+        );
+        assert_eq!(d.to_json_text("'User'"), "toJSONString('User')");
+    }
+
+    #[test]
+    fn any_dialect_clickhouse_delegates() {
+        let d = AnyDialect::Clickhouse(ClickhouseDialect);
+        assert_eq!(d.quote_ident("users"), "`users`");
+        assert_eq!(d.quote_literal("x"), "'x'");
+        assert_eq!(d.limit_offset(Some(1), None), " LIMIT 1");
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(1)), "UInt8"),
+            "CAST(1 AS UInt8)"
+        );
+        assert_eq!(
+            d.json_object(&[("k".into(), "toJSONString(v)".into())]),
+            "concat('{', '\"k\":', coalesce(toJSONString(v), 'null'), '}')"
+        );
+        assert_eq!(
+            d.json_array_agg("x", None),
+            "concat('[', arrayStringConcat(groupArray(CAST(x AS String)), ','), ']')"
+        );
+        assert_eq!(d.to_json_text("x"), "toJSONString(x)");
+    }
 
     #[test]
     fn quote_ident_wraps_in_double_quotes() {
@@ -852,37 +1150,37 @@ mod tests {
     }
 
     #[test]
-    fn mysql_json_object_alternates_quoted_keys_and_values() {
+    fn mysql_json_object_preserves_declared_key_order() {
         let d = MySqlDialect;
         assert_eq!(
             d.json_object(&[
                 ("id".to_string(), "_t0.id".to_string()),
                 ("name".to_string(), "_t0.name".to_string()),
             ]),
-            "JSON_OBJECT('id', _t0.id, 'name', _t0.name)"
+            "CONCAT('{', '\"id\":', COALESCE(CAST(_t0.id AS CHAR), 'null'), ',', '\"name\":', COALESCE(CAST(_t0.name AS CHAR), 'null'), '}')"
         );
-        assert_eq!(d.json_object(&[]), "JSON_OBJECT()");
+        assert_eq!(d.json_object(&[]), "'{}'");
     }
 
     #[test]
-    fn mysql_json_array_agg_no_reparse_and_ignores_order() {
+    fn mysql_json_array_agg_preserves_requested_order() {
         let d = MySqlDialect;
-        // No json(...) reparse wrapper (MySQL has a real JSON type), and the
-        // ORDER BY hint is ignored (JSON_ARRAYAGG takes no ORDER BY).
+        // Rows are already JSON text. GROUP_CONCAT keeps them raw and avoids
+        // MySQL binary-JSON key canonicalization.
         assert_eq!(
             d.json_array_agg("_e.j", None),
-            "COALESCE(JSON_ARRAYAGG(_e.j), JSON_ARRAY())"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(_e.j AS CHAR) SEPARATOR ','), ''), ']')"
         );
         assert_eq!(
             d.json_array_agg("t.e", Some("t.i ASC")),
-            "COALESCE(JSON_ARRAYAGG(t.e), JSON_ARRAY())"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(t.e AS CHAR) ORDER BY t.i ASC SEPARATOR ','), ''), ']')"
         );
     }
 
     #[test]
-    fn mysql_to_json_text_casts_to_json() {
+    fn mysql_to_json_text_quotes_text() {
         let d = MySqlDialect;
-        assert_eq!(d.to_json_text("'User'"), "CAST('User' AS JSON)");
+        assert_eq!(d.to_json_text("'User'"), "JSON_QUOTE(CAST('User' AS CHAR))");
     }
 
     #[test]
@@ -910,12 +1208,12 @@ mod tests {
         assert_eq!(d.render_scalar(&s(serde_json::json!(1)), "int"), "1");
         assert_eq!(
             d.json_object(&[("k".into(), "v".into())]),
-            "JSON_OBJECT('k', v)"
+            "CONCAT('{', '\"k\":', COALESCE(CAST(v AS CHAR), 'null'), '}')"
         );
         assert_eq!(
             d.json_array_agg("x", None),
-            "COALESCE(JSON_ARRAYAGG(x), JSON_ARRAY())"
+            "CONCAT('[', COALESCE(GROUP_CONCAT(CAST(x AS CHAR) SEPARATOR ','), ''), ']')"
         );
-        assert_eq!(d.to_json_text("x"), "CAST(x AS JSON)");
+        assert_eq!(d.to_json_text("x"), "JSON_QUOTE(CAST(x AS CHAR))");
     }
 }

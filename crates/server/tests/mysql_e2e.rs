@@ -12,11 +12,11 @@
 //! dialect fix (string escaping, JSON_ARRAYAGG nesting, scalar casts, the
 //! LIMIT/OFFSET shape). MySQL MUTATIONS are out of scope (no RETURNING).
 //!
-//! The test is skipped (passes trivially) when no MySQL server is reachable so
-//! the crate's test suite stays green in environments without the container.
+//! Set `DONAT_EXTERNAL_DB_TESTS=1` to make an unavailable configured MySQL
+//! service fail the test instead of taking the local no-service path.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use donat_backend::{AnyDialect, MySqlDialect};
 use donat_catalog::{Catalog, mysql_introspect};
@@ -26,15 +26,25 @@ use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Row, Value as MyValue};
 use serde_json::{Value as Json, json};
 
-const URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
+const DEFAULT_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
 const SCHEMA: &str = "donat";
 
-/// Connect to the container, retrying for up to ~60s while it initialises.
-/// Returns `None` if it never becomes reachable (the test then no-ops).
+fn mysql_url() -> String {
+    std::env::var("MYSQL_URL").unwrap_or_else(|_| DEFAULT_URL.to_string())
+}
+
+fn external_tests_required() -> bool {
+    std::env::var_os("DONAT_EXTERNAL_DB_TESTS").is_some() || std::env::var_os("MYSQL_URL").is_some()
+}
+
+/// Connect to the configured MySQL service, retrying while it initialises.
+/// Local unit runs make one quick probe; the compose-backed target enables
+/// strict mode and retries for the full startup window.
 fn connect() -> Option<Conn> {
-    let opts = Opts::from_url(URL).expect("valid mysql url");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let url = mysql_url();
+    let opts = Opts::from_url(&url).expect("valid mysql url");
+    let attempts = if external_tests_required() { 60 } else { 1 };
+    for attempt in 0..attempts {
         match Conn::new(opts.clone()) {
             Ok(mut conn) => {
                 // sqlgen renders identifiers with double quotes (its free
@@ -48,12 +58,18 @@ fn connect() -> Option<Conn> {
                     .expect("enable ANSI_QUOTES");
                 return Some(conn);
             }
-            Err(_) if Instant::now() < deadline => {
+            Err(_) if attempt + 1 < attempts => {
                 std::thread::sleep(Duration::from_millis(1000));
             }
-            Err(_) => return None,
+            Err(error) => {
+                if external_tests_required() {
+                    panic!("MySQL is required at {url}, but connection failed: {error}");
+                }
+                return None;
+            }
         }
     }
+    unreachable!("MySQL connection loop always returns")
 }
 
 /// (Re)create the schema and seed deterministic rows. Mirrors sqlite_e2e's
@@ -180,8 +196,9 @@ fn run(conn: &mut Conn, md: &Metadata, catalog: &Catalog, gql: &str) -> Json {
 
 #[test]
 fn mysql_e2e_full_pipeline() {
+    let url = mysql_url();
     let Some(mut conn) = connect() else {
-        eprintln!("skipping mysql_e2e: no MySQL server reachable at {URL}");
+        eprintln!("skipping mysql_e2e: MySQL is not configured at {url}");
         return;
     };
     seed(&mut conn);

@@ -691,6 +691,7 @@ fn mcp_combines_split_accept_header_values() {
         .header("Accept", "application/json")
         .header("Accept", "text/event-stream")
         .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .body(r#"{"jsonrpc":"2.0","id":97,"method":"tools/list"}"#)
         .send()
         .expect("http request failed");
@@ -713,6 +714,7 @@ fn mcp_tools_list_advertises_order_by_property_limits() {
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .body(r#"{"jsonrpc":"2.0","id":98,"method":"tools/list"}"#)
         .send()
         .expect("http request failed");
@@ -983,6 +985,7 @@ fn mcp_rejects_cross_site_fetch_metadata_before_dispatch() {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .header("Content-Type", "application/json")
         .header("Sec-Fetch-Site", "cross-site")
         .body(r#"{"jsonrpc":"2.0","id":107,"method":"tools/list"}"#)
@@ -2337,6 +2340,7 @@ fn mcp_ping_returns_empty_result_without_auth() {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 124,
@@ -2412,6 +2416,7 @@ fn mcp_accepted_responses_set_security_headers() {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .json(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
@@ -2452,6 +2457,36 @@ fn mcp_accepted_responses_set_security_headers() {
     );
     let text = resp.text().expect("response text");
     assert!(text.is_empty(), "{text}");
+
+    s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
+fn mcp_notifications_require_protocol_version_header() {
+    let s = Suite::new("mcp_notification_protocol_version").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+
+    let (status, body) = s.post_without_mcp_protocol(
+        "/mcp",
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+        &[],
+    );
+
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32602,
+                "message": "missing MCP protocol version header"
+            }
+        })
+    );
 
     s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
 }
@@ -2775,7 +2810,7 @@ fn mcp_tools_call_honors_authorization_bearer_jwt() {
     assert_eq!(resp["result"]["isError"], json!(false));
     assert_eq!(
         resp["result"]["structuredContent"],
-        json!([{ "id": 1, "name": "Rex" }])
+        json!({ "rows": [{ "id": 1, "name": "Rex" }] })
     );
 
     let (status, resp) = s.post(
@@ -3578,7 +3613,9 @@ fn mcp_query_without_limit_uses_default_page_size() {
 
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["isError"], json!(false));
-    let rows = resp["result"]["structuredContent"].as_array().unwrap();
+    let rows = resp["result"]["structuredContent"]["rows"]
+        .as_array()
+        .unwrap();
     assert_eq!(rows.len(), 100);
     assert_eq!(rows.first().unwrap()["id"], json!(1));
     assert_eq!(rows.last().unwrap()["id"], json!(1096));
@@ -3603,7 +3640,9 @@ fn mcp_query_without_limit_uses_default_page_size() {
 
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["isError"], json!(false));
-    let rows = resp["result"]["structuredContent"].as_array().unwrap();
+    let rows = resp["result"]["structuredContent"]["rows"]
+        .as_array()
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], json!(1));
 

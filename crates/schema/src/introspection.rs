@@ -5,6 +5,7 @@
 
 use serde_json::{Map as JsonMap, Value as Json, json};
 
+use donat_backend::capabilities::JsonOps;
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
 use crate::naming::{root_names, table_base_name};
@@ -154,7 +155,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
     let mut mutation_fields: Vec<Json> = vec![];
 
     let select_args = |base: &str| -> Vec<Json> {
-        vec![
+        let mut args = vec![
             input_value("where", named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
             input_value(
                 "order_by",
@@ -162,11 +163,14 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             ),
             input_value("limit", named("SCALAR", "Int")),
             input_value("offset", named("SCALAR", "Int")),
-            input_value(
+        ];
+        if planner.capabilities.distinct_on {
+            args.push(input_value(
                 "distinct_on",
                 list_of(non_null(named("ENUM", &format!("{base}_select_column")))),
-            ),
-        ]
+            ));
+        }
+        args
     };
 
     for (idx, entry) in planner.tables().iter().enumerate() {
@@ -341,77 +345,81 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
                 })
                 .collect();
-            for rel in &entry.object_relationships {
-                let Some(manual) = &rel.using.manual_configuration else {
-                    continue;
-                };
-                if manual.insertion_order.as_deref() != Some("after_parent") {
-                    continue;
+            if planner.capabilities.nested_inserts {
+                for rel in &entry.object_relationships {
+                    let Some(manual) = &rel.using.manual_configuration else {
+                        continue;
+                    };
+                    if manual.insertion_order.as_deref() != Some("after_parent") {
+                        continue;
+                    }
+                    let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
+                        continue;
+                    };
+                    if planner
+                        .table_ctx_by_name(&manual.remote_table, &session.role)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let remote_insert_perm = planner.resolve_role_perm(
+                        &remote_entry.insert_permissions,
+                        &session.role,
+                        |p| !p.backend_only || session.backend_request,
+                    );
+                    if remote_insert_perm.is_none() {
+                        continue;
+                    }
+                    insert_fields.push(input_value(
+                        &rel.name,
+                        named(
+                            "INPUT_OBJECT",
+                            &format!("{}_obj_rel_insert_input", table_base_name(remote_entry)),
+                        ),
+                    ));
                 }
-                let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
-                    continue;
-                };
-                if planner
-                    .table_ctx_by_name(&manual.remote_table, &session.role)
-                    .is_none()
-                {
-                    continue;
-                }
-                let remote_insert_perm = planner.resolve_role_perm(
-                    &remote_entry.insert_permissions,
-                    &session.role,
-                    |p| !p.backend_only || session.backend_request,
-                );
-                if remote_insert_perm.is_none() {
-                    continue;
-                }
-                insert_fields.push(input_value(
-                    &rel.name,
-                    named(
-                        "INPUT_OBJECT",
-                        &format!("{}_obj_rel_insert_input", table_base_name(remote_entry)),
-                    ),
-                ));
             }
             types.push(input_object_type(
                 &format!("{base}_insert_input"),
                 insert_fields,
             ));
-            for rel in &entry.object_relationships {
-                let Some(manual) = &rel.using.manual_configuration else {
-                    continue;
-                };
-                if manual.insertion_order.as_deref() != Some("after_parent") {
-                    continue;
+            if planner.capabilities.nested_inserts {
+                for rel in &entry.object_relationships {
+                    let Some(manual) = &rel.using.manual_configuration else {
+                        continue;
+                    };
+                    if manual.insertion_order.as_deref() != Some("after_parent") {
+                        continue;
+                    }
+                    let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
+                        continue;
+                    };
+                    if planner
+                        .table_ctx_by_name(&manual.remote_table, &session.role)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let remote_insert_perm = planner.resolve_role_perm(
+                        &remote_entry.insert_permissions,
+                        &session.role,
+                        |p| !p.backend_only || session.backend_request,
+                    );
+                    if remote_insert_perm.is_none() {
+                        continue;
+                    }
+                    let remote_base = table_base_name(remote_entry);
+                    types.push(input_object_type(
+                        &format!("{remote_base}_obj_rel_insert_input"),
+                        vec![input_value(
+                            "data",
+                            non_null(named(
+                                "INPUT_OBJECT",
+                                &format!("{remote_base}_insert_input"),
+                            )),
+                        )],
+                    ));
                 }
-                let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
-                    continue;
-                };
-                if planner
-                    .table_ctx_by_name(&manual.remote_table, &session.role)
-                    .is_none()
-                {
-                    continue;
-                }
-                let remote_insert_perm = planner.resolve_role_perm(
-                    &remote_entry.insert_permissions,
-                    &session.role,
-                    |p| !p.backend_only || session.backend_request,
-                );
-                if remote_insert_perm.is_none() {
-                    continue;
-                }
-                let remote_base = table_base_name(remote_entry);
-                types.push(input_object_type(
-                    &format!("{remote_base}_obj_rel_insert_input"),
-                    vec![input_value(
-                        "data",
-                        non_null(named(
-                            "INPUT_OBJECT",
-                            &format!("{remote_base}_insert_input"),
-                        )),
-                    )],
-                ));
             }
             types.push(object_type(
                 &format!("{base}_mutation_response"),
@@ -440,19 +448,22 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
             .is_some()
         {
+            let mut update_args = vec![
+                input_value(
+                    "where",
+                    non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
+                ),
+                input_value("_set", named("INPUT_OBJECT", &format!("{base}_set_input"))),
+            ];
+            if planner.capabilities.json_ops == JsonOps::Jsonb {
+                update_args.push(input_value(
+                    "_append",
+                    named("INPUT_OBJECT", &format!("{base}_append_input")),
+                ));
+            }
             mutation_fields.push(field(
                 &format!("update_{base}"),
-                vec![
-                    input_value(
-                        "where",
-                        non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
-                    ),
-                    input_value("_set", named("INPUT_OBJECT", &format!("{base}_set_input"))),
-                    input_value(
-                        "_append",
-                        named("INPUT_OBJECT", &format!("{base}_append_input")),
-                    ),
-                ],
+                update_args,
                 named("OBJECT", &format!("{base}_mutation_response")),
             ));
             types.push(input_object_type(
@@ -466,17 +477,19 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     })
                     .collect(),
             ));
-            types.push(input_object_type(
-                &format!("{base}_append_input"),
-                ctx.info
-                    .columns
-                    .iter()
-                    .filter(|c| c.pg_type == "jsonb")
-                    .map(|c| {
-                        input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", "jsonb"))
-                    })
-                    .collect(),
-            ));
+            if planner.capabilities.json_ops == JsonOps::Jsonb {
+                types.push(input_object_type(
+                    &format!("{base}_append_input"),
+                    ctx.info
+                        .columns
+                        .iter()
+                        .filter(|c| c.pg_type == "jsonb")
+                        .map(|c| {
+                            input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", "jsonb"))
+                        })
+                        .collect(),
+                ));
+            }
         }
         if planner
             .resolve_role_perm(&entry.delete_permissions, &session.role, |_| true)
@@ -513,7 +526,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         types.push(scalar_type(scalar));
     }
 
-    let has_mutations = !mutation_fields.is_empty();
+    let has_mutations = planner.capabilities.mutations && !mutation_fields.is_empty();
     let subscription_fields = query_fields.clone();
     types.push(object_type("query_root", query_fields));
     types.push(object_type("subscription_root", subscription_fields));

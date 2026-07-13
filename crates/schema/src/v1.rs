@@ -3,6 +3,7 @@
 //! GraphQL; only the argument syntax differs. As everywhere: no admin
 //! role — these planners always run as the request's explicit role.
 
+use donat_backend::capabilities::UpsertKind;
 use donat_ir::*;
 use donat_metadata::Columns;
 use serde_json::Value as Json;
@@ -117,7 +118,7 @@ impl<'a> Planner<'a> {
                                 alias: col.name.clone(),
                                 value: FieldValue::Column {
                                     column: col.name.clone(),
-                                    pg_type: col.pg_type.clone(),
+                                    pg_type: col.sql_type().to_string(),
                                 },
                             });
                         }
@@ -146,7 +147,7 @@ impl<'a> Planner<'a> {
                         alias: name.clone(),
                         value: FieldValue::Column {
                             column: info.name.clone(),
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                         },
                     });
                 }
@@ -338,7 +339,7 @@ impl<'a> Planner<'a> {
                             ),
                         ));
                     }
-                    let pg_type = ctx.info.column(col).unwrap().pg_type.clone();
+                    let pg_type = ctx.info.column(col).unwrap().sql_type().to_string();
                     let value = Scalar::Json(v.clone());
                     sets.push(match kind {
                         "inc" => SetOp::Inc {
@@ -362,7 +363,7 @@ impl<'a> Planner<'a> {
             };
             sets.push(SetOp::Set {
                 column: col.clone(),
-                pg_type: info.pg_type.clone(),
+                pg_type: info.sql_type().to_string(),
                 value: Scalar::Json(resolve_preset(value, session)?),
             });
         }
@@ -534,7 +535,12 @@ impl<'a> Planner<'a> {
 
         let typed_columns: Vec<(String, String)> = columns
             .iter()
-            .map(|c| (c.clone(), ctx.info.column(c).unwrap().pg_type.clone()))
+            .map(|c| {
+                (
+                    c.clone(),
+                    ctx.info.column(c).unwrap().sql_type().to_string(),
+                )
+            })
             .collect();
         let rows: Vec<Vec<Option<Scalar>>> = objects
             .iter()
@@ -562,6 +568,12 @@ impl<'a> Planner<'a> {
         // v1 on_conflict: { constraint | constraint_on, action: update|ignore }.
         let on_conflict = match args.get("on_conflict") {
             None | Some(Json::Null) => None,
+            Some(_) if self.capabilities.upsert == UpsertKind::None => {
+                return Err(PlanError::validation(
+                    path,
+                    "on_conflict is not supported by this backend",
+                ));
+            }
             Some(oc) => {
                 let constraint = oc
                     .get("constraint")
@@ -604,7 +616,7 @@ impl<'a> Planner<'a> {
                             };
                             set_ops.push(SetOp::Set {
                                 column: col.clone(),
-                                pg_type: info.pg_type.clone(),
+                                pg_type: info.sql_type().to_string(),
                                 value: Scalar::Json(resolve_preset(value, session)?),
                             });
                         }

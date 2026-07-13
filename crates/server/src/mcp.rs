@@ -524,7 +524,15 @@ pub async fn dispatch(
     }
 
     match json_rpc_non_request_message(&req) {
-        Ok(true) => return mcp_empty_response(StatusCode::ACCEPTED),
+        Ok(true) => {
+            if !headers.contains_key(MCP_PROTOCOL_VERSION_HEADER) {
+                return mcp_json_response(
+                    StatusCode::BAD_REQUEST,
+                    rpc_error(Json::Null, -32602, "missing MCP protocol version header"),
+                );
+            }
+            return mcp_empty_response(StatusCode::ACCEPTED);
+        }
         Ok(false) => {}
         Err(msg) => {
             return mcp_json_response(StatusCode::BAD_REQUEST, rpc_error(Json::Null, -32600, &msg));
@@ -551,6 +559,13 @@ pub async fn dispatch(
             return mcp_json_response(StatusCode::OK, rpc_error(id, -32600, &msg));
         }
     };
+
+    if method != "initialize" && !headers.contains_key(MCP_PROTOCOL_VERSION_HEADER) {
+        return mcp_json_response(
+            StatusCode::BAD_REQUEST,
+            rpc_error(Json::Null, -32602, "missing MCP protocol version header"),
+        );
+    }
 
     match method {
         "ping" => {
@@ -2396,10 +2411,18 @@ fn describe_table_output_schema() -> Json {
 
 fn query_output_schema() -> Json {
     json!({
+        "type": "object",
         "oneOf": [
             {
-                "type": "array",
-                "items": { "type": "object", "additionalProperties": true }
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": { "type": "object", "additionalProperties": true }
+                    }
+                },
+                "required": ["rows"],
+                "additionalProperties": false
             },
             error_structured_content_schema()
         ]
@@ -2408,6 +2431,7 @@ fn query_output_schema() -> Json {
 
 fn mutation_output_schema() -> Json {
     json!({
+        "type": "object",
         "oneOf": [
             {
                 "type": "object",
@@ -2540,7 +2564,13 @@ async fn call_tool(
                 Ok(args) => args,
                 Err(msg) => return tool_err(msg, None),
             };
-            crud_tool(state, session, headers, &args, build_query_gql).await
+            let mut result = crud_tool(state, session, headers, &args, build_query_gql).await;
+            if result.get("isError") == Some(&Json::Bool(false)) {
+                if let Some(rows) = result.get_mut("structuredContent").map(Json::take) {
+                    result["structuredContent"] = json!({ "rows": rows });
+                }
+            }
+            result
         }
         "insert" => {
             let args = match tool_arguments(params, &["table", "objects", "returning"]) {
@@ -2739,12 +2769,17 @@ async fn resolve_table(
     Option<u64>,
 )> {
     let engine = state.engine.read().await;
-    let entry = engine
-        .metadata
-        .sources
+    let source = engine.metadata.sources.iter().find(|source| {
+        source
+            .tables
+            .iter()
+            .any(|table| donat_schema::table_base_name(table) == base)
+    })?;
+    let entry = source
+        .tables
         .iter()
-        .flat_map(|s| &s.tables)
         .find(|t| donat_schema::table_base_name(t) == base)?;
+    let capabilities = source_capabilities(source.kind);
     let select_perms = role_select_perms(
         &entry.select_permissions,
         &engine.metadata.inherited_roles,
@@ -2778,7 +2813,7 @@ async fn resolve_table(
         role,
         |p| !p.backend_only || backend_request,
     );
-    let can_insert = insert_perm.is_some();
+    let can_insert = capabilities.mutations && insert_perm.is_some();
     let insertable_cols =
         mutation_columns_for_perm(insert_perm.map(|p| &p.columns), cols.as_deref(), can_insert);
     let update_perm = resolve_role_perm(
@@ -2787,22 +2822,27 @@ async fn resolve_table(
         role,
         |_| true,
     );
-    let can_update = update_perm.is_some();
+    let can_update = capabilities.mutations && update_perm.is_some();
     let updatable_cols =
         mutation_columns_for_perm(update_perm.map(|p| &p.columns), cols.as_deref(), can_update);
-    let can_delete = resolve_role_perm(
-        &entry.delete_permissions,
-        &engine.metadata.inherited_roles,
-        role,
-        |_| true,
-    )
-    .is_some();
-    let relationship_names = entry
-        .object_relationships
-        .iter()
-        .map(|rel| rel.name.clone())
-        .chain(entry.array_relationships.iter().map(|rel| rel.name.clone()))
-        .collect();
+    let can_delete = capabilities.mutations
+        && resolve_role_perm(
+            &entry.delete_permissions,
+            &engine.metadata.inherited_roles,
+            role,
+            |_| true,
+        )
+        .is_some();
+    let relationship_names = if capabilities.relationships {
+        entry
+            .object_relationships
+            .iter()
+            .map(|rel| rel.name.clone())
+            .chain(entry.array_relationships.iter().map(|rel| rel.name.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some((
         donat_schema::table_base_name(entry),
         donat_schema::crud_roots(entry),
@@ -2903,6 +2943,15 @@ where
 
 // ---------------------------------------------------------- discovery tools
 
+fn source_capabilities(kind: donat_metadata::SourceKind) -> donat_backend::Capabilities {
+    match kind {
+        donat_metadata::SourceKind::Postgres => donat_backend::capabilities::postgres(),
+        donat_metadata::SourceKind::Sqlite => donat_backend::capabilities::sqlite(),
+        donat_metadata::SourceKind::Mysql => donat_backend::capabilities::mysql(),
+        donat_metadata::SourceKind::Clickhouse => donat_backend::capabilities::clickhouse(),
+    }
+}
+
 /// `list_tables`: enumerate tracked tables the role may access (has at least a
 /// select permission for), with the permitted operations.
 async fn list_tables(state: &SharedState, session: &Session, _args: &Json) -> Json {
@@ -2911,6 +2960,7 @@ async fn list_tables(state: &SharedState, session: &Session, _args: &Json) -> Js
     let mut tables: Vec<Json> = Vec::new();
 
     for source in &engine.metadata.sources {
+        let capabilities = source_capabilities(source.kind);
         for entry in &source.tables {
             let select_perms = role_select_perms(
                 &entry.select_permissions,
@@ -2922,35 +2972,37 @@ async fn list_tables(state: &SharedState, session: &Session, _args: &Json) -> Js
             if has_select {
                 ops.push("select".to_string());
             }
-            if resolve_role_perm(
-                &entry.insert_permissions,
-                &engine.metadata.inherited_roles,
-                role,
-                |p| !p.backend_only || session.backend_request,
-            )
-            .is_some()
-            {
-                ops.push("insert".to_string());
-            }
-            if resolve_role_perm(
-                &entry.update_permissions,
-                &engine.metadata.inherited_roles,
-                role,
-                |_| true,
-            )
-            .is_some()
-            {
-                ops.push("update".to_string());
-            }
-            if resolve_role_perm(
-                &entry.delete_permissions,
-                &engine.metadata.inherited_roles,
-                role,
-                |_| true,
-            )
-            .is_some()
-            {
-                ops.push("delete".to_string());
+            if capabilities.mutations {
+                if resolve_role_perm(
+                    &entry.insert_permissions,
+                    &engine.metadata.inherited_roles,
+                    role,
+                    |p| !p.backend_only || session.backend_request,
+                )
+                .is_some()
+                {
+                    ops.push("insert".to_string());
+                }
+                if resolve_role_perm(
+                    &entry.update_permissions,
+                    &engine.metadata.inherited_roles,
+                    role,
+                    |_| true,
+                )
+                .is_some()
+                {
+                    ops.push("update".to_string());
+                }
+                if resolve_role_perm(
+                    &entry.delete_permissions,
+                    &engine.metadata.inherited_roles,
+                    role,
+                    |_| true,
+                )
+                .is_some()
+                {
+                    ops.push("delete".to_string());
+                }
             }
             if ops.is_empty() {
                 continue;
@@ -3148,13 +3200,21 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
     let role = session.role.as_str();
 
     // Find the tracked table entry by base name.
-    let entry = engine
-        .metadata
-        .sources
+    let source = engine.metadata.sources.iter().find(|source| {
+        source
+            .tables
+            .iter()
+            .any(|table| donat_schema::table_base_name(table) == base)
+    });
+    let Some(source) = source else {
+        return tool_err(unknown_table_error(), None);
+    };
+    let capabilities = source_capabilities(source.kind);
+    let Some(entry) = source
+        .tables
         .iter()
-        .flat_map(|s| &s.tables)
-        .find(|t| donat_schema::table_base_name(t) == base);
-    let Some(entry) = entry else {
+        .find(|table| donat_schema::table_base_name(table) == base)
+    else {
         return tool_err(unknown_table_error(), None);
     };
 
@@ -3170,24 +3230,32 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
     }
     let (selectable, allowed) = selectable_for_perms(&select_perms);
     let select_limit = select_limit_for_perms(&select_perms);
-    let insertable = columns_mask_json(
-        resolve_role_perm(
-            &entry.insert_permissions,
-            &engine.metadata.inherited_roles,
-            role,
-            |p| !p.backend_only || session.backend_request,
+    let insertable = if capabilities.mutations {
+        columns_mask_json(
+            resolve_role_perm(
+                &entry.insert_permissions,
+                &engine.metadata.inherited_roles,
+                role,
+                |p| !p.backend_only || session.backend_request,
+            )
+            .map(|p| &p.columns),
         )
-        .map(|p| &p.columns),
-    );
-    let updatable = columns_mask_json(
-        resolve_role_perm(
-            &entry.update_permissions,
-            &engine.metadata.inherited_roles,
-            role,
-            |_| true,
+    } else {
+        Json::Null
+    };
+    let updatable = if capabilities.mutations {
+        columns_mask_json(
+            resolve_role_perm(
+                &entry.update_permissions,
+                &engine.metadata.inherited_roles,
+                role,
+                |_| true,
+            )
+            .map(|p| &p.columns),
         )
-        .map(|p| &p.columns),
-    );
+    } else {
+        Json::Null
+    };
 
     // Catalog columns + types, filtered to the columns the role may select;
     // per-column description from metadata `column_config.<col>.comment`.
@@ -3219,16 +3287,24 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
         .unwrap_or_default();
 
     // Relationships from metadata.
-    let object_relationships: Vec<&str> = entry
-        .object_relationships
-        .iter()
-        .map(|r| r.name.as_str())
-        .collect();
-    let array_relationships: Vec<&str> = entry
-        .array_relationships
-        .iter()
-        .map(|r| r.name.as_str())
-        .collect();
+    let object_relationships: Vec<&str> = if capabilities.relationships {
+        entry
+            .object_relationships
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let array_relationships: Vec<&str> = if capabilities.relationships {
+        entry
+            .array_relationships
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     tool_ok(json!({
         "name": base,
@@ -4307,6 +4383,136 @@ fn build_delete_gql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    fn clickhouse_discovery_state() -> SharedState {
+        let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "clickhouse",
+                "configuration": {},
+                "tables": [{
+                    "table": { "schema": "analytics", "name": "events" },
+                    "configuration": { "custom_name": "events" },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": "*", "filter": {} }
+                    }],
+                    "insert_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": "*", "check": {} }
+                    }],
+                    "update_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": "*", "filter": {} }
+                    }],
+                    "delete_permissions": [{
+                        "role": "user",
+                        "permission": { "filter": {} }
+                    }]
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = donat_catalog::Catalog {
+            tables: BTreeMap::from([(
+                "analytics.events".to_string(),
+                donat_catalog::TableInfo {
+                    schema: "analytics".to_string(),
+                    name: "events".to_string(),
+                    columns: vec![donat_catalog::ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        Arc::new(crate::state::AppState {
+            pools: tokio::sync::RwLock::new(HashMap::new()),
+            sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
+            mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
+            engine: tokio::sync::RwLock::new(crate::state::Engine {
+                metadata,
+                catalogs: HashMap::from([("default".to_string(), catalog)]),
+            }),
+            default_url: "http://127.0.0.1:18123".to_string(),
+            admin_secret: None,
+            unauthorized_role: None,
+            stringify_numerics: false,
+            infer_function_permissions: true,
+            jwt: None,
+            auth_hook: None,
+            http: reqwest::Client::new(),
+            allowlist_enabled: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn clickhouse_discovery_hides_mutations_even_when_permissions_exist() {
+        let state = clickhouse_discovery_state();
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let listed = list_tables(&state, &session, &json!({})).await;
+        assert_eq!(
+            listed["structuredContent"]["tables"][0]["operations"],
+            json!(["select"])
+        );
+
+        let described = describe_table(&state, &session, &json!({ "table": "events" })).await;
+        assert_eq!(described["isError"], false, "{described}");
+        assert_eq!(
+            described["structuredContent"]["insertable_columns"],
+            Json::Null
+        );
+        assert_eq!(
+            described["structuredContent"]["updatable_columns"],
+            Json::Null
+        );
+
+        for (name, arguments, message) in [
+            (
+                "insert",
+                json!({ "table": "events", "objects": [{ "id": 1 }] }),
+                "insert permission required on the table",
+            ),
+            (
+                "update",
+                json!({
+                    "table": "events",
+                    "where": { "id": { "_eq": 1 } },
+                    "set": { "id": 2 }
+                }),
+                "update permission required on the table",
+            ),
+            (
+                "delete",
+                json!({ "table": "events", "where": { "id": { "_eq": 1 } } }),
+                "delete permission required on the table",
+            ),
+        ] {
+            let result = call_tool(
+                &state,
+                &session,
+                &HeaderMap::new(),
+                &json!({ "name": name, "arguments": arguments }),
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{name}: {result}");
+            assert_eq!(result["content"][0]["text"], message, "{name}: {result}");
+        }
+    }
 
     fn cols() -> Vec<String> {
         vec!["id".to_string(), "name".to_string(), "status".to_string()]
@@ -8527,6 +8733,11 @@ mod tests {
         let defs = tool_defs();
         let tools = defs.as_array().unwrap();
         assert!(tools.iter().all(|tool| tool.get("outputSchema").is_some()));
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["outputSchema"]["type"] == json!("object"))
+        );
 
         let list_tables = tools
             .iter()
@@ -8570,7 +8781,11 @@ mod tests {
         );
 
         let query = tools.iter().find(|tool| tool["name"] == "query").unwrap();
-        assert_eq!(query["outputSchema"]["oneOf"][0]["type"], json!("array"));
+        assert_eq!(query["outputSchema"]["oneOf"][0]["type"], json!("object"));
+        assert_eq!(
+            query["outputSchema"]["oneOf"][0]["required"],
+            json!(["rows"])
+        );
         assert_eq!(
             query["outputSchema"]["oneOf"][1]["required"],
             json!(["errors"])

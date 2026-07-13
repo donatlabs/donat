@@ -11,36 +11,76 @@ env:
 
 jobs:
   test:
-    name: Tests (unit + conformance)
+    name: Unit and snapshot tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgis/postgis:16-3.4
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 15432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      # Conformance harness: admin connection for per-suite databases.
-      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Build the engine binary first: conformance suites spawn it.
-      - name: Build engine
-        run: cargo build --workspace --bins
       - name: Unit and snapshot tests
         run: cargo test --workspace --exclude donat-conformance
-      - name: Conformance suite
-        run: cargo test -p donat-conformance
+
+  backend-core:
+    name: Shared conformance (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: postgres
+          - backend: sqlite
+          - backend: mysql
+          - backend: clickhouse
+    env:
+      CONF_BACKEND: ${{ matrix.backend }}
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
+      MYSQL_URL: mysql://root:root@127.0.0.1:13306/donat
+      CLICKHOUSE_URL: http://donat:donat@127.0.0.1:18123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: backend-${{ matrix.backend }}
+      - name: Start backend service
+        if: matrix.backend != 'sqlite'
+        run: docker compose -f docker-compose.conformance.yml up -d --wait "${{ matrix.backend }}"
+      - name: Build engine
+        run: cargo build -p donat-server --bin donat
+      - name: Matrix registry and manifest guards
+        run: cargo test -p donat-conformance --lib
+      - name: Shared backend contract
+        run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=4 --nocapture
         env:
           RUST_BACKTRACE: "1"
+      - name: Live MySQL runtime tests
+        if: matrix.backend == 'mysql'
+        run: |
+          cargo test -p donat-server \
+            --test mysql_e2e \
+            --test mysql_runtime \
+            --test mysql_mutations -- --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
+      - name: Live ClickHouse runtime tests
+        if: matrix.backend == 'clickhouse'
+        run: cargo test -p donat-server --test clickhouse_runtime -- --include-ignored --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
+      - name: Full Postgres reference conformance
+        if: matrix.backend == 'postgres'
+        run: cargo test -p donat-conformance -- --test-threads=4
+        env:
+          RUST_BACKTRACE: "1"
+
+  backend-core-gate:
+    name: Conformance matrix
+    if: always()
+    needs: backend-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every backend
+        run: test '${{ needs.backend-core.result }}' = success
 
   audit:
     name: Security advisories (cargo-audit)
@@ -61,7 +101,7 @@ jobs:
 
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
-    needs: test
+    needs: [test, backend-core-gate]
     strategy:
       matrix:
         target:

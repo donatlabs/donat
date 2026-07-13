@@ -244,6 +244,360 @@ use donat_metadata::{
     TableConfiguration, TableEntry, UpdatePermission,
 };
 
+/// Datasource backends covered by the mandatory conformance matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendId {
+    Postgres,
+    Sqlite,
+    Mysql,
+    Clickhouse,
+}
+
+impl BackendId {
+    pub const ALL: [Self; 4] = [Self::Postgres, Self::Sqlite, Self::Mysql, Self::Clickhouse];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+            Self::Mysql => "mysql",
+            Self::Clickhouse => "clickhouse",
+        }
+    }
+
+    pub const fn source_kind(self) -> SourceKind {
+        match self {
+            Self::Postgres => SourceKind::Postgres,
+            Self::Sqlite => SourceKind::Sqlite,
+            Self::Mysql => SourceKind::Mysql,
+            Self::Clickhouse => SourceKind::Clickhouse,
+        }
+    }
+
+    pub fn capabilities(self) -> donat_backend::Capabilities {
+        match self {
+            Self::Postgres => donat_backend::capabilities::postgres(),
+            Self::Sqlite => donat_backend::capabilities::sqlite(),
+            Self::Mysql => donat_backend::capabilities::mysql(),
+            Self::Clickhouse => donat_backend::capabilities::clickhouse(),
+        }
+    }
+
+    pub const fn required_url_env(self) -> Option<&'static str> {
+        match self {
+            Self::Mysql => Some("MYSQL_URL"),
+            Self::Clickhouse => Some("CLICKHOUSE_URL"),
+            Self::Postgres | Self::Sqlite => None,
+        }
+    }
+
+    pub fn validate_configuration(
+        self,
+        get_env: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<()> {
+        let Some(key) = self.required_url_env() else {
+            return Ok(());
+        };
+        match get_env(key) {
+            Some(value) if !value.trim().is_empty() => Ok(()),
+            _ => Err(anyhow!(
+                "CONF_BACKEND={} requires non-empty {key}",
+                self.as_str()
+            )),
+        }
+    }
+
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        let value = value
+            .filter(|value| !value.is_empty())
+            .unwrap_or("postgres");
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.as_str() == value)
+            .ok_or_else(|| {
+                let supported = Self::ALL.map(Self::as_str).join(", ");
+                anyhow!("unknown CONF_BACKEND '{value}'; expected one of: {supported}")
+            })
+    }
+
+    pub fn selected() -> Result<Self> {
+        let backend = Self::parse(std::env::var("CONF_BACKEND").ok().as_deref())?;
+        backend.validate_configuration(|key| std::env::var(key).ok())?;
+        Ok(backend)
+    }
+}
+
+impl From<SourceKind> for BackendId {
+    fn from(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Postgres => Self::Postgres,
+            SourceKind::Sqlite => Self::Sqlite,
+            SourceKind::Mysql => Self::Mysql,
+            SourceKind::Clickhouse => Self::Clickhouse,
+        }
+    }
+}
+
+/// Capabilities used to classify shared conformance cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseCapability {
+    Reads,
+    Transport,
+    Mutations,
+    Relationships,
+    Aggregates,
+    Json,
+    Geo,
+    Relay,
+    Regex,
+    Upsert,
+    Returning,
+    DistinctOn,
+    Lateral,
+    NestedInserts,
+}
+
+impl CaseCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reads => "reads",
+            Self::Transport => "transport",
+            Self::Mutations => "mutations",
+            Self::Relationships => "relationships",
+            Self::Aggregates => "aggregates",
+            Self::Json => "json",
+            Self::Geo => "geo",
+            Self::Relay => "relay",
+            Self::Regex => "regex",
+            Self::Upsert => "upsert",
+            Self::Returning => "returning",
+            Self::DistinctOn => "distinct-on",
+            Self::Lateral => "lateral",
+            Self::NestedInserts => "nested-inserts",
+        }
+    }
+
+    pub fn supported_by(self, backend: BackendId) -> bool {
+        let capabilities = backend.capabilities();
+        match self {
+            Self::Reads | Self::Transport => true,
+            Self::Mutations => capabilities.mutations,
+            Self::Relationships => capabilities.relationships,
+            Self::Aggregates => capabilities.aggregates,
+            Self::Json => capabilities.json_ops != donat_backend::capabilities::JsonOps::None,
+            Self::Geo => capabilities.geo,
+            Self::Relay => capabilities.relay,
+            Self::Regex => capabilities.regex_ops,
+            Self::Upsert => capabilities.upsert != donat_backend::capabilities::UpsertKind::None,
+            Self::Returning => capabilities.returning,
+            Self::DistinctOn => capabilities.distinct_on,
+            Self::Lateral => capabilities.lateral,
+            Self::NestedInserts => capabilities.nested_inserts,
+        }
+    }
+}
+
+/// A backend-specific difference that remains visible in the shared matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownDifference {
+    pub backend: BackendId,
+    pub reason: &'static str,
+    pub tracking: &'static str,
+}
+
+/// One single-sourced behavior case and the capabilities required to run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformanceCase {
+    pub name: &'static str,
+    pub requires: &'static [CaseCapability],
+    pub known_differences: &'static [KnownDifference],
+}
+
+impl ConformanceCase {
+    pub const fn new(name: &'static str, requires: &'static [CaseCapability]) -> Self {
+        Self {
+            name,
+            requires,
+            known_differences: &[],
+        }
+    }
+
+    pub const fn with_known_differences(
+        name: &'static str,
+        requires: &'static [CaseCapability],
+        known_differences: &'static [KnownDifference],
+    ) -> Self {
+        Self {
+            name,
+            requires,
+            known_differences,
+        }
+    }
+}
+
+/// Deterministic outcome counts emitted by one shared conformance group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaseSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub unsupported: usize,
+    pub known_differences: usize,
+    pub failed: usize,
+}
+
+/// Run every declared case exactly once for one backend.
+pub fn run_conformance_cases(
+    group: &'static str,
+    backend: BackendId,
+    cases: &'static [ConformanceCase],
+    mut run: impl FnMut(&'static str),
+) -> CaseSummary {
+    validate_case_manifest(group, cases);
+
+    let mut summary = CaseSummary {
+        total: cases.len(),
+        passed: 0,
+        unsupported: 0,
+        known_differences: 0,
+        failed: 0,
+    };
+    let mut first_failure: Option<Box<dyn std::any::Any + Send>> = None;
+
+    for case in cases {
+        let missing = case
+            .requires
+            .iter()
+            .copied()
+            .filter(|capability| !capability.supported_by(backend))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            summary.unsupported += 1;
+            let capabilities = missing
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "conformance backend={} group={group} case={} outcome=unsupported-by-capability capabilities={capabilities}",
+                backend.as_str(),
+                case.name
+            );
+            continue;
+        }
+
+        if let Some(difference) = case
+            .known_differences
+            .iter()
+            .find(|difference| difference.backend == backend)
+        {
+            summary.known_differences += 1;
+            eprintln!(
+                "conformance backend={} group={group} case={} outcome=known-diff reason={} tracking={}",
+                backend.as_str(),
+                case.name,
+                difference.reason,
+                difference.tracking
+            );
+            continue;
+        }
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(case.name))) {
+            Ok(()) => {
+                summary.passed += 1;
+                eprintln!(
+                    "conformance backend={} group={group} case={} outcome=passed",
+                    backend.as_str(),
+                    case.name
+                );
+            }
+            Err(failure) => {
+                summary.failed += 1;
+                eprintln!(
+                    "conformance backend={} group={group} case={} outcome=failed",
+                    backend.as_str(),
+                    case.name
+                );
+                if first_failure.is_none() {
+                    first_failure = Some(failure);
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "conformance backend={} group={group} total={} passed={} unsupported={} known-diff={} failed={}",
+        backend.as_str(),
+        summary.total,
+        summary.passed,
+        summary.unsupported,
+        summary.known_differences,
+        summary.failed
+    );
+
+    if let Some(failure) = first_failure {
+        std::panic::resume_unwind(failure);
+    }
+    summary
+}
+
+fn validate_case_manifest(group: &str, cases: &[ConformanceCase]) {
+    assert!(!group.trim().is_empty(), "conformance group name is empty");
+    assert!(
+        !cases.is_empty(),
+        "conformance group '{group}' has no cases"
+    );
+
+    for (case_index, case) in cases.iter().enumerate() {
+        assert!(
+            !case.name.trim().is_empty(),
+            "conformance group '{group}' has an empty case name"
+        );
+        assert!(
+            !cases[..case_index]
+                .iter()
+                .any(|existing| existing.name == case.name),
+            "conformance group '{group}' has duplicate case '{}'",
+            case.name
+        );
+        for (requirement_index, requirement) in case.requires.iter().enumerate() {
+            assert!(
+                !case.requires[..requirement_index].contains(requirement),
+                "conformance case '{group}/{}' repeats capability '{}'",
+                case.name,
+                requirement.as_str()
+            );
+        }
+        for (difference_index, difference) in case.known_differences.iter().enumerate() {
+            assert!(
+                !difference.reason.trim().is_empty(),
+                "known difference '{group}/{}' has no reason",
+                case.name
+            );
+            assert!(
+                !difference.tracking.trim().is_empty(),
+                "known difference '{group}/{}' has no tracking reference",
+                case.name
+            );
+            assert!(
+                !case.known_differences[..difference_index]
+                    .iter()
+                    .any(|existing| existing.backend == difference.backend),
+                "conformance case '{group}/{}' repeats known difference for backend '{}'",
+                case.name,
+                difference.backend.as_str()
+            );
+            assert!(
+                case.requires
+                    .iter()
+                    .all(|capability| capability.supported_by(difference.backend)),
+                "known difference '{group}/{}' hides an unsupported capability for backend '{}'",
+                case.name,
+                difference.backend.as_str()
+            );
+        }
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -252,6 +606,53 @@ fn workspace_root() -> PathBuf {
 }
 
 static BUILD_ENGINE: Once = Once::new();
+const ENGINE_HEALTH_DEADLINE: Duration = Duration::from_secs(30);
+const ENGINE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const ENGINE_START_ATTEMPTS: usize = 3;
+const ENGINE_START_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct EngineStartFailure {
+    attempt: usize,
+    reason: String,
+    log_path: PathBuf,
+}
+
+fn retry_engine_start<T>(
+    attempts: usize,
+    retry_delay: Duration,
+    mut start: impl FnMut(usize) -> Result<T, EngineStartFailure>,
+) -> Result<T, Vec<EngineStartFailure>> {
+    assert!(attempts > 0, "engine startup needs at least one attempt");
+    let mut failures = Vec::with_capacity(attempts);
+    for attempt in 1..=attempts {
+        match start(attempt) {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                failures.push(failure);
+                if attempt < attempts {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+    Err(failures)
+}
+
+fn format_engine_start_failures(failures: &[EngineStartFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "attempt {}: {}; see {}",
+                failure.attempt,
+                failure.reason,
+                failure.log_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 pub fn engine_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DONAT_BIN") {
@@ -271,6 +672,39 @@ pub fn engine_binary() -> PathBuf {
     bin
 }
 
+fn engine_is_healthy(client: &reqwest::blocking::Client, base_url: &str) -> bool {
+    client
+        .get(format!("{base_url}/healthz"))
+        .timeout(ENGINE_HEALTH_PROBE_TIMEOUT)
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn wait_for_engine_health(
+    client: &reqwest::blocking::Client,
+    proc: &mut EngineProc,
+) -> Option<String> {
+    let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
+    loop {
+        if engine_is_healthy(client, &proc.base_url) {
+            return None;
+        }
+        match proc.child.try_wait() {
+            Ok(Some(status)) => {
+                return Some(format!("exited before becoming healthy with {status}"));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Some(format!("could not check engine process status: {error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Some("did not become healthy before the startup deadline".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn pg_admin_url() -> String {
     std::env::var("PG_URL")
         .unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:15432/postgres".into())
@@ -284,14 +718,159 @@ fn with_db(admin_url: &str, db: &str) -> String {
     format!("{prefix}/{db}")
 }
 
-fn create_suite_db(name: &str) -> Result<String> {
+fn create_suite_db(name: &str) -> Result<(String, String)> {
     let admin = pg_admin_url();
     let mut client = postgres::Client::connect(&admin, postgres::NoTls)
         .with_context(|| format!("connecting to {admin} (is the postgres container up?)"))?;
     client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))?;
     client.batch_execute(&format!("CREATE DATABASE {name}"))?;
-    Ok(with_db(&admin, name))
+    let database_url = with_db(&admin, name);
+    Ok((admin, database_url))
 }
+
+fn suite_database_name(suite: &str) -> String {
+    let sanitized = suite
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .take(24)
+        .collect::<String>();
+    format!(
+        "conf_{}_{}_{}",
+        sanitized,
+        std::process::id(),
+        NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+struct SuiteDatabase {
+    url: String,
+    schema: String,
+    cleanup: SuiteCleanup,
+}
+
+enum SuiteCleanup {
+    Postgres { admin_url: String, name: String },
+    Sqlite(PathBuf),
+    Mysql { admin_url: String, name: String },
+    Clickhouse { admin_url: String, name: String },
+}
+
+impl SuiteDatabase {
+    fn create(backend: BackendId, name: &str) -> Result<Self> {
+        match backend {
+            BackendId::Postgres => Ok(Self {
+                url: {
+                    let (_, url) = create_suite_db(name)?;
+                    url
+                },
+                schema: "public".to_string(),
+                cleanup: SuiteCleanup::Postgres {
+                    admin_url: pg_admin_url(),
+                    name: name.to_string(),
+                },
+            }),
+            BackendId::Sqlite => {
+                let path = std::env::temp_dir().join(format!("donat_{name}.sqlite"));
+                let _ = std::fs::remove_file(&path);
+                rusqlite::Connection::open(&path)
+                    .with_context(|| format!("creating SQLite database {}", path.display()))?;
+                Ok(Self {
+                    url: path.to_string_lossy().into_owned(),
+                    schema: "main".to_string(),
+                    cleanup: SuiteCleanup::Sqlite(path),
+                })
+            }
+            BackendId::Mysql => {
+                use mysql::prelude::Queryable;
+
+                let admin_url = std::env::var("MYSQL_URL").context("MYSQL_URL is required")?;
+                let mut client = mysql::Conn::new(admin_url.as_str())
+                    .with_context(|| format!("connecting to MySQL at {admin_url}"))?;
+                client.query_drop(format!("DROP DATABASE IF EXISTS `{name}`"))?;
+                client.query_drop(format!("CREATE DATABASE `{name}`"))?;
+                let mut url = reqwest::Url::parse(&admin_url).context("parsing MYSQL_URL")?;
+                url.set_path(&format!("/{name}"));
+                Ok(Self {
+                    url: url.to_string(),
+                    schema: name.to_string(),
+                    cleanup: SuiteCleanup::Mysql {
+                        admin_url,
+                        name: name.to_string(),
+                    },
+                })
+            }
+            BackendId::Clickhouse => {
+                let configured =
+                    std::env::var("CLICKHOUSE_URL").context("CLICKHOUSE_URL is required")?;
+                let mut admin =
+                    reqwest::Url::parse(&configured).context("parsing CLICKHOUSE_URL")?;
+                let retained = admin
+                    .query_pairs()
+                    .filter(|(key, _)| key != "database")
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<Vec<_>>();
+                admin.set_query(None);
+                admin.query_pairs_mut().extend_pairs(retained);
+                let admin_url = admin.to_string();
+                let http = reqwest::blocking::Client::new();
+                http.post(&admin_url)
+                    .body(format!("DROP DATABASE IF EXISTS `{name}`"))
+                    .send()?
+                    .error_for_status()?;
+                http.post(&admin_url)
+                    .body(format!("CREATE DATABASE `{name}`"))
+                    .send()?
+                    .error_for_status()?;
+                let mut database = admin;
+                database.query_pairs_mut().append_pair("database", name);
+                Ok(Self {
+                    url: database.to_string(),
+                    schema: name.to_string(),
+                    cleanup: SuiteCleanup::Clickhouse {
+                        admin_url,
+                        name: name.to_string(),
+                    },
+                })
+            }
+        }
+    }
+}
+
+impl Drop for SuiteDatabase {
+    fn drop(&mut self) {
+        match &self.cleanup {
+            SuiteCleanup::Postgres { admin_url, name } => {
+                if let Ok(mut client) = postgres::Client::connect(admin_url, postgres::NoTls) {
+                    let _ = client
+                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+                }
+            }
+            SuiteCleanup::Sqlite(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+            SuiteCleanup::Mysql { admin_url, name } => {
+                use mysql::prelude::Queryable;
+                if let Ok(mut client) = mysql::Conn::new(admin_url.as_str()) {
+                    let _ = client.query_drop(format!("DROP DATABASE IF EXISTS `{name}`"));
+                }
+            }
+            SuiteCleanup::Clickhouse { admin_url, name } => {
+                let _ = reqwest::blocking::Client::new()
+                    .post(admin_url)
+                    .body(format!("DROP DATABASE IF EXISTS `{name}`"))
+                    .send();
+            }
+        }
+    }
+}
+
+static NEXT_DATABASE: AtomicU32 = AtomicU32::new(0);
 
 fn free_port() -> u16 {
     static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
@@ -319,15 +898,35 @@ fn free_port() -> u16 {
 /// (so `track_table` & co. have somewhere to live). The source points at
 /// `DONAT_DATABASE_URL`, which the engine resolves to the suite database.
 fn empty_metadata() -> Metadata {
+    default_metadata_with_configuration(
+        BackendId::Postgres,
+        serde_json::from_value(json!({
+            "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
+        }))
+        .expect("static source configuration"),
+    )
+}
+
+fn default_metadata_for(backend: BackendId, database_url: &str) -> Metadata {
+    default_metadata_with_configuration(
+        backend,
+        serde_json::from_value(json!({
+            "connection_info": { "database_url": database_url }
+        }))
+        .expect("backend source configuration"),
+    )
+}
+
+fn default_metadata_with_configuration(
+    backend: BackendId,
+    configuration: donat_metadata::SourceConfiguration,
+) -> Metadata {
     Metadata {
         version: 3,
         sources: vec![Source {
             name: "default".to_string(),
-            kind: SourceKind::Postgres,
-            configuration: serde_json::from_value(json!({
-                "connection_info": { "database_url": { "from_env": "DONAT_DATABASE_URL" } }
-            }))
-            .expect("static source configuration"),
+            kind: backend.source_kind(),
+            configuration,
             tables: vec![],
             functions: vec![],
         }],
@@ -351,6 +950,7 @@ pub enum Transport {
 
 pub struct Suite {
     name: String,
+    backend: Option<BackendId>,
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
@@ -358,12 +958,14 @@ pub struct Suite {
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
+    initial_metadata: Option<Metadata>,
 }
 
 impl Suite {
     pub fn new(name: &str) -> Self {
         Suite {
             name: name.to_string(),
+            backend: None,
             env: vec![],
             args: vec![],
             admin_secret: None,
@@ -371,7 +973,18 @@ impl Suite {
             cron: None,
             event: None,
             run_migrations: false,
+            initial_metadata: None,
         }
+    }
+
+    pub fn backend(mut self, backend: BackendId) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    pub fn initial_metadata(mut self, metadata: Metadata) -> Self {
+        self.initial_metadata = Some(metadata);
+        self
     }
 
     /// Apply the `migrations/` DDL (the `donat` catalog) to the suite
@@ -457,15 +1070,22 @@ impl Suite {
     /// The engine starts lazily on the first request, once all setup ops
     /// have been accumulated into the in-memory metadata.
     pub fn start(self) -> Running {
-        let db_url =
-            create_suite_db(&format!("conf_{}", self.name)).expect("creating suite database");
+        let backend = self
+            .backend
+            .map(Ok)
+            .unwrap_or_else(BackendId::selected)
+            .expect("selecting conformance backend");
+        let database = SuiteDatabase::create(backend, &suite_database_name(&self.name))
+            .expect("creating suite database");
+        let db_url = database.url.clone();
+        let schema = database.schema.clone();
 
         // Fresh database: postgis is used pervasively by fixtures. Concurrent
         // CREATE EXTENSION across databases races inside Postgres (shared
         // library/template locks) — serialize within this process and retry
         // to cover other test processes.
         static POSTGIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        {
+        if backend == BackendId::Postgres {
             let _guard = POSTGIS_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -492,8 +1112,13 @@ impl Suite {
             );
         }
 
+        let metadata = self
+            .initial_metadata
+            .unwrap_or_else(|| default_metadata_for(backend, &db_url));
+
         Running {
             name: self.name,
+            backend,
             env: self.env,
             args: self.args,
             admin_secret: self.admin_secret,
@@ -502,7 +1127,9 @@ impl Suite {
             event: self.event,
             run_migrations: self.run_migrations,
             db_url,
-            metadata: RefCell::new(empty_metadata()),
+            schema,
+            _database: database,
+            metadata: RefCell::new(metadata),
             engine: RefCell::new(None),
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -521,8 +1148,22 @@ struct EngineProc {
     _metadata_dir: PathBuf,
 }
 
+impl Drop for EngineProc {
+    fn drop(&mut self) {
+        let running = match self.child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) | Err(_) => true,
+        };
+        if running {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 pub struct Running {
     pub name: String,
+    pub backend: BackendId,
     env: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
@@ -531,6 +1172,8 @@ pub struct Running {
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
     db_url: String,
+    pub schema: String,
+    _database: SuiteDatabase,
     /// Accumulated metadata, applied lazily when the engine is spawned.
     metadata: RefCell<Metadata>,
     /// The spawned engine, started on first request (`ensure_engine`).
@@ -538,12 +1181,54 @@ pub struct Running {
     http: reqwest::blocking::Client,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FixtureColumnType {
+    BigInt,
+    Boolean,
+    Text,
+    Json,
+}
+
+fn fixture_native_type(backend: BackendId, ty: FixtureColumnType) -> &'static str {
+    match (backend, ty) {
+        (BackendId::Clickhouse, FixtureColumnType::BigInt) => "UInt64",
+        (BackendId::Clickhouse, FixtureColumnType::Boolean) => "Bool",
+        (BackendId::Clickhouse, FixtureColumnType::Text) => "String",
+        (BackendId::Clickhouse, FixtureColumnType::Json) => "JSON",
+        (BackendId::Sqlite, FixtureColumnType::BigInt) => "BIGINT",
+        (BackendId::Sqlite, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Sqlite, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Sqlite, FixtureColumnType::Json) => "JSON",
+        (BackendId::Mysql, FixtureColumnType::BigInt) => "BIGINT",
+        (BackendId::Mysql, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Mysql, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Mysql, FixtureColumnType::Json) => "JSON",
+        (BackendId::Postgres, FixtureColumnType::BigInt) => "BIGINT",
+        (BackendId::Postgres, FixtureColumnType::Boolean) => "BOOLEAN",
+        (BackendId::Postgres, FixtureColumnType::Text) => "TEXT",
+        (BackendId::Postgres, FixtureColumnType::Json) => "JSONB",
+    }
+}
+
+pub struct FixtureColumn {
+    pub name: &'static str,
+    pub ty: FixtureColumnType,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
+pub struct TableFixture {
+    pub name: &'static str,
+    pub columns: &'static [FixtureColumn],
+    pub rows: Vec<Vec<Json>>,
+    pub role: &'static str,
+    pub allow_aggregations: bool,
+    pub mutations: bool,
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
-        if let Some(mut proc) = self.engine.borrow_mut().take() {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-        }
+        let _ = self.engine.borrow_mut().take();
     }
 }
 
@@ -603,6 +1288,298 @@ fn same_object(a: &QualifiedTable, b: &QualifiedTable) -> bool {
 }
 
 impl Running {
+    pub fn add_select_permission(
+        &self,
+        table_name: &str,
+        role: &str,
+        columns: Json,
+        filter: Json,
+        allow_aggregations: bool,
+    ) {
+        self.add_select_permission_document(
+            table_name,
+            role,
+            json!({
+                "columns": columns,
+                "filter": filter,
+                "allow_aggregations": allow_aggregations
+            }),
+        );
+    }
+
+    pub fn add_select_permission_document(&self, table_name: &str, role: &str, document: Json) {
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: table_name.to_string(),
+        };
+        let permission: SelectPermission =
+            serde_json::from_value(document).expect("fixture select permission");
+        self.with_table(&table, |entry| {
+            entry.select_permissions.push(PermissionEntry {
+                role: role.to_string(),
+                permission,
+                comment: None,
+            });
+        });
+    }
+
+    pub fn add_insert_permission_document(&self, table_name: &str, role: &str, document: Json) {
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: table_name.to_string(),
+        };
+        let permission: InsertPermission =
+            serde_json::from_value(document).expect("fixture insert permission");
+        self.with_table(&table, |entry| {
+            entry.insert_permissions.push(PermissionEntry {
+                role: role.to_string(),
+                permission,
+                comment: None,
+            });
+        });
+    }
+
+    pub fn add_relationship(
+        &self,
+        local_table: &str,
+        name: &str,
+        remote_table: &str,
+        column_mapping: &[(&str, &str)],
+        array: bool,
+    ) {
+        let local = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: local_table.to_string(),
+        };
+        let remote = json!({ "schema": self.schema, "name": remote_table });
+        let mapping = column_mapping
+            .iter()
+            .map(|(local, remote)| ((*local).to_string(), json!(remote)))
+            .collect::<serde_json::Map<_, _>>();
+        let relationship = json!({
+            "name": name,
+            "using": {
+                "manual_configuration": {
+                    "remote_table": remote,
+                    "column_mapping": mapping
+                }
+            }
+        });
+        self.with_table(&local, |entry| {
+            if array {
+                entry.array_relationships.push(
+                    serde_json::from_value(relationship).expect("fixture array relationship"),
+                );
+            } else {
+                entry.object_relationships.push(
+                    serde_json::from_value(relationship).expect("fixture object relationship"),
+                );
+            }
+        });
+    }
+
+    pub fn install_table(&self, fixture: &TableFixture) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "fixtures must be installed before the engine starts"
+        );
+        let quote = |name: &str| match self.backend {
+            BackendId::Mysql | BackendId::Clickhouse => {
+                format!("`{}`", name.replace('`', "``"))
+            }
+            BackendId::Postgres | BackendId::Sqlite => {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+        };
+        let columns = fixture
+            .columns
+            .iter()
+            .map(|column| {
+                let base_type = fixture_native_type(self.backend, column.ty);
+                let native_type = if self.backend == BackendId::Clickhouse && column.nullable {
+                    format!("Nullable({base_type})")
+                } else {
+                    base_type.to_string()
+                };
+                let nullable = if column.nullable || self.backend == BackendId::Clickhouse {
+                    ""
+                } else {
+                    " NOT NULL"
+                };
+                let primary = if column.primary_key && self.backend != BackendId::Clickhouse {
+                    " PRIMARY KEY"
+                } else {
+                    ""
+                };
+                format!("{} {}{nullable}{primary}", quote(column.name), native_type)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = format!("{}.{}", quote(&self.schema), quote(fixture.name));
+        let engine = if self.backend == BackendId::Clickhouse {
+            let order = fixture
+                .columns
+                .iter()
+                .find(|column| column.primary_key)
+                .map(|column| quote(column.name))
+                .unwrap_or_else(|| "tuple()".to_string());
+            format!(" ENGINE = MergeTree ORDER BY {order}")
+        } else {
+            String::new()
+        };
+        self.execute_fixture_sql(&format!("CREATE TABLE {table} ({columns}){engine}"));
+
+        if !fixture.rows.is_empty() {
+            let column_names = fixture
+                .columns
+                .iter()
+                .map(|column| quote(column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = fixture
+                .rows
+                .iter()
+                .map(|row| {
+                    assert_eq!(row.len(), fixture.columns.len());
+                    format!(
+                        "({})",
+                        row.iter()
+                            .zip(fixture.columns)
+                            .map(|(value, column)| self.fixture_literal(value, column.ty))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.execute_fixture_sql(&format!(
+                "INSERT INTO {table} ({column_names}) VALUES {rows}"
+            ));
+        }
+
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: fixture.name.to_string(),
+        };
+        let permission: SelectPermission = serde_json::from_value(json!({
+            "columns": "*",
+            "filter": {},
+            "allow_aggregations": fixture.allow_aggregations
+        }))
+        .expect("fixture select permission");
+        self.with_table(&table, |entry| {
+            entry.configuration = Some(
+                serde_json::from_value(json!({ "custom_name": fixture.name }))
+                    .expect("fixture table configuration"),
+            );
+            entry.select_permissions.push(PermissionEntry {
+                role: fixture.role.to_string(),
+                permission,
+                comment: None,
+            });
+            if fixture.mutations {
+                entry.insert_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({
+                        "columns": "*",
+                        "check": {}
+                    }))
+                    .expect("fixture insert permission"),
+                    comment: None,
+                });
+                entry.update_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({
+                        "columns": "*",
+                        "filter": {},
+                        "check": {}
+                    }))
+                    .expect("fixture update permission"),
+                    comment: None,
+                });
+                entry.delete_permissions.push(PermissionEntry {
+                    role: fixture.role.to_string(),
+                    permission: serde_json::from_value(json!({ "filter": {} }))
+                        .expect("fixture delete permission"),
+                    comment: None,
+                });
+            }
+        });
+    }
+
+    fn execute_fixture_sql(&self, sql: &str) {
+        match self.backend {
+            BackendId::Postgres => {
+                pg_client(&self.db_url)
+                    .batch_execute(sql)
+                    .unwrap_or_else(|error| {
+                        panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                    })
+            }
+            BackendId::Sqlite => rusqlite::Connection::open(&self.db_url)
+                .and_then(|connection| connection.execute_batch(sql))
+                .unwrap_or_else(|error| {
+                    panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                }),
+            BackendId::Mysql => {
+                use mysql::prelude::Queryable;
+                let mut connection =
+                    mysql::Conn::new(self.db_url.as_str()).unwrap_or_else(|error| {
+                        panic!("[{}] MySQL connect failed: {error}", self.name)
+                    });
+                connection.query_drop(sql).unwrap_or_else(|error| {
+                    panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                });
+            }
+            BackendId::Clickhouse => {
+                self.http
+                    .post(&self.db_url)
+                    .body(sql.to_string())
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .unwrap_or_else(|error| {
+                        panic!("[{}] fixture SQL failed: {error}\n{sql}", self.name)
+                    });
+            }
+        }
+    }
+
+    fn fixture_literal(&self, value: &Json, ty: FixtureColumnType) -> String {
+        use donat_backend::Dialect;
+
+        if value.is_null() {
+            return "NULL".to_string();
+        }
+        let dialect = match self.backend {
+            BackendId::Postgres => {
+                donat_backend::AnyDialect::Postgres(donat_backend::PostgresDialect)
+            }
+            BackendId::Sqlite => donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect),
+            BackendId::Mysql => donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect),
+            BackendId::Clickhouse => {
+                donat_backend::AnyDialect::Clickhouse(donat_backend::ClickhouseDialect)
+            }
+        };
+        match value {
+            Json::Bool(value) => value.to_string(),
+            Json::Number(value) => value.to_string(),
+            Json::String(value) => dialect.quote_literal(value),
+            Json::Array(_) | Json::Object(_) => {
+                let literal = dialect.quote_literal(&value.to_string());
+                match (self.backend, ty) {
+                    (BackendId::Postgres, FixtureColumnType::Json) => {
+                        format!("{literal}::jsonb")
+                    }
+                    (BackendId::Mysql | BackendId::Clickhouse, FixtureColumnType::Json) => {
+                        format!("CAST({literal} AS JSON)")
+                    }
+                    _ => literal,
+                }
+            }
+            Json::Null => unreachable!(),
+        }
+    }
+
     /// Find (or create) the table entry for `args.table` in the default
     /// source and run `f` against it. Tables are matched by resolved
     /// (schema, name), so the bare-name and qualified forms unify.
@@ -1250,50 +2227,79 @@ impl Running {
                 self.name
             );
         }
-        let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
-        let log = std::fs::File::create(log_dir.join(format!("{}.log", self.name))).unwrap();
 
-        let mut cmd = Command::new(engine_binary());
-        cmd.arg("--port")
-            .arg(port.to_string())
-            .arg("--metadata-dir")
-            .arg(&metadata_dir)
-            .env("DONAT_DATABASE_URL", &self.db_url)
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log));
-        for a in &self.args {
-            cmd.arg(a);
-        }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        let child = cmd.spawn().expect("spawning donat");
+        // `free_port` probes a port and then releases it before the child can
+        // bind. Under parallel conformance, another process may claim that
+        // port in this small window. Retry the whole startup so a transient
+        // bind or database initialization failure does not fail an unrelated
+        // suite. Failed children are always reaped by `EngineProc::drop`
+        // before the next attempt.
+        let start_result =
+            retry_engine_start(ENGINE_START_ATTEMPTS, ENGINE_START_RETRY_DELAY, |attempt| {
+                let port = free_port();
+                let log_path = if attempt == ENGINE_START_ATTEMPTS {
+                    log_dir.join(format!("{}.log", self.name))
+                } else {
+                    log_dir.join(format!("{}.attempt-{attempt}.log", self.name))
+                };
+                let log = std::fs::File::create(&log_path).unwrap();
 
-        let proc = EngineProc {
-            child,
-            base_url: format!("http://127.0.0.1:{port}"),
-            ws_base: format!("ws://127.0.0.1:{port}"),
-            _metadata_dir: metadata_dir,
+                let mut cmd = Command::new(engine_binary());
+                cmd.arg("--port")
+                    .arg(port.to_string())
+                    .arg("--metadata-dir")
+                    .arg(&metadata_dir)
+                    .env("DONAT_DATABASE_URL", &self.db_url)
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log));
+                for a in &self.args {
+                    cmd.arg(a);
+                }
+                for (k, v) in &self.env {
+                    cmd.env(k, v);
+                }
+
+                let child = match cmd.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return Err(EngineStartFailure {
+                            attempt,
+                            reason: format!("could not spawn donat: {error}"),
+                            log_path,
+                        });
+                    }
+                };
+
+                let mut proc = EngineProc {
+                    child,
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    ws_base: format!("ws://127.0.0.1:{port}"),
+                    _metadata_dir: metadata_dir.clone(),
+                };
+
+                if let Some(reason) = wait_for_engine_health(&self.http, &mut proc) {
+                    drop(proc);
+                    Err(EngineStartFailure {
+                        attempt,
+                        reason,
+                        log_path,
+                    })
+                } else {
+                    Ok(proc)
+                }
+            });
+
+        let proc = match start_result {
+            Ok(proc) => proc,
+            Err(failures) => panic!(
+                "engine for suite {} failed to become healthy after {ENGINE_START_ATTEMPTS} attempts: {}",
+                self.name,
+                format_engine_start_failures(&failures)
+            ),
         };
 
-        // Wait healthy.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Ok(r) = self.http.get(format!("{}/healthz", proc.base_url)).send()
-                && r.status().is_success()
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "engine for suite {} did not become healthy; see target/conformance-logs/{}.log",
-                self.name,
-                self.name
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
         // Let webhook callback endpoints reach the now-running engine.
         if let Some(handle) = &self.webhook {
             handle.set(&proc.base_url, self.admin_secret.clone());
@@ -1362,6 +2368,25 @@ impl Running {
     /// the harness never depends on the runtime admin API. All other paths
     /// (graphql, relay, ...) reach the engine.
     pub fn post(&self, path: &str, body: &Json, headers: &[(String, String)]) -> (u16, Json) {
+        self.post_inner(path, body, headers, true)
+    }
+
+    pub fn post_without_mcp_protocol(
+        &self,
+        path: &str,
+        body: &Json,
+        headers: &[(String, String)],
+    ) -> (u16, Json) {
+        self.post_inner(path, body, headers, false)
+    }
+
+    fn post_inner(
+        &self,
+        path: &str,
+        body: &Json,
+        headers: &[(String, String)],
+        add_mcp_protocol: bool,
+    ) -> (u16, Json) {
         if path == "/v1/query" || path == "/v2/query" || path == "/v1/metadata" {
             // Admin-API paths are applied in-harness rather than POSTed.
             // Before the engine starts they accumulate into the boot
@@ -1381,6 +2406,16 @@ impl Running {
             .any(|(k, _)| k.eq_ignore_ascii_case("accept"));
         if path == "/mcp" && !has_accept {
             req = req.header("Accept", "application/json, text/event-stream");
+        }
+        let has_protocol = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("MCP-Protocol-Version"));
+        if path == "/mcp"
+            && add_mcp_protocol
+            && !has_protocol
+            && body.get("method").and_then(Json::as_str) != Some("initialize")
+        {
+            req = req.header("MCP-Protocol-Version", "2025-06-18");
         }
         for (k, v) in headers {
             req = req.header(k, v);
@@ -1732,6 +2767,499 @@ fn strip_mcp_content(v: &Json) -> Json {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+
+    #[test]
+    fn backend_registry_has_stable_ci_ids() {
+        assert_eq!(
+            BackendId::ALL.map(BackendId::as_str),
+            ["postgres", "sqlite", "mysql", "clickhouse"]
+        );
+    }
+
+    #[test]
+    fn engine_health_probe_timeout_is_bounded_per_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("binding health test server");
+        let address = listener.local_addr().expect("health test address");
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accepting health probe");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("health probe did not time out promptly");
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        assert!(!engine_is_healthy(&client, &format!("http://{address}")));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "one health probe consumed the whole startup deadline"
+        );
+
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_start_retry_stops_after_success() {
+        let mut calls = 0;
+        let result = retry_engine_start(3, Duration::ZERO, |attempt| {
+            calls += 1;
+            if attempt < 3 {
+                Err(EngineStartFailure {
+                    attempt,
+                    reason: format!("transient failure {attempt}"),
+                    log_path: PathBuf::from(format!("attempt-{attempt}.log")),
+                })
+            } else {
+                Ok(attempt)
+            }
+        });
+
+        assert_eq!(calls, 3);
+        assert_eq!(result.expect("third startup attempt succeeds"), 3);
+    }
+
+    #[test]
+    fn engine_start_failure_diagnostics_include_every_attempt_log() {
+        let failures = retry_engine_start::<()>(3, Duration::ZERO, |attempt| {
+            Err(EngineStartFailure {
+                attempt,
+                reason: format!("startup failure {attempt}"),
+                log_path: PathBuf::from(format!("attempt-{attempt}.log")),
+            })
+        })
+        .expect_err("all startup attempts fail");
+
+        assert_eq!(failures.len(), 3);
+        let diagnostics = format_engine_start_failures(&failures);
+        for attempt in 1..=3 {
+            assert!(diagnostics.contains(&format!("attempt {attempt}")));
+            assert!(diagnostics.contains(&format!("attempt-{attempt}.log")));
+        }
+    }
+
+    #[test]
+    fn free_ports_are_unique_when_allocated_in_parallel() {
+        let handles: Vec<_> = (0..8).map(|_| std::thread::spawn(free_port)).collect();
+        let mut ports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("port allocator thread succeeds"))
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_proc_drop_kills_and_reaps_child() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn cleanup test child");
+        let pid = child.id().to_string();
+        let proc = EngineProc {
+            child,
+            base_url: "http://127.0.0.1:1".to_string(),
+            ws_base: "ws://127.0.0.1:1".to_string(),
+            _metadata_dir: PathBuf::new(),
+        };
+
+        drop(proc);
+
+        let status = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe cleanup test child");
+        assert!(!status.success(), "child {pid} is still running");
+    }
+
+    #[test]
+    fn neutral_boolean_fixture_type_is_rendered_for_every_backend() {
+        assert_eq!(
+            fixture_native_type(BackendId::Postgres, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Sqlite, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Mysql, FixtureColumnType::Boolean),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            fixture_native_type(BackendId::Clickhouse, FixtureColumnType::Boolean),
+            "Bool"
+        );
+    }
+
+    #[test]
+    fn neutral_bigint_fixture_keeps_bigint_affinity_on_sqlite() {
+        assert_eq!(
+            fixture_native_type(BackendId::Sqlite, FixtureColumnType::BigInt),
+            "BIGINT"
+        );
+    }
+
+    #[test]
+    fn backend_selection_defaults_to_postgres() {
+        assert_eq!(BackendId::parse(None).unwrap(), BackendId::Postgres);
+        assert_eq!(BackendId::parse(Some("")).unwrap(), BackendId::Postgres);
+    }
+
+    #[test]
+    fn backend_selection_parses_every_registered_backend() {
+        for backend in BackendId::ALL {
+            assert_eq!(BackendId::parse(Some(backend.as_str())).unwrap(), backend);
+        }
+    }
+
+    #[test]
+    fn backend_selection_rejects_unknown_values() {
+        let err = BackendId::parse(Some("oracle")).unwrap_err();
+        assert!(err.to_string().contains("oracle"), "{err}");
+        for backend in BackendId::ALL {
+            assert!(err.to_string().contains(backend.as_str()), "{err}");
+        }
+    }
+
+    #[test]
+    fn backend_registry_covers_every_source_kind() {
+        for backend in BackendId::ALL {
+            assert_eq!(BackendId::from(backend.source_kind()), backend);
+        }
+    }
+
+    #[test]
+    fn backend_registry_uses_engine_capabilities() {
+        assert_eq!(
+            BackendId::Postgres.capabilities(),
+            donat_backend::capabilities::postgres()
+        );
+        assert_eq!(
+            BackendId::Sqlite.capabilities(),
+            donat_backend::capabilities::sqlite()
+        );
+        assert_eq!(
+            BackendId::Mysql.capabilities(),
+            donat_backend::capabilities::mysql()
+        );
+        assert_eq!(
+            BackendId::Clickhouse.capabilities(),
+            donat_backend::capabilities::clickhouse()
+        );
+    }
+
+    #[test]
+    fn case_capabilities_follow_backend_registry() {
+        for backend in BackendId::ALL {
+            assert!(CaseCapability::Reads.supported_by(backend));
+            assert_eq!(
+                CaseCapability::Mutations.supported_by(backend),
+                backend.capabilities().mutations
+            );
+            assert_eq!(
+                CaseCapability::Relationships.supported_by(backend),
+                backend.capabilities().relationships
+            );
+            assert_eq!(
+                CaseCapability::Json.supported_by(backend),
+                backend.capabilities().json_ops != donat_backend::capabilities::JsonOps::None
+            );
+        }
+    }
+
+    #[test]
+    fn case_runner_counts_passed_unsupported_and_known_differences() {
+        const KNOWN_DIFFERENCES: &[KnownDifference] = &[KnownDifference {
+            backend: BackendId::Clickhouse,
+            reason: "tracked output difference",
+            tracking: "knowledgebase/multi-backend/decisions/006-mandatory-conformance-backend-matrix.md",
+        }];
+        const CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("read", &[CaseCapability::Reads]),
+            ConformanceCase::new("write", &[CaseCapability::Mutations]),
+            ConformanceCase::with_known_differences(
+                "known-difference",
+                &[CaseCapability::Reads],
+                KNOWN_DIFFERENCES,
+            ),
+        ];
+
+        let mut called = Vec::new();
+        let summary = run_conformance_cases("runner-unit", BackendId::Clickhouse, CASES, |name| {
+            called.push(name)
+        });
+
+        assert_eq!(called, ["read"]);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.unsupported, 1);
+        assert_eq!(summary.known_differences, 1);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn case_runner_rejects_an_invalid_manifest() {
+        const DUPLICATE_CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("duplicate", &[CaseCapability::Reads]),
+            ConformanceCase::new("duplicate", &[CaseCapability::Reads]),
+        ];
+        assert!(
+            std::panic::catch_unwind(|| run_conformance_cases(
+                "duplicates",
+                BackendId::Postgres,
+                DUPLICATE_CASES,
+                |_| {}
+            ))
+            .is_err()
+        );
+
+        const UNTRACKED: &[KnownDifference] = &[KnownDifference {
+            backend: BackendId::Postgres,
+            reason: "",
+            tracking: "",
+        }];
+        const UNTRACKED_CASE: &[ConformanceCase] = &[ConformanceCase::with_known_differences(
+            "untracked",
+            &[CaseCapability::Reads],
+            UNTRACKED,
+        )];
+        assert!(
+            std::panic::catch_unwind(|| run_conformance_cases(
+                "untracked",
+                BackendId::Postgres,
+                UNTRACKED_CASE,
+                |_| {}
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_runner_records_all_failures_before_failing_the_test() {
+        const CASES: &[ConformanceCase] = &[
+            ConformanceCase::new("first", &[CaseCapability::Reads]),
+            ConformanceCase::new("second", &[CaseCapability::Reads]),
+        ];
+        let mut called = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_conformance_cases("failures", BackendId::Postgres, CASES, |name| {
+                called.push(name);
+                panic!("failure in {name}");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(called, ["first", "second"]);
+    }
+
+    #[test]
+    fn in_process_and_default_backends_need_no_explicit_url() {
+        BackendId::Postgres
+            .validate_configuration(|_| None)
+            .unwrap();
+        BackendId::Sqlite.validate_configuration(|_| None).unwrap();
+    }
+
+    #[test]
+    fn service_backends_require_explicit_urls() {
+        let mysql = BackendId::Mysql
+            .validate_configuration(|_| None)
+            .unwrap_err();
+        assert!(mysql.to_string().contains("MYSQL_URL"), "{mysql}");
+        let clickhouse = BackendId::Clickhouse
+            .validate_configuration(|_| None)
+            .unwrap_err();
+        assert!(
+            clickhouse.to_string().contains("CLICKHOUSE_URL"),
+            "{clickhouse}"
+        );
+
+        BackendId::Mysql
+            .validate_configuration(|key| (key == "MYSQL_URL").then(|| "mysql://db".into()))
+            .unwrap();
+        BackendId::Clickhouse
+            .validate_configuration(|key| {
+                (key == "CLICKHOUSE_URL").then(|| "http://clickhouse".into())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn default_metadata_tracks_selected_backend_and_url() {
+        for backend in BackendId::ALL {
+            let url = format!("{}://suite", backend.as_str());
+            let metadata = default_metadata_for(backend, &url);
+            let source = metadata.sources.first().unwrap();
+            assert_eq!(source.name, "default");
+            assert_eq!(source.kind, backend.source_kind());
+            let encoded = serde_json::to_value(&source.configuration).unwrap();
+            assert_eq!(
+                encoded.pointer("/connection_info/database_url"),
+                Some(&json!(url))
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_suite_owns_file_and_default_source() {
+        let path = {
+            let suite = Suite::new("sqlite_lifecycle")
+                .backend(BackendId::Sqlite)
+                .start();
+            assert_eq!(suite.backend, BackendId::Sqlite);
+            let path = PathBuf::from(&suite.db_url);
+            assert!(path.exists(), "SQLite database was not created");
+            let metadata = suite.metadata.borrow();
+            assert_eq!(metadata.sources[0].kind, SourceKind::Sqlite);
+            path
+        };
+        assert!(!path.exists(), "SQLite database was not cleaned up");
+    }
+
+    #[test]
+    fn suite_database_names_are_unique_and_safe() {
+        let first = suite_database_name("Reads / weird name");
+        let second = suite_database_name("Reads / weird name");
+        assert_ne!(first, second);
+        for name in [first, second] {
+            assert!(name.len() <= 63, "database name too long: {name}");
+            assert!(
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+                "unsafe database name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_matrix_covers_backend_registry() {
+        let workflow = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+            .expect("reading CI workflow");
+        let workflow: serde_yaml::Value =
+            serde_yaml::from_str(&workflow).expect("parsing CI workflow");
+        let include = workflow["jobs"]["backend-core"]["strategy"]["matrix"]["include"]
+            .as_sequence()
+            .expect("conformance matrix.include");
+        let actual = include
+            .iter()
+            .map(|entry| entry["backend"].as_str().expect("matrix backend string"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, BackendId::ALL.map(BackendId::as_str));
+
+        assert_eq!(
+            workflow["jobs"]["backend-core"]["strategy"]["fail-fast"].as_bool(),
+            Some(false)
+        );
+        let steps = workflow["jobs"]["backend-core"]["steps"]
+            .as_sequence()
+            .expect("backend matrix steps");
+        let backend_cache_key = steps
+            .iter()
+            .find(|step| step["uses"].as_str() == Some("Swatinem/rust-cache@v2"))
+            .and_then(|step| step["with"]["key"].as_str())
+            .expect("backend matrix cache key");
+        assert_eq!(
+            backend_cache_key, "backend-${{ matrix.backend }}",
+            "backend matrix caches must be isolated by backend"
+        );
+        let shared_command = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Shared backend contract"))
+            .and_then(|step| step["run"].as_str())
+            .expect("shared backend command");
+        assert!(
+            shared_command.contains("--test-threads=4 --nocapture"),
+            "shared backend suites must use the reviewed parallelism: {shared_command}"
+        );
+        let postgres_command = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Full Postgres reference conformance"))
+            .and_then(|step| step["run"].as_str())
+            .expect("full Postgres conformance command");
+        assert!(
+            postgres_command.contains("--test-threads=4"),
+            "full Postgres conformance must use the reviewed parallelism: {postgres_command}"
+        );
+        assert_eq!(
+            workflow["jobs"]["backend-core-gate"]["name"].as_str(),
+            Some("Conformance matrix")
+        );
+    }
+
+    #[test]
+    fn every_conformance_binary_is_classified() {
+        const SHARED: &[&str] = &["backend_matrix"];
+        const BACKEND_SPECIFIC: &[&str] = &[];
+        const POSTGRES_REFERENCE: &[&str] = &[
+            "actions",
+            "agg_relay_introspection",
+            "auth_env",
+            "cron_triggers",
+            "enabled_apis",
+            "event_triggers",
+            "graphql_mutations",
+            "graphql_queries",
+            "introspection_descriptions",
+            "jwk",
+            "jwt",
+            "mcp_tools",
+            "migrate",
+            "remote_schemas",
+            "rest_endpoints",
+            "roles_inheritance",
+            "security",
+            "subscriptions",
+        ];
+
+        let test_dir = workspace_root().join("crates/conformance/tests");
+        let test_files = std::fs::read_dir(&test_dir)
+            .expect("reading conformance tests")
+            .map(|entry| entry.expect("test entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+            .collect::<Vec<_>>();
+        for path in &test_files {
+            let source = std::fs::read_to_string(path).expect("reading conformance test source");
+            assert!(
+                !source.contains("#[ignore"),
+                "ignored conformance cases are forbidden: {}",
+                path.strip_prefix(&test_dir).unwrap_or(path).display()
+            );
+        }
+
+        let mut actual = test_files
+            .into_iter()
+            .map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("UTF-8 test filename")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut classified = SHARED
+            .iter()
+            .chain(BACKEND_SPECIFIC)
+            .chain(POSTGRES_REFERENCE)
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        classified.sort();
+        assert_eq!(actual, classified, "unclassified conformance test binary");
+        eprintln!(
+            "conformance manifest: {} shared / {} backend-specific / {} postgres-reference",
+            SHARED.len(),
+            BACKEND_SPECIFIC.len(),
+            POSTGRES_REFERENCE.len()
+        );
+    }
 
     // ---------------------------------------------------- load_fixture
 

@@ -33,6 +33,16 @@ pub fn operation_to_sql_with(roots: &[RootField], dialect: donat_backend::AnyDia
     operation_to_sql_full(roots, false, dialect)
 }
 
+/// Compile one operation for an explicit backend while honoring Donat's
+/// `--stringify-numeric-types` response option.
+pub fn operation_to_sql_opts_with(
+    roots: &[RootField],
+    stringify_numerics: bool,
+    dialect: donat_backend::AnyDialect,
+) -> String {
+    operation_to_sql_full(roots, stringify_numerics, dialect)
+}
+
 fn operation_to_sql_full(
     roots: &[RootField],
     stringify_numerics: bool,
@@ -51,7 +61,7 @@ fn operation_to_sql_full(
                 (alias.clone(), ctx.connection_expr(conn, None))
             }
             RootField::Typename { alias, value } => {
-                (alias.clone(), format!("{}::text", quote_lit(value)))
+                (alias.clone(), typename_literal(&ctx.dialect, value))
             }
         })
         .collect();
@@ -155,7 +165,7 @@ impl Ctx {
         if let Some(page) = &conn.page {
             q.limit = Some(page.size + 1);
         }
-        let tail = self.from_where_order(&q, &alias, outer);
+        let (tail, _) = self.from_where_order(&q, &alias, outer);
 
         let arr = self.alias();
         let raw = format!("{}.a", quote_ident(&arr));
@@ -184,7 +194,7 @@ impl Ctx {
             .iter()
             .map(|f| match f {
                 ConnectionField::Typename { alias, value } => {
-                    (alias.clone(), format!("{}::text", quote_lit(value)))
+                    (alias.clone(), typename_literal(&dialect, value))
                 }
                 ConnectionField::PageInfo { alias, fields } => {
                     let inner: Vec<(String, String)> = fields
@@ -224,7 +234,7 @@ impl Ctx {
                                 (alias.clone(), "e.value->'node'".to_string())
                             }
                             EdgeField::Typename { alias, value } => {
-                                (alias.clone(), format!("{}::text", quote_lit(value)))
+                                (alias.clone(), typename_literal(&dialect, value))
                             }
                         })
                         .collect();
@@ -278,7 +288,7 @@ impl Ctx {
 
         let alias = self.alias();
         let row_json = self.row_json(&q.fields, &alias);
-        let tail = self.from_where_order(q, &alias, outer);
+        let (tail, rendered_order) = self.from_where_order(q, &alias, outer);
         let distinct = distinct_clause(q, &alias);
 
         if q.single {
@@ -286,9 +296,34 @@ impl Ctx {
         } else {
             let elem = self.alias();
             let e = quote_ident(&elem);
+            let stable_order = if matches!(
+                self.dialect,
+                donat_backend::AnyDialect::Clickhouse(_) | donat_backend::AnyDialect::Mysql(_)
+            ) {
+                rendered_order
+                    .as_ref()
+                    .map(|_| format!("{e}.{}", quote_ident("__donat_ord")))
+            } else {
+                None
+            };
+            let row_projection = match rendered_order.as_deref() {
+                Some(order)
+                    if matches!(
+                        self.dialect,
+                        donat_backend::AnyDialect::Clickhouse(_)
+                            | donat_backend::AnyDialect::Mysql(_)
+                    ) =>
+                {
+                    format!(
+                        "{row_json} AS j, row_number() OVER (ORDER BY {order}) AS {}",
+                        quote_ident("__donat_ord")
+                    )
+                }
+                _ => format!("{row_json} AS j"),
+            };
             format!(
-                "(SELECT {agg} FROM (SELECT {distinct}{row_json} AS j {tail}) AS {e})",
-                agg = json_array_agg(&self.dialect, &format!("{e}.j"), None),
+                "(SELECT {agg} FROM (SELECT {distinct}{row_projection} {tail}) AS {e})",
+                agg = json_array_agg(&self.dialect, &format!("{e}.j"), stable_order.as_deref()),
             )
         }
     }
@@ -298,7 +333,7 @@ impl Ctx {
     fn aggregate_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
         let dialect = self.dialect;
         let inner_alias = self.alias();
-        let tail = self.from_where_order(q, &inner_alias, outer);
+        let (tail, _) = self.from_where_order(q, &inner_alias, outer);
         let distinct = distinct_clause(q, &inner_alias);
         let outer_alias = self.alias();
         let oa = quote_ident(&outer_alias);
@@ -331,7 +366,7 @@ impl Ctx {
                             json_array_agg(&dialect, &row, None)
                         }
                     }
-                    FieldValue::Typename { value } => to_json_text(&dialect, &quote_lit(value)),
+                    FieldValue::Typename { value } => typename_literal(&dialect, value),
                     other => panic!("non-aggregate field in aggregate select: {other:?}"),
                 };
                 (f.alias.clone(), value)
@@ -350,8 +385,9 @@ impl Ctx {
             .iter()
             .map(|f| {
                 let value = match &f.op {
+                    AggregateOp::Typename { value } => typename_literal(&dialect, value),
                     AggregateOp::Count { distinct, columns } => {
-                        if columns.is_empty() {
+                        let value = if columns.is_empty() {
                             "COUNT(*)".to_string()
                         } else {
                             let cols: Vec<String> =
@@ -364,6 +400,15 @@ impl Ctx {
                                 format!("({})", cols.join(", "))
                             };
                             format!("COUNT({d}{expr})")
+                        };
+                        match self.dialect {
+                            donat_backend::AnyDialect::Clickhouse(_) => {
+                                clickhouse_json_column(&value, "int8", false)
+                            }
+                            donat_backend::AnyDialect::Mysql(_) => {
+                                mysql_json_column(&value, "int8", false)
+                            }
+                            _ => value,
                         }
                     }
                     AggregateOp::ColumnOp { op, columns } => {
@@ -378,7 +423,30 @@ impl Ctx {
                                     }
                                     None => col,
                                 };
-                                (c.alias.clone(), format!("{op}({expr})"))
+                                let value = if matches!(
+                                    self.dialect,
+                                    donat_backend::AnyDialect::Clickhouse(_)
+                                ) {
+                                    format!("{}OrNull({expr})", clickhouse_aggregate_function(op))
+                                } else {
+                                    format!("{op}({expr})")
+                                };
+                                let value = match self.dialect {
+                                    donat_backend::AnyDialect::Clickhouse(_) => {
+                                        clickhouse_json_column(
+                                            &value,
+                                            &c.pg_type,
+                                            self.stringify_numerics,
+                                        )
+                                    }
+                                    donat_backend::AnyDialect::Mysql(_) => mysql_json_column(
+                                        &value,
+                                        &c.pg_type,
+                                        self.stringify_numerics,
+                                    ),
+                                    _ => value,
+                                };
+                                (c.alias.clone(), value)
                             })
                             .collect();
                         json_object(&dialect, &inner)
@@ -396,7 +464,7 @@ impl Ctx {
         q: &SelectQuery,
         alias: &str,
         outer: Option<OuterJoin>,
-    ) -> String {
+    ) -> (String, Option<String>) {
         let dialect = self.dialect;
         let from_item = match &q.from {
             FromSource::Table(t) => {
@@ -457,7 +525,7 @@ impl Ctx {
             sql.push_str(&format!(" WHERE {}", conds.join(" AND ")));
         }
 
-        if !q.order_by.is_empty() {
+        let rendered_order = if !q.order_by.is_empty() {
             let items: Vec<String> = q
                 .order_by
                 .iter()
@@ -543,12 +611,16 @@ impl Ctx {
                     format!("{target} {dir}{nulls}")
                 })
                 .collect();
-            sql.push_str(&format!(" ORDER BY {}", items.join(", ")));
-        }
+            let rendered = items.join(", ");
+            sql.push_str(&format!(" ORDER BY {rendered}"));
+            Some(rendered)
+        } else {
+            None
+        };
 
         use donat_backend::Dialect;
         sql.push_str(&self.dialect.limit_offset(q.limit, q.offset));
-        sql
+        (sql, rendered_order)
     }
 
     fn row_json(&mut self, fields: &[OutputField], table_alias: &str) -> String {
@@ -567,20 +639,9 @@ impl Ctx {
                         format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                     }
                     FieldValue::Column { column, pg_type } => {
-                        let col = qualified(table_alias, column);
-                        match pg_type.as_str() {
-                            // Donat renders geometry as GeoJSON with the
-                            // long CRS form (options bit 4).
-                            "geometry" | "geography" => {
-                                format!("ST_AsGeoJSON({col}, 15, 4)::json")
-                            }
-                            "int8" | "numeric" if self.stringify_numerics => {
-                                format!("({col})::text")
-                            }
-                            _ => col,
-                        }
+                        self.column_output(table_alias, column, pg_type)
                     }
-                    FieldValue::Typename { value } => format!("{}::text", quote_lit(value)),
+                    FieldValue::Typename { value } => typename_literal(&dialect, value),
                     FieldValue::Object { query, join } => {
                         self.select_expr(query, Some((join, table_alias)))
                     }
@@ -634,6 +695,15 @@ impl Ctx {
     /// Column output expression with type-specific casts.
     fn column_output(&mut self, table_alias: &str, column: &str, pg_type: &str) -> String {
         let col = qualified(table_alias, column);
+        if matches!(self.dialect, donat_backend::AnyDialect::Clickhouse(_)) {
+            return clickhouse_json_column(&col, pg_type, self.stringify_numerics);
+        }
+        if matches!(self.dialect, donat_backend::AnyDialect::Mysql(_)) {
+            return mysql_json_column(&col, pg_type, self.stringify_numerics);
+        }
+        if matches!(self.dialect, donat_backend::AnyDialect::Sqlite(_)) {
+            return sqlite_json_column(&col, pg_type, self.stringify_numerics);
+        }
         match pg_type {
             "geometry" | "geography" => format!("ST_AsGeoJSON({col}, 15, 4)::json"),
             "int8" | "numeric" if self.stringify_numerics => format!("({col})::text"),
@@ -1166,6 +1236,18 @@ fn mutation_to_sql_full(
 // SQLite mutation path (M4 carve-out, see ADR 003)
 // ---------------------------------------------------------------------
 
+/// A selected field in a Rust-assembled mutation response object.
+///
+/// SQLite and MySQL cannot use the Postgres in-database mutation response
+/// assembly path, so their executors retain these slots to preserve GraphQL
+/// selection order exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationResponseSlot {
+    Returning { alias: String },
+    AffectedRows { alias: String },
+    Typename { alias: String, value: String },
+}
+
 /// A planned SQLite mutation: one TOP-LEVEL DML statement whose RETURNING
 /// clause yields, per affected row, a `node` JSON object (built from BARE
 /// column names — SQLite RETURNING cannot reference an alias-qualified or
@@ -1178,12 +1260,11 @@ fn mutation_to_sql_full(
 pub struct SqliteMutationPlan {
     /// The single top-level DML to execute.
     pub dml_sql: String,
-    /// Response key for the `returning` array, when the selection asked for it.
-    pub returning_alias: Option<String>,
-    /// Response key for `affected_rows`, when selected.
-    pub affected_rows_alias: Option<String>,
-    /// `(alias, value)` for a `__typename` field on the mutation response.
-    pub typename: Option<(String, String)>,
+    /// Whether the GraphQL root returns one node directly instead of a
+    /// response object containing a `returning` array.
+    pub single_row_output: bool,
+    /// Selected mutation response fields in GraphQL selection order.
+    pub response_slots: Vec<MutationResponseSlot>,
     /// `(alias, value)` when the root is a `__typename` mutation root itself.
     pub root_typename: Option<(String, String)>,
     /// Error path reported on a check violation (carried into the executor's
@@ -1192,9 +1273,8 @@ pub struct SqliteMutationPlan {
 }
 
 /// Build the [`SqliteMutationPlan`] for an insert/update/delete mutation root.
-/// Renders with the SQLite dialect; `on_conflict` is not supported on SQLite
-/// (different `ON CONFLICT` grammar) and triggers a panic by design — the
-/// planner does not surface it on this path and the carve-out defers it.
+/// Renders with the SQLite dialect. Unsupported mutation features are rejected
+/// by the planner; the assertions below defend the SQL-generation boundary.
 pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     let dialect = donat_backend::AnyDialect::Sqlite(donat_backend::SqliteDialect);
     let mut ctx = Ctx {
@@ -1205,9 +1285,8 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     match root {
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
-            returning_alias: None,
-            affected_rows_alias: None,
-            typename: None,
+            single_row_output: false,
+            response_slots: vec![],
             root_typename: Some((String::new(), value.clone())),
             check_path: "$".into(),
         },
@@ -1336,10 +1415,8 @@ impl Ctx {
         check_path: &str,
         output: &MutationOutput,
     ) -> SqliteMutationPlan {
-        let dialect = self.dialect;
-        let mut returning_alias = None;
-        let mut affected_rows_alias = None;
-        let mut typename = None;
+        let single_row_output = matches!(output, MutationOutput::SingleRow(_));
+        let mut response_slots = vec![];
         // Determine the node fields (the per-row `returning { ... }` selection).
         // A SingleRow output (`insert_one` / `_by_pk`) also produces a node.
         let node_fields: Vec<OutputField> = match output {
@@ -1348,13 +1425,20 @@ impl Ctx {
                 for f in fields {
                     match f {
                         MutationResponseField::AffectedRows { alias } => {
-                            affected_rows_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::AffectedRows {
+                                alias: alias.clone(),
+                            });
                         }
                         MutationResponseField::Typename { alias, value } => {
-                            typename = Some((alias.clone(), value.clone()));
+                            response_slots.push(MutationResponseSlot::Typename {
+                                alias: alias.clone(),
+                                value: value.clone(),
+                            });
                         }
                         MutationResponseField::Returning { alias, fields } => {
-                            returning_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::Returning {
+                                alias: alias.clone(),
+                            });
                             node_fields = fields.clone();
                         }
                     }
@@ -1363,10 +1447,8 @@ impl Ctx {
             }
             MutationOutput::SingleRow(fields) => {
                 // `insert_<t>_one` / `_by_pk`: the row itself is the node;
-                // there is no affected_rows. Represent it as a returning alias
-                // so the executor still folds rows; the server's SingleRow
-                // handling for sqlite is out of scope for this carve-out.
-                returning_alias = Some("returning".to_string());
+                // there is no affected_rows. The executor folds the returned
+                // row and emits it directly when `single_row_output` is set.
                 fields.clone()
             }
         };
@@ -1375,19 +1457,17 @@ impl Ctx {
         let violated = match check {
             Some(check) => {
                 format!(
-                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    "CASE WHEN ({}) THEN 0 ELSE 1 END",
                     self.sqlite_bare_bool(check)
                 )
             }
             None => "0".to_string(),
         };
-        let _ = dialect;
         let dml_sql = format!("{dml} RETURNING {node_expr} AS node, {violated} AS violated");
         SqliteMutationPlan {
             dml_sql,
-            returning_alias,
-            affected_rows_alias,
-            typename,
+            single_row_output,
+            response_slots,
             root_typename: None,
             check_path: check_path.to_string(),
         }
@@ -1409,15 +1489,27 @@ impl Ctx {
             .iter()
             .map(|f| {
                 let value = match &f.value {
-                    FieldValue::Column { column, .. } => dialect.quote_ident(column),
-                    FieldValue::ColumnGuarded { column, guard, .. } => {
+                    FieldValue::Column { column, pg_type } => match dialect {
+                        donat_backend::AnyDialect::Mysql(_) => {
+                            mysql_json_column(&dialect.quote_ident(column), pg_type, false)
+                        }
+                        _ => sqlite_json_column(&dialect.quote_ident(column), pg_type, false),
+                    },
+                    FieldValue::ColumnGuarded {
+                        column,
+                        pg_type,
+                        guard,
+                    } => {
                         let cond = self.sqlite_bare_bool(guard);
-                        format!(
-                            "CASE WHEN {cond} THEN {} ELSE NULL END",
-                            dialect.quote_ident(column)
-                        )
+                        let col = match dialect {
+                            donat_backend::AnyDialect::Mysql(_) => {
+                                mysql_json_column(&dialect.quote_ident(column), pg_type, false)
+                            }
+                            _ => sqlite_json_column(&dialect.quote_ident(column), pg_type, false),
+                        };
+                        format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
                     }
-                    FieldValue::Typename { value } => dialect.quote_literal(value),
+                    FieldValue::Typename { value } => typename_literal(&dialect, value),
                     other => panic!(
                         "field {:?} is not expressible in a sqlite/mysql bare RETURNING",
                         std::mem::discriminant(other)
@@ -1550,18 +1642,17 @@ pub struct MySqlMutationPlan {
     /// The single DML to execute (`INSERT`/`UPDATE`/`DELETE`), no trailing
     /// `RETURNING` (MySQL has none). Empty for a `__typename` root.
     pub dml_sql: String,
+    /// Whether the GraphQL root returns one node directly instead of a
+    /// response object containing a `returning` array.
+    pub single_row_output: bool,
     /// The companion `SELECT <node> AS node, <flag> AS violated FROM `s`.`t``,
     /// WITHOUT the trailing `WHERE` — the executor appends the restriction it
     /// derives from `kind`. Empty for a `__typename` root.
     pub companion_select: String,
     /// Recovery strategy + companion-`WHERE` building blocks.
     pub kind: MySqlMutationKind,
-    /// Response key for the `returning` array, when selected.
-    pub returning_alias: Option<String>,
-    /// Response key for `affected_rows`, when selected.
-    pub affected_rows_alias: Option<String>,
-    /// `(alias, value)` for a `__typename` field on the mutation response.
-    pub typename: Option<(String, String)>,
+    /// Selected mutation response fields in GraphQL selection order.
+    pub response_slots: Vec<MutationResponseSlot>,
     /// `(alias, value)` when the root is a `__typename` mutation root itself.
     pub root_typename: Option<(String, String)>,
     /// Error path reported on a check violation.
@@ -1571,8 +1662,8 @@ pub struct MySqlMutationPlan {
 /// Build the [`MySqlMutationPlan`] for an insert/update/delete mutation root.
 /// `pk` is the table's primary-key column names (from the catalog) — needed for
 /// `last_insert_id()` recovery and for the supplied-PK `IN` predicate, which
-/// the IR mutation does not carry. `on_conflict` is DEFERRED on MySQL (ADR 004)
-/// and triggers a panic by design; the planner does not surface it on this path.
+/// the IR mutation does not carry. Unsupported mutation features are rejected
+/// by the planner; the assertions below defend the SQL-generation boundary.
 pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationPlan {
     use donat_backend::Dialect;
     let dialect = donat_backend::AnyDialect::Mysql(donat_backend::MySqlDialect);
@@ -1584,11 +1675,10 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
     match root {
         MutationRoot::Typename { value, .. } => MySqlMutationPlan {
             dml_sql: String::new(),
+            single_row_output: false,
             companion_select: String::new(),
             kind: MySqlMutationKind::Typename,
-            returning_alias: None,
-            affected_rows_alias: None,
-            typename: None,
+            response_slots: vec![],
             root_typename: Some((String::new(), value.clone())),
             check_path: "$".into(),
         },
@@ -1672,14 +1762,13 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 ctx.mysql_companion_select(&table, insert.check.as_ref(), &insert.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Insert {
                     pk_col,
                     pk_in_predicate,
                 },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: insert.check_path.clone(),
             }
@@ -1729,11 +1818,10 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
                 ctx.mysql_companion_select(&table, update.check.as_ref(), &update.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Update { where_clause },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: update.check_path.clone(),
             }
@@ -1752,11 +1840,10 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
             let companion = ctx.mysql_companion_select(&table, None, &delete.output);
             MySqlMutationPlan {
                 dml_sql: dml,
+                single_row_output: companion.single_row_output,
                 companion_select: companion.select,
                 kind: MySqlMutationKind::Delete { where_clause },
-                returning_alias: companion.returning_alias,
-                affected_rows_alias: companion.affected_rows_alias,
-                typename: companion.typename,
+                response_slots: companion.response_slots,
                 root_typename: None,
                 check_path: "$".into(),
             }
@@ -1767,9 +1854,8 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
 /// Intermediate result of [`Ctx::mysql_companion_select`].
 struct MySqlCompanion {
     select: String,
-    returning_alias: Option<String>,
-    affected_rows_alias: Option<String>,
-    typename: Option<(String, String)>,
+    single_row_output: bool,
+    response_slots: Vec<MutationResponseSlot>,
 }
 
 impl Ctx {
@@ -1785,38 +1871,41 @@ impl Ctx {
         check: Option<&BoolExp>,
         output: &MutationOutput,
     ) -> MySqlCompanion {
-        let mut returning_alias = None;
-        let mut affected_rows_alias = None;
-        let mut typename = None;
+        let single_row_output = matches!(output, MutationOutput::SingleRow(_));
+        let mut response_slots = vec![];
         let node_fields: Vec<OutputField> = match output {
             MutationOutput::Response(fields) => {
                 let mut node_fields = vec![];
                 for f in fields {
                     match f {
                         MutationResponseField::AffectedRows { alias } => {
-                            affected_rows_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::AffectedRows {
+                                alias: alias.clone(),
+                            });
                         }
                         MutationResponseField::Typename { alias, value } => {
-                            typename = Some((alias.clone(), value.clone()));
+                            response_slots.push(MutationResponseSlot::Typename {
+                                alias: alias.clone(),
+                                value: value.clone(),
+                            });
                         }
                         MutationResponseField::Returning { alias, fields } => {
-                            returning_alias = Some(alias.clone());
+                            response_slots.push(MutationResponseSlot::Returning {
+                                alias: alias.clone(),
+                            });
                             node_fields = fields.clone();
                         }
                     }
                 }
                 node_fields
             }
-            MutationOutput::SingleRow(fields) => {
-                returning_alias = Some("returning".to_string());
-                fields.clone()
-            }
+            MutationOutput::SingleRow(fields) => fields.clone(),
         };
         let node_expr = self.sqlite_node_json(&node_fields);
         let violated = match check {
             Some(check) => {
                 format!(
-                    "CASE WHEN NOT ({}) THEN 1 ELSE 0 END",
+                    "CASE WHEN ({}) THEN 0 ELSE 1 END",
                     self.sqlite_bare_bool(check)
                 )
             }
@@ -1824,9 +1913,8 @@ impl Ctx {
         };
         MySqlCompanion {
             select: format!("SELECT {node_expr} AS node, {violated} AS violated FROM {table}"),
-            returning_alias,
-            affected_rows_alias,
-            typename,
+            single_row_output,
+            response_slots,
         }
     }
 
@@ -1872,7 +1960,7 @@ impl Ctx {
                             (alias.clone(), format!("(SELECT count(*) FROM {cte_ident})"))
                         }
                         MutationResponseField::Typename { alias, value } => {
-                            (alias.clone(), format!("{}::text", quote_lit(value)))
+                            (alias.clone(), typename_literal(&dialect, value))
                         }
                         MutationResponseField::Returning { alias, fields } => {
                             let row = self.row_json(fields, cte);
@@ -1900,7 +1988,7 @@ impl Ctx {
         for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
             let check_cte_ident = quote_ident(&check_cte);
             let violated = format!(
-                "(SELECT count(*) FROM {check_cte_ident} WHERE NOT ({}))",
+                "(SELECT count(*) FROM {check_cte_ident} WHERE ({}) IS NOT TRUE)",
                 self.bool_exp_with_relationship_ctes(
                     check,
                     &check_cte,
@@ -1920,7 +2008,7 @@ impl Ctx {
         }
         if let Some(check) = check {
             let violated = format!(
-                "(SELECT count(*) FROM {cte_ident} WHERE NOT ({}))",
+                "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
                 self.bool_exp(check, cte, cte)
             );
             // The message carries the GraphQL error path as JSON; the
@@ -1969,6 +2057,79 @@ fn qualified(alias: &str, column: &str) -> String {
     format!("{}.{}", quote_ident(alias), quote_ident(column))
 }
 
+fn sqlite_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
+    match pg_type {
+        "int8" | "numeric" if stringify_numerics => format!("CAST({expression} AS TEXT)"),
+        "bool" => format!(
+            "CASE WHEN {expression} IS NULL THEN NULL WHEN {expression} THEN json('true') ELSE json('false') END"
+        ),
+        "json" => format!("json({expression})"),
+        _ => expression.to_string(),
+    }
+}
+
+fn clickhouse_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
+    if stringify_numerics && clickhouse_stringified_numeric_type(pg_type) {
+        format!("toJSONString(toString({expression}))")
+    } else {
+        format!("toJSONString({expression})")
+    }
+}
+
+fn clickhouse_stringified_numeric_type(native_type: &str) -> bool {
+    let mut native_type = native_type.trim();
+    loop {
+        let inner = ["Nullable", "LowCardinality"]
+            .into_iter()
+            .find_map(|wrapper| {
+                native_type
+                    .strip_prefix(wrapper)
+                    .and_then(|rest| rest.strip_prefix('('))
+                    .and_then(|rest| rest.strip_suffix(')'))
+            });
+        match inner {
+            Some(inner) => native_type = inner,
+            None => break,
+        }
+    }
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(family, _)| family)
+        .to_ascii_lowercase();
+    matches!(
+        family.as_str(),
+        "int8"
+            | "numeric"
+            | "int64"
+            | "uint64"
+            | "int128"
+            | "uint128"
+            | "int256"
+            | "uint256"
+            | "decimal"
+            | "decimal32"
+            | "decimal64"
+            | "decimal128"
+            | "decimal256"
+    )
+}
+
+fn mysql_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) -> String {
+    match pg_type {
+        "bool" => format!(
+            "CASE WHEN {expression} IS NULL THEN NULL WHEN {expression} THEN 'true' ELSE 'false' END"
+        ),
+        "int8" | "numeric" if stringify_numerics => {
+            format!("JSON_QUOTE(CAST({expression} AS CHAR))")
+        }
+        "text" | "varchar" | "bpchar" | "uuid" | "timestamp" | "timestamptz" | "date" | "time"
+        | "bytea" | "inet" | "citext" => {
+            format!("JSON_QUOTE(CAST({expression} AS CHAR))")
+        }
+        _ => format!("CAST({expression} AS CHAR)"),
+    }
+}
+
 pub fn quote_ident(ident: &str) -> String {
     use donat_backend::Dialect;
     donat_backend::PostgresDialect.quote_ident(ident)
@@ -1996,12 +2157,6 @@ fn json_array_agg(
     dialect.json_array_agg(row_expr, order_by)
 }
 
-/// Render an expression as a JSON string (LEAF op #7).
-fn to_json_text(dialect: &donat_backend::AnyDialect, expr: &str) -> String {
-    use donat_backend::Dialect;
-    dialect.to_json_text(expr)
-}
-
 /// Render a JSON scalar as a SQL literal cast to the column's type.
 /// Delegates to the active backend dialect's `render_scalar`, which holds the
 /// byte-for-byte rendering (including the geometry/geography GeoJSON case).
@@ -2010,10 +2165,34 @@ fn scalar_sql(dialect: &donat_backend::AnyDialect, scalar: &Scalar, pg_type: &st
     dialect.render_scalar(scalar, pg_type)
 }
 
+fn typename_literal(dialect: &donat_backend::AnyDialect, value: &str) -> String {
+    use donat_backend::Dialect;
+
+    let literal = dialect.quote_literal(value);
+    match dialect {
+        donat_backend::AnyDialect::Postgres(_) => format!("{literal}::text"),
+        donat_backend::AnyDialect::Clickhouse(_) => {
+            format!("toJSONString(CAST({literal} AS String))")
+        }
+        donat_backend::AnyDialect::Sqlite(_) => literal,
+        donat_backend::AnyDialect::Mysql(_) => format!("JSON_QUOTE(CAST({literal} AS CHAR))"),
+    }
+}
+
+fn clickhouse_aggregate_function(op: &str) -> &str {
+    match op {
+        "stddev" => "stddev_samp",
+        "variance" => "var_samp",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod dialect_dispatch_tests {
     use super::*;
-    use donat_backend::{AnyDialect, PostgresDialect};
+    use donat_backend::{
+        AnyDialect, ClickhouseDialect, MySqlDialect, PostgresDialect, SqliteDialect,
+    };
 
     fn sample_roots() -> Vec<RootField> {
         let cols = vec![
@@ -2043,7 +2222,11 @@ mod dialect_dispatch_tests {
                 pg_type: "int4".into(),
                 op: CompareOp::Eq(Scalar::Json(serde_json::json!(7))),
             }),
-            order_by: vec![],
+            order_by: vec![OrderBy {
+                target: OrderByTarget::Column("id".into()),
+                direction: OrderDirection::Asc,
+                nulls: NullsOrder::Last,
+            }],
             limit: Some(10),
             nodes_limit: None,
             offset: Some(2),
@@ -2071,6 +2254,193 @@ mod dialect_dispatch_tests {
         let default = operation_to_sql(&roots);
         let explicit = operation_to_sql_with(&roots, AnyDialect::Postgres(PostgresDialect));
         assert_eq!(default, explicit);
+    }
+
+    #[test]
+    fn operation_to_sql_with_clickhouse_uses_ordered_json_text_and_casts() {
+        let mut roots = sample_roots();
+        let list_root = roots.pop().expect("list root");
+        let sql = operation_to_sql_with(&[list_root], AnyDialect::Clickhouse(ClickhouseDialect));
+
+        // ClickHouse accepts standard double-quoted identifiers as well as
+        // backticks; the shared query assembler currently emits the former.
+        assert!(sql.contains("\"public\".\"author\""), "{sql}");
+        assert!(sql.contains("concat('{',"), "{sql}");
+        assert!(sql.contains("toJSONString(\"_t0\".\"id\")"), "{sql}");
+        assert!(sql.contains("groupArray(("), "{sql}");
+        assert!(sql.contains("arrayStringConcat("), "{sql}");
+        assert!(sql.contains("row_number() OVER (ORDER BY"), "{sql}");
+        assert!(sql.contains("arraySort("), "{sql}");
+        assert!(
+            !sql.contains(" AS JSON"),
+            "JSON casts reorder object keys: {sql}"
+        );
+        assert!(sql.contains("CAST(7 AS Int32)"), "{sql}");
+        assert!(sql.contains(" LIMIT 10 OFFSET 2"), "{sql}");
+        assert!(!sql.contains(';'), "one SQL statement only: {sql}");
+    }
+
+    #[test]
+    fn clickhouse_stringify_numerics_recognizes_wrapped_native_types() {
+        for numeric in [
+            "int8",
+            "numeric",
+            "UInt64",
+            "Nullable(UInt128)",
+            "LowCardinality(Nullable(Decimal256(76)))",
+        ] {
+            assert!(clickhouse_stringified_numeric_type(numeric), "{numeric}");
+        }
+        for non_numeric in ["UInt32", "Float64", "Nullable(String)"] {
+            assert!(
+                !clickhouse_stringified_numeric_type(non_numeric),
+                "{non_numeric}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_to_sql_with_sqlite_serializes_boolean_columns_as_json_booleans() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "main".into(),
+                name: "article".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "is_published".into(),
+                value: FieldValue::Column {
+                    column: "is_published".into(),
+                    pg_type: "bool".into(),
+                },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "article".into(),
+                query,
+            }],
+            AnyDialect::Sqlite(SqliteDialect),
+        );
+
+        assert!(
+            sql.contains("json('true')"),
+            "true is not JSON boolean: {sql}"
+        );
+        assert!(
+            sql.contains("json('false')"),
+            "false is not JSON boolean: {sql}"
+        );
+        assert!(
+            sql.contains("IS NULL THEN NULL"),
+            "nullable booleans must remain null: {sql}"
+        );
+    }
+
+    #[test]
+    fn operation_to_sql_with_mysql_preserves_field_order_and_boolean_shape() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "app".into(),
+                name: "article".into(),
+            }),
+            fields: vec![
+                OutputField {
+                    alias: "title".into(),
+                    value: FieldValue::Column {
+                        column: "title".into(),
+                        pg_type: "text".into(),
+                    },
+                },
+                OutputField {
+                    alias: "is_published".into(),
+                    value: FieldValue::Column {
+                        column: "is_published".into(),
+                        pg_type: "bool".into(),
+                    },
+                },
+            ],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "article".into(),
+                query,
+            }],
+            AnyDialect::Mysql(MySqlDialect),
+        );
+
+        let title = sql.find("'\"title\":'").expect("title key");
+        let published = sql.find("'\"is_published\":'").expect("is_published key");
+        assert!(title < published, "selection order changed: {sql}");
+        assert!(
+            sql.contains("JSON_QUOTE(CAST(\"_t0\".\"title\" AS CHAR))"),
+            "text column is not JSON-quoted: {sql}"
+        );
+        assert!(sql.contains("THEN 'true' ELSE 'false'"), "{sql}");
+        assert!(
+            !sql.contains("JSON_OBJECT"),
+            "binary JSON reorders keys: {sql}"
+        );
+    }
+
+    #[test]
+    fn mysql_mutation_nodes_json_quote_typenames() {
+        let typename_field = || OutputField {
+            alias: "__typename".into(),
+            value: FieldValue::Typename {
+                value: "note".into(),
+            },
+        };
+        let insert = |output| MutationRoot::Insert {
+            alias: "insert_note".into(),
+            insert: InsertMutation {
+                table: Table {
+                    schema: "donat".into(),
+                    name: "note".into(),
+                },
+                columns: vec![("body".into(), "text".into())],
+                rows: vec![vec![Some(Scalar::Json(serde_json::json!("hello")))]],
+                nested_object_inserts: vec![],
+                on_conflict: None,
+                check: None,
+                check_path: "$".into(),
+                output,
+            },
+        };
+
+        let returning = mysql_mutation_plan(
+            &insert(MutationOutput::Response(vec![
+                MutationResponseField::Returning {
+                    alias: "returning".into(),
+                    fields: vec![typename_field()],
+                },
+            ])),
+            &["id".into()],
+        );
+        let single = mysql_mutation_plan(
+            &insert(MutationOutput::SingleRow(vec![typename_field()])),
+            &["id".into()],
+        );
+
+        for sql in [returning.companion_select, single.companion_select] {
+            assert!(
+                sql.contains("JSON_QUOTE(CAST('note' AS CHAR))"),
+                "typename is not valid JSON text: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -2108,5 +2478,110 @@ mod dialect_dispatch_tests {
         let default = mutation_to_sql(&root);
         let explicit = mutation_to_sql_with(&root, AnyDialect::Postgres(PostgresDialect));
         assert_eq!(default, explicit);
+    }
+
+    #[test]
+    fn operation_to_sql_with_clickhouse_renders_typenames_without_postgres_casts() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "analytics".into(),
+                name: "author".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "__typename".into(),
+                value: FieldValue::Typename {
+                    value: "author".into(),
+                },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: Some(1),
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let sql = operation_to_sql_with(
+            &[
+                RootField::Typename {
+                    alias: "__typename".into(),
+                    value: "query_root".into(),
+                },
+                RootField::Select {
+                    alias: "author".into(),
+                    query,
+                },
+            ],
+            AnyDialect::Clickhouse(ClickhouseDialect),
+        );
+
+        assert!(!sql.contains("::text"), "Postgres cast leaked: {sql}");
+        assert!(sql.contains("query_root"), "root typename missing: {sql}");
+        assert!(sql.contains("author"), "row typename missing: {sql}");
+    }
+
+    #[test]
+    fn clickhouse_uses_supported_statistical_aggregate_names() {
+        let fields = [
+            "stddev",
+            "stddev_samp",
+            "stddev_pop",
+            "variance",
+            "var_samp",
+            "var_pop",
+        ]
+        .into_iter()
+        .map(|op| AggregateField {
+            alias: op.to_string(),
+            op: AggregateOp::ColumnOp {
+                op: op.to_string(),
+                columns: vec![AggregateColumn {
+                    alias: "id".into(),
+                    column: "id".into(),
+                    pg_type: "int4".into(),
+                    guard: None,
+                }],
+            },
+        })
+        .collect();
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "analytics".into(),
+                name: "author".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "aggregate".into(),
+                value: FieldValue::Aggregate { fields },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+
+        let sql = operation_to_sql_with(
+            &[RootField::Select {
+                alias: "author_aggregate".into(),
+                query,
+            }],
+            AnyDialect::Clickhouse(ClickhouseDialect),
+        );
+
+        for function in [
+            "stddev_sampOrNull",
+            "stddev_popOrNull",
+            "var_sampOrNull",
+            "var_popOrNull",
+        ] {
+            assert!(sql.contains(function), "missing {function}: {sql}");
+        }
+        assert!(!sql.contains("stddevOrNull"), "unsupported function: {sql}");
+        assert!(
+            !sql.contains("varianceOrNull"),
+            "unsupported function: {sql}"
+        );
     }
 }
