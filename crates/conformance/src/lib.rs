@@ -2987,8 +2987,8 @@ mod tests {
             .and_then(|step| step["run"].as_str())
             .expect("shared backend command");
         assert!(
-            shared_command.contains("--test-threads=1 --nocapture"),
-            "shared backend summaries must be visible and deterministic: {shared_command}"
+            shared_command.contains("--test-threads=4 --nocapture"),
+            "shared backend suites must use the reviewed parallelism: {shared_command}"
         );
         let postgres_command = steps
             .iter()

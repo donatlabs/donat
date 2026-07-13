@@ -48,7 +48,7 @@ jobs:
       - name: Matrix registry and manifest guards
         run: cargo test -p donat-conformance --lib
       - name: Shared backend contract
-        run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=1 --nocapture
+        run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=4 --nocapture
         env:
           RUST_BACKTRACE: "1"
       - name: Live MySQL runtime tests
