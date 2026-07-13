@@ -27,12 +27,33 @@
 - Modify: `crates/server/src/state.rs`
 - Test: `crates/catalog/src/lib.rs`
 - Test: `crates/server/tests/clickhouse_runtime.rs`
+- Create: `crates/conformance/tests/clickhouse_multi_database.rs`
 
 **Interfaces:**
 - Consumes: tracked `Source.tables` schemas and the resolved ClickHouse URL.
 - Produces: `clickhouse_catalog_from_json_each_row(input, fallback_database)` that accepts rows carrying their own `database`; `sync_sources` builds one catalog containing every tracked ClickHouse database.
 
-- [ ] **Step 1: Add a failing catalog parser test**
+- [ ] **Step 1: Start mandatory infrastructure**
+
+Run:
+
+```bash
+docker compose -f docker-compose.conformance.yml up -d --wait
+```
+
+Expected: Postgres, MySQL, and ClickHouse report healthy before any RED run.
+
+- [ ] **Step 2: Add the failing real-binary conformance contract first**
+
+Create isolated `analytics` and `logs` databases in real ClickHouse, seed one
+tracked table in each, and start the freshly built Donat binary with one
+ClickHouse metadata source whose URL has no `database=` parameter. Send an
+authenticated query selecting both roots and compare the compact raw HTTP body
+to an exact ordered response string. The test must also assert both roots occur
+in introspection. This test is the native conformance owner for multi-database
+discovery and remains RED until this task's implementation is complete.
+
+- [ ] **Step 3: Add a failing catalog parser test**
 
 Add JSONEachRow input containing `analytics.daily` and `logs.events` and assert both keys exist in one `Catalog`:
 
@@ -46,28 +67,36 @@ assert!(catalog.table("analytics", "daily").is_some());
 assert!(catalog.table("logs", "events").is_some());
 ```
 
-- [ ] **Step 2: Run the parser test and verify RED**
+- [ ] **Step 4: Add the failing runtime introspection test**
 
-Run: `cargo test -p donat-catalog clickhouse_tests::clickhouse_json_each_row_builds_multi_database_catalog -- --exact`
+Create ClickHouse metadata with one source, a URL without `database=`, and
+tracked tables in `analytics` and `logs`. Make the HTTP stub assert a single
+`system.columns` request using `{databases:Array(String)}`, return rows from
+both databases, and assert neither metadata table is pruned.
 
-Expected: exactly one test runs and FAILS because `database` is ignored and
-both rows are assigned to the fallback schema. Zero executed tests is not RED.
+- [ ] **Step 5: Run all three tests and verify RED**
 
-- [ ] **Step 3: Parse an optional database per row**
+Run:
+
+```bash
+cargo build -p donat-server --bin donat
+DONAT_EXTERNAL_DB_TESTS=1 \
+CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
+  cargo test -p donat-conformance --test clickhouse_multi_database -- --test-threads=1 --nocapture
+cargo test -p donat-catalog clickhouse_tests::clickhouse_json_each_row_builds_multi_database_catalog -- --exact
+cargo test -p donat-server --test clickhouse_runtime clickhouse_tracks_tables_across_databases_without_url_database -- --exact
+```
+
+Expected: conformance fails because the secondary-database root is absent; the
+catalog test runs exactly once and fails because `database` is ignored; the
+runtime test fails because introspection requests only `database=default` and
+prunes both tracked tables. Zero executed tests is not RED.
+
+- [ ] **Step 6: Parse an optional database per row**
 
 Extend `ClickhouseColumnRow` with `database: Option<String>`. Use the row database when present and the function argument only for backward-compatible single-database responses. Keep column and primary-key order unchanged.
 
-- [ ] **Step 4: Add a failing runtime introspection test**
-
-Create ClickHouse metadata with one source, a URL without `database=`, and tracked tables in `analytics` and `logs`. Make the HTTP stub assert a single `system.columns` request using `{databases:Array(String)}`, return rows from both databases, and assert neither metadata table is pruned.
-
-- [ ] **Step 5: Run the runtime test and verify RED**
-
-Run: `cargo test -p donat-server --test clickhouse_runtime clickhouse_tracks_tables_across_databases_without_url_database -- --exact`
-
-Expected: FAIL because current introspection requests only `database=default` and prunes both tables.
-
-- [ ] **Step 6: Implement tracked-database discovery**
+- [ ] **Step 7: Implement tracked-database discovery**
 
 Carry a stable deduplicated `Vec<String>` of tracked schemas into the ClickHouse arm of `sync_sources`. Query:
 
@@ -81,21 +110,24 @@ FORMAT JSONEachRow
 
 Append `param_databases` to the request URL using a serialized array value. If no tables are tracked, use the URL `database` and then `default` as fallback.
 
-- [ ] **Step 7: Verify GREEN and regression coverage**
+- [ ] **Step 8: Verify GREEN and regression coverage**
 
 Run:
 
 ```bash
 cargo test -p donat-catalog
 cargo test -p donat-server --test clickhouse_runtime
+DONAT_EXTERNAL_DB_TESTS=1 \
+CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
+  cargo test -p donat-conformance --test clickhouse_multi_database -- --test-threads=1 --nocapture
 ```
 
 Expected: PASS with the new multi-database test and all existing ClickHouse runtime tests.
 
-- [ ] **Step 8: Commit and judge**
+- [ ] **Step 9: Commit and judge**
 
 ```bash
-git add crates/catalog/src/lib.rs crates/server/src/state.rs crates/server/tests/clickhouse_runtime.rs
+git add crates/catalog/src/lib.rs crates/server/src/state.rs crates/server/tests/clickhouse_runtime.rs crates/conformance/tests/clickhouse_multi_database.rs
 git commit -m "fix(clickhouse): introspect all tracked databases"
 ```
 
@@ -127,13 +159,22 @@ Dispatch the mandatory judge with the task requirements and fresh test output; c
 
 - [ ] **Step 1: Add the failing native conformance contract first**
 
-Create a conformance test that provisions one isolated Postgres database and a
-ClickHouse HTTP stub, starts the real Donat binary with two metadata sources,
-and sends an authenticated mixed query containing alternating Postgres and
-ClickHouse roots plus `__typename`. The expected fixture must assert the exact
-ordered response body and exactly one data request to each source. Add explicit
+Ensure `docker compose -f docker-compose.conformance.yml up -d --wait` has
+completed. Create a conformance test that provisions two isolated Postgres
+databases and a ClickHouse HTTP stub, starts the real Donat binary with three
+metadata sources, and sends an authenticated mixed query containing at least
+two alternating roots from the default Postgres source and ClickHouse plus
+`__typename`. Compare the compact raw HTTP body byte-for-byte so root and
+nested object key order are covered. The ClickHouse stub must assert one data
+request. The corresponding server runtime test uses the recording executor
+below to assert one Postgres call containing both roots; a per-root
+implementation must fail there.
+
+Through the real binary, also mutate a table owned only by the secondary
+Postgres source, prove the default database is unchanged with direct SQL, and
+query a relationship between two tables on that secondary source. Add explicit
 cases for a missing role header and an ungranted `admin` role, both with exact
-error bodies and zero data requests.
+raw error bodies and zero data calls.
 
 - [ ] **Step 2: Add every planner behavior test before implementation**
 
@@ -164,11 +205,31 @@ production code:
 
 Add every runtime case before production edits. Use mandatory Postgres from
 `PG_URL` and a ClickHouse HTTP stub for alternating mixed roots plus
-`__typename`, exact response order, and one data request per source. Add exact
-allowed/session-filtered responses for both sources, HTTP missing-role denial,
-ungranted and explicitly granted `admin` cases, unknown-source no-fallback,
-secondary backend failure shape, typename-only zero-call behavior, and a
-non-default mutation routing test using two distinct temporary SQLite stores.
+`__typename`, exact raw response bytes, and one data request per source. Add a
+small `SourceQueryExecutor` interface at the server orchestration boundary and
+use a recording fake in the test: each `execute(source, roots)` call records
+the exact source and all roots, then returns an ordered object. Assert one call
+per participating source and at least two roots in each call. This is the
+concrete query counter; it does not depend on Postgres logging extensions.
+
+Also add exact allowed/session-filtered responses for both sources, HTTP
+missing-role denial, ungranted and explicitly granted `admin` cases,
+unknown-source no-fallback, secondary backend failure shape, and typename-only
+zero-call behavior. Add all of these source-addressing cases:
+
+- two isolated Postgres databases as two metadata sources: mutate only the
+  secondary source, verify its row changed and the default source stayed
+  unchanged;
+- two tables with an object/array relationship on the secondary Postgres
+  source: query the nested relationship and verify it stays source-local after
+  top-level response assembly;
+- two distinct temporary SQLite stores: mutate the non-default source only;
+- two MySQL databases when `DONAT_EXTERNAL_DB_TESTS=1`: mutate/query the
+  secondary source and verify the default database remains unchanged.
+
+If an executor signature for any supported backend is made source-addressed,
+its secondary-source test is mandatory in this task; do not rely on default
+source fallback.
 
 - [ ] **Step 3: Run conformance and planner tests and verify RED**
 
@@ -182,6 +243,7 @@ PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
 cargo test -p donat-schema --test multi_source
 DONAT_EXTERNAL_DB_TESTS=1 \
 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
+MYSQL_URL=mysql://root:root@127.0.0.1:13306/donat \
   cargo test -p donat-server --test multi_source_runtime -- --test-threads=1 --nocapture
 ```
 
@@ -217,6 +279,11 @@ source, merge returned objects and local typename slots in response-slot order,
 and apply existing remote-join resolution after the merge. A mutation containing
 datasource fields must execute only against its single resolved source.
 
+Define `SourceQueryExecutor` at the orchestration boundary with one method that
+accepts a source name and the complete root slice. The production implementation
+delegates to the exact-name `AppState` accessors; tests use the recording fake
+from Step 2. Do not expose a default-source fallback through this interface.
+
 - [ ] **Step 7: Verify planner and native conformance tests GREEN**
 
 Run:
@@ -230,12 +297,16 @@ PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
   cargo test -p donat-conformance --test multi_source -- --test-threads=1 --nocapture
 DONAT_EXTERNAL_DB_TESTS=1 \
 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
+MYSQL_URL=mysql://root:root@127.0.0.1:13306/donat \
   cargo test -p donat-server --test multi_source_runtime -- --test-threads=1 --nocapture
 cargo test -p donat-server
 ```
 
 Expected: PASS with all existing planner/introspection tests unchanged and the
-exact mixed-source conformance responses matching the fixtures.
+exact mixed-source conformance responses matching raw fixtures. The recording
+executor proves one call per source with multiple roots; secondary Postgres,
+SQLite, and MySQL routing tests prove no fallback, and the secondary Postgres
+relationship response is intact.
 
 - [ ] **Step 8: Commit and judge**
 
@@ -254,6 +325,8 @@ Dispatch the mandatory judge and continue only after ACCEPT.
 - Create: `crates/server/tests/tandt_clickhouse_contract.rs`
 - Create: `crates/server/tests/fixtures/tandt_clickhouse_metadata.json`
 - Create: `crates/server/tests/fixtures/tandt_clickhouse_queries.graphql`
+- Create: `crates/conformance/tests/tandt_clickhouse_contract.rs`
+- Create: `crates/conformance/fixtures/tandt_clickhouse/`
 - Modify: `crates/conformance/README.md`
 
 **Interfaces:**
@@ -277,6 +350,9 @@ fixture header:
 Define a Postgres `default` source plus a ClickHouse source using Hasura
 `configuration.template`. Track the exact roots and columns with explicit
 `company` and `l2-executor` permissions, aggregations, and session filters.
+Copy each operation document byte-for-byte from the pinned revision. Keep a
+fixture manifest mapping every operation name to its source path and SHA-256 so
+the test fails if a future fixture edit silently diverges from tandt.
 
 - [ ] **Step 2: Add the twelve named GraphQL operations**
 
@@ -284,36 +360,54 @@ Include the query documents used by tandt-backend:
 
 `AnalyticsDocumentDailyStats`, `AnalyticsWorkflowExecutions`, `AnalyticsErrors`, `AnalyticsCodeLifecycleEvents`, `AnalyticsAggregationOperations`, `AnalyticsDashboardStats`, `ApplicationLogsList`, `DocumentIntegrationRequests`, `L2JobEvents`, `L2DeviceEvents`, `L2TrafficLogs`, and `L2ProductionEvents`.
 
-Use Date and DateTime variables for dashboard time bounds; do not encode SQL expressions as scalar strings.
+Do not normalize or improve the documents. In particular,
+`AnalyticsDashboardStats` has only `$company_id: int32!` and retains the exact
+inline scalar values `"now() - interval '30 days'"` and
+`"now() - interval '7 days'"`. `ApplicationLogsList.context` is a String in
+this pinned contract. `AnalyticsWorkflowExecutions` uses `workflow_type`; its
+filter oracle must use `_like` on `workflow_type`, not a nonexistent `name`.
 
 Create a case table with exact variables and exact ordered expected JSON:
 
 | Operation | Required oracle |
 |---|---|
 | `AnalyticsDocumentDailyStats` | two seeded statuses returned `date desc`, filtered by company, with exact count, users, and nullable duration |
-| `AnalyticsWorkflowExecutions` | `_like` name filter and descending `start_time` return exactly one row |
+| `AnalyticsWorkflowExecutions` | `_like` `workflow_type` filter and descending `start_time` return exactly one row |
 | `AnalyticsErrors` | unresolved/company predicate and descending `error_time` return the seeded error only |
 | `AnalyticsCodeLifecycleEvents` | DateTime lower bound excludes the old event and returns the new event |
 | `AnalyticsAggregationOperations` | limit/offset and descending time return the second seeded page exactly |
 | `AnalyticsDashboardStats` | four aliased aggregate roots return exact counts, sums, and nodes for Date/DateTime bounds |
-| `ApplicationLogsList` | exact JSON/Map/Tuple/Array `context` and ordered log fields round-trip |
+| `ApplicationLogsList` | exact String `context` and ordered log fields round-trip |
 | `DocumentIntegrationRequests` | document filter and descending request time return the matching OMS row only |
 | `L2JobEvents` | `_and`, pagination, and aggregate `count` return one node and total two |
 | `L2DeviceEvents` | equipment/device filter and aggregate `count` return the exact node and total |
 | `L2TrafficLogs` | order, offset, and aggregate count return the exact payload page and total |
 | `L2ProductionEvents` | work-order filter, descending event time, and aggregate count return exact rows and total |
 
-Store exact request and response JSON for every case. Tests compare full
-`serde_json::Value` equality, not merely absence of errors.
+Store exact request and compact response bytes for every case. Compare the raw
+HTTP response body to the expected UTF-8 bytes, then parse it only for helpful
+failure diagnostics. `serde_json::Value` equality is insufficient because it
+does not prove object-key order. Include nested objects and aggregates in the
+raw fixtures so order is checked at every object level.
 
-- [ ] **Step 3: Add a failing real ClickHouse contract test**
+Add a separate non-tandt `ClickHouseComplexValues` fixture/table for JSON,
+Map, Tuple, and Array round trips. Do not attribute those types to
+`logs_application_logs.context` or mutate any of the twelve pinned operations.
+
+- [ ] **Step 3: Add a failing real-binary ClickHouse contract test**
 
 Create isolated `analytics` and `logs` databases and deterministic tables/rows
-matching every selected field. Start `AppState` with a base URL lacking
-`database=`, run all operations with pinned variables and explicit sessions,
-and compare each response to its exact JSON oracle. Provision Postgres from
-mandatory `PG_URL` and run a mixed Postgres/ClickHouse operation; missing
-Postgres must fail when `DONAT_EXTERNAL_DB_TESTS=1`.
+matching every selected field. Ensure the conformance compose stack is healthy,
+build the current Donat binary, and start that binary with a base ClickHouse URL
+lacking `database=`. Run all operations through HTTP with pinned variables and
+explicit sessions and compare each compact raw body byte-for-byte. Provision
+Postgres from mandatory `PG_URL` and run a mixed Postgres/ClickHouse operation;
+missing Postgres must fail when `DONAT_EXTERNAL_DB_TESTS=1`.
+
+The dashboard seed uses rows at `today`, `today - 8 days`, and
+`today - 31 days` (and equivalent DateTime values) so the exact inline
+`now() - interval ...` literals have deterministic inclusion/exclusion oracles.
+Run the separate complex-value case through the same real binary.
 
 - [ ] **Step 4: Run against ClickHouse and verify RED or uncovered incompatibilities**
 
@@ -323,14 +417,19 @@ Run:
 DONAT_EXTERNAL_DB_TESTS=1 \
 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
 CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
-  cargo test -p donat-server --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
+  cargo test -p donat-conformance --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
 ```
 
 Expected before final compatibility fixes: at least one failing operation identifies the unsupported query shape precisely.
 
 - [ ] **Step 5: Fix only demonstrated compatibility gaps**
 
-For each failure, add the smallest unit test in the owning crate before changing production code. Keep backend-specific literal rendering in `donat-backend`, planning semantics in `donat-schema`, SQL assembly in `donat-sqlgen`, and transport in `donat-server`.
+For each failure, first isolate the smallest failing request as a native
+real-binary conformance case and run it RED. Then add the smallest unit test in
+the owning crate before changing production code. Keep backend-specific literal
+rendering in `donat-backend`, planning semantics in `donat-schema`, SQL assembly
+in `donat-sqlgen`, and transport in `donat-server`. A compatibility fix is not
+complete until both its native conformance case and owning-crate test are GREEN.
 
 - [ ] **Step 6: Verify all twelve exact response oracles GREEN**
 
@@ -339,7 +438,7 @@ Re-run the exact contract command and require all operation assertions to pass a
 - [ ] **Step 7: Document the contract command and commit**
 
 ```bash
-git add crates/server/tests/tandt_clickhouse_contract.rs crates/server/tests/fixtures crates/conformance/README.md
+git add crates/server/tests/tandt_clickhouse_contract.rs crates/server/tests/fixtures crates/conformance/tests/tandt_clickhouse_contract.rs crates/conformance/fixtures/tandt_clickhouse crates/conformance/README.md
 git add crates/backend crates/schema crates/sqlgen crates/server
 git commit -m "test: cover tandt multi-source ClickHouse contract"
 ```
@@ -407,7 +506,7 @@ CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
 DONAT_EXTERNAL_DB_TESTS=1 \
 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
 CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
-  cargo test -p donat-server --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
+  cargo test -p donat-conformance --test tandt_clickhouse_contract -- --test-threads=1 --nocapture
 ```
 
 Expected: SQLite, MySQL, and ClickHouse matrix legs pass, and all twelve tandt
