@@ -63,3 +63,16 @@ per-row round trips. Cross-source relationships remain out of scope and must be
 modeled as remote relationships. Root/type ownership conflicts become startup
 errors instead of silently choosing one source. ClickHouse remains read-only,
 and no admin role or permission bypass is introduced.
+
+## Reference Implementation
+
+- `crates/schema/src/multi_source.rs`: composite schema construction, root
+  ownership, operation partitioning, and ordered response slots.
+- `crates/server/src/gql.rs`: exact-source dispatch, source-local remote joins,
+  and top-level response assembly.
+- `crates/server/src/state.rs`: source-addressed connections and ClickHouse
+  multi-database catalog discovery.
+- `crates/conformance/tests/multi_source.rs`: mixed Postgres/ClickHouse and
+  secondary Postgres routing contract.
+- `crates/conformance/tests/tandt_clickhouse_contract.rs`: pinned tandt
+  ClickHouse GraphQL compatibility contract.

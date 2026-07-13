@@ -121,15 +121,16 @@ executor after the merged schema value is built.
 ### Source-aware execution
 
 `AppState` gains source-addressed helpers for source kind, URL, Postgres pool,
-SQLite path, and MySQL URL. `execute_query_json(source, roots)` selects the
-backend and connection by source name instead of falling back to `default`.
+SQLite path, and MySQL URL. `execute_source_query_json(source, roots)` selects
+the backend and connection by source name instead of falling back to `default`.
 
 One SQL statement is generated and executed per participating source. Source
-plans may execute concurrently because reads have no cross-source transaction.
-The server merges the returned data objects in response-slot order, inserts
-local typename values without a backend call, then applies existing remote-join
-post-processing to each source root. A backend failure retains
-the existing Hasura-compatible GraphQL error body and fails the operation.
+plans execute in metadata source order, which keeps failure selection
+deterministic without creating a cross-source transaction. The server applies
+existing remote-join post-processing to each source result, then merges the
+returned data objects in response-slot order and inserts local typename values
+without a backend call. A backend failure retains the existing
+Hasura-compatible GraphQL error body and fails the operation.
 
 ### ClickHouse multi-database introspection
 
