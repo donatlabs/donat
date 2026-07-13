@@ -40,6 +40,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: backend-${{ matrix.backend }}
       - name: Start backend service
         if: matrix.backend != 'sqlite'
         run: docker compose -f docker-compose.conformance.yml up -d --wait "${{ matrix.backend }}"

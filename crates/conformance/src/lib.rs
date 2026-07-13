@@ -2981,6 +2981,15 @@ mod tests {
         let steps = workflow["jobs"]["backend-core"]["steps"]
             .as_sequence()
             .expect("backend matrix steps");
+        let backend_cache_key = steps
+            .iter()
+            .find(|step| step["uses"].as_str() == Some("Swatinem/rust-cache@v2"))
+            .and_then(|step| step["with"]["key"].as_str())
+            .expect("backend matrix cache key");
+        assert_eq!(
+            backend_cache_key, "backend-${{ matrix.backend }}",
+            "backend matrix caches must be isolated by backend"
+        );
         let shared_command = steps
             .iter()
             .find(|step| step["name"].as_str() == Some("Shared backend contract"))
