@@ -1053,6 +1053,23 @@ fn order_by_relationship_aggregate_allows_whitelisted_function() {
 }
 
 #[test]
+fn clickhouse_order_by_rejects_tracked_relationships() {
+    for (relationship, nested) in [
+        ("articles_aggregate", "articles_aggregate: { count: asc }"),
+        ("profile", "profile: { id: asc }"),
+    ] {
+        let query = format!("query {{ author(order_by: {{ {nested} }}) {{ id }} }}");
+        let err = plan_gql_for_source(SourceKind::Clickhouse, &query, &user(), json!({}))
+            .expect_err("ClickHouse must not plan relationship order_by");
+        assert_eq!(err.code, "validation-failed");
+        assert_eq!(
+            err.message,
+            format!("field '{relationship}' not found in type: 'author'")
+        );
+    }
+}
+
+#[test]
 fn permission_limit_caps_user_limit() {
     // article select for "user" carries limit: 100.
     assert_eq!(

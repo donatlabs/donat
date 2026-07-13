@@ -1751,6 +1751,7 @@ impl<'a> Planner<'a> {
                         .entry
                         .array_relationships
                         .iter()
+                        .filter(|_| self.capabilities.relationships)
                         .find(|r| r.name == base)
                     {
                         let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
@@ -1831,6 +1832,7 @@ impl<'a> Planner<'a> {
                     .entry
                     .object_relationships
                     .iter()
+                    .filter(|_| self.capabilities.relationships)
                     .find(|r| r.name == *key)
                 {
                     let (remote_table, join) = self.object_rel_target(ctx, rel, path)?;

@@ -12,10 +12,10 @@ pub trait Dialect {
     /// Render the trailing `LIMIT`/`OFFSET` clause (with leading spaces),
     /// or the empty string when neither bound is present.
     fn limit_offset(&self, limit: Option<u64>, offset: Option<u64>) -> String;
-    /// Render a JSON scalar as a SQL literal cast to the column's native
-    /// type. Mirrors sqlgen's `scalar_sql`: NULL / TRUE / FALSE, numbers and
-    /// strings cast to `::"ty"`, JSON arrays/objects targeting json/jsonb,
-    /// and the geometry/geography GeoJSON special-case.
+    /// Render a JSON scalar as a SQL literal compatible with the column's
+    /// native type. Mirrors sqlgen's `scalar_sql`: NULL / TRUE / FALSE,
+    /// numbers and strings cast to the backend type, JSON arrays/objects
+    /// targeting json/jsonb, and the geometry/geography GeoJSON special-case.
     fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String;
 
     /// Assemble a JSON object from `(raw key, value expr)` pairs. The key is
@@ -372,6 +372,25 @@ impl Dialect for ClickhouseDialect {
     }
 
     fn render_scalar(&self, scalar: &donat_ir::Scalar, native_type: &str) -> String {
+        let native_type = native_type.trim();
+        if clickhouse_complex_type(native_type) {
+            // ClickHouse does not support CAST(String AS Map/Tuple/Array),
+            // while JSONExtract's type-name overload parses the same JSON
+            // literal into the native complex value.
+            let value = scalar.as_json();
+            if value.is_null() {
+                return "NULL".into();
+            }
+            let json = match value {
+                serde_json::Value::String(value) => value.clone(),
+                value => value.to_string(),
+            };
+            return format!(
+                "JSONExtract({}, {})",
+                self.quote_literal(&json),
+                self.quote_literal(native_type)
+            );
+        }
         let native_type = clickhouse_cast_type(native_type);
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
@@ -441,6 +460,29 @@ fn clickhouse_cast_type(logical_type: &str) -> &str {
         "date" => "Date",
         other => other,
     }
+}
+
+fn clickhouse_complex_type(native_type: &str) -> bool {
+    let mut native_type = native_type.trim();
+    loop {
+        let inner = ["Nullable", "LowCardinality"]
+            .into_iter()
+            .find_map(|wrapper| {
+                native_type
+                    .strip_prefix(wrapper)
+                    .and_then(|rest| rest.strip_prefix('('))
+                    .and_then(|rest| rest.strip_suffix(')'))
+            });
+        match inner {
+            Some(inner) => native_type = inner,
+            None => break,
+        }
+    }
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(family, _)| family)
+        .to_ascii_lowercase();
+    matches!(family.as_str(), "array" | "map" | "tuple")
 }
 
 /// A backend dialect selected at runtime. Implements [`Dialect`] by
@@ -563,6 +605,23 @@ mod tests {
         assert_eq!(
             d.render_scalar(&s(serde_json::json!(42)), "int4"),
             "CAST(42 AS Int32)"
+        );
+    }
+
+    #[test]
+    fn clickhouse_renders_complex_literals_with_json_extract() {
+        let d = ClickhouseDialect;
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": 1})), "Map(String, UInt64)"),
+            "JSONExtract('{\"a\":1}', 'Map(String, UInt64)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!(["a", "b"])), "Array(String)"),
+            "JSONExtract('[\"a\",\"b\"]', 'Array(String)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"a": 1})), "Tuple(a UInt64)"),
+            "JSONExtract('{\"a\":1}', 'Tuple(a UInt64)')"
         );
     }
 
