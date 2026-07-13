@@ -35,6 +35,9 @@ reasoning never has to be reconstructed.
 - [[decisions/009-parallel-conformance-engine-startup]] — parallel conformance
   keeps its test-thread speed while retrying transient per-suite engine
   startup failures with RAII child cleanup and complete diagnostics.
+- [[decisions/010-compose-metadata-sources-in-graphql]] — one GraphQL schema
+  composes per-source planners, executes one statement per participating
+  datasource, and merges only top-level response objects in source order.
 
 ## One-paragraph shape
 

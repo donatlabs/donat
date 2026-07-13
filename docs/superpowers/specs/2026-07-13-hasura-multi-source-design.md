@@ -67,20 +67,35 @@ pub struct SourceQueryPlan {
     pub roots: Vec<donat_ir::RootField>,
 }
 
+pub enum QueryResponseSlot {
+    SourceField { key: String },
+    LocalTypename { key: String, value: String },
+}
+
 pub enum MultiSourcePlan {
     Query {
         sources: Vec<SourceQueryPlan>,
-        response_order: Vec<String>,
+        response: Vec<QueryResponseSlot>,
     },
     Mutation {
-        source: String,
+        source: Option<String>,
         roots: Vec<donat_ir::MutationRoot>,
+        response: Vec<QueryResponseSlot>,
     },
 }
 ```
 
-`response_order` contains response keys after aliases and includes root
-`__typename` fields. Duplicate response keys remain a GraphQL validation error.
+`response` contains response keys after aliases. Root `__typename` fields are
+synthetic local slots and require no datasource, so typename-only query and
+mutation operations do not perform a backend call. A mutation source is `None`
+only for a typename-only operation.
+
+Top-level fields are collected in first-seen response-key order using GraphQL's
+field-selection merging rules. Repeated compatible fields with the same field
+name and equivalent arguments merge their nested selection sets, including
+fields introduced through fragments. A response-key collision with different
+field names or incompatible arguments returns `validation-failed` before any
+source planner or backend call.
 
 Mutations must resolve to exactly one source. This preserves each backend's
 existing atomic mutation semantics and avoids pretending to provide a
@@ -110,8 +125,9 @@ backend and connection by source name instead of falling back to `default`.
 
 One SQL statement is generated and executed per participating source. Source
 plans may execute concurrently because reads have no cross-source transaction.
-The server merges the returned data objects in `response_order`, then applies
-existing remote-join post-processing to each root. A backend failure retains
+The server merges the returned data objects in response-slot order, inserts
+local typename values without a backend call, then applies existing remote-join
+post-processing to each source root. A backend failure retains
 the existing Hasura-compatible GraphQL error body and fails the operation.
 
 ### ClickHouse multi-database introspection
@@ -132,6 +148,8 @@ Only tables genuinely absent from that combined catalog are pruned.
 - Duplicate root ownership or incompatible duplicate GraphQL type definitions
   fail startup with source and root/type names in the diagnostic.
 - Cross-source mutations return `validation-failed` before any backend call.
+- Compatible repeated fields merge according to GraphQL semantics; conflicting
+  aliases or arguments return `validation-failed` before any backend call.
 - Missing source connections return the existing `unexpected` query error and
   never fall back to another source.
 - ClickHouse introspection transport and response-size limits remain unchanged.
@@ -139,8 +157,8 @@ Only tables genuinely absent from that combined catalog are pruned.
 ## Verification
 
 1. Unit tests prove root ownership, operation partitioning, schema merging,
-   source-specific capability handling, response ordering, and collision
-   rejection.
+   source-specific capability handling, response ordering, direct and fragment
+   field merging, conflicting alias/argument rejection, and collision rejection.
 2. Runtime tests use one Postgres source and one ClickHouse HTTP stub to prove
    source routing and a mixed-source response.
 3. A real ClickHouse test creates both `analytics` and `logs` databases, uses a
@@ -150,6 +168,12 @@ Only tables genuinely absent from that combined catalog are pruned.
    documents with representative variables.
 5. Existing workspace unit tests and the full conformance suite remain green.
 6. The real ClickHouse backend matrix remains green against ClickHouse 25.8.
+7. Negative authorization tests prove that role-specific root visibility and
+   session-variable row filters are enforced independently for Postgres and
+   ClickHouse. Requests without a role and requests naming `admin` cannot read
+   either source unless explicit metadata permissions grant that exact role.
+8. Typename-only query/mutation operations and mixed typename plus datasource
+   operations preserve response order and make only the required backend calls.
 
 ## Compatibility
 
