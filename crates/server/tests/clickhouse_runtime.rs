@@ -76,6 +76,30 @@ fn metadata_with_mutations(url: &str, mutations: bool) -> Metadata {
     metadata_for(url, "analytics", mutations)
 }
 
+fn complex_metadata(url: &str, database: &str) -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "clickhouse",
+            "configuration": { "connection_info": { "database_url": url } },
+            "tables": [{
+                "table": { "schema": database, "name": "complex_values" },
+                "configuration": { "custom_name": "complex_values" },
+                "select_permissions": [{
+                    "role": "user",
+                    "permission": {
+                        "columns": "*",
+                        "filter": {},
+                        "allow_aggregations": true
+                    }
+                }]
+            }]
+        }]
+    }))
+    .expect("metadata deserializes")
+}
+
 fn session() -> Session {
     Session {
         role: "user".to_string(),
@@ -459,4 +483,106 @@ async fn clickhouse_real_server_when_configured() {
             "empty {op} must be null: {aggregate_body}"
         );
     }
+}
+
+#[tokio::test]
+async fn clickhouse_complex_type_filters_round_trip() {
+    let Some(url) = std::env::var("CLICKHOUSE_URL").ok() else {
+        if std::env::var_os("DONAT_EXTERNAL_DB_TESTS").is_some() {
+            panic!("CLICKHOUSE_URL must be set when DONAT_EXTERNAL_DB_TESTS=1");
+        }
+        eprintln!("skipping real ClickHouse complex-type test: CLICKHOUSE_URL is not configured");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let database = format!("donat_clickhouse_complex_{}", std::process::id());
+    let test_url = with_database(&url, &database);
+
+    let drop_database = format!("DROP DATABASE IF EXISTS {database}");
+    let _ = client.post(&url).body(drop_database.clone()).send().await;
+    let response = client
+        .post(&url)
+        .body(format!("CREATE DATABASE {database}"))
+        .send()
+        .await
+        .expect("create complex-type test database");
+    assert!(response.status().is_success(), "create database failed");
+    for sql in [
+        "CREATE TABLE complex_values (id UInt64, numeric_map Map(UInt64, UInt64), string_map Map(String, UInt64), labels Array(String), point Tuple(label String, value UInt64)) ENGINE = MergeTree ORDER BY id",
+        "INSERT INTO complex_values VALUES (1, map(1, 2), map('a', 2), ['red', 'blue'], ('p', 7)), (2, map(3, 4), map('b', 4), ['green'], ('q', 8))",
+    ] {
+        let response = client
+            .post(&test_url)
+            .body(sql)
+            .send()
+            .await
+            .expect("ClickHouse complex-type setup request");
+        assert!(
+            response.status().is_success(),
+            "setup failed: {}",
+            response.text().await.unwrap()
+        );
+    }
+
+    let state = app_state_with_metadata(complex_metadata(&test_url, &database));
+    state
+        .sync_sources()
+        .await
+        .expect("real ClickHouse complex-type introspection");
+    let (_, equality_body) = gql::execute_full(
+        &state,
+        &session(),
+        &json!({
+            "query": r#"query($where: complex_values_bool_exp!) {
+                complex_values(where: $where) { id }
+            }"#,
+            "variables": {
+                "where": {
+                    "numeric_map": { "_eq": { "1": 2 } },
+                    "string_map": { "_eq": { "a": 2 } },
+                    "labels": { "_eq": ["red", "blue"] },
+                    "point": { "_eq": { "label": "p", "value": 7 } }
+                }
+            }
+        }),
+        false,
+        &HeaderMap::new(),
+    )
+    .await;
+    let (_, in_body) = gql::execute_full(
+        &state,
+        &session(),
+        &json!({
+            "query": r#"query($where: complex_values_bool_exp!) {
+                complex_values(where: $where) { id }
+            }"#,
+            "variables": {
+                "where": {
+                    "numeric_map": { "_in": [{ "1": 2 }, { "3": 4 }] }
+                }
+            }
+        }),
+        false,
+        &HeaderMap::new(),
+    )
+    .await;
+
+    let cleanup = client
+        .post(&url)
+        .body(drop_database)
+        .send()
+        .await
+        .expect("complex-type cleanup request");
+    assert!(cleanup.status().is_success(), "cleanup failed: {cleanup:?}");
+
+    assert_eq!(
+        equality_body,
+        json!({ "data": { "complex_values": [{ "id": 1 }] } }),
+        "complex equality filters failed"
+    );
+    assert_eq!(
+        in_body,
+        json!({ "data": { "complex_values": [{ "id": 1 }, { "id": 2 }] } }),
+        "complex _in filter failed"
+    );
 }

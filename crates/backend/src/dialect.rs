@@ -385,6 +385,19 @@ impl Dialect for ClickhouseDialect {
                 serde_json::Value::String(value) => value.clone(),
                 value => value.to_string(),
             };
+            if let Some((key_type, value_type)) = clickhouse_map_types(native_type)
+                && !key_type.eq_ignore_ascii_case("String")
+            {
+                // JSONExtract only accepts String map keys. Parse the JSON
+                // object as a string-keyed map first, then convert its keys
+                // with ClickHouse's map cast.
+                let string_map_type = format!("Map(String, {value_type})");
+                return format!(
+                    "CAST(JSONExtract({}, {}) AS {native_type})",
+                    self.quote_literal(&json),
+                    self.quote_literal(&string_map_type)
+                );
+            }
             return format!(
                 "JSONExtract({}, {})",
                 self.quote_literal(&json),
@@ -463,6 +476,15 @@ fn clickhouse_cast_type(logical_type: &str) -> &str {
 }
 
 fn clickhouse_complex_type(native_type: &str) -> bool {
+    let native_type = clickhouse_unwrap_type(native_type);
+    let family = native_type
+        .split_once('(')
+        .map_or(native_type, |(family, _)| family)
+        .to_ascii_lowercase();
+    matches!(family.as_str(), "array" | "map" | "tuple")
+}
+
+fn clickhouse_unwrap_type(native_type: &str) -> &str {
     let mut native_type = native_type.trim();
     loop {
         let inner = ["Nullable", "LowCardinality"]
@@ -478,11 +500,37 @@ fn clickhouse_complex_type(native_type: &str) -> bool {
             None => break,
         }
     }
-    let family = native_type
-        .split_once('(')
-        .map_or(native_type, |(family, _)| family)
-        .to_ascii_lowercase();
-    matches!(family.as_str(), "array" | "map" | "tuple")
+    native_type
+}
+
+fn clickhouse_map_types(native_type: &str) -> Option<(&str, &str)> {
+    let native_type = clickhouse_unwrap_type(native_type);
+    let (family, args) = native_type.split_once('(')?;
+    if !family.trim().eq_ignore_ascii_case("Map") {
+        return None;
+    }
+    let args = args.strip_suffix(')')?;
+    let mut nesting = 0usize;
+    let separator = args.char_indices().find_map(|(index, ch)| match ch {
+        '(' => {
+            nesting += 1;
+            None
+        }
+        ')' => {
+            nesting = nesting.checked_sub(1)?;
+            None
+        }
+        ',' if nesting == 0 => Some(index),
+        _ => None,
+    })?;
+    let (key_type, value_type) = args.split_at(separator);
+    let value_type = value_type.strip_prefix(',')?;
+    let key_type = key_type.trim();
+    let value_type = value_type.trim();
+    if key_type.is_empty() || value_type.is_empty() {
+        return None;
+    }
+    Some((key_type, value_type))
 }
 
 /// A backend dialect selected at runtime. Implements [`Dialect`] by
@@ -622,6 +670,10 @@ mod tests {
         assert_eq!(
             d.render_scalar(&s(serde_json::json!({"a": 1})), "Tuple(a UInt64)"),
             "JSONExtract('{\"a\":1}', 'Tuple(a UInt64)')"
+        );
+        assert_eq!(
+            d.render_scalar(&s(serde_json::json!({"1": 2})), "Map(UInt64, UInt64)"),
+            "CAST(JSONExtract('{\"1\":2}', 'Map(String, UInt64)') AS Map(UInt64, UInt64))"
         );
     }
 

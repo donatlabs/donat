@@ -4395,6 +4395,7 @@ mod tests {
                 "configuration": {},
                 "tables": [{
                     "table": { "schema": "analytics", "name": "events" },
+                    "configuration": { "custom_name": "events" },
                     "select_permissions": [{
                         "role": "user",
                         "permission": { "columns": "*", "filter": {} }
@@ -4470,6 +4471,7 @@ mod tests {
         );
 
         let described = describe_table(&state, &session, &json!({ "table": "events" })).await;
+        assert_eq!(described["isError"], false, "{described}");
         assert_eq!(
             described["structuredContent"]["insertable_columns"],
             Json::Null
@@ -4478,6 +4480,38 @@ mod tests {
             described["structuredContent"]["updatable_columns"],
             Json::Null
         );
+
+        for (name, arguments, message) in [
+            (
+                "insert",
+                json!({ "table": "events", "objects": [{ "id": 1 }] }),
+                "insert permission required on the table",
+            ),
+            (
+                "update",
+                json!({
+                    "table": "events",
+                    "where": { "id": { "_eq": 1 } },
+                    "set": { "id": 2 }
+                }),
+                "update permission required on the table",
+            ),
+            (
+                "delete",
+                json!({ "table": "events", "where": { "id": { "_eq": 1 } } }),
+                "delete permission required on the table",
+            ),
+        ] {
+            let result = call_tool(
+                &state,
+                &session,
+                &HeaderMap::new(),
+                &json!({ "name": name, "arguments": arguments }),
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{name}: {result}");
+            assert_eq!(result["content"][0]["text"], message, "{name}: {result}");
+        }
     }
 
     fn cols() -> Vec<String> {
