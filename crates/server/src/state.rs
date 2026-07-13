@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use donat_backend::{AnyDialect, ClickhouseDialect, MySqlDialect, SqliteDialect};
+use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
@@ -676,24 +676,32 @@ impl AppState {
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         // Later same-named sources override earlier ones (the harness
         // appends a second 'default' pointing at a per-test database).
-        let sources: Vec<(String, SourceKind, String)> = {
+        let sources: Vec<(String, SourceKind, String, Vec<String>)> = {
             let engine = self.engine.read().await;
-            let mut resolved: Vec<(String, SourceKind, String)> = vec![];
+            let mut resolved: Vec<(String, SourceKind, String, Vec<String>)> = vec![];
             for s in &engine.metadata.sources {
                 let url = resolve_source_url(s, &self.default_url);
-                match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
+                let mut tracked_databases = Vec::new();
+                for table in &s.tables {
+                    let schema = table.table.schema().to_string();
+                    if !tracked_databases.contains(&schema) {
+                        tracked_databases.push(schema);
+                    }
+                }
+                match resolved.iter_mut().find(|(n, _, _, _)| n == &s.name) {
                     Some(entry) => {
                         entry.1 = s.kind;
                         entry.2 = url;
+                        entry.3 = tracked_databases;
                     }
-                    None => resolved.push((s.name.clone(), s.kind, url)),
+                    None => resolved.push((s.name.clone(), s.kind, url, tracked_databases)),
                 }
             }
             resolved
         };
 
         let mut new_catalogs = HashMap::new();
-        for (name, kind, url) in &sources {
+        for (name, kind, url, tracked_databases) in &sources {
             let catalog = match kind {
                 SourceKind::Postgres => {
                     let existing = {
@@ -762,16 +770,22 @@ impl AppState {
                     catalog
                 }
                 SourceKind::Clickhouse => {
-                    let database = clickhouse_database(url)?;
-                    let sql = "SELECT table, name, type, default_kind, is_in_primary_key \
+                    let fallback_database = clickhouse_database(url)?;
+                    let databases = if tracked_databases.is_empty() {
+                        vec![fallback_database.clone()]
+                    } else {
+                        tracked_databases.clone()
+                    };
+                    let sql = "SELECT database, table, name, type, default_kind, is_in_primary_key \
                                FROM system.columns \
-                               WHERE database = {database:String} \
-                               ORDER BY table, position \
+                               WHERE database IN {databases:Array(String)} \
+                               ORDER BY database, table, position \
                                FORMAT JSONEachRow";
-                    let text = clickhouse_post_with_database_param(&self.http, url, sql, &database)
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                    donat_catalog::clickhouse_catalog_from_json_each_row(&text, &database)?
+                    let text =
+                        clickhouse_post_with_databases_param(&self.http, url, sql, &databases)
+                            .await
+                            .map_err(anyhow::Error::msg)?;
+                    donat_catalog::clickhouse_catalog_from_json_each_row(&text, &fallback_database)?
                 }
             };
             new_catalogs.insert(name.clone(), catalog);
@@ -860,15 +874,23 @@ fn append_clickhouse_chunk(
     Ok(())
 }
 
-async fn clickhouse_post_with_database_param(
+async fn clickhouse_post_with_databases_param(
     client: &reqwest::Client,
     url: &str,
     sql: &str,
-    database: &str,
+    databases: &[String],
 ) -> Result<String, String> {
     let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    let databases = format!(
+        "[{}]",
+        databases
+            .iter()
+            .map(|database| ClickhouseDialect.quote_literal(database))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     url.query_pairs_mut()
-        .append_pair("param_database", database);
+        .append_pair("param_databases", &databases);
     clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_CATALOG_BYTES).await
 }
 

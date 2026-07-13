@@ -559,6 +559,7 @@ mod mysql_tests {
 
 #[derive(Debug, Deserialize)]
 struct ClickhouseColumnRow {
+    database: Option<String>,
     table: String,
     name: String,
     #[serde(rename = "type")]
@@ -578,6 +579,7 @@ pub fn clickhouse_catalog_from_json_each_row(
 
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let row: ClickhouseColumnRow = serde_json::from_str(line)?;
+        let database = row.database.as_deref().unwrap_or(database);
         let key = format!("{database}.{}", row.table);
         let table = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: database.to_string(),
@@ -684,6 +686,20 @@ mod clickhouse_tests {
 
         let users = catalog.table("analytics", "users").unwrap();
         assert_eq!(users.column("id").unwrap().pg_type, "uuid");
+    }
+
+    #[test]
+    fn clickhouse_json_each_row_builds_multi_database_catalog() {
+        let rows = concat!(
+            r#"{"database":"analytics","table":"daily","name":"date","type":"Date","default_kind":"","is_in_primary_key":1}"#,
+            "\n",
+            r#"{"database":"logs","table":"events","name":"event_time","type":"DateTime64(6)","default_kind":"","is_in_primary_key":1}"#,
+        );
+
+        let catalog = clickhouse_catalog_from_json_each_row(rows, "default").unwrap();
+
+        assert!(catalog.table("analytics", "daily").is_some());
+        assert!(catalog.table("logs", "events").is_some());
     }
 
     #[test]
