@@ -37,7 +37,7 @@ reasoning never has to be reconstructed.
   startup failures with RAII child cleanup and complete diagnostics.
 - [[decisions/010-compose-metadata-sources-in-graphql]] — one GraphQL schema
   composes per-source planners, executes one statement per participating
-  datasource, and merges only top-level response objects in source order.
+  datasource, and merges top-level values in operation response-slot order.
 
 ## One-paragraph shape
 

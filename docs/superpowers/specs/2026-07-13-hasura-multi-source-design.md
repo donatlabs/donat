@@ -97,7 +97,8 @@ fields introduced through fragments. A response-key collision with different
 field names or incompatible arguments returns `validation-failed` before any
 source planner or backend call.
 
-Mutations must resolve to exactly one source. This preserves each backend's
+Mutations containing datasource fields must resolve to exactly one source;
+typename-only mutations remain source-less. This preserves each backend's
 existing atomic mutation semantics and avoids pretending to provide a
 distributed transaction. ClickHouse never owns mutation roots because its
 capabilities are read-only.
