@@ -639,7 +639,16 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
         TableInfo {
             schema: "public".to_string(),
             name: "other".to_string(),
-            columns: vec![col("id"), col("body")],
+            columns: vec![
+                col("id"),
+                ColumnInfo {
+                    name: "body".to_string(),
+                    pg_type: "text".to_string(),
+                    native_type: None,
+                    nullable: false,
+                    has_default: false,
+                },
+            ],
             primary_key: vec!["id".to_string()],
             foreign_keys: vec![],
         },
@@ -650,7 +659,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
         r#"{
           node(id: "WyJkZWZhdWx0IiwicHVibGljIiwiaXRlbSIsMV0=") {
             ... on public_item { value: id }
-            ... on public_other { value: body }
+            ... on public_other { value: id }
           }
         }"#,
     )
@@ -660,6 +669,21 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
     planner
         .plan(&doc, None, &JsonMap::new(), &session("user"))
         .expect("mutually exclusive concrete fragments do not conflict");
+
+    let incompatible = graphql_parser::parse_query::<String>(
+        r#"{
+          node(id: "WyJkZWZhdWx0IiwicHVibGljIiwiaXRlbSIsMV0=") {
+            ... on public_item { value: id }
+            ... on public_other { value: body }
+          }
+        }"#,
+    )
+    .expect("incompatible Relay query parses")
+    .into_static();
+    let error = planner
+        .plan(&incompatible, None, &JsonMap::new(), &session("user"))
+        .expect_err("mutually exclusive fields still require the same response shape");
+    assert!(error.message.contains("response key 'value' conflict"));
 }
 
 #[test]

@@ -699,8 +699,16 @@ fn validate_selection_conflicts(
                 .alias
                 .as_deref()
                 .unwrap_or(right.field.name.as_str());
-            if left_key != right_key || !scopes_overlap(&left.conditions, &right.conditions, schema)
-            {
+            if left_key != right_key {
+                continue;
+            }
+            if !scoped_response_shapes_match(left, right, schema) {
+                return Err(PlanError::validation(
+                    &format!("{path}.{}", right.field.name),
+                    format!("fields with response key '{right_key}' conflict"),
+                ));
+            }
+            if !scopes_overlap(&left.conditions, &right.conditions, schema) {
                 continue;
             }
             if left.field.name != right.field.name || !arguments_match(&left.field, &right.field) {
@@ -741,6 +749,45 @@ fn validate_selection_conflicts(
         validate_selection_conflicts(nested, fragments, vars, &nested_path, schema)?;
     }
     Ok(())
+}
+
+fn scoped_response_shapes_match(left: &ScopedField, right: &ScopedField, schema: &Json) -> bool {
+    let field_type = |field: &ScopedField| {
+        field.conditions.iter().rev().find_map(|condition| {
+            schema["types"]
+                .as_array()?
+                .iter()
+                .find(|ty| ty["name"].as_str() == Some(condition.as_str()))?["fields"]
+                .as_array()?
+                .iter()
+                .find(|candidate| candidate["name"] == field.field.name)
+                .map(|candidate| &candidate["type"])
+        })
+    };
+    match (field_type(left), field_type(right)) {
+        (Some(left), Some(right)) => response_types_match(left, right),
+        _ => true,
+    }
+}
+
+fn response_types_match(left: &Json, right: &Json) -> bool {
+    let left_kind = left["kind"].as_str();
+    let right_kind = right["kind"].as_str();
+    match (left_kind, right_kind) {
+        (Some("NON_NULL"), Some("NON_NULL")) | (Some("LIST"), Some("LIST")) => {
+            response_types_match(&left["ofType"], &right["ofType"])
+        }
+        (Some("NON_NULL" | "LIST"), _) | (_, Some("NON_NULL" | "LIST")) => false,
+        (Some(left_kind), Some(right_kind)) => {
+            let composite = |kind: &str| matches!(kind, "OBJECT" | "INTERFACE" | "UNION");
+            if composite(left_kind) && composite(right_kind) {
+                true
+            } else {
+                left_kind == right_kind && left["name"] == right["name"]
+            }
+        }
+        _ => true,
+    }
 }
 
 fn collect_scoped_fields(
