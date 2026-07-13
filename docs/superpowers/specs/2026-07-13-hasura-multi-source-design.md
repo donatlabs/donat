@@ -125,12 +125,13 @@ SQLite path, and MySQL URL. `execute_source_query_json(source, roots)` selects
 the backend and connection by source name instead of falling back to `default`.
 
 One SQL statement is generated and executed per participating source. Source
-plans execute in metadata source order, which keeps failure selection
-deterministic without creating a cross-source transaction. The server applies
-existing remote-join post-processing to each source result, then merges the
-returned data objects in response-slot order and inserts local typename values
-without a backend call. A backend failure retains the existing
-Hasura-compatible GraphQL error body and fails the operation.
+plans execute in the order each source first appears among the operation's
+top-level fields, which keeps failure selection deterministic without creating
+a cross-source transaction. The server applies existing remote-join
+post-processing to each source result, then merges the returned data objects in
+response-slot order and inserts local typename values without a backend call. A
+backend failure retains the existing Hasura-compatible GraphQL error body and
+fails the operation.
 
 ### ClickHouse multi-database introspection
 
