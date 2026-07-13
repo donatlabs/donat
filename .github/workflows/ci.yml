@@ -69,7 +69,7 @@ jobs:
           DONAT_EXTERNAL_DB_TESTS: "1"
       - name: Full Postgres reference conformance
         if: matrix.backend == 'postgres'
-        run: cargo test -p donat-conformance -- --test-threads=4
+        run: env -u MYSQL_URL -u CLICKHOUSE_URL cargo test -p donat-conformance -- --test-threads=4
         env:
           RUST_BACKTRACE: "1"
 
