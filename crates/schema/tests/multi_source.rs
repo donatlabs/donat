@@ -664,6 +664,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
     let doc = graphql_parser::parse_query::<String>(
         r#"{
           node(id: "WyJkZWZhdWx0IiwicHVibGljIiwiaXRlbSIsMV0=") {
+            value: id
             ... on public_item { value: id }
             ... on public_other { value: id }
           }

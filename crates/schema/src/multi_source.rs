@@ -661,8 +661,21 @@ fn collect_fields(
     }
     for collected in &fields {
         let nested_path = format!("{path}.{}.selectionSet", collected.field.name);
+        let relay_selection = if relay_id_types.is_empty() {
+            RelaySelectionType::None
+        } else if collected.field.name == "node" {
+            RelaySelectionType::Node
+        } else if collected.field.name.ends_with("_connection") {
+            RelaySelectionType::Connection
+        } else {
+            RelaySelectionType::None
+        };
         validate_selection_conflicts(
-            vec![(collected.field.selection_set.clone(), vec![])],
+            vec![(
+                collected.field.selection_set.clone(),
+                vec![],
+                relay_selection,
+            )],
             fragments,
             vars,
             &nested_path,
@@ -677,10 +690,23 @@ fn collect_fields(
 struct ScopedField {
     field: GqlField<'static, String>,
     conditions: Vec<String>,
+    relay_selection: RelaySelectionType,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelaySelectionType {
+    None,
+    Connection,
+    Edge,
+    Node,
 }
 
 fn validate_selection_conflicts(
-    selection_sets: Vec<(SelectionSet<'static, String>, Vec<String>)>,
+    selection_sets: Vec<(
+        SelectionSet<'static, String>,
+        Vec<String>,
+        RelaySelectionType,
+    )>,
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
     path: &str,
@@ -688,12 +714,13 @@ fn validate_selection_conflicts(
     relay_id_types: &HashSet<String>,
 ) -> Result<(), PlanError> {
     let mut fields = vec![];
-    for (selection_set, conditions) in &selection_sets {
+    for (selection_set, conditions, relay_selection) in &selection_sets {
         collect_scoped_fields(
             selection_set,
             fragments,
             vars,
             conditions,
+            *relay_selection,
             &mut vec![],
             &mut fields,
         )?;
@@ -756,7 +783,14 @@ fn validate_selection_conflicts(
         let nested_path = format!("{path}.{}.selectionSet", first.field.name);
         let nested = group
             .into_iter()
-            .map(|field| (field.field.selection_set, field.conditions))
+            .map(|field| {
+                let relay_selection = match (field.relay_selection, field.field.name.as_str()) {
+                    (RelaySelectionType::Connection, "edges") => RelaySelectionType::Edge,
+                    (RelaySelectionType::Edge, "node") => RelaySelectionType::Node,
+                    _ => RelaySelectionType::None,
+                };
+                (field.field.selection_set, field.conditions, relay_selection)
+            })
             .collect();
         validate_selection_conflicts(
             nested,
@@ -778,11 +812,12 @@ fn scoped_response_shapes_match(
 ) -> bool {
     let relay_id = |field: &ScopedField| {
         field.field.name == "id"
-            && field
-                .conditions
-                .iter()
-                .rev()
-                .any(|condition| relay_id_types.contains(condition))
+            && (field.relay_selection == RelaySelectionType::Node
+                || field
+                    .conditions
+                    .iter()
+                    .rev()
+                    .any(|condition| relay_id_types.contains(condition)))
     };
     let field_type = |field: &ScopedField| {
         field.conditions.iter().rev().find_map(|condition| {
@@ -845,6 +880,7 @@ fn collect_scoped_fields(
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
     conditions: &[String],
+    relay_selection: RelaySelectionType,
     fragment_stack: &mut Vec<String>,
     output: &mut Vec<ScopedField>,
 ) -> Result<(), PlanError> {
@@ -855,6 +891,7 @@ fn collect_scoped_fields(
                     output.push(ScopedField {
                         field: field.clone(),
                         conditions: conditions.to_vec(),
+                        relay_selection,
                     });
                 }
             }
@@ -886,6 +923,7 @@ fn collect_scoped_fields(
                     fragments,
                     vars,
                     &nested_conditions,
+                    relay_selection,
                     fragment_stack,
                     output,
                 );
@@ -905,6 +943,7 @@ fn collect_scoped_fields(
                     fragments,
                     vars,
                     &nested_conditions,
+                    relay_selection,
                     fragment_stack,
                     output,
                 )?;
