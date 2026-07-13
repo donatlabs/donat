@@ -608,6 +608,8 @@ fn workspace_root() -> PathBuf {
 static BUILD_ENGINE: Once = Once::new();
 const ENGINE_HEALTH_DEADLINE: Duration = Duration::from_secs(30);
 const ENGINE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const ENGINE_START_ATTEMPTS: usize = 3;
+const ENGINE_START_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub fn engine_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DONAT_BIN") {
@@ -2147,59 +2149,97 @@ impl Running {
                 self.name
             );
         }
-        let port = free_port();
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
-        let log = std::fs::File::create(log_dir.join(format!("{}.log", self.name))).unwrap();
+        let mut last_failure = String::new();
+        let mut last_log_path = log_dir.join(format!("{}.log", self.name));
 
-        let mut cmd = Command::new(engine_binary());
-        cmd.arg("--port")
-            .arg(port.to_string())
-            .arg("--metadata-dir")
-            .arg(&metadata_dir)
-            .env("DONAT_DATABASE_URL", &self.db_url)
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log));
-        for a in &self.args {
-            cmd.arg(a);
-        }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        let child = cmd.spawn().expect("spawning donat");
+        // `free_port` probes a port and then releases it before the child can
+        // bind. Under parallel conformance, another process may claim that
+        // port in this small window. Retry the whole startup so a transient
+        // bind or database initialization failure does not fail an unrelated
+        // suite. Failed children are always reaped before the next attempt.
+        for attempt in 1..=ENGINE_START_ATTEMPTS {
+            let port = free_port();
+            let log_path = if attempt == ENGINE_START_ATTEMPTS {
+                log_dir.join(format!("{}.log", self.name))
+            } else {
+                log_dir.join(format!("{}.attempt-{attempt}.log", self.name))
+            };
+            let log = std::fs::File::create(&log_path).unwrap();
 
-        let mut proc = EngineProc {
-            child,
-            base_url: format!("http://127.0.0.1:{port}"),
-            ws_base: format!("ws://127.0.0.1:{port}"),
-            _metadata_dir: metadata_dir,
-        };
-
-        // Wait healthy.
-        let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
-        loop {
-            if engine_is_healthy(&self.http, &proc.base_url) {
-                break;
+            let mut cmd = Command::new(engine_binary());
+            cmd.arg("--port")
+                .arg(port.to_string())
+                .arg("--metadata-dir")
+                .arg(&metadata_dir)
+                .env("DONAT_DATABASE_URL", &self.db_url)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log));
+            for a in &self.args {
+                cmd.arg(a);
             }
-            if let Some(status) = proc.child.try_wait().expect("checking donat process") {
-                panic!(
-                    "engine for suite {} exited before becoming healthy with {status}; see target/conformance-logs/{}.log",
-                    self.name, self.name
-                );
+            for (k, v) in &self.env {
+                cmd.env(k, v);
             }
-            assert!(
-                Instant::now() < deadline,
-                "engine for suite {} did not become healthy; see target/conformance-logs/{}.log",
-                self.name,
-                self.name
-            );
-            std::thread::sleep(Duration::from_millis(50));
+
+            let child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    last_failure = format!("could not spawn donat: {error}");
+                    last_log_path = log_path;
+                    if attempt < ENGINE_START_ATTEMPTS {
+                        std::thread::sleep(ENGINE_START_RETRY_DELAY);
+                    }
+                    continue;
+                }
+            };
+
+            let mut proc = EngineProc {
+                child,
+                base_url: format!("http://127.0.0.1:{port}"),
+                ws_base: format!("ws://127.0.0.1:{port}"),
+                _metadata_dir: metadata_dir.clone(),
+            };
+
+            // Wait healthy.
+            let deadline = Instant::now() + ENGINE_HEALTH_DEADLINE;
+            let failure = loop {
+                if engine_is_healthy(&self.http, &proc.base_url) {
+                    break None;
+                }
+                if let Some(status) = proc.child.try_wait().expect("checking donat process") {
+                    break Some(format!("exited before becoming healthy with {status}"));
+                }
+                if Instant::now() >= deadline {
+                    break Some("did not become healthy before the startup deadline".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+
+            let Some(failure) = failure else {
+                // Let webhook callback endpoints reach the now-running engine.
+                if let Some(handle) = &self.webhook {
+                    handle.set(&proc.base_url, self.admin_secret.clone());
+                }
+                *self.engine.borrow_mut() = Some(proc);
+                return;
+            };
+
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+            last_failure = failure;
+            last_log_path = log_path;
+            if attempt < ENGINE_START_ATTEMPTS {
+                std::thread::sleep(ENGINE_START_RETRY_DELAY);
+            }
         }
-        // Let webhook callback endpoints reach the now-running engine.
-        if let Some(handle) = &self.webhook {
-            handle.set(&proc.base_url, self.admin_secret.clone());
-        }
-        *self.engine.borrow_mut() = Some(proc);
+
+        panic!(
+            "engine for suite {} failed to become healthy after {ENGINE_START_ATTEMPTS} attempts: {last_failure}; see {}",
+            self.name,
+            last_log_path.display()
+        );
     }
 
     /// The engine's HTTP base URL, spawning it lazily if needed.
