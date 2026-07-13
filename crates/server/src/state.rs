@@ -55,6 +55,7 @@ pub type SharedState = Arc<AppState>;
 /// variant to the existing GraphQL error body so the Postgres path keeps
 /// byte-for-byte identical error shaping (`Postgres` carries the real
 /// `tokio_postgres::Error` for `db_error_json`).
+#[derive(Debug)]
 pub enum QueryError {
     NoDefaultSource,
     Pool(String),
@@ -185,7 +186,7 @@ fn render_hasura_environment_template(template: &str) -> Option<serde_json::Valu
 }
 
 impl AppState {
-    async fn default_source_url(&self) -> Option<String> {
+    async fn default_source_name(&self) -> Option<String> {
         let engine = self.engine.read().await;
         engine
             .metadata
@@ -193,44 +194,59 @@ impl AppState {
             .iter()
             .find(|source| source.name == "default")
             .or_else(|| engine.metadata.sources.first())
-            .map(|source| resolve_source_url(source, &self.default_url))
+            .map(|source| source.name.clone())
     }
 
-    pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
-        let pools = self.pools.read().await;
-        pools
-            .get("default")
-            .or_else(|| pools.values().next())
-            .map(|(_, p)| p.clone())
-    }
-
-    /// The backend kind of the source the GraphQL schema is built against
-    /// (the "default" source, or the first one) — mirrors
-    /// `Engine::default_catalog`'s selection. Defaults to Postgres when no
-    /// source is declared.
-    pub async fn default_source_kind(&self) -> SourceKind {
+    pub async fn source_url(&self, source_name: &str) -> Option<String> {
         let engine = self.engine.read().await;
         engine
             .metadata
             .sources
             .iter()
-            .find(|s| s.name == "default")
-            .or_else(|| engine.metadata.sources.first())
-            .map(|s| s.kind)
-            .unwrap_or(SourceKind::Postgres)
+            .rev()
+            .find(|source| source.name == source_name)
+            .map(|source| resolve_source_url(source, &self.default_url))
     }
 
-    /// Run a planned read operation against the default source's backend and
-    /// return the assembled JSON `data` object. Dispatches on the source's
-    /// backend kind so the Postgres path is byte-for-byte identical to the
-    /// pre-multi-backend behavior (same SQL, same client call, same error
-    /// shaping — the caller maps `QueryError` back to the existing bodies).
-    pub async fn execute_query_json(&self, roots: &[RootField]) -> Result<Json, QueryError> {
-        match self.default_source_kind().await {
+    pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
+        let source = self.default_source_name().await?;
+        self.source_pool(&source).await
+    }
+
+    pub async fn source_pool(&self, source_name: &str) -> Option<deadpool_postgres::Pool> {
+        self.pools
+            .read()
+            .await
+            .get(source_name)
+            .map(|(_, pool)| pool.clone())
+    }
+
+    pub async fn source_kind(&self, source_name: &str) -> Option<SourceKind> {
+        self.engine
+            .read()
+            .await
+            .metadata
+            .sources
+            .iter()
+            .rev()
+            .find(|source| source.name == source_name)
+            .map(|source| source.kind)
+    }
+
+    pub async fn execute_source_query_json(
+        &self,
+        source_name: &str,
+        roots: &[RootField],
+    ) -> Result<Json, QueryError> {
+        match self
+            .source_kind(source_name)
+            .await
+            .ok_or(QueryError::NoDefaultSource)?
+        {
             SourceKind::Postgres => {
                 let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
                 let pool = self
-                    .default_pool()
+                    .source_pool(source_name)
                     .await
                     .ok_or(QueryError::NoDefaultSource)?;
                 let client = pool
@@ -253,8 +269,7 @@ impl AppState {
                 let path = {
                     let paths = self.sqlite_paths.read().await;
                     paths
-                        .get("default")
-                        .or_else(|| paths.values().next())
+                        .get(source_name)
                         .cloned()
                         .ok_or(QueryError::NoDefaultSource)?
                 };
@@ -278,8 +293,7 @@ impl AppState {
                 );
                 let url = {
                     let urls = self.mysql_urls.read().await;
-                    urls.get("default")
-                        .or_else(|| urls.values().next())
+                    urls.get(source_name)
                         .cloned()
                         .ok_or(QueryError::NoDefaultSource)?
                 };
@@ -309,7 +323,7 @@ impl AppState {
                     AnyDialect::Clickhouse(ClickhouseDialect),
                 );
                 let url = self
-                    .default_source_url()
+                    .source_url(source_name)
                     .await
                     .ok_or(QueryError::NoDefaultSource)?;
                 let text = clickhouse_post_data(
@@ -335,8 +349,9 @@ impl AppState {
     /// can render the exact permission-error body. The check is computed in
     /// the same DML and the rollback is in the same transaction, so the
     /// permission is still enforced atomically (no bypass).
-    pub async fn execute_sqlite_mutations(
+    pub async fn execute_source_sqlite_mutations(
         &self,
+        source_name: &str,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, SqliteMutationError> {
         use donat_sqlgen::{MutationResponseSlot, SqliteMutationPlan};
@@ -360,8 +375,7 @@ impl AppState {
         let path = {
             let paths = self.sqlite_paths.read().await;
             paths
-                .get("default")
-                .or_else(|| paths.values().next())
+                .get(source_name)
                 .cloned()
                 .ok_or(SqliteMutationError::NoDefaultSource)?
         };
@@ -464,8 +478,9 @@ impl AppState {
     /// rolls the whole transaction back and yields
     /// [`MysqlMutationError::CheckViolation`] — the same atomic enforcement the
     /// Postgres/SQLite paths give.
-    pub async fn execute_mysql_mutations(
+    pub async fn execute_source_mysql_mutations(
         &self,
+        source_name: &str,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
         use donat_sqlgen::{MutationResponseSlot, MySqlMutationKind, MySqlMutationPlan};
@@ -477,7 +492,11 @@ impl AppState {
         // recovery / the supplied-PK predicate). Preserve selection order.
         let planned: Vec<(String, MySqlMutationPlan)> = {
             let engine = self.engine.read().await;
-            let catalog = engine.default_catalog();
+            let catalog = engine
+                .catalogs
+                .get(source_name)
+                .cloned()
+                .unwrap_or_default();
             let pk_of = |t: &donat_ir::Table| -> Vec<String> {
                 catalog
                     .tables
@@ -508,8 +527,7 @@ impl AppState {
 
         let url = {
             let urls = self.mysql_urls.read().await;
-            urls.get("default")
-                .or_else(|| urls.values().next())
+            urls.get(source_name)
                 .cloned()
                 .ok_or(MysqlMutationError::NoDefaultSource)?
         };
