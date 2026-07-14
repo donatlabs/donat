@@ -54,7 +54,9 @@ temporary source-local planners and produces:
 - the set of known metadata roles;
 - prebuilt standard and Relay introspection schemas for each
   `(role, backend_request)` pair;
-- prevalidated standard and Relay root/type collision results.
+- prevalidated standard and Relay root/type collision results. A Relay-only
+  collision is stored in the snapshot so ordinary GraphQL remains available;
+  enabling Relay returns that cached validation error immediately.
 
 Compilation is the only API that performs whole-schema composition or builds
 table/function root indexes. A `MultiSourcePlanner` is created from metadata,
@@ -105,9 +107,10 @@ introspection schema.
 
 ## Failure Semantics
 
-- Missing catalogs and root/type collisions fail candidate compilation.
-- Relay collisions are detected during candidate compilation, not on the first
-  Relay request.
+- Missing catalogs and standard GraphQL root/type collisions fail candidate
+  compilation.
+- Relay collisions are detected during candidate compilation and stored as a
+  deterministic Relay-mode error, not rediscovered on each Relay request.
 - A failed candidate leaves the previous serving snapshot, including backend
   routing handles, unchanged.
 - Calling the request planner before successful bootstrap returns an explicit
