@@ -1,6 +1,7 @@
 //! Query planning: one GraphQL operation -> Vec<RootField> (IR).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use donat_catalog::{Catalog, TableInfo};
 use donat_ir::*;
@@ -43,7 +44,7 @@ pub(crate) fn is_session_var_name(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-hasura-"))
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct PlanError {
     pub message: String,
@@ -225,18 +226,8 @@ impl<'a> TableCtx<'a> {
     }
 }
 
-pub struct Planner<'a> {
-    /// When false (DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
-    /// tracked functions need an explicit per-role permission entry.
-    pub infer_function_permissions: bool,
-    /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
-    pub relay: bool,
+pub struct PlannerIndex {
     pub(crate) capabilities: donat_backend::Capabilities,
-    inherited_roles: &'a [donat_metadata::InheritedRole],
-    remote_schemas: &'a [donat_metadata::RemoteSchema],
-    catalog: &'a Catalog,
-    tables: &'a [TableEntry],
-    functions: &'a [donat_metadata::FunctionEntry],
     /// "schema.name" -> index into `tables`.
     by_table: HashMap<String, usize>,
     /// root field name -> (kind, source).
@@ -245,6 +236,37 @@ pub struct Planner<'a> {
     pub(crate) mutation_roots: HashMap<String, (MutationKind, usize)>,
     /// mutation root field name -> function index (exposed_as: mutation).
     mutation_function_roots: HashMap<String, usize>,
+}
+
+pub struct Planner<'a> {
+    /// When false (DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false),
+    /// tracked functions need an explicit per-role permission entry.
+    pub infer_function_permissions: bool,
+    /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
+    pub relay: bool,
+    inherited_roles: &'a [donat_metadata::InheritedRole],
+    remote_schemas: &'a [donat_metadata::RemoteSchema],
+    catalog: &'a Catalog,
+    tables: &'a [TableEntry],
+    functions: &'a [donat_metadata::FunctionEntry],
+    index: Arc<PlannerIndex>,
+}
+
+impl std::ops::Deref for Planner<'_> {
+    type Target = PlannerIndex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
+}
+
+fn capabilities_for_source(kind: SourceKind) -> donat_backend::Capabilities {
+    match kind {
+        SourceKind::Sqlite => donat_backend::capabilities::sqlite(),
+        SourceKind::Mysql => donat_backend::capabilities::mysql(),
+        SourceKind::Clickhouse => donat_backend::capabilities::clickhouse(),
+        SourceKind::Postgres => donat_backend::capabilities::postgres(),
+    }
 }
 
 impl<'a> Planner<'a> {
@@ -266,35 +288,42 @@ impl<'a> Planner<'a> {
             catalog,
             &[],
             &[],
-            donat_backend::capabilities::postgres(),
+            Self::compile_index_parts(&[], &[], donat_backend::capabilities::postgres()),
         )
     }
 
     /// Construct a planner for one exact metadata source. The composite
     /// planner uses this to preserve all source-local authority.
     pub fn for_source(metadata: &'a Metadata, source: &'a Source, catalog: &'a Catalog) -> Self {
-        let capabilities = match source.kind {
-            SourceKind::Sqlite => donat_backend::capabilities::sqlite(),
-            SourceKind::Mysql => donat_backend::capabilities::mysql(),
-            SourceKind::Clickhouse => donat_backend::capabilities::clickhouse(),
-            SourceKind::Postgres => donat_backend::capabilities::postgres(),
-        };
+        let index = Self::compile_index(source);
+        Self::for_source_with_index(metadata, source, catalog, index)
+    }
+
+    pub(crate) fn compile_index(source: &Source) -> Arc<PlannerIndex> {
+        let capabilities = capabilities_for_source(source.kind);
+        Self::compile_index_parts(&source.tables, &source.functions, capabilities)
+    }
+
+    pub(crate) fn for_source_with_index(
+        metadata: &'a Metadata,
+        source: &'a Source,
+        catalog: &'a Catalog,
+        index: Arc<PlannerIndex>,
+    ) -> Self {
         Self::from_parts(
             metadata,
             catalog,
             source.tables.as_slice(),
             source.functions.as_slice(),
-            capabilities,
+            index,
         )
     }
 
-    fn from_parts(
-        metadata: &'a Metadata,
-        catalog: &'a Catalog,
-        tables: &'a [TableEntry],
-        functions: &'a [donat_metadata::FunctionEntry],
+    fn compile_index_parts(
+        tables: &[TableEntry],
+        functions: &[donat_metadata::FunctionEntry],
         capabilities: donat_backend::Capabilities,
-    ) -> Self {
+    ) -> Arc<PlannerIndex> {
         let mut by_table = HashMap::new();
         let mut roots = HashMap::new();
         for (idx, entry) in tables.iter().enumerate() {
@@ -366,19 +395,31 @@ impl<'a> Planner<'a> {
             );
         }
 
+        Arc::new(PlannerIndex {
+            capabilities,
+            by_table,
+            roots,
+            mutation_roots,
+            mutation_function_roots,
+        })
+    }
+
+    fn from_parts(
+        metadata: &'a Metadata,
+        catalog: &'a Catalog,
+        tables: &'a [TableEntry],
+        functions: &'a [donat_metadata::FunctionEntry],
+        index: Arc<PlannerIndex>,
+    ) -> Self {
         Planner {
             infer_function_permissions: true,
             relay: false,
-            capabilities,
             inherited_roles: &metadata.inherited_roles,
             remote_schemas: &metadata.remote_schemas,
             catalog,
             tables,
             functions,
-            by_table,
-            roots,
-            mutation_roots,
-            mutation_function_roots,
+            index,
         }
     }
 

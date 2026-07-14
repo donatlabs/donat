@@ -286,13 +286,7 @@ async fn main() -> anyhow::Result<()> {
         jwt.spawn_refresher(reqwest::Client::new());
     }
     let state: SharedState = Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata,
-            catalogs: std::collections::HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
         default_url: database_url,
         admin_secret,
         unauthorized_role,
@@ -324,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             sources = engine.metadata.sources.len(),
             tables = engine.default_catalog().tables.len(),
+            schema_compiled = engine.compiled.is_some(),
             "initialized"
         );
     }

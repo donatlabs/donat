@@ -173,13 +173,7 @@ fn app_state(url: &str) -> Arc<AppState> {
 
 fn app_state_with_metadata(metadata: Metadata) -> Arc<AppState> {
     Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata,
-            catalogs: HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,

@@ -4435,15 +4435,20 @@ mod tests {
             )]),
             functions: BTreeMap::new(),
         };
+        let url = "http://127.0.0.1:18123".to_string();
+        let engine = crate::state::Engine::compiled(
+            metadata,
+            HashMap::from([("default".to_string(), catalog)]),
+            HashMap::from([(
+                "default".to_string(),
+                crate::state::SourceRuntime::Clickhouse { url: url.clone() },
+            )]),
+            true,
+        )
+        .expect("MCP engine snapshot compiles");
         Arc::new(crate::state::AppState {
-            pools: tokio::sync::RwLock::new(HashMap::new()),
-            sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-            mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-            engine: tokio::sync::RwLock::new(crate::state::Engine {
-                metadata,
-                catalogs: HashMap::from([("default".to_string(), catalog)]),
-            }),
-            default_url: "http://127.0.0.1:18123".to_string(),
+            engine: tokio::sync::RwLock::new(Arc::new(engine)),
+            default_url: url,
             admin_secret: None,
             unauthorized_role: None,
             stringify_numerics: false,

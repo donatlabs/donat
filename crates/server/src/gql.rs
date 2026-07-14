@@ -1,5 +1,6 @@
 //! /v1/graphql execution: headers -> session, plan -> SQL -> one row.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -7,10 +8,10 @@ use axum::http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_schema::{
-    MultiSourcePlan, MultiSourcePlanner, Planner, QueryResponseSlot, Session, SourceQueryPlan,
+    MultiSourcePlan, MultiSourcePlanner, PlanError, QueryResponseSlot, Session, SourceQueryPlan,
 };
 
-use crate::state::{AppState, QueryError, SharedState};
+use crate::state::{AppState, Engine, QueryError, SharedState, SourceRuntime};
 
 /// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
 /// the planner both recurse on nesting, so an unbounded query would overflow
@@ -38,6 +39,36 @@ impl SourceQueryExecutor for AppState {
     ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>> {
         Box::pin(self.execute_source_query_json(source, roots))
     }
+}
+
+struct SnapshotSourceQueryExecutor<'a> {
+    state: &'a AppState,
+    runtimes: HashMap<String, SourceRuntime>,
+}
+
+impl SourceQueryExecutor for SnapshotSourceQueryExecutor<'_> {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>> {
+        let runtime = self.runtimes.get(source).cloned();
+        Box::pin(async move {
+            let runtime = runtime.ok_or(QueryError::NoDefaultSource)?;
+            self.state.execute_runtime_query_json(runtime, roots).await
+        })
+    }
+}
+
+fn planner_from_snapshot(engine: &Engine) -> Result<MultiSourcePlanner<'_>, PlanError> {
+    let compiled = engine.compiled.as_deref().ok_or_else(|| {
+        PlanError::new(
+            "$",
+            "unexpected",
+            "engine schema snapshot is not initialized",
+        )
+    })?;
+    MultiSourcePlanner::from_compiled(&engine.metadata, &engine.catalogs, compiled)
 }
 
 pub async fn execute_source_query_plans<E: SourceQueryExecutor + Sync>(
@@ -468,7 +499,7 @@ pub async fn execute_full(
         }
     };
 
-    let engine = state.engine.read().await;
+    let engine = state.engine_snapshot().await;
     // Remote schema routing: operations aimed entirely at a permitted
     // remote schema are validated against the role's SDL and forwarded.
     let mut remote_variables = variables.clone();
@@ -483,12 +514,10 @@ pub async fn execute_full(
                     let order: Vec<(String, bool)> = top_level_fields(&doc);
                     let mut intro_doc = doc.clone();
                     crate::remote::keep_introspection_roots(&mut intro_doc);
-                    let mut planner =
-                        match MultiSourcePlanner::new(&engine.metadata, &engine.catalogs) {
-                            Ok(planner) => planner,
-                            Err(error) => return ok(error.to_graphql()),
-                        };
-                    planner.set_infer_function_permissions(state.infer_function_permissions);
+                    let planner = match planner_from_snapshot(&engine) {
+                        Ok(planner) => planner,
+                        Err(error) => return ok(error.to_graphql()),
+                    };
                     let intro_data = match donat_schema::execute_multi_source_introspection(
                         &planner,
                         session,
@@ -549,9 +578,9 @@ pub async fn execute_full(
     // Action routing: an operation whose top-level fields are actions is
     // resolved by calling the action's HTTP handler, not by SQL planning.
     if let Some(ctx) = crate::action::match_action(&engine.metadata, &doc, operation_name) {
-        drop(engine);
         return crate::action::resolve(
             state,
+            engine,
             session,
             &ctx,
             &doc,
@@ -586,11 +615,10 @@ pub async fn execute_full(
         tables = engine.metadata.sources.iter().map(|source| source.tables.len()).sum::<usize>(),
         catalog_tables = engine.catalogs.values().map(|catalog| catalog.tables.len()).sum::<usize>(),
         "graphql request");
-    let mut planner = match MultiSourcePlanner::new(&engine.metadata, &engine.catalogs) {
+    let mut planner = match planner_from_snapshot(&engine) {
         Ok(planner) => planner,
         Err(error) => return ok(error.to_graphql()),
     };
-    planner.set_infer_function_permissions(state.infer_function_permissions);
     if let Err(error) = planner.set_relay(relay) {
         return ok(error.to_graphql());
     }
@@ -614,8 +642,21 @@ pub async fn execute_full(
 
     match plan {
         MultiSourcePlan::Query { sources, response } => {
-            drop(engine);
-            match execute_source_query_plans(state.as_ref(), &sources).await {
+            let mut runtimes = HashMap::with_capacity(sources.len());
+            for source in &sources {
+                let Some(runtime) = engine.runtimes.get(&source.source).cloned() else {
+                    return ok(error_json(
+                        "unexpected",
+                        format!("runtime for source '{}' not found", source.source),
+                    ));
+                };
+                runtimes.insert(source.source.clone(), runtime);
+            }
+            let executor = SnapshotSourceQueryExecutor {
+                state: state.as_ref(),
+                runtimes,
+            };
+            match execute_source_query_plans(&executor, &sources).await {
                 Ok(mut source_data) => {
                     for (source_plan, data) in sources.iter().zip(&mut source_data) {
                         for root in &source_plan.roots {
@@ -625,6 +666,7 @@ pub async fn execute_full(
                             if let Some(node) = data.get_mut(alias.as_str()) {
                                 if let Err(e) = resolve_remote_joins(
                                     state,
+                                    engine.as_ref(),
                                     session,
                                     &query.fields,
                                     node,
@@ -653,41 +695,45 @@ pub async fn execute_full(
                 let data = assemble_multi_source_response(&response, std::iter::empty());
                 return ok(json!({ "data": data }));
             };
-            let source_kind = engine
-                .metadata
-                .sources
-                .iter()
-                .rev()
-                .find(|candidate| candidate.name == source)
-                .map(|candidate| candidate.kind);
-            let Some(source_kind) = source_kind else {
-                return ok(error_json("unexpected", "no default source"));
-            };
-
-            if source_kind == donat_metadata::SourceKind::Sqlite {
-                drop(engine);
-                return match state.execute_source_sqlite_mutations(&source, &roots).await {
-                    Ok(data) => ok(json!({
-                        "data": assemble_multi_source_response(&response, [data])
-                    })),
-                    Err(e) => ok(sqlite_mutation_error_json(e)),
-                };
-            }
-            if source_kind == donat_metadata::SourceKind::Mysql {
-                drop(engine);
-                return match state.execute_source_mysql_mutations(&source, &roots).await {
-                    Ok(data) => ok(json!({
-                        "data": assemble_multi_source_response(&response, [data])
-                    })),
-                    Err(e) => ok(mysql_mutation_error_json(e)),
-                };
-            }
-            if source_kind == donat_metadata::SourceKind::Clickhouse {
+            let Some(runtime) = engine.runtimes.get(&source).cloned() else {
                 return ok(error_json(
                     "unexpected",
-                    format!("mutations are not supported for source '{source}'"),
+                    format!("runtime for source '{source}' not found"),
                 ));
-            }
+            };
+            let pool = match runtime {
+                SourceRuntime::Sqlite { path } => {
+                    drop(engine);
+                    return match state.execute_sqlite_mutations_at(path, &roots).await {
+                        Ok(data) => ok(json!({
+                            "data": assemble_multi_source_response(&response, [data])
+                        })),
+                        Err(e) => ok(sqlite_mutation_error_json(e)),
+                    };
+                }
+                SourceRuntime::Mysql { url } => {
+                    let Some(catalog) = engine.catalogs.get(&source).cloned() else {
+                        return ok(error_json(
+                            "unexpected",
+                            format!("catalog for source '{source}' not found"),
+                        ));
+                    };
+                    drop(engine);
+                    return match state.execute_mysql_mutations_at(catalog, url, &roots).await {
+                        Ok(data) => ok(json!({
+                            "data": assemble_multi_source_response(&response, [data])
+                        })),
+                        Err(e) => ok(mysql_mutation_error_json(e)),
+                    };
+                }
+                SourceRuntime::Clickhouse { .. } => {
+                    return ok(error_json(
+                        "unexpected",
+                        format!("mutations are not supported for source '{source}'"),
+                    ));
+                }
+                SourceRuntime::Postgres { pool, .. } => pool,
+            };
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
             let fields: Vec<(String, String)> = roots
@@ -707,10 +753,6 @@ pub async fn execute_full(
                 })
                 .collect();
             drop(engine);
-
-            let Some(pool) = state.source_pool(&source).await else {
-                return ok(error_json("unexpected", "no default source"));
-            };
             let mut client = match pool.get().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -769,8 +811,45 @@ pub async fn execute_full(
 /// `data` object on success or a GraphQL error body on failure. Used to
 /// resolve action output-object relationships into tracked tables (the target
 /// is queried under the same session, so the role's permissions apply).
+fn plan_internal_select_from_snapshot(
+    engine: &Engine,
+    session: &Session,
+    doc: &graphql_parser::query::Document<'static, String>,
+    variables: &JsonMap<String, Json>,
+) -> Result<(String, Vec<donat_ir::RootField>, SourceRuntime), Json> {
+    let compiled = engine
+        .compiled
+        .as_deref()
+        .ok_or_else(|| error_json("unexpected", "engine schema snapshot is not initialized"))?;
+    let source = engine
+        .metadata
+        .sources
+        .iter()
+        .find(|source| source.name == "default")
+        .or_else(|| engine.metadata.sources.first())
+        .ok_or_else(|| error_json("unexpected", "no default source"))?;
+    let planner = compiled
+        .source_planner(&engine.metadata, &engine.catalogs, &source.name)
+        .map_err(|error| error.to_graphql())?;
+    let plan = planner
+        .plan(doc, None, variables, session)
+        .map_err(|error| error.to_graphql())?;
+    let roots = match plan {
+        donat_schema::Plan::Query(roots) => roots,
+        _ => return Err(error_json("unexpected", "internal query must be a select")),
+    };
+    let runtime = engine.runtimes.get(&source.name).cloned().ok_or_else(|| {
+        error_json(
+            "unexpected",
+            format!("runtime for source '{}' not found", source.name),
+        )
+    })?;
+    Ok((source.name.clone(), roots, runtime))
+}
+
 pub(crate) async fn execute_select_internal(
     state: &SharedState,
+    engine: &Engine,
     session: &Session,
     query: &str,
     variables: &JsonMap<String, Json>,
@@ -779,24 +858,11 @@ pub(crate) async fn execute_select_internal(
         .map_err(|e| error_json("unexpected", format!("internal query parse error: {e}")))?
         .into_static();
 
-    let engine = state.engine.read().await;
-    let catalog = engine.default_catalog();
-    let mut planner = Planner::new(&engine.metadata, &catalog);
-    planner.infer_function_permissions = state.infer_function_permissions;
-    let plan = planner
-        .plan(&doc, None, variables, session)
-        .map_err(|e| e.to_graphql())?;
-    let roots = match plan {
-        donat_schema::Plan::Query(roots) => roots,
-        _ => return Err(error_json("unexpected", "internal query must be a select")),
+    let (_, roots, runtime) = plan_internal_select_from_snapshot(engine, session, &doc, variables)?;
+    let SourceRuntime::Postgres { pool, .. } = runtime else {
+        return Err(error_json("unexpected", "no default source"));
     };
     let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
-    drop(engine);
-
-    let pool = state
-        .default_pool()
-        .await
-        .ok_or_else(|| error_json("unexpected", "no default source"))?;
     let client = pool
         .get()
         .await
@@ -813,6 +879,7 @@ pub(crate) async fn execute_select_internal(
             if let Some(node) = data.get_mut(alias.as_str()) {
                 resolve_remote_joins(
                     state,
+                    engine,
                     session,
                     &query.fields,
                     node,
@@ -885,6 +952,7 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
 /// and strip the hidden "__rr__" columns.
 fn resolve_remote_joins<'a>(
     state: &'a SharedState,
+    engine: &'a Engine,
     session: &'a Session,
     fields: &'a [donat_ir::OutputField],
     node: &'a mut Json,
@@ -894,7 +962,7 @@ fn resolve_remote_joins<'a>(
         match node {
             Json::Array(items) => {
                 for item in items {
-                    resolve_remote_joins(state, session, fields, item, path).await?;
+                    resolve_remote_joins(state, engine, session, fields, item, path).await?;
                 }
                 Ok(())
             }
@@ -906,6 +974,7 @@ fn resolve_remote_joins<'a>(
                             if let Some(child) = node.get_mut(field.alias.as_str()) {
                                 resolve_remote_joins(
                                     state,
+                                    engine,
                                     session,
                                     &query.fields,
                                     child,
@@ -928,7 +997,6 @@ fn resolve_remote_joins<'a>(
                                     error_json("unexpected", format!("bad remote join: {e}"))
                                 })?
                                 .into_static();
-                            let engine = state.engine.read().await;
                             let mut varmap = vars.clone();
                             let matched = crate::remote::match_remote_with(
                                 &engine.metadata,
@@ -937,7 +1005,6 @@ fn resolve_remote_joins<'a>(
                                 &mut varmap,
                                 true,
                             );
-                            drop(engine);
                             let value = match matched {
                                 Some(Ok(target)) => {
                                     let body = json!({
@@ -1066,7 +1133,6 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
 fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
     use crate::state::SqliteMutationError as E;
     match e {
-        E::NoDefaultSource => error_json("unexpected", "no default source"),
         E::CheckViolation { path } => json!({
             "errors": [{
                 "extensions": { "path": path, "code": "permission-error" },
@@ -1084,7 +1150,6 @@ fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
 fn mysql_mutation_error_json(e: crate::state::MysqlMutationError) -> Json {
     use crate::state::MysqlMutationError as E;
     match e {
-        E::NoDefaultSource => error_json("unexpected", "no default source"),
         E::CheckViolation { path } => json!({
             "errors": [{
                 "extensions": { "path": path, "code": "permission-error" },
@@ -1107,6 +1172,8 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -1300,5 +1367,300 @@ mod tests {
                 "message": "boom",
             }] })
         );
+    }
+
+    #[test]
+    fn internal_action_select_reuses_the_compiled_default_source() {
+        use std::collections::{BTreeMap, HashMap};
+
+        use crate::state::{Engine, SourceRuntime};
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+        use donat_metadata::Metadata;
+
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": "/tmp/action.sqlite" }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": { "custom_name": "public_item" },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.item".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "item".to_string(),
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        let engine = Engine::compiled(
+            metadata,
+            HashMap::from([("default".to_string(), catalog)]),
+            HashMap::from([(
+                "default".to_string(),
+                SourceRuntime::Sqlite {
+                    path: "/tmp/action.sqlite".to_string(),
+                },
+            )]),
+            true,
+        )
+        .expect("engine compiles");
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        for _ in 0..2 {
+            let (source, roots, runtime) = plan_internal_select_from_snapshot(
+                &engine,
+                &session,
+                &parse("{ public_item { id } }"),
+                &JsonMap::new(),
+            )
+            .expect("internal action select plans from the snapshot");
+            assert_eq!(source, "default");
+            assert_eq!(roots.len(), 1);
+            assert!(matches!(runtime, SourceRuntime::Sqlite { .. }));
+        }
+    }
+
+    fn shared_state(engine: Arc<Engine>) -> SharedState {
+        Arc::new(AppState {
+            engine: tokio::sync::RwLock::new(engine),
+            default_url: "postgres://unused".to_string(),
+            admin_secret: None,
+            unauthorized_role: None,
+            stringify_numerics: false,
+            infer_function_permissions: true,
+            jwt: None,
+            auth_hook: None,
+            http: reqwest::Client::new(),
+            allowlist_enabled: false,
+        })
+    }
+
+    fn empty_metadata() -> donat_metadata::Metadata {
+        serde_json::from_value(json!({ "version": 3, "sources": [] }))
+            .expect("empty metadata deserializes")
+    }
+
+    #[tokio::test]
+    async fn remote_join_uses_request_snapshot_after_publication() {
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                axum::Json(json!({ "data": { "message": { "name": "old" } } }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let old_metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let request_snapshot = Arc::new(Engine::bootstrap(old_metadata));
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!({ "__rr__id": 7, "joined": null });
+
+        resolve_remote_joins(
+            &state,
+            request_snapshot.as_ref(),
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.item",
+        )
+        .await
+        .expect("remote join resolves from request snapshot");
+
+        assert_eq!(node, json!({ "joined": { "name": "old" } }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn action_relationship_uses_request_snapshot_after_publication() {
+        use std::collections::BTreeMap;
+
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::Json(json!({ "id": 7 })) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "postgres",
+                "configuration": {
+                    "connection_info": {
+                        "database_url": "postgres://postgres:postgres@127.0.0.1:1/unused"
+                    }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "user" },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                }]
+            }],
+            "actions": [{
+                "name": "lookup",
+                "definition": {
+                    "kind": "synchronous",
+                    "type": "query",
+                    "handler": format!("http://{address}/"),
+                    "output_type": "Lookup"
+                },
+                "permissions": [{ "role": "user" }]
+            }],
+            "custom_types": {
+                "objects": [{
+                    "name": "Lookup",
+                    "fields": [{ "name": "id", "type": "Int!" }],
+                    "relationships": [{
+                        "name": "user",
+                        "type": "object",
+                        "remote_table": { "schema": "public", "name": "user" },
+                        "field_mapping": { "id": "id" }
+                    }]
+                }]
+            }
+        }))
+        .expect("action metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.user".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "user".to_string(),
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        let pool = crate::state::make_pool(
+            "postgres://postgres:postgres@127.0.0.1:1/unused?connect_timeout=1",
+        )
+        .expect("pool constructs");
+        let request_snapshot = Arc::new(
+            Engine::compiled(
+                metadata,
+                HashMap::from([("default".to_string(), catalog)]),
+                HashMap::from([(
+                    "default".to_string(),
+                    SourceRuntime::Postgres {
+                        url: "postgres://postgres:postgres@127.0.0.1:1/unused".to_string(),
+                        pool,
+                    },
+                )]),
+                true,
+            )
+            .expect("action snapshot compiles"),
+        );
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let doc = parse("{ lookup { id user { id } } }");
+        let ctx = crate::action::match_action(&request_snapshot.metadata, &doc, None)
+            .expect("action matches old snapshot");
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let (_, body) = crate::action::resolve(
+            &state,
+            request_snapshot,
+            &session,
+            &ctx,
+            &doc,
+            &JsonMap::new(),
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+
+        assert!(
+            body.pointer("/errors/0/message")
+                .and_then(Json::as_str)
+                .is_some_and(|message| message.starts_with("connection pool error:")),
+            "unexpected body: {body}"
+        );
+        server.abort();
     }
 }

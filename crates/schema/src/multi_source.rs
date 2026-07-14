@@ -1,6 +1,8 @@
 //! Composition of independently-authoritative source planners.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use donat_catalog::Catalog;
 use donat_ir::{MutationRoot, RootField};
@@ -11,9 +13,11 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::introspection::{build_schema_json, execute_introspection_schema};
+use crate::introspection::{build_schema_json, execute_introspection_schema_lazy};
 use crate::naming::table_base_name;
-use crate::plan::{Fragments, Plan, PlanError, Planner, Session, flatten, value_to_json};
+use crate::plan::{
+    Fragments, Plan, PlanError, Planner, PlannerIndex, Session, flatten, value_to_json,
+};
 
 /// A source-local query IR, ready for exactly one backend request.
 #[derive(Debug, Clone)]
@@ -49,14 +53,42 @@ struct ChildPlanner<'a> {
     planner: Planner<'a>,
 }
 
-/// Planner facade for Hasura metadata containing multiple data sources.
-pub struct MultiSourcePlanner<'a> {
-    children: Vec<ChildPlanner<'a>>,
-    base_query_owners: HashMap<String, String>,
+type RootOwners = HashMap<String, String>;
+
+struct RoleSchemas {
+    standard: [Json; 2],
+    relay: [Json; 2],
+}
+
+/// Immutable schema and source-index state compiled from one metadata/catalog
+/// snapshot. It owns no references into that snapshot.
+pub struct CompiledMultiSourceSchema {
+    source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
+    relay_query_owners: HashMap<String, String>,
     mutation_owners: HashMap<String, String>,
     schema_template: Json,
     relay_id_types: HashSet<String>,
+    relay_error: Option<PlanError>,
+    role_schemas: HashMap<String, RoleSchemas>,
+    unknown_role_schemas: RoleSchemas,
+    infer_function_permissions: bool,
+}
+
+impl std::fmt::Debug for CompiledMultiSourceSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledMultiSourceSchema")
+            .field("sources", &self.source_indexes.len())
+            .field("roles", &self.role_schemas.len())
+            .finish()
+    }
+}
+
+/// Planner facade for Hasura metadata containing multiple data sources.
+pub struct MultiSourcePlanner<'a> {
+    children: Vec<ChildPlanner<'a>>,
+    compiled: &'a CompiledMultiSourceSchema,
+    relay: bool,
 }
 
 impl std::fmt::Debug for MultiSourcePlanner<'_> {
@@ -74,94 +106,170 @@ impl std::fmt::Debug for MultiSourcePlanner<'_> {
     }
 }
 
-impl<'a> MultiSourcePlanner<'a> {
-    /// Build one child planner for every metadata source. Catalog lookup is
-    /// exact by source name; there is deliberately no default-source fallback.
-    pub fn new(
-        metadata: &'a Metadata,
-        catalogs: &'a HashMap<String, Catalog>,
+impl CompiledMultiSourceSchema {
+    pub fn compile(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
-        let mut children = vec![];
-        let mut query_owners = HashMap::new();
-        let mut mutation_owners = HashMap::new();
-
-        for source in &metadata.sources {
-            let catalog = catalogs.get(&source.name).ok_or_else(|| {
-                PlanError::new(
-                    "$",
-                    "not-found",
-                    format!("catalog for source '{}' not found", source.name),
-                )
-            })?;
-            let planner = Planner::for_source(metadata, source, catalog);
-            register_owners(
-                &mut query_owners,
-                planner.query_root_names(),
-                &source.name,
-                "query",
-            )?;
-            register_owners(
-                &mut mutation_owners,
-                planner.mutation_root_names(),
-                &source.name,
-                "mutation",
-            )?;
-            children.push(ChildPlanner {
-                source: source.name.clone(),
-                planner,
-            });
-        }
-
-        let schema_template = build_role_independent_schema(metadata, catalogs)?;
-        validate_role_projections(metadata, &children)?;
-        Ok(Self {
-            children,
-            base_query_owners: query_owners.clone(),
-            query_owners,
-            mutation_owners,
-            schema_template,
-            relay_id_types: HashSet::new(),
-        })
-    }
-
-    pub fn set_infer_function_permissions(&mut self, enabled: bool) {
-        for child in &mut self.children {
-            child.planner.infer_function_permissions = enabled;
-        }
-    }
-
-    /// Apply relay mode to each capable child and rebuild composite relay
-    /// ownership. The update is atomic when relay roots collide.
-    pub fn set_relay(&mut self, enabled: bool) -> Result<(), PlanError> {
-        let previous: Vec<bool> = self
-            .children
+        let source_indexes = metadata
+            .sources
             .iter()
-            .map(|child| child.planner.relay)
-            .collect();
-        let previous_id_types = self.relay_id_types.clone();
-        let mut owners = self.base_query_owners.clone();
-        let mut relay_id_types = HashSet::new();
-        let result = (|| {
-            for child in &mut self.children {
-                child.planner.relay = enabled && child.planner.supports_relay();
+            .map(Planner::compile_index)
+            .collect::<Vec<_>>();
+        let mut children = build_children(
+            metadata,
+            catalogs,
+            &source_indexes,
+            infer_function_permissions,
+        )?;
+        let (query_owners, mutation_owners) = root_owners(&children)?;
+        let schema_template = build_role_independent_schema(metadata, catalogs, &source_indexes)?;
+        let roles = metadata_roles(metadata);
+        let unknown_role = denied_role_name(&roles);
+        let standard = compose_role_schemas(&children, &roles)?;
+        let unknown_standard = compose_role_schema(&children, &unknown_role)?;
+
+        let relay_result = (|| {
+            let mut relay_query_owners = query_owners.clone();
+            let mut relay_id_types = HashSet::new();
+            for child in &mut children {
+                child.planner.relay = child.planner.supports_relay();
                 if child.planner.relay {
                     relay_id_types.extend(child.planner.tables().iter().map(table_base_name));
                     for root in child.planner.relay_root_names() {
-                        register_owner(&mut owners, &root, &child.source, "query")?;
+                        register_owner(&mut relay_query_owners, &root, &child.source, "query")?;
                     }
                 }
             }
-            Ok(())
+            Ok((
+                relay_query_owners,
+                relay_id_types,
+                compose_role_schemas(&children, &roles)?,
+                compose_role_schema(&children, &unknown_role)?,
+            ))
         })();
-        if let Err(error) = result {
-            for (child, relay) in self.children.iter_mut().zip(previous) {
-                child.planner.relay = relay;
-            }
-            self.relay_id_types = previous_id_types;
-            return Err(error);
+        let (relay_query_owners, relay_id_types, mut relay, unknown_relay, relay_error) =
+            match relay_result {
+                Ok((owners, id_types, schemas, unknown)) => {
+                    (owners, id_types, schemas, unknown, None)
+                }
+                Err(error) => (
+                    query_owners.clone(),
+                    HashSet::new(),
+                    standard.clone(),
+                    unknown_standard.clone(),
+                    Some(error),
+                ),
+            };
+        let mut standard = standard;
+        let role_schemas = roles
+            .into_iter()
+            .map(|role| {
+                let schemas = RoleSchemas {
+                    standard: standard
+                        .remove(&role)
+                        .expect("standard role schema was composed"),
+                    relay: relay.remove(&role).expect("Relay role schema was composed"),
+                };
+                (role, schemas)
+            })
+            .collect();
+
+        Ok(Self {
+            source_indexes,
+            query_owners,
+            relay_query_owners,
+            mutation_owners,
+            schema_template,
+            relay_id_types,
+            relay_error,
+            role_schemas,
+            unknown_role_schemas: RoleSchemas {
+                standard: unknown_standard,
+                relay: unknown_relay,
+            },
+            infer_function_permissions,
+        })
+    }
+
+    pub fn source_planner<'a>(
+        &'a self,
+        metadata: &'a Metadata,
+        catalogs: &'a HashMap<String, Catalog>,
+        source_name: &str,
+    ) -> Result<Planner<'a>, PlanError> {
+        let (index, source) = metadata
+            .sources
+            .iter()
+            .enumerate()
+            .find(|(_, source)| source.name == source_name)
+            .ok_or_else(|| {
+                PlanError::new(
+                    "$",
+                    "not-found",
+                    format!("source '{source_name}' not found"),
+                )
+            })?;
+        let catalog = catalogs.get(source_name).ok_or_else(|| {
+            PlanError::new(
+                "$",
+                "not-found",
+                format!("catalog for source '{source_name}' not found"),
+            )
+        })?;
+        let source_index = self
+            .source_indexes
+            .get(index)
+            .ok_or_else(|| PlanError::new("$", "unexpected", "compiled source index is missing"))?;
+        let mut planner =
+            Planner::for_source_with_index(metadata, source, catalog, source_index.clone());
+        planner.infer_function_permissions = self.infer_function_permissions;
+        Ok(planner)
+    }
+
+    fn schema(&self, session: &Session, relay: bool) -> &Json {
+        let schemas = self
+            .role_schemas
+            .get(&session.role)
+            .unwrap_or(&self.unknown_role_schemas);
+        let pair = if relay {
+            &schemas.relay
+        } else {
+            &schemas.standard
+        };
+        &pair[usize::from(session.backend_request)]
+    }
+}
+
+impl<'a> MultiSourcePlanner<'a> {
+    pub fn from_compiled(
+        metadata: &'a Metadata,
+        catalogs: &'a HashMap<String, Catalog>,
+        compiled: &'a CompiledMultiSourceSchema,
+    ) -> Result<Self, PlanError> {
+        let children = build_children(
+            metadata,
+            catalogs,
+            &compiled.source_indexes,
+            compiled.infer_function_permissions,
+        )?;
+        Ok(Self {
+            children,
+            compiled,
+            relay: false,
+        })
+    }
+
+    /// Apply the Relay mode that was validated during snapshot compilation.
+    pub fn set_relay(&mut self, enabled: bool) -> Result<(), PlanError> {
+        if enabled && let Some(error) = &self.compiled.relay_error {
+            return Err(error.clone());
         }
-        self.query_owners = owners;
-        self.relay_id_types = relay_id_types;
+        for child in &mut self.children {
+            child.planner.relay = enabled && child.planner.supports_relay();
+        }
+        self.relay = enabled;
         Ok(())
     }
 
@@ -202,21 +310,29 @@ impl<'a> MultiSourcePlanner<'a> {
         {
             return Err(PlanError::validation("$", "no mutations exist"));
         }
+        let empty_relay_id_types = HashSet::new();
+        let relay_id_types = if self.relay {
+            &self.compiled.relay_id_types
+        } else {
+            &empty_relay_id_types
+        };
         let fields = collect_fields(
             selection_set,
             &fragments,
             &vars,
             "$.selectionSet",
-            &self.schema_template,
-            &self.relay_id_types,
+            &self.compiled.schema_template,
+            relay_id_types,
         )?;
         if fields.is_empty() {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
         }
         let owners = if is_mutation {
-            &self.mutation_owners
+            &self.compiled.mutation_owners
+        } else if self.relay {
+            &self.compiled.relay_query_owners
         } else {
-            &self.query_owners
+            &self.compiled.query_owners
         };
         let collected = assign_owners(fields, owners, is_mutation)?;
         let response = collected
@@ -331,19 +447,68 @@ impl<'a> MultiSourcePlanner<'a> {
             .ok_or_else(|| PlanError::new("$", "not-found", format!("source '{source}' not found")))
     }
 
-    fn schema_json(&self, session: &Session) -> Result<Json, PlanError> {
-        compose_schema(
-            self.children.iter().map(|child| &child.planner),
-            session,
-            Some(&self.schema_template),
-        )
+    fn schema_json(&self, session: &Session) -> Result<Cow<'_, Json>, PlanError> {
+        Ok(Cow::Borrowed(self.compiled.schema(session, self.relay)))
     }
 }
 
-fn validate_role_projections(
-    metadata: &Metadata,
-    children: &[ChildPlanner<'_>],
-) -> Result<(), PlanError> {
+fn build_children<'a>(
+    metadata: &'a Metadata,
+    catalogs: &'a HashMap<String, Catalog>,
+    source_indexes: &[Arc<PlannerIndex>],
+    infer_function_permissions: bool,
+) -> Result<Vec<ChildPlanner<'a>>, PlanError> {
+    if metadata.sources.len() != source_indexes.len() {
+        return Err(PlanError::new(
+            "$",
+            "unexpected",
+            "compiled source indexes do not match metadata",
+        ));
+    }
+    metadata
+        .sources
+        .iter()
+        .zip(source_indexes)
+        .map(|(source, index)| {
+            let catalog = catalogs.get(&source.name).ok_or_else(|| {
+                PlanError::new(
+                    "$",
+                    "not-found",
+                    format!("catalog for source '{}' not found", source.name),
+                )
+            })?;
+            let mut planner =
+                Planner::for_source_with_index(metadata, source, catalog, index.clone());
+            planner.infer_function_permissions = infer_function_permissions;
+            Ok(ChildPlanner {
+                source: source.name.clone(),
+                planner,
+            })
+        })
+        .collect()
+}
+
+fn root_owners(children: &[ChildPlanner<'_>]) -> Result<(RootOwners, RootOwners), PlanError> {
+    let mut query_owners = HashMap::new();
+    let mut mutation_owners = HashMap::new();
+    for child in children {
+        register_owners(
+            &mut query_owners,
+            child.planner.query_root_names(),
+            &child.source,
+            "query",
+        )?;
+        register_owners(
+            &mut mutation_owners,
+            child.planner.mutation_root_names(),
+            &child.source,
+            "mutation",
+        )?;
+    }
+    Ok((query_owners, mutation_owners))
+}
+
+fn metadata_roles(metadata: &Metadata) -> BTreeSet<String> {
     let mut roles = BTreeSet::new();
     for inherited in &metadata.inherited_roles {
         roles.insert(inherited.role_name.clone());
@@ -386,17 +551,37 @@ fn validate_role_projections(
         }
     }
 
-    for role in roles {
-        for backend_request in [false, true] {
-            let session = Session {
-                role: role.clone(),
-                vars: HashMap::new(),
-                backend_request,
-            };
-            compose_schema(children.iter().map(|child| &child.planner), &session, None)?;
-        }
+    roles
+}
+
+fn denied_role_name(roles: &BTreeSet<String>) -> String {
+    let mut role = "__donat_unknown_role".to_string();
+    while roles.contains(&role) {
+        role.push('_');
     }
-    Ok(())
+    role
+}
+
+fn compose_role_schema(children: &[ChildPlanner<'_>], role: &str) -> Result<[Json; 2], PlanError> {
+    let compose = |backend_request| {
+        let session = Session {
+            role: role.to_string(),
+            vars: HashMap::new(),
+            backend_request,
+        };
+        compose_schema(children.iter().map(|child| &child.planner), &session, None)
+    };
+    Ok([compose(false)?, compose(true)?])
+}
+
+fn compose_role_schemas(
+    children: &[ChildPlanner<'_>],
+    roles: &BTreeSet<String>,
+) -> Result<HashMap<String, [Json; 2]>, PlanError> {
+    roles
+        .iter()
+        .map(|role| Ok((role.clone(), compose_role_schema(children, role)?)))
+        .collect()
 }
 
 /// Composite equivalent of [`crate::execute_introspection`].
@@ -407,10 +592,12 @@ pub fn execute_multi_source_introspection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<Result<Json, PlanError>> {
-    match planner.schema_json(session) {
-        Ok(schema) => execute_introspection_schema(&schema, doc, operation_name, variables),
-        Err(error) => Some(Err(error)),
-    }
+    execute_introspection_schema_lazy(
+        || planner.schema_json(session),
+        doc,
+        operation_name,
+        variables,
+    )
 }
 
 fn register_owners<'a>(
@@ -445,6 +632,7 @@ fn register_owner(
 fn build_role_independent_schema(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
+    source_indexes: &[Arc<PlannerIndex>],
 ) -> Result<Json, PlanError> {
     let mut validation_metadata = metadata.clone();
     let mut validation_role = "__donat_composite_schema_validation".to_string();
@@ -478,7 +666,7 @@ fn build_role_independent_schema(
         }
     }
     let mut planners = vec![];
-    for source in &validation_metadata.sources {
+    for (source, index) in validation_metadata.sources.iter().zip(source_indexes) {
         let catalog = catalogs.get(&source.name).ok_or_else(|| {
             PlanError::new(
                 "$",
@@ -486,7 +674,12 @@ fn build_role_independent_schema(
                 format!("catalog for source '{}' not found", source.name),
             )
         })?;
-        planners.push(Planner::for_source(&validation_metadata, source, catalog));
+        planners.push(Planner::for_source_with_index(
+            &validation_metadata,
+            source,
+            catalog,
+            index.clone(),
+        ));
     }
     let session = Session {
         role: validation_role,

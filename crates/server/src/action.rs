@@ -20,7 +20,7 @@ use donat_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata,
 use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
-use crate::state::SharedState;
+use crate::state::{Engine, EngineSnapshot, SharedState};
 
 fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
@@ -75,6 +75,7 @@ pub fn match_action(
 /// response. Returns a GraphQL HTTP response (`{data}` or `{errors}`).
 pub async fn resolve(
     state: &SharedState,
+    engine: EngineSnapshot,
     session: &Session,
     ctx: &ActionContext,
     doc: &Document<'static, String>,
@@ -150,6 +151,7 @@ pub async fn resolve(
 
         match call_action(
             state,
+            engine.as_ref(),
             session,
             action,
             field,
@@ -172,6 +174,7 @@ pub async fn resolve(
 /// Build the webhook payload, POST it, and shape the response.
 async fn call_action(
     state: &SharedState,
+    engine: &Engine,
     session: &Session,
     action: &ActionEntry,
     field: &Field<'static, String>,
@@ -265,6 +268,7 @@ async fn call_action(
     // apply), using the raw webhook row for the join values.
     fill_relationships(
         state,
+        engine,
         session,
         custom_types,
         &ty,
@@ -280,6 +284,7 @@ async fn call_action(
 /// selected output-object relationship into its tracked table.
 fn fill_relationships<'a>(
     state: &'a SharedState,
+    engine: &'a Engine,
     session: &'a Session,
     custom_types: &'a CustomTypes,
     ty: &'a TypeRef,
@@ -297,6 +302,7 @@ fn fill_relationships<'a>(
                     for (item, raw_item) in items.iter_mut().zip(raws.iter()) {
                         fill_relationships(
                             state,
+                            engine,
                             session,
                             custom_types,
                             inner,
@@ -320,9 +326,15 @@ fn fill_relationships<'a>(
                     let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
 
                     if let Some(rel) = obj.relationships.iter().find(|r| r.name == field.name) {
-                        let resolved =
-                            resolve_relationship(state, session, rel, raw, &field.selection_set)
-                                .await?;
+                        let resolved = resolve_relationship(
+                            state,
+                            engine,
+                            session,
+                            rel,
+                            raw,
+                            &field.selection_set,
+                        )
+                        .await?;
                         if let Some(map) = shaped.as_object_mut() {
                             map.insert(alias, resolved);
                         }
@@ -337,6 +349,7 @@ fn fill_relationships<'a>(
                         if let Some(child) = shaped.get_mut(&alias) {
                             fill_relationships(
                                 state,
+                                engine,
                                 session,
                                 custom_types,
                                 &ftype,
@@ -357,6 +370,7 @@ fn fill_relationships<'a>(
 /// Resolve a single output-object relationship by querying its target table.
 async fn resolve_relationship(
     state: &SharedState,
+    engine: &Engine,
     session: &Session,
     rel: &CustomTypeRelationship,
     raw: &Json,
@@ -380,7 +394,7 @@ async fn resolve_relationship(
     let mut vars = JsonMap::new();
     vars.insert("w".into(), Json::Object(where_map));
 
-    let data = crate::gql::execute_select_internal(state, session, &query, &vars)
+    let data = crate::gql::execute_select_internal(state, engine, session, &query, &vars)
         .await
         .map_err(|e| (StatusCode::OK, e))?;
     let rows = data.get(&base).cloned().unwrap_or(Json::Null);

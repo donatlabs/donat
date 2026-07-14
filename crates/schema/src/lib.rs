@@ -21,8 +21,8 @@ mod v1;
 
 pub use introspection::execute_introspection;
 pub use multi_source::{
-    MultiSourcePlan, MultiSourcePlanner, QueryResponseSlot, SourceQueryPlan,
-    execute_multi_source_introspection,
+    CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, QueryResponseSlot,
+    SourceQueryPlan, execute_multi_source_introspection,
 };
 pub use naming::{CrudRoots, crud_roots, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};

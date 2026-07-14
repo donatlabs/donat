@@ -38,6 +38,9 @@ reasoning never has to be reconstructed.
 - [[decisions/010-compose-metadata-sources-in-graphql]] — one GraphQL schema
   composes per-source planners, executes one statement per participating
   datasource, and merges top-level values in operation response-slot order.
+- [[decisions/011-compile-schema-at-snapshot-publication]] — schema composition
+  and role projection validation happen once before an immutable engine
+  snapshot is atomically published, never on ordinary request paths.
 
 ## One-paragraph shape
 
