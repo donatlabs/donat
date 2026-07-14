@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -17,6 +17,11 @@ use tokio::sync::Mutex;
 #[derive(Clone, Default)]
 struct StubState {
     requests: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct MultiDatabaseStubState {
+    requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 async fn clickhouse_stub(State(state): State<StubState>, body: Bytes) -> impl IntoResponse {
@@ -33,6 +38,25 @@ async fn clickhouse_stub(State(state): State<StubState>, body: Bytes) -> impl In
         );
     }
     "{\"author\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}\n"
+}
+
+async fn multi_database_clickhouse_stub(
+    State(state): State<MultiDatabaseStubState>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> impl IntoResponse {
+    let sql = String::from_utf8(body.to_vec()).expect("request body is SQL");
+    state
+        .requests
+        .lock()
+        .await
+        .push((query.unwrap_or_default(), sql));
+    concat!(
+        "{\"database\":\"analytics\",\"table\":\"daily\",\"name\":\"id\",",
+        "\"type\":\"UInt64\",\"default_kind\":\"\",\"is_in_primary_key\":1}\n",
+        "{\"database\":\"logs\",\"table\":\"events\",\"name\":\"id\",",
+        "\"type\":\"UInt64\",\"default_kind\":\"\",\"is_in_primary_key\":1}\n"
+    )
 }
 
 fn metadata_for(url: &str, database: &str, mutations: bool) -> Metadata {
@@ -70,6 +94,41 @@ fn metadata_for(url: &str, database: &str, mutations: bool) -> Metadata {
 
 fn metadata(url: &str) -> Metadata {
     metadata_for(url, "analytics", false)
+}
+
+fn multi_database_metadata(url: &str) -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "clickhouse",
+            "configuration": { "connection_info": { "database_url": url } },
+            "tables": [{
+                "table": { "schema": "analytics", "name": "daily" },
+                "configuration": { "custom_name": "analytics_daily" },
+                "select_permissions": [{
+                    "role": "user",
+                    "permission": {
+                        "columns": "*",
+                        "filter": {},
+                        "allow_aggregations": true
+                    }
+                }]
+            }, {
+                "table": { "schema": "logs", "name": "events" },
+                "configuration": { "custom_name": "logs_events" },
+                "select_permissions": [{
+                    "role": "user",
+                    "permission": {
+                        "columns": "*",
+                        "filter": {},
+                        "allow_aggregations": true
+                    }
+                }]
+            }]
+        }]
+    }))
+    .expect("metadata deserializes")
 }
 
 fn metadata_with_mutations(url: &str, mutations: bool) -> Metadata {
@@ -145,6 +204,58 @@ fn with_database(url: &str, database: &str) -> String {
         .extend_pairs(retained)
         .append_pair("database", database);
     url.to_string()
+}
+
+#[tokio::test]
+async fn clickhouse_tracks_tables_across_databases_without_url_database() {
+    let stub = MultiDatabaseStubState::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/", post(multi_database_clickhouse_stub))
+        .with_state(stub.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("stub server");
+    });
+    let state = app_state_with_metadata(multi_database_metadata(&format!("http://{address}/")));
+
+    state
+        .sync_sources()
+        .await
+        .expect("multi-database ClickHouse introspection");
+
+    let engine = state.engine.read().await;
+    let tables = &engine.metadata.sources[0].tables;
+    assert_eq!(tables.len(), 2, "tracked tables must not be pruned");
+    assert!(
+        tables
+            .iter()
+            .any(|table| { table.table.schema() == "analytics" && table.table.name() == "daily" })
+    );
+    assert!(
+        tables
+            .iter()
+            .any(|table| { table.table.schema() == "logs" && table.table.name() == "events" })
+    );
+    drop(engine);
+
+    let requests = stub.requests.lock().await;
+    assert_eq!(requests.len(), 1, "one introspection request");
+    let (query, sql) = &requests[0];
+    assert!(
+        sql.contains("WHERE database IN {databases:Array(String)}"),
+        "{sql}"
+    );
+    let parsed =
+        reqwest::Url::parse(&format!("http://localhost/?{query}")).expect("request query parses");
+    let databases = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "param_databases")
+        .map(|(_, value)| value.into_owned())
+        .expect("param_databases is present");
+    assert_eq!(databases, "['analytics','logs']");
+
+    server.abort();
 }
 
 #[tokio::test]

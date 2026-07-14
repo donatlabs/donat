@@ -96,7 +96,16 @@ impl Planner<'_> {
                         .column_db_name_for_filter(column, is_permission)
                         .expect("column existence checked by column_allowed_for_filter");
                     let info = ctx.column_info(&db_column).unwrap();
-                    let ops = self.parse_ops(ctx, &db_column, sub, session, is_permission, path)?;
+                    let column_path = format!("{path}.{column}");
+                    let ops = self.parse_ops(
+                        ctx,
+                        &db_column,
+                        &info.pg_type,
+                        sub,
+                        session,
+                        is_permission,
+                        &column_path,
+                    )?;
                     let mut parsed: Vec<BoolExp> = ops
                         .into_iter()
                         .map(|op| BoolExp::Compare {
@@ -252,7 +261,16 @@ impl Planner<'_> {
                 .returns_scalar
                 .clone()
                 .unwrap_or_else(|| "text".into());
-            let ops = self.parse_ops(ctx, &cf.name, value, session, is_permission, path)?;
+            let field_path = format!("{path}.{}", cf.name);
+            let ops = self.parse_ops(
+                ctx,
+                &cf.name,
+                &pg_type,
+                value,
+                session,
+                is_permission,
+                &field_path,
+            )?;
             let mut out: Vec<BoolExp> = ops
                 .into_iter()
                 .map(|op| BoolExp::ComputedCompare {
@@ -276,6 +294,7 @@ impl Planner<'_> {
         &self,
         ctx: &TableCtx<'_>,
         column: &str,
+        scalar_type: &str,
         value: &Json,
         session: &Session,
         is_permission: bool,
@@ -296,24 +315,31 @@ impl Planner<'_> {
             } else {
                 raw_op_name
             };
+            let op_path = format!("{path}.{op_name}");
             let scalar = |v: &Json| -> Result<Scalar, PlanError> {
-                Ok(Scalar::Json(resolve_session(
-                    v,
-                    session,
-                    is_permission,
-                    path,
-                )?))
+                let resolved = resolve_session(v, session, is_permission, &op_path)?;
+                validate_comparison_scalar(scalar_type, resolved, &op_path)
             };
             let list = |v: &Json| -> Result<Vec<Scalar>, PlanError> {
                 // A session variable may itself hold an array, as JSON
                 // ("[1,2]") or as a Postgres array literal ("{a,b}").
-                let resolved = resolve_session(v, session, is_permission, path)?;
+                let resolved = resolve_session(v, session, is_permission, &op_path)?;
                 match resolved {
-                    Json::Array(items) => items.into_iter().map(|i| Ok(Scalar::Json(i))).collect(),
+                    Json::Array(items) => items
+                        .into_iter()
+                        .map(|item| validate_comparison_scalar(scalar_type, item, &op_path))
+                        .collect(),
                     Json::String(s) => parse_array_literal(&s)
-                        .ok_or_else(|| PlanError::validation(path, "expected an array of values"))
-                        .map(|items| items.into_iter().map(Scalar::Json).collect()),
-                    _ => Err(PlanError::validation(path, "expected an array of values")),
+                        .ok_or_else(|| {
+                            PlanError::validation(&op_path, "expected an array of values")
+                        })?
+                        .into_iter()
+                        .map(|item| validate_comparison_scalar(scalar_type, item, &op_path))
+                        .collect(),
+                    _ => Err(PlanError::validation(
+                        &op_path,
+                        "expected an array of values",
+                    )),
                 }
             };
             let string_list = |v: &Json| -> Result<Vec<String>, PlanError> {
@@ -350,7 +376,7 @@ impl Planner<'_> {
                 "_nregex" if self.capabilities.regex_ops => CompareOp::Nregex(scalar(op_value)?),
                 "_niregex" if self.capabilities.regex_ops => CompareOp::Niregex(scalar(op_value)?),
                 "_is_null" => {
-                    let v = resolve_session(op_value, session, is_permission, path)?;
+                    let v = resolve_session(op_value, session, is_permission, &op_path)?;
                     CompareOp::IsNull(v.as_bool().unwrap_or(false))
                 }
                 // Column-to-column comparisons.
@@ -499,6 +525,25 @@ impl Planner<'_> {
             _ => Err(PlanError::validation(path, "expected a column name")),
         }
     }
+}
+
+fn validate_comparison_scalar(
+    scalar_type: &str,
+    value: Json,
+    path: &str,
+) -> Result<Scalar, PlanError> {
+    let valid_date = match &value {
+        Json::Null => true,
+        Json::String(text) => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok(),
+        _ => false,
+    };
+    if scalar_type == "date" && !valid_date {
+        return Err(PlanError::validation(
+            path,
+            format!("expected a date, but found {value}"),
+        ));
+    }
+    Ok(Scalar::Json(value))
 }
 
 fn as_array<'v>(value: &'v Json, path: &str) -> Result<&'v Vec<Json>, PlanError> {

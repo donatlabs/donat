@@ -1,0 +1,25 @@
+query DocumentIntegrationRequests(
+  $documentId: int64!
+  $limit: Int = 200
+) {
+  items: logs_integration_requests(
+    where: { document_id: { _eq: $documentId } }
+    order_by: { event_time: desc }
+    limit: $limit
+  ) {
+    event_time
+    integration_type
+    operation
+    http_method
+    http_url
+    http_status
+    status
+    duration_ms
+    request_id
+    request_body
+    response_body
+    request_size
+    response_size
+    error_message
+  }
+}

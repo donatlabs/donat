@@ -1,0 +1,484 @@
+# Pinned from tandt-backend c780834e50f53e5b4e94f1f33e88748a443f98ec.
+# Sources:
+# ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts
+# ui/apps/l3-l4-web-ui/src/shared/api/entities/logs/api.ts
+# ui/apps/l3-l4-web-ui/src/shared/api/entities/document/integration-request-api.ts
+# ui/packages/l2-api/src/entities/l2-job-event/queries.ts
+# ui/packages/l2-api/src/entities/l2-device-event/queries.ts
+# ui/packages/l2-api/src/entities/l2-traffic-log/queries.ts
+# ui/packages/l2-api/src/entities/l2-production-event/queries.ts
+
+query AnalyticsDocumentDailyStats(
+  $limit: Int = 30
+  $order_by: [analytics_document_daily_stats_order_by!] = { date: desc }
+  $where: analytics_document_daily_stats_bool_exp = {}
+) {
+  items: analytics_document_daily_stats(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    date
+    doc_type
+    status
+    doc_count
+    unique_users
+    avg_duration_ms
+    company_id
+  }
+}
+
+query AnalyticsWorkflowExecutions(
+  $limit: Int = 100
+  $order_by: [analytics_workflow_executions_order_by!] = { start_time: desc }
+  $where: analytics_workflow_executions_bool_exp = {}
+) {
+  items: analytics_workflow_executions(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    workflow_id
+    workflow_type
+    status
+    start_time
+    end_time
+    duration_ms
+    activity_count
+    retry_count
+    error_message
+    company_id
+    user_id
+    document_id
+  }
+}
+
+query AnalyticsErrors(
+  $limit: Int = 100
+  $order_by: [analytics_errors_order_by!] = { error_time: desc }
+  $where: analytics_errors_bool_exp = {}
+) {
+  items: analytics_errors(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    error_time
+    error_type
+    error_code
+    error_message
+    severity
+    entity_type
+    entity_id
+    resolved_at
+    resolved_by
+    resolution_notes
+    company_id
+    user_id
+    document_id
+    workflow_id
+    context
+  }
+}
+
+query AnalyticsCodeLifecycleEvents(
+  $limit: Int = 100
+  $order_by: [analytics_code_lifecycle_events_order_by!] = { event_time: desc }
+  $where: analytics_code_lifecycle_events_bool_exp = {}
+) {
+  items: analytics_code_lifecycle_events(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    event_time
+    event_type
+    code_id
+    code
+    cis
+    gtin
+    pg
+    package_type
+    emission_type
+    old_status
+    new_status
+    old_location_id
+    new_location_id
+    parent_id
+    company_id
+    user_id
+    document_id
+  }
+}
+
+query AnalyticsAggregationOperations(
+  $limit: Int = 100
+  $order_by: [analytics_aggregation_operations_order_by!] = { operation_time: desc }
+  $where: analytics_aggregation_operations_bool_exp = {}
+) {
+  items: analytics_aggregation_operations(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    operation_time
+    operation_type
+    parent_code_id
+    parent_cis
+    parent_package_type
+    child_count
+    gtin
+    pg
+    location_id
+    company_id
+    user_id
+    document_id
+  }
+}
+
+query AnalyticsDashboardStats($company_id: int32!) {
+  # Total documents by status (last 30 days)
+  document_stats: analytics_document_daily_stats_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      date: { _gte: "now() - interval '30 days'" }
+    }
+  ) {
+    aggregate {
+      sum {
+        doc_count
+      }
+    }
+    nodes {
+      status
+      doc_count
+    }
+  }
+
+  # Workflow success rate
+  workflow_stats: analytics_workflow_executions_aggregate(
+    where: { company_id: { _eq: $company_id } }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      status
+    }
+  }
+
+  # Recent errors count
+  error_stats: analytics_errors_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      resolved_at: { _is_null: true }
+    }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      severity
+    }
+  }
+
+  # Code events count (last 7 days)
+  code_events: analytics_code_lifecycle_events_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      event_time: { _gte: "now() - interval '7 days'" }
+    }
+  ) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment applicationLog on logs_application_logs {
+  company_id
+  context
+  document_id
+  environment
+  execution_path
+  level
+  log_id
+  log_type
+  message
+  parent_log_id
+  role
+  service
+  source
+  span_id
+  timestamp
+  trace_id
+  user_id
+  version
+  activity_id
+}
+
+query ApplicationLogsList(
+  $limit: Int = 10
+  $offset: Int = 0
+  $order_by: [logs_application_logs_order_by!] = {}
+  $where: logs_application_logs_bool_exp = {}
+) {
+  items: logs_application_logs(
+    limit: $limit
+    offset: $offset
+    order_by: $order_by
+    where: $where
+  ) {
+    ...applicationLog
+  }
+}
+
+query DocumentIntegrationRequests(
+  $documentId: int64!
+  $limit: Int = 200
+) {
+  items: logs_integration_requests(
+    where: { document_id: { _eq: $documentId } }
+    order_by: { event_time: desc }
+    limit: $limit
+  ) {
+    event_time
+    integration_type
+    operation
+    http_method
+    http_url
+    http_status
+    status
+    duration_ms
+    request_id
+    request_body
+    response_body
+    request_size
+    response_size
+    error_message
+  }
+}
+
+fragment L2JobEventFragment on logs_l2_job_events {
+  event_time
+  event_type
+  job_id
+  work_order_id
+  equipment_id
+  gtin
+  produced_count
+  rejected_count
+  target_quantity
+  reason
+  trace_id
+  event_id
+}
+
+query L2JobEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_job_events_bool_exp
+  $order_by: [logs_l2_job_events_order_by!]
+) {
+  logs_l2_job_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2JobEventFragment
+  }
+  logs_l2_job_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2DeviceEventFragment on logs_l2_device_events {
+  event_time
+  event_type
+  device_id
+  device_type
+  ip_address
+  node_code
+  instance_id
+  equipment_id
+  reason
+  error_message
+  trace_id
+  event_id
+}
+
+query L2DeviceEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_device_events_bool_exp
+  $order_by: [logs_l2_device_events_order_by!]
+) {
+  logs_l2_device_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2DeviceEventFragment
+  }
+  logs_l2_device_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2TrafficLogFragment on logs_l2_traffic {
+  event_time
+  equipment_id
+  device_id
+  direction
+  data_ascii
+  data_hex
+  data_len
+}
+
+query L2TrafficLogs(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_traffic_bool_exp
+  $order_by: [logs_l2_traffic_order_by!]
+) {
+  logs_l2_traffic(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2TrafficLogFragment
+  }
+  logs_l2_traffic_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2ProductionEventFragment on logs_l2_production_events {
+  event_time
+  event_type
+  job_id
+  work_order_id
+  equipment_id
+  code
+  parent_code
+  gtin
+  node_code
+  reason
+  line_number
+  aggregation_level
+  trace_id
+  event_id
+}
+
+query L2ProductionEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_production_events_bool_exp
+  $order_by: [logs_l2_production_events_order_by!]
+) {
+  logs_l2_production_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2ProductionEventFragment
+  }
+  logs_l2_production_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+# Corrected deployment companion; not part of the pinned tandt revision.
+query AnalyticsDashboardStatsSafe(
+  $company_id: int32!
+  $document_since: date!
+  $code_events_since: timestamp!
+) {
+  document_stats: analytics_document_daily_stats_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      date: { _gte: $document_since }
+    }
+  ) {
+    aggregate {
+      sum {
+        doc_count
+      }
+    }
+    nodes {
+      status
+      doc_count
+    }
+  }
+  workflow_stats: analytics_workflow_executions_aggregate(
+    where: { company_id: { _eq: $company_id } }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      status
+    }
+  }
+  error_stats: analytics_errors_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      resolved_at: { _is_null: true }
+    }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      severity
+    }
+  }
+  code_events: analytics_code_lifecycle_events_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      event_time: { _gte: $code_events_since }
+    }
+  ) {
+    aggregate {
+      count
+    }
+  }
+}
+
+# Donat-only complex scalar contract; not attributed to tandt application logs.
+query ClickHouseComplexValues {
+  clickhouse_complex_values(order_by: { id: asc }) {
+    id
+    payload
+    attributes
+    point
+    labels
+  }
+}
+
+# Donat-only mixed source contract.
+query MixedPostgresClickHouse {
+  postgres: contract_probe(order_by: { id: asc }) {
+    id
+    label
+  }
+  clickhouse: analytics_document_daily_stats(
+    limit: 1
+    order_by: { date: desc }
+  ) {
+    date
+    status
+  }
+}

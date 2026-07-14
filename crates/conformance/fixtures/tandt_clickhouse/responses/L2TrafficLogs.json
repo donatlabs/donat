@@ -1,0 +1,1 @@
+{"data":{"logs_l2_traffic":[{"event_time":"2026-06-05 10:00:00.200000","equipment_id":"EQ-1","device_id":"dev-1","direction":"in","data_ascii":"B","data_hex":"42","data_len":1}],"logs_l2_traffic_aggregate":{"aggregate":{"count":3}}}}

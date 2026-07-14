@@ -1,11 +1,16 @@
 //! /v1/graphql execution: headers -> session, plan -> SQL -> one row.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use axum::http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use donat_schema::{Planner, Session};
+use donat_schema::{
+    MultiSourcePlan, MultiSourcePlanner, Planner, QueryResponseSlot, Session, SourceQueryPlan,
+};
 
-use crate::state::{QueryError, SharedState};
+use crate::state::{AppState, QueryError, SharedState};
 
 /// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
 /// the planner both recurse on nesting, so an unbounded query would overflow
@@ -13,6 +18,66 @@ use crate::state::{QueryError, SharedState};
 /// handful of levels; this cap is far above legitimate use and far below the
 /// overflow threshold.
 pub const MAX_QUERY_DEPTH: usize = 100;
+
+/// Exact-source query execution boundary. Composite orchestration passes the
+/// complete root slice for a source in one call and exposes no default-source
+/// fallback.
+pub trait SourceQueryExecutor {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>>;
+}
+
+impl SourceQueryExecutor for AppState {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>> {
+        Box::pin(self.execute_source_query_json(source, roots))
+    }
+}
+
+pub async fn execute_source_query_plans<E: SourceQueryExecutor + Sync>(
+    executor: &E,
+    plans: &[SourceQueryPlan],
+) -> Result<Vec<Json>, QueryError> {
+    let mut output = Vec::with_capacity(plans.len());
+    for plan in plans {
+        output.push(
+            executor
+                .execute_source_query(&plan.source, &plan.roots)
+                .await?,
+        );
+    }
+    Ok(output)
+}
+
+fn assemble_multi_source_response(
+    response: &[QueryResponseSlot],
+    source_data: impl IntoIterator<Item = Json>,
+) -> Json {
+    let mut values = std::collections::HashMap::new();
+    for data in source_data {
+        if let Json::Object(data) = data {
+            values.extend(data);
+        }
+    }
+    let mut ordered = JsonMap::new();
+    for slot in response {
+        match slot {
+            QueryResponseSlot::SourceField { key } => {
+                ordered.insert(key.clone(), values.remove(key).unwrap_or(Json::Null));
+            }
+            QueryResponseSlot::LocalTypename { key, value } => {
+                ordered.insert(key.clone(), Json::String(value.clone()));
+            }
+        }
+    }
+    Json::Object(ordered)
+}
 
 /// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
 /// [`MAX_QUERY_DEPTH`], before the recursive parser runs. Counting raw
@@ -418,10 +483,13 @@ pub async fn execute_full(
                     let order: Vec<(String, bool)> = top_level_fields(&doc);
                     let mut intro_doc = doc.clone();
                     crate::remote::keep_introspection_roots(&mut intro_doc);
-                    let catalog = engine.default_catalog();
-                    let mut planner = Planner::new(&engine.metadata, &catalog);
-                    planner.infer_function_permissions = state.infer_function_permissions;
-                    let intro_data = match donat_schema::execute_introspection(
+                    let mut planner =
+                        match MultiSourcePlanner::new(&engine.metadata, &engine.catalogs) {
+                            Ok(planner) => planner,
+                            Err(error) => return ok(error.to_graphql()),
+                        };
+                    planner.set_infer_function_permissions(state.infer_function_permissions);
+                    let intro_data = match donat_schema::execute_multi_source_introspection(
                         &planner,
                         session,
                         &intro_doc,
@@ -514,17 +582,26 @@ pub async fn execute_full(
             return ok(error_json("validation-failed", "query is not allowed"));
         }
     }
-    let catalog = engine.default_catalog();
     tracing::debug!(role = %session.role, sources = engine.metadata.sources.len(),
-        tables = engine.metadata.sources.first().map(|s| s.tables.len()).unwrap_or(0),
-        catalog_tables = catalog.tables.len(), "graphql request");
-    let mut planner = Planner::new(&engine.metadata, &catalog);
-    planner.infer_function_permissions = state.infer_function_permissions;
-    planner.relay = relay && planner.supports_relay();
+        tables = engine.metadata.sources.iter().map(|source| source.tables.len()).sum::<usize>(),
+        catalog_tables = engine.catalogs.values().map(|catalog| catalog.tables.len()).sum::<usize>(),
+        "graphql request");
+    let mut planner = match MultiSourcePlanner::new(&engine.metadata, &engine.catalogs) {
+        Ok(planner) => planner,
+        Err(error) => return ok(error.to_graphql()),
+    };
+    planner.set_infer_function_permissions(state.infer_function_permissions);
+    if let Err(error) = planner.set_relay(relay) {
+        return ok(error.to_graphql());
+    }
     // Introspection operations are answered from the type system directly.
-    if let Some(result) =
-        donat_schema::execute_introspection(&planner, session, &doc, operation_name, &variables)
-    {
+    if let Some(result) = donat_schema::execute_multi_source_introspection(
+        &planner,
+        session,
+        &doc,
+        operation_name,
+        &variables,
+    ) {
         return match result {
             Ok(data) => ok(json!({ "data": data })),
             Err(e) => ok(e.to_graphql()),
@@ -536,15 +613,15 @@ pub async fn execute_full(
     };
 
     match plan {
-        donat_schema::Plan::Query(roots) => {
-            // Dispatch on the default source's backend kind. For Postgres the
-            // dispatch renders and runs exactly the same SQL as before; the
-            // error variants below reproduce the previous bodies verbatim.
+        MultiSourcePlan::Query { sources, response } => {
             drop(engine);
-            match state.execute_query_json(&roots).await {
-                Ok(mut data) => {
-                    for root in &roots {
-                        if let donat_ir::RootField::Select { alias, query } = root {
+            match execute_source_query_plans(state.as_ref(), &sources).await {
+                Ok(mut source_data) => {
+                    for (source_plan, data) in sources.iter().zip(&mut source_data) {
+                        for root in &source_plan.roots {
+                            let donat_ir::RootField::Select { alias, query } = root else {
+                                continue;
+                            };
                             if let Some(node) = data.get_mut(alias.as_str()) {
                                 if let Err(e) = resolve_remote_joins(
                                     state,
@@ -560,40 +637,56 @@ pub async fn execute_full(
                             }
                         }
                     }
+                    let data = assemble_multi_source_response(&response, source_data);
                     ok(json!({ "data": data }))
                 }
                 Err(e) => ok(query_error_json(e)),
             }
         }
-        donat_schema::Plan::Mutation(roots) => {
-            // SQLite can't run the Postgres CTE-wrapped, in-DB-assembled
-            // mutation (DML in a CTE/subquery is forbidden), so it has its own
-            // executor: one top-level DML per root, response folded in Rust,
-            // rollback on a permission-check violation (see ADR 003). The
-            // Postgres path below is unchanged (byte-identical SQL + tx).
-            if matches!(
-                state.default_source_kind().await,
-                donat_metadata::SourceKind::Sqlite
-            ) {
+        MultiSourcePlan::Mutation {
+            source,
+            roots,
+            response,
+        } => {
+            let Some(source) = source else {
                 drop(engine);
-                return match state.execute_sqlite_mutations(&roots).await {
-                    Ok(data) => ok(json!({ "data": data })),
+                let data = assemble_multi_source_response(&response, std::iter::empty());
+                return ok(json!({ "data": data }));
+            };
+            let source_kind = engine
+                .metadata
+                .sources
+                .iter()
+                .rev()
+                .find(|candidate| candidate.name == source)
+                .map(|candidate| candidate.kind);
+            let Some(source_kind) = source_kind else {
+                return ok(error_json("unexpected", "no default source"));
+            };
+
+            if source_kind == donat_metadata::SourceKind::Sqlite {
+                drop(engine);
+                return match state.execute_source_sqlite_mutations(&source, &roots).await {
+                    Ok(data) => ok(json!({
+                        "data": assemble_multi_source_response(&response, [data])
+                    })),
                     Err(e) => ok(sqlite_mutation_error_json(e)),
                 };
             }
-            // MySQL has no `RETURNING` and read-only CTEs, so it has its own
-            // executor too: each root runs a DML plus a COMPANION SELECT in one
-            // transaction to recover `returning`, rolling back on a check
-            // violation (see ADR 004). The Postgres path below is unchanged.
-            if matches!(
-                state.default_source_kind().await,
-                donat_metadata::SourceKind::Mysql
-            ) {
+            if source_kind == donat_metadata::SourceKind::Mysql {
                 drop(engine);
-                return match state.execute_mysql_mutations(&roots).await {
-                    Ok(data) => ok(json!({ "data": data })),
+                return match state.execute_source_mysql_mutations(&source, &roots).await {
+                    Ok(data) => ok(json!({
+                        "data": assemble_multi_source_response(&response, [data])
+                    })),
                     Err(e) => ok(mysql_mutation_error_json(e)),
                 };
+            }
+            if source_kind == donat_metadata::SourceKind::Clickhouse {
+                return ok(error_json(
+                    "unexpected",
+                    format!("mutations are not supported for source '{source}'"),
+                ));
             }
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
@@ -615,7 +708,7 @@ pub async fn execute_full(
                 .collect();
             drop(engine);
 
-            let Some(pool) = state.default_pool().await else {
+            let Some(pool) = state.source_pool(&source).await else {
                 return ok(error_json("unexpected", "no default source"));
             };
             let mut client = match pool.get().await {
@@ -666,6 +759,7 @@ pub async fn execute_full(
             if let Err(e) = tx.commit().await {
                 return ok(db_error_json(&e));
             }
+            let data = assemble_multi_source_response(&response, [Json::Object(data)]);
             ok(json!({ "data": data }))
         }
     }

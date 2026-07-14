@@ -6,6 +6,7 @@
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
+use donat_metadata::Columns;
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
 use crate::naming::{root_names, table_base_name};
@@ -335,11 +336,16 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
                 !p.backend_only || session.backend_request
             });
-        if insert_perm.is_some() {
+        if let Some(insert_perm) = insert_perm {
             let mut insert_fields: Vec<Json> = ctx
                 .info
                 .columns
                 .iter()
+                .filter(|column| match &insert_perm.columns {
+                    Columns::Star => true,
+                    Columns::List(columns) => columns.iter().any(|name| name == &column.name),
+                })
+                .filter(|column| !insert_perm.set.contains_key(&column.name))
                 .map(|c| {
                     let scalar = scalar_name(&c.pg_type).to_string();
                     input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
@@ -575,6 +581,22 @@ pub fn execute_introspection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<Result<Json, PlanError>> {
+    execute_introspection_schema(
+        &build_schema_json(planner, session),
+        doc,
+        operation_name,
+        variables,
+    )
+}
+
+/// Project an introspection operation through a prebuilt role schema. This
+/// lets composite planners reuse the exact existing introspection executor.
+pub(crate) fn execute_introspection_schema(
+    schema: &Json,
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<Result<Json, PlanError>> {
     let mut fragments: Fragments = std::collections::HashMap::new();
     let mut operations = vec![];
     for def in &doc.definitions {
@@ -607,7 +629,6 @@ pub fn execute_introspection(
         return None;
     }
 
-    let schema = build_schema_json(planner, session);
     let mut data = JsonMap::new();
     for root in roots {
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());

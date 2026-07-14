@@ -17,7 +17,7 @@ use crate::plan::{
 impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Donat reports "no mutations exist" when not.
-    fn role_has_any_mutation(&self, session: &Session) -> bool {
+    pub(crate) fn role_has_any_mutation(&self, session: &Session) -> bool {
         if !self.capabilities.mutations {
             return false;
         }

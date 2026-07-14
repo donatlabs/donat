@@ -1,0 +1,58 @@
+query AnalyticsDashboardStats($company_id: int32!) {
+  # Total documents by status (last 30 days)
+  document_stats: analytics_document_daily_stats_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      date: { _gte: "now() - interval '30 days'" }
+    }
+  ) {
+    aggregate {
+      sum {
+        doc_count
+      }
+    }
+    nodes {
+      status
+      doc_count
+    }
+  }
+
+  # Workflow success rate
+  workflow_stats: analytics_workflow_executions_aggregate(
+    where: { company_id: { _eq: $company_id } }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      status
+    }
+  }
+
+  # Recent errors count
+  error_stats: analytics_errors_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      resolved_at: { _is_null: true }
+    }
+  ) {
+    aggregate {
+      count
+    }
+    nodes {
+      severity
+    }
+  }
+
+  # Code events count (last 7 days)
+  code_events: analytics_code_lifecycle_events_aggregate(
+    where: {
+      company_id: { _eq: $company_id }
+      event_time: { _gte: "now() - interval '7 days'" }
+    }
+  ) {
+    aggregate {
+      count
+    }
+  }
+}

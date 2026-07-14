@@ -1,0 +1,35 @@
+query L2DeviceEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_device_events_bool_exp
+  $order_by: [logs_l2_device_events_order_by!]
+) {
+  logs_l2_device_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2DeviceEventFragment
+  }
+  logs_l2_device_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2DeviceEventFragment on logs_l2_device_events {
+  event_time
+  event_type
+  device_id
+  device_type
+  ip_address
+  node_code
+  instance_id
+  equipment_id
+  reason
+  error_message
+  trace_id
+  event_id
+}

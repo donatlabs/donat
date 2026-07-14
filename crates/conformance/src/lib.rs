@@ -3189,16 +3189,59 @@ mod tests {
             postgres_command.contains("--test-threads=4"),
             "full Postgres conformance must use the reviewed parallelism: {postgres_command}"
         );
+        assert!(
+            postgres_command.contains("env -u MYSQL_URL -u CLICKHOUSE_URL"),
+            "full Postgres conformance must not enter unrelated backend binaries: {postgres_command}"
+        );
         assert_eq!(
             workflow["jobs"]["backend-core-gate"]["name"].as_str(),
             Some("Conformance matrix")
+        );
+
+        let mixed_steps = workflow["jobs"]["mixed-backend-conformance"]["steps"]
+            .as_sequence()
+            .expect("mixed backend steps");
+        let start_mixed = mixed_steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Start Postgres and ClickHouse"))
+            .and_then(|step| step["run"].as_str())
+            .expect("mixed backend service command");
+        assert!(start_mixed.contains("--wait postgres clickhouse"));
+        let mixed_contract = mixed_steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Multi-database and multi-source contracts"))
+            .and_then(|step| step["run"].as_str())
+            .expect("mixed backend contract command");
+        for binary in [
+            "clickhouse_multi_database",
+            "multi_source",
+            "tandt_clickhouse_contract",
+        ] {
+            assert!(
+                mixed_contract.contains(&format!("--test {binary}")),
+                "mixed backend job misses {binary}: {mixed_contract}"
+            );
+        }
+        assert!(mixed_contract.contains("--test-threads=1 --nocapture"));
+
+        let artifact_needs = workflow["jobs"]["artifacts"]["needs"]
+            .as_sequence()
+            .expect("artifact job needs");
+        assert!(
+            artifact_needs
+                .iter()
+                .any(|need| { need.as_str() == Some("mixed-backend-conformance") })
         );
     }
 
     #[test]
     fn every_conformance_binary_is_classified() {
         const SHARED: &[&str] = &["backend_matrix"];
-        const BACKEND_SPECIFIC: &[&str] = &[];
+        const BACKEND_SPECIFIC: &[&str] = &[
+            "clickhouse_multi_database",
+            "multi_source",
+            "tandt_clickhouse_contract",
+        ];
         const POSTGRES_REFERENCE: &[&str] = &[
             "actions",
             "agg_relay_introspection",

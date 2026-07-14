@@ -1,0 +1,10 @@
+# Donat-only complex scalar contract; not attributed to tandt application logs.
+query ClickHouseComplexValues {
+  clickhouse_complex_values(order_by: { id: asc }) {
+    id
+    payload
+    attributes
+    point
+    labels
+  }
+}

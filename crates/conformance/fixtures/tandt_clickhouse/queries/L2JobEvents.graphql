@@ -1,0 +1,35 @@
+query L2JobEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_job_events_bool_exp
+  $order_by: [logs_l2_job_events_order_by!]
+) {
+  logs_l2_job_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2JobEventFragment
+  }
+  logs_l2_job_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2JobEventFragment on logs_l2_job_events {
+  event_time
+  event_type
+  job_id
+  work_order_id
+  equipment_id
+  gtin
+  produced_count
+  rejected_count
+  target_quantity
+  reason
+  trace_id
+  event_id
+}

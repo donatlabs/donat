@@ -671,6 +671,7 @@ name = "donat-schema"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chrono",
  "donat-backend",
  "donat-catalog",
  "donat-ir",
