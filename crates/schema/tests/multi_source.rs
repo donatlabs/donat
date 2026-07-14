@@ -124,7 +124,8 @@ fn plan_with_variables(
 ) -> Result<MultiSourcePlan, PlanError> {
     let metadata = metadata();
     let catalogs = catalogs();
-    let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled = CompiledMultiSourceSchema::compile(&metadata, &catalogs, true)?;
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)?;
     let doc = graphql_parser::parse_query::<String>(query)
         .expect("query parses")
         .into_static();
@@ -507,7 +508,10 @@ fn read_only_composite_preserves_no_mutations_exist_error() {
     let mut catalogs = catalogs();
     let clickhouse = catalogs.remove("clickhouse").unwrap();
     let catalogs = HashMap::from([("clickhouse".to_string(), clickhouse)]);
-    let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
     let doc = graphql_parser::parse_query::<String>(
         "mutation { insert_logs_event_one(object: { id: 1, message: \"x\" }) { id } }",
     )
@@ -549,7 +553,10 @@ fn child_planners_enforce_role_visibility_admin_and_session_predicates() {
         .expect("permission deserializes"),
     );
     let catalogs = catalogs();
-    let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
     let doc = graphql_parser::parse_query::<String>("{ logs_event { id } }")
         .expect("query parses")
         .into_static();
@@ -564,7 +571,10 @@ fn child_planners_enforce_role_visibility_admin_and_session_predicates() {
 fn composite_introspection_merges_roots_and_preserves_capability_arguments() {
     let metadata = metadata();
     let catalogs = catalogs();
-    let planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
     let doc = graphql_parser::parse_query::<String>(
         r#"{
             query: __type(name: "query_root") { fields { name args { name } } }
@@ -831,7 +841,10 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
             foreign_keys: vec![],
         },
     );
-    let mut planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let mut planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
     planner.set_relay(true).expect("single Relay source");
     let doc = graphql_parser::parse_query::<String>(
         r#"{
@@ -921,7 +934,10 @@ fn forwards_relay_mode_only_to_capable_children() {
     metadata.sources.truncate(2);
     let mut catalogs = catalogs();
     catalogs.remove("secondary");
-    let mut planner = MultiSourcePlanner::new(&metadata, &catalogs).expect("planner constructs");
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let mut planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
     planner
         .set_relay(true)
         .expect("relay ownership is unambiguous");

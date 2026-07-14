@@ -92,7 +92,7 @@ fn session() -> Session {
 
 fn app_state(db_path: &str) -> Arc<AppState> {
     Arc::new(AppState {
-        engine: tokio::sync::RwLock::new(Engine::bootstrap(metadata(db_path))),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata(db_path)))),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,

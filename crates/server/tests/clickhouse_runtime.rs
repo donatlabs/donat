@@ -173,7 +173,7 @@ fn app_state(url: &str) -> Arc<AppState> {
 
 fn app_state_with_metadata(metadata: Metadata) -> Arc<AppState> {
     Arc::new(AppState {
-        engine: tokio::sync::RwLock::new(Engine::bootstrap(metadata)),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,

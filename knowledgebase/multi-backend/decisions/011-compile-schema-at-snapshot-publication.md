@@ -23,9 +23,11 @@ Donat compiles per-source table/function indexes, multi-source ownership,
 validation state, and role-specific standard/Relay introspection schemas when a
 candidate metadata/catalog snapshot is synchronized. Candidate compilation and
 backend routing setup complete before publication, and the engine atomically
-swaps metadata, catalogs, runtime handles, and the immutable compiled schema.
-Requests create only lightweight planner views that borrow the published
-snapshot.
+swaps one `Arc<Engine>` containing metadata, catalogs, runtime handles, and the
+immutable compiled schema. Requests clone that Arc and create only lightweight
+planner views that borrow it. The same Arc is passed through action relationships
+and remote joins, preventing a concurrent publication from mixing request
+metadata, permissions, and runtime routing from different generations.
 
 Introspection roots are detected before a cached role schema is selected.
 Ordinary operations never compose an introspection schema. Permission checks

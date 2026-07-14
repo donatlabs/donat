@@ -71,8 +71,9 @@ session variable values never participate in schema shape.
 
 ### Engine snapshot lifecycle
 
-`Engine` owns metadata, catalogs, an `Arc<CompiledMultiSourceSchema>`, and a
-source-name map of backend runtime handles as one snapshot. A runtime handle
+An `Arc<Engine>` owns metadata, catalogs, an
+`Arc<CompiledMultiSourceSchema>`, and a source-name map of backend runtime handles
+as one snapshot. `AppState` publishes it through `RwLock<Arc<Engine>>`. A runtime handle
 contains the resolved URL and the backend-specific cloneable connection state
 (PostgreSQL pool, SQLite path, MySQL URL, or ClickHouse URL). During source
 synchronization, the server:
@@ -82,8 +83,9 @@ synchronization, the server:
    catalogs without holding the engine write lock;
 3. prunes missing tracked objects in the candidate metadata;
 4. compiles and validates the candidate schema;
-5. acquires the write lock and swaps metadata, catalogs, compiled schema, and
-   runtime handles together.
+5. wraps the candidate in an Arc, acquires the write lock, and swaps that one
+   pointer so metadata, catalogs, compiled schema, and runtime handles change
+   together.
 
 If connection, introspection, or compilation fails, the previous snapshot and
 all of its routing handles remain unchanged. The server does not publish
@@ -93,11 +95,13 @@ successful synchronization.
 
 ### Request path
 
-After parsing and action/remote routing, a tabular GraphQL request reads one
-engine snapshot, creates lightweight planner views from its compiled source
+After parsing, a GraphQL request clones one `Arc<Engine>` and releases the read
+lock. It creates lightweight planner views from that snapshot's compiled source
 indexes, selects standard or Relay mode, and plans the operation. No metadata
 clone, table/function index rebuild, role enumeration, or schema composition
-occurs.
+occurs. The same Arc is carried through action webhooks, action relationship
+queries, local execution, and remote joins, so publication during I/O cannot
+mix metadata or permissions from a newer snapshot into the in-flight request.
 
 Introspection detection is split from schema projection. The executor first
 selects the operation and flattens only its roots. It requests a cached role

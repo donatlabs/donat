@@ -84,26 +84,10 @@ impl std::fmt::Debug for CompiledMultiSourceSchema {
     }
 }
 
-enum CompiledSchemaRef<'a> {
-    Borrowed(&'a CompiledMultiSourceSchema),
-    Owned(Box<CompiledMultiSourceSchema>),
-}
-
-impl std::ops::Deref for CompiledSchemaRef<'_> {
-    type Target = CompiledMultiSourceSchema;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Borrowed(compiled) => compiled,
-            Self::Owned(compiled) => compiled,
-        }
-    }
-}
-
 /// Planner facade for Hasura metadata containing multiple data sources.
 pub struct MultiSourcePlanner<'a> {
     children: Vec<ChildPlanner<'a>>,
-    compiled: CompiledSchemaRef<'a>,
+    compiled: &'a CompiledMultiSourceSchema,
     relay: bool,
 }
 
@@ -259,28 +243,6 @@ impl CompiledMultiSourceSchema {
 }
 
 impl<'a> MultiSourcePlanner<'a> {
-    /// Build one child planner for every metadata source. Catalog lookup is
-    /// exact by source name; there is deliberately no default-source fallback.
-    pub fn new(
-        metadata: &'a Metadata,
-        catalogs: &'a HashMap<String, Catalog>,
-    ) -> Result<Self, PlanError> {
-        let compiled = Box::new(CompiledMultiSourceSchema::compile(
-            metadata, catalogs, true,
-        )?);
-        let children = build_children(
-            metadata,
-            catalogs,
-            &compiled.source_indexes,
-            compiled.infer_function_permissions,
-        )?;
-        Ok(Self {
-            children,
-            compiled: CompiledSchemaRef::Owned(compiled),
-            relay: false,
-        })
-    }
-
     pub fn from_compiled(
         metadata: &'a Metadata,
         catalogs: &'a HashMap<String, Catalog>,
@@ -294,15 +256,9 @@ impl<'a> MultiSourcePlanner<'a> {
         )?;
         Ok(Self {
             children,
-            compiled: CompiledSchemaRef::Borrowed(compiled),
+            compiled,
             relay: false,
         })
-    }
-
-    pub fn set_infer_function_permissions(&mut self, enabled: bool) {
-        for child in &mut self.children {
-            child.planner.infer_function_permissions = enabled;
-        }
     }
 
     /// Apply the Relay mode that was validated during snapshot compilation.
@@ -492,21 +448,7 @@ impl<'a> MultiSourcePlanner<'a> {
     }
 
     fn schema_json(&self, session: &Session) -> Result<Cow<'_, Json>, PlanError> {
-        match &self.compiled {
-            CompiledSchemaRef::Borrowed(compiled)
-                if self.children.iter().all(|child| {
-                    child.planner.infer_function_permissions == compiled.infer_function_permissions
-                }) =>
-            {
-                Ok(Cow::Borrowed(compiled.schema(session, self.relay)))
-            }
-            CompiledSchemaRef::Borrowed(_) | CompiledSchemaRef::Owned(_) => compose_schema(
-                self.children.iter().map(|child| &child.planner),
-                session,
-                Some(&self.compiled.schema_template),
-            )
-            .map(Cow::Owned),
-        }
+        Ok(Cow::Borrowed(self.compiled.schema(session, self.relay)))
     }
 }
 

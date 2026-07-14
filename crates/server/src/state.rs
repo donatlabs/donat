@@ -17,7 +17,7 @@ const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct AppState {
-    pub engine: RwLock<Engine>,
+    pub engine: RwLock<EngineSnapshot>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
     pub default_url: String,
@@ -38,6 +38,7 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+pub type EngineSnapshot = Arc<Engine>;
 
 /// Failure of a backend read in `execute_query_json`. The caller maps each
 /// variant to the existing GraphQL error body so the Postgres path keeps
@@ -57,7 +58,6 @@ pub enum QueryError {
 /// The caller maps each variant to the GraphQL error body; `CheckViolation`
 /// reproduces the same `permission-error` shape the Postgres path emits.
 pub enum SqliteMutationError {
-    NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
     CheckViolation {
@@ -71,7 +71,6 @@ pub enum SqliteMutationError {
 /// the SQLite variant, the caller maps each variant to the GraphQL error body;
 /// `CheckViolation` reproduces the same `permission-error` shape Postgres emits.
 pub enum MysqlMutationError {
-    NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
     CheckViolation {
@@ -167,11 +166,6 @@ impl Engine {
             compiled: Some(compiled),
             runtimes,
         })
-    }
-
-    pub fn publish(&mut self, candidate: Result<Self, PlanError>) -> Result<(), PlanError> {
-        *self = candidate?;
-        Ok(())
     }
 
     /// The catalog the GraphQL schema is built against: the "default"
@@ -294,8 +288,21 @@ fn render_hasura_environment_template(template: &str) -> Option<serde_json::Valu
 }
 
 impl AppState {
+    pub async fn engine_snapshot(&self) -> EngineSnapshot {
+        self.engine.read().await.clone()
+    }
+
+    async fn publish_candidate(
+        &self,
+        candidate: Result<Engine, PlanError>,
+    ) -> Result<(), PlanError> {
+        let candidate = Arc::new(candidate?);
+        *self.engine.write().await = candidate;
+        Ok(())
+    }
+
     async fn default_source_name(&self) -> Option<String> {
-        let engine = self.engine.read().await;
+        let engine = self.engine_snapshot().await;
         engine
             .metadata
             .sources
@@ -318,7 +325,11 @@ impl AppState {
     }
 
     async fn source_runtime(&self, source_name: &str) -> Option<SourceRuntime> {
-        self.engine.read().await.runtimes.get(source_name).cloned()
+        self.engine_snapshot()
+            .await
+            .runtimes
+            .get(source_name)
+            .cloned()
     }
 
     pub async fn execute_source_query_json(
@@ -326,11 +337,19 @@ impl AppState {
         source_name: &str,
         roots: &[RootField],
     ) -> Result<Json, QueryError> {
-        match self
+        let runtime = self
             .source_runtime(source_name)
             .await
-            .ok_or(QueryError::NoDefaultSource)?
-        {
+            .ok_or(QueryError::NoDefaultSource)?;
+        self.execute_runtime_query_json(runtime, roots).await
+    }
+
+    pub(crate) async fn execute_runtime_query_json(
+        &self,
+        runtime: SourceRuntime,
+        roots: &[RootField],
+    ) -> Result<Json, QueryError> {
+        match runtime {
             SourceRuntime::Postgres { pool, .. } => {
                 let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
                 let client = pool
@@ -416,9 +435,9 @@ impl AppState {
     /// can render the exact permission-error body. The check is computed in
     /// the same DML and the rollback is in the same transaction, so the
     /// permission is still enforced atomically (no bypass).
-    pub async fn execute_source_sqlite_mutations(
+    pub(crate) async fn execute_sqlite_mutations_at(
         &self,
-        source_name: &str,
+        path: String,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, SqliteMutationError> {
         use donat_sqlgen::{MutationResponseSlot, SqliteMutationPlan};
@@ -438,11 +457,6 @@ impl AppState {
                 (alias, donat_sqlgen::sqlite_mutation_plan(m))
             })
             .collect();
-
-        let path = match self.source_runtime(source_name).await {
-            Some(SourceRuntime::Sqlite { path }) => path,
-            _ => return Err(SqliteMutationError::NoDefaultSource),
-        };
 
         tokio::task::spawn_blocking(move || -> Result<Json, SqliteMutationError> {
             let mut conn = rusqlite::Connection::open(&path)
@@ -542,9 +556,10 @@ impl AppState {
     /// rolls the whole transaction back and yields
     /// [`MysqlMutationError::CheckViolation`] — the same atomic enforcement the
     /// Postgres/SQLite paths give.
-    pub async fn execute_source_mysql_mutations(
+    pub(crate) async fn execute_mysql_mutations_at(
         &self,
-        source_name: &str,
+        catalog: Catalog,
+        url: String,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
         use donat_sqlgen::{MutationResponseSlot, MySqlMutationKind, MySqlMutationPlan};
@@ -554,45 +569,32 @@ impl AppState {
         // table's primary key from the catalog (the IR mutation does not carry
         // it, but the insert companion SELECT needs it for last_insert_id()
         // recovery / the supplied-PK predicate). Preserve selection order.
-        let planned: Vec<(String, MySqlMutationPlan)> = {
-            let engine = self.engine.read().await;
-            let catalog = engine
-                .catalogs
-                .get(source_name)
-                .cloned()
-                .unwrap_or_default();
-            let pk_of = |t: &donat_ir::Table| -> Vec<String> {
-                catalog
-                    .tables
-                    .get(&format!("{}.{}", t.schema, t.name))
-                    .map(|info| info.primary_key.clone())
-                    .unwrap_or_default()
-            };
-            roots
-                .iter()
-                .map(|m| {
-                    let (alias, pk) = match m {
-                        donat_ir::MutationRoot::Insert { alias, insert } => {
-                            (alias.clone(), pk_of(&insert.table))
-                        }
-                        donat_ir::MutationRoot::Update { alias, update } => {
-                            (alias.clone(), pk_of(&update.table))
-                        }
-                        donat_ir::MutationRoot::Delete { alias, delete } => {
-                            (alias.clone(), pk_of(&delete.table))
-                        }
-                        donat_ir::MutationRoot::FunctionCall { alias, .. }
-                        | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
-                    };
-                    (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
-                })
-                .collect()
+        let pk_of = |t: &donat_ir::Table| -> Vec<String> {
+            catalog
+                .tables
+                .get(&format!("{}.{}", t.schema, t.name))
+                .map(|info| info.primary_key.clone())
+                .unwrap_or_default()
         };
-
-        let url = match self.source_runtime(source_name).await {
-            Some(SourceRuntime::Mysql { url }) => url,
-            _ => return Err(MysqlMutationError::NoDefaultSource),
-        };
+        let planned: Vec<(String, MySqlMutationPlan)> = roots
+            .iter()
+            .map(|m| {
+                let (alias, pk) = match m {
+                    donat_ir::MutationRoot::Insert { alias, insert } => {
+                        (alias.clone(), pk_of(&insert.table))
+                    }
+                    donat_ir::MutationRoot::Update { alias, update } => {
+                        (alias.clone(), pk_of(&update.table))
+                    }
+                    donat_ir::MutationRoot::Delete { alias, delete } => {
+                        (alias.clone(), pk_of(&delete.table))
+                    }
+                    donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
+                };
+                (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
+            })
+            .collect();
 
         tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
             let mut conn = mysql::Conn::new(url.as_str())
@@ -754,13 +756,13 @@ impl AppState {
     /// pruning metadata that refers to dropped objects (run_sql untracks
     /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
-        let metadata = self.engine.read().await.metadata.clone();
+        let metadata = self.engine_snapshot().await.metadata.clone();
         self.sync_candidate(metadata).await
     }
 
     async fn sync_candidate(&self, mut metadata: Metadata) -> anyhow::Result<()> {
         normalize_metadata_sources(&mut metadata);
-        let existing_runtimes = self.engine.read().await.runtimes.clone();
+        let existing_runtimes = self.engine_snapshot().await.runtimes.clone();
         let sources: Vec<(String, SourceKind, String, Vec<String>)> = metadata
             .sources
             .iter()
@@ -883,7 +885,7 @@ impl AppState {
             new_runtimes,
             self.infer_function_permissions,
         )?;
-        self.engine.write().await.publish(Ok(candidate))?;
+        self.publish_candidate(Ok(candidate)).await?;
         Ok(())
     }
 }
@@ -1054,7 +1056,7 @@ mod snapshot_tests {
 
     fn state(engine: Engine) -> AppState {
         AppState {
-            engine: RwLock::new(engine),
+            engine: RwLock::new(Arc::new(engine)),
             default_url: "sqlite::memory:".to_string(),
             admin_secret: None,
             unauthorized_role: None,
@@ -1188,7 +1190,7 @@ mod snapshot_tests {
             .await
             .expect_err("candidate sync fails during SQLite introspection");
 
-        let engine = state.engine.read().await;
+        let engine = state.engine_snapshot().await;
         assert_eq!(
             engine.metadata.sources[0].tables[0]
                 .configuration
@@ -1206,18 +1208,21 @@ mod snapshot_tests {
         ));
     }
 
-    #[test]
-    fn failed_candidate_preserves_entire_engine_snapshot() {
+    #[tokio::test]
+    async fn failed_candidate_preserves_entire_engine_snapshot() {
         let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
-        let mut engine =
+        let engine =
             Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
         let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
 
         let (metadata, _, runtimes) = candidate("new_item", "/tmp/new.sqlite");
         let invalid = Engine::compiled(metadata, HashMap::new(), runtimes, true);
-        engine
-            .publish(invalid)
+        state
+            .publish_candidate(invalid)
+            .await
             .expect_err("missing candidate catalog is rejected");
+        let engine = state.engine_snapshot().await;
 
         assert_eq!(
             engine.metadata.sources[0].tables[0]
@@ -1237,16 +1242,21 @@ mod snapshot_tests {
         ));
     }
 
-    #[test]
-    fn valid_candidate_publishes_entire_engine_snapshot() {
+    #[tokio::test]
+    async fn valid_candidate_publishes_entire_engine_snapshot() {
         let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
-        let mut engine =
+        let engine =
             Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
         let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
         let (metadata, catalogs, runtimes) = candidate("new_item", "/tmp/new.sqlite");
         let replacement = Engine::compiled(metadata, catalogs, runtimes, true);
 
-        engine.publish(replacement).expect("candidate publishes");
+        state
+            .publish_candidate(replacement)
+            .await
+            .expect("candidate publishes");
+        let engine = state.engine_snapshot().await;
 
         assert_eq!(
             engine.metadata.sources[0].tables[0]

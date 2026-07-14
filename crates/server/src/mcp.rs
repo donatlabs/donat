@@ -4447,7 +4447,7 @@ mod tests {
         )
         .expect("MCP engine snapshot compiles");
         Arc::new(crate::state::AppState {
-            engine: tokio::sync::RwLock::new(engine),
+            engine: tokio::sync::RwLock::new(Arc::new(engine)),
             default_url: url,
             admin_secret: None,
             unauthorized_role: None,

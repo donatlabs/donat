@@ -73,13 +73,21 @@ pub struct Engine {
     pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
     pub runtimes: HashMap<String, SourceRuntime>,
 }
+
+pub struct AppState {
+    pub engine: RwLock<Arc<Engine>>,
+    // ...
+}
 ```
 
 `sync_sources` constructs a complete candidate `Engine` outside the write lock.
-The only publication statement is `*self.engine.write().await = candidate` after
-all connections, introspection, pruning, and compilation succeed. Request
-planners own only cheap `Arc<PlannerIndex>` clones and borrow metadata/catalogs
-from one engine read guard; no compiled object borrows from `Engine`.
+The only publication statement replaces the shared `Arc<Engine>` after all
+connections, introspection, pruning, and compilation succeed. Each request
+clones that Arc under the read lock and releases the lock before any database,
+action-webhook, or remote-schema I/O. Request planners own only cheap
+`Arc<PlannerIndex>` clones and borrow metadata/catalogs from the request's Arc;
+action relationships and remote joins receive the same Arc instead of reading
+global state again. No compiled object borrows from `Engine`.
 `PlannerIndex` stays crate-private: action relationship resolution uses the
 narrow public `CompiledMultiSourceSchema::source_planner` factory.
 
