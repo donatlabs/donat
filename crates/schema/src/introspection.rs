@@ -3,6 +3,8 @@
 //! selection set. The schema reflects exactly what the planner would
 //! accept: per-role roots, column masks, relationships, mutations.
 
+use std::borrow::Cow;
+
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
@@ -671,6 +673,61 @@ pub(crate) fn execute_introspection_schema(
     Some(Ok(Json::Object(data)))
 }
 
+/// Project introspection through a schema that is obtained only when the
+/// selected operation actually contains `__schema` or `__type`.
+pub(crate) fn execute_introspection_schema_lazy<'schema>(
+    schema: impl FnOnce() -> Result<Cow<'schema, Json>, PlanError>,
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<Result<Json, PlanError>> {
+    if !is_introspection_operation(doc, operation_name, variables) {
+        return None;
+    }
+    let schema = match schema() {
+        Ok(schema) => schema,
+        Err(error) => return Some(Err(error)),
+    };
+    execute_introspection_schema(&schema, doc, operation_name, variables)
+}
+
+pub(crate) fn is_introspection_operation(
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> bool {
+    let mut fragments: Fragments = std::collections::HashMap::new();
+    let mut operations = vec![];
+    for definition in &doc.definitions {
+        match definition {
+            Definition::Fragment(fragment) => {
+                fragments.insert(fragment.name.clone(), fragment);
+            }
+            Definition::Operation(operation) => operations.push(operation),
+        }
+    }
+    let operation = match operation_name {
+        Some(wanted) => operations.iter().find(|operation| match operation {
+            OperationDefinition::Query(query) => query.name.as_deref() == Some(wanted),
+            _ => false,
+        }),
+        None if operations.len() == 1 => operations.first(),
+        None => None,
+    };
+    let Some(selection_set) = operation.and_then(|operation| match operation {
+        OperationDefinition::Query(query) => Some(&query.selection_set),
+        OperationDefinition::SelectionSet(selection_set) => Some(selection_set),
+        _ => None,
+    }) else {
+        return false;
+    };
+    flatten(selection_set, &fragments, variables, None).is_ok_and(|roots| {
+        roots
+            .iter()
+            .any(|field| field.name == "__schema" || field.name == "__type")
+    })
+}
+
 /// Project a prebuilt introspection value through a selection set.
 /// An FK-based object relationship is non-nullable when every local FK
 /// column is NOT NULL (the referenced row is guaranteed to exist). Manual
@@ -723,5 +780,177 @@ fn project(
             Ok(Json::Object(out))
         }
         scalar => Ok(scalar.clone()),
+    }
+}
+
+#[cfg(test)]
+mod lazy_schema_tests {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+
+    use super::execute_introspection_schema_lazy;
+    use serde_json::{Map as JsonMap, json};
+
+    #[test]
+    fn ordinary_operations_do_not_materialize_an_introspection_schema() {
+        let schema = json!({ "types": [] });
+        for query in ["{ public_item { id } }", "{ __typename }"] {
+            let builds = Cell::new(0);
+            let doc = graphql_parser::parse_query::<String>(query)
+                .expect("query parses")
+                .into_static();
+
+            let result = execute_introspection_schema_lazy(
+                || {
+                    builds.set(builds.get() + 1);
+                    Ok(Cow::Borrowed(&schema))
+                },
+                &doc,
+                None,
+                &JsonMap::new(),
+            );
+
+            assert!(result.is_none(), "{query} is not introspection");
+            assert_eq!(builds.get(), 0, "{query} must not request a schema");
+        }
+    }
+
+    #[test]
+    fn introspection_materializes_the_schema_once() {
+        let schema = json!({
+            "types": [{
+                "__typename": "__Type",
+                "kind": "OBJECT",
+                "name": "query_root"
+            }]
+        });
+        let builds = Cell::new(0);
+        let doc =
+            graphql_parser::parse_query::<String>(r#"{ __type(name: "query_root") { name } }"#)
+                .expect("query parses")
+                .into_static();
+
+        let data = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            None,
+            &JsonMap::new(),
+        )
+        .expect("introspection is detected")
+        .expect("introspection succeeds");
+
+        assert_eq!(data["__type"]["name"], "query_root");
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn selected_named_operation_controls_schema_materialization() {
+        let schema = json!({ "types": [] });
+        let doc = graphql_parser::parse_query::<String>(
+            r#"
+            query Data { public_item { id } }
+            query Inspect { __type(name: "query_root") { name } }
+            "#,
+        )
+        .expect("query parses")
+        .into_static();
+        let builds = Cell::new(0);
+
+        let data = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            Some("Data"),
+            &JsonMap::new(),
+        );
+        assert!(data.is_none());
+        assert_eq!(builds.get(), 0);
+
+        let introspection = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            Some("Inspect"),
+            &JsonMap::new(),
+        );
+        assert!(introspection.is_some());
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn fragments_and_directives_control_schema_materialization() {
+        let schema = json!({ "types": [] });
+        let doc = graphql_parser::parse_query::<String>(
+            r#"
+            query Inspect($include: Boolean!, $skip: Boolean!) {
+              ...IntrospectionFields @include(if: $include) @skip(if: $skip)
+            }
+            fragment IntrospectionFields on query_root {
+              __type(name: "query_root") { name }
+            }
+            "#,
+        )
+        .expect("query parses")
+        .into_static();
+
+        for (include, skip, expected_builds) in
+            [(false, false, 0), (true, true, 0), (true, false, 1)]
+        {
+            let builds = Cell::new(0);
+            let variables = JsonMap::from_iter([
+                ("include".to_string(), json!(include)),
+                ("skip".to_string(), json!(skip)),
+            ]);
+            let result = execute_introspection_schema_lazy(
+                || {
+                    builds.set(builds.get() + 1);
+                    Ok(Cow::Borrowed(&schema))
+                },
+                &doc,
+                Some("Inspect"),
+                &variables,
+            );
+
+            assert_eq!(builds.get(), expected_builds);
+            assert_eq!(result.is_some(), expected_builds == 1);
+        }
+    }
+
+    #[test]
+    fn mixed_data_and_introspection_preserves_the_validation_error() {
+        let schema = json!({ "types": [] });
+        let builds = Cell::new(0);
+        let doc = graphql_parser::parse_query::<String>(
+            r#"{ __type(name: "query_root") { name } public_item { id } }"#,
+        )
+        .expect("query parses")
+        .into_static();
+
+        let error = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            None,
+            &JsonMap::new(),
+        )
+        .expect("introspection is detected")
+        .expect_err("mixed roots are rejected");
+
+        assert_eq!(builds.get(), 1);
+        assert_eq!(error.code, "validation-failed");
+        assert_eq!(error.path, "$");
+        assert_eq!(
+            error.message,
+            "cannot mix 'public_item' with introspection fields"
+        );
     }
 }

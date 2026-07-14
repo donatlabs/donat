@@ -1,5 +1,6 @@
 //! Composition of independently-authoritative source planners.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use donat_catalog::Catalog;
@@ -11,7 +12,7 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::introspection::{build_schema_json, execute_introspection_schema};
+use crate::introspection::{build_schema_json, execute_introspection_schema_lazy};
 use crate::naming::table_base_name;
 use crate::plan::{Fragments, Plan, PlanError, Planner, Session, flatten, value_to_json};
 
@@ -407,10 +408,12 @@ pub fn execute_multi_source_introspection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<Result<Json, PlanError>> {
-    match planner.schema_json(session) {
-        Ok(schema) => execute_introspection_schema(&schema, doc, operation_name, variables),
-        Err(error) => Some(Err(error)),
-    }
+    execute_introspection_schema_lazy(
+        || planner.schema_json(session).map(Cow::Owned),
+        doc,
+        operation_name,
+        variables,
+    )
 }
 
 fn register_owners<'a>(
