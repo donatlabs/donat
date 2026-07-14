@@ -107,13 +107,7 @@ fn session() -> Session {
 
 fn state(fixtures: &SqliteFixtures) -> Arc<AppState> {
     Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata: metadata(fixtures),
-            catalogs: HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Engine::bootstrap(metadata(fixtures))),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,
@@ -383,13 +377,7 @@ async fn secondary_mysql_mutation_never_falls_back_to_default_source() {
     }))
     .expect("multi-source MySQL metadata");
     let state = Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata,
-            catalogs: HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Engine::bootstrap(metadata)),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,

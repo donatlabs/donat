@@ -9,6 +9,7 @@ use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, Sqlite
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_schema::{CompiledMultiSourceSchema, PlanError};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
@@ -16,19 +17,6 @@ const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct AppState {
-    /// One (url, pool) per Postgres source name; the pool is recreated when
-    /// the source's url changes (e.g. replace_metadata pointing 'default'
-    /// at a per-test database).
-    pub pools: RwLock<HashMap<String, (String, deadpool_postgres::Pool)>>,
-    /// One db path/url per SQLite source name. SQLite uses no pool: the
-    /// runtime opens a `rusqlite::Connection` per query inside
-    /// `spawn_blocking` (see `execute_query_json`).
-    pub sqlite_paths: RwLock<HashMap<String, String>>,
-    /// One connection url per MySQL source name. Like SQLite, MySQL uses no
-    /// pool: the runtime opens a `mysql::Conn` per query inside
-    /// `spawn_blocking` (see `execute_query_json`). The url carries the
-    /// database name, which is also the tracked schema.
-    pub mysql_urls: RwLock<HashMap<String, String>>,
     pub engine: RwLock<Engine>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
@@ -94,13 +82,98 @@ pub enum MysqlMutationError {
     Other(String),
 }
 
+#[derive(Clone)]
+pub enum SourceRuntime {
+    Postgres {
+        url: String,
+        pool: deadpool_postgres::Pool,
+    },
+    Sqlite {
+        path: String,
+    },
+    Mysql {
+        url: String,
+    },
+    Clickhouse {
+        url: String,
+    },
+}
+
+impl SourceRuntime {
+    fn kind(&self) -> SourceKind {
+        match self {
+            Self::Postgres { .. } => SourceKind::Postgres,
+            Self::Sqlite { .. } => SourceKind::Sqlite,
+            Self::Mysql { .. } => SourceKind::Mysql,
+            Self::Clickhouse { .. } => SourceKind::Clickhouse,
+        }
+    }
+}
+
 pub struct Engine {
     pub metadata: Metadata,
     /// Catalog snapshot per source name.
     pub catalogs: HashMap<String, Catalog>,
+    pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+    pub runtimes: HashMap<String, SourceRuntime>,
 }
 
 impl Engine {
+    pub fn bootstrap(metadata: Metadata) -> Self {
+        Self {
+            metadata,
+            catalogs: HashMap::new(),
+            compiled: None,
+            runtimes: HashMap::new(),
+        }
+    }
+
+    pub fn compiled(
+        mut metadata: Metadata,
+        catalogs: HashMap<String, Catalog>,
+        runtimes: HashMap<String, SourceRuntime>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        normalize_metadata_sources(&mut metadata);
+        for source in &metadata.sources {
+            let runtime = runtimes.get(&source.name).ok_or_else(|| {
+                PlanError::new(
+                    "$",
+                    "not-found",
+                    format!("runtime for source '{}' not found", source.name),
+                )
+            })?;
+            if runtime.kind() != source.kind {
+                return Err(PlanError::new(
+                    "$",
+                    "unexpected",
+                    format!(
+                        "runtime for source '{}' is {:?}, metadata requires {:?}",
+                        source.name,
+                        runtime.kind(),
+                        source.kind
+                    ),
+                ));
+            }
+        }
+        let compiled = Arc::new(CompiledMultiSourceSchema::compile(
+            &metadata,
+            &catalogs,
+            infer_function_permissions,
+        )?);
+        Ok(Self {
+            metadata,
+            catalogs,
+            compiled: Some(compiled),
+            runtimes,
+        })
+    }
+
+    pub fn publish(&mut self, candidate: Result<Self, PlanError>) -> Result<(), PlanError> {
+        *self = candidate?;
+        Ok(())
+    }
+
     /// The catalog the GraphQL schema is built against: the "default"
     /// source, or the first one.
     pub fn default_catalog(&self) -> Catalog {
@@ -124,6 +197,41 @@ pub fn make_pool(url: &str) -> anyhow::Result<deadpool_postgres::Pool> {
         Some(deadpool_postgres::Runtime::Tokio1),
         tokio_postgres::NoTls,
     )?)
+}
+
+fn stage_postgres_runtime(
+    url: &str,
+    existing: Option<&SourceRuntime>,
+) -> anyhow::Result<SourceRuntime> {
+    if let Some(SourceRuntime::Postgres {
+        url: existing_url,
+        pool,
+    }) = existing
+        && existing_url == url
+    {
+        return Ok(SourceRuntime::Postgres {
+            url: url.to_string(),
+            pool: pool.clone(),
+        });
+    }
+    Ok(SourceRuntime::Postgres {
+        url: url.to_string(),
+        pool: make_pool(url)?,
+    })
+}
+
+fn normalize_metadata_sources(metadata: &mut Metadata) {
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut normalized = Vec::with_capacity(metadata.sources.len());
+    for source in std::mem::take(&mut metadata.sources) {
+        if let Some(index) = indexes.get(&source.name).copied() {
+            normalized[index] = source;
+        } else {
+            indexes.insert(source.name.clone(), normalized.len());
+            normalized.push(source);
+        }
+    }
+    metadata.sources = normalized;
 }
 
 fn resolve_source_url(source: &Source, default_url: &str) -> String {
@@ -197,40 +305,20 @@ impl AppState {
             .map(|source| source.name.clone())
     }
 
-    pub async fn source_url(&self, source_name: &str) -> Option<String> {
-        let engine = self.engine.read().await;
-        engine
-            .metadata
-            .sources
-            .iter()
-            .rev()
-            .find(|source| source.name == source_name)
-            .map(|source| resolve_source_url(source, &self.default_url))
-    }
-
     pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
         let source = self.default_source_name().await?;
         self.source_pool(&source).await
     }
 
     pub async fn source_pool(&self, source_name: &str) -> Option<deadpool_postgres::Pool> {
-        self.pools
-            .read()
-            .await
-            .get(source_name)
-            .map(|(_, pool)| pool.clone())
+        match self.source_runtime(source_name).await {
+            Some(SourceRuntime::Postgres { pool, .. }) => Some(pool),
+            _ => None,
+        }
     }
 
-    pub async fn source_kind(&self, source_name: &str) -> Option<SourceKind> {
-        self.engine
-            .read()
-            .await
-            .metadata
-            .sources
-            .iter()
-            .rev()
-            .find(|source| source.name == source_name)
-            .map(|source| source.kind)
+    async fn source_runtime(&self, source_name: &str) -> Option<SourceRuntime> {
+        self.engine.read().await.runtimes.get(source_name).cloned()
     }
 
     pub async fn execute_source_query_json(
@@ -239,16 +327,12 @@ impl AppState {
         roots: &[RootField],
     ) -> Result<Json, QueryError> {
         match self
-            .source_kind(source_name)
+            .source_runtime(source_name)
             .await
             .ok_or(QueryError::NoDefaultSource)?
         {
-            SourceKind::Postgres => {
+            SourceRuntime::Postgres { pool, .. } => {
                 let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
-                let pool = self
-                    .source_pool(source_name)
-                    .await
-                    .ok_or(QueryError::NoDefaultSource)?;
                 let client = pool
                     .get()
                     .await
@@ -260,19 +344,12 @@ impl AppState {
                 row.try_get::<_, Json>(0)
                     .map_err(|e| QueryError::Decode(e.to_string()))
             }
-            SourceKind::Sqlite => {
+            SourceRuntime::Sqlite { path } => {
                 let sql = donat_sqlgen::operation_to_sql_opts_with(
                     roots,
                     self.stringify_numerics,
                     AnyDialect::Sqlite(SqliteDialect),
                 );
-                let path = {
-                    let paths = self.sqlite_paths.read().await;
-                    paths
-                        .get(source_name)
-                        .cloned()
-                        .ok_or(QueryError::NoDefaultSource)?
-                };
                 let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
                     let conn = rusqlite::Connection::open(&path)
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
@@ -283,7 +360,7 @@ impl AppState {
                 .map_err(|e| QueryError::Pool(format!("sqlite task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
-            SourceKind::Mysql => {
+            SourceRuntime::Mysql { url } => {
                 use mysql::prelude::Queryable;
 
                 let sql = donat_sqlgen::operation_to_sql_opts_with(
@@ -291,12 +368,6 @@ impl AppState {
                     self.stringify_numerics,
                     AnyDialect::Mysql(MySqlDialect),
                 );
-                let url = {
-                    let urls = self.mysql_urls.read().await;
-                    urls.get(source_name)
-                        .cloned()
-                        .ok_or(QueryError::NoDefaultSource)?
-                };
                 let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
                     let mut conn = mysql::Conn::new(url.as_str())
                         .map_err(|e| QueryError::Sqlite(e.to_string()))?;
@@ -316,16 +387,12 @@ impl AppState {
                 .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
                 serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
             }
-            SourceKind::Clickhouse => {
+            SourceRuntime::Clickhouse { url } => {
                 let sql = donat_sqlgen::operation_to_sql_opts_with(
                     roots,
                     self.stringify_numerics,
                     AnyDialect::Clickhouse(ClickhouseDialect),
                 );
-                let url = self
-                    .source_url(source_name)
-                    .await
-                    .ok_or(QueryError::NoDefaultSource)?;
                 let text = clickhouse_post_data(
                     &self.http,
                     &url,
@@ -372,12 +439,9 @@ impl AppState {
             })
             .collect();
 
-        let path = {
-            let paths = self.sqlite_paths.read().await;
-            paths
-                .get(source_name)
-                .cloned()
-                .ok_or(SqliteMutationError::NoDefaultSource)?
+        let path = match self.source_runtime(source_name).await {
+            Some(SourceRuntime::Sqlite { path }) => path,
+            _ => return Err(SqliteMutationError::NoDefaultSource),
         };
 
         tokio::task::spawn_blocking(move || -> Result<Json, SqliteMutationError> {
@@ -525,11 +589,9 @@ impl AppState {
                 .collect()
         };
 
-        let url = {
-            let urls = self.mysql_urls.read().await;
-            urls.get(source_name)
-                .cloned()
-                .ok_or(MysqlMutationError::NoDefaultSource)?
+        let url = match self.source_runtime(source_name).await {
+            Some(SourceRuntime::Mysql { url }) => url,
+            _ => return Err(MysqlMutationError::NoDefaultSource),
         };
 
         tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
@@ -692,57 +754,41 @@ impl AppState {
     /// pruning metadata that refers to dropped objects (run_sql untracks
     /// dropped tables/functions, like Donat).
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
-        // Later same-named sources override earlier ones (the harness
-        // appends a second 'default' pointing at a per-test database).
-        let sources: Vec<(String, SourceKind, String, Vec<String>)> = {
-            let engine = self.engine.read().await;
-            let mut resolved: Vec<(String, SourceKind, String, Vec<String>)> = vec![];
-            for s in &engine.metadata.sources {
-                let url = resolve_source_url(s, &self.default_url);
+        let metadata = self.engine.read().await.metadata.clone();
+        self.sync_candidate(metadata).await
+    }
+
+    async fn sync_candidate(&self, mut metadata: Metadata) -> anyhow::Result<()> {
+        normalize_metadata_sources(&mut metadata);
+        let existing_runtimes = self.engine.read().await.runtimes.clone();
+        let sources: Vec<(String, SourceKind, String, Vec<String>)> = metadata
+            .sources
+            .iter()
+            .map(|source| {
+                let url = resolve_source_url(source, &self.default_url);
                 let mut tracked_databases = Vec::new();
-                for table in &s.tables {
+                for table in &source.tables {
                     let schema = table.table.schema().to_string();
                     if !tracked_databases.contains(&schema) {
                         tracked_databases.push(schema);
                     }
                 }
-                match resolved.iter_mut().find(|(n, _, _, _)| n == &s.name) {
-                    Some(entry) => {
-                        entry.1 = s.kind;
-                        entry.2 = url;
-                        entry.3 = tracked_databases;
-                    }
-                    None => resolved.push((s.name.clone(), s.kind, url, tracked_databases)),
-                }
-            }
-            resolved
-        };
+                (source.name.clone(), source.kind, url, tracked_databases)
+            })
+            .collect();
 
         let mut new_catalogs = HashMap::new();
+        let mut new_runtimes = HashMap::new();
         for (name, kind, url, tracked_databases) in &sources {
-            let catalog = match kind {
+            let (catalog, runtime) = match kind {
                 SourceKind::Postgres => {
-                    let existing = {
-                        let pools = self.pools.read().await;
-                        pools
-                            .get(name)
-                            .filter(|(u, _)| u == url)
-                            .map(|(_, p)| p.clone())
-                    };
-                    let pool = match existing {
-                        Some(pool) => pool,
-                        None => {
-                            let pool = make_pool(url)?;
-                            self.pools
-                                .write()
-                                .await
-                                .insert(name.clone(), (url.clone(), pool.clone()));
-                            pool
-                        }
+                    let runtime = stage_postgres_runtime(url, existing_runtimes.get(name))?;
+                    let SourceRuntime::Postgres { pool, .. } = &runtime else {
+                        unreachable!("PostgreSQL staging returned a non-PostgreSQL runtime")
                     };
                     let client = pool.get().await?;
                     ensure_check_violation_helper(&client).await?;
-                    donat_catalog::introspect(&client).await?
+                    (donat_catalog::introspect(&client).await?, runtime)
                 }
                 SourceKind::Sqlite => {
                     // SQLite uses no pool and no PL/pgSQL helper: introspect
@@ -756,11 +802,7 @@ impl AppState {
                             Ok(donat_catalog::sqlite_introspect(&conn)?)
                         })
                         .await??;
-                    self.sqlite_paths
-                        .write()
-                        .await
-                        .insert(name.clone(), url.clone());
-                    catalog
+                    (catalog, SourceRuntime::Sqlite { path: url.clone() })
                 }
                 SourceKind::Mysql => {
                     // MySQL uses no pool and no PL/pgSQL helper: introspect once
@@ -781,11 +823,7 @@ impl AppState {
                             Ok(donat_catalog::mysql_introspect(&mut conn, &db)?)
                         })
                         .await??;
-                    self.mysql_urls
-                        .write()
-                        .await
-                        .insert(name.clone(), url.clone());
-                    catalog
+                    (catalog, SourceRuntime::Mysql { url: url.clone() })
                 }
                 SourceKind::Clickhouse => {
                     let fallback_database = clickhouse_database(url)?;
@@ -803,14 +841,20 @@ impl AppState {
                         clickhouse_post_with_databases_param(&self.http, url, sql, &databases)
                             .await
                             .map_err(anyhow::Error::msg)?;
-                    donat_catalog::clickhouse_catalog_from_json_each_row(&text, &fallback_database)?
+                    (
+                        donat_catalog::clickhouse_catalog_from_json_each_row(
+                            &text,
+                            &fallback_database,
+                        )?,
+                        SourceRuntime::Clickhouse { url: url.clone() },
+                    )
                 }
             };
             new_catalogs.insert(name.clone(), catalog);
+            new_runtimes.insert(name.clone(), runtime);
         }
 
-        let mut engine = self.engine.write().await;
-        for source in &mut engine.metadata.sources {
+        for source in &mut metadata.sources {
             let Some(catalog) = new_catalogs.get(&source.name) else {
                 continue;
             };
@@ -833,7 +877,13 @@ impl AppState {
                 });
             }
         }
-        engine.catalogs = new_catalogs;
+        let candidate = Engine::compiled(
+            metadata,
+            new_catalogs,
+            new_runtimes,
+            self.infer_function_permissions,
+        )?;
+        self.engine.write().await.publish(Ok(candidate))?;
         Ok(())
     }
 }
@@ -925,6 +975,296 @@ async fn clickhouse_post_data(
         // toJSONString. ClickHouse quotes 64-bit integers by default.
         .append_pair("output_format_json_quote_64bit_integers", "0");
     clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_DATA_BYTES).await
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+    use donat_metadata::{Metadata, SourceKind};
+    use donat_schema::{MultiSourcePlan, MultiSourcePlanner, Session};
+    use serde_json::{Map as JsonMap, json};
+    use tokio::sync::RwLock;
+
+    use super::{AppState, Engine, SourceRuntime, stage_postgres_runtime};
+
+    fn candidate(
+        root: &str,
+        path: &str,
+    ) -> (
+        Metadata,
+        HashMap<String, Catalog>,
+        HashMap<String, SourceRuntime>,
+    ) {
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": path }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": { "custom_name": root },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }],
+                    "insert_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "check": {} }
+                    }]
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.item".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "item".to_string(),
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        (
+            metadata,
+            HashMap::from([("default".to_string(), catalog)]),
+            HashMap::from([(
+                "default".to_string(),
+                SourceRuntime::Sqlite {
+                    path: path.to_string(),
+                },
+            )]),
+        )
+    }
+
+    fn state(engine: Engine) -> AppState {
+        AppState {
+            engine: RwLock::new(engine),
+            default_url: "sqlite::memory:".to_string(),
+            admin_secret: None,
+            unauthorized_role: None,
+            stringify_numerics: false,
+            infer_function_permissions: true,
+            jwt: None,
+            auth_hook: None,
+            http: reqwest::Client::new(),
+            allowlist_enabled: false,
+        }
+    }
+
+    fn user_session() -> Session {
+        Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        }
+    }
+
+    #[test]
+    fn duplicate_source_uses_last_definition_for_query_and_mutation() {
+        let (first, catalogs, _) = candidate("old_item", "/tmp/old.sqlite");
+        let (last, _, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let mut metadata = first;
+        metadata.sources[0].kind = SourceKind::Postgres;
+        metadata.sources.extend(last.sources);
+
+        let engine = Engine::compiled(metadata, catalogs, runtimes, true)
+            .expect("the last same-named source wins");
+        assert_eq!(engine.metadata.sources.len(), 1);
+        assert_eq!(engine.metadata.sources[0].kind, SourceKind::Sqlite);
+        let compiled = engine.compiled.as_deref().expect("compiled snapshot");
+        let planner =
+            MultiSourcePlanner::from_compiled(&engine.metadata, &engine.catalogs, compiled)
+                .expect("planner constructs from normalized snapshot");
+
+        let query = graphql_parser::parse_query::<String>("{ new_item { id } }")
+            .expect("query parses")
+            .into_static();
+        let MultiSourcePlan::Query { sources, .. } = planner
+            .plan(&query, None, &JsonMap::new(), &user_session())
+            .expect("last source query plans")
+        else {
+            panic!("query plan expected");
+        };
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source, "default");
+
+        let mutation = graphql_parser::parse_query::<String>(
+            "mutation { insert_new_item_one(object: { id: 1 }) { id } }",
+        )
+        .expect("mutation parses")
+        .into_static();
+        let MultiSourcePlan::Mutation { source, .. } = planner
+            .plan(&mutation, None, &JsonMap::new(), &user_session())
+            .expect("last source mutation plans")
+        else {
+            panic!("mutation plan expected");
+        };
+        assert_eq!(source.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_missing_or_mismatched_runtime() {
+        let (metadata, catalogs, _) = candidate("item", "/tmp/item.sqlite");
+        let missing = Engine::compiled(metadata.clone(), catalogs.clone(), HashMap::new(), true)
+            .err()
+            .expect("a source without a runtime is rejected");
+        assert!(
+            missing
+                .message
+                .contains("runtime for source 'default' not found")
+        );
+
+        let runtimes = HashMap::from([(
+            "default".to_string(),
+            SourceRuntime::Mysql {
+                url: "mysql://unused/item".to_string(),
+            },
+        )]);
+        let mismatched = Engine::compiled(metadata, catalogs, runtimes, true)
+            .err()
+            .expect("a runtime with the wrong backend kind is rejected");
+        assert!(mismatched.message.contains("metadata requires Sqlite"));
+    }
+
+    #[test]
+    fn postgres_runtime_reuses_pool_only_for_the_same_url() {
+        let first = stage_postgres_runtime("postgres://localhost/first", None)
+            .expect("first runtime stages");
+        let same = stage_postgres_runtime("postgres://localhost/first", Some(&first))
+            .expect("same-url runtime stages");
+        let changed = stage_postgres_runtime("postgres://localhost/second", Some(&same))
+            .expect("changed-url runtime stages");
+
+        let SourceRuntime::Postgres {
+            pool: first_pool, ..
+        } = &first
+        else {
+            panic!("postgres runtime expected");
+        };
+        let SourceRuntime::Postgres {
+            pool: same_pool, ..
+        } = &same
+        else {
+            panic!("postgres runtime expected");
+        };
+        let SourceRuntime::Postgres {
+            pool: changed_pool, ..
+        } = &changed
+        else {
+            panic!("postgres runtime expected");
+        };
+        assert!(std::ptr::eq(first_pool.manager(), same_pool.manager()));
+        assert!(!std::ptr::eq(same_pool.manager(), changed_pool.manager()));
+    }
+
+    #[tokio::test]
+    async fn failed_sync_preserves_the_published_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+        let (candidate, _, _) =
+            candidate("new_item", "/definitely/missing/donat-parent/new.sqlite");
+
+        state
+            .sync_candidate(candidate)
+            .await
+            .expect_err("candidate sync fails during SQLite introspection");
+
+        let engine = state.engine.read().await;
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("old_item")
+        );
+        assert!(Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path }) if path == "/tmp/old.sqlite"
+        ));
+    }
+
+    #[test]
+    fn failed_candidate_preserves_entire_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let mut engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+
+        let (metadata, _, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let invalid = Engine::compiled(metadata, HashMap::new(), runtimes, true);
+        engine
+            .publish(invalid)
+            .expect_err("missing candidate catalog is rejected");
+
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("old_item")
+        );
+        assert!(engine.catalogs.contains_key("default"));
+        assert!(Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path }) if path == "/tmp/old.sqlite"
+        ));
+    }
+
+    #[test]
+    fn valid_candidate_publishes_entire_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let mut engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let (metadata, catalogs, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let replacement = Engine::compiled(metadata, catalogs, runtimes, true);
+
+        engine.publish(replacement).expect("candidate publishes");
+
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("new_item")
+        );
+        assert!(engine.catalogs.contains_key("default"));
+        assert!(!Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path }) if path == "/tmp/new.sqlite"
+        ));
+    }
 }
 
 #[cfg(test)]

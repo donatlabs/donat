@@ -100,13 +100,7 @@ fn session_for(role: &str) -> Session {
 
 fn app_state(db_url: &str) -> Arc<AppState> {
     Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata: metadata(db_url),
-            catalogs: HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Engine::bootstrap(metadata(db_url))),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,
