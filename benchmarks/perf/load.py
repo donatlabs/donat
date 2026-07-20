@@ -119,7 +119,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 payload = response.read()
                 local_bytes += len(payload)
                 decoded = json.loads(payload)
-                if response.status != 200 or decoded.get("errors") is not None:
+                if (
+                    response.status != 200
+                    or not isinstance(decoded, dict)
+                    or decoded.get("errors") is not None
+                ):
                     attempt_failed = True
             except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
                 attempt_failed = True

@@ -931,15 +931,20 @@ fn validate_selection_conflicts(
     }
 
     let mut indexes_by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut keys_in_client_order = vec![];
     for (index, field) in fields.iter().enumerate() {
         let key = field
             .field
             .alias
             .as_deref()
             .unwrap_or(field.field.name.as_str());
+        if !indexes_by_key.contains_key(key) {
+            keys_in_client_order.push(key);
+        }
         indexes_by_key.entry(key).or_default().push(index);
     }
-    for indexes in indexes_by_key.values() {
+    for key in keys_in_client_order {
+        let indexes = &indexes_by_key[key];
         for (position, left_index) in indexes.iter().enumerate() {
             let left = &fields[*left_index];
             for right_index in indexes.iter().skip(position + 1) {

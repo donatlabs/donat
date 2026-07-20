@@ -421,6 +421,29 @@ fn rejects_nested_response_key_conflicts_before_child_planning() {
 }
 
 #[test]
+fn response_key_conflicts_are_reported_in_client_order() {
+    let query = r#"
+        {
+          public_item {
+            first: id
+            first: name
+            second: id
+            second: name
+          }
+        }
+        "#;
+
+    for _ in 0..32 {
+        let error = plan(query, "user").expect_err("response-key collision must fail");
+        assert_eq!(error.code, "validation-failed");
+        assert!(
+            error.message.contains("response key 'first' conflict"),
+            "first client-order conflict must be stable: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_nested_conflicts_from_included_fragments() {
     let error = plan(
         r#"

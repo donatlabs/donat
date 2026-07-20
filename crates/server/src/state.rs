@@ -346,6 +346,7 @@ fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {
                 .filter(move |collection| collection.name == entry.collection)
                 .flat_map(|collection| collection.definition.queries.iter())
         })
+        .filter(|query| !crate::gql::query_too_deep(&query.query))
         .filter_map(|query| graphql_parser::parse_query::<String>(&query.query).ok())
         .map(|document| crate::gql::normalize_for_allowlist(&document.into_static()))
         .collect()
@@ -1283,8 +1284,8 @@ mod snapshot_tests {
     use tokio::sync::RwLock;
 
     use super::{
-        AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, runtime_pool_settings,
-        stage_mysql_runtime, stage_postgres_runtime,
+        AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, compile_allowed_queries,
+        runtime_pool_settings, stage_mysql_runtime, stage_postgres_runtime,
     };
 
     fn candidate(
@@ -1615,6 +1616,27 @@ mod snapshot_tests {
                 .remote_permission_schemas
                 .contains_key(&("remote".into(), "user".into()))
         );
+    }
+
+    #[test]
+    fn over_depth_allowlist_query_is_skipped_before_parsing() {
+        let query = format!(
+            "{}{}",
+            "{ field ".repeat(crate::gql::MAX_QUERY_DEPTH + 1),
+            "}".repeat(crate::gql::MAX_QUERY_DEPTH + 1),
+        );
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "query_collections": [{
+                "name": "allowed",
+                "definition": { "queries": [{ "name": "deep", "query": query }] }
+            }],
+            "allowlist": [{ "collection": "allowed" }]
+        }))
+        .expect("metadata deserializes");
+
+        assert!(compile_allowed_queries(&metadata).is_empty());
     }
 
     #[tokio::test]

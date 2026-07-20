@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use futures_util::future::join_all;
@@ -1277,6 +1278,7 @@ async fn execute_remote_join_sequential(
     state: &SharedState,
     prepared: &[PreparedRemoteJoin],
     root_field: &str,
+    batch_permits: &Arc<tokio::sync::Semaphore>,
 ) -> Result<Vec<Json>, Json> {
     let mut values = Vec::with_capacity(prepared.len());
     for request in prepared {
@@ -1284,8 +1286,14 @@ async fn execute_remote_join_sequential(
             "query": request.query,
             "variables": request.variables,
         });
+        let permit = batch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("remote batch semaphore is never closed");
         let (_, response) =
             crate::remote::forward(state, &request.target, &body, &HeaderMap::new()).await;
+        drop(permit);
         if let Some(errors) = response.get("errors") {
             return Err(json!({ "errors": errors }));
         }
@@ -1303,12 +1311,13 @@ async fn execute_remote_join_chunk(
     state: &SharedState,
     prepared: &[PreparedRemoteJoin],
     root_field: &str,
+    batch_permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<Vec<Json>, Json> {
     if prepared.len() == 1 {
-        return execute_remote_join_sequential(state, prepared, root_field).await;
+        return execute_remote_join_sequential(state, prepared, root_field, &batch_permits).await;
     }
     let Some((query, variables)) = build_remote_join_batch(prepared) else {
-        return execute_remote_join_sequential(state, prepared, root_field).await;
+        return execute_remote_join_sequential(state, prepared, root_field, &batch_permits).await;
     };
     let first = prepared.first().expect("non-empty remote join batch");
     let target = crate::remote::RemoteTarget {
@@ -1320,15 +1329,24 @@ async fn execute_remote_join_chunk(
         timeout_seconds: first.target.timeout_seconds,
     };
     let body = json!({ "query": query, "variables": variables });
+    let permit = batch_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("remote batch semaphore is never closed");
     let (_, response) = crate::remote::forward(state, &target, &body, &HeaderMap::new()).await;
+    drop(permit);
     if let Some(errors) = response.get("errors") {
         if remote_batch_is_validation_error(errors) {
-            return execute_remote_join_sequential(state, prepared, root_field).await;
+            return execute_remote_join_sequential(state, prepared, root_field, &batch_permits)
+                .await;
         }
         // Transport failures, timeouts, and resolver errors must not fan out
         // into N retries. Only a recognized GraphQL validation rejection says
         // that the upstream cannot execute our aliased batch shape.
-        return Err(json!({ "errors": errors }));
+        return Err(json!({
+            "errors": restore_remote_join_error_paths(errors, root_field)
+        }));
     }
     Ok((0..prepared.len())
         .map(|index| {
@@ -1338,6 +1356,47 @@ async fn execute_remote_join_chunk(
                 .unwrap_or(Json::Null)
         })
         .collect())
+}
+
+fn restore_remote_join_error_paths(errors: &Json, root_field: &str) -> Json {
+    let mut restored = errors.clone();
+    let Some(items) = restored.as_array_mut() else {
+        return restored;
+    };
+    for error in items {
+        let Some(error) = error.as_object_mut() else {
+            continue;
+        };
+        if let Some(path) = error.get_mut("path").and_then(Json::as_array_mut)
+            && path
+                .first()
+                .and_then(Json::as_str)
+                .is_some_and(|segment| segment.starts_with("__donat_rr_"))
+        {
+            path[0] = Json::String(root_field.to_string());
+        }
+        let extension_path = error
+            .get("extensions")
+            .and_then(Json::as_object)
+            .and_then(|extensions| extensions.get("path"))
+            .and_then(Json::as_str)
+            .map(str::to_string);
+        if let Some(path) = extension_path
+            && let Some(start) = path.find("__donat_rr_")
+        {
+            let end = path[start..]
+                .find(|character: char| character == '.' || character == '[')
+                .map(|offset| start + offset)
+                .unwrap_or(path.len());
+            if let Some(extensions) = error.get_mut("extensions").and_then(Json::as_object_mut) {
+                extensions.insert(
+                    "path".to_string(),
+                    Json::String(format!("{}{}{}", &path[..start], root_field, &path[end..])),
+                );
+            }
+        }
+    }
+    restored
 }
 
 fn remote_batch_is_validation_error(errors: &Json) -> bool {
@@ -1364,6 +1423,7 @@ async fn resolve_remote_join_group(
     engine: &Engine,
     session: &Session,
     group: &RemoteJoinGroup<'_>,
+    batch_permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<Vec<Json>, Json> {
     let doc = graphql_parser::parse_query::<String>(&group.spec.query)
         .map_err(|error| error_json("unexpected", format!("bad remote join: {error}")))?
@@ -1419,11 +1479,9 @@ async fn resolve_remote_join_group(
     let mut unique_values = Vec::with_capacity(prepared.len());
     let window_size = REMOTE_JOIN_BATCH_SIZE * REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES;
     for window in prepared.chunks(window_size) {
-        let results = join_all(
-            window
-                .chunks(REMOTE_JOIN_BATCH_SIZE)
-                .map(|chunk| execute_remote_join_chunk(state, chunk, &group.spec.root_field)),
-        )
+        let results = join_all(window.chunks(REMOTE_JOIN_BATCH_SIZE).map(|chunk| {
+            execute_remote_join_chunk(state, chunk, &group.spec.root_field, batch_permits.clone())
+        }))
         .await;
         for result in results {
             unique_values.extend(result?);
@@ -1436,18 +1494,26 @@ async fn resolve_remote_join_group(
         .collect())
 }
 
-fn strip_remote_join_hidden(node: &mut Json) {
+fn strip_remote_join_hidden_fields(fields: &[donat_ir::OutputField], node: &mut Json) {
     match node {
         Json::Array(items) => {
             for item in items {
-                strip_remote_join_hidden(item);
+                strip_remote_join_hidden_fields(fields, item);
             }
         }
         Json::Object(map) => {
-            map.retain(|key, _| !key.starts_with("__rr__"));
-            for value in map.values_mut() {
-                strip_remote_join_hidden(value);
+            for field in fields {
+                match &field.value {
+                    donat_ir::FieldValue::Object { query, .. }
+                    | donat_ir::FieldValue::Array { query, .. } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_fields(&query.fields, child);
+                        }
+                    }
+                    _ => {}
+                }
             }
+            map.retain(|key, _| !key.starts_with("__rr__"));
         }
         _ => {}
     }
@@ -1467,12 +1533,13 @@ fn resolve_remote_joins<'a>(
     Box::pin(async move {
         let mut groups = vec![];
         collect_remote_join_groups(fields, node, "", path, &mut groups);
+        let batch_permits = Arc::new(tokio::sync::Semaphore::new(
+            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+        ));
         for window in groups.chunks(REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES) {
-            let resolved = join_all(
-                window
-                    .iter()
-                    .map(|group| resolve_remote_join_group(state, engine, session, group)),
-            )
+            let resolved = join_all(window.iter().map(|group| {
+                resolve_remote_join_group(state, engine, session, group, batch_permits.clone())
+            }))
             .await;
             for (group, values) in window.iter().zip(resolved) {
                 for (entry, value) in group.entries.iter().zip(values?) {
@@ -1483,7 +1550,7 @@ fn resolve_remote_joins<'a>(
                 }
             }
         }
-        strip_remote_join_hidden(node);
+        strip_remote_join_hidden_fields(fields, node);
         Ok(())
     })
 }
@@ -1786,6 +1853,59 @@ mod tests {
     }
 
     #[test]
+    fn remote_join_cleanup_keeps_json_keys_outside_planner_rows() {
+        use donat_ir::{FieldValue, OutputField};
+
+        let fields = vec![OutputField {
+            alias: "payload".to_string(),
+            value: FieldValue::Column {
+                column: "payload".to_string(),
+                pg_type: "jsonb".to_string(),
+            },
+        }];
+        let mut node = json!({
+            "__rr__id": 7,
+            "payload": { "__rr__user_key": "preserve" }
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "payload": { "__rr__user_key": "preserve" }
+            })
+        );
+    }
+
+    #[test]
+    fn remote_batch_errors_restore_original_root_paths() {
+        let restored = restore_remote_join_error_paths(
+            &json!([{
+                "path": ["__donat_rr_1", "name"],
+                "extensions": {
+                    "path": "$.selectionSet.__donat_rr_1.selectionSet.name",
+                    "code": "unexpected"
+                },
+                "message": "remote resolver failed"
+            }]),
+            "message",
+        );
+
+        assert_eq!(
+            restored,
+            json!([{
+                "path": ["message", "name"],
+                "extensions": {
+                    "path": "$.selectionSet.message.selectionSet.name",
+                    "code": "unexpected"
+                },
+                "message": "remote resolver failed"
+            }])
+        );
+    }
+
+    #[test]
     fn error_json_shape() {
         assert_eq!(
             error_json("validation-failed", "boom"),
@@ -2065,6 +2185,109 @@ mod tests {
             ])
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_groups_share_a_global_batch_limit() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State((active, maximum, requests)): State<(
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        axum::Json(json!({ "data": {} }))
+                    },
+                ),
+            )
+            .with_state((active, maximum.clone(), requests.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields: Vec<OutputField> = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|alias| OutputField {
+                alias: alias.to_string(),
+                value: FieldValue::RemoteJoin {
+                    spec: RemoteJoinSpec {
+                        schema: "messages".to_string(),
+                        query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                        variables: vec![("v0".to_string(), format!("__rr__{alias}"))],
+                        root_field: "message".to_string(),
+                    },
+                },
+            })
+            .collect();
+        let mut node = Json::Array(
+            (0..=REMOTE_JOIN_BATCH_SIZE)
+                .map(|id| {
+                    json!({
+                        "__rr__one": id,
+                        "__rr__two": id,
+                        "__rr__three": id,
+                        "__rr__four": id,
+                    })
+                })
+                .collect(),
+        );
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("remote joins resolve");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 8);
+        assert!(
+            maximum.load(Ordering::SeqCst) <= REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+            "all relationship groups share the same remote batch limit"
+        );
         server.abort();
     }
 

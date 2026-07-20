@@ -52,8 +52,8 @@ if [[ "${PERF_SKIP_BUILD:-0}" != "1" ]]; then
 fi
 
 PERF_DATABASE_URL="${database_url}" \
+  DONAT_GRAPHQL_DATABASE_URL="${database_url}" \
   target/release/donat \
-  --database-url "${database_url}" \
   --metadata-dir "${metadata_dir}" \
   --port "${port}" \
   >"${temporary_dir:-/tmp}/donat-perf-server.log" 2>&1 &
