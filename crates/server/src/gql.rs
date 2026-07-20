@@ -517,7 +517,7 @@ pub async fn execute_full(
         body,
         relay,
         headers,
-        doc,
+        &doc,
         variables,
         operation_name,
     )
@@ -553,7 +553,7 @@ pub(crate) async fn execute_preparsed_full(
         body,
         relay,
         headers,
-        doc.clone(),
+        doc,
         variables,
         operation_name,
     )
@@ -566,7 +566,7 @@ async fn execute_parsed_full(
     body: &Json,
     relay: bool,
     headers: &axum::http::HeaderMap,
-    doc: graphql_parser::query::Document<'static, String>,
+    doc: &graphql_parser::query::Document<'static, String>,
     variables: JsonMap<String, Json>,
     operation_name: Option<&str>,
 ) -> (axum::http::StatusCode, Json) {
@@ -575,7 +575,7 @@ async fn execute_parsed_full(
     // Remote schema routing: operations aimed entirely at a permitted
     // remote schema are validated against the role's SDL and forwarded.
     let mut remote_variables = variables.clone();
-    if let Some(result) = crate::remote::match_remote(&engine, session, &doc, &mut remote_variables)
+    if let Some(result) = crate::remote::match_remote(&engine, session, doc, &mut remote_variables)
     {
         trace_perf_phase("graphql.route", routing_started);
         return match result {
@@ -583,7 +583,7 @@ async fn execute_parsed_full(
                 if target.has_introspection {
                     // Answer introspection locally, forward the rest,
                     // merge in the original selection order.
-                    let order: Vec<(String, bool)> = top_level_fields(&doc);
+                    let order: Vec<(String, bool)> = top_level_fields(doc);
                     let mut intro_doc = doc.clone();
                     crate::remote::keep_introspection_roots(&mut intro_doc);
                     let planner = match planner_from_snapshot(&engine) {
@@ -649,14 +649,14 @@ async fn execute_parsed_full(
     }
     // Action routing: an operation whose top-level fields are actions is
     // resolved by calling the action's HTTP handler, not by SQL planning.
-    if let Some(ctx) = crate::action::match_action(&engine.metadata, &doc, operation_name) {
+    if let Some(ctx) = crate::action::match_action(&engine.metadata, doc, operation_name) {
         trace_perf_phase("graphql.route", routing_started);
         return crate::action::resolve(
             state,
             engine,
             session,
             &ctx,
-            &doc,
+            doc,
             &variables,
             operation_name,
             headers,
@@ -668,7 +668,7 @@ async fn execute_parsed_full(
     // (__typename selections are ignored, like Donat).
     if state.allowlist_enabled {
         let allowlist_started = std::time::Instant::now();
-        let normalized = normalize_for_allowlist(&doc);
+        let normalized = normalize_for_allowlist(doc);
         if !engine.allowed_queries.contains(&normalized) {
             return ok(error_json("validation-failed", "query is not allowed"));
         }
@@ -690,7 +690,7 @@ async fn execute_parsed_full(
     if let Some(result) = donat_schema::execute_multi_source_introspection(
         &planner,
         session,
-        &doc,
+        doc,
         operation_name,
         &variables,
     ) {
@@ -699,7 +699,7 @@ async fn execute_parsed_full(
             Err(e) => ok(e.to_graphql()),
         };
     }
-    let plan = match planner.plan(&doc, operation_name, &variables, session) {
+    let plan = match planner.plan(doc, operation_name, &variables, session) {
         Ok(plan) => plan,
         Err(e) => return ok(e.to_graphql()),
     };
@@ -723,25 +723,60 @@ async fn execute_parsed_full(
             };
             match execute_source_query_plans(&executor, &sources).await {
                 Ok(mut source_data) => {
-                    for (source_plan, data) in sources.iter().zip(&mut source_data) {
+                    // Source reads have completed. Remote joins rooted at
+                    // separate response fields are independent too, so move
+                    // each JSON subtree out, resolve it concurrently, then
+                    // restore the result in plan order. One shared semaphore
+                    // keeps all roots within this operation's upstream batch
+                    // limit rather than multiplying the limit per root.
+                    let mut remote_roots = vec![];
+                    for (source_index, (source_plan, data)) in
+                        sources.iter().zip(&mut source_data).enumerate()
+                    {
                         for root in &source_plan.roots {
                             let donat_ir::RootField::Select { alias, query } = root else {
                                 continue;
                             };
                             if let Some(node) = data.get_mut(alias.as_str()) {
-                                if let Err(e) = resolve_remote_joins(
+                                remote_roots.push((
+                                    source_index,
+                                    alias.clone(),
+                                    query.fields.clone(),
+                                    format!("$.selectionSet.{alias}"),
+                                    std::mem::take(node),
+                                ));
+                            }
+                        }
+                    }
+                    let remote_batch_permits = Arc::new(tokio::sync::Semaphore::new(
+                        REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+                    ));
+                    let resolved = join_all(remote_roots.into_iter().map(
+                        |(source_index, alias, fields, path, mut node)| {
+                            let engine = engine.clone();
+                            let batch_permits = remote_batch_permits.clone();
+                            async move {
+                                let result = resolve_remote_joins_with_permits(
                                     state,
                                     engine.as_ref(),
                                     session,
-                                    &query.fields,
-                                    node,
-                                    &format!("$.selectionSet.{alias}"),
+                                    &fields,
+                                    &mut node,
+                                    &path,
+                                    batch_permits,
                                 )
-                                .await
-                                {
-                                    return ok(e);
-                                }
+                                .await;
+                                (source_index, alias, node, result)
                             }
+                        },
+                    ))
+                    .await;
+                    for (source_index, alias, node, result) in resolved {
+                        if let Some(slot) = source_data[source_index].get_mut(alias.as_str()) {
+                            *slot = node;
+                        }
+                        if let Err(error) = result {
+                            return ok(error);
                         }
                     }
                     let data = assemble_multi_source_response(&response, source_data);
@@ -779,7 +814,12 @@ async fn execute_parsed_full(
                         Err(e) => ok(sqlite_mutation_error_json(e)),
                     };
                 }
-                SourceRuntime::Mysql { pool, settings, .. } => {
+                SourceRuntime::Mysql {
+                    pool,
+                    permits,
+                    settings,
+                    ..
+                } => {
                     let Some(catalog) = engine.catalogs.get(&source) else {
                         return ok(error_json(
                             "unexpected",
@@ -807,7 +847,7 @@ async fn execute_parsed_full(
                         .collect();
                     drop(engine);
                     return match state
-                        .execute_mysql_mutations_at(primary_keys, pool, settings, &roots)
+                        .execute_mysql_mutations_at(primary_keys, pool, permits, settings, &roots)
                         .await
                     {
                         Ok(data) => ok(json!({
@@ -1588,12 +1628,31 @@ fn resolve_remote_joins<'a>(
     node: &'a mut Json,
     path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
+    resolve_remote_joins_with_permits(
+        state,
+        engine,
+        session,
+        fields,
+        node,
+        path,
+        Arc::new(tokio::sync::Semaphore::new(
+            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+        )),
+    )
+}
+
+fn resolve_remote_joins_with_permits<'a>(
+    state: &'a SharedState,
+    engine: &'a Engine,
+    session: &'a Session,
+    fields: &'a [donat_ir::OutputField],
+    node: &'a mut Json,
+    path: &'a str,
+    batch_permits: Arc<tokio::sync::Semaphore>,
+) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
     Box::pin(async move {
         let mut groups = vec![];
         collect_remote_join_groups(fields, node, "", path, &mut groups);
-        let batch_permits = Arc::new(tokio::sync::Semaphore::new(
-            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
-        ));
         for window in groups.chunks(REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES) {
             let resolved = join_all(window.iter().map(|group| {
                 resolve_remote_join_group(state, engine, session, group, batch_permits.clone())
@@ -2192,6 +2251,7 @@ mod tests {
             http: reqwest::Client::new(),
             allowlist_enabled: false,
             subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+            subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 

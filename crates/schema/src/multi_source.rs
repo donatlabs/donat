@@ -930,9 +930,25 @@ fn validate_selection_conflicts(
         )?;
     }
 
+    // A fragment can be spread thousands of times at the same level. Equal
+    // fields have identical response shapes, conditions, and arguments, so
+    // comparing every copy with every other copy adds quadratic planner work
+    // without changing the result. Keep one representative for conflict
+    // validation; retain `fields` below because every nested selection still
+    // participates in recursive validation.
+    let mut conflict_fields: Vec<&ScopedField> = vec![];
+    for field in &fields {
+        if !conflict_fields
+            .iter()
+            .any(|existing| same_conflict_identity(existing, field))
+        {
+            conflict_fields.push(field);
+        }
+    }
+
     let mut indexes_by_key: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut keys_in_client_order = vec![];
-    for (index, field) in fields.iter().enumerate() {
+    for (index, field) in conflict_fields.iter().enumerate() {
         let key = field
             .field
             .alias
@@ -946,9 +962,9 @@ fn validate_selection_conflicts(
     for key in keys_in_client_order {
         let indexes = &indexes_by_key[key];
         for (position, left_index) in indexes.iter().enumerate() {
-            let left = &fields[*left_index];
+            let left = conflict_fields[*left_index];
             for right_index in indexes.iter().skip(position + 1) {
-                let right = &fields[*right_index];
+                let right = conflict_fields[*right_index];
                 let right_key = right
                     .field
                     .alias
@@ -1020,6 +1036,14 @@ fn validate_selection_conflicts(
         )?;
     }
     Ok(())
+}
+
+fn same_conflict_identity(left: &ScopedField, right: &ScopedField) -> bool {
+    left.conditions == right.conditions
+        && left.relay_selection == right.relay_selection
+        && left.field.name == right.field.name
+        && left.field.alias == right.field.alias
+        && arguments_match(&left.field, &right.field)
 }
 
 fn scoped_response_shapes_match(
@@ -1370,5 +1394,31 @@ mod performance_tests {
         )
         .expect("unique response keys do not conflict");
         assert_eq!(fields.len(), 2_000);
+    }
+
+    #[test]
+    fn repeated_fragment_fields_are_validated_once_per_identity() {
+        let query = format!(
+            "query {{ item {{ {} }} }} fragment Repeated on item {{ id }}",
+            "...Repeated ".repeat(10_000)
+        );
+        let document = graphql_parser::parse_query::<String>(&query)
+            .expect("wide repeated query parses")
+            .into_static();
+        let (operation, fragments) = select_operation(&document, None).expect("operation found");
+
+        validate_selection_conflicts(
+            vec![(
+                operation_selection_set(operation).clone(),
+                vec![],
+                RelaySelectionType::None,
+            )],
+            &fragments,
+            &JsonMap::new(),
+            "$.selectionSet",
+            &serde_json::json!({}),
+            &HashSet::new(),
+        )
+        .expect("identical fragment fields do not conflict");
     }
 }

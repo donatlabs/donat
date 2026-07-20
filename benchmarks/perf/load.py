@@ -14,11 +14,15 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+PERF_TRACE_FIELD = re.compile(r'\b(backend|phase|elapsed_us)=((?:"[^"]*")|\S+)')
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -69,6 +73,47 @@ def git_revision() -> str | None:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return None
+
+
+def phase_trace_summary(filename: str | None) -> dict[str, dict[str, float | int]]:
+    """Summarize opt-in `donat::perf` trace lines without parsing log format."""
+    if not filename:
+        return {}
+    try:
+        lines = Path(filename).read_text(encoding="utf-8", errors="replace").splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return {}
+
+    samples: dict[str, list[float]] = {}
+    for line in lines:
+        if "donat::perf" not in line:
+            continue
+        fields = {
+            name: value.strip('"')
+            for name, value in PERF_TRACE_FIELD.findall(line)
+        }
+        phase = fields.get("phase")
+        elapsed_us = fields.get("elapsed_us")
+        if not phase or elapsed_us is None:
+            continue
+        try:
+            elapsed = float(elapsed_us)
+        except ValueError:
+            continue
+        backend = fields.get("backend")
+        key = f"{backend}.{phase}" if backend else phase
+        samples.setdefault(key, []).append(elapsed)
+
+    return {
+        phase: {
+            "count": len(values),
+            "mean_us": sum(values) / len(values),
+            "p50_us": percentile(values, 0.50),
+            "p95_us": percentile(values, 0.95),
+            "max_us": max(values),
+        }
+        for phase, values in samples.items()
+    }
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -184,6 +229,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "concurrency": args.concurrency,
             "duration_seconds": args.duration,
         },
+        "server_phase_trace": phase_trace_summary(getattr(args, "phase_log", None)),
         "result": {
             "requests": requests,
             "errors": errors,
@@ -210,7 +256,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "mean_response_bytes": response_bytes / requests if requests else None,
             "server_cpu_percent": cpu_percent,
             "server_max_rss_kib": max_rss_kib or None,
-            "server_max_established_connections": max_connections,
+            "server_max_established_http_connections": max_connections,
         },
     }
 
@@ -227,6 +273,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--pid", type=int)
     parser.add_argument("--server-port", type=int)
+    parser.add_argument("--phase-log")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     result = run(args)

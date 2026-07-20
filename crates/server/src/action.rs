@@ -11,6 +11,7 @@
 
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::BoxFuture;
+use futures_util::stream::StreamExt;
 use graphql_parser::query::{
     Definition, Document, Field, OperationDefinition, Selection, SelectionSet, Value as GqlValue,
 };
@@ -21,6 +22,8 @@ use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
 use crate::state::{Engine, EngineSnapshot, SharedState};
+
+const MAX_CONCURRENT_ACTION_RELATIONSHIP_GROUPS: usize = 4;
 
 fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
@@ -633,9 +636,29 @@ fn fill_relationships_with<'a, E: ActionRelationshipExecutor + ?Sized>(
             "$",
             &mut groups,
         );
-        for group in groups {
-            let values =
-                execute_action_relationship_group(executor, engine, session, &group).await?;
+        // Groups target independent relationship selections. Bound their
+        // internal reads to avoid serial latency without turning a wide action
+        // response into an unbounded burst. Results are reapplied in client
+        // order so an error keeps the sequential implementation's observable
+        // precedence.
+        let work = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| async move {
+                (
+                    index,
+                    execute_action_relationship_group(executor, engine, session, group).await,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut results = futures_util::stream::iter(work)
+            .buffer_unordered(MAX_CONCURRENT_ACTION_RELATIONSHIP_GROUPS)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_by_key(|(index, _)| *index);
+
+        for (group, (_, result)) in groups.iter().zip(results) {
+            let values = result?;
             for (entry, value) in group.entries.iter().zip(values) {
                 let Some(Json::Object(object)) = shaped.pointer_mut(&entry.object_pointer) else {
                     continue;
@@ -1269,6 +1292,122 @@ mod tests {
                 { "id": 7, "user": { "id": 7 } },
                 { "id": 8, "user": { "id": 8 } }
             ])
+        );
+    }
+
+    struct BarrierRelationshipExecutor {
+        barrier: Arc<tokio::sync::Barrier>,
+        calls: AtomicUsize,
+    }
+
+    impl ActionRelationshipExecutor for BarrierRelationshipExecutor {
+        fn execute<'a>(
+            &'a self,
+            _engine: &'a Engine,
+            _session: &'a Session,
+            _query: &'a str,
+            variables: &'a JsonMap<String, Json>,
+        ) -> BoxFuture<'a, Result<Json, Json>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.barrier.wait().await;
+                let mut data = JsonMap::new();
+                for (name, value) in variables {
+                    let Some(index) = name.strip_prefix("__donat_action_rel_w_") else {
+                        continue;
+                    };
+                    let id = value.pointer("/id/_eq").cloned().unwrap_or(Json::Null);
+                    data.insert(format!("__donat_action_rel_{index}"), json!([{ "id": id }]));
+                }
+                Ok(Json::Object(data))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_action_relationship_groups_run_concurrently() {
+        use std::collections::BTreeMap;
+
+        let mapping = BTreeMap::from([("id".into(), "id".into())]);
+        let custom_types = CustomTypes {
+            objects: vec![ObjectType {
+                name: "Out".into(),
+                fields: vec![CustomTypeField {
+                    name: "id".into(),
+                    type_: "Int!".into(),
+                    description: None,
+                }],
+                relationships: vec![
+                    CustomTypeRelationship {
+                        name: "user".into(),
+                        type_: "object".into(),
+                        remote_table: QualifiedTable::Name("user".into()),
+                        field_mapping: mapping.clone(),
+                    },
+                    CustomTypeRelationship {
+                        name: "account".into(),
+                        type_: "object".into(),
+                        remote_table: QualifiedTable::Name("account".into()),
+                        field_mapping: mapping,
+                    },
+                ],
+                description: None,
+            }],
+            ..Default::default()
+        };
+        let doc =
+            graphql_parser::parse_query::<String>("{ lookup { id user { id } account { id } } }")
+                .unwrap()
+                .into_static();
+        let selection = match &doc.definitions[0] {
+            Definition::Operation(OperationDefinition::SelectionSet(root)) => {
+                let Selection::Field(action) = &root.items[0] else {
+                    unreachable!()
+                };
+                action.selection_set.items.as_slice()
+            }
+            _ => unreachable!(),
+        };
+        let mut shaped = json!({ "id": 7, "user": null, "account": null });
+        let raw = shaped.clone();
+        let executor = BarrierRelationshipExecutor {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            calls: AtomicUsize::new(0),
+        };
+        let engine = Engine::bootstrap(
+            serde_json::from_value(json!({ "version": 3, "sources": [] })).unwrap(),
+        );
+        let session = Session {
+            role: "user".into(),
+            vars: Default::default(),
+            backend_request: false,
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fill_relationships_with(
+                &executor,
+                &engine,
+                &session,
+                &custom_types,
+                &parse_type("Out"),
+                &mut shaped,
+                &raw,
+                selection,
+            ),
+        )
+        .await
+        .expect("independent groups do not serialize")
+        .expect("relationship groups resolve");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            shaped,
+            json!({
+                "id": 7,
+                "user": { "id": 7 },
+                "account": { "id": 7 },
+            })
         );
     }
 

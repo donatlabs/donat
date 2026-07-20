@@ -36,6 +36,40 @@ fn checkout_mysql_connection(
     }
 }
 
+async fn run_mysql_blocking<T, F>(
+    pool: mysql::Pool,
+    permits: Arc<tokio::sync::Semaphore>,
+    timeout_seconds: Option<u64>,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(mysql::Pool) -> T + Send + 'static,
+{
+    let pool_started = std::time::Instant::now();
+    let acquire = permits.acquire_owned();
+    let permit = match timeout_seconds {
+        Some(seconds) => tokio::time::timeout(std::time::Duration::from_secs(seconds), acquire)
+            .await
+            .map_err(|_| "mysql pool wait timed out")?
+            .map_err(|_| "mysql pool closed")?,
+        None => acquire.await.map_err(|_| "mysql pool closed")?,
+    };
+    trace_perf_phase("mysql", "pool.wait", pool_started);
+    let database_started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        // Keep the admission permit with the blocking job: cancelling its
+        // async caller must not admit a replacement while checkout or the
+        // database call is still in progress.
+        let _permit = permit;
+        work(pool)
+    })
+    .await
+    .map_err(|error| format!("mysql task panicked: {error}"));
+    trace_perf_phase("mysql", "database.execute", database_started);
+    result
+}
+
 pub struct AppState {
     pub engine: RwLock<EngineSnapshot>,
     /// The fallback/default database (also the metadata database in
@@ -55,8 +89,13 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// DONAT_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
     pub allowlist_enabled: bool,
-    /// Process-wide admission control for polling subscription tasks.
+    /// Process-wide admission control for active subscription tasks.
     pub subscription_permits: Arc<tokio::sync::Semaphore>,
+    /// Process-wide admission control for individual subscription polls.
+    /// This is deliberately separate from the active-task limit: a long-lived
+    /// socket subscription must not reserve a database execution slot between
+    /// polls.
+    pub subscription_poll_permits: Arc<tokio::sync::Semaphore>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -119,6 +158,7 @@ pub enum SourceRuntime {
     Mysql {
         url: String,
         pool: mysql::Pool,
+        permits: Arc<tokio::sync::Semaphore>,
         settings: RuntimePoolSettings,
     },
     Clickhouse {
@@ -408,6 +448,7 @@ fn stage_mysql_runtime(
     if let Some(SourceRuntime::Mysql {
         url: existing_url,
         pool,
+        permits,
         settings: existing_settings,
     }) = existing
         && existing_url == url
@@ -416,6 +457,7 @@ fn stage_mysql_runtime(
         return Ok(SourceRuntime::Mysql {
             url: url.to_string(),
             pool: pool.clone(),
+            permits: permits.clone(),
             settings,
         });
     }
@@ -437,6 +479,7 @@ fn stage_mysql_runtime(
     Ok(SourceRuntime::Mysql {
         url: url.to_string(),
         pool: mysql::Pool::new(opts)?,
+        permits: Arc::new(tokio::sync::Semaphore::new(settings.max_connections)),
         settings,
     })
 }
@@ -651,7 +694,12 @@ impl AppState {
                 trace_perf_phase("sqlite", "response.decode", decode_started);
                 result
             }
-            SourceRuntime::Mysql { pool, settings, .. } => {
+            SourceRuntime::Mysql {
+                pool,
+                permits,
+                settings,
+                ..
+            } => {
                 use mysql::prelude::Queryable;
 
                 let sqlgen_started = std::time::Instant::now();
@@ -661,20 +709,26 @@ impl AppState {
                     AnyDialect::Mysql(MySqlDialect),
                 );
                 trace_perf_phase("mysql", "sql.generate", sqlgen_started);
-                let database_started = std::time::Instant::now();
-                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
-                    let mut conn = checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
-                        .map_err(|e| QueryError::Mysql(e.to_string()))?;
-                    let row: Option<String> = conn
-                        .query_first(&sql)
-                        .map_err(|e| QueryError::Mysql(e.to_string()))?;
-                    row.ok_or_else(|| QueryError::Mysql("mysql returned no rows".to_string()))
-                })
+                let text = run_mysql_blocking(
+                    pool,
+                    permits,
+                    settings.pool_timeout_seconds,
+                    move |pool| -> Result<String, QueryError> {
+                        let mut conn =
+                            checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
+                                .map_err(|e| QueryError::Mysql(e.to_string()))?;
+                        let row: Option<String> = conn
+                            .query_first(&sql)
+                            .map_err(|e| QueryError::Mysql(e.to_string()))?;
+                        row.ok_or_else(|| QueryError::Mysql("mysql returned no rows".to_string()))
+                    },
+                )
                 .await
-                .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
+                .map_err(QueryError::Pool)??;
+                let decode_started = std::time::Instant::now();
                 let result =
                     serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()));
-                trace_perf_phase("mysql", "database.pool_execute_decode", database_started);
+                trace_perf_phase("mysql", "response.decode", decode_started);
                 result
             }
             SourceRuntime::Clickhouse { url } => {
@@ -844,6 +898,7 @@ impl AppState {
         &self,
         primary_keys: HashMap<String, Vec<String>>,
         pool: mysql::Pool,
+        permits: Arc<tokio::sync::Semaphore>,
         settings: RuntimePoolSettings,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
@@ -880,155 +935,160 @@ impl AppState {
             })
             .collect();
 
-        tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
-            let mut conn = checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-            let mut tx = conn
-                .start_transaction(mysql::TxOpts::default())
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+        run_mysql_blocking(
+            pool,
+            permits,
+            settings.pool_timeout_seconds,
+            move |pool| -> Result<Json, MysqlMutationError> {
+                let mut conn = checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                let mut tx = conn
+                    .start_transaction(mysql::TxOpts::default())
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
 
-            let mut data = serde_json::Map::new();
-            for (alias, plan) in &planned {
-                // A `__typename`-only mutation root has no DML.
-                if let Some((_, value)) = &plan.root_typename {
-                    data.insert(alias.clone(), Json::String(value.clone()));
-                    continue;
-                }
+                let mut data = serde_json::Map::new();
+                for (alias, plan) in &planned {
+                    // A `__typename`-only mutation root has no DML.
+                    if let Some((_, value)) = &plan.root_typename {
+                        data.insert(alias.clone(), Json::String(value.clone()));
+                        continue;
+                    }
 
-                // Build the companion-SELECT WHERE + ordering of DML vs SELECT
-                // from the recovery strategy.
-                let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
-                    MySqlMutationKind::Insert {
-                        pk_col,
-                        pk_in_predicate,
-                    } => {
-                        // INSERT first, then recover the new rows.
-                        tx.query_drop(&plan.dml_sql)
-                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        let affected = tx.affected_rows() as i64;
-                        let where_clause = match pk_in_predicate {
-                            // Supplied PK: restrict by the exact values.
-                            Some(pred) => pred.clone(),
-                            None => {
-                                // last_insert_id() recovery: requires a single
-                                // AUTO_INCREMENT PK. The N rows occupy
-                                // [last_id, last_id + affected - 1].
-                                let col = pk_col.as_ref().ok_or_else(|| {
-                                    MysqlMutationError::Other(
-                                        "mysql insert returning needs a single \
+                    // Build the companion-SELECT WHERE + ordering of DML vs SELECT
+                    // from the recovery strategy.
+                    let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
+                        MySqlMutationKind::Insert {
+                            pk_col,
+                            pk_in_predicate,
+                        } => {
+                            // INSERT first, then recover the new rows.
+                            tx.query_drop(&plan.dml_sql)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let affected = tx.affected_rows() as i64;
+                            let where_clause = match pk_in_predicate {
+                                // Supplied PK: restrict by the exact values.
+                                Some(pred) => pred.clone(),
+                                None => {
+                                    // last_insert_id() recovery: requires a single
+                                    // AUTO_INCREMENT PK. The N rows occupy
+                                    // [last_id, last_id + affected - 1].
+                                    let col = pk_col.as_ref().ok_or_else(|| {
+                                        MysqlMutationError::Other(
+                                            "mysql insert returning needs a single \
                                          auto-increment primary key or supplied pk values"
-                                            .to_string(),
-                                    )
-                                })?;
-                                let last = tx.last_insert_id().unwrap_or(0) as i64;
-                                if affected <= 0 {
-                                    // Nothing inserted: an always-false restriction.
-                                    format!("{col} IS NULL AND {col} IS NOT NULL")
-                                } else {
-                                    let hi = last + affected - 1;
-                                    format!("{col} BETWEEN {last} AND {hi}")
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    let last = tx.last_insert_id().unwrap_or(0) as i64;
+                                    if affected <= 0 {
+                                        // Nothing inserted: an always-false restriction.
+                                        format!("{col} IS NULL AND {col} IS NOT NULL")
+                                    } else {
+                                        let hi = last + affected - 1;
+                                        format!("{col} BETWEEN {last} AND {hi}")
+                                    }
                                 }
+                            };
+                            (
+                                Some(format!("{} WHERE {where_clause}", plan.companion_select)),
+                                affected,
+                            )
+                        }
+                        MySqlMutationKind::Update { where_clause } => {
+                            // UPDATE first, then re-select by the same predicate.
+                            tx.query_drop(&plan.dml_sql)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let affected = tx.affected_rows() as i64;
+                            let sql = match where_clause {
+                                Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                                None => plan.companion_select.clone(),
+                            };
+                            (Some(sql), affected)
+                        }
+                        MySqlMutationKind::Delete { where_clause } => {
+                            // SELECT first (capture returning), then DELETE.
+                            let sql = match where_clause {
+                                Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                                None => plan.companion_select.clone(),
+                            };
+                            (Some(sql), 0) // affected filled after the DELETE below.
+                        }
+                        MySqlMutationKind::Typename => (None, 0),
+                    };
+
+                    // Run the companion SELECT, folding node rows + violated flags.
+                    let mut returning: Vec<Json> = vec![];
+                    let mut violated = false;
+                    let mut captured_rows: i64 = 0;
+                    if let Some(sql) = &companion_sql {
+                        let rows = tx
+                            .query_iter(sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        for row in rows {
+                            let row = row.map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let (node_text, flag): (String, i64) = mysql::from_row_opt(row)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            captured_rows += 1;
+                            if flag != 0 {
+                                violated = true;
                             }
-                        };
-                        (
-                            Some(format!("{} WHERE {where_clause}", plan.companion_select)),
-                            affected,
-                        )
+                            let node: Json = serde_json::from_str(&node_text)
+                                .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
+                            returning.push(node);
+                        }
                     }
-                    MySqlMutationKind::Update { where_clause } => {
-                        // UPDATE first, then re-select by the same predicate.
+
+                    // For delete, the DML runs AFTER the capturing SELECT.
+                    let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
                         tx.query_drop(&plan.dml_sql)
                             .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        let affected = tx.affected_rows() as i64;
-                        let sql = match where_clause {
-                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
-                            None => plan.companion_select.clone(),
-                        };
-                        (Some(sql), affected)
+                        tx.affected_rows() as i64
+                    } else {
+                        affected_rows
+                    };
+                    let _ = captured_rows;
+
+                    if violated {
+                        let _ = tx.rollback();
+                        return Err(MysqlMutationError::CheckViolation {
+                            path: plan.check_path.clone(),
+                        });
                     }
-                    MySqlMutationKind::Delete { where_clause } => {
-                        // SELECT first (capture returning), then DELETE.
-                        let sql = match where_clause {
-                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
-                            None => plan.companion_select.clone(),
-                        };
-                        (Some(sql), 0) // affected filled after the DELETE below.
+
+                    if plan.single_row_output {
+                        data.insert(
+                            alias.clone(),
+                            returning.into_iter().next().unwrap_or(Json::Null),
+                        );
+                        continue;
                     }
-                    MySqlMutationKind::Typename => (None, 0),
-                };
 
-                // Run the companion SELECT, folding node rows + violated flags.
-                let mut returning: Vec<Json> = vec![];
-                let mut violated = false;
-                let mut captured_rows: i64 = 0;
-                if let Some(sql) = &companion_sql {
-                    let rows = tx
-                        .query_iter(sql)
-                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                    for row in rows {
-                        let row = row.map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        let (node_text, flag): (String, i64) = mysql::from_row_opt(row)
-                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        captured_rows += 1;
-                        if flag != 0 {
-                            violated = true;
-                        }
-                        let node: Json = serde_json::from_str(&node_text)
-                            .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
-                        returning.push(node);
-                    }
-                }
-
-                // For delete, the DML runs AFTER the capturing SELECT.
-                let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
-                    tx.query_drop(&plan.dml_sql)
-                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                    tx.affected_rows() as i64
-                } else {
-                    affected_rows
-                };
-                let _ = captured_rows;
-
-                if violated {
-                    let _ = tx.rollback();
-                    return Err(MysqlMutationError::CheckViolation {
-                        path: plan.check_path.clone(),
-                    });
-                }
-
-                if plan.single_row_output {
-                    data.insert(
-                        alias.clone(),
-                        returning.into_iter().next().unwrap_or(Json::Null),
-                    );
-                    continue;
-                }
-
-                // Assemble this root's response object in GraphQL selection order.
-                let mut obj = serde_json::Map::new();
-                let returning_value = Json::Array(returning);
-                for slot in &plan.response_slots {
-                    match slot {
-                        MutationResponseSlot::Returning { alias } => {
-                            obj.insert(alias.clone(), returning_value.clone());
-                        }
-                        MutationResponseSlot::AffectedRows { alias } => {
-                            obj.insert(alias.clone(), Json::from(affected_rows));
-                        }
-                        MutationResponseSlot::Typename { alias, value } => {
-                            obj.insert(alias.clone(), Json::String(value.clone()));
+                    // Assemble this root's response object in GraphQL selection order.
+                    let mut obj = serde_json::Map::new();
+                    let returning_value = Json::Array(returning);
+                    for slot in &plan.response_slots {
+                        match slot {
+                            MutationResponseSlot::Returning { alias } => {
+                                obj.insert(alias.clone(), returning_value.clone());
+                            }
+                            MutationResponseSlot::AffectedRows { alias } => {
+                                obj.insert(alias.clone(), Json::from(affected_rows));
+                            }
+                            MutationResponseSlot::Typename { alias, value } => {
+                                obj.insert(alias.clone(), Json::String(value.clone()));
+                            }
                         }
                     }
+                    data.insert(alias.clone(), Json::Object(obj));
                 }
-                data.insert(alias.clone(), Json::Object(obj));
-            }
 
-            tx.commit()
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-            Ok(Json::Object(data))
-        })
+                tx.commit()
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                Ok(Json::Object(data))
+            },
+        )
         .await
-        .map_err(|e| MysqlMutationError::Other(format!("mysql task panicked: {e}")))?
+        .map_err(MysqlMutationError::Other)?
     }
 
     /// Reconcile pools and catalogs with the current metadata sources,
@@ -1085,14 +1145,19 @@ impl AppState {
                         unreachable!("SQLite staging returned a non-SQLite runtime")
                     };
                     let pool = pool.clone();
-                    let catalog =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<Catalog> {
-                            let connection = pool.take()?;
-                            let result = donat_catalog::sqlite_introspect(&connection);
-                            pool.put(connection);
-                            Ok(result?)
-                        })
-                        .await??;
+                    let catalog = pool
+                        .clone()
+                        .run_blocking(
+                            pool_settings.pool_timeout_seconds,
+                            move |pool| -> anyhow::Result<Catalog> {
+                                let connection = pool.take()?;
+                                let result = donat_catalog::sqlite_introspect(&connection);
+                                pool.put(connection);
+                                Ok(result?)
+                            },
+                        )
+                        .await
+                        .map_err(anyhow::Error::msg)??;
                     (catalog, runtime)
                 }
                 SourceKind::Mysql => {
@@ -1101,12 +1166,17 @@ impl AppState {
                     let conn_url = url.clone();
                     let runtime =
                         stage_mysql_runtime(url, *pool_settings, existing_runtimes.get(name))?;
-                    let SourceRuntime::Mysql { pool, .. } = &runtime else {
+                    let SourceRuntime::Mysql { pool, permits, .. } = &runtime else {
                         unreachable!("MySQL staging returned a non-MySQL runtime")
                     };
                     let pool = pool.clone();
-                    let catalog =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<Catalog> {
+                    let permits = permits.clone();
+                    let pool_timeout_seconds = pool_settings.pool_timeout_seconds;
+                    let catalog = run_mysql_blocking(
+                        pool,
+                        permits,
+                        pool_timeout_seconds,
+                        move |pool| -> anyhow::Result<Catalog> {
                             let opts = mysql::Opts::from_url(&conn_url)?;
                             let db =
                                 opts.get_db_name().map(|s| s.to_string()).ok_or_else(|| {
@@ -1114,10 +1184,12 @@ impl AppState {
                                         "mysql source url has no database name: {conn_url}"
                                     )
                                 })?;
-                            let mut conn = pool.get_conn()?;
+                            let mut conn = checkout_mysql_connection(&pool, pool_timeout_seconds)?;
                             Ok(donat_catalog::mysql_introspect(conn.as_mut(), &db)?)
-                        })
-                        .await??;
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)??;
                     (catalog, runtime)
                 }
                 SourceKind::Clickhouse => {
@@ -1285,7 +1357,7 @@ mod snapshot_tests {
 
     use super::{
         AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, compile_allowed_queries,
-        runtime_pool_settings, stage_mysql_runtime, stage_postgres_runtime,
+        run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime, stage_postgres_runtime,
     };
 
     fn candidate(
@@ -1365,6 +1437,7 @@ mod snapshot_tests {
             http: reqwest::Client::new(),
             allowlist_enabled: false,
             subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+            subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
         }
     }
 
@@ -1486,6 +1559,52 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn mysql_runtime_reuses_admission_permits_only_for_same_settings() {
+        let first =
+            stage_mysql_runtime("mysql://unused/item", RuntimePoolSettings::default(), None)
+                .expect("first runtime stages");
+        let same = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings::default(),
+            Some(&first),
+        )
+        .expect("same runtime stages");
+        let changed = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings {
+                max_connections: 2,
+                pool_timeout_seconds: None,
+            },
+            Some(&same),
+        )
+        .expect("changed runtime stages");
+
+        let SourceRuntime::Mysql {
+            permits: first_permits,
+            ..
+        } = &first
+        else {
+            panic!("mysql runtime expected");
+        };
+        let SourceRuntime::Mysql {
+            permits: same_permits,
+            ..
+        } = &same
+        else {
+            panic!("mysql runtime expected");
+        };
+        let SourceRuntime::Mysql {
+            permits: changed_permits,
+            ..
+        } = &changed
+        else {
+            panic!("mysql runtime expected");
+        };
+        assert!(Arc::ptr_eq(first_permits, same_permits));
+        assert!(!Arc::ptr_eq(same_permits, changed_permits));
+    }
+
+    #[test]
     fn pool_settings_control_capacity_and_runtime_reuse() {
         let source: donat_metadata::Source = serde_json::from_value(json!({
             "name": "default",
@@ -1570,6 +1689,51 @@ mod snapshot_tests {
             .await
             .expect("permit becomes available after blocking job finishes")
             .expect("sqlite pool remains open");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn mysql_pool_keeps_permit_until_cancelled_blocking_job_finishes() {
+        let runtime = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings {
+                max_connections: 1,
+                pool_timeout_seconds: None,
+            },
+            None,
+        )
+        .expect("lazy mysql runtime constructs");
+        let SourceRuntime::Mysql { pool, permits, .. } = runtime else {
+            panic!("mysql runtime expected");
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(run_mysql_blocking(pool, permits.clone(), None, move |_| {
+            let _ = started_tx.send(());
+            release_rx.recv().expect("test releases blocking job");
+        }));
+        started_rx.await.expect("blocking job started");
+        task.abort();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                permits.clone().acquire_owned(),
+            )
+            .await
+            .is_err(),
+            "cancelling the async caller must not release the blocking job's permit"
+        );
+
+        release_tx.send(()).expect("release blocking job");
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            permits.clone().acquire_owned(),
+        )
+        .await
+        .expect("permit becomes available after blocking job finishes")
+        .expect("mysql pool remains open");
         drop(permit);
     }
 

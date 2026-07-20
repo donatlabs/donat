@@ -3,6 +3,7 @@ import importlib.util
 import threading
 import time
 import unittest
+from tempfile import TemporaryDirectory
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -109,6 +110,20 @@ class LoadHarnessTests(unittest.TestCase):
         self.assertGreaterEqual(result["requests"], 1)
         self.assertEqual(result["errors"], result["requests"])
         self.assertIsNone(result["successful_latency_ms"]["p99"])
+
+    def test_phase_trace_summary_is_embedded_in_artifact(self) -> None:
+        with TemporaryDirectory() as directory:
+            trace = Path(directory) / "server.log"
+            trace.write_text(
+                'TRACE donat::perf: request phase backend="sqlite" phase="pool.wait" elapsed_us=7\n'
+                'TRACE donat::perf: request phase backend="sqlite" phase="pool.wait" elapsed_us=13\n',
+                encoding="utf-8",
+            )
+            summary = LOAD.phase_trace_summary(str(trace))
+
+        self.assertEqual(summary["sqlite.pool.wait"]["count"], 2)
+        self.assertEqual(summary["sqlite.pool.wait"]["p50_us"], 7.0)
+        self.assertEqual(summary["sqlite.pool.wait"]["p95_us"], 13.0)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -21,9 +22,24 @@ use crate::state::SharedState;
 
 type Sender = Arc<Mutex<SplitSink<WebSocket, Message>>>;
 const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100;
+const SUBSCRIPTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+static NEXT_SUBSCRIPTION_POLL_PHASE: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveSubscription {
     handle: tokio::task::JoinHandle<()>,
+}
+
+fn subscription_poll_phase(sequence: u64) -> std::time::Duration {
+    // The multiplier is coprime with 1,000, so consecutive subscriptions are
+    // distributed over the entire one-second polling interval rather than
+    // waking in a synchronized burst.
+    std::time::Duration::from_millis(sequence.wrapping_mul(618_033) % 1_000)
+}
+
+async fn acquire_subscription_poll_permit(
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    permits.acquire_owned().await.ok()
 }
 
 pub async fn upgrade(State(state): State<SharedState>, ws: WebSocketUpgrade) -> Response {
@@ -172,6 +188,10 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                         }
                     };
                     let state = state.clone();
+                    let poll_permits = state.subscription_poll_permits.clone();
+                    let initial_poll_delay = subscription_poll_phase(
+                        NEXT_SUBSCRIPTION_POLL_PHASE.fetch_add(1, Ordering::Relaxed),
+                    );
                     let sender_task = sender.clone();
                     let id_task = id.clone();
                     let handle = tokio::spawn(async move {
@@ -179,7 +199,16 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                         // it is released immediately on normal exit or abort.
                         let _permit = permit;
                         let mut last: Option<Json> = None;
+                        tokio::time::sleep(initial_poll_delay).await;
                         loop {
+                            // Only an individual poll holds this permit. A
+                            // long-lived subscription therefore cannot occupy
+                            // a backend execution slot while it sleeps.
+                            let Some(poll_permit) =
+                                acquire_subscription_poll_permit(poll_permits.clone()).await
+                            else {
+                                break;
+                            };
                             let response = gql::execute_preparsed_full(
                                 &state,
                                 &session,
@@ -190,6 +219,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                             )
                             .await
                             .1;
+                            drop(poll_permit);
                             if last.as_ref() != Some(&response) {
                                 last = Some(response.clone());
                                 if send(
@@ -202,7 +232,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                                     break;
                                 }
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            tokio::time::sleep(SUBSCRIPTION_POLL_INTERVAL).await;
                         }
                     });
                     subscriptions.insert(id_key, ActiveSubscription { handle });
@@ -325,5 +355,37 @@ mod tests {
         assert!(!is_subscription(&json!({})));
         assert!(!is_subscription(&json!({ "query": 5 })));
         assert!(!is_subscription(&json!({ "query": "not graphql {" })));
+    }
+
+    #[test]
+    fn subscription_poll_phases_cover_the_polling_interval() {
+        let mut phases: Vec<_> = (0..1_000)
+            .map(subscription_poll_phase)
+            .map(|phase| phase.as_millis())
+            .collect();
+        phases.sort_unstable();
+        phases.dedup();
+        assert_eq!(phases.len(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn subscription_poll_permit_bounds_only_poll_execution() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = acquire_subscription_poll_permit(permits.clone())
+            .await
+            .expect("first poll acquires the permit");
+        let waiter = tokio::spawn(acquire_subscription_poll_permit(permits.clone()));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+                .await
+                .is_err(),
+            "another poll must wait without consuming an active subscription slot"
+        );
+        drop(held);
+        let permit = acquire_subscription_poll_permit(permits)
+            .await
+            .expect("next poll acquires after execution finishes");
+        drop(permit);
     }
 }

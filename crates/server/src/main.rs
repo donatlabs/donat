@@ -302,6 +302,13 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1_000),
         )),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(
+            std::env::var("DONAT_GRAPHQL_MAX_CONCURRENT_SUBSCRIPTION_POLLS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(16),
+        )),
     });
 
     // The database may still be starting; retry the first sync.

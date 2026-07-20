@@ -120,6 +120,7 @@ fn state(fixtures: &SqliteFixtures) -> Arc<AppState> {
         http: reqwest::Client::new(),
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     })
 }
 
@@ -489,6 +490,7 @@ async fn secondary_mysql_mutation_never_falls_back_to_default_source() {
         http: reqwest::Client::new(),
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     });
     state
         .sync_sources()

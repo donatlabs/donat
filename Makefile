@@ -1,5 +1,5 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
-	backend-runtime conformance-matrix perf run claude codex
+	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex
 
 build:
 	cargo build
@@ -79,6 +79,17 @@ conformance-matrix:
 # PERF_DATABASE_URL + PERF_METADATA_DIR.
 perf:
 	BACKEND="$${BACKEND:-sqlite}" benchmarks/perf/run.sh
+
+# Local-only backend comparison. External backends use
+# PERF_<BACKEND>_DATABASE_URL and PERF_<BACKEND>_METADATA_DIR so a matrix
+# cannot accidentally combine a URL with metadata for another backend.
+perf-matrix:
+	benchmarks/perf/matrix.sh
+
+# Local-only mixed-source workload. Its metadata and query must describe the
+# participating sources explicitly; this target never assumes a topology.
+perf-mixed:
+	benchmarks/perf/mixed.sh
 
 run:
 	cargo run --bin donat -- --metadata-dir crates/metadata/tests/fixtures/metadata
