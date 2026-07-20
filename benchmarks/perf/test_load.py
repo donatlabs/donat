@@ -1,5 +1,7 @@
 import argparse
 import importlib.util
+import os
+import subprocess
 import threading
 import time
 import unittest
@@ -124,6 +126,30 @@ class LoadHarnessTests(unittest.TestCase):
         self.assertEqual(summary["sqlite.pool.wait"]["count"], 2)
         self.assertEqual(summary["sqlite.pool.wait"]["p50_us"], 7.0)
         self.assertEqual(summary["sqlite.pool.wait"]["p95_us"], 13.0)
+
+    def test_matrix_rejects_generic_external_backend_configuration(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PERF_MATRIX_BACKENDS": "mysql",
+                "PERF_DATABASE_URL": "mysql://wrong-source",
+                "PERF_METADATA_DIR": "/tmp/wrong-metadata",
+            }
+        )
+        environment.pop("PERF_MYSQL_DATABASE_URL", None)
+        environment.pop("PERF_MYSQL_METADATA_DIR", None)
+
+        result = subprocess.run(
+            ["bash", str(Path(__file__).with_name("matrix.sh"))],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("PERF_MYSQL_DATABASE_URL", result.stderr)
 
 
 if __name__ == "__main__":

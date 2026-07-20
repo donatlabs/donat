@@ -937,11 +937,10 @@ fn validate_selection_conflicts(
     // validation; retain `fields` below because every nested selection still
     // participates in recursive validation.
     let mut conflict_fields: Vec<&ScopedField> = vec![];
+    let mut conflict_identities = HashSet::new();
     for field in &fields {
-        if !conflict_fields
-            .iter()
-            .any(|existing| same_conflict_identity(existing, field))
-        {
+        let identity = scoped_field_conflict_identity(field);
+        if conflict_identities.insert(identity) {
             conflict_fields.push(field);
         }
     }
@@ -1038,12 +1037,28 @@ fn validate_selection_conflicts(
     Ok(())
 }
 
-fn same_conflict_identity(left: &ScopedField, right: &ScopedField) -> bool {
-    left.conditions == right.conditions
-        && left.relay_selection == right.relay_selection
-        && left.field.name == right.field.name
-        && left.field.alias == right.field.alias
-        && arguments_match(&left.field, &right.field)
+fn scoped_field_conflict_identity(field: &ScopedField) -> String {
+    // `arguments_match` normalizes argument ordering with a BTreeMap. Encode
+    // that same normalized structure as the index key so the fast path is
+    // semantically identical to pairwise comparison, including nested input
+    // values. `Debug` for graphql-parser values is structural, and the string
+    // is an owned set key rather than a lossy hash.
+    let arguments = field
+        .field
+        .arguments
+        .iter()
+        .map(|(name, value)| (name, value))
+        .collect::<BTreeMap<_, _>>();
+    let relay = match field.relay_selection {
+        RelaySelectionType::None => 0,
+        RelaySelectionType::Connection => 1,
+        RelaySelectionType::Edge => 2,
+        RelaySelectionType::Node => 3,
+    };
+    format!(
+        "{:?}|{:?}|{:?}|{relay}|{arguments:?}",
+        field.conditions, field.field.name, field.field.alias,
+    )
 }
 
 fn scoped_response_shapes_match(
@@ -1420,5 +1435,34 @@ mod performance_tests {
             &HashSet::new(),
         )
         .expect("identical fragment fields do not conflict");
+    }
+
+    #[test]
+    fn wide_unique_nested_selection_avoids_identity_scans() {
+        let query = format!(
+            "query {{ item {{ {} }} }}",
+            (0..10_000)
+                .map(|index| format!("a{index}: id"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let document = graphql_parser::parse_query::<String>(&query)
+            .expect("wide nested query parses")
+            .into_static();
+        let (operation, fragments) = select_operation(&document, None).expect("operation found");
+
+        validate_selection_conflicts(
+            vec![(
+                operation_selection_set(operation).clone(),
+                vec![],
+                RelaySelectionType::None,
+            )],
+            &fragments,
+            &JsonMap::new(),
+            "$.selectionSet",
+            &serde_json::json!({}),
+            &HashSet::new(),
+        )
+        .expect("unique nested aliases do not conflict");
     }
 }
