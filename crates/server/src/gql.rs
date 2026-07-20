@@ -1510,7 +1510,65 @@ fn strip_remote_join_hidden_fields(fields: &[donat_ir::OutputField], node: &mut 
                             strip_remote_join_hidden_fields(&query.fields, child);
                         }
                     }
+                    donat_ir::FieldValue::Nodes { fields } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_fields(fields, child);
+                        }
+                    }
+                    donat_ir::FieldValue::NestedConnection { conn } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_connection(conn, child);
+                        }
+                    }
                     _ => {}
+                }
+            }
+            map.retain(|key, _| !key.starts_with("__rr__"));
+        }
+        _ => {}
+    }
+}
+
+fn strip_remote_join_hidden_connection(conn: &donat_ir::Connection, node: &mut Json) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden_connection(conn, item);
+            }
+        }
+        Json::Object(map) => {
+            for field in &conn.fields {
+                let donat_ir::ConnectionField::Edges { alias, fields } = field else {
+                    continue;
+                };
+                if let Some(edges) = map.get_mut(alias) {
+                    strip_remote_join_hidden_edges(&conn.query.fields, fields, edges);
+                }
+            }
+            map.retain(|key, _| !key.starts_with("__rr__"));
+        }
+        _ => {}
+    }
+}
+
+fn strip_remote_join_hidden_edges(
+    node_fields: &[donat_ir::OutputField],
+    edge_fields: &[donat_ir::EdgeField],
+    node: &mut Json,
+) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden_edges(node_fields, edge_fields, item);
+            }
+        }
+        Json::Object(map) => {
+            for field in edge_fields {
+                let donat_ir::EdgeField::Node { alias } = field else {
+                    continue;
+                };
+                if let Some(child) = map.get_mut(alias) {
+                    strip_remote_join_hidden_fields(node_fields, child);
                 }
             }
             map.retain(|key, _| !key.starts_with("__rr__"));
@@ -1874,6 +1932,128 @@ mod tests {
             node,
             json!({
                 "payload": { "__rr__user_key": "preserve" }
+            })
+        );
+    }
+
+    #[test]
+    fn remote_join_cleanup_traverses_aggregate_nodes() {
+        use donat_ir::{FieldValue, OutputField};
+
+        let fields = vec![OutputField {
+            alias: "nodes".to_string(),
+            value: FieldValue::Nodes {
+                fields: vec![
+                    OutputField {
+                        alias: "__rr__id".to_string(),
+                        value: FieldValue::Column {
+                            column: "id".to_string(),
+                            pg_type: "int4".to_string(),
+                        },
+                    },
+                    OutputField {
+                        alias: "payload".to_string(),
+                        value: FieldValue::Column {
+                            column: "payload".to_string(),
+                            pg_type: "jsonb".to_string(),
+                        },
+                    },
+                ],
+            },
+        }];
+        let mut node = json!({
+            "nodes": [{
+                "__rr__id": 7,
+                "payload": { "__rr__user_key": "preserve" }
+            }]
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "nodes": [{ "payload": { "__rr__user_key": "preserve" } }]
+            })
+        );
+    }
+
+    #[test]
+    fn remote_join_cleanup_traverses_relay_connection_nodes() {
+        use donat_ir::{
+            Connection, ConnectionField, EdgeField, FieldValue, FromSource, OutputField,
+            SelectQuery, Table,
+        };
+
+        let node_fields = vec![
+            OutputField {
+                alias: "__rr__id".to_string(),
+                value: FieldValue::Column {
+                    column: "id".to_string(),
+                    pg_type: "int4".to_string(),
+                },
+            },
+            OutputField {
+                alias: "payload".to_string(),
+                value: FieldValue::Column {
+                    column: "payload".to_string(),
+                    pg_type: "jsonb".to_string(),
+                },
+            },
+        ];
+        let fields = vec![OutputField {
+            alias: "messages".to_string(),
+            value: FieldValue::NestedConnection {
+                conn: Box::new(Connection {
+                    query: SelectQuery {
+                        from: FromSource::Table(Table {
+                            schema: "public".to_string(),
+                            name: "message".to_string(),
+                        }),
+                        fields: node_fields,
+                        predicate: None,
+                        order_by: vec![],
+                        limit: None,
+                        nodes_limit: None,
+                        offset: None,
+                        distinct_on: vec![],
+                        single: false,
+                    },
+                    join: vec![],
+                    pk: vec![],
+                    schema: "public".to_string(),
+                    table: "message".to_string(),
+                    fields: vec![ConnectionField::Edges {
+                        alias: "edges".to_string(),
+                        fields: vec![EdgeField::Node {
+                            alias: "node".to_string(),
+                        }],
+                    }],
+                    page: None,
+                }),
+            },
+        }];
+        let mut node = json!({
+            "messages": {
+                "edges": [{
+                    "node": {
+                        "__rr__id": 7,
+                        "payload": { "__rr__user_key": "preserve" }
+                    }
+                }]
+            }
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "messages": {
+                    "edges": [{
+                        "node": { "payload": { "__rr__user_key": "preserve" } }
+                    }]
+                }
             })
         );
     }
