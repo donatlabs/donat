@@ -2532,6 +2532,260 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_level_remote_join_roots_share_permits_and_preserve_plan_order() {
+        use std::collections::BTreeMap;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        use axum::extract::State;
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+        use donat_metadata::Metadata;
+
+        const ROOTS: [(&str, &str, &str); 5] = [
+            ("zeta", "remote_zeta", "zetaRemote"),
+            ("alpha", "remote_alpha", "alphaRemote"),
+            ("gamma", "remote_gamma", "gammaRemote"),
+            ("beta", "remote_beta", "betaRemote"),
+            ("delta", "remote_delta", "deltaRemote"),
+        ];
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let fail_roots = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State((active, maximum, fail_roots)): State<(
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                        Arc<std::sync::atomic::AtomicBool>,
+                    )>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        let (label, root) = ROOTS
+                            .iter()
+                            .find(|(_, _, root)| query.contains(*root))
+                            .map(|(label, _, root)| (*label, *root))
+                            .expect("remote join query identifies its root");
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        let failing = fail_roots.load(Ordering::SeqCst);
+                        let delay = if failing && label == "zeta" {
+                            Duration::from_millis(40)
+                        } else if failing && label == "alpha" {
+                            Duration::from_millis(5)
+                        } else {
+                            Duration::from_millis(20)
+                        };
+                        tokio::time::sleep(delay).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+
+                        if failing && matches!(label, "zeta" | "alpha") {
+                            return axum::Json(json!({
+                                "errors": [{ "message": format!("{label} remote failure") }]
+                            }));
+                        }
+                        let mut data = JsonMap::new();
+                        data.insert(root.to_string(), json!({ "name": label }));
+                        axum::Json(json!({ "data": data }))
+                    },
+                ),
+            )
+            .with_state((active, maximum.clone(), fail_roots.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let database_path = std::env::temp_dir().join(format!(
+            "donat-gql-remote-roots-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open test sqlite");
+            for (_, table, _) in ROOTS {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TABLE {table} (id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES (1);"
+                    ))
+                    .expect("seed test table");
+            }
+        }
+        let database_path = database_path.to_string_lossy().into_owned();
+        let tables = ROOTS
+            .iter()
+            .map(|(root, table, remote_root)| {
+                let remote_field = Json::Object(JsonMap::from_iter([(
+                    remote_root.to_string(),
+                    json!({ "arguments": { "id": "$id" } }),
+                )]));
+                json!({
+                    "table": { "schema": "main", "name": table },
+                    "configuration": { "custom_name": root },
+                    "remote_relationships": [{
+                        "name": "joined",
+                        "donat_fields": ["id"],
+                        "remote_schema": "messages",
+                        "remote_field": remote_field,
+                    }],
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let remote_fields = ROOTS
+            .iter()
+            .map(|(_, _, remote_root)| format!("{remote_root}(id: Int!): Message"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": database_path }
+                },
+                "tables": tables,
+            }],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": format!("type Query {{ {remote_fields} }} type Message {{ name: String }}")
+                    }
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: ROOTS
+                .iter()
+                .map(|(_, table, _)| {
+                    (
+                        format!("main.{table}"),
+                        TableInfo {
+                            schema: "main".to_string(),
+                            name: table.to_string(),
+                            columns: vec![ColumnInfo {
+                                name: "id".to_string(),
+                                pg_type: "int4".to_string(),
+                                native_type: None,
+                                nullable: false,
+                                has_default: false,
+                            }],
+                            primary_key: vec!["id".to_string()],
+                            foreign_keys: vec![],
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            functions: BTreeMap::new(),
+        };
+        let runtime = SourceRuntime::Sqlite {
+            path: database_path.clone(),
+            pool: Arc::new(crate::state::SqlitePool::new(database_path.clone(), 8)),
+            settings: crate::state::RuntimePoolSettings::default(),
+        };
+        let engine = Arc::new(
+            Engine::compiled(
+                metadata,
+                HashMap::from([("default".to_string(), catalog)]),
+                HashMap::from([("default".to_string(), runtime)]),
+                true,
+            )
+            .expect("engine compiles"),
+        );
+        let state = shared_state(engine);
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let query = format!(
+            "{{ {} }}",
+            ROOTS
+                .iter()
+                .map(|(root, _, _)| format!("{root} {{ id joined {{ name }} }}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let document = parse(&query);
+
+        let (status, response) = execute_preparsed_full(
+            &state,
+            &session,
+            &json!({ "query": query }),
+            false,
+            &HeaderMap::new(),
+            &document,
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let keys = response
+            .pointer("/data")
+            .and_then(Json::as_object)
+            .unwrap_or_else(|| panic!("successful response has data: {response}"))
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            ROOTS
+                .iter()
+                .map(|(root, _, _)| root.to_string())
+                .collect::<Vec<_>>(),
+            "source response is reassembled in GraphQL plan order"
+        );
+        for (root, _, _) in ROOTS {
+            assert_eq!(
+                response.pointer(&format!("/data/{root}/0/joined/name")),
+                Some(&Json::String(root.to_string()))
+            );
+        }
+        assert!(
+            maximum.load(Ordering::SeqCst) >= 2,
+            "independent top-level remote joins begin concurrently"
+        );
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+            "one semaphore limits batches across all top-level roots"
+        );
+
+        fail_roots.store(true, Ordering::SeqCst);
+        let (_, failure) = execute_preparsed_full(
+            &state,
+            &session,
+            &json!({ "query": query }),
+            false,
+            &HeaderMap::new(),
+            &document,
+        )
+        .await;
+        assert_eq!(
+            failure.pointer("/errors/0/message"),
+            Some(&Json::String("zeta remote failure".to_string())),
+            "the first planned root wins even when a later root fails sooner"
+        );
+
+        server.abort();
+        std::fs::remove_file(database_path).expect("remove test sqlite");
+    }
+
+    #[tokio::test]
     async fn remote_join_batch_timeout_does_not_retry_each_key() {
         use axum::extract::State;
         use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
