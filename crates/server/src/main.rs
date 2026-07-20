@@ -179,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "donat=debug".into()),
+                .unwrap_or_else(|_| "donat=info".into()),
         )
         .init();
 
@@ -296,6 +296,12 @@ async fn main() -> anyhow::Result<()> {
         auth_hook,
         http: reqwest::Client::new(),
         allowlist_enabled,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(
+            std::env::var("DONAT_GRAPHQL_MAX_ACTIVE_SUBSCRIPTIONS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000),
+        )),
     });
 
     // The database may still be starting; retry the first sync.
@@ -317,7 +323,11 @@ async fn main() -> anyhow::Result<()> {
         let engine = state.engine.read().await;
         tracing::info!(
             sources = engine.metadata.sources.len(),
-            tables = engine.default_catalog().tables.len(),
+            tables = engine
+                .catalogs
+                .values()
+                .map(|catalog| catalog.tables.len())
+                .sum::<usize>(),
             schema_compiled = engine.compiled.is_some(),
             "initialized"
         );

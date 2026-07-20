@@ -8,9 +8,9 @@
 //! boot introspection), then issues a GraphQL query through
 //! `gql::execute_full` and asserts the seeded rows come back.
 //!
-//! `:memory:` would NOT work here: the server opens its own connection per
-//! query, and an in-memory SQLite database is private to the connection that
-//! created it. Hence a temp file on disk.
+//! A temp file is used because setup happens on a connection created outside
+//! the runtime pool; a separate `:memory:` connection would have a separate
+//! database. Runtime queries themselves reuse pooled SQLite connections.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +99,7 @@ fn app_state(db_path: &str) -> Arc<AppState> {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
     })
 }
 

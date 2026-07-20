@@ -1,5 +1,5 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
-	backend-runtime conformance-matrix run claude codex
+	backend-runtime conformance-matrix perf run claude codex
 
 build:
 	cargo build
@@ -73,6 +73,12 @@ conformance-matrix:
 		$(MAKE) conformance-backend BACKEND=$$backend || exit $$?; \
 	done; \
 	$(MAKE) backend-runtime
+
+# Local bottleneck investigation only: records measurements and never applies
+# pass/fail thresholds. SQLite is self-contained; external backends use
+# PERF_DATABASE_URL + PERF_METADATA_DIR.
+perf:
+	BACKEND="$${BACKEND:-sqlite}" benchmarks/perf/run.sh
 
 run:
 	cargo run --bin donat -- --metadata-dir crates/metadata/tests/fixtures/metadata

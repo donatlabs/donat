@@ -2787,10 +2787,11 @@ async fn resolve_table(
     );
     let can_select = !select_perms.is_empty();
     let select_limit = select_limit_for_perms_value(&select_perms);
-    let cols: Option<Vec<String>> = engine
-        .default_catalog()
-        .table(entry.table.schema(), entry.table.name())
-        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect());
+    let cols: Option<Vec<String>> = engine.catalogs.get(&source.name).and_then(|catalog| {
+        catalog
+            .table(entry.table.schema(), entry.table.name())
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+    });
     let selectable_cols = match (&cols, can_select) {
         (_, false) => Some(Vec::new()),
         (Some(cols), true) => {
@@ -3259,9 +3260,10 @@ async fn describe_table(state: &SharedState, session: &Session, args: &Json) -> 
 
     // Catalog columns + types, filtered to the columns the role may select;
     // per-column description from metadata `column_config.<col>.comment`.
-    let catalog = engine.default_catalog();
-    let columns: Vec<Json> = catalog
-        .table(entry.table.schema(), entry.table.name())
+    let columns: Vec<Json> = engine
+        .catalogs
+        .get(&source.name)
+        .and_then(|catalog| catalog.table(entry.table.schema(), entry.table.name()))
         .map(|t| {
             t.columns
                 .iter()
@@ -4457,6 +4459,7 @@ mod tests {
             auth_hook: None,
             http: reqwest::Client::new(),
             allowlist_enabled: false,
+            subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         })
     }
 

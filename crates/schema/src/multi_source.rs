@@ -836,9 +836,11 @@ fn collect_fields(
     relay_id_types: &HashSet<String>,
 ) -> Result<Vec<CollectedField>, PlanError> {
     let mut fields: Vec<CollectedField> = vec![];
+    let mut field_indexes: HashMap<String, usize> = HashMap::new();
     for field in flatten(selection_set, fragments, vars, None)? {
         let key = field.alias.clone().unwrap_or_else(|| field.name.clone());
-        if let Some(existing) = fields.iter_mut().find(|existing| existing.key == key) {
+        if let Some(index) = field_indexes.get(&key).copied() {
+            let existing = &mut fields[index];
             if existing.field.name != field.name || !arguments_match(&existing.field, field) {
                 return Err(PlanError::validation(
                     &format!("{path}.{}", field.name),
@@ -853,6 +855,7 @@ fn collect_fields(
         } else {
             let mut field = field.clone();
             field.directives.clear();
+            field_indexes.insert(key.clone(), fields.len());
             fields.push(CollectedField {
                 key,
                 field,
@@ -927,49 +930,58 @@ fn validate_selection_conflicts(
         )?;
     }
 
-    for (index, left) in fields.iter().enumerate() {
-        let left_key = left
+    let mut indexes_by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, field) in fields.iter().enumerate() {
+        let key = field
             .field
             .alias
             .as_deref()
-            .unwrap_or(left.field.name.as_str());
-        for right in fields.iter().skip(index + 1) {
-            let right_key = right
-                .field
-                .alias
-                .as_deref()
-                .unwrap_or(right.field.name.as_str());
-            if left_key != right_key {
-                continue;
-            }
-            if !scoped_response_shapes_match(left, right, schema, relay_id_types) {
-                return Err(PlanError::validation(
-                    &format!("{path}.{}", right.field.name),
-                    format!("fields with response key '{right_key}' conflict"),
-                ));
-            }
-            if !scopes_overlap(&left.conditions, &right.conditions, schema) {
-                continue;
-            }
-            if left.field.name != right.field.name || !arguments_match(&left.field, &right.field) {
-                return Err(PlanError::validation(
-                    &format!("{path}.{}", right.field.name),
-                    format!("fields with response key '{right_key}' conflict"),
-                ));
+            .unwrap_or(field.field.name.as_str());
+        indexes_by_key.entry(key).or_default().push(index);
+    }
+    for indexes in indexes_by_key.values() {
+        for (position, left_index) in indexes.iter().enumerate() {
+            let left = &fields[*left_index];
+            for right_index in indexes.iter().skip(position + 1) {
+                let right = &fields[*right_index];
+                let right_key = right
+                    .field
+                    .alias
+                    .as_deref()
+                    .unwrap_or(right.field.name.as_str());
+                if !scoped_response_shapes_match(left, right, schema, relay_id_types) {
+                    return Err(PlanError::validation(
+                        &format!("{path}.{}", right.field.name),
+                        format!("fields with response key '{right_key}' conflict"),
+                    ));
+                }
+                if !scopes_overlap(&left.conditions, &right.conditions, schema) {
+                    continue;
+                }
+                if left.field.name != right.field.name
+                    || !arguments_match(&left.field, &right.field)
+                {
+                    return Err(PlanError::validation(
+                        &format!("{path}.{}", right.field.name),
+                        format!("fields with response key '{right_key}' conflict"),
+                    ));
+                }
             }
         }
     }
 
     let mut groups: Vec<(String, Vec<ScopedField>)> = vec![];
+    let mut group_indexes: HashMap<String, usize> = HashMap::new();
     for field in fields {
         let key = field
             .field
             .alias
             .clone()
             .unwrap_or_else(|| field.field.name.clone());
-        if let Some((_, group)) = groups.iter_mut().find(|(candidate, _)| candidate == &key) {
-            group.push(field);
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].1.push(field);
         } else {
+            group_indexes.insert(key.clone(), groups.len());
             groups.push((key, vec![field]));
         }
     }
@@ -1320,4 +1332,38 @@ fn root_type(name: &str, fields: Vec<Json>) -> Json {
         "enumValues": null,
         "possibleTypes": null,
     })
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn wide_unique_selection_is_collected_without_pairwise_scans() {
+        let query = format!(
+            "{{ {} }}",
+            (0..2_000)
+                .map(|index| format!("field_{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let document = graphql_parser::parse_query::<String>(&query)
+            .expect("wide query parses")
+            .into_static();
+        let Definition::Operation(OperationDefinition::SelectionSet(selection_set)) =
+            &document.definitions[0]
+        else {
+            unreachable!()
+        };
+        let fields = collect_fields(
+            selection_set,
+            &HashMap::new(),
+            &JsonMap::new(),
+            "$.selectionSet",
+            &serde_json::json!({}),
+            &HashSet::new(),
+        )
+        .expect("unique response keys do not conflict");
+        assert_eq!(fields.len(), 2_000);
+    }
 }

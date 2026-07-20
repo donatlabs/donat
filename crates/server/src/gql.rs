@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::http::HeaderMap;
+use futures_util::future::join_all;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_schema::{
@@ -12,6 +13,15 @@ use donat_schema::{
 };
 
 use crate::state::{AppState, Engine, QueryError, SharedState, SourceRuntime};
+
+fn trace_perf_phase(phase: &'static str, started: std::time::Instant) {
+    tracing::trace!(
+        target: "donat::perf",
+        phase,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "request phase"
+    );
+}
 
 /// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
 /// the planner both recurse on nesting, so an unbounded query would overflow
@@ -75,15 +85,14 @@ pub async fn execute_source_query_plans<E: SourceQueryExecutor + Sync>(
     executor: &E,
     plans: &[SourceQueryPlan],
 ) -> Result<Vec<Json>, QueryError> {
-    let mut output = Vec::with_capacity(plans.len());
-    for plan in plans {
-        output.push(
-            executor
-                .execute_source_query(&plan.source, &plan.roots)
-                .await?,
-        );
-    }
-    Ok(output)
+    join_all(
+        plans
+            .iter()
+            .map(|plan| executor.execute_source_query(&plan.source, &plan.roots)),
+    )
+    .await
+    .into_iter()
+    .collect()
 }
 
 fn assemble_multi_source_response(
@@ -489,6 +498,7 @@ pub async fn execute_full(
             format!("query exceeds maximum nesting depth of {MAX_QUERY_DEPTH}"),
         ));
     }
+    let parse_started = std::time::Instant::now();
     let doc = match graphql_parser::parse_query::<String>(query) {
         Ok(doc) => doc.into_static(),
         Err(e) => {
@@ -498,14 +508,75 @@ pub async fn execute_full(
             ));
         }
     };
+    trace_perf_phase("graphql.parse", parse_started);
 
+    execute_parsed_full(
+        state,
+        session,
+        body,
+        relay,
+        headers,
+        doc,
+        variables,
+        operation_name,
+    )
+    .await
+}
+
+/// Execute a document compiled into the current immutable engine snapshot.
+/// REST endpoints use this path so their saved query is not reparsed for every
+/// request. The caller is responsible for applying textual limits while
+/// compiling the document.
+pub(crate) async fn execute_preparsed_full(
+    state: &SharedState,
+    session: &Session,
+    body: &Json,
+    relay: bool,
+    headers: &axum::http::HeaderMap,
+    doc: &graphql_parser::query::Document<'static, String>,
+) -> (axum::http::StatusCode, Json) {
+    let variables: JsonMap<String, Json> = match body.get("variables") {
+        Some(Json::Object(map)) => map.clone(),
+        Some(Json::Null) | None => JsonMap::new(),
+        Some(_) => {
+            return ok(error_json(
+                "validation-failed",
+                "variables must be an object",
+            ));
+        }
+    };
+    let operation_name = body.get("operationName").and_then(Json::as_str);
+    execute_parsed_full(
+        state,
+        session,
+        body,
+        relay,
+        headers,
+        doc.clone(),
+        variables,
+        operation_name,
+    )
+    .await
+}
+
+async fn execute_parsed_full(
+    state: &SharedState,
+    session: &Session,
+    body: &Json,
+    relay: bool,
+    headers: &axum::http::HeaderMap,
+    doc: graphql_parser::query::Document<'static, String>,
+    variables: JsonMap<String, Json>,
+    operation_name: Option<&str>,
+) -> (axum::http::StatusCode, Json) {
+    let routing_started = std::time::Instant::now();
     let engine = state.engine_snapshot().await;
     // Remote schema routing: operations aimed entirely at a permitted
     // remote schema are validated against the role's SDL and forwarded.
     let mut remote_variables = variables.clone();
-    if let Some(result) =
-        crate::remote::match_remote(&engine.metadata, session, &doc, &mut remote_variables)
+    if let Some(result) = crate::remote::match_remote(&engine, session, &doc, &mut remote_variables)
     {
+        trace_perf_phase("graphql.route", routing_started);
         return match result {
             Ok(target) => {
                 if target.has_introspection {
@@ -578,6 +649,7 @@ pub async fn execute_full(
     // Action routing: an operation whose top-level fields are actions is
     // resolved by calling the action's HTTP handler, not by SQL planning.
     if let Some(ctx) = crate::action::match_action(&engine.metadata, &doc, operation_name) {
+        trace_perf_phase("graphql.route", routing_started);
         return crate::action::resolve(
             state,
             engine,
@@ -590,31 +662,22 @@ pub async fn execute_full(
         )
         .await;
     }
+    trace_perf_phase("graphql.route", routing_started);
     // Allowlist gate: the query must structurally match a listed one
     // (__typename selections are ignored, like Donat).
     if state.allowlist_enabled {
+        let allowlist_started = std::time::Instant::now();
         let normalized = normalize_for_allowlist(&doc);
-        let allowed = engine.metadata.allowlist.iter().any(|entry| {
-            engine
-                .metadata
-                .query_collections
-                .iter()
-                .filter(|c| c.name == entry.collection)
-                .flat_map(|c| c.definition.queries.iter())
-                .any(|q| {
-                    graphql_parser::parse_query::<String>(&q.query)
-                        .map(|d| normalize_for_allowlist(&d.into_static()) == normalized)
-                        .unwrap_or(false)
-                })
-        });
-        if !allowed {
+        if !engine.allowed_queries.contains(&normalized) {
             return ok(error_json("validation-failed", "query is not allowed"));
         }
+        trace_perf_phase("graphql.allowlist", allowlist_started);
     }
-    tracing::debug!(role = %session.role, sources = engine.metadata.sources.len(),
+    tracing::trace!(role = %session.role, sources = engine.metadata.sources.len(),
         tables = engine.metadata.sources.iter().map(|source| source.tables.len()).sum::<usize>(),
         catalog_tables = engine.catalogs.values().map(|catalog| catalog.tables.len()).sum::<usize>(),
         "graphql request");
+    let planning_started = std::time::Instant::now();
     let mut planner = match planner_from_snapshot(&engine) {
         Ok(planner) => planner,
         Err(error) => return ok(error.to_graphql()),
@@ -639,6 +702,7 @@ pub async fn execute_full(
         Ok(plan) => plan,
         Err(e) => return ok(e.to_graphql()),
     };
+    trace_perf_phase("graphql.plan", planning_started);
 
     match plan {
         MultiSourcePlan::Query { sources, response } => {
@@ -702,24 +766,49 @@ pub async fn execute_full(
                 ));
             };
             let pool = match runtime {
-                SourceRuntime::Sqlite { path } => {
+                SourceRuntime::Sqlite { pool, settings, .. } => {
                     drop(engine);
-                    return match state.execute_sqlite_mutations_at(path, &roots).await {
+                    return match state
+                        .execute_sqlite_mutations_at(pool, settings, &roots)
+                        .await
+                    {
                         Ok(data) => ok(json!({
                             "data": assemble_multi_source_response(&response, [data])
                         })),
                         Err(e) => ok(sqlite_mutation_error_json(e)),
                     };
                 }
-                SourceRuntime::Mysql { url } => {
-                    let Some(catalog) = engine.catalogs.get(&source).cloned() else {
+                SourceRuntime::Mysql { pool, settings, .. } => {
+                    let Some(catalog) = engine.catalogs.get(&source) else {
                         return ok(error_json(
                             "unexpected",
                             format!("catalog for source '{source}' not found"),
                         ));
                     };
+                    let primary_keys: std::collections::HashMap<String, Vec<String>> = roots
+                        .iter()
+                        .filter_map(|root| {
+                            let table = match root {
+                                donat_ir::MutationRoot::Insert { insert, .. } => &insert.table,
+                                donat_ir::MutationRoot::Update { update, .. } => &update.table,
+                                donat_ir::MutationRoot::Delete { delete, .. } => &delete.table,
+                                donat_ir::MutationRoot::FunctionCall { .. }
+                                | donat_ir::MutationRoot::Typename { .. } => return None,
+                            };
+                            let key = format!("{}.{}", table.schema, table.name);
+                            let primary_key = catalog
+                                .tables
+                                .get(&key)
+                                .map(|info| info.primary_key.clone())
+                                .unwrap_or_default();
+                            Some((key, primary_key))
+                        })
+                        .collect();
                     drop(engine);
-                    return match state.execute_mysql_mutations_at(catalog, url, &roots).await {
+                    return match state
+                        .execute_mysql_mutations_at(primary_keys, pool, settings, &roots)
+                        .await
+                    {
                         Ok(data) => ok(json!({
                             "data": assemble_multi_source_response(&response, [data])
                         })),
@@ -768,7 +857,7 @@ pub async fn execute_full(
             };
             let mut data = serde_json::Map::new();
             for (alias, sql) in fields {
-                tracing::debug!(%sql, "executing mutation");
+                tracing::trace!(target: "donat::sql", %sql, "executing mutation");
                 match tx.query_one(&sql, &[]).await {
                     Ok(row) => {
                         // Typename roots produce text, everything else json.
@@ -893,7 +982,9 @@ pub(crate) async fn execute_select_internal(
 }
 
 /// Render a document with every __typename selection removed.
-fn normalize_for_allowlist(doc: &graphql_parser::query::Document<'static, String>) -> String {
+pub(crate) fn normalize_for_allowlist(
+    doc: &graphql_parser::query::Document<'static, String>,
+) -> String {
     use graphql_parser::query::{Definition, Selection};
     fn strip(set: &mut graphql_parser::query::SelectionSet<'static, String>) {
         set.items
@@ -948,8 +1039,423 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
     out
 }
 
-/// Fill RemoteJoin placeholders by querying the remote schema per row
-/// and strip the hidden "__rr__" columns.
+struct RemoteJoinEntry {
+    object_pointer: String,
+    variables: JsonMap<String, Json>,
+}
+
+struct RemoteJoinGroup<'a> {
+    spec: &'a donat_ir::RemoteJoinSpec,
+    client_field_path: String,
+    field_alias: String,
+    entries: Vec<RemoteJoinEntry>,
+}
+
+struct PreparedRemoteJoin {
+    target: crate::remote::RemoteTarget,
+    query: String,
+    variables: JsonMap<String, Json>,
+}
+
+const REMOTE_JOIN_BATCH_SIZE: usize = 100;
+const REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES: usize = 4;
+
+fn pointer_child(base: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{base}/{escaped}")
+}
+
+fn collect_remote_join_groups<'a>(
+    fields: &'a [donat_ir::OutputField],
+    node: &Json,
+    object_pointer: &str,
+    path: &str,
+    groups: &mut Vec<RemoteJoinGroup<'a>>,
+) {
+    match node {
+        Json::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_remote_join_groups(
+                    fields,
+                    item,
+                    &pointer_child(object_pointer, &index.to_string()),
+                    path,
+                    groups,
+                );
+            }
+        }
+        Json::Object(map) => {
+            for field in fields {
+                match &field.value {
+                    donat_ir::FieldValue::Object { query, .. }
+                    | donat_ir::FieldValue::Array { query, .. } => {
+                        if let Some(child) = map.get(field.alias.as_str()) {
+                            collect_remote_join_groups(
+                                &query.fields,
+                                child,
+                                &pointer_child(object_pointer, &field.alias),
+                                &format!("{path}.selectionSet.{}", field.alias),
+                                groups,
+                            );
+                        }
+                    }
+                    donat_ir::FieldValue::RemoteJoin { spec } => {
+                        let client_field_path = format!("{path}.selectionSet.{}", field.alias);
+                        let variables = spec
+                            .variables
+                            .iter()
+                            .map(|(variable, hidden)| {
+                                (
+                                    variable.clone(),
+                                    map.get(hidden.as_str()).cloned().unwrap_or(Json::Null),
+                                )
+                            })
+                            .collect();
+                        if let Some(group) = groups.iter_mut().find(|group| {
+                            group.client_field_path == client_field_path
+                                && group.spec.query == spec.query
+                                && group.spec.schema == spec.schema
+                        }) {
+                            group.entries.push(RemoteJoinEntry {
+                                object_pointer: object_pointer.to_string(),
+                                variables,
+                            });
+                        } else {
+                            groups.push(RemoteJoinGroup {
+                                spec,
+                                client_field_path,
+                                field_alias: field.alias.clone(),
+                                entries: vec![RemoteJoinEntry {
+                                    object_pointer: object_pointer.to_string(),
+                                    variables,
+                                }],
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_query_value_variables(
+    value: &mut graphql_parser::query::Value<'static, String>,
+    names: &std::collections::HashMap<String, String>,
+) {
+    use graphql_parser::query::Value;
+    match value {
+        Value::Variable(name) => {
+            if let Some(replacement) = names.get(name) {
+                *name = replacement.clone();
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                rename_query_value_variables(item, names);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                rename_query_value_variables(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_query_directive_variables(
+    directives: &mut [graphql_parser::query::Directive<'static, String>],
+    names: &std::collections::HashMap<String, String>,
+) {
+    for directive in directives {
+        for (_, value) in &mut directive.arguments {
+            rename_query_value_variables(value, names);
+        }
+    }
+}
+
+fn rename_selection_variables(
+    selection_set: &mut graphql_parser::query::SelectionSet<'static, String>,
+    names: &std::collections::HashMap<String, String>,
+) {
+    use graphql_parser::query::Selection;
+    for selection in &mut selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                for (_, value) in &mut field.arguments {
+                    rename_query_value_variables(value, names);
+                }
+                rename_query_directive_variables(&mut field.directives, names);
+                rename_selection_variables(&mut field.selection_set, names);
+            }
+            Selection::InlineFragment(fragment) => {
+                rename_query_directive_variables(&mut fragment.directives, names);
+                rename_selection_variables(&mut fragment.selection_set, names);
+            }
+            Selection::FragmentSpread(fragment) => {
+                rename_query_directive_variables(&mut fragment.directives, names);
+            }
+        }
+    }
+}
+
+fn build_remote_join_batch(
+    prepared: &[PreparedRemoteJoin],
+) -> Option<(String, JsonMap<String, Json>)> {
+    use graphql_parser::query::{Definition, OperationDefinition, Selection};
+
+    let mut combined_doc = None;
+    let mut combined_variables = JsonMap::new();
+    let mut variable_definitions = vec![];
+    let mut selections = vec![];
+
+    for (index, request) in prepared.iter().enumerate() {
+        let mut doc = graphql_parser::parse_query::<String>(&request.query)
+            .ok()?
+            .into_static();
+        if doc
+            .definitions
+            .iter()
+            .any(|definition| matches!(definition, Definition::Fragment(_)))
+        {
+            return None;
+        }
+        let query = doc.definitions.iter_mut().find_map(|definition| {
+            let Definition::Operation(OperationDefinition::Query(query)) = definition else {
+                return None;
+            };
+            Some(query)
+        })?;
+        if query.selection_set.items.len() != 1 {
+            return None;
+        }
+
+        let names: std::collections::HashMap<_, _> = query
+            .variable_definitions
+            .iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    format!("__donat_rr_{index}_{}", definition.name),
+                )
+            })
+            .collect();
+        for definition in &mut query.variable_definitions {
+            definition.name = names.get(&definition.name)?.clone();
+        }
+        rename_selection_variables(&mut query.selection_set, &names);
+        let Selection::Field(field) = query.selection_set.items.first_mut()? else {
+            return None;
+        };
+        field.alias = Some(format!("__donat_rr_{index}"));
+
+        for (name, value) in &request.variables {
+            combined_variables.insert(names.get(name)?.clone(), value.clone());
+        }
+        variable_definitions.extend(query.variable_definitions.clone());
+        selections.extend(query.selection_set.items.clone());
+        if combined_doc.is_none() {
+            combined_doc = Some(doc);
+        }
+    }
+
+    let mut combined_doc = combined_doc?;
+    let combined_query = combined_doc.definitions.iter_mut().find_map(|definition| {
+        let Definition::Operation(OperationDefinition::Query(query)) = definition else {
+            return None;
+        };
+        Some(query)
+    })?;
+    combined_query.variable_definitions = variable_definitions;
+    combined_query.selection_set.items = selections;
+    Some((format!("{combined_doc}"), combined_variables))
+}
+
+async fn execute_remote_join_sequential(
+    state: &SharedState,
+    prepared: &[PreparedRemoteJoin],
+    root_field: &str,
+) -> Result<Vec<Json>, Json> {
+    let mut values = Vec::with_capacity(prepared.len());
+    for request in prepared {
+        let body = json!({
+            "query": request.query,
+            "variables": request.variables,
+        });
+        let (_, response) =
+            crate::remote::forward(state, &request.target, &body, &HeaderMap::new()).await;
+        if let Some(errors) = response.get("errors") {
+            return Err(json!({ "errors": errors }));
+        }
+        values.push(
+            response
+                .pointer(&format!("/data/{root_field}"))
+                .cloned()
+                .unwrap_or(Json::Null),
+        );
+    }
+    Ok(values)
+}
+
+async fn execute_remote_join_chunk(
+    state: &SharedState,
+    prepared: &[PreparedRemoteJoin],
+    root_field: &str,
+) -> Result<Vec<Json>, Json> {
+    if prepared.len() == 1 {
+        return execute_remote_join_sequential(state, prepared, root_field).await;
+    }
+    let Some((query, variables)) = build_remote_join_batch(prepared) else {
+        return execute_remote_join_sequential(state, prepared, root_field).await;
+    };
+    let first = prepared.first().expect("non-empty remote join batch");
+    let target = crate::remote::RemoteTarget {
+        url: first.target.url.clone(),
+        forward_client_headers: first.target.forward_client_headers,
+        rewritten_query: Some(query.clone()),
+        has_introspection: false,
+        namespace: None,
+        timeout_seconds: first.target.timeout_seconds,
+    };
+    let body = json!({ "query": query, "variables": variables });
+    let (_, response) = crate::remote::forward(state, &target, &body, &HeaderMap::new()).await;
+    if let Some(errors) = response.get("errors") {
+        if remote_batch_is_validation_error(errors) {
+            return execute_remote_join_sequential(state, prepared, root_field).await;
+        }
+        // Transport failures, timeouts, and resolver errors must not fan out
+        // into N retries. Only a recognized GraphQL validation rejection says
+        // that the upstream cannot execute our aliased batch shape.
+        return Err(json!({ "errors": errors }));
+    }
+    Ok((0..prepared.len())
+        .map(|index| {
+            response
+                .pointer(&format!("/data/__donat_rr_{index}"))
+                .cloned()
+                .unwrap_or(Json::Null)
+        })
+        .collect())
+}
+
+fn remote_batch_is_validation_error(errors: &Json) -> bool {
+    let Some(errors) = errors.as_array() else {
+        return false;
+    };
+    !errors.is_empty()
+        && errors.iter().all(|error| {
+            let Some(code) = error.pointer("/extensions/code").and_then(Json::as_str) else {
+                return false;
+            };
+            matches!(
+                code.to_ascii_lowercase().as_str(),
+                "validation-failed"
+                    | "validation_failed"
+                    | "graphql_validation_failed"
+                    | "graphql_validation_error"
+            )
+        })
+}
+
+async fn resolve_remote_join_group(
+    state: &SharedState,
+    engine: &Engine,
+    session: &Session,
+    group: &RemoteJoinGroup<'_>,
+) -> Result<Vec<Json>, Json> {
+    let doc = graphql_parser::parse_query::<String>(&group.spec.query)
+        .map_err(|error| error_json("unexpected", format!("bad remote join: {error}")))?
+        .into_static();
+
+    let mut unique_variables: Vec<JsonMap<String, Json>> = vec![];
+    let mut unique_indexes: HashMap<String, usize> = HashMap::new();
+    let mut entry_to_unique = Vec::with_capacity(group.entries.len());
+    for entry in &group.entries {
+        let key = serde_json::to_string(&entry.variables)
+            .expect("remote relationship variables always serialize");
+        if let Some(index) = unique_indexes.get(&key).copied() {
+            entry_to_unique.push(index);
+        } else {
+            let index = unique_variables.len();
+            unique_indexes.insert(key, index);
+            entry_to_unique.push(index);
+            unique_variables.push(entry.variables.clone());
+        }
+    }
+
+    let mut prepared = Vec::with_capacity(unique_variables.len());
+    for mut variables in unique_variables {
+        let matched = crate::remote::match_remote_with(engine, session, &doc, &mut variables, true);
+        let target = match matched {
+            Some(Ok(target)) => target,
+            Some(Err(error)) => {
+                let server_root = format!("$.selectionSet.{}", group.spec.root_field);
+                let rewritten = match error.path.strip_prefix(&server_root) {
+                    Some(rest) => format!("{}{rest}", group.client_field_path),
+                    None => group.client_field_path.clone(),
+                };
+                return Err(json!({
+                    "errors": [{
+                        "extensions": { "path": rewritten, "code": error.code },
+                        "message": error.message,
+                    }]
+                }));
+            }
+            None => return Ok(vec![Json::Null; group.entries.len()]),
+        };
+        let query = target
+            .rewritten_query
+            .clone()
+            .unwrap_or_else(|| group.spec.query.clone());
+        prepared.push(PreparedRemoteJoin {
+            target,
+            query,
+            variables,
+        });
+    }
+
+    let mut unique_values = Vec::with_capacity(prepared.len());
+    let window_size = REMOTE_JOIN_BATCH_SIZE * REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES;
+    for window in prepared.chunks(window_size) {
+        let results = join_all(
+            window
+                .chunks(REMOTE_JOIN_BATCH_SIZE)
+                .map(|chunk| execute_remote_join_chunk(state, chunk, &group.spec.root_field)),
+        )
+        .await;
+        for result in results {
+            unique_values.extend(result?);
+        }
+    }
+
+    Ok(entry_to_unique
+        .into_iter()
+        .map(|index| unique_values[index].clone())
+        .collect())
+}
+
+fn strip_remote_join_hidden(node: &mut Json) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden(item);
+            }
+        }
+        Json::Object(map) => {
+            map.retain(|key, _| !key.starts_with("__rr__"));
+            for value in map.values_mut() {
+                strip_remote_join_hidden(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fill RemoteJoin placeholders with one upstream GraphQL operation per
+/// relationship selection, deduplicating repeated join keys, then strip the
+/// hidden "__rr__" columns.
 fn resolve_remote_joins<'a>(
     state: &'a SharedState,
     engine: &'a Engine,
@@ -959,107 +1465,26 @@ fn resolve_remote_joins<'a>(
     path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
     Box::pin(async move {
-        match node {
-            Json::Array(items) => {
-                for item in items {
-                    resolve_remote_joins(state, engine, session, fields, item, path).await?;
+        let mut groups = vec![];
+        collect_remote_join_groups(fields, node, "", path, &mut groups);
+        for window in groups.chunks(REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES) {
+            let resolved = join_all(
+                window
+                    .iter()
+                    .map(|group| resolve_remote_join_group(state, engine, session, group)),
+            )
+            .await;
+            for (group, values) in window.iter().zip(resolved) {
+                for (entry, value) in group.entries.iter().zip(values?) {
+                    let Some(Json::Object(object)) = node.pointer_mut(&entry.object_pointer) else {
+                        continue;
+                    };
+                    object.insert(group.field_alias.clone(), value);
                 }
-                Ok(())
             }
-            Json::Object(_) => {
-                for field in fields {
-                    match &field.value {
-                        donat_ir::FieldValue::Object { query, .. }
-                        | donat_ir::FieldValue::Array { query, .. } => {
-                            if let Some(child) = node.get_mut(field.alias.as_str()) {
-                                resolve_remote_joins(
-                                    state,
-                                    engine,
-                                    session,
-                                    &query.fields,
-                                    child,
-                                    &format!("{path}.selectionSet.{}", field.alias),
-                                )
-                                .await?;
-                            }
-                        }
-                        donat_ir::FieldValue::RemoteJoin { spec } => {
-                            // Variables from the row's hidden columns.
-                            let mut vars = serde_json::Map::new();
-                            for (var, hidden) in &spec.variables {
-                                vars.insert(
-                                    var.clone(),
-                                    node.get(hidden.as_str()).cloned().unwrap_or(Json::Null),
-                                );
-                            }
-                            let doc = graphql_parser::parse_query::<String>(&spec.query)
-                                .map_err(|e| {
-                                    error_json("unexpected", format!("bad remote join: {e}"))
-                                })?
-                                .into_static();
-                            let mut varmap = vars.clone();
-                            let matched = crate::remote::match_remote_with(
-                                &engine.metadata,
-                                session,
-                                &doc,
-                                &mut varmap,
-                                true,
-                            );
-                            let value = match matched {
-                                Some(Ok(target)) => {
-                                    let body = json!({
-                                        "query": target
-                                            .rewritten_query
-                                            .clone()
-                                            .unwrap_or_else(|| spec.query.clone()),
-                                        "variables": varmap,
-                                    });
-                                    let (_, resp) = crate::remote::forward(
-                                        state,
-                                        &target,
-                                        &body,
-                                        &axum::http::HeaderMap::new(),
-                                    )
-                                    .await;
-                                    if let Some(errors) = resp.get("errors") {
-                                        return Err(json!({ "errors": errors }));
-                                    }
-                                    resp.pointer(&format!("/data/{}", spec.root_field))
-                                        .cloned()
-                                        .unwrap_or(Json::Null)
-                                }
-                                Some(Err(e)) => {
-                                    // Validation errors for the server-built
-                                    // join query are reported at the client's
-                                    // field path, not the join root's.
-                                    let client_field =
-                                        format!("{path}.selectionSet.{}", field.alias);
-                                    let server_root = format!("$.selectionSet.{}", spec.root_field);
-                                    let rewritten = match e.path.strip_prefix(&server_root) {
-                                        Some(rest) => format!("{client_field}{rest}"),
-                                        None => client_field,
-                                    };
-                                    return Err(json!({
-                                        "errors": [{
-                                            "extensions": { "path": rewritten, "code": e.code },
-                                            "message": e.message,
-                                        }]
-                                    }));
-                                }
-                                None => Json::Null,
-                            };
-                            node[field.alias.as_str()] = value;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Json::Object(map) = node {
-                    map.retain(|k, _| !k.starts_with("__rr__"));
-                }
-                Ok(())
-            }
-            _ => Ok(()),
         }
+        strip_remote_join_hidden(node);
+        Ok(())
     })
 }
 
@@ -1078,6 +1503,7 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Decode(msg) => error_json("unexpected", format!("cannot decode result: {msg}")),
         QueryError::Postgres(err) => db_error_json(&err),
         QueryError::Sqlite(msg) => error_json("data-exception", msg),
+        QueryError::Mysql(msg) => error_json("data-exception", msg),
         QueryError::Clickhouse(msg) => error_json("data-exception", msg),
     }
 }
@@ -1173,6 +1599,7 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -1422,6 +1849,11 @@ mod tests {
                 "default".to_string(),
                 SourceRuntime::Sqlite {
                     path: "/tmp/action.sqlite".to_string(),
+                    pool: Arc::new(crate::state::SqlitePool::new(
+                        "/tmp/action.sqlite".to_string(),
+                        8,
+                    )),
+                    settings: crate::state::RuntimePoolSettings::default(),
                 },
             )]),
             true,
@@ -1459,6 +1891,7 @@ mod tests {
             auth_hook: None,
             http: reqwest::Client::new(),
             allowlist_enabled: false,
+            subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         })
     }
 
@@ -1532,6 +1965,287 @@ mod tests {
         .expect("remote join resolves from request snapshot");
 
         assert_eq!(node, json!({ "joined": { "name": "old" } }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_batches_rows_and_deduplicates_join_keys() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State(requests): State<Arc<AtomicUsize>>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        if query.contains("__donat_rr_0") {
+                            axum::Json(json!({
+                                "data": {
+                                    "__donat_rr_0": { "name": "seven" },
+                                    "__donat_rr_1": { "name": "eight" }
+                                }
+                            }))
+                        } else {
+                            let id = body.pointer("/variables/v0").and_then(Json::as_i64);
+                            let name = if id == Some(7) { "seven" } else { "eight" };
+                            axum::Json(json!({ "data": { "message": { "name": name } } }))
+                        }
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("remote joins resolve");
+
+        assert_eq!(
+            node,
+            json!([
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "eight" } }
+            ])
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_batch_timeout_does_not_retry_each_key() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    axum::Json(json!({ "data": { "message": null } }))
+                }),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": {
+                    "url": format!("http://{address}/"),
+                    "timeout_seconds": 1
+                },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            resolve_remote_joins(
+                &state,
+                &engine,
+                &session,
+                &fields,
+                &mut node,
+                "$.selectionSet.items",
+            ),
+        )
+        .await
+        .expect("timeout response must not trigger sequential retries");
+
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_batch_validation_error_falls_back_sequentially() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State(requests): State<Arc<AtomicUsize>>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        if query.contains("__donat_rr_0") {
+                            return axum::Json(json!({
+                                "errors": [{
+                                    "extensions": { "code": "GRAPHQL_VALIDATION_FAILED" },
+                                    "message": "aliased batches are not supported"
+                                }]
+                            }));
+                        }
+                        let id = body.pointer("/variables/v0").and_then(Json::as_i64);
+                        let name = if id == Some(7) { "seven" } else { "eight" };
+                        axum::Json(json!({ "data": { "message": { "name": name } } }))
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("recognized validation error falls back");
+
+        assert_eq!(
+            node,
+            json!([
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "eight" } }
+            ])
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
         server.abort();
     }
 
@@ -1627,6 +2341,7 @@ mod tests {
                     SourceRuntime::Postgres {
                         url: "postgres://postgres:postgres@127.0.0.1:1/unused".to_string(),
                         pool,
+                        settings: crate::state::RuntimePoolSettings::default(),
                     },
                 )]),
                 true,

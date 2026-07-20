@@ -41,6 +41,15 @@ reasoning never has to be reconstructed.
 - [[decisions/011-compile-schema-at-snapshot-publication]] — schema composition
   and role projection validation happen once before an immutable engine
   snapshot is atomically published, never on ordinary request paths.
+- [[decisions/012-parallel-independent-source-queries]] — independent source
+  reads run concurrently while response and error ordering remain
+  deterministic.
+- [[decisions/013-batch-row-dependent-relationships]] — remote and Action
+  relationship keys are deduplicated and resolved with bounded aliased batches
+  instead of row-by-row N+1 calls.
+- [[decisions/014-reuse-backend-connections-and-snapshot-metadata]] — backend
+  connections are pooled and allowlist, REST, remote SDL, and subscription
+  documents are compiled outside the steady-state request path.
 
 ## One-paragraph shape
 
