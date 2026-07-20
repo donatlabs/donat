@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::http::HeaderMap;
 use donat_metadata::Metadata;
@@ -13,6 +14,7 @@ use donat_server::state::{AppState, Engine, QueryError};
 use mysql::prelude::Queryable;
 use rusqlite::Connection;
 use serde_json::json;
+use tokio::sync::Notify;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -117,6 +119,8 @@ fn state(fixtures: &SqliteFixtures) -> Arc<AppState> {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     })
 }
 
@@ -221,6 +225,104 @@ async fn source_less_query_plan_executes_no_backends() {
             .expect("recording executor lock")
             .is_empty()
     );
+}
+
+struct GatedExecutor {
+    started: AtomicUsize,
+    all_started: Notify,
+    release: Notify,
+}
+
+impl GatedExecutor {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            all_started: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+}
+
+impl SourceQueryExecutor for GatedExecutor {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        _roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, QueryError>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                self.all_started.notify_one();
+            }
+            self.release.notified().await;
+            Ok(json!({ "source": source }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn independent_source_plans_start_concurrently_and_preserve_result_order() {
+    let executor = GatedExecutor::new();
+    let plans = vec![
+        SourceQueryPlan {
+            source: "slow-first".to_string(),
+            roots: vec![],
+        },
+        SourceQueryPlan {
+            source: "fast-second".to_string(),
+            roots: vec![],
+        },
+    ];
+
+    let execution = execute_source_query_plans(&executor, &plans);
+    let release = async {
+        tokio::time::timeout(Duration::from_millis(500), executor.all_started.notified())
+            .await
+            .expect("all independent source plans should start before either completes");
+        executor.release.notify_waiters();
+    };
+    let (results, ()) = tokio::join!(execution, release);
+
+    assert_eq!(
+        results.expect("source execution succeeds"),
+        vec![
+            json!({ "source": "slow-first" }),
+            json!({ "source": "fast-second" })
+        ]
+    );
+}
+
+struct ErrorExecutor;
+
+impl SourceQueryExecutor for ErrorExecutor {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        _roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, QueryError>> + Send + 'a>> {
+        Box::pin(async move { Err(QueryError::Sqlite(source.to_string())) })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_source_errors_remain_deterministic_in_plan_order() {
+    let plans = vec![
+        SourceQueryPlan {
+            source: "first".to_string(),
+            roots: vec![],
+        },
+        SourceQueryPlan {
+            source: "second".to_string(),
+            roots: vec![],
+        },
+    ];
+
+    let error = execute_source_query_plans(&ErrorExecutor, &plans)
+        .await
+        .expect_err("source execution should fail");
+    match error {
+        QueryError::Sqlite(source) => assert_eq!(source, "first"),
+        _ => panic!("expected the first source error"),
+    }
 }
 
 struct MysqlDatabases {
@@ -387,6 +489,8 @@ async fn secondary_mysql_mutation_never_falls_back_to_default_source() {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     });
     state
         .sync_sources()

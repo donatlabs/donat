@@ -11,6 +11,7 @@
 
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::BoxFuture;
+use futures_util::stream::StreamExt;
 use graphql_parser::query::{
     Definition, Document, Field, OperationDefinition, Selection, SelectionSet, Value as GqlValue,
 };
@@ -21,6 +22,8 @@ use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
 use crate::state::{Engine, EngineSnapshot, SharedState};
+
+const MAX_CONCURRENT_ACTION_RELATIONSHIP_GROUPS: usize = 4;
 
 fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
@@ -95,80 +98,115 @@ pub async fn resolve(
         }
     };
 
-    let mut data = JsonMap::new();
-    for item in &set.items {
-        let Selection::Field(field) = item else {
-            return err(
-                "$",
-                "validation-failed",
-                "fragments are not supported on actions",
-            );
-        };
-        let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
-        if field.name == "__typename" {
-            data.insert(
-                alias,
-                Json::String(if ctx.is_query {
-                    "query_root".into()
-                } else {
-                    "mutation_root".into()
-                }),
-            );
-            continue;
-        }
-        let Some(action) = ctx.find(&field.name) else {
-            return err(
-                &format!("$.selectionSet.{}", field.name),
-                "validation-failed",
-                format!(
-                    "field \"{}\" not found in type: '{}'",
-                    field.name,
-                    if ctx.is_query {
-                        "query_root"
-                    } else {
-                        "mutation_root"
-                    }
-                ),
-            );
-        };
-
-        // Permission: the role must be granted this action explicitly.
-        if !action.permissions.iter().any(|p| p.role == session.role) {
-            return err(
-                &format!("$.selectionSet.{}", field.name),
-                "validation-failed",
-                format!(
-                    "field \"{}\" not found in type: '{}'",
-                    field.name,
-                    if ctx.is_query {
-                        "query_root"
-                    } else {
-                        "mutation_root"
-                    }
-                ),
-            );
-        }
-
-        match call_action(
+    let execute_item = |item| {
+        resolve_action_item(
             state,
             engine.as_ref(),
             session,
-            action,
-            field,
+            ctx,
+            item,
             variables,
             headers,
-            &ctx.custom_types,
         )
-        .await
-        {
-            Ok(value) => {
+    };
+    let results =
+        schedule_action_items(ctx.is_query, set.items.iter().map(execute_item).collect()).await;
+    let mut data = JsonMap::new();
+    for result in results {
+        match result {
+            Ok((alias, value)) => {
                 data.insert(alias, value);
             }
-            Err(resp) => return resp,
+            Err(response) => return response,
         }
     }
 
     (StatusCode::OK, json!({ "data": data }))
+}
+
+async fn schedule_action_items<F, T>(is_query: bool, futures: Vec<F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if is_query {
+        futures_util::future::join_all(futures).await
+    } else {
+        let mut results = Vec::with_capacity(futures.len());
+        for future in futures {
+            results.push(future.await);
+        }
+        results
+    }
+}
+
+async fn resolve_action_item(
+    state: &SharedState,
+    engine: &Engine,
+    session: &Session,
+    ctx: &ActionContext,
+    item: &Selection<'static, String>,
+    variables: &JsonMap<String, Json>,
+    headers: &HeaderMap,
+) -> Result<(String, Json), (StatusCode, Json)> {
+    let Selection::Field(field) = item else {
+        return Err(err(
+            "$",
+            "validation-failed",
+            "fragments are not supported on actions",
+        ));
+    };
+    let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
+    if field.name == "__typename" {
+        return Ok((
+            alias,
+            Json::String(if ctx.is_query {
+                "query_root".into()
+            } else {
+                "mutation_root".into()
+            }),
+        ));
+    }
+    let Some(action) = ctx.find(&field.name) else {
+        return Err(action_field_not_found(ctx, field));
+    };
+    if !action
+        .permissions
+        .iter()
+        .any(|permission| permission.role == session.role)
+    {
+        return Err(action_field_not_found(ctx, field));
+    }
+    let value = call_action(
+        state,
+        engine,
+        session,
+        action,
+        field,
+        variables,
+        headers,
+        &ctx.custom_types,
+    )
+    .await?;
+    Ok((alias, value))
+}
+
+fn action_field_not_found(
+    ctx: &ActionContext,
+    field: &Field<'static, String>,
+) -> (StatusCode, Json) {
+    err(
+        &format!("$.selectionSet.{}", field.name),
+        "validation-failed",
+        format!(
+            "field \"{}\" not found in type: '{}'",
+            field.name,
+            if ctx.is_query {
+                "query_root"
+            } else {
+                "mutation_root"
+            }
+        ),
+    )
 }
 
 /// Build the webhook payload, POST it, and shape the response.
@@ -206,6 +244,9 @@ async fn call_action(
 
     let url = resolve_url_template(&action.definition.handler);
     let mut req = state.http.post(&url).json(&payload);
+    if let Some(seconds) = action.definition.timeout {
+        req = req.timeout(std::time::Duration::from_secs(seconds));
+    }
     if action.definition.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
@@ -280,6 +321,34 @@ async fn call_action(
     Ok(shaped)
 }
 
+trait ActionRelationshipExecutor: Sync {
+    fn execute<'a>(
+        &'a self,
+        engine: &'a Engine,
+        session: &'a Session,
+        query: &'a str,
+        variables: &'a JsonMap<String, Json>,
+    ) -> BoxFuture<'a, Result<Json, Json>>;
+}
+
+struct StateActionRelationshipExecutor<'a> {
+    state: &'a SharedState,
+}
+
+impl ActionRelationshipExecutor for StateActionRelationshipExecutor<'_> {
+    fn execute<'a>(
+        &'a self,
+        engine: &'a Engine,
+        session: &'a Session,
+        query: &'a str,
+        variables: &'a JsonMap<String, Json>,
+    ) -> BoxFuture<'a, Result<Json, Json>> {
+        Box::pin(crate::gql::execute_select_internal(
+            self.state, engine, session, query, variables,
+        ))
+    }
+}
+
 /// Walk the shaped output alongside the raw webhook value, resolving any
 /// selected output-object relationship into its tracked table.
 fn fill_relationships<'a>(
@@ -293,119 +362,312 @@ fn fill_relationships<'a>(
     selection: &'a [Selection<'static, String>],
 ) -> BoxFuture<'a, Result<(), (StatusCode, Json)>> {
     Box::pin(async move {
-        if shaped.is_null() {
-            return Ok(());
-        }
-        match ty {
-            TypeRef::List { inner, .. } => {
-                if let (Json::Array(items), Json::Array(raws)) = (&mut *shaped, raw) {
-                    for (item, raw_item) in items.iter_mut().zip(raws.iter()) {
-                        fill_relationships(
-                            state,
-                            engine,
-                            session,
-                            custom_types,
-                            inner,
-                            item,
-                            raw_item,
-                            selection,
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
-            }
-            TypeRef::Named { name, .. } => {
-                let Some(obj) = custom_types.objects.iter().find(|o| &o.name == name) else {
-                    return Ok(());
-                };
-                for item in selection {
-                    let Selection::Field(field) = item else {
-                        continue;
-                    };
-                    let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
-
-                    if let Some(rel) = obj.relationships.iter().find(|r| r.name == field.name) {
-                        let resolved = resolve_relationship(
-                            state,
-                            engine,
-                            session,
-                            rel,
-                            raw,
-                            &field.selection_set,
-                        )
-                        .await?;
-                        if let Some(map) = shaped.as_object_mut() {
-                            map.insert(alias, resolved);
-                        }
-                        continue;
-                    }
-
-                    // A declared object/list field may itself contain
-                    // relationships further down (e.g. NestedJoinObject.user_id).
-                    if let Some(field_def) = obj.fields.iter().find(|f| f.name == field.name) {
-                        let ftype = parse_type(&field_def.type_);
-                        let raw_child = raw.get(&field.name).cloned().unwrap_or(Json::Null);
-                        if let Some(child) = shaped.get_mut(&alias) {
-                            fill_relationships(
-                                state,
-                                engine,
-                                session,
-                                custom_types,
-                                &ftype,
-                                child,
-                                &raw_child,
-                                &field.selection_set.items,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-        }
+        let executor = StateActionRelationshipExecutor { state };
+        fill_relationships_with(
+            &executor,
+            engine,
+            session,
+            custom_types,
+            ty,
+            shaped,
+            raw,
+            selection,
+        )
+        .await
     })
 }
 
-/// Resolve a single output-object relationship by querying its target table.
-async fn resolve_relationship(
-    state: &SharedState,
+struct ActionRelationshipEntry {
+    object_pointer: String,
+    filter: JsonMap<String, Json>,
+}
+
+struct ActionRelationshipGroup<'a> {
+    relationship: &'a CustomTypeRelationship,
+    selection: &'a SelectionSet<'static, String>,
+    selection_path: String,
+    field_alias: String,
+    entries: Vec<ActionRelationshipEntry>,
+}
+
+fn action_pointer_child(base: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{base}/{escaped}")
+}
+
+fn relationship_filter(rel: &CustomTypeRelationship, raw: &Json) -> JsonMap<String, Json> {
+    rel.field_mapping
+        .iter()
+        .map(|(output_field, remote_column)| {
+            (
+                remote_column.clone(),
+                json!({
+                    "_eq": raw.get(output_field).cloned().unwrap_or(Json::Null)
+                }),
+            )
+        })
+        .collect()
+}
+
+fn collect_action_relationship_groups<'a>(
+    custom_types: &'a CustomTypes,
+    ty: &TypeRef,
+    shaped: &Json,
+    raw: &Json,
+    selection: &'a [Selection<'static, String>],
+    object_pointer: &str,
+    selection_path: &str,
+    groups: &mut Vec<ActionRelationshipGroup<'a>>,
+) {
+    if shaped.is_null() {
+        return;
+    }
+    match ty {
+        TypeRef::List { inner, .. } => {
+            if let (Json::Array(items), Json::Array(raws)) = (shaped, raw) {
+                for (index, (item, raw_item)) in items.iter().zip(raws).enumerate() {
+                    collect_action_relationship_groups(
+                        custom_types,
+                        inner,
+                        item,
+                        raw_item,
+                        selection,
+                        &action_pointer_child(object_pointer, &index.to_string()),
+                        selection_path,
+                        groups,
+                    );
+                }
+            }
+        }
+        TypeRef::Named { name, .. } => {
+            let Some(object_type) = custom_types
+                .objects
+                .iter()
+                .find(|object| &object.name == name)
+            else {
+                return;
+            };
+            for item in selection {
+                let Selection::Field(field) = item else {
+                    continue;
+                };
+                let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
+                let field_path = format!("{selection_path}.{alias}");
+                if let Some(relationship) = object_type
+                    .relationships
+                    .iter()
+                    .find(|relationship| relationship.name == field.name)
+                {
+                    let entry = ActionRelationshipEntry {
+                        object_pointer: object_pointer.to_string(),
+                        filter: relationship_filter(relationship, raw),
+                    };
+                    if let Some(group) = groups.iter_mut().find(|group| {
+                        group.selection_path == field_path
+                            && group.relationship.name == relationship.name
+                            && group.relationship.remote_table == relationship.remote_table
+                    }) {
+                        group.entries.push(entry);
+                    } else {
+                        groups.push(ActionRelationshipGroup {
+                            relationship,
+                            selection: &field.selection_set,
+                            selection_path: field_path,
+                            field_alias: alias,
+                            entries: vec![entry],
+                        });
+                    }
+                    continue;
+                }
+
+                if let Some(field_definition) = object_type
+                    .fields
+                    .iter()
+                    .find(|definition| definition.name == field.name)
+                {
+                    let field_type = parse_type(&field_definition.type_);
+                    let raw_child = raw.get(&field.name).unwrap_or(&Json::Null);
+                    if let Some(shaped_child) = shaped.get(&alias) {
+                        collect_action_relationship_groups(
+                            custom_types,
+                            &field_type,
+                            shaped_child,
+                            raw_child,
+                            &field.selection_set.items,
+                            &action_pointer_child(object_pointer, &alias),
+                            &field_path,
+                            groups,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ActionRelationshipBatch {
+    query: String,
+    variables: JsonMap<String, Json>,
+    entry_to_unique: Vec<usize>,
+    unique_filters: Vec<JsonMap<String, Json>>,
+}
+
+fn build_action_relationship_batch(group: &ActionRelationshipGroup<'_>) -> ActionRelationshipBatch {
+    let mut unique_filters: Vec<JsonMap<String, Json>> = vec![];
+    let mut unique_indexes = std::collections::HashMap::<String, usize>::new();
+    let mut entry_to_unique = Vec::with_capacity(group.entries.len());
+    for entry in &group.entries {
+        let key = serde_json::to_string(&entry.filter)
+            .expect("action relationship filters always serialize");
+        if let Some(index) = unique_indexes.get(&key).copied() {
+            entry_to_unique.push(index);
+        } else {
+            let index = unique_filters.len();
+            unique_indexes.insert(key, index);
+            entry_to_unique.push(index);
+            unique_filters.push(entry.filter.clone());
+        }
+    }
+
+    let base = table_base_name(&group.relationship.remote_table);
+    let selection = render_selection(group.selection);
+    let mut definitions = Vec::with_capacity(unique_filters.len());
+    let mut roots = Vec::with_capacity(unique_filters.len());
+    let mut variables = JsonMap::new();
+    for (index, filter) in unique_filters.iter().enumerate() {
+        let variable = format!("__donat_action_rel_w_{index}");
+        let alias = format!("__donat_action_rel_{index}");
+        definitions.push(format!("${variable}: {base}_bool_exp"));
+        let limit = (group.relationship.type_ != "array")
+            .then_some(", limit: 1")
+            .unwrap_or("");
+        roots.push(format!(
+            "{alias}: {base}(where: ${variable}{limit}) {selection}"
+        ));
+        variables.insert(variable, Json::Object(filter.clone()));
+    }
+    ActionRelationshipBatch {
+        query: format!(
+            "query({}) {{ {} }}",
+            definitions.join(", "),
+            roots.join(" ")
+        ),
+        variables,
+        entry_to_unique,
+        unique_filters,
+    }
+}
+
+async fn execute_action_relationship_group<E: ActionRelationshipExecutor + ?Sized>(
+    executor: &E,
     engine: &Engine,
     session: &Session,
-    rel: &CustomTypeRelationship,
-    raw: &Json,
-    selection: &SelectionSet<'static, String>,
-) -> Result<Json, (StatusCode, Json)> {
-    let base = table_base_name(&rel.remote_table);
-    // Build `where: { <remote_col>: { _eq: <row value> }, ... }` from the
-    // mapping (output-object field -> remote table column).
-    let mut where_map = serde_json::Map::new();
-    for (out_field, remote_col) in &rel.field_mapping {
-        let value = raw.get(out_field).cloned().unwrap_or(Json::Null);
-        where_map.insert(remote_col.clone(), json!({ "_eq": value }));
-    }
-    let is_array = rel.type_ == "array";
-    let selset = render_selection(selection);
-    let query = if is_array {
-        format!("query($w: {base}_bool_exp){{ {base}(where: $w) {selset} }}")
-    } else {
-        format!("query($w: {base}_bool_exp){{ {base}(where: $w, limit: 1) {selset} }}")
+    group: &ActionRelationshipGroup<'_>,
+) -> Result<Vec<Json>, (StatusCode, Json)> {
+    let batch = build_action_relationship_batch(group);
+    let is_array = group.relationship.type_ == "array";
+    let shape_rows = |rows: Json| {
+        if is_array {
+            rows
+        } else {
+            rows.as_array()
+                .and_then(|items| items.first().cloned())
+                .unwrap_or(Json::Null)
+        }
     };
-    let mut vars = JsonMap::new();
-    vars.insert("w".into(), Json::Object(where_map));
-
-    let data = crate::gql::execute_select_internal(state, engine, session, &query, &vars)
+    let unique_values = match executor
+        .execute(engine, session, &batch.query, &batch.variables)
         .await
-        .map_err(|e| (StatusCode::OK, e))?;
-    let rows = data.get(&base).cloned().unwrap_or(Json::Null);
-    if is_array {
-        Ok(rows)
-    } else {
-        Ok(rows
-            .as_array()
-            .and_then(|a| a.first().cloned())
-            .unwrap_or(Json::Null))
-    }
+    {
+        Ok(data) => (0..batch.unique_filters.len())
+            .map(|index| {
+                shape_rows(
+                    data.get(&format!("__donat_action_rel_{index}"))
+                        .cloned()
+                        .unwrap_or(Json::Null),
+                )
+            })
+            .collect(),
+        Err(_) => {
+            // Recover the pre-batching error shape/path deterministically.
+            let base = table_base_name(&group.relationship.remote_table);
+            let selection = render_selection(group.selection);
+            let limit = if is_array { "" } else { ", limit: 1" };
+            let query =
+                format!("query($w: {base}_bool_exp) {{ {base}(where: $w{limit}) {selection} }}");
+            let mut values = Vec::with_capacity(batch.unique_filters.len());
+            for filter in &batch.unique_filters {
+                let variables = JsonMap::from_iter([("w".into(), Json::Object(filter.clone()))]);
+                let data = executor
+                    .execute(engine, session, &query, &variables)
+                    .await
+                    .map_err(|error| (StatusCode::OK, error))?;
+                values.push(shape_rows(data.get(&base).cloned().unwrap_or(Json::Null)));
+            }
+            values
+        }
+    };
+    Ok(batch
+        .entry_to_unique
+        .into_iter()
+        .map(|index| unique_values[index].clone())
+        .collect())
+}
+
+fn fill_relationships_with<'a, E: ActionRelationshipExecutor + ?Sized>(
+    executor: &'a E,
+    engine: &'a Engine,
+    session: &'a Session,
+    custom_types: &'a CustomTypes,
+    ty: &'a TypeRef,
+    shaped: &'a mut Json,
+    raw: &'a Json,
+    selection: &'a [Selection<'static, String>],
+) -> BoxFuture<'a, Result<(), (StatusCode, Json)>> {
+    Box::pin(async move {
+        let mut groups = vec![];
+        collect_action_relationship_groups(
+            custom_types,
+            ty,
+            shaped,
+            raw,
+            selection,
+            "",
+            "$",
+            &mut groups,
+        );
+        // Groups target independent relationship selections. Bound their
+        // internal reads to avoid serial latency without turning a wide action
+        // response into an unbounded burst. Results are reapplied in client
+        // order so an error keeps the sequential implementation's observable
+        // precedence.
+        let work = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| async move {
+                (
+                    index,
+                    execute_action_relationship_group(executor, engine, session, group).await,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut results = futures_util::stream::iter(work)
+            .buffer_unordered(MAX_CONCURRENT_ACTION_RELATIONSHIP_GROUPS)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_by_key(|(index, _)| *index);
+
+        for (group, (_, result)) in groups.iter().zip(results) {
+            let values = result?;
+            for (entry, value) in group.entries.iter().zip(values) {
+                let Some(Json::Object(object)) = shaped.pointer_mut(&entry.object_pointer) else {
+                    continue;
+                };
+                object.insert(group.field_alias.clone(), value);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// The GraphQL base name of a table: bare name for `public`, else
@@ -672,6 +934,11 @@ fn err(path: &str, code: &str, message: impl Into<String>) -> (StatusCode, Json)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use donat_metadata::{CustomTypeField, ObjectType};
 
@@ -914,5 +1181,264 @@ mod tests {
         };
         let out = validate(&ct, &parse_type("UserId"), &json!({ "id": 1 }), &sel).unwrap();
         assert_eq!(out, json!({ "id": 1, "user": null }));
+    }
+
+    struct RecordingRelationshipExecutor {
+        calls: AtomicUsize,
+    }
+
+    impl ActionRelationshipExecutor for RecordingRelationshipExecutor {
+        fn execute<'a>(
+            &'a self,
+            _engine: &'a Engine,
+            _session: &'a Session,
+            _query: &'a str,
+            variables: &'a JsonMap<String, Json>,
+        ) -> BoxFuture<'a, Result<Json, Json>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let mut data = JsonMap::new();
+                for (name, value) in variables {
+                    let Some(index) = name.strip_prefix("__donat_action_rel_w_") else {
+                        continue;
+                    };
+                    let id = value.pointer("/id/_eq").cloned().unwrap_or(Json::Null);
+                    data.insert(format!("__donat_action_rel_{index}"), json!([{ "id": id }]));
+                }
+                if data.is_empty() {
+                    let id = variables
+                        .get("w")
+                        .and_then(|value| value.pointer("/id/_eq"))
+                        .cloned()
+                        .unwrap_or(Json::Null);
+                    data.insert("user".into(), json!([{ "id": id }]));
+                }
+                Ok(Json::Object(data))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_action_relationships_execute_one_batched_query() {
+        use std::collections::BTreeMap;
+
+        let custom_types = CustomTypes {
+            objects: vec![ObjectType {
+                name: "Out".into(),
+                fields: vec![CustomTypeField {
+                    name: "id".into(),
+                    type_: "Int!".into(),
+                    description: None,
+                }],
+                relationships: vec![CustomTypeRelationship {
+                    name: "user".into(),
+                    type_: "object".into(),
+                    remote_table: QualifiedTable::Name("user".into()),
+                    field_mapping: BTreeMap::from([("id".into(), "id".into())]),
+                }],
+                description: None,
+            }],
+            ..Default::default()
+        };
+        let doc = graphql_parser::parse_query::<String>("{ lookup { id user { id } } }")
+            .unwrap()
+            .into_static();
+        let selection = match &doc.definitions[0] {
+            Definition::Operation(OperationDefinition::SelectionSet(root)) => {
+                let Selection::Field(action) = &root.items[0] else {
+                    unreachable!()
+                };
+                action.selection_set.items.as_slice()
+            }
+            _ => unreachable!(),
+        };
+        let mut shaped = json!([
+            { "id": 7, "user": null },
+            { "id": 7, "user": null },
+            { "id": 8, "user": null }
+        ]);
+        let raw = shaped.clone();
+        let executor = RecordingRelationshipExecutor {
+            calls: AtomicUsize::new(0),
+        };
+        let engine = Engine::bootstrap(
+            serde_json::from_value(json!({ "version": 3, "sources": [] })).unwrap(),
+        );
+        let session = Session {
+            role: "user".into(),
+            vars: Default::default(),
+            backend_request: false,
+        };
+        let ty = parse_type("[Out]");
+
+        fill_relationships_with(
+            &executor,
+            &engine,
+            &session,
+            &custom_types,
+            &ty,
+            &mut shaped,
+            &raw,
+            selection,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shaped,
+            json!([
+                { "id": 7, "user": { "id": 7 } },
+                { "id": 7, "user": { "id": 7 } },
+                { "id": 8, "user": { "id": 8 } }
+            ])
+        );
+    }
+
+    struct BarrierRelationshipExecutor {
+        barrier: Arc<tokio::sync::Barrier>,
+        calls: AtomicUsize,
+    }
+
+    impl ActionRelationshipExecutor for BarrierRelationshipExecutor {
+        fn execute<'a>(
+            &'a self,
+            _engine: &'a Engine,
+            _session: &'a Session,
+            _query: &'a str,
+            variables: &'a JsonMap<String, Json>,
+        ) -> BoxFuture<'a, Result<Json, Json>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.barrier.wait().await;
+                let mut data = JsonMap::new();
+                for (name, value) in variables {
+                    let Some(index) = name.strip_prefix("__donat_action_rel_w_") else {
+                        continue;
+                    };
+                    let id = value.pointer("/id/_eq").cloned().unwrap_or(Json::Null);
+                    data.insert(format!("__donat_action_rel_{index}"), json!([{ "id": id }]));
+                }
+                Ok(Json::Object(data))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_action_relationship_groups_run_concurrently() {
+        use std::collections::BTreeMap;
+
+        let mapping = BTreeMap::from([("id".into(), "id".into())]);
+        let custom_types = CustomTypes {
+            objects: vec![ObjectType {
+                name: "Out".into(),
+                fields: vec![CustomTypeField {
+                    name: "id".into(),
+                    type_: "Int!".into(),
+                    description: None,
+                }],
+                relationships: vec![
+                    CustomTypeRelationship {
+                        name: "user".into(),
+                        type_: "object".into(),
+                        remote_table: QualifiedTable::Name("user".into()),
+                        field_mapping: mapping.clone(),
+                    },
+                    CustomTypeRelationship {
+                        name: "account".into(),
+                        type_: "object".into(),
+                        remote_table: QualifiedTable::Name("account".into()),
+                        field_mapping: mapping,
+                    },
+                ],
+                description: None,
+            }],
+            ..Default::default()
+        };
+        let doc =
+            graphql_parser::parse_query::<String>("{ lookup { id user { id } account { id } } }")
+                .unwrap()
+                .into_static();
+        let selection = match &doc.definitions[0] {
+            Definition::Operation(OperationDefinition::SelectionSet(root)) => {
+                let Selection::Field(action) = &root.items[0] else {
+                    unreachable!()
+                };
+                action.selection_set.items.as_slice()
+            }
+            _ => unreachable!(),
+        };
+        let mut shaped = json!({ "id": 7, "user": null, "account": null });
+        let raw = shaped.clone();
+        let executor = BarrierRelationshipExecutor {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            calls: AtomicUsize::new(0),
+        };
+        let engine = Engine::bootstrap(
+            serde_json::from_value(json!({ "version": 3, "sources": [] })).unwrap(),
+        );
+        let session = Session {
+            role: "user".into(),
+            vars: Default::default(),
+            backend_request: false,
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fill_relationships_with(
+                &executor,
+                &engine,
+                &session,
+                &custom_types,
+                &parse_type("Out"),
+                &mut shaped,
+                &raw,
+                selection,
+            ),
+        )
+        .await
+        .expect("independent groups do not serialize")
+        .expect("relationship groups resolve");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            shaped,
+            json!({
+                "id": 7,
+                "user": { "id": 7 },
+                "account": { "id": 7 },
+            })
+        );
+    }
+
+    async fn observe_concurrency(active: Arc<AtomicUsize>, maximum: Arc<AtomicUsize>) {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn query_actions_run_concurrently_but_mutations_remain_sequential() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        schedule_action_items(
+            true,
+            (0..3)
+                .map(|_| observe_concurrency(active.clone(), maximum.clone()))
+                .collect(),
+        )
+        .await;
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+
+        maximum.store(0, Ordering::SeqCst);
+        schedule_action_items(
+            false,
+            (0..3)
+                .map(|_| observe_concurrency(active.clone(), maximum.clone()))
+                .collect(),
+        )
+        .await;
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 }

@@ -4,7 +4,7 @@
 //! remote schema (per its SDL document), the whole request is validated
 //! against that document and forwarded to the remote GraphQL server.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use graphql_parser::query::{
@@ -15,7 +15,30 @@ use serde_json::{Value as Json, json};
 
 use donat_schema::Session;
 
-use crate::state::AppState;
+use crate::state::{AppState, Engine};
+
+pub(crate) type CompiledRemoteSchemas = HashMap<(String, String), Arc<SDoc<'static, String>>>;
+
+pub(crate) fn compile_permission_schemas(
+    metadata: &donat_metadata::Metadata,
+) -> CompiledRemoteSchemas {
+    metadata
+        .remote_schemas
+        .iter()
+        .flat_map(|schema| {
+            schema.permissions.iter().filter_map(move |permission| {
+                graphql_parser::parse_schema::<String>(&permission.definition.schema)
+                    .ok()
+                    .map(|document| {
+                        (
+                            (schema.name.clone(), permission.role.clone()),
+                            Arc::new(document.into_static()),
+                        )
+                    })
+            })
+        })
+        .collect()
+}
 
 fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
@@ -29,6 +52,7 @@ fn is_session_var_name(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-hasura-"))
 }
 
+#[derive(Clone)]
 pub struct RemoteTarget {
     pub url: String,
     pub forward_client_headers: bool,
@@ -40,24 +64,26 @@ pub struct RemoteTarget {
     /// root_fields_namespace: the forwarded response gets wrapped back
     /// under this key.
     pub namespace: Option<String>,
+    /// Per-request upstream deadline from remote-schema metadata.
+    pub timeout_seconds: Option<u64>,
 }
 
 /// If the operation is aimed at a permitted remote schema, validate it
 /// against the role's SDL and return the forwarding target. `None` means
 /// "not a remote operation".
 pub fn match_remote<'m>(
-    metadata: &'m donat_metadata::Metadata,
+    engine: &'m Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
 ) -> Option<Result<RemoteTarget, crate::gql::GqlError>> {
-    match_remote_with(metadata, session, doc, variables, false)
+    match_remote_with(engine, session, doc, variables, false)
 }
 
 /// `internal` requests (remote-relationship joins) may set arguments that
 /// carry @preset (they are server-built, not client input).
 pub fn match_remote_with<'m>(
-    metadata: &'m donat_metadata::Metadata,
+    engine: &'m Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -96,7 +122,7 @@ pub fn match_remote_with<'m>(
     }
 
     let mut decustomized_storage: Option<QDoc<'static, String>> = None;
-    for schema in &metadata.remote_schemas {
+    for schema in &engine.metadata.remote_schemas {
         let Some(permission) = schema.permissions.iter().find(|p| p.role == session.role) else {
             continue;
         };
@@ -138,12 +164,14 @@ pub fn match_remote_with<'m>(
         if root_fields.is_empty() {
             continue;
         }
-        let Ok(sdl) = graphql_parser::parse_schema::<String>(&permission.definition.schema) else {
+        let Some(sdl) = engine
+            .remote_permission_schemas
+            .get(&(schema.name.clone(), permission.role.clone()))
+        else {
             continue;
         };
-        let sdl = sdl.into_static();
-        let types = type_map(&sdl);
-        let Some(query_type) = root_type_name(&sdl, &types) else {
+        let types = type_map(sdl);
+        let Some(query_type) = root_type_name(sdl, &types) else {
             continue;
         };
         // All data root fields must exist on the permitted Query type.
@@ -215,6 +243,7 @@ pub fn match_remote_with<'m>(
                 .or_else(|| decustomized_storage.as_ref().map(|d| format!("{d}"))),
             has_introspection,
             namespace,
+            timeout_seconds: schema.definition.timeout_seconds,
         }));
     }
     None
@@ -755,6 +784,9 @@ pub async fn forward(
         payload["query"] = Json::String(query.clone());
     }
     let mut request = state.http.post(&target.url).json(&payload);
+    if let Some(seconds) = target.timeout_seconds {
+        request = request.timeout(std::time::Duration::from_secs(seconds));
+    }
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();

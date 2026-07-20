@@ -15,7 +15,7 @@ use axum::http::HeaderMap;
 use donat_metadata::Metadata;
 use donat_schema::Session;
 use donat_server::gql;
-use donat_server::state::{AppState, Engine};
+use donat_server::state::{AppState, Engine, SourceRuntime};
 use mysql::prelude::Queryable;
 use serde_json::json;
 
@@ -110,6 +110,8 @@ fn app_state(db_url: &str) -> Arc<AppState> {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     })
 }
 
@@ -149,5 +151,34 @@ async fn mysql_source_served_through_runtime() {
             { "id": 3, "name": "Carol" },
         ]}}),
         "unexpected response body: {body}"
+    );
+
+    let pool = match state
+        .engine_snapshot()
+        .await
+        .runtimes
+        .get("default")
+        .cloned()
+    {
+        Some(SourceRuntime::Mysql { pool, .. }) => pool,
+        _ => panic!("mysql runtime expected"),
+    };
+    let mut first = pool.get_conn().expect("first pooled checkout");
+    let (first_id, sql_mode, group_concat_max_len): (u64, String, u64) = first
+        .query_first("SELECT CONNECTION_ID(), @@SESSION.sql_mode, @@SESSION.group_concat_max_len")
+        .expect("read initialized session")
+        .expect("session row");
+    assert!(sql_mode.split(',').any(|mode| mode == "ANSI_QUOTES"));
+    assert_eq!(group_concat_max_len, 4_294_967_295);
+    drop(first);
+
+    let mut second = pool.get_conn().expect("second pooled checkout");
+    let second_id: u64 = second
+        .query_first("SELECT CONNECTION_ID()")
+        .expect("read connection id")
+        .expect("connection id row");
+    assert_eq!(
+        second_id, first_id,
+        "ordinary checkouts should reuse the initialized physical connection"
     );
 }

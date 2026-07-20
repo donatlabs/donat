@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PERF_MIXED_DATABASE_URL:?PERF_MIXED_DATABASE_URL is required}"
+: "${PERF_MIXED_METADATA_DIR:?PERF_MIXED_METADATA_DIR is required}"
+: "${PERF_MIXED_QUERY:?PERF_MIXED_QUERY is required}"
+
+BACKEND=mixed \
+  PERF_DATABASE_URL="${PERF_MIXED_DATABASE_URL}" \
+  PERF_METADATA_DIR="${PERF_MIXED_METADATA_DIR}" \
+  PERF_QUERY="${PERF_MIXED_QUERY}" \
+  benchmarks/perf/run.sh

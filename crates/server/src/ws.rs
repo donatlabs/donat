@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,6 +21,26 @@ use crate::gql;
 use crate::state::SharedState;
 
 type Sender = Arc<Mutex<SplitSink<WebSocket, Message>>>;
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100;
+const SUBSCRIPTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+static NEXT_SUBSCRIPTION_POLL_PHASE: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveSubscription {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn subscription_poll_phase(sequence: u64) -> std::time::Duration {
+    // The multiplier is coprime with 1,000, so consecutive subscriptions are
+    // distributed over the entire one-second polling interval rather than
+    // waking in a synchronized burst.
+    std::time::Duration::from_millis(sequence.wrapping_mul(618_033) % 1_000)
+}
+
+async fn acquire_subscription_poll_permit(
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    permits.acquire_owned().await.ok()
+}
 
 pub async fn upgrade(State(state): State<SharedState>, ws: WebSocketUpgrade) -> Response {
     ws.protocols(["graphql-ws"])
@@ -43,10 +64,11 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
     let (sink, mut stream) = socket.split();
     let sender: Sender = Arc::new(Mutex::new(sink));
     let mut session_headers = HeaderMap::new();
-    let mut subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut subscriptions: HashMap<String, ActiveSubscription> = HashMap::new();
     let mut expiry_task: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(Ok(message)) = stream.next().await {
+        subscriptions.retain(|_, subscription| !subscription.handle.is_finished());
         let text = match message {
             Message::Text(text) => text.to_string(),
             Message::Ping(_) | Message::Pong(_) => continue,
@@ -119,17 +141,85 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                     }
                 };
 
-                if is_subscription(&payload) {
+                if let Some(subscription_doc) = subscription_document(&payload) {
                     // Live query: poll and push on change.
                     let id_key = id.as_str().unwrap_or_default().to_string();
+                    if let Some(old) = subscriptions.remove(&id_key) {
+                        old.handle.abort();
+                        let _ = old.handle.await;
+                    }
+                    if subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        let _ = send(
+                            &sender,
+                            json!({
+                                "type": "data",
+                                "id": id,
+                                "payload": {
+                                    "errors": [{
+                                        "extensions": { "path": "$", "code": "unexpected" },
+                                        "message": "subscription limit exceeded"
+                                    }]
+                                }
+                            }),
+                        )
+                        .await;
+                        let _ = send(&sender, json!({ "type": "complete", "id": id })).await;
+                        continue;
+                    }
+                    let permit = match state.subscription_permits.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let _ = send(
+                                &sender,
+                                json!({
+                                    "type": "data",
+                                    "id": id,
+                                    "payload": {
+                                        "errors": [{
+                                            "extensions": { "path": "$", "code": "unexpected" },
+                                            "message": "server subscription capacity exhausted"
+                                        }]
+                                    }
+                                }),
+                            )
+                            .await;
+                            let _ = send(&sender, json!({ "type": "complete", "id": id })).await;
+                            continue;
+                        }
+                    };
                     let state = state.clone();
+                    let poll_permits = state.subscription_poll_permits.clone();
+                    let initial_poll_delay = subscription_poll_phase(
+                        NEXT_SUBSCRIPTION_POLL_PHASE.fetch_add(1, Ordering::Relaxed),
+                    );
                     let sender_task = sender.clone();
                     let id_task = id.clone();
                     let handle = tokio::spawn(async move {
+                        // Keep the process-wide slot with the task itself so
+                        // it is released immediately on normal exit or abort.
+                        let _permit = permit;
                         let mut last: Option<Json> = None;
+                        tokio::time::sleep(initial_poll_delay).await;
                         loop {
-                            let response =
-                                gql::execute_with(&state, &session, &payload, relay).await.1;
+                            // Only an individual poll holds this permit. A
+                            // long-lived subscription therefore cannot occupy
+                            // a backend execution slot while it sleeps.
+                            let Some(poll_permit) =
+                                acquire_subscription_poll_permit(poll_permits.clone()).await
+                            else {
+                                break;
+                            };
+                            let response = gql::execute_preparsed_full(
+                                &state,
+                                &session,
+                                &payload,
+                                relay,
+                                &HeaderMap::new(),
+                                &subscription_doc,
+                            )
+                            .await
+                            .1;
+                            drop(poll_permit);
                             if last.as_ref() != Some(&response) {
                                 last = Some(response.clone());
                                 if send(
@@ -142,12 +232,10 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
                                     break;
                                 }
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            tokio::time::sleep(SUBSCRIPTION_POLL_INTERVAL).await;
                         }
                     });
-                    if let Some(old) = subscriptions.insert(id_key, handle) {
-                        old.abort();
-                    }
+                    subscriptions.insert(id_key, ActiveSubscription { handle });
                 } else {
                     let response = gql::execute_with(&state, &session, &payload, relay).await.1;
                     if send(
@@ -165,7 +253,7 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
             Some("stop") => match frame.get("id").and_then(Json::as_str) {
                 Some(id) => {
                     if let Some(task) = subscriptions.remove(id) {
-                        task.abort();
+                        task.handle.abort();
                     }
                 }
                 None => {
@@ -198,33 +286,43 @@ async fn serve(state: SharedState, socket: WebSocket, relay: bool) {
     }
 
     for (_, task) in subscriptions {
-        task.abort();
+        task.handle.abort();
     }
     if let Some(task) = expiry_task {
         task.abort();
     }
 }
 
+#[cfg(test)]
 fn is_subscription(payload: &Json) -> bool {
+    subscription_document(payload).is_some()
+}
+
+fn subscription_document(
+    payload: &Json,
+) -> Option<graphql_parser::query::Document<'static, String>> {
     let Some(query) = payload.get("query").and_then(Json::as_str) else {
-        return false;
+        return None;
     };
     // Don't parse a too-deep query here (would overflow); execute_with will
     // reject it with the depth error.
     if gql::query_too_deep(query) {
-        return false;
+        return None;
     }
-    let Ok(doc) = graphql_parser::parse_query::<String>(query) else {
-        return false;
-    };
-    doc.definitions.iter().any(|d| {
-        matches!(
-            d,
-            graphql_parser::query::Definition::Operation(
-                graphql_parser::query::OperationDefinition::Subscription(_)
+    let doc = graphql_parser::parse_query::<String>(query)
+        .ok()?
+        .into_static();
+    doc.definitions
+        .iter()
+        .any(|d| {
+            matches!(
+                d,
+                graphql_parser::query::Definition::Operation(
+                    graphql_parser::query::OperationDefinition::Subscription(_)
+                )
             )
-        )
-    })
+        })
+        .then_some(doc)
 }
 
 #[cfg(test)]
@@ -257,5 +355,37 @@ mod tests {
         assert!(!is_subscription(&json!({})));
         assert!(!is_subscription(&json!({ "query": 5 })));
         assert!(!is_subscription(&json!({ "query": "not graphql {" })));
+    }
+
+    #[test]
+    fn subscription_poll_phases_cover_the_polling_interval() {
+        let mut phases: Vec<_> = (0..1_000)
+            .map(subscription_poll_phase)
+            .map(|phase| phase.as_millis())
+            .collect();
+        phases.sort_unstable();
+        phases.dedup();
+        assert_eq!(phases.len(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn subscription_poll_permit_bounds_only_poll_execution() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = acquire_subscription_poll_permit(permits.clone())
+            .await
+            .expect("first poll acquires the permit");
+        let waiter = tokio::spawn(acquire_subscription_poll_permit(permits.clone()));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+                .await
+                .is_err(),
+            "another poll must wait without consuming an active subscription slot"
+        );
+        drop(held);
+        let permit = acquire_subscription_poll_permit(permits)
+            .await
+            .expect("next poll acquires after execution finishes");
+        drop(permit);
     }
 }

@@ -657,7 +657,15 @@ impl Ctx {
                     FieldValue::NestedConnection { conn } => {
                         self.connection_expr(conn, Some((&conn.join, table_alias)))
                     }
-                    FieldValue::RemoteJoin { .. } => "NULL::json".to_string(),
+                    // The placeholder is replaced after the source query by
+                    // the remote-join resolver. PostgreSQL needs the JSON
+                    // cast to keep `json_build_object` typed; the portable
+                    // backends accept a plain SQL NULL in their JSON object
+                    // builders and reject PostgreSQL's `::json` syntax.
+                    FieldValue::RemoteJoin { .. } => match dialect {
+                        donat_backend::AnyDialect::Postgres(_) => "NULL::json".to_string(),
+                        _ => "NULL".to_string(),
+                    },
                     FieldValue::ComputedScalar {
                         schema,
                         name,
@@ -2243,6 +2251,45 @@ mod dialect_dispatch_tests {
                 query: query(false),
             },
         ]
+    }
+
+    #[test]
+    fn remote_join_placeholder_uses_portable_null_outside_postgres() {
+        let query = SelectQuery {
+            from: FromSource::Table(Table {
+                schema: "public".into(),
+                name: "author".into(),
+            }),
+            fields: vec![OutputField {
+                alias: "joined".into(),
+                value: FieldValue::RemoteJoin {
+                    spec: RemoteJoinSpec {
+                        schema: "remote".into(),
+                        query: "query { message { name } }".into(),
+                        variables: vec![],
+                        root_field: "message".into(),
+                    },
+                },
+            }],
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+            nodes_limit: None,
+            offset: None,
+            distinct_on: vec![],
+            single: false,
+        };
+        let roots = [RootField::Select {
+            alias: "authors".into(),
+            query,
+        }];
+
+        let postgres = operation_to_sql_with(&roots, AnyDialect::Postgres(PostgresDialect));
+        let sqlite = operation_to_sql_with(&roots, AnyDialect::Sqlite(SqliteDialect));
+
+        assert!(postgres.contains("NULL::json"), "{postgres}");
+        assert!(sqlite.contains("'joined', NULL"), "{sqlite}");
+        assert!(!sqlite.contains("::json"), "{sqlite}");
     }
 
     #[test]

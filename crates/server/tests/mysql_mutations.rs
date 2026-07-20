@@ -138,6 +138,8 @@ fn app_state(db_url: &str) -> Arc<AppState> {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
     })
 }
 
