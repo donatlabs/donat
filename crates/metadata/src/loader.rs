@@ -39,6 +39,8 @@ pub enum LoadError {
     IncludeCycle { path: PathBuf },
     #[error("unsupported metadata version {0} (only version 3 is supported)")]
     UnsupportedVersion(u32),
+    #[error("invalid MCP metadata in {path}: {message}")]
+    Mcp { path: PathBuf, message: String },
 }
 
 /// Load and fully resolve a metadata directory.
@@ -65,12 +67,13 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
     // which has two top-level keys: `actions:` (a list) and `custom_types:`
     // (a mapping). Both are optional. This mirrors the donat-cli export.
     let (actions, custom_types) = load_actions(dir)?;
+    let mcp = load_mcp(dir)?;
 
     // Optional top-level sections, in the Donat v3 export layout. Each file
     // is a list (with `!include` allowed); absent files mean "none". This is
     // what lets the whole metadata surface boot from the filesystem with no
     // runtime admin/metadata API.
-    Ok(Metadata {
+    let metadata = Metadata {
         version: version.version,
         sources,
         inherited_roles: load_section(dir, "inherited_roles.yaml")?,
@@ -81,7 +84,160 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         custom_types,
         cron_triggers: load_section(dir, "cron_triggers.yaml")?,
         rest_endpoints: load_section(dir, "rest_endpoints.yaml")?,
-    })
+        mcp,
+    };
+    validate_mcp_references(&metadata).map_err(|message| LoadError::Mcp {
+        path: dir.join("mcp.yaml"),
+        message,
+    })?;
+    Ok(metadata)
+}
+
+/// Load the optional MCP presentation layer. Unlike the other top-level
+/// sections this file is a mapping, not a list, so it gets a dedicated loader.
+fn load_mcp(dir: &Path) -> Result<crate::types::McpMetadata, LoadError> {
+    let path = dir.join("mcp.yaml");
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let value = load_yaml_resolved(&path)?;
+    let mut mcp: crate::types::McpMetadata = if value.is_null() {
+        Default::default()
+    } else {
+        serde_yaml::from_value(value).map_err(|source| LoadError::Yaml {
+            path: path.clone(),
+            source,
+        })?
+    };
+    // Presence switches MCP into the explicit publication mode even when the
+    // mapping is empty. An operator may deliberately use an empty mapping to
+    // publish no tools.
+    mcp.mark_configured();
+    validate_mcp(&mcp).map_err(|message| LoadError::Mcp { path, message })?;
+    Ok(mcp)
+}
+
+fn validate_mcp(mcp: &crate::types::McpMetadata) -> Result<(), String> {
+    if mcp.resources.schema.enabled {
+        return Err("MCP schema resources are not supported".to_string());
+    }
+    let mut names = HashSet::new();
+    for tool in &mcp.tools {
+        if tool.name.is_empty() {
+            return Err("tool name must not be empty".to_string());
+        }
+        if !names.insert(tool.name.as_str()) {
+            return Err(format!("duplicate tool name '{}'", tool.name));
+        }
+        let source_count = usize::from(tool.source.saved_query.is_some())
+            + usize::from(tool.source.action.is_some());
+        if source_count != 1 {
+            return Err(format!(
+                "tool '{}' must declare exactly one of source.saved_query or source.action",
+                tool.name
+            ));
+        }
+        if tool.permissions.is_empty() {
+            return Err(format!("tool '{}' must declare at least one role", tool.name));
+        }
+    }
+    for table_tool in &mcp.table_tools {
+        for operation in &table_tool.operations {
+            if operation.name.is_empty() {
+                return Err("table tool name must not be empty".to_string());
+            }
+            if !names.insert(operation.name.as_str()) {
+                return Err(format!("duplicate tool name '{}'", operation.name));
+            }
+            if operation.permissions.is_empty() {
+                return Err(format!(
+                    "table tool '{}' must declare at least one role",
+                    operation.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the publication layer names real GraphQL entrypoints before
+/// booting the server. Publishing a broken tool is worse than rejecting the
+/// deployment because MCP clients discover it before they can learn it fails.
+fn validate_mcp_references(metadata: &Metadata) -> Result<(), String> {
+    for tool in &metadata.mcp.tools {
+        if let Some(source) = &tool.source.saved_query {
+            let found = metadata
+                .query_collections
+                .iter()
+                .find(|collection| collection.name == source.collection)
+                .is_some_and(|collection| {
+                    collection
+                        .definition
+                        .queries
+                        .iter()
+                        .any(|query| query.name == source.query)
+                });
+            if !found {
+                return Err(format!(
+                    "tool '{}' references unknown saved query '{}.{}'",
+                    tool.name, source.collection, source.query
+                ));
+            }
+        }
+        if let Some(action_name) = &tool.source.action {
+            let Some(action) = metadata.actions.iter().find(|action| action.name == *action_name)
+            else {
+                return Err(format!(
+                    "tool '{}' references unknown action '{}'",
+                    tool.name, action_name
+                ));
+            };
+            if action_output_has_relationships(
+                &metadata.custom_types,
+                &action.definition.output_type,
+                &mut HashSet::new(),
+            ) {
+                return Err(format!(
+                    "tool '{}' references action '{}' with unsupported output relationships",
+                    tool.name, action_name
+                ));
+            }
+        }
+    }
+    for table_tool in &metadata.mcp.table_tools {
+        let tracked = metadata.sources.iter().flat_map(|source| &source.tables).any(|entry| {
+            entry.table.schema() == table_tool.table.schema()
+                && entry.table.name() == table_tool.table.name()
+        });
+        if !tracked {
+            return Err(format!(
+                "MCP table tool references untracked table '{}.{}'",
+                table_tool.table.schema(),
+                table_tool.table.name()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn action_output_has_relationships(
+    custom_types: &crate::types::CustomTypes,
+    type_: &str,
+    ancestors: &mut HashSet<String>,
+) -> bool {
+    let name = type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
+    let Some(object) = custom_types.objects.iter().find(|object| object.name == name) else {
+        return false;
+    };
+    if !ancestors.insert(object.name.clone()) {
+        return false;
+    }
+    let has_relationship = !object.relationships.is_empty()
+        || object.fields.iter().any(|field| {
+            action_output_has_relationships(custom_types, &field.type_, ancestors)
+        });
+    ancestors.remove(&object.name);
+    has_relationship
 }
 
 /// Load `actions.yaml`, which carries both the action list and the custom

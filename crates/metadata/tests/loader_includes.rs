@@ -265,6 +265,169 @@ fn top_level_sections_absent_default_to_empty() {
     assert!(md.query_collections.is_empty());
     assert!(md.allowlist.is_empty());
     assert!(md.remote_schemas.is_empty());
+    assert!(md.mcp.is_empty());
+    assert!(!md.mcp.is_configured());
+}
+
+#[test]
+fn mcp_metadata_loads_from_its_own_file() {
+    let dir = base_dir("mcp");
+    write(
+        &dir,
+        "query_collections.yaml",
+        "\
+- name: agent
+  definition:
+    queries:
+      - name: AuthorById
+        query: \"query { author { id } }\"
+",
+    );
+    write(&dir, "mcp.yaml", r#"
+tools:
+  - name: author.lookup
+    title: Find author
+    description: Find an author by id.
+    source:
+      saved_query:
+        collection: agent
+        query: AuthorById
+    permissions: [user]
+    arguments:
+      id: Author identifier.
+table_tools:
+  - table: { schema: public, name: author }
+    operations:
+      - operation: query
+        name: author.list
+        description: List authors.
+        permissions: [user]
+"#);
+    let md = load_metadata_dir(&dir).expect("metadata should load");
+    assert_eq!(md.mcp.tools[0].name, "author.lookup");
+    assert_eq!(md.mcp.table_tools[0].operations[0].name, "author.list");
+    assert!(md.mcp.is_configured());
+}
+
+#[test]
+fn empty_mcp_file_is_an_explicit_deny_all_configuration() {
+    for (tag, contents) in [("mapping", "{}\n"), ("tools", "tools: []\n")] {
+        let dir = base_dir(&format!("mcp_empty_{tag}"));
+        write(&dir, "mcp.yaml", contents);
+
+        let md = load_metadata_dir(&dir).expect("empty MCP publication should load");
+        assert!(md.mcp.is_configured(), "{tag}");
+        assert!(md.mcp.is_empty(), "{tag}");
+    }
+}
+
+#[test]
+fn mcp_schema_resources_are_rejected_until_supported() {
+    let dir = base_dir("mcp_schema_resource");
+    write(&dir, "mcp.yaml", "resources:\n  schema: { enabled: true }\n");
+
+    let err = load_metadata_dir(&dir).expect_err("unsupported MCP resource must fail");
+    assert!(err.to_string().contains("schema resources are not supported"), "{err}");
+}
+
+#[test]
+fn mcp_metadata_rejects_ambiguous_tool_source() {
+    let dir = base_dir("mcp_bad_source");
+    write(&dir, "mcp.yaml", r#"
+tools:
+  - name: ambiguous
+    description: invalid
+    source:
+      saved_query: { collection: agent, query: Search }
+      action: Search
+    permissions: [user]
+"#);
+    let err = load_metadata_dir(&dir).expect_err("ambiguous MCP source must fail");
+    assert!(err.to_string().contains("exactly one"), "{err}");
+}
+
+#[test]
+fn mcp_metadata_rejects_unresolved_publication_sources() {
+    let cases = [
+        (
+            "saved_query",
+            r#"
+tools:
+  - name: missing.saved
+    description: invalid
+    source:
+      saved_query: { collection: agent, query: Missing }
+    permissions: [user]
+"#,
+            "unknown saved query",
+        ),
+        (
+            "action",
+            r#"
+tools:
+  - name: missing.action
+    description: invalid
+    source: { action: Missing }
+    permissions: [user]
+"#,
+            "unknown action",
+        ),
+        (
+            "table",
+            r#"
+table_tools:
+  - table: { schema: public, name: missing }
+    operations:
+      - operation: query
+        name: missing.list
+        description: invalid
+        permissions: [user]
+"#,
+            "untracked table",
+        ),
+    ];
+    for (tag, mcp, expected) in cases {
+        let dir = base_dir(&format!("mcp_unresolved_{tag}"));
+        write(&dir, "mcp.yaml", mcp);
+
+        let err = load_metadata_dir(&dir).expect_err("unresolved MCP source must fail");
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn mcp_metadata_rejects_action_output_relationships() {
+    let dir = base_dir("mcp_action_relationship");
+    write(&dir, "actions.yaml", r#"
+actions:
+  - name: lookup
+    definition:
+      type: query
+      arguments: []
+      output_type: Out
+      handler: http://example.test/lookup
+custom_types:
+  objects:
+    - name: Out
+      fields:
+        - name: id
+          type: Int
+      relationships:
+        - name: author
+          type: object
+          remote_table: author
+          field_mapping: { id: id }
+"#);
+    write(&dir, "mcp.yaml", r#"
+tools:
+  - name: lookup
+    description: invalid
+    source: { action: lookup }
+    permissions: [user]
+"#);
+
+    let err = load_metadata_dir(&dir).expect_err("unsupported action relationship must fail");
+    assert!(err.to_string().contains("unsupported output relationships"), "{err}");
 }
 
 #[test]

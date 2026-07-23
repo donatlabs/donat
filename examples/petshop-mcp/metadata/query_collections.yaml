@@ -1,0 +1,13 @@
+- name: agent
+  definition:
+    queries:
+      - name: AvailablePets
+        query: |
+          query ($limit: Int) {
+            pet(order_by: { id: asc }, limit: $limit) {
+              id
+              name
+              price
+              status
+            }
+          }

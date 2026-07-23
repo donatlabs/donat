@@ -183,12 +183,13 @@ An unknown route is `404`; a known route called with the wrong method is `405`.
 
 ## MCP
 
-The engine also speaks the **Model Context Protocol** over streamable HTTP at
-`POST /mcp` (JSON-RPC 2.0, JSON mode), so an LLM client can read and write the
-store under a role. It exposes six generic, table-parameterized tools —
-`list_tables`, `describe_table`, `query`, `insert`, `update`, `delete` — each of
-which runs as the request's role through the same permission system (a tool
-call lacking permission comes back as `isError`, never a bypass).
+The engine also speaks the **Model Context Protocol** at `POST /mcp` (JSON-RPC
+2.0, JSON mode), so an LLM client can read and write the store under a role.
+Without `metadata/mcp.yaml` it exposes six generic, table-parameterized tools
+— `list_tables`, `describe_table`, `query`, `insert`, `update`, `delete`.
+For a remote agent contract, add `mcp.yaml`: it publishes only named saved
+queries and explicit table operations. Both modes run as the request's role
+through the same permission system; a tool call never bypasses permissions.
 
 Point an HTTP-capable MCP client at `http://localhost:8080/mcp` and send the
 role headers with each request (here the demo secret + `X-Donat-Role`; in

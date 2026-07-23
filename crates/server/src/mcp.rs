@@ -1,10 +1,9 @@
-//! MCP (Model Context Protocol) server at `POST /mcp`.
+//! MCP (Model Context Protocol) server at `/mcp`.
 //!
 //! A minimal hand-rolled JSON-RPC 2.0 handler in **JSON mode**: it answers a
 //! POST with a single `application/json` response (no SSE streaming). It
-//! exposes a small fixed set of generic, table-parameterized CRUD tools
-//! (`list_tables`, `describe_table`, `query`, `insert`, `update`, `delete`)
-//! for LLM clients.
+//! exposes either legacy generic CRUD tools or explicit tools from
+//! `metadata/mcp.yaml` for LLM clients.
 //!
 //! Every data operation is rendered into a parametrized GraphQL operation and
 //! executed through [`crate::gql::execute_full`] — the same pipeline as
@@ -18,8 +17,8 @@
 //! `custom_root_fields` (via [`donat_schema::crud_roots`]); an unknown table
 //! name matches nothing and is rejected before any GraphQL text is built.
 //!
-//! Known limitations (v1):
-//! - `GET /mcp` returns 405 (SSE streaming is out of scope).
+//! Network admission (TLS, Host/Origin, rate limits) belongs to the reverse
+//! proxy, matching the GraphQL deployment model.
 
 use axum::{
     body::{Body, Bytes},
@@ -39,12 +38,6 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// HTTP transport header carrying the negotiated MCP protocol version after
 /// initialization.
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
-/// Browser Origin header. MCP Streamable HTTP servers must validate this to
-/// prevent DNS rebinding against local MCP endpoints.
-const ORIGIN_HEADER: &str = "Origin";
-/// HTTP Host header. MCP SDKs also validate this for local unauthenticated
-/// transports as a defense-in-depth DNS rebinding guard.
-const HOST_HEADER: &str = "Host";
 /// Optional Streamable HTTP session identifier header.
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 /// HTTP content negotiation header for MCP Streamable HTTP responses.
@@ -154,10 +147,6 @@ const MCP_MAX_ID_STRING_LEN: usize = 512;
 const MCP_MAX_SESSION_ID_LEN: usize = 512;
 /// Bound mirrored MCP protocol version metadata before version negotiation.
 const MCP_MAX_PROTOCOL_VERSION_HEADER_LEN: usize = 32;
-/// Bound browser Origin before DNS-rebinding allowlist parsing.
-const MCP_MAX_ORIGIN_HEADER_LEN: usize = 512;
-/// Bound Host authority before DNS-rebinding allowlist parsing.
-const MCP_MAX_HOST_HEADER_LEN: usize = 255;
 /// Bound Accept before parsing split media ranges and quality parameters.
 const MCP_MAX_ACCEPT_HEADER_LEN: usize = 2048;
 /// Bound Content-Type before parsing media type parameters.
@@ -586,10 +575,25 @@ pub async fn dispatch(
             if let Err(msg) = list_tools_params_arg(params) {
                 return mcp_json_response(StatusCode::OK, rpc_error(id, -32602, &msg));
             }
-            mcp_json_response(
-                StatusCode::OK,
-                rpc_result(id, json!({ "tools": tool_defs() })),
-            )
+            let configured = {
+                let engine = state.engine.read().await;
+                engine.metadata.mcp.is_configured()
+            };
+            if !configured {
+                return mcp_json_response(
+                    StatusCode::OK,
+                    rpc_result(id, json!({ "tools": tool_defs() })),
+                );
+            }
+            let session = match gql::resolve_session(&state, &headers).await {
+                Ok(s) => s,
+                Err((_, errors)) => {
+                    let msg = auth_error_message(&errors);
+                    return mcp_json_response(StatusCode::OK, rpc_error(id, -32602, &msg));
+                }
+            };
+            let tools = configured_tool_defs(&state, &session).await;
+            mcp_json_response(StatusCode::OK, rpc_result(id, json!({ "tools": tools })))
         }
         "tools/call" => {
             // Role is mandatory, exactly like /v1/graphql. An auth failure is
@@ -864,12 +868,8 @@ fn json_rpc_response_result_arg(result: &Json) -> Result<(), String> {
 }
 
 fn mcp_connection_headers(headers: &HeaderMap) -> Result<(), (StatusCode, i64, String)> {
-    if let Err((status, msg)) = mcp_origin_header(headers) {
-        return Err((status, -32600, msg));
-    }
-    if let Err((status, msg)) = mcp_host_header(headers) {
-        return Err((status, -32600, msg));
-    }
+    // Reverse proxies commonly rewrite Host/Origin. Do not make `/mcp`
+    // loopback-only when the other API surfaces are remotely deployable.
     if let Err(msg) = mcp_session_id_header(headers) {
         return Err((StatusCode::BAD_REQUEST, -32600, msg));
     }
@@ -1153,62 +1153,6 @@ fn singleton_header_value<'a>(
         return Err(format!("duplicate {label}"));
     }
     Ok(Some(first))
-}
-
-fn mcp_origin_header(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    let value = singleton_header_value(headers, ORIGIN_HEADER, "MCP origin header")
-        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let Ok(origin) = value.to_str() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid MCP origin header".to_string(),
-        ));
-    };
-    if origin.len() > MCP_MAX_ORIGIN_HEADER_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("MCP origin header must be at most {MCP_MAX_ORIGIN_HEADER_LEN} characters"),
-        ));
-    }
-    if is_allowed_mcp_origin(origin) {
-        Ok(())
-    } else {
-        Err((StatusCode::FORBIDDEN, "forbidden MCP origin".to_string()))
-    }
-}
-
-fn mcp_host_header(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    let value = singleton_header_value(headers, HOST_HEADER, "MCP host header")
-        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let Some(value) = value else {
-        return Err((
-            StatusCode::MISDIRECTED_REQUEST,
-            "forbidden MCP host".to_string(),
-        ));
-    };
-    let Ok(host) = value.to_str() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid MCP host header".to_string(),
-        ));
-    };
-    if host.len() > MCP_MAX_HOST_HEADER_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("MCP host header must be at most {MCP_MAX_HOST_HEADER_LEN} characters"),
-        ));
-    }
-    if is_allowed_mcp_host(host) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::MISDIRECTED_REQUEST,
-            "forbidden MCP host".to_string(),
-        ))
-    }
 }
 
 fn mcp_session_id_header(headers: &HeaderMap) -> Result<(), String> {
@@ -1833,105 +1777,6 @@ fn mcp_request_size(headers: &HeaderMap, actual_len: usize) -> Result<(), (Statu
     Ok(())
 }
 
-fn is_allowed_mcp_origin(origin: &str) -> bool {
-    let Some((scheme, authority)) = origin.split_once("://") else {
-        return false;
-    };
-    if scheme != "http" && scheme != "https" {
-        return false;
-    }
-    if authority.is_empty()
-        || authority.contains('/')
-        || authority.contains('?')
-        || authority.contains('#')
-    {
-        return false;
-    }
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, tail)) = rest.split_once(']') else {
-            return false;
-        };
-        if !tail.is_empty() && !tail.starts_with(':') {
-            return false;
-        }
-        host
-    } else {
-        authority
-            .split_once(':')
-            .map_or(authority, |(host, _)| host)
-    };
-
-    is_allowed_mcp_loopback_host(host)
-}
-
-fn is_allowed_mcp_host(authority: &str) -> bool {
-    let Some(host) = authority_host(authority) else {
-        return false;
-    };
-    is_allowed_mcp_loopback_host(host)
-}
-
-fn is_allowed_mcp_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || is_ipv4_loopback(host)
-}
-
-fn is_ipv4_loopback(host: &str) -> bool {
-    let mut parts = host.split('.');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if first != "127" {
-        return false;
-    }
-    let mut count = 1;
-    for part in parts {
-        count += 1;
-        if part.is_empty()
-            || part.len() > 3
-            || !part.bytes().all(|b| b.is_ascii_digit())
-            || part.parse::<u8>().is_err()
-        {
-            return false;
-        }
-    }
-    count == 4
-}
-
-fn authority_host(authority: &str) -> Option<&str> {
-    if authority.is_empty()
-        || authority.contains('/')
-        || authority.contains('?')
-        || authority.contains('#')
-        || authority.contains('@')
-        || authority.contains("://")
-    {
-        return None;
-    }
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']')?;
-        if !tail.is_empty() {
-            let port = tail.strip_prefix(':')?;
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-        }
-        Some(host)
-    } else {
-        let (host, port) = authority
-            .split_once(':')
-            .map_or((authority, None), |(host, port)| (host, Some(port)));
-        if host.is_empty() || host.contains(':') {
-            return None;
-        }
-        if let Some(port) = port {
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-        }
-        Some(host)
-    }
-}
-
 fn initialize_params_arg(params: Option<&Json>) -> Result<(), String> {
     let Some(params) = params.filter(|value| !value.is_null()) else {
         return Err("missing required parameter 'params'".to_string());
@@ -2199,48 +2044,7 @@ fn tool_defs() -> Json {
                 "openWorldHint": false
             },
             "description": "Read rows from a table with optional column selection, where-filter, order_by, limit and offset.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_TABLE_NAME_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                    "columns": { "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS },
-                    "where": { "type": "object", "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } },
-                    "order_by": {
-                        "description": "A column order_by object or array of column order_by objects.",
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "minProperties": 1,
-                                "maxProperties": MCP_MAX_ORDER_BY_TERMS,
-                                "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                                "additionalProperties": {
-                                    "type": "string",
-                                    "enum": ["asc", "asc_nulls_first", "asc_nulls_last", "desc", "desc_nulls_first", "desc_nulls_last"]
-                                }
-                            },
-                            {
-                                "type": "array",
-                                "minItems": 1,
-                                "maxItems": MCP_MAX_ORDER_BY_TERMS,
-                                "items": {
-                                    "type": "object",
-                                    "minProperties": 1,
-                                    "maxProperties": MCP_MAX_ORDER_BY_TERMS,
-                                    "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                                    "additionalProperties": {
-                                        "type": "string",
-                                        "enum": ["asc", "asc_nulls_first", "asc_nulls_last", "desc", "desc_nulls_first", "desc_nulls_last"]
-                                    }
-                                }
-                            }
-                        ]
-                    },
-                    "limit": { "type": "integer", "minimum": 0, "maximum": MCP_MAX_QUERY_LIMIT, "default": MCP_DEFAULT_QUERY_LIMIT },
-                    "offset": { "type": "integer", "minimum": 0, "maximum": MCP_MAX_QUERY_OFFSET }
-                },
-                "required": ["table"],
-                "additionalProperties": false
-            },
+            "inputSchema": table_tool_input_schema(donat_metadata::McpTableOperationKind::Query, true),
             "outputSchema": query_output_schema()
         },
         {
@@ -2253,16 +2057,7 @@ fn tool_defs() -> Json {
                 "openWorldHint": false
             },
             "description": "Insert one or more rows into a table. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_TABLE_NAME_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                    "objects": { "type": "array", "items": { "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_MUTATION_FIELDS, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }, "minItems": 1, "maxItems": MCP_MAX_INSERT_OBJECTS },
-                    "returning": { "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }
-                },
-                "required": ["table", "objects"],
-                "additionalProperties": false
-            },
+            "inputSchema": table_tool_input_schema(donat_metadata::McpTableOperationKind::Insert, true),
             "outputSchema": mutation_output_schema()
         },
         {
@@ -2275,17 +2070,7 @@ fn tool_defs() -> Json {
                 "openWorldHint": false
             },
             "description": "Update rows matching a where-filter by setting columns. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_TABLE_NAME_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                    "where": { "type": "object", "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } },
-                    "set": { "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_MUTATION_FIELDS, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } },
-                    "returning": { "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }
-                },
-                "required": ["table", "where", "set"],
-                "additionalProperties": false
-            },
+            "inputSchema": table_tool_input_schema(donat_metadata::McpTableOperationKind::Update, true),
             "outputSchema": mutation_output_schema()
         },
         {
@@ -2298,19 +2083,255 @@ fn tool_defs() -> Json {
                 "openWorldHint": false
             },
             "description": "Delete rows matching a where-filter. Returns affected_rows and, when explicitly requested with returning and permitted by the role, returning rows.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_TABLE_NAME_LEN, "pattern": GRAPHQL_NAME_PATTERN },
-                    "where": { "type": "object", "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } },
-                    "returning": { "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }
-                },
-                "required": ["table", "where"],
-                "additionalProperties": false
-            },
+            "inputSchema": table_tool_input_schema(donat_metadata::McpTableOperationKind::Delete, true),
             "outputSchema": mutation_output_schema()
         }
     ])
+}
+
+/// The legacy CRUD tools accept a caller-supplied `table`; configured table
+/// tools bind it in metadata. Keep the remaining argument contract identical
+/// so `tools/list` describes exactly what `call_configured_tool` accepts.
+fn table_tool_input_schema(
+    operation: donat_metadata::McpTableOperationKind,
+    include_table: bool,
+) -> Json {
+    let mut properties = JsonMap::new();
+    let required: &[&str] = match operation {
+        donat_metadata::McpTableOperationKind::Query => {
+            properties.insert(
+                "columns".to_string(),
+                json!({ "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }),
+            );
+            properties.insert(
+                "where".to_string(),
+                json!({ "type": "object", "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }),
+            );
+            properties.insert(
+                "order_by".to_string(),
+                json!({
+                    "description": "A column order_by object or array of column order_by objects.",
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "minProperties": 1,
+                            "maxProperties": MCP_MAX_ORDER_BY_TERMS,
+                            "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN },
+                            "additionalProperties": {
+                                "type": "string",
+                                "enum": ["asc", "asc_nulls_first", "asc_nulls_last", "desc", "desc_nulls_first", "desc_nulls_last"]
+                            }
+                        },
+                        {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MCP_MAX_ORDER_BY_TERMS,
+                            "items": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "maxProperties": MCP_MAX_ORDER_BY_TERMS,
+                                "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN },
+                                "additionalProperties": {
+                                    "type": "string",
+                                    "enum": ["asc", "asc_nulls_first", "asc_nulls_last", "desc", "desc_nulls_first", "desc_nulls_last"]
+                                }
+                            }
+                        }
+                    ]
+                }),
+            );
+            properties.insert(
+                "limit".to_string(),
+                json!({ "type": "integer", "minimum": 0, "maximum": MCP_MAX_QUERY_LIMIT, "default": MCP_DEFAULT_QUERY_LIMIT }),
+            );
+            properties.insert(
+                "offset".to_string(),
+                json!({ "type": "integer", "minimum": 0, "maximum": MCP_MAX_QUERY_OFFSET }),
+            );
+            &[]
+        }
+        donat_metadata::McpTableOperationKind::Insert => {
+            properties.insert(
+                "objects".to_string(),
+                json!({ "type": "array", "items": { "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_MUTATION_FIELDS, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }, "minItems": 1, "maxItems": MCP_MAX_INSERT_OBJECTS }),
+            );
+            properties.insert(
+                "returning".to_string(),
+                json!({ "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }),
+            );
+            &["objects"]
+        }
+        donat_metadata::McpTableOperationKind::Update => {
+            properties.insert(
+                "where".to_string(),
+                json!({ "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }),
+            );
+            properties.insert(
+                "set".to_string(),
+                json!({ "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_MUTATION_FIELDS, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }),
+            );
+            properties.insert(
+                "returning".to_string(),
+                json!({ "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }),
+            );
+            &["where", "set"]
+        }
+        donat_metadata::McpTableOperationKind::Delete => {
+            properties.insert(
+                "where".to_string(),
+                json!({ "type": "object", "minProperties": 1, "maxProperties": MCP_MAX_WHERE_NODES, "propertyNames": { "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN } }),
+            );
+            properties.insert(
+                "returning".to_string(),
+                json!({ "type": "array", "items": { "type": "string", "maxLength": MCP_MAX_IDENTIFIER_LEN, "pattern": GRAPHQL_NAME_PATTERN }, "minItems": 1, "maxItems": MCP_MAX_SELECTION_FIELDS }),
+            );
+            &["where"]
+        }
+    };
+
+    let mut required = required.to_vec();
+    if include_table {
+        properties.insert(
+            "table".to_string(),
+            json!({ "type": "string", "minLength": 1, "maxLength": MCP_MAX_TABLE_NAME_LEN, "pattern": GRAPHQL_NAME_PATTERN }),
+        );
+        required.insert(0, "table");
+    }
+
+    let mut schema = json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    });
+    if !required.is_empty() {
+        schema["required"] = json!(required);
+    }
+    schema
+}
+
+/// Build the role-scoped tool catalogue from `mcp.yaml`. The metadata file is
+/// an explicit publication list: unlike legacy mode, no table or action is
+/// discoverable merely because it exists in the GraphQL schema.
+async fn configured_tool_defs(state: &SharedState, session: &Session) -> Json {
+    let engine = state.engine.read().await;
+    let metadata = &engine.metadata;
+    let mut tools = Vec::new();
+    for tool in &metadata.mcp.tools {
+        if !mcp_role_allowed(&tool.permissions, &metadata.inherited_roles, &session.role) {
+            continue;
+        }
+        let read_only = tool
+            .source
+            .saved_query
+            .as_ref()
+            .and_then(|source| saved_query_text(metadata, source))
+            .is_some_and(saved_query_is_read_only);
+        tools.push(configured_saved_tool_definition(tool, read_only));
+    }
+    for table_tool in &metadata.mcp.table_tools {
+        for operation in &table_tool.operations {
+            if !mcp_role_allowed(
+                &operation.permissions,
+                &metadata.inherited_roles,
+                &session.role,
+            ) {
+                continue;
+            }
+            let (read_only, destructive) = match operation.operation {
+                donat_metadata::McpTableOperationKind::Query => (true, false),
+                donat_metadata::McpTableOperationKind::Insert => (false, false),
+                donat_metadata::McpTableOperationKind::Update
+                | donat_metadata::McpTableOperationKind::Delete => (false, true),
+            };
+            tools.push(json!({
+                "name": operation.name,
+                "description": operation.description,
+                "annotations": {
+                    "readOnlyHint": read_only,
+                    "destructiveHint": destructive,
+                    "openWorldHint": false
+                },
+                "inputSchema": table_tool_input_schema(operation.operation, false)
+            }));
+        }
+    }
+    Json::Array(tools)
+}
+
+fn saved_query_text<'a>(
+    metadata: &'a donat_metadata::Metadata,
+    source: &donat_metadata::McpSavedQuery,
+) -> Option<&'a str> {
+    metadata
+        .query_collections
+        .iter()
+        .find(|collection| collection.name == source.collection)
+        .and_then(|collection| {
+            collection
+                .definition
+                .queries
+                .iter()
+                .find(|query| query.name == source.query)
+        })
+        .map(|query| query.query.as_str())
+}
+
+/// Parse the saved operation for the MCP safety annotation. A parse failure,
+/// mutation, or subscription is conservatively treated as non-read-only.
+fn saved_query_is_read_only(query: &str) -> bool {
+    use graphql_parser::query::{Definition, OperationDefinition};
+
+    let Ok(document) = graphql_parser::parse_query::<String>(query) else {
+        return false;
+    };
+    let mut found_operation = false;
+    for definition in document.definitions {
+        let Definition::Operation(operation) = definition else {
+            continue;
+        };
+        found_operation = true;
+        if !matches!(
+            operation,
+            OperationDefinition::SelectionSet(_) | OperationDefinition::Query(_)
+        ) {
+            return false;
+        }
+    }
+    found_operation
+}
+
+fn configured_saved_tool_definition(tool: &donat_metadata::McpTool, read_only: bool) -> Json {
+    let mut properties = JsonMap::new();
+    for (name, description) in &tool.arguments {
+        properties.insert(name.clone(), json!({ "description": description }));
+    }
+    let mut definition = json!({
+        "name": tool.name,
+        "description": tool.description,
+        "annotations": {
+            "readOnlyHint": read_only,
+            "openWorldHint": false
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": true
+        }
+    });
+    if let Some(title) = &tool.title {
+        definition["title"] = Json::String(title.clone());
+    }
+    definition
+}
+
+fn mcp_role_allowed(
+    permissions: &[String],
+    inherited_roles: &[donat_metadata::InheritedRole],
+    role: &str,
+) -> bool {
+    permissions.iter().any(|allowed| {
+        allowed == role || expand_role(inherited_roles, role).iter().any(|parent| parent == allowed)
+    })
 }
 
 fn error_structured_content_schema() -> Json {
@@ -2541,6 +2562,17 @@ async fn call_tool(
         Err(msg) => return tool_err(msg, None),
     };
 
+    // An `mcp.yaml` switches MCP into explicit-publication mode. Resolve the
+    // configured tool before considering legacy names so a deployment cannot
+    // accidentally expose generic CRUD alongside its curated agent surface.
+    let configured = {
+        let engine = state.engine.read().await;
+        engine.metadata.mcp.is_configured()
+    };
+    if configured {
+        return call_configured_tool(state, session, headers, name, params).await;
+    }
+
     match name {
         "list_tables" => {
             let args = match tool_arguments(params, &[]) {
@@ -2597,6 +2629,261 @@ async fn call_tool(
     }
 }
 
+async fn call_configured_tool(
+    state: &SharedState,
+    session: &Session,
+    headers: &HeaderMap,
+    name: &str,
+    params: &Json,
+) -> Json {
+    let (saved, table_operation, inherited_roles) = {
+        let engine = state.engine.read().await;
+        let metadata = &engine.metadata;
+        let saved = metadata.mcp.tools.iter().find(|tool| tool.name == name).cloned();
+        let table_operation = metadata
+            .mcp
+            .table_tools
+            .iter()
+            .flat_map(|entry| entry.operations.iter().map(move |op| (entry, op)))
+            .find(|(_, operation)| operation.name == name)
+            .map(|(entry, operation)| (entry.table.clone(), operation.clone()));
+        (saved, table_operation, metadata.inherited_roles.clone())
+    };
+
+    if let Some(tool) = saved {
+        if !mcp_role_allowed(&tool.permissions, &inherited_roles, &session.role) {
+            return tool_err("tool is not available for this role", None);
+        }
+        let args = match tool_arbitrary_arguments(params) {
+            // Saved queries own their variable contract; variables are passed
+            // to GraphQL, which remains the single validator.
+            Ok(args) => args,
+            Err(msg) => return tool_err(msg, None),
+        };
+        if let Some(source) = tool.source.saved_query {
+            return call_saved_query(state, session, headers, &source, args).await;
+        }
+        if let Some(action) = tool.source.action {
+            return call_action(state, session, headers, &action, args).await;
+        }
+        return tool_err("configured MCP tool has no source", None);
+    }
+
+    if let Some((table, operation)) = table_operation {
+        if !mcp_role_allowed(&operation.permissions, &inherited_roles, &session.role) {
+            return tool_err("tool is not available for this role", None);
+        }
+        let allowed = match operation.operation {
+            donat_metadata::McpTableOperationKind::Query => {
+                &["columns", "where", "order_by", "limit", "offset"][..]
+            }
+            donat_metadata::McpTableOperationKind::Insert => &["objects", "returning"][..],
+            donat_metadata::McpTableOperationKind::Update => &["where", "set", "returning"][..],
+            donat_metadata::McpTableOperationKind::Delete => &["where", "returning"][..],
+        };
+        let mut args = match tool_arguments(params, allowed) {
+            Ok(args) => args,
+            Err(msg) => return tool_err(msg, None),
+        };
+        let Some(map) = args.as_object_mut() else {
+            return tool_err("'arguments' must be an object", None);
+        };
+        let base = {
+            let engine = state.engine.read().await;
+            engine
+                .metadata
+                .sources
+                .iter()
+                .flat_map(|source| source.tables.iter())
+                .find(|entry| {
+                    entry.table.schema() == table.schema() && entry.table.name() == table.name()
+                })
+                .map(donat_schema::table_base_name)
+        };
+        let Some(base) = base else {
+            return tool_err("configured MCP table is not tracked", None);
+        };
+        map.insert("table".to_string(), Json::String(base));
+        return match operation.operation {
+            donat_metadata::McpTableOperationKind::Query => {
+                let mut result = crud_tool(state, session, headers, &args, build_query_gql).await;
+                if result.get("isError") == Some(&Json::Bool(false)) {
+                    if let Some(rows) = result.get_mut("structuredContent").map(Json::take) {
+                        result["structuredContent"] = json!({ "rows": rows });
+                    }
+                }
+                result
+            }
+            donat_metadata::McpTableOperationKind::Insert => {
+                crud_tool(state, session, headers, &args, build_insert_gql).await
+            }
+            donat_metadata::McpTableOperationKind::Update => {
+                crud_tool(state, session, headers, &args, build_update_gql).await
+            }
+            donat_metadata::McpTableOperationKind::Delete => {
+                crud_tool(state, session, headers, &args, build_delete_gql).await
+            }
+        };
+    }
+
+    tool_err(unknown_name_error("unknown tool"), None)
+}
+
+async fn call_saved_query(
+    state: &SharedState,
+    session: &Session,
+    headers: &HeaderMap,
+    source: &donat_metadata::McpSavedQuery,
+    variables: Json,
+) -> Json {
+    let query = {
+        let engine = state.engine.read().await;
+        saved_query_text(&engine.metadata, source).map(str::to_owned)
+    };
+    let Some(query) = query else {
+        return tool_err("configured saved query was not found", None);
+    };
+    let body = json!({ "query": query, "variables": variables, "operationName": Json::Null });
+    let (_status, response) = gql::execute_full(state, session, &body, false, headers).await;
+    if response.get("errors").is_some() {
+        return tool_err("graphql error", Some(response));
+    }
+    tool_ok(response.get("data").cloned().unwrap_or(Json::Null))
+}
+
+/// Invoke a typed GraphQL action through its normal schema entrypoint. The
+/// action's argument type strings and custom output-object fields live in
+/// metadata, so this still builds a regular GraphQL document and delegates
+/// all permission and webhook behaviour to `gql::execute_full`.
+async fn call_action(
+    state: &SharedState,
+    session: &Session,
+    headers: &HeaderMap,
+    action_name: &str,
+    variables: Json,
+) -> Json {
+    let action = {
+        let engine = state.engine.read().await;
+        engine
+            .metadata
+            .actions
+            .iter()
+            .find(|action| action.name == action_name)
+            .cloned()
+            .map(|action| (action, engine.metadata.custom_types.clone()))
+    };
+    let Some((action, custom_types)) = action else {
+        return tool_err("configured action was not found", None);
+    };
+    let operation = if action.definition.action_type.as_deref() == Some("query") {
+        "query"
+    } else {
+        "mutation"
+    };
+    let definitions: Vec<String> = action
+        .definition
+        .arguments
+        .iter()
+        .map(|argument| format!("${}: {}", argument.name, argument.type_))
+        .collect();
+    let invocation: Vec<String> = action
+        .definition
+        .arguments
+        .iter()
+        .map(|argument| format!("{}: ${}", argument.name, argument.name))
+        .collect();
+    let selection = action_output_selection(&custom_types, &action.definition.output_type);
+    let variable_definitions = if definitions.is_empty() {
+        String::new()
+    } else {
+        format!("({})", definitions.join(", "))
+    };
+    let arguments = if invocation.is_empty() {
+        String::new()
+    } else {
+        format!("({})", invocation.join(", "))
+    };
+    let query = format!(
+        "{operation}{variable_definitions} {{ {}{arguments}{selection} }}",
+        action.name,
+    );
+    let body = json!({ "query": query, "variables": variables, "operationName": Json::Null });
+    let (_status, response) = gql::execute_full(state, session, &body, false, headers).await;
+    if response.get("errors").is_some() {
+        return tool_err("graphql error", Some(response));
+    }
+    tool_ok(response.get("data").cloned().unwrap_or(Json::Null))
+}
+
+/// Generate a complete selection for an action's declared custom output type.
+/// MCP action tools do not accept an arbitrary GraphQL selection from the
+/// caller, so nested output objects must be expanded here rather than being
+/// projected against an empty selection by the action resolver.
+fn action_output_selection(
+    custom_types: &donat_metadata::CustomTypes,
+    output_type: &str,
+) -> String {
+    let mut ancestors = std::collections::HashSet::new();
+    action_type_selection(custom_types, output_type, &mut ancestors)
+        .map(|fields| format!(" {{ {fields} }}"))
+        .unwrap_or_default()
+}
+
+fn action_type_selection(
+    custom_types: &donat_metadata::CustomTypes,
+    type_: &str,
+    ancestors: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let name = type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
+    let object = custom_types.objects.iter().find(|object| object.name == name)?;
+
+    // A finite generated selection cannot fully expand recursive custom
+    // objects. At the cycle boundary select scalar fields (or __typename) so
+    // the generated GraphQL remains valid while still returning useful data.
+    if !ancestors.insert(object.name.clone()) {
+        return Some(action_scalar_field_selection(custom_types, object));
+    }
+
+    let fields = object
+        .fields
+        .iter()
+        .map(|field| {
+            action_type_selection(custom_types, &field.type_, ancestors)
+                .map(|nested| format!("{} {{ {nested} }}", field.name))
+                .unwrap_or_else(|| field.name.clone())
+        })
+        .collect::<Vec<_>>();
+    ancestors.remove(&object.name);
+
+    Some(if fields.is_empty() {
+        "__typename".to_string()
+    } else {
+        fields.join(" ")
+    })
+}
+
+fn action_scalar_field_selection(
+    custom_types: &donat_metadata::CustomTypes,
+    object: &donat_metadata::ObjectType,
+) -> String {
+    let fields = object
+        .fields
+        .iter()
+        .filter(|field| {
+            let name = field
+                .type_
+                .trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
+            !custom_types.objects.iter().any(|object| object.name == name)
+        })
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        "__typename".to_string()
+    } else {
+        fields.join(" ")
+    }
+}
+
 fn tool_params_arg(params: &Json) -> Result<(), String> {
     let Some(map) = params.as_object() else {
         return Err("'params' must be an object".to_string());
@@ -2650,6 +2937,30 @@ fn tool_arguments(params: &Json, allowed: &[&str]) -> Result<Json, String> {
             return Err(unknown_name_error("unknown argument"));
         }
     }
+    Ok(args.clone())
+}
+
+/// Read an argument object without imposing a transport-level key allowlist.
+/// Saved GraphQL operations own the variable schema, so this adapter must not
+/// duplicate GraphQL's validation or silently drop future variables.
+fn tool_arbitrary_arguments(params: &Json) -> Result<Json, String> {
+    let Some(args) = params.get("arguments").filter(|v| !v.is_null()) else {
+        return Ok(Json::Object(JsonMap::new()));
+    };
+    if !args.is_object() {
+        return Err("'arguments' must be an object".to_string());
+    }
+    if json_encoded_len(args) > MCP_MAX_ARGUMENT_BYTES {
+        return Err(format!(
+            "'arguments' JSON must be at most {MCP_MAX_ARGUMENT_BYTES} bytes"
+        ));
+    }
+    validate_json_shape_budget(
+        args,
+        "arguments",
+        MCP_MAX_ARGUMENT_DEPTH,
+        MCP_MAX_ARGUMENT_NODES,
+    )?;
     Ok(args.clone())
 }
 
@@ -6758,135 +7069,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_origin_header_allows_only_local_origins() {
-        let headers = HeaderMap::new();
-        mcp_origin_header(&headers).unwrap();
-
-        for origin in [
-            "http://localhost:3000",
-            "https://LOCALHOST",
-            "http://127.0.0.1:5173",
-            "http://127.99.88.77",
-            "http://[::1]:3000",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(ORIGIN_HEADER, origin.parse().unwrap());
-            mcp_origin_header(&headers).unwrap();
-            assert!(is_allowed_mcp_origin(origin), "{origin}");
-        }
-
-        for origin in [
-            "https://evil.example",
-            "http://localhost.evil.example",
-            "http://127.evil.example",
-            "file://localhost",
-            "null",
-            "http://[::2]",
-            "http://localhost/path",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(ORIGIN_HEADER, origin.parse().unwrap());
-            let err = mcp_origin_header(&headers).unwrap_err();
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
-            assert_eq!(err.1, "forbidden MCP origin");
-            assert!(!is_allowed_mcp_origin(origin), "{origin}");
-        }
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            ORIGIN_HEADER,
-            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
-        );
-        let err = mcp_origin_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "invalid MCP origin header");
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            ORIGIN_HEADER,
-            format!("http://localhost{}", "x".repeat(MCP_MAX_ORIGIN_HEADER_LEN))
-                .parse()
-                .unwrap(),
-        );
-        let err = mcp_origin_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "MCP origin header must be at most 512 characters");
-
-        let mut headers = HeaderMap::new();
-        headers.append(ORIGIN_HEADER, "http://localhost:3000".parse().unwrap());
-        headers.append(ORIGIN_HEADER, "https://evil.example".parse().unwrap());
-        let err = mcp_origin_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "duplicate MCP origin header");
-    }
-
-    #[test]
-    fn mcp_host_header_allows_only_local_hosts() {
-        let headers = HeaderMap::new();
-        let err = mcp_host_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::MISDIRECTED_REQUEST);
-        assert_eq!(err.1, "forbidden MCP host");
-
-        for host in [
-            "localhost",
-            "LOCALHOST:3000",
-            "127.0.0.1:5173",
-            "127.99.88.77",
-            "[::1]:3000",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(HOST_HEADER, host.parse().unwrap());
-            mcp_host_header(&headers).unwrap();
-            assert!(is_allowed_mcp_host(host), "{host}");
-        }
-
-        for host in [
-            "evil.example",
-            "localhost.evil.example",
-            "127.evil.example",
-            "[::2]",
-            "localhost/path",
-            "http://localhost",
-            "localhost@evil.example",
-            "localhost:bad",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(HOST_HEADER, host.parse().unwrap());
-            let err = mcp_host_header(&headers).unwrap_err();
-            assert_eq!(err.0, StatusCode::MISDIRECTED_REQUEST);
-            assert_eq!(err.1, "forbidden MCP host");
-            assert!(!is_allowed_mcp_host(host), "{host}");
-        }
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HOST_HEADER,
-            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
-        );
-        let err = mcp_host_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "invalid MCP host header");
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HOST_HEADER,
-            format!("localhost{}", "x".repeat(MCP_MAX_HOST_HEADER_LEN))
-                .parse()
-                .unwrap(),
-        );
-        let err = mcp_host_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "MCP host header must be at most 255 characters");
-
-        let mut headers = HeaderMap::new();
-        headers.append(HOST_HEADER, "localhost:3000".parse().unwrap());
-        headers.append(HOST_HEADER, "evil.example".parse().unwrap());
-        let err = mcp_host_header(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "duplicate MCP host header");
-    }
-
-    #[test]
     fn mcp_session_id_header_requires_bounded_visible_ascii() {
         let headers = HeaderMap::new();
         mcp_session_id_header(&headers).unwrap();
@@ -7638,18 +7820,16 @@ mod tests {
     #[test]
     fn mcp_connection_headers_apply_to_get_and_post_boundaries() {
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         mcp_connection_headers(&headers).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(ORIGIN_HEADER, "https://evil.example".parse().unwrap());
-        let err = mcp_connection_headers(&headers).unwrap_err();
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert_eq!(err.1, -32600);
-        assert_eq!(err.2, "forbidden MCP origin");
+        headers.insert("Origin", "https://evil.example".parse().unwrap());
+        headers.insert("Host", "mcp.example.com".parse().unwrap());
+        mcp_connection_headers(&headers).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         headers.insert(SEC_FETCH_SITE_HEADER, "cross-site".parse().unwrap());
         let err = mcp_connection_headers(&headers).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
@@ -7657,7 +7837,7 @@ mod tests {
         assert_eq!(err.2, "forbidden MCP fetch site");
 
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         headers.insert(MCP_PROTOCOL_VERSION_HEADER, "2024-11-05".parse().unwrap());
         let err = mcp_connection_headers(&headers).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -7665,7 +7845,7 @@ mod tests {
         assert_eq!(err.2, "unsupported MCP protocol version");
 
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         headers.append(AUTHORIZATION_HEADER, "Bearer token-1".parse().unwrap());
         headers.append(AUTHORIZATION_HEADER, "Bearer token-2".parse().unwrap());
         let err = mcp_connection_headers(&headers).unwrap_err();
@@ -7674,7 +7854,7 @@ mod tests {
         assert_eq!(err.2, "duplicate MCP authorization header");
 
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         headers.append(COOKIE_HEADER, "donat_user=token-1".parse().unwrap());
         headers.append(COOKIE_HEADER, "donat_user=token-2".parse().unwrap());
         let err = mcp_connection_headers(&headers).unwrap_err();
@@ -7683,7 +7863,7 @@ mod tests {
         assert_eq!(err.2, "duplicate MCP cookie header");
 
         let mut headers = HeaderMap::new();
-        headers.insert(HOST_HEADER, "localhost".parse().unwrap());
+        headers.insert("Host", "localhost".parse().unwrap());
         headers.append("X-Donat-Role", "user".parse().unwrap());
         headers.append("x-donat-role", "viewer".parse().unwrap());
         let err = mcp_connection_headers(&headers).unwrap_err();
@@ -9121,5 +9301,144 @@ mod tests {
             !message.contains("ignore previous instructions"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn configured_mcp_roles_honor_inheritance() {
+        let inherited = vec![donat_metadata::InheritedRole {
+            role_name: "staff_manager".to_string(),
+            role_set: vec!["staff".to_string()],
+        }];
+        assert!(mcp_role_allowed(
+            &["staff".to_string()],
+            &inherited,
+            "staff_manager"
+        ));
+        assert!(!mcp_role_allowed(
+            &["customer".to_string()],
+            &inherited,
+            "staff_manager"
+        ));
+    }
+
+    #[test]
+    fn saved_query_arguments_are_not_transport_allowlisted() {
+        let params = json!({ "arguments": { "future_variable": 1 } });
+        assert_eq!(
+            tool_arbitrary_arguments(&params).unwrap(),
+            json!({ "future_variable": 1 })
+        );
+    }
+
+    #[test]
+    fn saved_query_read_only_hint_is_derived_from_the_operation() {
+        assert!(saved_query_is_read_only("query FindPets { pet { id } }"));
+        assert!(saved_query_is_read_only("{ pet { id } }"));
+        assert!(!saved_query_is_read_only(
+            "mutation CreatePet { insert_pet(objects: []) { affected_rows } }"
+        ));
+        assert!(!saved_query_is_read_only("not valid GraphQL"));
+    }
+
+    #[test]
+    fn configured_table_tool_schemas_omit_the_bound_table_and_require_mutation_inputs() {
+        let query = table_tool_input_schema(donat_metadata::McpTableOperationKind::Query, false);
+        assert_eq!(query["additionalProperties"], json!(false));
+        assert!(query["properties"].get("table").is_none());
+        assert!(query.get("required").is_none());
+        assert!(query["properties"].get("columns").is_some());
+
+        let insert =
+            table_tool_input_schema(donat_metadata::McpTableOperationKind::Insert, false);
+        assert_eq!(insert["required"], json!(["objects"]));
+        assert!(insert["properties"].get("table").is_none());
+
+        let update =
+            table_tool_input_schema(donat_metadata::McpTableOperationKind::Update, false);
+        assert_eq!(update["required"], json!(["where", "set"]));
+        assert_eq!(update["properties"]["where"]["minProperties"], json!(1));
+
+        let delete =
+            table_tool_input_schema(donat_metadata::McpTableOperationKind::Delete, false);
+        assert_eq!(delete["required"], json!(["where"]));
+        assert_eq!(delete["properties"]["where"]["minProperties"], json!(1));
+    }
+
+    #[test]
+    fn configured_saved_tool_omits_absent_title() {
+        let tool = donat_metadata::McpTool {
+            name: "pet.search".to_string(),
+            title: None,
+            description: "Find pets".to_string(),
+            source: donat_metadata::McpToolSource {
+                saved_query: Some(donat_metadata::McpSavedQuery {
+                    collection: "agent".to_string(),
+                    query: "Pets".to_string(),
+                }),
+                action: None,
+            },
+            permissions: vec!["user".to_string()],
+            arguments: Default::default(),
+        };
+
+        let definition = configured_saved_tool_definition(&tool, true);
+        assert!(definition.get("title").is_none());
+        assert_eq!(definition["annotations"]["readOnlyHint"], json!(true));
+    }
+
+    #[test]
+    fn action_output_selection_recurses_into_nested_custom_objects_and_lists() {
+        let custom_types = donat_metadata::CustomTypes {
+            objects: vec![
+                donat_metadata::ObjectType {
+                    name: "NestedOutObject".to_string(),
+                    fields: vec![
+                        donat_metadata::CustomTypeField {
+                            name: "id".to_string(),
+                            type_: "Int!".to_string(),
+                            description: None,
+                        },
+                        donat_metadata::CustomTypeField {
+                            name: "address".to_string(),
+                            type_: "Address".to_string(),
+                            description: None,
+                        },
+                        donat_metadata::CustomTypeField {
+                            name: "addresses".to_string(),
+                            type_: "[Address]".to_string(),
+                            description: None,
+                        },
+                    ],
+                    relationships: vec![],
+                    description: None,
+                },
+                donat_metadata::ObjectType {
+                    name: "Address".to_string(),
+                    fields: vec![
+                        donat_metadata::CustomTypeField {
+                            name: "city".to_string(),
+                            type_: "String".to_string(),
+                            description: None,
+                        },
+                        donat_metadata::CustomTypeField {
+                            name: "country".to_string(),
+                            type_: "String".to_string(),
+                            description: None,
+                        },
+                    ],
+                    relationships: vec![],
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let selection = action_output_selection(&custom_types, "[NestedOutObject]!");
+        assert_eq!(
+            selection,
+            " { id address { city country } addresses { city country } }"
+        );
+        graphql_parser::parse_query::<String>(&format!("query {{ action{selection} }}"))
+            .expect("generated nested action selection must be valid GraphQL");
     }
 }

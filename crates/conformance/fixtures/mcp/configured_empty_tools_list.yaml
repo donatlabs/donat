@@ -1,0 +1,18 @@
+description: >
+  A present but empty mcp.yaml is an explicit deny-all publication list, so
+  tools/list never falls back to legacy generic CRUD tools.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 701
+  method: tools/list
+  params: {}
+response:
+  jsonrpc: "2.0"
+  id: 701
+  result:
+    tools: []

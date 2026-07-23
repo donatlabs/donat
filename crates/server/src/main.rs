@@ -278,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
             custom_types: Default::default(),
             cron_triggers: vec![],
             rest_endpoints: vec![],
+            mcp: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);

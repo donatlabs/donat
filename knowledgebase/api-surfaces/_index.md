@@ -29,6 +29,13 @@ separate branches and merge independently).
 - [[decisions/006-hasura-session-variable-compatibility]] — why `x-hasura-*`
   is accepted as a session-variable compatibility namespace without adding
   Hasura admin-secret or permission-bypass semantics
+- [[decisions/007-explicit-mcp-publication-metadata]] — why `mcp.yaml` is an
+  explicit role-scoped publication layer and network admission belongs to the
+  reverse proxy
+- [[decisions/008-defer-mcp-schema-resources]] — why schema-resource metadata
+  fails validation until discovery and read dispatch are implemented together
+- [[decisions/009-defer-mcp-action-output-relationships]] — why action tools
+  reject output relationships until MCP has a role-scoped target selection
 
 ## Cross-cutting
 

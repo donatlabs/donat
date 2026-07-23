@@ -37,6 +37,121 @@ pub struct Metadata {
     /// REST endpoints exposing saved queries over templated URLs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rest_endpoints: Vec<RestEndpoint>,
+    /// Agent-facing MCP tools. Kept in a separate `mcp.yaml` so GraphQL
+    /// metadata remains transport-neutral and MCP exposure is opt-in.
+    #[serde(default, skip_serializing_if = "McpMetadata::is_empty")]
+    pub mcp: McpMetadata,
+}
+
+/// Metadata loaded from the optional top-level `mcp.yaml` file.
+///
+/// This is deliberately a presentation/policy layer: a tool can only invoke
+/// a saved GraphQL query or an existing typed action. It never grants data
+/// permissions and it never introduces an MCP-only execution path.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpMetadata {
+    /// Whether `mcp.yaml` was present when metadata was loaded. This is kept
+    /// separate from its contents because an empty file is still an explicit
+    /// deny-all publication policy, not a request for legacy CRUD tools.
+    #[serde(skip)]
+    configured: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<McpTool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_tools: Vec<McpTableTool>,
+    #[serde(default, skip_serializing_if = "McpResources::is_empty")]
+    pub resources: McpResources,
+}
+
+impl McpMetadata {
+    pub fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    /// Mark this value as originating from a present `mcp.yaml` file.
+    /// Programmatic metadata writers must call this before serialization when
+    /// they intentionally need an empty explicit publication allowlist.
+    pub fn mark_configured(&mut self) {
+        self.configured = true;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.table_tools.is_empty() && self.resources.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub description: String,
+    pub source: McpToolSource,
+    /// Explicit MCP policy. Empty means no role is granted MCP exposure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
+    /// Human-facing descriptions keyed by GraphQL variable name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpToolSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_query: Option<McpSavedQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpSavedQuery {
+    pub collection: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpTableTool {
+    pub table: QualifiedTable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub operations: Vec<McpTableOperation>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpTableOperation {
+    pub operation: McpTableOperationKind,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTableOperationKind {
+    Query,
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpResources {
+    #[serde(default)]
+    pub schema: McpSchemaResource,
+}
+
+impl McpResources {
+    pub fn is_empty(&self) -> bool {
+        !self.schema.enabled
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpSchemaResource {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A custom GraphQL field (query or mutation) resolved by calling an HTTP
