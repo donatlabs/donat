@@ -1,0 +1,22 @@
+description: >
+  A present but empty mcp.yaml rejects direct calls to legacy generic CRUD
+  tools as unknown names, rather than treating the absent publication list as
+  legacy mode.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 702
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+response:
+  jsonrpc: "2.0"
+  id: 702
+  result:
+    isError: true

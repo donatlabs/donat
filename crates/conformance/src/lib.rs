@@ -239,9 +239,9 @@ use std::cell::RefCell;
 use donat_metadata::{
     AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
     FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
-    ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship,
-    RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind,
-    TableConfiguration, TableEntry, UpdatePermission,
+    McpMetadata, ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection,
+    RemoteRelationship, RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission,
+    Source, SourceKind, TableConfiguration, TableEntry, UpdatePermission,
 };
 
 /// Datasource backends covered by the mandatory conformance matrix.
@@ -938,6 +938,7 @@ fn default_metadata_with_configuration(
         custom_types: Default::default(),
         cron_triggers: vec![],
         rest_endpoints: vec![],
+        mcp: Default::default(),
     }
 }
 
@@ -2186,6 +2187,13 @@ impl Running {
             )
             .unwrap();
         }
+        if md.mcp.is_configured() {
+            std::fs::write(
+                dir.join("mcp.yaml"),
+                serde_yaml::to_string(&md.mcp).unwrap(),
+            )
+            .unwrap();
+        }
         if !md.actions.is_empty() || !md.custom_types.is_empty() {
             // Both live together in actions.yaml, the donat-cli export layout.
             let doc = json!({
@@ -2341,6 +2349,18 @@ impl Running {
             "add_cron_trigger must be called before the engine spawns"
         );
         self.metadata.borrow_mut().cron_triggers.push(trigger);
+    }
+
+    /// Configure the explicit MCP publication metadata before the engine
+    /// starts. This always writes an `mcp.yaml`, including for an empty
+    /// deny-all publication list.
+    pub fn set_mcp_metadata(&self, mut mcp: McpMetadata) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "set_mcp_metadata must be called before the engine spawns"
+        );
+        mcp.mark_configured();
+        self.metadata.borrow_mut().mcp = mcp;
     }
 
     /// The recording event webhook stub (only present after

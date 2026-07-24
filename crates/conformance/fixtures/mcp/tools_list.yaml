@@ -291,6 +291,7 @@ response:
             pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           where:
             type: object
+            minProperties: 1
             maxProperties: 100
             propertyNames:
               maxLength: 64
@@ -352,6 +353,7 @@ response:
             pattern: "^[_A-Za-z][_0-9A-Za-z]*$"
           where:
             type: object
+            minProperties: 1
             maxProperties: 100
             propertyNames:
               maxLength: 64

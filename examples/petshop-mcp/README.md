@@ -16,20 +16,21 @@ main example; only the served surface differs.
 
 ## The MCP server
 
-`POST /mcp` speaks JSON-RPC 2.0 over streamable HTTP (JSON mode, protocol
-`2025-06-18`): `initialize`, `tools/list`, `tools/call`. It exposes six
-generic, table-parameterized tools — `list_tables`, `describe_table`,
-`query`, `insert`, `update`, `delete` — derived from the tracked tables and
-the caller's permissions. A tool call without permission comes back as
-`isError`, never a bypass.
+`POST /mcp` speaks JSON-RPC 2.0 over HTTP: `initialize`, `tools/list`, and
+`tools/call`. The separate [`metadata/mcp.yaml`](metadata/mcp.yaml) is an
+explicit publication list: it exposes a curated catalogue search plus three
+staff-only inventory operations. A tracked table or saved GraphQL query is not
+agent-visible unless that file names it. Tool calls still run through the
+normal GraphQL planner, so a tool never bypasses a role, row filter, allowlist,
+or column permission.
 
 ## Auth
 
 The MCP request carries the same headers as the rest of the engine. In this
 demo, the trusted secret `petshop-secret` plus an `X-Donat-Role` header pick
 the role; in production you would send a JWT (`Authorization: Bearer <jwt>`)
-and the role comes from its claims. `tools/list` needs no role; `tools/call`
-does.
+and the role comes from its claims. Curated `tools/list` and `tools/call` both
+need a role because the published catalogue is role-scoped.
 
 ## Connect an MCP client
 
@@ -70,59 +71,51 @@ For a stdio-only client, bridge with `mcp-remote`:
 
 ## Try it with curl
 
-List the tools (no role required):
+List the tools for a role:
 
 ```bash
 curl -s localhost:8080/mcp -H 'content-type: application/json' \
+  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-`describe_table` returns each column's type and its **description** (sourced
-from `configuration.column_config.<col>.comment` in the table metadata):
+Call the curated inventory lookup tool:
 
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-        "name":"describe_table","arguments":{"table":"pet"}}}'
-# ... structuredContent.columns: [{"name":"status","type":"text","nullable":false,
-#     "description":"Availability of the pet. Exactly one of: \"available\" ..."}, ...]
-# The comments come from configuration.column_config.<col>.comment in the table
-# metadata — write them verbosely; the text is what an LLM reads to use a column.
+        "name":"inventory.lookup",
+        "arguments":{"columns":["id","name","status"],"order_by":{"id":"asc"}}}}'
 ```
 
-Query the inventory as staff (arguments are passed as GraphQL variables — a
-`where` filter, `order_by`, `limit`, …):
+Search the catalogue as any permitted role; its variables are passed through
+to the saved GraphQL operation:
 
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-        "name":"query",
-        "arguments":{"table":"pet","columns":["id","name","status"],
-                     "where":{"status":{"_eq":"pending"}},"order_by":{"id":"asc"}}}}'
-# result.structuredContent: [{"id":4,"name":"Shadow","status":"pending"}]
+        "name":"catalogue.search", "arguments":{"limit":10}}}'
 ```
 
-Insert as staff (`update`/`delete` take a `where` + `set` the same way):
+Create an inventory item as staff:
 
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
-        "name":"insert",
-        "arguments":{"table":"pet","objects":[{"name":"Milo","category_id":2,"price":80,"status":"available"}],
+        "name":"inventory.create",
+        "arguments":{"objects":[{"name":"Milo","category_id":2,"price":80,"status":"available"}],
                      "returning":["id","name"]}}}'
 # result.structuredContent: {"affected_rows":1,"returning":[{"id":8,"name":"Milo"}]}
 ```
 
-`list_tables` reports only what the role may touch — as `staff` every table
-with its allowed operations; as `anonymous` just the catalogue. A mutating
-call under a role without permission returns `isError: true` and writes
-nothing.
+A mutating call under a role without permission is absent from discovery and
+returns `isError: true` if called directly; it writes nothing.
 
 ## Reset
 
