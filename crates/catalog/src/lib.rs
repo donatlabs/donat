@@ -100,12 +100,19 @@ pub struct ColumnInfo {
     pub name: String,
     /// Postgres type name as reported by pg_catalog (e.g. `int4`, `text`).
     pub pg_type: String,
+    /// Raw `pg_attribute.atttypmod` from PostgreSQL, or `-1` when unavailable.
+    #[serde(default = "default_pg_typmod")]
+    pub pg_typmod: i32,
     /// Backend-native type used for SQL literal casts when it differs from
     /// the logical `pg_type` exposed through the GraphQL schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_type: Option<String>,
     pub nullable: bool,
     pub has_default: bool,
+}
+
+fn default_pg_typmod() -> i32 {
+    -1
 }
 
 impl ColumnInfo {
@@ -124,7 +131,7 @@ pub struct ForeignKey {
 }
 
 const COLUMNS_SQL: &str = r#"
-SELECT n.nspname, c.relname, a.attname, t.typname,
+SELECT n.nspname, c.relname, a.attname, t.typname, a.atttypmod,
        NOT a.attnotnull AS nullable,
        a.atthasdef AS has_default,
        c.relkind
@@ -206,7 +213,7 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
     for row in client.query(COLUMNS_SQL, &[]).await? {
         let schema: String = row.get(0);
         let table: String = row.get(1);
-        let relation_kind = RelationKind::from_postgres_relkind(row.get(6))
+        let relation_kind = RelationKind::from_postgres_relkind(row.get(7))
             .expect("COLUMNS_SQL must only return supported pg_class.relkind values");
         let key = format!("{schema}.{table}");
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
@@ -220,9 +227,10 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
         entry.columns.push(ColumnInfo {
             name: row.get(2),
             pg_type: row.get(3),
+            pg_typmod: row.get(4),
             native_type: None,
-            nullable: row.get(4),
-            has_default: row.get(5),
+            nullable: row.get(5),
+            has_default: row.get(6),
         });
     }
 
@@ -377,6 +385,7 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
                 columns.push(ColumnInfo {
                     name,
                     pg_type: sqlite_type_to_pg(&decl_type).to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: notnull == 0,
                     has_default: dflt.is_some(),
@@ -474,6 +483,7 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
         entry.columns.push(ColumnInfo {
             name: column,
             pg_type: mysql_type_to_pg(&data_type, &column_type).to_string(),
+            pg_typmod: -1,
             // MySQL scalar rendering is coercion-based and does not need the
             // physical COLUMN_TYPE. Keeping it out of the transitional
             // `sql_type()` path ensures logical `bool` reaches SQLgen instead
@@ -631,6 +641,7 @@ pub fn clickhouse_catalog_from_json_each_row(
         table.columns.push(ColumnInfo {
             name: row.name,
             pg_type: clickhouse_type_to_pg(&row.native_type).to_string(),
+            pg_typmod: -1,
             native_type: Some(row.native_type.clone()),
             nullable: clickhouse_is_nullable(&row.native_type),
             has_default: !row.default_kind.is_empty(),

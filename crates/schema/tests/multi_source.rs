@@ -66,6 +66,7 @@ fn col(name: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: "int4".to_string(),
+        pg_typmod: -1,
         native_type: None,
         nullable: false,
         has_default: false,
@@ -850,6 +851,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
                 ColumnInfo {
                     name: "id".to_string(),
                     pg_type: "uuid".to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: false,
                     has_default: false,
@@ -857,6 +859,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
                 ColumnInfo {
                     name: "body".to_string(),
                     pg_type: "text".to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: false,
                     has_default: false,

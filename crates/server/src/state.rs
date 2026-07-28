@@ -1888,6 +1888,7 @@ mod snapshot_tests {
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
+                        pg_typmod: -1,
                         native_type: None,
                         nullable: false,
                         has_default: false,
