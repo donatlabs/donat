@@ -238,3 +238,27 @@ fn validate_rejects_non_finite_or_unknown_declared_rule_types() {
         );
     }
 }
+
+#[test]
+fn validate_rule_errors_identify_the_metadata_path_without_echoing_expression_source() {
+    let db = fresh_db("conf_rules_source_redaction");
+    let source = "unexposed_rule_source_7e3c";
+    let rules = format!(
+        "rules:\n  - name: invalid_source_redaction\n    result: bool!\n    expression: \"{source} +\"\n"
+    );
+    let metadata = metadata_dir("source_redaction", Some(&rules));
+    let (ok, output) = validate(&db, &metadata);
+
+    assert!(
+        !ok,
+        "invalid rule metadata unexpectedly validated:\n{output}"
+    );
+    assert!(
+        output.contains("rules.yaml"),
+        "validation must retain the deploy-time metadata location:\n{output}"
+    );
+    assert!(
+        !output.contains(source),
+        "rule source must not appear in validation errors:\n{output}"
+    );
+}

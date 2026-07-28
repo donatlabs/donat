@@ -673,7 +673,7 @@ fn decision_trace_is_redacted_and_contains_only_a_revision_rows_booleans_and_dig
         .expect("the decision should evaluate");
     let trace_json = serde_json::to_string(&result.trace).expect("trace should serialize");
 
-    assert_eq!(result.trace.table_revision, "rules-2026-07-28");
+    assert_sha256_hex(&result.trace.table_revision, "table revision");
     assert_eq!(result.trace.table_name, "invoice_approval");
     assert_eq!(result.trace.matched_row_id.as_deref(), Some("default"));
     assert_eq!(result.trace.rejection, None);
@@ -690,7 +690,7 @@ fn decision_trace_is_redacted_and_contains_only_a_revision_rows_booleans_and_dig
             },
         ]
     );
-    assert!(result.trace.input_digest.len() >= 16);
+    assert_sha256_hex(&result.trace.input_digest, "canonical decoded input digest");
     assert!(!trace_json.contains("top-secret-value"));
     assert!(!format!("{:#?}", result.trace).contains("top-secret-value"));
     assert!(!trace_json.contains("\"amount\":100"));
@@ -754,7 +754,7 @@ fn assert_rejected_trace(
 ) {
     let trace_json = serde_json::to_string(trace).expect("trace should serialize");
 
-    assert_eq!(trace.table_revision, "rules-2026-07-28");
+    assert_sha256_hex(&trace.table_revision, "table revision");
     assert_eq!(trace.table_name, "invoice_approval");
     assert_eq!(trace.matched_row_id, None);
     assert_eq!(trace.rejection, Some(rejection));
@@ -762,6 +762,17 @@ fn assert_rejected_trace(
     assert!(!trace_json.contains(secret));
     assert!(!format!("{trace:#?}").contains(secret));
     assert!(!trace_json.contains(&format!("\"amount\":{raw_amount}")));
+    assert_sha256_hex(&trace.input_digest, "canonical decoded input digest");
+}
+
+fn assert_sha256_hex(value: &str, label: &str) {
+    assert_eq!(value.len(), 64, "{label} must be a SHA-256 hex digest");
+    assert!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} must be lower-case hexadecimal"
+    );
 }
 
 #[test]

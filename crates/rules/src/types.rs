@@ -115,6 +115,29 @@ pub struct RuleDefinition {
     pub expression: String,
 }
 
+/// The persisted profile artifact for one compiled rule. It is deploy-time
+/// metadata only: request errors never include the original source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleArtifact {
+    pub profile_version: u16,
+    pub original_source: String,
+    pub canonical_ast_sha256: String,
+    pub source_sha256: String,
+}
+
+/// An immutable canonical revision for a compiled decision definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DefinitionRevision(pub String);
+
+/// Framed canonical record roots for profile version one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CanonicalRoot {
+    TypedRuleAst = 0x01,
+    DecisionDefinition = 0x02,
+    DecodedTypedInput = 0x03,
+}
+
 /// The two and only two supported DMN-inspired decision-table policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HitPolicy {
@@ -182,7 +205,9 @@ pub struct CompiledRule {
     pub name: String,
     pub bindings: BTreeMap<String, RuleType>,
     pub result: RuleType,
+    pub artifact: RuleArtifact,
     pub(crate) expression: CheckedExpr,
+    pub(crate) declared_types: Vec<RuleType>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,10 +261,13 @@ pub struct DecisionResult {
 #[derive(Debug, Clone)]
 pub struct CompiledDecisionTable {
     pub name: String,
-    pub revision: String,
+    pub revision: DefinitionRevision,
     pub(crate) inputs: BTreeMap<String, RuleType>,
+    pub(crate) output: BTreeMap<String, RuleType>,
     pub(crate) hit_policy: HitPolicy,
     pub rows: Vec<CompiledDecisionRow>,
+    pub(crate) test_cases: Vec<CompiledDecisionTestCase>,
+    pub(crate) declared_types: Vec<RuleType>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +276,27 @@ pub struct CompiledDecisionRow {
     pub description: Option<String>,
     pub(crate) conditions: BTreeMap<String, CheckedExpr>,
     pub(crate) output: Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledDecisionTestCase {
+    pub(crate) name: String,
+    pub(crate) input: BTreeMap<String, Value>,
+    pub(crate) output: BTreeMap<String, Value>,
+    pub(crate) matched_row_id: String,
+}
+
+/// A profile value submitted to [`crate::canonical_bytes`] for root tag `03`.
+/// Its JSON representation is decoded with the accompanying closed type map
+/// before canonical framing; it is never serialized as JSON for hashing.
+#[derive(Debug, Clone)]
+pub enum CanonicalValue {
+    TypedRule(CompiledRule),
+    DecisionDefinition(CompiledDecisionTable),
+    DecodedTypedInput {
+        types: BTreeMap<String, RuleType>,
+        bindings: BTreeMap<String, Value>,
+    },
 }
 
 /// The complete compiled snapshot. It stores no raw input data and exposes no

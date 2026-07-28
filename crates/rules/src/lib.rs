@@ -15,17 +15,24 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use eval::{
-    RuleBindings, compile_catalog, compile_catalog_with_declared_types,
-    compile_catalog_with_declared_types_and_contexts, evaluate_bool,
+    RuleBindings, canonical_bytes, compile_catalog, compile_catalog_with_declared_types,
+    compile_catalog_with_declared_types_and_contexts,
+    compile_catalog_with_declared_types_and_contexts_and_declaration_order, evaluate_bool,
 };
 pub use parser::parse_expression;
 pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres};
 pub use types::{
-    CompiledDecisionRow, CompiledDecisionTable, CompiledRule, DecisionConditionTrace,
-    DecisionRejection, DecisionResult, DecisionRow, DecisionTableDefinition, DecisionTableTestCase,
-    DecisionTestExpectation, DecisionTrace, ExpressionContext, ExpressionOwner, HitPolicy,
-    RuleCatalog, RuleDefinition, RuleDiagnostic, RuleError, RuleType,
+    CanonicalRoot, CanonicalValue, CompiledDecisionRow, CompiledDecisionTable, CompiledRule,
+    DecisionConditionTrace, DecisionRejection, DecisionResult, DecisionRow,
+    DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation, DecisionTrace,
+    DefinitionRevision, ExpressionContext, ExpressionOwner, HitPolicy, RuleArtifact, RuleCatalog,
+    RuleDefinition, RuleDiagnostic, RuleError, RuleType,
 };
+
+/// Profile format version carried in every canonical rule artifact.
+pub const PROFILE_VERSION: u16 = 1;
+/// Fixed prefix for all canonical profile records.
+pub const MAGIC: [u8; 22] = *b"DONAT-RULES-CANONICAL\0";
 
 /// Maximum UTF-8 source size for a single declarative rule expression.
 pub const MAX_EXPRESSION_BYTES: usize = 4096;

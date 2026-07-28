@@ -472,9 +472,9 @@ pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, P
             Ok((
                 RuleDecisionTableDefinition {
                     name: definition.name.clone(),
-                    // Process revisions will add immutable definition hashes.
-                    // This deploy-time catalog has no separately mutable table
-                    // revision, so the stable declared name scopes its trace.
+                    // The rules crate derives this deploy-time revision from
+                    // the complete canonical compiled definition; the legacy
+                    // field remains for its source-model compatibility only.
                     revision: definition.name.clone(),
                     inputs: compile_rule_types(
                         &definition.inputs,
@@ -517,32 +517,64 @@ pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, P
     let (tables, decision_condition_contexts): (Vec<_>, Vec<_>) =
         tables_and_contexts.into_iter().unzip();
 
-    donat_rules::compile_catalog_with_declared_types_and_contexts(
-        &declared_types,
-        &rules,
-        &tables,
-        &rule_contexts,
-        &decision_condition_contexts,
-    )
-    .map_err(|error| {
-        if let Some(diagnostic) = error.diagnostic() {
-            PlanError::validation(
-                &diagnostic.context.metadata_path,
-                format!(
-                    "declarative rule validation failed for {} at bytes {}..{}: {}",
-                    render_expression_owner(&diagnostic.context.expression_owner),
-                    diagnostic.span.start,
-                    diagnostic.span.end,
-                    diagnostic.message
-                ),
-            )
-        } else {
-            PlanError::validation(
-                "rules.yaml",
-                format!("declarative rule validation failed: {error}"),
-            )
-        }
-    })
+    let declaration_order = metadata
+        .rules
+        .types
+        .iter()
+        .map(|declaration| declaration.name.clone())
+        .collect::<Vec<_>>();
+    let catalog =
+        donat_rules::compile_catalog_with_declared_types_and_contexts_and_declaration_order(
+            &declared_types,
+            &declaration_order,
+            &rules,
+            &tables,
+            &rule_contexts,
+            &decision_condition_contexts,
+        )
+        .map_err(|error| {
+            if let Some(diagnostic) = error.diagnostic() {
+                PlanError::validation(
+                    &diagnostic.context.metadata_path,
+                    format!(
+                        "declarative rule validation failed for {} at bytes {}..{}: {}",
+                        render_expression_owner(&diagnostic.context.expression_owner),
+                        diagnostic.span.start,
+                        diagnostic.span.end,
+                        diagnostic.message
+                    ),
+                )
+            } else {
+                PlanError::validation(
+                    "rules.yaml",
+                    format!("declarative rule validation failed: {error}"),
+                )
+            }
+        })?;
+
+    for rule in &rules {
+        let compiled = catalog
+            .rule(&rule.name)
+            .expect("validated rule remains in the compiled catalog");
+        tracing::debug!(
+            rule = %compiled.name,
+            profile_version = compiled.artifact.profile_version,
+            source_sha256 = %compiled.artifact.source_sha256,
+            canonical_ast_sha256 = %compiled.artifact.canonical_ast_sha256,
+            "declarative rule profile artifact compiled"
+        );
+    }
+    for table in &tables {
+        let compiled = catalog
+            .decision_table(&table.name)
+            .expect("validated decision remains in the compiled catalog");
+        tracing::debug!(
+            table = %compiled.name,
+            revision = %compiled.revision.0,
+            "declarative decision revision compiled"
+        );
+    }
+    Ok(catalog)
 }
 
 fn render_expression_owner(owner: &ExpressionOwner) -> String {

@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::types::{
-    CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable, access_result_type,
+    CanonicalValue, CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable,
+    CompiledDecisionTestCase, DefinitionRevision, RuleArtifact, access_result_type,
 };
 use crate::{
-    BinaryOp, CompiledRule, DecisionConditionTrace, DecisionRejection, DecisionResult,
-    DecisionTableDefinition, DecisionTrace, Expr, ExprKind, ExpressionContext, Function, HitPolicy,
-    Literal, RuleCatalog, RuleDefinition, RuleError, RuleType, UnaryOp, parse_expression,
+    BinaryOp, CanonicalRoot, CompiledRule, DecisionConditionTrace, DecisionRejection,
+    DecisionResult, DecisionTableDefinition, DecisionTrace, Expr, ExprKind, ExpressionContext,
+    Function, HitPolicy, Literal, MAGIC, PROFILE_VERSION, RuleCatalog, RuleDefinition, RuleError,
+    RuleType, UnaryOp, parse_expression,
 };
 
 pub type RuleBindings = BTreeMap<String, Value>;
@@ -31,7 +34,7 @@ pub fn compile_catalog_with_declared_types(
     rules: &[RuleDefinition],
     tables: &[DecisionTableDefinition],
 ) -> Result<RuleCatalog, RuleError> {
-    compile_catalog_internal(declared_types, rules, tables, None, None)
+    compile_catalog_internal(declared_types, None, rules, tables, None, None)
 }
 
 /// Compile a catalog with the source-site locations supplied by the metadata
@@ -45,6 +48,28 @@ pub fn compile_catalog_with_declared_types_and_contexts(
     rule_contexts: &[ExpressionContext],
     decision_condition_contexts: &[Vec<BTreeMap<String, ExpressionContext>>],
 ) -> Result<RuleCatalog, RuleError> {
+    let declaration_order = declared_types.keys().cloned().collect::<Vec<_>>();
+    compile_catalog_with_declared_types_and_contexts_and_declaration_order(
+        declared_types,
+        &declaration_order,
+        rules,
+        tables,
+        rule_contexts,
+        decision_condition_contexts,
+    )
+}
+
+/// Compile a catalog while retaining the metadata declaration list order in
+/// canonical decision records. Map-only callers use deterministic UTF-8 key
+/// order through [`compile_catalog_with_declared_types_and_contexts`].
+pub fn compile_catalog_with_declared_types_and_contexts_and_declaration_order(
+    declared_types: &BTreeMap<String, RuleType>,
+    declaration_order: &[String],
+    rules: &[RuleDefinition],
+    tables: &[DecisionTableDefinition],
+    rule_contexts: &[ExpressionContext],
+    decision_condition_contexts: &[Vec<BTreeMap<String, ExpressionContext>>],
+) -> Result<RuleCatalog, RuleError> {
     if rule_contexts.len() != rules.len() || decision_condition_contexts.len() != tables.len() {
         return Err(RuleError::InternalInvariant {
             rule: "catalog".to_owned(),
@@ -52,6 +77,7 @@ pub fn compile_catalog_with_declared_types_and_contexts(
     }
     compile_catalog_internal(
         declared_types,
+        Some(declaration_order),
         rules,
         tables,
         Some(rule_contexts),
@@ -61,12 +87,14 @@ pub fn compile_catalog_with_declared_types_and_contexts(
 
 fn compile_catalog_internal(
     declared_types: &BTreeMap<String, RuleType>,
+    declaration_order: Option<&[String]>,
     rules: &[RuleDefinition],
     tables: &[DecisionTableDefinition],
     rule_contexts: Option<&[ExpressionContext]>,
     decision_condition_contexts: Option<&[Vec<BTreeMap<String, ExpressionContext>>]>,
 ) -> Result<RuleCatalog, RuleError> {
     let mut catalog = RuleCatalog::default();
+    let declared_type_declarations = canonical_declarations(declared_types, declaration_order)?;
 
     for (rule_index, definition) in rules.iter().enumerate() {
         if catalog.rules.contains_key(&definition.name)
@@ -110,15 +138,25 @@ fn compile_catalog_internal(
                 },
             );
         }
-        catalog.rules.insert(
-            definition.name.clone(),
-            CompiledRule {
-                name: definition.name.clone(),
-                bindings: definition.bindings.clone(),
-                result: definition.result.clone(),
-                expression: checked,
+        let mut compiled = CompiledRule {
+            name: definition.name.clone(),
+            bindings: definition.bindings.clone(),
+            result: definition.result.clone(),
+            artifact: RuleArtifact {
+                profile_version: PROFILE_VERSION,
+                original_source: definition.expression.clone(),
+                canonical_ast_sha256: String::new(),
+                source_sha256: sha256_hex(definition.expression.as_bytes()),
             },
+            expression: checked,
+            declared_types: declared_type_declarations.clone(),
+        };
+        let bytes = canonical_bytes(
+            CanonicalRoot::TypedRuleAst,
+            &CanonicalValue::TypedRule(compiled.clone()),
         );
+        compiled.artifact.canonical_ast_sha256 = sha256_hex(&bytes);
+        catalog.rules.insert(definition.name.clone(), compiled);
     }
 
     for (table_index, definition) in tables.iter().enumerate() {
@@ -133,6 +171,7 @@ fn compile_catalog_internal(
         let compiled = compile_decision_table(
             definition,
             declared_types,
+            &declared_type_declarations,
             decision_condition_contexts.and_then(|contexts| contexts.get(table_index)),
         )?;
         catalog
@@ -141,6 +180,7 @@ fn compile_catalog_internal(
     }
 
     validate_decision_test_cases(&catalog, tables)?;
+    derive_decision_revisions(&mut catalog);
     Ok(catalog)
 }
 
@@ -240,6 +280,7 @@ pub fn evaluate_bool(rule: &CompiledRule, bindings: &RuleBindings) -> Result<boo
 fn compile_decision_table(
     definition: &DecisionTableDefinition,
     declared_types: &BTreeMap<String, RuleType>,
+    declared_type_declarations: &[RuleType],
     condition_contexts: Option<&Vec<BTreeMap<String, ExpressionContext>>>,
 ) -> Result<CompiledDecisionTable, RuleError> {
     let policy = match &definition.hit_policy {
@@ -341,12 +382,40 @@ fn compile_decision_table(
         });
     }
 
+    let test_cases = definition
+        .test_cases
+        .iter()
+        .map(|case| {
+            let Value::Object(input) = &case.input else {
+                return Err(RuleError::DecisionTestCaseMismatch {
+                    table: definition.name.clone(),
+                    case_name: case.name.clone(),
+                });
+            };
+            let Value::Object(output) = &case.expect.output else {
+                return Err(RuleError::DecisionTestCaseMismatch {
+                    table: definition.name.clone(),
+                    case_name: case.name.clone(),
+                });
+            };
+            Ok(CompiledDecisionTestCase {
+                name: case.name.clone(),
+                input: input.clone().into_iter().collect(),
+                output: output.clone().into_iter().collect(),
+                matched_row_id: case.expect.matched_row_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(CompiledDecisionTable {
         name: definition.name.clone(),
-        revision: definition.revision.clone(),
+        revision: DefinitionRevision(String::new()),
         inputs: definition.inputs.clone(),
+        output: definition.output.clone(),
         hit_policy: policy,
         rows,
+        test_cases,
+        declared_types: declared_type_declarations.to_vec(),
     })
 }
 
@@ -892,7 +961,7 @@ fn evaluate_decision_table(
                     None,
                     Some(DecisionRejection::NoMatch),
                     condition_results.clone(),
-                    bindings,
+                    &context,
                 )),
             })?,
         HitPolicy::Unique if matched.len() == 1 => {
@@ -911,7 +980,7 @@ fn evaluate_decision_table(
                     None,
                     Some(DecisionRejection::NoMatch),
                     condition_results,
-                    bindings,
+                    &context,
                 )),
             });
         }
@@ -924,7 +993,7 @@ fn evaluate_decision_table(
                     None,
                     Some(DecisionRejection::MultipleMatches),
                     condition_results,
-                    bindings,
+                    &context,
                 )),
             });
         }
@@ -944,7 +1013,7 @@ fn evaluate_decision_table(
             Some(matched_row_id),
             None,
             condition_results,
-            bindings,
+            &context,
         ),
     })
 }
@@ -954,15 +1023,18 @@ fn decision_trace(
     matched_row_id: Option<String>,
     rejection: Option<DecisionRejection>,
     condition_results: Vec<DecisionConditionTrace>,
-    bindings: &RuleBindings,
+    decoded_bindings: &BTreeMap<String, RuntimeValue>,
 ) -> DecisionTrace {
     DecisionTrace {
         table_name: table.name.clone(),
-        table_revision: table.revision.clone(),
+        table_revision: table.revision.0.clone(),
         matched_row_id,
         rejection,
         condition_results,
-        input_digest: digest_bindings(bindings),
+        input_digest: sha256_hex(&canonical_decoded_input_bytes(
+            &table.inputs,
+            decoded_bindings,
+        )),
     }
 }
 
@@ -1013,7 +1085,7 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
         RuleType::Uuid => value
             .as_str()
             .filter(|value| is_uuid(value))
-            .map(|value| RuntimeValue::Uuid(value.to_owned())),
+            .map(|value| RuntimeValue::Uuid(value.to_ascii_lowercase())),
         RuleType::Date => value
             .as_str()
             .filter(|value| is_canonical_date(value))
@@ -1021,7 +1093,8 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
         RuleType::Timestamp => value
             .as_str()
             .filter(|value| is_canonical_timestamp(value))
-            .map(|value| RuntimeValue::Timestamp(value.to_owned())),
+            .and_then(canonical_timestamp_utc)
+            .map(RuntimeValue::Timestamp),
         RuleType::Enum { name, symbols } => value
             .as_str()
             .filter(|value| symbols.iter().any(|symbol| symbol == value))
@@ -1139,6 +1212,72 @@ fn is_canonical_timestamp(value: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn canonical_timestamp_utc(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut zone_start = 19;
+    if bytes.get(zone_start) == Some(&b'.') {
+        zone_start += 1;
+        while bytes
+            .get(zone_start)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            zone_start += 1;
+        }
+    }
+    if bytes.get(zone_start) == Some(&b'Z') {
+        return Some(value.to_owned());
+    }
+    let sign = match bytes.get(zone_start) {
+        Some(b'+') => 1_i32,
+        Some(b'-') => -1_i32,
+        _ => return None,
+    };
+    let offset_hour = parse_two_or_four_digits(&value[zone_start + 1..zone_start + 3])? as i32;
+    let offset_minute = parse_two_or_four_digits(&value[zone_start + 4..zone_start + 6])? as i32;
+    let mut year = parse_two_or_four_digits(&value[0..4])?;
+    let mut month = parse_two_or_four_digits(&value[5..7])?;
+    let mut day = parse_two_or_four_digits(&value[8..10])?;
+    let local_minutes = parse_two_or_four_digits(&value[11..13])? as i32 * 60
+        + parse_two_or_four_digits(&value[14..16])? as i32;
+    let mut utc_minutes = local_minutes - sign * (offset_hour * 60 + offset_minute);
+    while utc_minutes < 0 {
+        utc_minutes += 24 * 60;
+        if day > 1 {
+            day -= 1;
+        } else if month > 1 {
+            month -= 1;
+            day = days_in_month(year, month);
+        } else {
+            year = year.checked_sub(1)?;
+            if year == 0 {
+                return None;
+            }
+            month = 12;
+            day = 31;
+        }
+    }
+    while utc_minutes >= 24 * 60 {
+        utc_minutes -= 24 * 60;
+        if day < days_in_month(year, month) {
+            day += 1;
+        } else if month < 12 {
+            month += 1;
+            day = 1;
+        } else {
+            year = year.checked_add(1)?;
+            month = 1;
+            day = 1;
+        }
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{}{}Z",
+        utc_minutes / 60,
+        utc_minutes % 60,
+        &value[17..19],
+        &value[19..zone_start],
+    ))
 }
 
 fn parse_two_or_four_digits(value: &str) -> Option<u32> {
@@ -1618,59 +1757,609 @@ impl PartialOrd for Decimal {
     }
 }
 
+/// Encode a complete profile-v1 record. This deliberately writes the
+/// normative byte grammar directly; no serde or Rust map serialization is part
+/// of the artifact format.
+pub fn canonical_bytes(root: CanonicalRoot, value: &CanonicalValue) -> Vec<u8> {
+    let mut output = Vec::with_capacity(128);
+    output.extend_from_slice(&MAGIC);
+    output.extend_from_slice(&PROFILE_VERSION.to_be_bytes());
+    output.push(root as u8);
+
+    match (root, value) {
+        (CanonicalRoot::TypedRuleAst, CanonicalValue::TypedRule(rule)) => {
+            encode_rule_record(&mut output, rule);
+        }
+        (CanonicalRoot::DecisionDefinition, CanonicalValue::DecisionDefinition(table)) => {
+            encode_decision_record(&mut output, table);
+        }
+        (
+            CanonicalRoot::DecodedTypedInput,
+            CanonicalValue::DecodedTypedInput { types, bindings },
+        ) => {
+            let decoded = decode_bindings(types, bindings)
+                .expect("canonical decoded input must have complete typed bindings");
+            encode_runtime_map(&mut output, types, &decoded);
+        }
+        _ => panic!("canonical root must match its canonical value"),
+    }
+
+    output
+}
+
+fn canonical_decoded_input_bytes(
+    types: &BTreeMap<String, RuleType>,
+    decoded_bindings: &BTreeMap<String, RuntimeValue>,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(128);
+    output.extend_from_slice(&MAGIC);
+    output.extend_from_slice(&PROFILE_VERSION.to_be_bytes());
+    output.push(CanonicalRoot::DecodedTypedInput as u8);
+    encode_runtime_map(&mut output, types, decoded_bindings);
+    output
+}
+
+fn canonical_declarations(
+    declared_types: &BTreeMap<String, RuleType>,
+    declaration_order: Option<&[String]>,
+) -> Result<Vec<RuleType>, RuleError> {
+    let names = declaration_order
+        .map(|names| names.to_vec())
+        .unwrap_or_else(|| declared_types.keys().cloned().collect());
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            if !seen.insert(name.clone()) {
+                return Err(RuleError::InternalInvariant {
+                    rule: "catalog".to_owned(),
+                });
+            }
+            declared_types
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| RuleError::InternalInvariant {
+                    rule: "catalog".to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn derive_decision_revisions(catalog: &mut RuleCatalog) {
+    for table in catalog.decision_tables.values_mut() {
+        let bytes = canonical_bytes(
+            CanonicalRoot::DecisionDefinition,
+            &CanonicalValue::DecisionDefinition(table.clone()),
+        );
+        table.revision = DefinitionRevision(sha256_hex(&bytes));
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn encode_rule_record(output: &mut Vec<u8>, rule: &CompiledRule) {
+    encode_string(output, &rule.name);
+    encode_type_map(output, &rule.bindings);
+    encode_type(output, &rule.result);
+    let context = CanonicalExpressionContext {
+        bindings: &rule.bindings,
+        declared_types: &rule.declared_types,
+    };
+    encode_expression(
+        output,
+        &rule.expression.expression,
+        &context,
+        Some(&rule.result),
+    );
+}
+
+fn encode_decision_record(output: &mut Vec<u8>, table: &CompiledDecisionTable) {
+    encode_string(output, &table.name);
+    encode_count(output, table.declared_types.len());
+    for declaration in &table.declared_types {
+        encode_declaration(output, declaration);
+    }
+    encode_type_map(output, &table.inputs);
+    encode_type_map(output, &table.output);
+    output.push(match table.hit_policy {
+        HitPolicy::First => 0x00,
+        HitPolicy::Unique => 0x01,
+        HitPolicy::Unsupported(_) => panic!("validated decision hit policy"),
+    });
+    encode_count(output, table.rows.len());
+    let context = CanonicalExpressionContext {
+        bindings: &table.inputs,
+        declared_types: &table.declared_types,
+    };
+    for row in &table.rows {
+        encode_string(output, &row.id);
+        encode_count(output, row.conditions.len());
+        let mut conditions = row.conditions.iter().collect::<Vec<_>>();
+        conditions.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        for (name, condition) in conditions {
+            encode_string(output, name);
+            encode_expression(
+                output,
+                &condition.expression,
+                &context,
+                Some(&RuleType::Bool),
+            );
+        }
+        let Value::Object(row_output) = &row.output else {
+            panic!("validated decision row output is an object");
+        };
+        let row_output = row_output.clone().into_iter().collect::<BTreeMap<_, _>>();
+        encode_json_map(output, &table.output, &row_output);
+    }
+    encode_count(output, table.test_cases.len());
+    for case in &table.test_cases {
+        encode_string(output, &case.name);
+        encode_json_map(output, &table.inputs, &case.input);
+        encode_json_map(output, &table.output, &case.output);
+        encode_string(output, &case.matched_row_id);
+    }
+}
+
+fn encode_declaration(output: &mut Vec<u8>, declaration: &RuleType) {
+    match declaration {
+        RuleType::Enum { name, symbols } => {
+            output.push(0x40);
+            encode_string(output, name);
+            encode_count(output, symbols.len());
+            for symbol in symbols {
+                encode_string(output, symbol);
+            }
+        }
+        RuleType::Object { name, fields } => {
+            output.push(0x41);
+            encode_string(output, name);
+            encode_type_map(output, fields);
+        }
+        _ => panic!("resolved declarations are object or enum types"),
+    }
+}
+
+fn encode_type_map(output: &mut Vec<u8>, types: &BTreeMap<String, RuleType>) {
+    encode_count(output, types.len());
+    let mut entries = types.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    for (name, type_) in entries {
+        encode_string(output, name);
+        encode_type(output, type_);
+    }
+}
+
+fn encode_type(output: &mut Vec<u8>, type_: &RuleType) {
+    match type_ {
+        RuleType::Bool => output.push(0x10),
+        RuleType::String => output.push(0x11),
+        RuleType::Int => output.push(0x12),
+        RuleType::Decimal => output.push(0x13),
+        RuleType::Uuid => output.push(0x14),
+        RuleType::Date => output.push(0x15),
+        RuleType::Timestamp => output.push(0x16),
+        RuleType::Enum { name, symbols } => {
+            output.push(0x17);
+            encode_string(output, name);
+            encode_count(output, symbols.len());
+            for symbol in symbols {
+                encode_string(output, symbol);
+            }
+        }
+        RuleType::List(item) => {
+            output.push(0x18);
+            encode_type(output, item);
+        }
+        RuleType::Object { name, fields } => {
+            output.push(0x19);
+            encode_string(output, name);
+            encode_type_map(output, fields);
+        }
+        RuleType::Nullable(inner) => {
+            output.push(0x1a);
+            let mut inner = inner.as_ref();
+            while let RuleType::Nullable(next) = inner {
+                inner = next;
+            }
+            encode_type(output, inner);
+        }
+    }
+}
+
+struct CanonicalExpressionContext<'a> {
+    bindings: &'a BTreeMap<String, RuleType>,
+    declared_types: &'a [RuleType],
+}
+
+fn encode_expression(
+    output: &mut Vec<u8>,
+    expression: &Expr,
+    context: &CanonicalExpressionContext<'_>,
+    expected: Option<&RuleType>,
+) -> RuleType {
+    let type_ = expression_type(expression, context, expected);
+    match &expression.kind {
+        ExprKind::Literal(literal) => {
+            output.push(0x20);
+            encode_literal(output, literal);
+        }
+        ExprKind::Name(name) => {
+            output.push(0x21);
+            encode_string(output, name);
+        }
+        ExprKind::EnumSymbol { enum_name, symbol } => {
+            output.push(0x22);
+            encode_string(output, enum_name);
+            encode_string(output, symbol);
+        }
+        ExprKind::List(items) => {
+            output.push(0x23);
+            encode_count(output, items.len());
+            let RuleType::List(item_type) = &type_ else {
+                panic!("validated list expression has a list result");
+            };
+            for item in items {
+                encode_expression(output, item, context, Some(item_type));
+            }
+        }
+        ExprKind::Member { target, field } => {
+            output.push(0x24);
+            encode_expression(output, target, context, None);
+            encode_string(output, field);
+        }
+        ExprKind::Index { target, index } => {
+            output.push(0x25);
+            encode_expression(output, target, context, None);
+            encode_count(output, *index);
+        }
+        ExprKind::Call {
+            function,
+            arguments,
+        } => {
+            output.push(0x26);
+            output.push(function_tag(*function));
+            encode_count(output, arguments.len());
+            for argument in arguments {
+                encode_expression(output, argument, context, None);
+            }
+        }
+        ExprKind::Unary { op, operand } => {
+            output.push(0x27);
+            output.push(unary_tag(*op));
+            encode_expression(output, operand, context, None);
+        }
+        ExprKind::Binary { op, left, right } => {
+            output.push(0x28);
+            output.push(binary_tag(*op));
+            let (left_expected, right_expected) = equality_expected_types(left, right, context);
+            encode_expression(output, left, context, left_expected.as_ref());
+            encode_expression(output, right, context, right_expected.as_ref());
+        }
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            output.push(0x29);
+            encode_expression(output, condition, context, Some(&RuleType::Bool));
+            encode_expression(output, when_true, context, Some(&type_));
+            encode_expression(output, when_false, context, Some(&type_));
+        }
+    }
+    encode_type(output, &type_);
+    type_
+}
+
+fn expression_type(
+    expression: &Expr,
+    context: &CanonicalExpressionContext<'_>,
+    expected: Option<&RuleType>,
+) -> RuleType {
+    match &expression.kind {
+        ExprKind::Literal(Literal::Null) => expected
+            .filter(|type_| type_.accepts_null())
+            .cloned()
+            .expect("validated null expression has a nullable resolved type"),
+        ExprKind::Literal(Literal::Bool(_)) => RuleType::Bool,
+        ExprKind::Literal(Literal::String(_)) => RuleType::String,
+        ExprKind::Literal(Literal::Int(_)) => RuleType::Int,
+        ExprKind::Literal(Literal::Decimal(_)) => RuleType::Decimal,
+        ExprKind::Name(name) => context
+            .bindings
+            .get(name)
+            .cloned()
+            .expect("validated expression name"),
+        ExprKind::EnumSymbol { enum_name, .. } => context
+            .declared_types
+            .iter()
+            .find(|type_| matches!(type_, RuleType::Enum { name, .. } if name == enum_name))
+            .cloned()
+            .expect("validated enum symbol"),
+        ExprKind::List(items) => {
+            let item_expected = match expected {
+                Some(RuleType::List(item)) => Some(item.as_ref()),
+                _ => None,
+            };
+            let item = items
+                .first()
+                .map(|item| expression_type(item, context, item_expected))
+                .expect("validated list has an item");
+            RuleType::List(Box::new(item))
+        }
+        ExprKind::Member { target, field } => {
+            let RuleType::Object { fields, .. } = expression_type(target, context, None) else {
+                panic!("validated member target is an object");
+            };
+            RuleType::nullable(fields.get(field).cloned().expect("validated object field"))
+        }
+        ExprKind::Index { target, .. } => {
+            let RuleType::List(item) = expression_type(target, context, None) else {
+                panic!("validated index target is a list");
+            };
+            RuleType::nullable(*item)
+        }
+        ExprKind::Call { function, .. } => match function {
+            Function::Size => RuleType::Int,
+            Function::IsNull | Function::StartsWith | Function::EndsWith => RuleType::Bool,
+        },
+        ExprKind::Unary { op, operand } => match op {
+            UnaryOp::Not => RuleType::Bool,
+            UnaryOp::Negate => expression_type(operand, context, None),
+        },
+        ExprKind::Binary { op, left, .. } => match op {
+            BinaryOp::Or
+            | BinaryOp::And
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual => RuleType::Bool,
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                expression_type(left, context, None)
+            }
+        },
+        ExprKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            if let Some(expected) = expected {
+                return expected.clone();
+            }
+            match &when_true.kind {
+                ExprKind::Literal(Literal::Null) => expression_type(when_false, context, None),
+                _ => expression_type(when_true, context, None),
+            }
+        }
+    }
+}
+
+fn equality_expected_types(
+    left: &Expr,
+    right: &Expr,
+    context: &CanonicalExpressionContext<'_>,
+) -> (Option<RuleType>, Option<RuleType>) {
+    if !matches!(left.kind, ExprKind::Literal(Literal::Null))
+        && !matches!(right.kind, ExprKind::Literal(Literal::Null))
+    {
+        return (None, None);
+    }
+    if matches!(left.kind, ExprKind::Literal(Literal::Null)) {
+        let type_ = expression_type(right, context, None);
+        return (Some(type_.clone()), Some(type_));
+    }
+    let type_ = expression_type(left, context, None);
+    (Some(type_.clone()), Some(type_))
+}
+
+fn encode_literal(output: &mut Vec<u8>, literal: &Literal) {
+    match literal {
+        Literal::Null => output.push(0x00),
+        Literal::Bool(value) => {
+            output.push(0x01);
+            encode_bool(output, *value);
+        }
+        Literal::Int(value) => {
+            output.push(0x02);
+            let value = value
+                .parse::<i128>()
+                .expect("validated canonical integer literal")
+                .to_string();
+            encode_string(output, &value);
+        }
+        Literal::Decimal(value) => {
+            output.push(0x03);
+            encode_decimal(
+                output,
+                Decimal::parse(value).expect("validated canonical decimal literal"),
+            );
+        }
+        Literal::String(value) => {
+            output.push(0x04);
+            encode_string(output, value);
+        }
+    }
+}
+
+fn function_tag(function: Function) -> u8 {
+    match function {
+        Function::Size => 0x00,
+        Function::IsNull => 0x01,
+        Function::StartsWith => 0x02,
+        Function::EndsWith => 0x03,
+    }
+}
+
+fn unary_tag(op: UnaryOp) -> u8 {
+    match op {
+        UnaryOp::Not => 0x00,
+        UnaryOp::Negate => 0x01,
+    }
+}
+
+fn binary_tag(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => 0x00,
+        BinaryOp::And => 0x01,
+        BinaryOp::Equal => 0x02,
+        BinaryOp::NotEqual => 0x03,
+        BinaryOp::LessThan => 0x04,
+        BinaryOp::LessThanOrEqual => 0x05,
+        BinaryOp::GreaterThan => 0x06,
+        BinaryOp::GreaterThanOrEqual => 0x07,
+        BinaryOp::Add => 0x08,
+        BinaryOp::Subtract => 0x09,
+        BinaryOp::Multiply => 0x0a,
+        BinaryOp::Divide => 0x0b,
+    }
+}
+
+fn encode_json_map(
+    output: &mut Vec<u8>,
+    types: &BTreeMap<String, RuleType>,
+    values: &BTreeMap<String, Value>,
+) {
+    encode_count(output, types.len());
+    let mut entries = types.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    for (name, type_) in entries {
+        let value = values
+            .get(name)
+            .and_then(|value| decode_value(value, type_))
+            .expect("validated canonical typed value");
+        encode_string(output, name);
+        encode_typed_value(output, type_, &value);
+    }
+}
+
+fn encode_runtime_map(
+    output: &mut Vec<u8>,
+    types: &BTreeMap<String, RuleType>,
+    values: &BTreeMap<String, RuntimeValue>,
+) {
+    encode_count(output, types.len());
+    let mut entries = types.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    for (name, type_) in entries {
+        encode_string(output, name);
+        let value = values
+            .get(name)
+            .expect("complete decoded canonical bindings");
+        // Total object access represents an omitted member as null even when
+        // its declared member type is non-null. Canonical values preserve the
+        // null only with an explicit nullable value type, as required by the
+        // profile grammar.
+        if matches!(value, RuntimeValue::Null) && !type_.accepts_null() {
+            encode_typed_value(output, &RuleType::nullable(type_.clone()), value);
+        } else {
+            encode_typed_value(output, type_, value);
+        }
+    }
+}
+
+fn encode_typed_value(output: &mut Vec<u8>, type_: &RuleType, value: &RuntimeValue) {
+    encode_type(output, type_);
+    match value {
+        RuntimeValue::Null => {
+            assert!(
+                type_.accepts_null(),
+                "null requires a nullable canonical type"
+            );
+            output.push(0x30);
+        }
+        RuntimeValue::Bool(value) => {
+            output.push(0x31);
+            encode_bool(output, *value);
+        }
+        RuntimeValue::String(value) => {
+            output.push(0x32);
+            encode_string(output, value);
+        }
+        RuntimeValue::Int(value) => {
+            output.push(0x33);
+            encode_string(output, &value.to_string());
+        }
+        RuntimeValue::Decimal(value) => {
+            output.push(0x34);
+            encode_decimal(output, *value);
+        }
+        RuntimeValue::Uuid(value) => {
+            output.push(0x35);
+            encode_string(output, &value.to_ascii_lowercase());
+        }
+        RuntimeValue::Date(value) => {
+            output.push(0x36);
+            encode_string(output, value);
+        }
+        RuntimeValue::Timestamp(value) => {
+            output.push(0x37);
+            encode_string(output, value);
+        }
+        RuntimeValue::Enum { enum_name, symbol } => {
+            output.push(0x38);
+            encode_string(output, enum_name);
+            encode_string(output, symbol);
+        }
+        RuntimeValue::List(values) => {
+            output.push(0x39);
+            let RuleType::List(item_type) = type_ else {
+                panic!("validated list value has a list type");
+            };
+            encode_count(output, values.len());
+            for value in values {
+                encode_typed_value(output, item_type, value);
+            }
+        }
+        RuntimeValue::Object(values) => {
+            output.push(0x3a);
+            let RuleType::Object { fields, .. } = type_ else {
+                panic!("validated object value has an object type");
+            };
+            encode_runtime_map(output, fields, values);
+        }
+    }
+}
+
+fn encode_decimal(output: &mut Vec<u8>, value: Decimal) {
+    let value = value.normalized();
+    if value.coefficient == 0 {
+        output.push(0x00);
+        encode_string(output, "0");
+        output.extend_from_slice(&0_u32.to_be_bytes());
+        return;
+    }
+    output.push(if value.coefficient.is_negative() {
+        0x01
+    } else {
+        0x00
+    });
+    encode_string(output, &value.coefficient.unsigned_abs().to_string());
+    output.extend_from_slice(&value.scale.to_be_bytes());
+}
+
+fn encode_bool(output: &mut Vec<u8>, value: bool) {
+    output.push(u8::from(value));
+}
+
+fn encode_string(output: &mut Vec<u8>, value: &str) {
+    encode_count(output, value.len());
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn encode_count(output: &mut Vec<u8>, count: usize) {
+    let count = u32::try_from(count).expect("canonical profile count fits U32");
+    output.extend_from_slice(&count.to_be_bytes());
+}
+
 fn power_of_ten(exponent: u32) -> Option<i128> {
     10_i128.checked_pow(exponent)
-}
-
-fn digest_bindings(bindings: &RuleBindings) -> String {
-    let mut canonical = String::new();
-    for (name, value) in bindings {
-        canonical.push_str(name);
-        canonical.push(':');
-        canonical_json(value, &mut canonical);
-        canonical.push(';');
-    }
-    let hash = canonical
-        .bytes()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
-    format!("{hash:016x}")
-}
-
-fn canonical_json(value: &Value, output: &mut String) {
-    match value {
-        Value::Null => output.push_str("null"),
-        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        Value::Number(value) => output.push_str(&value.to_string()),
-        Value::String(value) => {
-            output.push('"');
-            for character in value.chars() {
-                for escaped in character.escape_default() {
-                    output.push(escaped);
-                }
-            }
-            output.push('"');
-        }
-        Value::Array(values) => {
-            output.push('[');
-            for value in values {
-                canonical_json(value, output);
-                output.push(',');
-            }
-            output.push(']');
-        }
-        Value::Object(values) => {
-            output.push('{');
-            let mut sorted = values.iter().collect::<Vec<_>>();
-            sorted.sort_unstable_by_key(|(key, _)| *key);
-            for (key, value) in sorted {
-                output.push_str(key);
-                output.push(':');
-                canonical_json(value, output);
-                output.push(',');
-            }
-            output.push('}');
-        }
-    }
 }
