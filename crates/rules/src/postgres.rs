@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use crate::types::access_result_type;
 use crate::{
-    BinaryOp, CompiledRule, Expr, ExprKind, Function, Literal, RuleError, RuleType, UnaryOp,
+    BinaryOp, CompiledRule, Expr, ExprKind, Function, Literal, LoweredRuleValue, RuleError,
+    RuleType, UnaryOp,
 };
 
 /// A closed SQL context for one compiled rule. Values are either safe literals
@@ -69,7 +70,10 @@ impl SqlExpression {
 /// Lower a fully type-checked declarative rule to one parenthesized Postgres
 /// expression. All identifiers and literals pass through sqlgen helpers; the
 /// original CEL-like source is intentionally never rendered.
-pub fn lower_postgres(rule: &CompiledRule, bindings: &SqlBindings) -> Result<String, RuleError> {
+pub fn lower_postgres_value(
+    rule: &CompiledRule,
+    bindings: &SqlBindings,
+) -> Result<LoweredRuleValue, RuleError> {
     for name in bindings.names() {
         if !rule.bindings.contains_key(name) {
             return Err(RuleError::UnexpectedBinding { name: name.clone() });
@@ -82,11 +86,21 @@ pub fn lower_postgres(rule: &CompiledRule, bindings: &SqlBindings) -> Result<Str
     }
 
     let lowered = lower_expression(rule, bindings, &rule.expression.expression)?;
-    if !matches!(lowered.type_, ExpressionType::Concrete(RuleType::Bool)) {
+    Ok(LoweredRuleValue {
+        sql: lowered.sql,
+        type_: rule.result.clone(),
+    })
+}
+
+/// Lower a fully type-checked boolean declarative rule to one parenthesized
+/// Postgres expression.
+pub fn lower_postgres(rule: &CompiledRule, bindings: &SqlBindings) -> Result<String, RuleError> {
+    let lowered = lower_postgres_value(rule, bindings)?;
+    if lowered.type_ != RuleType::Bool {
         return Err(RuleError::InvalidRuleResult {
             rule: rule.name.clone(),
             expected: "bool".to_owned(),
-            actual: expression_type_name(&lowered.type_),
+            actual: lowered.type_.display_name(),
         });
     }
     Ok(lowered.sql)
@@ -112,12 +126,8 @@ fn lower_expression(
     let sql = match &expression.kind {
         ExprKind::Literal(literal) => lower_literal(&rule.name, literal)?,
         ExprKind::Name(name) => lower_binding(rule, bindings, name)?,
-        // Value lowering is introduced as a dedicated later slice. Task 1
-        // keeps enum declarations and type checking deploy-time-only.
-        ExprKind::EnumSymbol { .. } => {
-            return Err(RuleError::InternalInvariant {
-                rule: rule.name.clone(),
-            });
+        ExprKind::EnumSymbol { symbol, .. } => {
+            format!("{}::text", donat_sqlgen::quote_lit(symbol))
         }
         ExprKind::List(items) => {
             let items = items
@@ -213,7 +223,16 @@ fn infer_expression_type(
             .cloned()
             .map(ExpressionType::Concrete)
             .ok_or_else(invariant),
-        ExprKind::EnumSymbol { .. } => Err(invariant()),
+        ExprKind::EnumSymbol { enum_name, symbol } => rule
+            .declared_types
+            .iter()
+            .find(|type_| {
+                matches!(type_, RuleType::Enum { name, symbols }
+                    if name == enum_name && symbols.iter().any(|candidate| candidate == symbol))
+            })
+            .cloned()
+            .map(ExpressionType::Concrete)
+            .ok_or_else(invariant),
         ExprKind::List(items) => {
             let first = items.first().ok_or_else(invariant)?;
             let ExpressionType::Concrete(item_type) = infer_expression_type(rule, first)? else {
@@ -620,13 +639,6 @@ fn postgres_type(type_: &RuleType) -> &'static str {
         RuleType::Timestamp => "timestamptz",
         RuleType::List(_) | RuleType::Object { .. } => "jsonb",
         RuleType::Nullable(_) => unreachable!("nullable types are unwrapped above"),
-    }
-}
-
-fn expression_type_name(type_: &ExpressionType) -> String {
-    match type_ {
-        ExpressionType::Concrete(type_) => type_.display_name(),
-        ExpressionType::Null => "null".to_owned(),
     }
 }
 

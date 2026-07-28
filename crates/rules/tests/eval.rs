@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use donat_rules::{
     DecisionRow, DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation,
-    ExpressionContext, ExpressionOwner, HitPolicy, RuleDefinition, RuleError, RuleType, Span,
-    compile_catalog, compile_catalog_with_declared_types,
-    compile_catalog_with_declared_types_and_contexts,
+    EvaluatedRuleValue, ExpressionContext, ExpressionOwner, HitPolicy, RuleDefinition, RuleError,
+    RuleType, Span, compile_catalog, compile_catalog_with_declared_types,
+    compile_catalog_with_declared_types_and_contexts, evaluate_bool, evaluate_value,
 };
 use serde_json::{Value, json};
 
@@ -162,6 +162,209 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
     assert!(
         matches!(catalog, donat_rules::RuleError::UnknownField { ref field, .. } if field == "email")
     );
+}
+
+#[test]
+fn evaluate_value_returns_typed_values() {
+    let status = RuleType::Enum {
+        name: "OrderStatus".to_owned(),
+        symbols: vec!["draft".to_owned(), "submitted".to_owned()],
+    };
+    let customer = object("Customer", map([("nickname", RuleType::String)]));
+
+    let cases = [
+        (
+            compile_catalog(
+                &[rule(
+                    "string_value",
+                    map([("name", RuleType::String)]),
+                    RuleType::String,
+                    "name",
+                )],
+                &[],
+            )
+            .expect("a string value rule should compile"),
+            "string_value",
+            map([("name", json!("Ada"))]),
+            RuleType::String,
+            json!("Ada"),
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "decimal_value",
+                    map([("price", RuleType::Decimal)]),
+                    RuleType::Decimal,
+                    "price / 2.0",
+                )],
+                &[],
+            )
+            .expect("a decimal value rule should compile"),
+            "decimal_value",
+            map([("price", json!(2.4))]),
+            RuleType::Decimal,
+            json!(1.2),
+        ),
+        (
+            compile_catalog_with_declared_types(
+                &map([("OrderStatus", status.clone())]),
+                &[rule(
+                    "enum_value",
+                    BTreeMap::new(),
+                    status.clone(),
+                    "OrderStatus::draft",
+                )],
+                &[],
+            )
+            .expect("an enum value rule should compile"),
+            "enum_value",
+            BTreeMap::new(),
+            status.clone(),
+            json!("draft"),
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "missing_member",
+                    map([("customer", customer.clone())]),
+                    RuleType::nullable(RuleType::String),
+                    "customer.nickname",
+                )],
+                &[],
+            )
+            .expect("a nullable member value rule should compile"),
+            "missing_member",
+            map([("customer", json!({}))]),
+            RuleType::nullable(RuleType::String),
+            Value::Null,
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "missing_item",
+                    map([("lines", RuleType::List(Box::new(RuleType::Int)))]),
+                    RuleType::nullable(RuleType::Int),
+                    "lines[3]",
+                )],
+                &[],
+            )
+            .expect("a nullable list item value rule should compile"),
+            "missing_item",
+            map([("lines", json!([1]))]),
+            RuleType::nullable(RuleType::Int),
+            Value::Null,
+        ),
+    ];
+
+    for (catalog, name, bindings, type_, value) in cases {
+        let rule = catalog.rule(name).expect("the compiled rule should exist");
+        assert_eq!(
+            evaluate_value(rule, &bindings).expect("a value rule should evaluate"),
+            EvaluatedRuleValue { type_, value },
+            "typed value mismatch for {name}",
+        );
+    }
+}
+
+#[test]
+fn evaluate_bool_rejects_non_bool_rule() {
+    let status = RuleType::Enum {
+        name: "OrderStatus".to_owned(),
+        symbols: vec!["draft".to_owned()],
+    };
+    let customer = object("Customer", map([("nickname", RuleType::String)]));
+    let cases = [
+        (
+            compile_catalog(
+                &[rule(
+                    "string_value",
+                    map([("name", RuleType::String)]),
+                    RuleType::String,
+                    "name",
+                )],
+                &[],
+            )
+            .expect("a string value rule should compile"),
+            "string_value",
+            map([("name", json!("Ada"))]),
+            "string",
+        ),
+        (
+            compile_catalog_with_declared_types(
+                &map([("OrderStatus", status.clone())]),
+                &[rule(
+                    "enum_value",
+                    BTreeMap::new(),
+                    status,
+                    "OrderStatus::draft",
+                )],
+                &[],
+            )
+            .expect("an enum value rule should compile"),
+            "enum_value",
+            BTreeMap::new(),
+            "enum",
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "list_value",
+                    BTreeMap::new(),
+                    RuleType::List(Box::new(RuleType::Int)),
+                    "[1]",
+                )],
+                &[],
+            )
+            .expect("a list value rule should compile"),
+            "list_value",
+            BTreeMap::new(),
+            "list",
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "object_value",
+                    map([("customer", customer.clone())]),
+                    customer,
+                    "customer",
+                )],
+                &[],
+            )
+            .expect("an object value rule should compile"),
+            "object_value",
+            map([("customer", json!({"nickname": "Ada"}))]),
+            "object",
+        ),
+        (
+            compile_catalog(
+                &[rule(
+                    "null_value",
+                    BTreeMap::new(),
+                    RuleType::nullable(RuleType::String),
+                    "null",
+                )],
+                &[],
+            )
+            .expect("a nullable null value rule should compile"),
+            "null_value",
+            BTreeMap::new(),
+            "null",
+        ),
+    ];
+
+    for (catalog, name, bindings, actual) in cases {
+        let rule = catalog
+            .rule(name)
+            .expect("the compiled value rule should exist");
+        let error = evaluate_bool(rule, &bindings)
+            .expect_err("boolean evaluation must reject a non-boolean rule");
+
+        assert!(matches!(
+            error,
+            RuleError::InvalidRuleResult { rule, expected, actual: error_actual }
+                if rule == name && expected == "bool" && error_actual == actual
+        ));
+    }
 }
 
 #[test]

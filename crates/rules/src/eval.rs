@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::types::{
     CanonicalValue, CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable,
-    CompiledDecisionTestCase, DefinitionRevision, RuleArtifact, access_result_type,
+    CompiledDecisionTestCase, DefinitionRevision, EvaluatedRuleValue, RuleArtifact,
+    access_result_type,
 };
 use crate::{
     BinaryOp, CanonicalRoot, CompiledRule, DecisionConditionTrace, DecisionRejection,
@@ -263,18 +264,53 @@ impl RuleCatalog {
     }
 }
 
+/// Evaluate a compiled rule over its complete, closed bindings.
+pub fn evaluate_value(
+    rule: &CompiledRule,
+    bindings: &RuleBindings,
+) -> Result<EvaluatedRuleValue, RuleError> {
+    let value = evaluate_runtime_value(rule, bindings)?;
+
+    Ok(EvaluatedRuleValue {
+        type_: value.type_.clone(),
+        value: value.value.canonical_json(&rule.name, &value.type_)?,
+    })
+}
+
 /// Evaluate a compiled boolean rule over its complete, closed bindings.
 pub fn evaluate_bool(rule: &CompiledRule, bindings: &RuleBindings) -> Result<bool, RuleError> {
-    let context = decode_bindings(&rule.bindings, bindings)?;
-    let value = evaluate_expression(&rule.name, &rule.expression.expression, &context)?;
-    match value {
-        RuntimeValue::Bool(value) => Ok(value),
-        other => Err(RuleError::InvalidRuleResult {
+    let value = evaluate_runtime_value(rule, bindings)?;
+    if value.type_ != RuleType::Bool {
+        return Err(RuleError::InvalidRuleResult {
             rule: rule.name.clone(),
             expected: "bool".to_owned(),
-            actual: other.type_name(),
-        }),
+            actual: value.value.type_name(),
+        });
     }
+    let RuntimeValue::Bool(value) = value.value else {
+        return Err(RuleError::InternalInvariant {
+            rule: rule.name.clone(),
+        });
+    };
+    Ok(value)
+}
+
+struct EvaluatedRuntimeValue {
+    type_: RuleType,
+    value: RuntimeValue,
+}
+
+fn evaluate_runtime_value(
+    rule: &CompiledRule,
+    bindings: &RuleBindings,
+) -> Result<EvaluatedRuntimeValue, RuleError> {
+    let context = decode_bindings(&rule.bindings, bindings)?;
+    let value = evaluate_expression(&rule.name, &rule.expression.expression, &context)?;
+
+    Ok(EvaluatedRuntimeValue {
+        type_: rule.result.clone(),
+        value,
+    })
 }
 
 fn compile_decision_table(
@@ -1626,6 +1662,49 @@ impl RuntimeValue {
         }
         .to_owned()
     }
+
+    fn canonical_json(&self, rule_name: &str, type_: &RuleType) -> Result<Value, RuleError> {
+        let invariant = || RuleError::InternalInvariant {
+            rule: rule_name.to_owned(),
+        };
+        match (self, type_) {
+            (Self::Null, RuleType::Nullable(_)) => Ok(Value::Null),
+            (Self::Bool(value), RuleType::Bool) => Ok(Value::Bool(*value)),
+            (Self::String(value), RuleType::String) => Ok(Value::String(value.clone())),
+            (Self::Int(value), RuleType::Int) => serde_json::Number::from_i128(*value)
+                .map(Value::Number)
+                .ok_or_else(invariant),
+            (Self::Decimal(value), RuleType::Decimal) => {
+                serde_json::from_str(&value.canonical_string()).map_err(|_| invariant())
+            }
+            (Self::Uuid(value), RuleType::Uuid)
+            | (Self::Date(value), RuleType::Date)
+            | (Self::Timestamp(value), RuleType::Timestamp) => Ok(Value::String(value.clone())),
+            (Self::Enum { enum_name, symbol }, RuleType::Enum { name, symbols })
+                if enum_name == name && symbols.iter().any(|candidate| candidate == symbol) =>
+            {
+                Ok(Value::String(symbol.clone()))
+            }
+            (Self::List(values), RuleType::List(item_type)) => values
+                .iter()
+                .map(|value| value.canonical_json(rule_name, item_type))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            (Self::Object(values), RuleType::Object { fields, .. }) => fields
+                .iter()
+                .map(|(field, type_)| {
+                    values
+                        .get(field)
+                        .ok_or_else(invariant)
+                        .and_then(|value| value.canonical_json(rule_name, type_))
+                        .map(|value| (field.clone(), value))
+                })
+                .collect::<Result<serde_json::Map<_, _>, _>>()
+                .map(Value::Object),
+            (_, RuleType::Nullable(inner)) => self.canonical_json(rule_name, inner),
+            _ => Err(invariant()),
+        }
+    }
 }
 
 /// A bounded decimal representation used only for the profile's exact numeric
@@ -1677,6 +1756,29 @@ impl Decimal {
 
     fn is_zero(self) -> bool {
         self.coefficient == 0
+    }
+
+    fn canonical_string(self) -> String {
+        if self.scale == 0 {
+            return self.coefficient.to_string();
+        }
+
+        let sign = if self.coefficient.is_negative() {
+            "-"
+        } else {
+            ""
+        };
+        let digits = self.coefficient.unsigned_abs().to_string();
+        if digits.len() <= self.scale as usize {
+            format!(
+                "{sign}0.{}{}",
+                "0".repeat(self.scale as usize - digits.len()),
+                digits
+            )
+        } else {
+            let split = digits.len() - self.scale as usize;
+            format!("{sign}{}.{}", &digits[..split], &digits[split..])
+        }
     }
 
     fn checked_add(self, other: Self) -> Option<Self> {

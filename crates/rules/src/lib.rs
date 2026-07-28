@@ -18,15 +18,17 @@ pub use eval::{
     RuleBindings, canonical_bytes, compile_catalog, compile_catalog_with_declared_types,
     compile_catalog_with_declared_types_and_contexts,
     compile_catalog_with_declared_types_and_contexts_and_declaration_order, evaluate_bool,
+    evaluate_value,
 };
 pub use parser::parse_expression;
-pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres};
+pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres, lower_postgres_value};
 pub use types::{
     CanonicalRoot, CanonicalValue, CompiledDecisionRow, CompiledDecisionTable, CompiledRule,
     DecisionConditionTrace, DecisionRejection, DecisionResult, DecisionRow,
     DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation, DecisionTrace,
-    DefinitionRevision, ExpressionContext, ExpressionOwner, HitPolicy, RuleArtifact, RuleCatalog,
-    RuleDefinition, RuleDiagnostic, RuleError, RuleType,
+    DefinitionRevision, EvaluatedRuleValue, ExpressionContext, ExpressionOwner, HitPolicy,
+    LoweredRuleValue, RuleArtifact, RuleCatalog, RuleDefinition, RuleDiagnostic, RuleError,
+    RuleType,
 };
 
 /// Profile format version carried in every canonical rule artifact.

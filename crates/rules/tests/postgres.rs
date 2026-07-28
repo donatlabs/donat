@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use donat_rules::{
     RuleDefinition, RuleError, RuleType, SqlBinding, SqlBindings, SqlExpression, compile_catalog,
-    evaluate_bool, lower_postgres,
+    compile_catalog_with_declared_types, evaluate_bool, evaluate_value, lower_postgres,
+    lower_postgres_value,
 };
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
@@ -25,11 +26,19 @@ fn compiled_rule(
     bindings: BTreeMap<String, RuleType>,
     expression: &str,
 ) -> donat_rules::CompiledRule {
+    compiled_value_rule(RuleType::Bool, bindings, expression)
+}
+
+fn compiled_value_rule(
+    result: RuleType,
+    bindings: BTreeMap<String, RuleType>,
+    expression: &str,
+) -> donat_rules::CompiledRule {
     let catalog = compile_catalog(
         &[RuleDefinition {
             name: "checkout_policy".to_owned(),
             bindings,
-            result: RuleType::Bool,
+            result,
             expression: expression.to_owned(),
         }],
         &[],
@@ -183,6 +192,115 @@ fn lowerer_rejects_a_declared_binding_without_a_typed_sql_expression() {
 }
 
 #[test]
+fn lower_postgres_value_matches_live_postgres() {
+    let status = RuleType::Enum {
+        name: "OrderStatus".to_owned(),
+        symbols: vec!["draft".to_owned(), "submitted".to_owned()],
+    };
+    let customer = object("Customer", map([("nickname", RuleType::String)]));
+    let enum_catalog = compile_catalog_with_declared_types(
+        &map([("OrderStatus", status.clone())]),
+        &[RuleDefinition {
+            name: "checkout_policy".to_owned(),
+            bindings: BTreeMap::new(),
+            result: status.clone(),
+            expression: "OrderStatus::draft".to_owned(),
+        }],
+        &[],
+    )
+    .expect("an enum value rule should compile");
+    let enum_rule = enum_catalog
+        .rule("checkout_policy")
+        .expect("the enum value rule should exist")
+        .clone();
+    let cases = vec![
+        (
+            compiled_value_rule(RuleType::String, map([("name", RuleType::String)]), "name"),
+            map([("name", json!("Ada"))]),
+            RuleType::String,
+            json!("Ada"),
+        ),
+        (
+            compiled_value_rule(
+                RuleType::Decimal,
+                map([("price", RuleType::Decimal)]),
+                "price / 2.0",
+            ),
+            map([("price", json!(2.4))]),
+            RuleType::Decimal,
+            json!(1.2),
+        ),
+        (enum_rule, BTreeMap::new(), status.clone(), json!("draft")),
+        (
+            compiled_value_rule(
+                RuleType::nullable(RuleType::String),
+                map([("customer", customer)]),
+                "customer.nickname",
+            ),
+            map([("customer", json!({}))]),
+            RuleType::nullable(RuleType::String),
+            Value::Null,
+        ),
+        (
+            compiled_value_rule(
+                RuleType::nullable(RuleType::Int),
+                map([("lines", RuleType::List(Box::new(RuleType::Int)))]),
+                "lines[3]",
+            ),
+            map([("lines", json!([1]))]),
+            RuleType::nullable(RuleType::Int),
+            Value::Null,
+        ),
+    ];
+    let mut client = postgres_client();
+
+    for (rule, bindings, type_, value) in cases {
+        let sql_bindings = SqlBindings::new(
+            bindings
+                .into_iter()
+                .map(|(name, value)| (name, SqlBinding::literal(value))),
+        );
+        let lowered =
+            lower_postgres_value(&rule, &sql_bindings).expect("a typed value rule should lower");
+        assert_eq!(
+            lowered.type_, type_,
+            "lowered type mismatch for {}",
+            rule.name
+        );
+        let actual = client
+            .query_one(
+                &format!(
+                    "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
+                    lowered.sql
+                ),
+                &[],
+            )
+            .expect("the lowered typed value should execute in PostgreSQL")
+            .get::<_, String>("value")
+            .parse::<Value>()
+            .expect("PostgreSQL JSON output should parse");
+
+        assert_eq!(actual, value, "Postgres value mismatch for {}", rule.name);
+    }
+}
+
+#[test]
+fn lower_postgres_rejects_non_bool_rule() {
+    let rule = compiled_value_rule(RuleType::String, map([("name", RuleType::String)]), "name");
+    let error = lower_postgres(
+        &rule,
+        &SqlBindings::new([("name".to_owned(), SqlBinding::literal(json!("Ada")))]),
+    )
+    .expect_err("boolean lowering must reject a non-boolean rule");
+
+    assert!(matches!(
+        error,
+        RuleError::InvalidRuleResult { ref rule, ref expected, ref actual }
+            if rule == "checkout_policy" && expected == "bool" && actual == "string"
+    ));
+}
+
+#[test]
 fn lowerer_matches_rust_decimal_division_scale_and_truncation() {
     let mut client = postgres_client();
 
@@ -255,11 +373,28 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
             ),
         ),
     ]);
-    let context_rule = compiled_rule(
-        context_bindings,
+    let bool_rule = compiled_rule(
+        context_bindings.clone(),
         "amount + tax * quantity >= discount - 5 && size(name) >= 2 && startsWith(name, 'A') && endsWith(name, 'z') && size(lines) == 2 && (limit == null || is_null(limit)) && is_null(customer.nickname)",
     );
-    let integer_rule = compiled_rule(
+    let string_rule = compiled_value_rule(RuleType::String, context_bindings.clone(), "name");
+    let conditional_rule = compiled_value_rule(
+        RuleType::String,
+        context_bindings.clone(),
+        "amount >= 0 ? 'matched' : 'fallback'",
+    );
+    let nullable_member_rule = compiled_value_rule(
+        RuleType::nullable(RuleType::String),
+        context_bindings.clone(),
+        "customer.nickname",
+    );
+    let nullable_item_rule = compiled_value_rule(
+        RuleType::nullable(RuleType::Int),
+        context_bindings,
+        "lines[3]",
+    );
+    let integer_rule = compiled_value_rule(
+        RuleType::Int,
         map([
             ("left", RuleType::Int),
             ("addend", RuleType::Int),
@@ -267,9 +402,10 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
             ("divisor", RuleType::Int),
             ("threshold", RuleType::Int),
         ]),
-        "-left + addend * multiplier / divisor >= threshold - 5",
+        "-left + addend * multiplier / divisor",
     );
-    let decimal_rule = compiled_rule(
+    let decimal_rule = compiled_value_rule(
+        RuleType::Decimal,
         map([
             ("left", RuleType::Decimal),
             ("addend", RuleType::Decimal),
@@ -277,17 +413,60 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
             ("divisor", RuleType::Decimal),
             ("threshold", RuleType::Decimal),
         ]),
-        "-left + addend * multiplier / divisor >= threshold - 0.333333333333333333",
+        "-left + addend * multiplier / divisor",
     );
+    let status = RuleType::Enum {
+        name: "OrderStatus".to_owned(),
+        symbols: vec!["draft".to_owned(), "submitted".to_owned()],
+    };
+    let enum_catalog = compile_catalog_with_declared_types(
+        &map([("OrderStatus", status.clone())]),
+        &[RuleDefinition {
+            name: "checkout_policy".to_owned(),
+            bindings: BTreeMap::new(),
+            result: status,
+            expression: "OrderStatus::draft".to_owned(),
+        }],
+        &[],
+    )
+    .expect("a generated enum value rule should compile");
+    let enum_rule = enum_catalog
+        .rule("checkout_policy")
+        .expect("the generated enum rule should exist")
+        .clone();
     let mut client = postgres_client();
     let mut seed = 0x7A11_CE55_u64;
 
     for case_index in 0..128 {
         assert_postgres_matches_rust(
             &mut client,
-            &context_rule,
+            &bool_rule,
             generated_context_bindings(&mut seed),
-            &format!("typed context case {case_index}"),
+            &format!("bool case {case_index}"),
+        );
+        assert_postgres_matches_rust(
+            &mut client,
+            &string_rule,
+            generated_context_bindings(&mut seed),
+            &format!("string case {case_index}"),
+        );
+        assert_postgres_matches_rust(
+            &mut client,
+            &conditional_rule,
+            generated_context_bindings(&mut seed),
+            &format!("conditional case {case_index}"),
+        );
+        assert_postgres_matches_rust(
+            &mut client,
+            &nullable_member_rule,
+            generated_context_bindings(&mut seed),
+            &format!("nullable member case {case_index}"),
+        );
+        assert_postgres_matches_rust(
+            &mut client,
+            &nullable_item_rule,
+            generated_context_bindings(&mut seed),
+            &format!("nullable item case {case_index}"),
         );
         assert_postgres_matches_rust(
             &mut client,
@@ -300,6 +479,12 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
             &decimal_rule,
             generated_decimal_bindings(&mut seed),
             &format!("decimal arithmetic case {case_index}"),
+        );
+        assert_postgres_matches_rust(
+            &mut client,
+            &enum_rule,
+            BTreeMap::new(),
+            &format!("enum case {case_index}"),
         );
     }
 }
@@ -317,25 +502,36 @@ fn assert_postgres_matches_rust(
     bindings: BTreeMap<String, Value>,
     case: &str,
 ) {
-    let expected = evaluate_bool(rule, &bindings)
+    let expected = evaluate_value(rule, &bindings)
         .expect("the generated values must remain inside the typed profile");
     let sql_bindings = SqlBindings::new(
         bindings
             .iter()
             .map(|(name, value)| (name.clone(), SqlBinding::literal(value.clone()))),
     );
-    let expression = lower_postgres(rule, &sql_bindings)
+    let lowered = lower_postgres_value(rule, &sql_bindings)
         .expect("every generated closed context should lower safely");
+    assert_eq!(
+        lowered.type_, expected.type_,
+        "Postgres/Rust type mismatch for {case}"
+    );
     let actual = client
-        .query_one(&format!("SELECT {expression} AS value"), &[])
+        .query_one(
+            &format!(
+                "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
+                lowered.sql
+            ),
+            &[],
+        )
         .expect("the lowerer should emit a valid PostgreSQL expression")
-        .get::<_, Option<bool>>("value")
-        .expect("a typed boolean rule must not produce SQL NULL");
+        .get::<_, String>("value")
+        .parse::<Value>()
+        .expect("PostgreSQL JSON output should parse");
 
     assert_eq!(
         actual,
-        expected,
-        "Postgres/Rust rule mismatch for {case}; bindings: {}",
+        expected.value,
+        "Postgres/Rust canonical JSON mismatch for {case}; bindings: {}",
         serde_json::to_string(&bindings).expect("generated bindings serialize"),
     );
 }

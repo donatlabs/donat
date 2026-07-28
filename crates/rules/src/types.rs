@@ -210,6 +210,22 @@ pub struct CompiledRule {
     pub(crate) declared_types: Vec<RuleType>,
 }
 
+/// The canonical JSON result of evaluating one compiled rule together with its
+/// deploy-time-resolved profile type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedRuleValue {
+    pub type_: RuleType,
+    pub value: Value,
+}
+
+/// One safely lowered Postgres expression together with its deploy-time-
+/// resolved profile type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoweredRuleValue {
+    pub sql: String,
+    pub type_: RuleType,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedExpr {
     pub(crate) expression: Expr,
