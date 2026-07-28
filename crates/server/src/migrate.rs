@@ -290,6 +290,11 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
     let metadata = donat_metadata::load_metadata_dir(metadata_dir)
         .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
 
+    let mut problems = vec![];
+    if let Err(error) = crate::state::compile_rule_catalog(&metadata) {
+        problems.push(format!("{}: {}", error.path, error.message));
+    }
+
     let (client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
         .context("connecting to database for validate")?;
@@ -299,7 +304,6 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
         .context("introspecting database")?;
     conn.abort();
 
-    let mut problems = vec![];
     for source in &metadata.sources {
         if source.kind != donat_metadata::SourceKind::Postgres {
             continue;

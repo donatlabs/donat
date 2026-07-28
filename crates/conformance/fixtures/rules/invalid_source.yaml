@@ -1,0 +1,6 @@
+rules:
+  - name: undeclared_binding
+    parameters:
+      amount: int!
+    result: bool!
+    expression: "unknown > 0"

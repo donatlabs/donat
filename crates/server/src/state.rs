@@ -2,13 +2,19 @@
 //! snapshot (metadata + per-source catalogs) that metadata operations
 //! mutate at runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
 use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_rules::{
+    DecisionRow as RuleDecisionRow, DecisionTableDefinition as RuleDecisionTableDefinition,
+    DecisionTableTestCase as RuleDecisionTableTestCase,
+    DecisionTestExpectation as RuleDecisionTestExpectation, HitPolicy, RuleCatalog, RuleDefinition,
+    RuleType,
+};
 use donat_schema::{CompiledMultiSourceSchema, PlanError};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
@@ -297,6 +303,10 @@ impl SourceRuntime {
 
 pub struct Engine {
     pub metadata: Metadata,
+    /// Typed, deploy-time-only rules for this immutable engine snapshot.
+    /// Request handlers never parse source text or mutate this catalog.
+    #[allow(dead_code)] // Commands and processes consume this in later slices.
+    pub rule_catalog: Arc<RuleCatalog>,
     /// Catalog snapshot per source name.
     pub catalogs: HashMap<String, Catalog>,
     pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
@@ -312,12 +322,27 @@ pub struct Engine {
 }
 
 impl Engine {
+    #[allow(dead_code)] // Existing test helpers construct unconnected engines.
     pub fn bootstrap(metadata: Metadata) -> Self {
+        Self::with_rule_catalog(metadata, RuleCatalog::default())
+    }
+
+    /// Build the initial, unconnected engine snapshot only after all
+    /// deploy-time rule metadata has compiled. The serving binary uses this
+    /// before opening a listener; test helpers may use [`Self::bootstrap`]
+    /// when they intentionally exercise a later candidate failure.
+    pub fn bootstrap_checked(metadata: Metadata) -> Result<Self, PlanError> {
+        let rule_catalog = compile_rule_catalog(&metadata)?;
+        Ok(Self::with_rule_catalog(metadata, rule_catalog))
+    }
+
+    fn with_rule_catalog(metadata: Metadata, rule_catalog: RuleCatalog) -> Self {
         let allowed_queries = compile_allowed_queries(&metadata);
         let rest_queries = crate::rest::compile_saved_queries(&metadata);
         let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
         Self {
             metadata,
+            rule_catalog: Arc::new(rule_catalog),
             catalogs: HashMap::new(),
             compiled: None,
             runtimes: HashMap::new(),
@@ -334,6 +359,7 @@ impl Engine {
         infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
         normalize_metadata_sources(&mut metadata);
+        let rule_catalog = Arc::new(compile_rule_catalog(&metadata)?);
         for source in &metadata.sources {
             let runtime = runtimes.get(&source.name).ok_or_else(|| {
                 PlanError::new(
@@ -365,6 +391,7 @@ impl Engine {
         let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
         Ok(Self {
             metadata,
+            rule_catalog,
             catalogs,
             compiled: Some(compiled),
             runtimes,
@@ -373,6 +400,122 @@ impl Engine {
             remote_permission_schemas,
         })
     }
+}
+
+/// Translate the YAML metadata shape into the strict rules crate model and
+/// compile it before a candidate snapshot can publish.
+///
+/// The adapter deliberately admits only the Phase-1 scalar/list type profile.
+/// Unknown GraphQL names are not silently widened to strings or JSON values.
+pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, PlanError> {
+    let rules = metadata
+        .rules
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.rules[{index}]");
+            Ok(RuleDefinition {
+                name: definition.name.clone(),
+                bindings: compile_rule_types(&definition.parameters, &path)?,
+                result: parse_rule_type(&definition.result, &format!("{path}.result"))?,
+                expression: definition.expression.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let tables = metadata
+        .rules
+        .decision_tables
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.decision_tables[{index}]");
+            Ok(RuleDecisionTableDefinition {
+                name: definition.name.clone(),
+                // Process revisions will add immutable definition hashes.
+                // This deploy-time catalog has no separately mutable table
+                // revision, so the stable declared name scopes its trace.
+                revision: definition.name.clone(),
+                inputs: compile_rule_types(&definition.inputs, &format!("{path}.inputs"))?,
+                output: compile_rule_types(&definition.output, &format!("{path}.output"))?,
+                hit_policy: HitPolicy::from_metadata(&definition.hit_policy),
+                rows: definition
+                    .rows
+                    .iter()
+                    .map(|row| RuleDecisionRow {
+                        id: row.id.clone(),
+                        description: row.description.clone(),
+                        when: row.when.clone(),
+                        output: row.output.clone(),
+                    })
+                    .collect(),
+                test_cases: definition
+                    .test_cases
+                    .iter()
+                    .map(|case| RuleDecisionTableTestCase {
+                        name: case.name.clone(),
+                        input: case.input.clone(),
+                        expect: RuleDecisionTestExpectation {
+                            output: case.expect.output.clone(),
+                            matched_row_id: case.expect.matched_row_id.clone(),
+                        },
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+
+    donat_rules::compile_catalog(&rules, &tables).map_err(|error| {
+        PlanError::validation(
+            "rules.yaml",
+            format!("declarative rule validation failed: {error}"),
+        )
+    })
+}
+
+fn compile_rule_types(
+    types: &BTreeMap<String, String>,
+    path: &str,
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    types
+        .iter()
+        .map(|(name, type_)| {
+            parse_rule_type(type_, &format!("{path}.{name}")).map(|type_| (name.clone(), type_))
+        })
+        .collect()
+}
+
+fn parse_rule_type(source: &str, path: &str) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    let type_ = if source.starts_with('[') && source.ends_with(']') {
+        RuleType::List(Box::new(parse_rule_type(
+            &source[1..source.len() - 1],
+            path,
+        )?))
+    } else {
+        match source {
+            "bool" => RuleType::Bool,
+            "string" => RuleType::String,
+            "int" => RuleType::Int,
+            "decimal" => RuleType::Decimal,
+            "uuid" => RuleType::Uuid,
+            "date" => RuleType::Date,
+            "timestamp" => RuleType::Timestamp,
+            _ => {
+                return Err(PlanError::validation(
+                    path,
+                    format!("unsupported rule type `{source}`"),
+                ));
+            }
+        }
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
 }
 
 fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {
@@ -1513,6 +1656,30 @@ mod snapshot_tests {
             .err()
             .expect("a runtime with the wrong backend kind is rejected");
         assert!(mismatched.message.contains("metadata requires Sqlite"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_rules_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.rules = serde_json::from_value(json!({
+            "rules": [
+                {"name": "duplicate", "result": "bool!", "expression": "true"},
+                {"name": "duplicate", "result": "bool!", "expression": "false"}
+            ]
+        }))
+        .expect("rules metadata deserializes");
+
+        let Err(error) = Engine::bootstrap_checked(metadata.clone()) else {
+            panic!("invalid rules are rejected before the server listens");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with duplicate rules is rejected before publishing");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
     }
 
     #[test]

@@ -2133,12 +2133,15 @@ impl Running {
 
     /// Serialize the accumulated metadata to a temp `version: 3` directory.
     fn write_metadata_dir(&self) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("dist_conf_md_{}_{}", self.name, std::process::id()));
+        let md = self.metadata.borrow();
+        Self::write_metadata_snapshot(&self.name, &md)
+    }
+
+    fn write_metadata_snapshot(name: &str, md: &Metadata) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dist_conf_md_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("databases")).unwrap();
 
-        let md = self.metadata.borrow();
         std::fs::write(dir.join("version.yaml"), "version: 3\n").unwrap();
         std::fs::write(
             dir.join("databases").join("databases.yaml"),
@@ -2184,6 +2187,13 @@ impl Running {
             std::fs::write(
                 dir.join("rest_endpoints.yaml"),
                 serde_yaml::to_string(&md.rest_endpoints).unwrap(),
+            )
+            .unwrap();
+        }
+        if !md.rules.is_empty() {
+            std::fs::write(
+                dir.join("rules.yaml"),
+                serde_yaml::to_string(&md.rules).expect("serialize rules wrapper"),
             )
             .unwrap();
         }
@@ -3260,6 +3270,7 @@ mod tests {
             "remote_schemas",
             "rest_endpoints",
             "roles_inheritance",
+            "rules",
             "security",
             "subscriptions",
         ];
@@ -3308,6 +3319,45 @@ mod tests {
     // ---------------------------------------------------- load_fixture
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_rules_wrapper() {
+        let mut with_rules = empty_metadata();
+        with_rules.rules = serde_json::from_value(json!({
+            "rules": [{
+                "name": "is_ready",
+                "result": "bool!",
+                "expression": "true"
+            }],
+            "decision_tables": [{
+                "name": "route",
+                "inputs": {"amount": "int!"},
+                "output": {"route": "string!"},
+                "hit_policy": "first",
+                "rows": [{
+                    "id": "default",
+                    "when": {"amount": "true"},
+                    "output": {"route": "manual"}
+                }]
+            }]
+        }))
+        .expect("rule metadata deserializes");
+        let with_rules_dir = Running::write_metadata_snapshot("rules_wrapper", &with_rules);
+        let rules = std::fs::read_to_string(with_rules_dir.join("rules.yaml"))
+            .expect("nonempty wrapper is serialized");
+        assert!(rules.contains("is_ready"));
+        assert!(rules.contains("decision_tables"));
+
+        let without_rules_dir =
+            Running::write_metadata_snapshot("empty_rules_wrapper", &empty_metadata());
+        assert!(
+            !without_rules_dir.join("rules.yaml").exists(),
+            "an empty wrapper must not create rules.yaml"
+        );
+
+        std::fs::remove_dir_all(with_rules_dir).expect("remove rules metadata directory");
+        std::fs::remove_dir_all(without_rules_dir).expect("remove empty metadata directory");
+    }
 
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

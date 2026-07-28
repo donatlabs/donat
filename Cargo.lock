@@ -708,6 +708,7 @@ dependencies = [
  "donat-catalog",
  "donat-ir",
  "donat-metadata",
+ "donat-rules",
  "donat-schema",
  "donat-sqlgen",
  "futures-util",

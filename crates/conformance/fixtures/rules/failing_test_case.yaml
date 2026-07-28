@@ -1,0 +1,26 @@
+decision_tables:
+  - name: approval_route
+    inputs:
+      amount: int!
+    output:
+      route: string!
+    hit_policy: first
+    rows:
+      - id: automatic
+        when:
+          amount: "amount < 100"
+        output:
+          route: automatic
+      - id: default
+        when:
+          amount: "true"
+        output:
+          route: manual
+    test_cases:
+      - name: expected_row_is_wrong
+        input:
+          amount: 10
+        expect:
+          output:
+            route: manual
+          matched_row_id: default
