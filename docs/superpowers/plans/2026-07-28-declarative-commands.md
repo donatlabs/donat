@@ -110,6 +110,13 @@ schemas and only if their entire static result selection can be generated.
 
 ### Task 2: Compile static command definitions during validation
 
+**Recovery status:** The implementation commit for this task
+(`26f4bde`) is unaccepted because it loses concrete PostgreSQL type and
+modifier information before validating metadata literals. Do not treat its
+earlier judge passes as approval of this range. Complete the recovery plan
+[`Command literal database-scalar validation`](2026-07-28-command-literal-db-scalar-validation.md)
+to amend or fix this task's range, then obtain fresh review.
+
 **Files:**
 - Add: `crates/schema/src/commands.rs`, `crates/schema/tests/commands.rs`
 - Modify: `crates/schema/src/lib.rs`, `crates/schema/src/plan.rs`,

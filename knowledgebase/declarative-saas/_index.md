@@ -7,6 +7,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 
 - [[decisions/001-declarative-saas-runtime-and-porting-policy]]
 - [[decisions/002-durable-process-operational-contracts]]
+- [[decisions/004-command-literal-db-scalar-validation]]
 
 ## Reference governance
 

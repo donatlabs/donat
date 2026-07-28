@@ -243,7 +243,7 @@ A value reference is one of the following closed forms:
 | argument | a declared command argument | GraphQL type is assignable to target column |
 | item | a field of the current insert_many item | allowed only inside that step; field type is assignable |
 | step | a previously completed, declared returning column | source step precedes destination and has compatible cardinality |
-| literal | a metadata literal | parsed and cast at deploy time against the column type |
+| literal | a metadata literal | parsed and validated at deploy time against the concrete target column's PostgreSQL descriptor |
 | rule | a named Spec 004 expression | result type is assignable and all parameter bindings are explicit |
 
 No form permits a SQL fragment, identifier, JSON path, or string template.
@@ -252,6 +252,44 @@ map containing every primary-key column. A command may assert an arbitrary
 Spec 004 boolean expression over its declared bindings, but it cannot add a
 free-form WHERE clause. This is the Phase-1 guardrail against accidental
 set-wide writes.
+
+### 7.4 Metadata literal database-scalar validation
+
+A `literal` bound to a column in a command object or complete primary-key
+predicate is validated at deployment against that concrete catalog column,
+not merely against its GraphQL-facing scalar. The Postgres catalog retains the
+column's `pg_type` and raw `atttypmod`; schema compilation derives a private
+command-only descriptor from those fields and the column nullability. It does
+not expand `StaticType`, GraphQL, or Spec 004 Rules types, and it does not
+change how arguments, `insert_many` items, prior-step values, or rule values
+are typed.
+
+The descriptor accepts only these scalar families:
+
+| Family | Deployment requirement |
+| --- | --- |
+| `bool` | JSON boolean; no type modifier. |
+| `int2`, `int4`, `int8` | Integral JSON number or integral string in the exact signed range of that concrete PostgreSQL type. |
+| `float4`, `float8` | JSON number or numeric string that is finite in the concrete IEEE width. |
+| `numeric`, `decimal` | Decimal JSON number or string in the command decimal grammar, constrained by the PostgreSQL precision and signed scale decoded from `atttypmod`. |
+| `uuid` | Valid UUID string. |
+| `date` | Valid calendar date string. |
+| `timestamp`, `timestamptz` | Valid timestamp string with fractional seconds no more precise than the column modifier. `timestamptz` requires an RFC 3339 offset. |
+| `text`, `varchar`, `bpchar`, `name`, `citext` | String within any PostgreSQL-imposed character or byte limit. |
+
+Object and list literals are forbidden. `literal: null` is permitted only for
+a nullable concrete column and remains typed as that column when later lowered
+to SQL. Any unsupported `pg_type`, malformed or unsupported modifier, invalid
+literal spelling, over-limit value, or null for a non-nullable column is a
+deterministic metadata validation error. It must never fall back to `String`,
+`Float`, or another static scalar.
+
+This validation happens while building the immutable candidate engine and
+through `donat validate` and `migrate --metadata-dir`; it never adds runtime
+introspection, metadata mutation, DDL, an admin role, or a permission bypass.
+The command remains one PostgreSQL statement once execution exists. The full
+rationale and decoding rules are in
+[[knowledgebase/declarative-saas/decisions/004-command-literal-db-scalar-validation]].
 
 A command or process may accept a decision value only into an exactly typed data destination
 or map a declared enum at deploy time to fixed action/state targets; they
@@ -373,6 +411,7 @@ runtime GraphQL errors.
 | update/delete omits a primary-key column | identifies the missing column |
 | role lacks a referenced table or column permission | identifies role, operation, and relation |
 | result field has no derivable GraphQL type | identifies result field and source value |
+| literal does not satisfy the concrete column type, modifier, or nullability | identifies command, step, column, and concrete PostgreSQL type before serving |
 | process effect names a missing process or has incompatible input | identifies command, effect, and process field |
 | process signal names an undeclared waiting signal or has incompatible payload/correlation | identifies command, effect, process state, and field |
 | idempotency key/scope is not deterministic | identifies the offending component |
