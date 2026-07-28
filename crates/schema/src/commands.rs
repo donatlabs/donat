@@ -510,7 +510,7 @@ fn timestamp_fractional_digits(value: &str, with_time_zone: bool) -> Result<u8, 
     let time_and_offset = &value[separator + 1..];
     let time = if with_time_zone {
         let end = time_and_offset
-            .find(|character: char| matches!(character, 'Z' | '+' | '-'))
+            .find(['Z', '+', '-'])
             .unwrap_or(time_and_offset.len());
         &time_and_offset[..end]
     } else {
@@ -612,17 +612,10 @@ pub fn compile_command_catalog(
                 ),
             ));
         }
-        let catalog = catalogs.get(&source.name).ok_or_else(|| {
-            PlanError::validation(
-                &path,
-                format!("catalog for command source '{}' is missing", source.name),
-            )
-        })?;
         validate_command(
             metadata,
             catalogs,
             source,
-            catalog,
             rules,
             infer_function_permissions,
             command,
@@ -646,13 +639,18 @@ fn validate_command(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
     source: &Source,
-    catalog: &Catalog,
     rules: &RuleCatalog,
     infer_function_permissions: bool,
     command: &Command,
     command_index: usize,
 ) -> Result<(), PlanError> {
     let path = format!("commands[{command_index}]");
+    let catalog = catalogs.get(&source.name).ok_or_else(|| {
+        PlanError::validation(
+            &path,
+            format!("catalog for command source '{}' is missing", source.name),
+        )
+    })?;
     if command.name.is_empty() {
         return Err(PlanError::validation(&path, "command name cannot be empty"));
     }
