@@ -513,13 +513,9 @@ fn compiled_profiles_and_traces_retain_hashes_without_raw_input() {
         .expect("decision evaluates");
     assert_eq!(result.trace.table_revision.len(), 64);
     assert_eq!(result.trace.input_digest.len(), 64);
-    assert!(
-        result
-            .trace
-            .input_digest
-            .bytes()
-            .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
-    );
+    assert!(result.trace.input_digest.bytes().all(|byte| {
+        byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+    }));
     assert!(!format!("{:#?}", result.trace).contains("never-in-a-trace"));
 }
 
