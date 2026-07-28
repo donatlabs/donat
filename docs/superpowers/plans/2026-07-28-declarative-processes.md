@@ -1,7 +1,9 @@
 # Durable Processes Implementation Plan
 
-> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and a
-> judge ACCEPT after each commit. The last integration slice completes the
+> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and
+> focused commits. A commit is not a review gate; request one independent code
+> review for the complete process range before merging, handoff, or readiness.
+> The last integration slice completes the
 > `start_process` command effect left intentionally inactive by the commands
 > core plan.
 
@@ -206,7 +208,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: run `cargo test -p donat-metadata`,
   `cargo test -p donat-server --test process_definition`, and
   `cargo test --workspace --no-run`.
-- [ ] Commit the process-metadata/compiler slice and obtain judge ACCEPT.
+- [ ] Commit the process-metadata/compiler slice.
 
 ### Task 2: Create migrations and reconcile immutable definition revisions
 
@@ -247,7 +249,7 @@ instances, change a definition, or set an instance role.
   nothing; `serve` performs neither reconciliation nor DDL.
 - [ ] GREEN: run `cargo test -p donat-server --test process_reconcile` and
   `cargo build -p donat-server --bin donat`.
-- [ ] Commit the migration/revision slice and obtain judge ACCEPT.
+- [ ] Commit the migration/revision slice.
 
 ### Task 3: Persist and consume idempotent starts with a pinned revision
 
@@ -278,7 +280,7 @@ instances, change a definition, or set an instance role.
   duplicate instance.
 - [ ] GREEN: run `cargo test -p donat-server --test process_start` and the
   process reconciliation suite.
-- [ ] Commit the durable-start slice and obtain judge ACCEPT.
+- [ ] Commit the durable-start slice.
 
 ### Task 4: Add command transitions with fixed roles and rule guards
 
@@ -308,7 +310,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: run `cargo test -p donat-server --test process_transition`,
   `cargo test -p donat-schema --test commands`, and
   `cargo test -p donat-sqlgen --test commands`.
-- [ ] Commit the command-transition slice and obtain judge ACCEPT.
+- [ ] Commit the command-transition slice.
 
 ### Task 5: Claim connector activities with leases and no transaction over HTTP
 
@@ -355,7 +357,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: run `cargo test -p donat-server --test process_activity` and the
   connector HTTP/Stripe test suites. Verify existing cron/event loops were not
   reused if they keep a database transaction across HTTP.
-- [ ] Commit the lease/activity slice and obtain judge ACCEPT.
+- [ ] Commit the lease/activity slice.
 
 ### Task 6: Process timers and verified inbound events
 
@@ -397,7 +399,7 @@ instances, change a definition, or set an instance role.
   it never adds an operator CLI or generic HTTP recovery endpoint.
 - [ ] GREEN: run the focused timer/inbound tests, connector webhook tests, and
   `cargo test -p donat-server`.
-- [ ] Commit the timer/inbound slice and obtain judge ACCEPT.
+- [ ] Commit the timer/inbound slice.
 
 ### Task 7: Activate process start and domain signals atomically
 
@@ -430,7 +432,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: run focused command SQL/process tests, rebuild the server, and
   run `cargo test -p donat-conformance --test commands` after adding the
   previously deferred `start_process` fixtures.
-- [ ] Commit the cross-plan integration slice and obtain judge ACCEPT.
+- [ ] Commit the cross-plan integration slice.
 
 ### Task 8: Add read-only operational inspection and history verification
 
@@ -458,7 +460,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: run `cargo test -p donat-server --test process_inspect` and an
   integration test against a process with a completed activity and a redacted
   failure. Inspect the SQL logs to prove all statements are read-only.
-- [ ] Commit the operational-observability slice and obtain judge ACCEPT.
+- [ ] Commit the operational-observability slice.
 
 ### Task 9: Prove crash, concurrency, and upgrade semantics in conformance
 
@@ -487,7 +489,7 @@ instances, change a definition, or set an instance role.
 - [ ] GREEN: rebuild and run the focused suite with one test thread for
   lifecycle determinism, then run it with `--test-threads=2` to exercise
   independent database isolation and two-worker cases.
-- [ ] Commit conformance corrections separately and obtain judge ACCEPT.
+- [ ] Commit conformance corrections separately.
 
 ### Task 10: Final full-system acceptance
 
@@ -510,4 +512,6 @@ instances, change a definition, or set an instance role.
   metadata, serve without any DDL, active revision pinned across a metadata
   upgrade, no role bypass, no transaction held over HTTP, and no resolved
   secret in output/log capture.
-- [ ] Obtain final judge ACCEPT for the complete declarative SaaS runtime.
+- [ ] Request one independent code review for the complete declarative SaaS
+  runtime and address material findings with regression tests and fresh
+  verification before declaring it ready.

@@ -1,7 +1,8 @@
 # In-Binary Connectors Implementation Plan
 
-> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and a
-> judge ACCEPT after each commit.
+> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and
+> focused commits. A commit is not a review gate: request one independent code
+> review for the complete connector range before merging, handoff, or readiness.
 
 **Goal:** Provide a safe compiled connector boundary for declarative SaaS
 processes: a generic declarative HTTP module and a narrow Stripe Checkout
@@ -106,7 +107,7 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] GREEN: run `cargo test -p donat-metadata`,
   `cargo test -p donat-server connector_startup`, and
   `cargo test --workspace --no-run`.
-- [ ] Commit the metadata/startup slice and obtain judge ACCEPT.
+- [ ] Commit the metadata/startup slice.
 
 ### Task 2: Create the compiled registry and safe outbound HTTP core
 
@@ -148,7 +149,7 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] GREEN: run `cargo test -p donat-server --test connectors_http` and
   `cargo test -p donat-server connectors`. Expected: local tests demonstrate
   no open redirect or private-address bypass.
-- [ ] Commit the HTTP-core slice and obtain judge ACCEPT.
+- [ ] Commit the HTTP-core slice.
 
 ### Task 3: Make operations declarative and idempotency-aware
 
@@ -186,7 +187,7 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   operation declares one.
 - [ ] GREEN: run `cargo test -p donat-server --test connectors_http` and
   `cargo test -p donat-metadata connectors`.
-- [ ] Commit the declarative-operation slice and obtain judge ACCEPT.
+- [ ] Commit the declarative-operation slice.
 
 ### Task 4: Implement the narrow Stripe Checkout module from pinned references
 
@@ -224,7 +225,7 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] GREEN: run `cargo test -p donat-server --test connectors_stripe` and
   `cargo test -p donat-server connectors`. Expected: Stripe's narrow contract
   works against the local test server without importing Stripe SDK code.
-- [ ] Commit the Stripe slice and obtain judge ACCEPT.
+- [ ] Commit the Stripe slice.
 
 ### Task 5: Add signed inbound routing without a public generic webhook API
 
@@ -250,7 +251,7 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   accepted event from being lost. Do not add an in-memory queue.
 - [ ] GREEN: run `cargo test -p donat-server --test connector_webhook` and all
   existing action/event webhook tests to prove their routes did not change.
-- [ ] Commit the inbound-route boundary and obtain judge ACCEPT.
+- [ ] Commit the inbound-route boundary.
 
 ### Task 6: Prove the connector boundary before processes integrate it
 
@@ -274,5 +275,6 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] Run `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, and inspect all
   porting-register/notice changes.
-- [ ] Commit any test-proven correction and obtain final judge ACCEPT before
-  starting durable processes.
+- [ ] Commit any test-proven correction. Before starting durable processes,
+  request one independent code review of the completed connector range and
+  address material findings with regression tests and fresh verification.

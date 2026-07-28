@@ -1,8 +1,9 @@
 # Declarative SaaS Runtime Rollout Implementation Plan
 
 > **For Codex:** Execute every checkbox in order. Each implementation slice
-> starts RED, ends GREEN, is committed separately, and receives an ACCEPT from
-> the mandatory judge before work starts on the next slice.
+> starts RED, ends GREEN, and is committed separately. Preserve focused test
+> evidence for every slice; run one independent code review only after the
+> complete cohesive feature range is ready for merge, handoff, or readiness.
 
 **Goal:** Add a declarative SaaS automation layer to the existing Donat data
 plane without duplicating Hasura-compatible views, permissions, CRUD, REST,
@@ -210,23 +211,20 @@ only the smallest independently tested algorithm. Do not import an upstream
 runtime, workflow server, Stripe SDK, CEL evaluator, code generator, or
 microservice.
 
-## Commit and judge protocol
+## Commit and review protocol
 
 After each completed implementation slice:
 
 1. Inspect the staged diff and run the focused RED/GREEN commands stated in
    the relevant plan.
 2. Commit only that slice.
-3. Dispatch the repository judge with `.Codex/agents/judge.md` input format:
-
-   ```text
-   Agent(subagent_type="judge", run_in_background=true,
-         prompt="REVIEW TASK: <slice, contract, changed files, commands and output>")
-   ```
-
-4. Do not start the next slice until the judge returns ACCEPT. On REJECT, add
-   a failing regression test, correct the issue, recommit the correction, and
-   obtain another ACCEPT.
+3. Continue to the next independently testable slice when its focused evidence
+   is green; a commit is not a review boundary.
+4. Before merging, handing off, or declaring the complete cohesive feature
+   range ready, request one independent code review over the full range,
+   including the changed contract, files, and fresh verification evidence.
+   Address material findings with a failing regression test and fresh
+   verification before completion.
 
 ## Final acceptance sequence
 
@@ -242,5 +240,5 @@ After each completed implementation slice:
 - [ ] `make conformance`
 - [ ] Review every SQL snapshot with `cargo insta review`; accept only
   intentional one-statement SQL changes.
-- [ ] Run `git diff --check origin/main...HEAD` and obtain a final judge ACCEPT
-  over the full diff and fresh verification evidence.
+- [ ] Run `git diff --check origin/main...HEAD` and obtain one independent
+  code review over the full diff and fresh verification evidence.

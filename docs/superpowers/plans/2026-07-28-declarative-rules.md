@@ -1,7 +1,8 @@
 # Declarative Rules Implementation Plan
 
-> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and a
-> judge ACCEPT after each commit.
+> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and
+> focused commits. A commit is not a review gate: request one independent code
+> review for the complete rules range before merging, handoff, or readiness.
 
 **Goal:** Introduce a small, strict, typed CEL-inspired expression language
 that can validate command input and make deterministic process decisions
@@ -94,7 +95,7 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
 - [ ] GREEN: run `cargo test -p donat-metadata` and
   `cargo test -p donat-conformance --lib metadata`. Expected: metadata
   round-trips preserve the new sections and existing fixtures are unchanged.
-- [ ] Commit this metadata-only slice and obtain judge ACCEPT.
+- [ ] Commit this metadata-only slice.
 
 ### Task 2: Parse the deliberately small language
 
@@ -119,7 +120,7 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
 - [ ] GREEN: run `cargo test -p donat-rules --test parser` and
   `cargo test -p donat-rules`. Expected: every accepted expression produces a
   deterministic AST and every rejected expression carries its source offset.
-- [ ] Commit this parser slice and obtain judge ACCEPT.
+- [ ] Commit this parser slice.
 
 ### Task 3: Type-check and evaluate closed bindings
 
@@ -153,7 +154,7 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
 - [ ] GREEN: run `cargo test -p donat-rules --test eval` and
   `cargo test -p donat-rules`. Expected: valid examples return an exact bool
   and invalid contexts fail before evaluation.
-- [ ] Commit this evaluator slice and obtain judge ACCEPT.
+- [ ] Commit this evaluator slice.
 
 ### Task 4: Lower the shared typed AST to Postgres safely
 
@@ -180,7 +181,7 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
 - [ ] GREEN: run `cargo test -p donat-rules --test postgres`,
   `cargo test -p donat-sqlgen`, and the focused Postgres differential test.
   Review snapshots with `cargo insta review`.
-- [ ] Commit this lowering slice and obtain judge ACCEPT.
+- [ ] Commit this lowering slice.
 
 ### Task 5: Validate rules at deploy time and expose no runtime mutation
 
@@ -207,7 +208,7 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
   tables.
 - [ ] GREEN: rebuild the binary and run the focused conformance test, then
   `cargo test -p donat-server` and `cargo test -p donat-metadata`.
-- [ ] Commit this deploy-validation slice and obtain judge ACCEPT.
+- [ ] Commit this deploy-validation slice.
 
 ### Task 6: Preserve the contract before commands consume rules
 
@@ -220,5 +221,6 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
   `cargo test -p donat-server`.
 - [ ] Rebuild with `cargo build -p donat-server --bin donat` and run
   `cargo test -p donat-conformance --test rules`.
-- [ ] Review all snapshots and obtain a final judge ACCEPT for this plan before
-  beginning the commands plan.
+- [ ] Review all snapshots and request one independent code review for the
+  completed rules range before beginning the commands plan. Address material
+  findings with a regression test and fresh verification.
