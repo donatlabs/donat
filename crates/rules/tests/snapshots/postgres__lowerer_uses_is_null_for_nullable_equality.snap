@@ -2,4 +2,4 @@
 source: crates/rules/tests/postgres.rs
 expression: sql
 ---
-((((((("input"."limit")::numeric) IS NULL)) OR (((("input"."limit")::numeric) IS NOT NULL)))) OR (((("input"."limit")::numeric) IS NULL)))
+(CASE WHEN ((CASE WHEN (((("input"."limit")::numeric) IS NULL)) THEN TRUE ELSE (((("input"."limit")::numeric) IS NOT NULL)) END)) THEN TRUE ELSE (((("input"."limit")::numeric) IS NULL)) END)

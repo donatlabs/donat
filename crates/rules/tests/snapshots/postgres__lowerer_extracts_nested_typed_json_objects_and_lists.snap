@@ -2,4 +2,4 @@
 source: crates/rules/tests/postgres.rs
 expression: sql
 ---
-((((((NULLIF((((NULLIF((((NULLIF((((("input"."customer")::jsonb)::jsonb -> 'addresses')), 'null'::jsonb))::jsonb -> 0)), 'null'::jsonb))::jsonb -> 'country')), 'null'::jsonb) #>> '{}'))::text) = ('US'::text))) AND (((jsonb_array_length((NULLIF((((("input"."customer")::jsonb)::jsonb -> 'tags')), 'null'::jsonb))::jsonb)) = ((2)::numeric))))
+(CASE WHEN (((((NULLIF((((("input"."customer")::jsonb)::jsonb -> 'nickname')), 'null'::jsonb) #>> '{}'))::text) IS NULL)) THEN (((((NULLIF((((("input"."lines")::jsonb)::jsonb -> 3)), 'null'::jsonb) #>> '{}'))::numeric) IS NULL)) ELSE FALSE END)

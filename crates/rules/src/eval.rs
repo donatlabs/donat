@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::types::{CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable};
+use crate::types::{
+    CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable, access_result_type,
+};
 use crate::{
     BinaryOp, CompiledRule, DecisionConditionTrace, DecisionRejection, DecisionResult,
     DecisionTableDefinition, DecisionTrace, Expr, ExprKind, ExpressionContext, Function, HitPolicy,
@@ -480,14 +482,12 @@ fn check_expression(
                     check_expression(context, rule_name, target, bindings, declared_types)?;
                 let object = required_concrete(rule_name, &target.type_)?;
                 match object {
-                    RuleType::Object { fields, .. } => {
-                        CheckedType::Concrete(fields.get(field).cloned().ok_or_else(|| {
-                            RuleError::UnknownField {
-                                rule: rule_name.to_owned(),
-                                field: field.clone(),
-                            }
-                        })?)
-                    }
+                    RuleType::Object { fields, .. } => CheckedType::Concrete(access_result_type(
+                        fields.get(field).ok_or_else(|| RuleError::UnknownField {
+                            rule: rule_name.to_owned(),
+                            field: field.clone(),
+                        })?,
+                    )),
                     other => return Err(type_mismatch(rule_name, "object", other.display_name())),
                 }
             }
@@ -496,7 +496,7 @@ fn check_expression(
                     check_expression(context, rule_name, target, bindings, declared_types)?;
                 let list = required_concrete(rule_name, &target.type_)?;
                 match list {
-                    RuleType::List(item) => CheckedType::Concrete((**item).clone()),
+                    RuleType::List(item) => CheckedType::Concrete(access_result_type(item)),
                     other => return Err(type_mismatch(rule_name, "list", other.display_name())),
                 }
             }
@@ -537,6 +537,11 @@ fn check_expression(
             ExprKind::Binary { op, left, right } => {
                 let left = check_expression(context, rule_name, left, bindings, declared_types)?;
                 let right = check_expression(context, rule_name, right, bindings, declared_types)?;
+                if matches!(op, BinaryOp::Divide) && literal_normalizes_to_zero(&right.expression) {
+                    return Err(RuleError::DivisionByZero {
+                        rule: rule_name.to_owned(),
+                    });
+                }
                 check_binary(rule_name, *op, &left.type_, &right.type_)?
             }
             ExprKind::Conditional {
@@ -563,6 +568,22 @@ fn check_expression(
         Some(context) => error.with_diagnostic(context, expression.span),
         None => error,
     })
+}
+
+fn literal_normalizes_to_zero(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::Literal(Literal::Int(value)) => {
+            value.parse::<i128>().is_ok_and(|value| value == 0)
+        }
+        ExprKind::Literal(Literal::Decimal(value)) => {
+            Decimal::parse(value).is_some_and(|value| value.is_zero())
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Negate,
+            operand,
+        } => literal_normalizes_to_zero(operand),
+        _ => false,
+    }
 }
 
 fn check_literal(rule_name: &str, literal: &Literal) -> Result<CheckedType, RuleError> {
@@ -1019,10 +1040,11 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
             fields
                 .iter()
                 .map(|(field, type_)| {
-                    object
-                        .get(field)
-                        .and_then(|value| decode_value(value, type_))
-                        .map(|value| (field.clone(), value))
+                    let value = match object.get(field) {
+                        Some(value) => decode_value(value, type_),
+                        None => Some(RuntimeValue::Null),
+                    }?;
+                    Some((field.clone(), value))
                 })
                 .collect::<Option<BTreeMap<_, _>>>()
                 .map(RuntimeValue::Object)
@@ -1158,13 +1180,7 @@ fn evaluate_expression(
         ExprKind::Member { target, field } => {
             match evaluate_expression(rule_name, target, context)? {
                 RuntimeValue::Object(fields) => {
-                    fields
-                        .get(field)
-                        .cloned()
-                        .ok_or_else(|| RuleError::UnknownField {
-                            rule: rule_name.to_owned(),
-                            field: field.clone(),
-                        })
+                    Ok(fields.get(field).cloned().unwrap_or(RuntimeValue::Null))
                 }
                 other => Err(type_mismatch(rule_name, "object", other.type_name())),
             }
@@ -1172,13 +1188,7 @@ fn evaluate_expression(
         ExprKind::Index { target, index } => match evaluate_expression(rule_name, target, context)?
         {
             RuntimeValue::List(items) => {
-                items
-                    .get(*index)
-                    .cloned()
-                    .ok_or_else(|| RuleError::InvalidBinding {
-                        name: "list index".to_owned(),
-                        expected: "an in-range literal list index".to_owned(),
-                    })
+                Ok(items.get(*index).cloned().unwrap_or(RuntimeValue::Null))
             }
             other => Err(type_mismatch(rule_name, "list", other.type_name())),
         },

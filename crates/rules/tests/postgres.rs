@@ -78,35 +78,34 @@ fn lowerer_uses_is_null_for_nullable_equality() {
         .expect("a nullable column should lower through SQL null predicates");
 
     insta::assert_snapshot!(sql);
+    assert!(
+        !sql.contains(" AND ") && !sql.contains(" OR "),
+        "profile boolean operators must lower through CASE: {sql}"
+    );
 }
 
 #[test]
 fn lowerer_extracts_nested_typed_json_objects_and_lists() {
-    let bindings = map([(
-        "customer",
-        object(
-            "Customer",
-            map([
-                (
-                    "addresses",
-                    RuleType::List(Box::new(object(
-                        "Address",
-                        map([("country", RuleType::String)]),
-                    ))),
-                ),
-                ("tags", RuleType::List(Box::new(RuleType::Int))),
-            ]),
+    let bindings = map([
+        (
+            "customer",
+            object("Customer", map([("nickname", RuleType::String)])),
         ),
-    )]);
+        ("lines", RuleType::List(Box::new(RuleType::Int))),
+    ]);
     let rule = compiled_rule(
         bindings.clone(),
-        "customer.addresses[0].country == 'US' && size(customer.tags) == 2",
+        "is_null(customer.nickname) && is_null(lines[3])",
     );
 
     let sql = lower_postgres(&rule, &typed_columns(&bindings))
-        .expect("typed JSON columns should lower static object and list access");
+        .expect("typed JSON columns should lower nullable static object and list access");
 
     insta::assert_snapshot!(sql);
+    assert!(
+        !sql.contains(" AND ") && !sql.contains(" OR "),
+        "profile boolean operators must lower through CASE: {sql}"
+    );
 }
 
 #[test]
@@ -125,6 +124,49 @@ fn lowerer_supports_each_allowed_function() {
         .expect("all profile functions should lower from the typed AST");
 
     insta::assert_snapshot!(sql);
+    assert!(
+        !sql.contains(" AND ") && !sql.contains(" OR "),
+        "profile boolean operators must lower through CASE: {sql}"
+    );
+}
+
+#[test]
+fn lowerer_short_circuits_runtime_division_with_typed_columns() {
+    let bindings = map([("numerator", RuleType::Int), ("denominator", RuleType::Int)]);
+    let mut client = postgres_client();
+
+    for (source, expected) in [
+        ("false && (numerator / denominator > 0)", false),
+        ("true || (numerator / denominator > 0)", true),
+    ] {
+        let rule = compiled_rule(bindings.clone(), source);
+        let expression = lower_postgres(&rule, &typed_columns(&bindings))
+            .expect("typed SQL columns should lower short-circuited arithmetic");
+        assert!(
+            expression.contains("CASE WHEN"),
+            "the operator must lower through CASE: {expression}"
+        );
+        assert!(
+            !expression.contains(" AND ") && !expression.contains(" OR "),
+            "the lowerer must not emit raw boolean operators: {expression}"
+        );
+
+        let actual = client
+            .query_one(
+                &format!(
+                    "SELECT {expression} AS value FROM (VALUES (1::numeric, 0::numeric)) AS input(numerator, denominator)"
+                ),
+                &[],
+            )
+            .expect("CASE must avoid evaluating the zero typed-column divisor")
+            .get::<_, Option<bool>>("value");
+
+        assert_eq!(
+            actual,
+            Some(expected),
+            "Postgres result mismatch for {source}"
+        );
+    }
 }
 
 #[test]
@@ -208,13 +250,14 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
                         ))),
                     ),
                     ("tags", RuleType::List(Box::new(RuleType::Int))),
+                    ("nickname", RuleType::String),
                 ]),
             ),
         ),
     ]);
     let context_rule = compiled_rule(
         context_bindings,
-        "amount + tax * quantity >= discount - 5 && size(name) >= 2 && startsWith(name, 'A') && endsWith(name, 'z') && size(lines) == 2 && (limit == null || is_null(limit)) && customer.addresses[0].country == 'US' && size(customer.tags) == 2",
+        "amount + tax * quantity >= discount - 5 && size(name) >= 2 && startsWith(name, 'A') && endsWith(name, 'z') && size(lines) == 2 && (limit == null || is_null(limit)) && is_null(customer.nickname)",
     );
     let integer_rule = compiled_rule(
         map([

@@ -73,7 +73,10 @@ pub enum RuleType {
 
 impl RuleType {
     pub fn nullable(inner: RuleType) -> Self {
-        Self::Nullable(Box::new(inner))
+        match inner {
+            Self::Nullable(_) => inner,
+            other => Self::Nullable(Box::new(other)),
+        }
     }
 
     pub(crate) fn accepts_null(&self) -> bool {
@@ -95,6 +98,10 @@ impl RuleType {
             Self::Nullable(inner) => format!("nullable<{}>", inner.display_name()),
         }
     }
+}
+
+pub(crate) fn access_result_type(member_or_item: &RuleType) -> RuleType {
+    RuleType::nullable(member_or_item.clone())
 }
 
 /// Source-level definition of one named boolean or value rule. Metadata is

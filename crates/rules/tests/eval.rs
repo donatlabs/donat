@@ -123,7 +123,7 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
             ),
         ]),
         RuleType::Bool,
-        "active && customer.name == 'Ada'",
+        "active && is_null(customer.name) == false",
     );
 
     assert!(
@@ -335,21 +335,115 @@ fn permits_only_explicit_null_checks_for_nullable_values() {
 }
 
 #[test]
+fn static_access_is_nullable_total_and_has_no_flow_sensitive_refinement() {
+    let out_of_range = rule(
+        "policy",
+        map([("lines", RuleType::List(Box::new(RuleType::Int)))]),
+        RuleType::Bool,
+        "is_null(lines[3])",
+    );
+    assert!(
+        evaluate(out_of_range, map([("lines", json!([1]))]))
+            .expect("an out-of-range static list access must become null")
+    );
+
+    let missing_object_key = rule(
+        "policy",
+        map([(
+            "customer",
+            object("Customer", map([("nickname", RuleType::String)])),
+        )]),
+        RuleType::Bool,
+        "is_null(customer.nickname)",
+    );
+    assert!(
+        evaluate(missing_object_key, map([("customer", json!({}))]))
+            .expect("an absent declared object key must decode as null")
+    );
+
+    assert_eq!(
+        RuleType::nullable(RuleType::nullable(RuleType::String)),
+        RuleType::nullable(RuleType::String),
+        "nullable access results must not accumulate wrappers"
+    );
+    let nullable_item = rule(
+        "policy",
+        map([(
+            "lines",
+            RuleType::List(Box::new(RuleType::nullable(RuleType::String))),
+        )]),
+        RuleType::Bool,
+        "is_null(lines[3])",
+    );
+    assert!(
+        evaluate(nullable_item, map([("lines", json!(["present"]))]))
+            .expect("an absent nullable list item must still be a single nullable result")
+    );
+
+    let error = compile_catalog(
+        &[rule(
+            "policy",
+            map([(
+                "customer",
+                object("Customer", map([("nickname", RuleType::String)])),
+            )]),
+            RuleType::String,
+            "is_null(customer.nickname) ? 'missing' : customer.nickname",
+        )],
+        &[],
+    )
+    .expect_err("checking an access for null must not refine it to a non-null value");
+    assert!(matches!(error, RuleError::IncompatibleBranches { .. }));
+
+    let error = compile_catalog(
+        &[rule(
+            "policy",
+            map([(
+                "customer",
+                object("Customer", map([("nickname", RuleType::String)])),
+            )]),
+            RuleType::Bool,
+            "customer.nickname == 'Ada'",
+        )],
+        &[],
+    )
+    .expect_err("non-null-only operations must reject nullable access results");
+    assert!(matches!(error, RuleError::NullableOperation { .. }));
+}
+
+#[test]
+fn rejects_literal_zero_divisors_at_deploy_time() {
+    for expression in ["false && (1 / 0 > 0)", "false && (1.0 / 0.0 > 0)"] {
+        let error = compile_catalog(
+            &[rule("policy", BTreeMap::new(), RuleType::Bool, expression)],
+            &[],
+        )
+        .expect_err("planner-visible literal zero divisors must be rejected at deploy time");
+        assert!(matches!(error, RuleError::DivisionByZero { .. }));
+    }
+}
+
+#[test]
 fn evaluates_list_size_string_predicates_and_short_circuit_boolean_operators() {
     let definition = rule(
         "policy",
         map([
             ("lines", RuleType::List(Box::new(RuleType::Int))),
             ("name", RuleType::String),
+            ("denominator", RuleType::Int),
         ]),
         RuleType::Bool,
-        "size(lines) == 2 && startsWith(name, 'A') && endsWith(name, 'z') && (false && 1 / 0 > 0) == false && (true || 1 / 0 > 0)",
+        "size(lines) == 2 && startsWith(name, 'A') && endsWith(name, 'z') && (false && 1 / denominator > 0) == false && (true || 1 / denominator > 0)",
     );
 
     assert!(
         evaluate(
             definition,
-            map([("lines", json!([1, 2])), ("name", json!("Az"))]),
+            map([
+                ("lines", json!([1, 2])),
+                ("name", json!("Az")),
+                ("denominator", json!(0)),
+            ]),
         )
         .expect("short-circuited branches must not evaluate their division by zero")
     );

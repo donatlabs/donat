@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::types::access_result_type;
 use crate::{
     BinaryOp, CompiledRule, Expr, ExprKind, Function, Literal, RuleError, RuleType, UnaryOp,
 };
@@ -138,7 +139,7 @@ fn lower_expression(
                 .ok_or_else(|| RuleError::InternalInvariant {
                     rule: rule.name.clone(),
                 })?;
-            json_access(&target.sql, field, field_type)
+            json_access(&target.sql, field, &access_result_type(field_type))
         }
         ExprKind::Index { target, index } => {
             let target = lower_expression(rule, bindings, target)?;
@@ -148,7 +149,7 @@ fn lower_expression(
                     rule: rule.name.clone(),
                 });
             };
-            json_index(&target.sql, *index, item_type)
+            json_index(&target.sql, *index, &access_result_type(item_type))
         }
         ExprKind::Call {
             function,
@@ -230,7 +231,7 @@ fn infer_expression_type(
             };
             fields
                 .get(field)
-                .cloned()
+                .map(access_result_type)
                 .map(ExpressionType::Concrete)
                 .ok_or_else(invariant)
         }
@@ -240,7 +241,7 @@ fn infer_expression_type(
             else {
                 return Err(invariant());
             };
-            Ok(ExpressionType::Concrete(*item_type))
+            Ok(ExpressionType::Concrete(access_result_type(&item_type)))
         }
         ExprKind::Call { function, .. } => match function {
             Function::Size => Ok(ExpressionType::Concrete(RuleType::Int)),
@@ -439,16 +440,12 @@ fn lower_value_literal(
                 .ok_or_else(|| invalid_literal(rule_name, type_))?;
             let mut pairs = Vec::with_capacity(fields.len() * 2);
             for (field, field_type) in fields {
-                let value = object
-                    .get(field)
-                    .ok_or_else(|| invalid_literal(rule_name, type_))?;
                 pairs.push(donat_sqlgen::quote_lit(field));
-                pairs.push(lower_value_literal(
-                    rule_name,
-                    binding_name,
-                    field_type,
-                    value,
-                )?);
+                let value = match object.get(field) {
+                    Some(value) => lower_value_literal(rule_name, binding_name, field_type, value)?,
+                    None => format!("NULL::{}", postgres_type(field_type)),
+                };
+                pairs.push(value);
             }
             Ok(format!("jsonb_build_object({})", pairs.join(", ")))
         }
@@ -515,8 +512,14 @@ fn lower_call(
 
 fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpression) -> String {
     match operation {
-        BinaryOp::Or => format!("(({}) OR ({}))", left.sql, right.sql),
-        BinaryOp::And => format!("(({}) AND ({}))", left.sql, right.sql),
+        BinaryOp::Or => format!(
+            "(CASE WHEN ({}) THEN TRUE ELSE ({}) END)",
+            left.sql, right.sql
+        ),
+        BinaryOp::And => format!(
+            "(CASE WHEN ({}) THEN ({}) ELSE FALSE END)",
+            left.sql, right.sql
+        ),
         BinaryOp::Equal if matches!(right.type_, ExpressionType::Null) => {
             format!("(({}) IS NULL)", left.sql)
         }
