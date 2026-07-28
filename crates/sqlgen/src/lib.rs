@@ -1010,6 +1010,9 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
     );
 
     let mut ctes = Vec::new();
+    let guard_cte = "_cmd_guard_gate";
+    ctes.push(command_rule_gate_cte(guard_cte, &command.guards, "TRUE"));
+    let guard_gate = command_gate_exists(guard_cte);
     let (execution_gate, invocation) = match &command.idempotency {
         Some(idempotency) => {
             let scope = command_canonical_json_array(&idempotency.scope);
@@ -1022,7 +1025,7 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 .map(|seconds| format!("statement_timestamp() + {} * interval '1 second'", seconds))
                 .unwrap_or_else(|| "'infinity'::timestamptz".to_owned());
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} AS {target} ({command_name}, {scope_hash_col}, {key_col}, {claim_state}, {expires_at_col}) VALUES ({name}, {scope_hash}, {key}, 'first', {expires_at}) ON CONFLICT ({command_name}, {scope_hash_col}, {key_col}) DO UPDATE SET {claim_state} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN 'first' ELSE 'replay' END, {expires_at_col} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN EXCLUDED.{expires_at_col} ELSE {target}.{expires_at_col} END RETURNING {command_name}, {scope_hash_col}, {key_col}, {claim_state})",
+                "{cte} AS (INSERT INTO {schema}.{table} AS {target} ({command_name}, {scope_hash_col}, {key_col}, {claim_state}, {expires_at_col}) SELECT {name}, {scope_hash}, {key}, 'first', {expires_at} FROM {guard_cte} ON CONFLICT ({command_name}, {scope_hash_col}, {key_col}) DO UPDATE SET {claim_state} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN 'first' ELSE 'replay' END, {expires_at_col} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN EXCLUDED.{expires_at_col} ELSE {target}.{expires_at_col} END RETURNING {command_name}, {scope_hash_col}, {key_col}, {claim_state})",
                 cte = quote_ident("_cmd_claim"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocation_claims"),
@@ -1033,10 +1036,12 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 claim_state = quote_ident("claim_state"),
                 expires_at_col = quote_ident("expires_at"),
                 name = quote_lit(&command.name),
+                guard_cte = quote_ident(guard_cte),
             ));
             (
                 format!(
-                    "EXISTS (SELECT 1 FROM {claim} WHERE {claim_state} = 'first')",
+                    "({guard_gate}) AND EXISTS (SELECT 1 FROM {claim} WHERE {claim_state} = 'first')",
+                    guard_gate = guard_gate,
                     claim = quote_ident("_cmd_claim"),
                     claim_state = quote_ident("claim_state"),
                 ),
@@ -1047,20 +1052,40 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 }),
             )
         }
-        None => ("TRUE".to_owned(), None),
+        None => (guard_gate, None),
     };
 
-    for step in &command.steps {
-        if let Some(cte) = command_step_cte(ctx, step, &execution_gate) {
+    let mut step_execution_gate = execution_gate.clone();
+    for (index, step) in command.steps.iter().enumerate() {
+        if let CommandExecutionStep::Assert { rule, .. } = step {
+            let assert_cte = format!("_cmd_assert_gate_{index}");
+            ctes.push(command_rule_gate_cte(
+                &assert_cte,
+                std::slice::from_ref(rule),
+                &step_execution_gate,
+            ));
+            step_execution_gate = format!(
+                "({step_execution_gate}) AND {assert_gate}",
+                assert_gate = command_gate_exists(&assert_cte),
+            );
+        } else if let Some(cte) = command_step_cte(ctx, step, &step_execution_gate) {
             ctes.push(cte);
         }
     }
 
+    let final_gate_cte = "_cmd_final_gate";
+    ctes.push(command_rule_gate_cte(
+        final_gate_cte,
+        &[],
+        &step_execution_gate,
+    ));
+
     let result = command_full_result_json(ctx, command);
     ctes.push(format!(
-        "{cte} AS (SELECT ({result})::jsonb AS {column})",
+        "{cte} AS (SELECT ({result})::jsonb AS {column} FROM {final_gate})",
         cte = quote_ident("_cmd_result"),
         column = quote_ident("result"),
+        final_gate = quote_ident(final_gate_cte),
     ));
 
     let result_source = match &invocation {
@@ -1151,6 +1176,30 @@ struct CommandInvocationSql {
     expires_at: String,
 }
 
+/// Materialize one boolean gate before any dependent command DML. A false Rule
+/// raises the existing structured GraphQL rejection while this CTE is still the
+/// source of the dependent write, so a `BEFORE` trigger cannot run first.
+fn command_rule_gate_cte(cte: &str, rules: &[CommandRule], precondition: &str) -> String {
+    let mut condition = "TRUE".to_owned();
+    for rule in rules.iter().rev() {
+        condition = format!(
+            "CASE WHEN ({rule_sql}) IS TRUE THEN ({condition}) ELSE (donat.raise_graphql_error('validation-failed', {path}, {message}) IS NULL) END",
+            rule_sql = rule.sql,
+            path = quote_lit(&rule.error_path),
+            message = quote_lit(&rule.message),
+        );
+    }
+    format!(
+        "{cte} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN ({condition}) ELSE FALSE END)",
+        cte = quote_ident(cte),
+        ok = quote_ident("ok"),
+    )
+}
+
+fn command_gate_exists(cte: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM {})", quote_ident(cte))
+}
+
 fn command_step_cte(
     ctx: &mut Ctx,
     step: &CommandExecutionStep,
@@ -1204,6 +1253,7 @@ fn command_step_cte(
             cte,
             table,
             items,
+            item_fields,
             object,
             ..
         } => {
@@ -1226,30 +1276,35 @@ fn command_step_cte(
                         .iter()
                         .map(|assignment| command_value_sql_for_item(ctx, &assignment.value, item))
                         .collect::<Vec<_>>();
+                    let item_source = command_item_source_sql(ctx, item_fields, item);
                     let item_cte = format!("{cte}_item_{index}");
                     format!(
-                        "{item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} WHERE {execution_gate} RETURNING *)",
+                        "{item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} FROM ({item_source}) AS {item_alias} WHERE {execution_gate} RETURNING *)",
                         item_cte = quote_ident(&item_cte),
                         table = command_table_sql(table),
                         columns = columns.join(", "),
                         values = values.join(", "),
+                        item_alias = quote_ident("_cmd_item"),
                     )
                 })
                 .collect::<Vec<_>>();
             if item_ctes.is_empty() {
+                let empty_item = serde_json::Map::new();
                 let values = object
                     .iter()
                     .map(|assignment| {
-                        command_value_sql_for_item(ctx, &assignment.value, &serde_json::Map::new())
+                        command_value_sql_for_item(ctx, &assignment.value, &empty_item)
                     })
                     .collect::<Vec<_>>();
+                let item_source = command_item_source_sql(ctx, item_fields, &empty_item);
                 let empty_item_cte = format!("{cte}_item_empty");
                 Some(format!(
-                    "{empty_item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} WHERE FALSE RETURNING *), {cte} AS (SELECT 0::bigint AS {ordinal}, {empty_item_cte}.* FROM {empty_item_cte} WHERE FALSE)",
+                    "{empty_item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} FROM ({item_source}) AS {item_alias} WHERE FALSE RETURNING *), {cte} AS (SELECT 0::bigint AS {ordinal}, {empty_item_cte}.* FROM {empty_item_cte} WHERE FALSE)",
                     empty_item_cte = quote_ident(&empty_item_cte),
                     table = command_table_sql(table),
                     columns = columns.join(", "),
                     values = values.join(", "),
+                    item_alias = quote_ident("_cmd_item"),
                     cte = quote_ident(cte),
                     ordinal = quote_ident("_cmd_ordinal"),
                 ))
@@ -1400,6 +1455,32 @@ fn command_value_sql_for_item(
     }
 }
 
+fn command_item_source_sql(
+    ctx: &mut Ctx,
+    item_fields: &[CommandColumn],
+    item: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let values = item_fields
+        .iter()
+        .map(|field| {
+            let value = item
+                .get(&field.name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            format!(
+                "{} AS {}",
+                scalar_sql(&ctx.dialect, &Scalar::Json(value), &field.pg_type),
+                quote_ident(&field.name),
+            )
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "SELECT 1 AS \"_cmd_item_present\"".to_owned()
+    } else {
+        format!("SELECT {}", values.join(", "))
+    }
+}
+
 fn command_full_result_json(ctx: &mut Ctx, command: &CommandMutation) -> String {
     let pairs = command
         .result
@@ -1512,24 +1593,10 @@ enum CommandRejection {
 }
 
 fn command_rejection_checks(ctx: &mut Ctx, command: &CommandMutation) -> Vec<CommandRejection> {
-    let mut checks = command
-        .guards
-        .iter()
-        .map(|rule| CommandRejection::Business {
-            condition: format!("({}) IS NOT TRUE", rule.sql),
-            path: rule.error_path.clone(),
-            message: rule.message.clone(),
-        })
-        .collect::<Vec<_>>();
+    let mut checks = Vec::new();
     for step in &command.steps {
         match step {
-            CommandExecutionStep::Assert { name: _, rule } => {
-                checks.push(CommandRejection::Business {
-                    condition: format!("({}) IS NOT TRUE", rule.sql),
-                    path: rule.error_path.clone(),
-                    message: rule.message.clone(),
-                })
-            }
+            CommandExecutionStep::Assert { .. } => {}
             CommandExecutionStep::SelectOne {
                 name,
                 cte,

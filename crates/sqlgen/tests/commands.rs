@@ -360,6 +360,221 @@ fn command_business_rejection_rolls_back_claim_and_journal_before_retry() {
 }
 
 #[test]
+fn command_insert_many_rule_binding_uses_each_current_item_value() {
+    let table_name = format!("command_sqlgen_item_rule_{}", std::process::id());
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    tx.batch_execute(&format!(
+        "CREATE TABLE \"public\".\"{table_name}\" (id bigserial PRIMARY KEY, quantity int4 NOT NULL)"
+    ))
+    .expect("create the command target table");
+
+    let command = root(CommandMutation {
+        name: "item_rule_batch".to_owned(),
+        steps: vec![CommandExecutionStep::InsertMany {
+            name: "lines".to_owned(),
+            cte: "_cmd_step_0".to_owned(),
+            table: table(&table_name),
+            items: Scalar::Json(json!([
+                { "quantity": 2 },
+                { "quantity": 3 }
+            ])),
+            item_fields: vec![column("quantity", "int4")],
+            object: vec![CommandAssignment {
+                column: column("quantity", "int4"),
+                value: CommandExecutionValue::Rule {
+                    sql: "((\"_cmd_item\".\"quantity\")::numeric * 2)".to_owned(),
+                    pg_type: "int4".to_owned(),
+                },
+            }],
+            returning: vec![column("quantity", "int4")],
+            allow_empty: false,
+            check: None,
+            error_path: "$.selectionSet.item_rule_batch".to_owned(),
+        }],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "lines".to_owned(),
+            value: CommandResultValue::StepRow {
+                cte: "_cmd_step_0".to_owned(),
+                many: true,
+                columns: vec![column("quantity", "int4")],
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::List {
+            alias: "lines".to_owned(),
+            field: "lines".to_owned(),
+            selections: vec![CommandResultSelection::Scalar {
+                alias: "quantity".to_owned(),
+                field: "quantity".to_owned(),
+            }],
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    assert!(
+        sql.contains("AS \"_cmd_item\""),
+        "compiled Rules must receive a concrete per-item alias: {sql}"
+    );
+    tx.execute(&sql, &[])
+        .expect("the pre-lowered Rule sees each typed item binding");
+    let quantities = tx
+        .query(
+            &format!("SELECT quantity FROM \"public\".\"{table_name}\" ORDER BY id"),
+            &[],
+        )
+        .expect("query inserted rows")
+        .into_iter()
+        .map(|row| row.get::<_, i32>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(quantities, vec![4, 6]);
+
+    tx.rollback()
+        .expect("remove the isolated command target table");
+}
+
+#[test]
+fn command_guard_rejection_does_not_reach_a_before_insert_trigger() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!("command_sqlgen_guard_trigger_{}", std::process::id());
+    let function_name = format!("command_sqlgen_guard_trigger_fn_{}", std::process::id());
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        r#"
+        CREATE TABLE "public"."{table_name}" (id uuid PRIMARY KEY, status text NOT NULL);
+        CREATE FUNCTION "public"."{function_name}"() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'guard trigger must not run' USING ERRCODE = 'P0G01';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER "before_insert" BEFORE INSERT ON "public"."{table_name}"
+        FOR EACH ROW EXECUTE FUNCTION "public"."{function_name}"();
+        "#
+    ))
+    .expect("create trigger-sensitive command target");
+
+    let mut root = idempotent_insert_root("guard_trigger_command", &table_name, "draft");
+    let MutationRoot::Command { command, .. } = &mut root else {
+        panic!("helper must construct a command root");
+    };
+    command.idempotency = None;
+    command.guards.push(CommandRule {
+        sql: "FALSE".to_owned(),
+        pg_type: "bool".to_owned(),
+        error_path: "$.selectionSet.create_order".to_owned(),
+        message: "guard denied".to_owned(),
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&root);
+    assert!(
+        sql.contains("\"_cmd_guard_gate\""),
+        "the guard must be an explicit dependency of every command DML CTE: {sql}"
+    );
+    let error = tx
+        .execute(&sql, &[])
+        .expect_err("a false guard must reject before the DML trigger runs");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("P0D01"),
+        "a trigger error proves the insert was reached: {error:?}"
+    );
+
+    tx.rollback()
+        .expect("remove the isolated trigger-sensitive target");
+}
+
+#[test]
+fn command_assertion_rejection_does_not_reach_later_dml_trigger() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!("command_sqlgen_assert_trigger_{}", std::process::id());
+    let function_name = format!("command_sqlgen_assert_trigger_fn_{}", std::process::id());
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        r#"
+        CREATE TABLE "public"."{table_name}" (id uuid PRIMARY KEY, status text NOT NULL);
+        CREATE FUNCTION "public"."{function_name}"() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'assertion trigger must not run' USING ERRCODE = 'P0G01';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER "before_insert" BEFORE INSERT ON "public"."{table_name}"
+        FOR EACH ROW EXECUTE FUNCTION "public"."{function_name}"();
+        "#
+    ))
+    .expect("create trigger-sensitive command target");
+
+    let command = root(CommandMutation {
+        name: "assert_trigger_command".to_owned(),
+        steps: vec![
+            CommandExecutionStep::Assert {
+                name: "must_be_allowed".to_owned(),
+                rule: CommandRule {
+                    sql: "FALSE".to_owned(),
+                    pg_type: "bool".to_owned(),
+                    error_path: "$.selectionSet.create_order".to_owned(),
+                    message: "assertion denied".to_owned(),
+                },
+            },
+            CommandExecutionStep::Insert {
+                name: "order".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table(&table_name),
+                object: vec![
+                    assignment("id", "uuid", json!("550e8400-e29b-41d4-a716-446655440000")),
+                    assignment("status", "text", json!("draft")),
+                ],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                check: None,
+                error_path: "$.selectionSet.create_order".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "status".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_1".to_owned(),
+                column: column("status", "text"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "status".to_owned(),
+            field: "status".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    assert!(
+        sql.contains("\"_cmd_assert_gate_0\""),
+        "an assertion must materialize a gate CTE for later DML: {sql}"
+    );
+    let error = tx
+        .execute(&sql, &[])
+        .expect_err("a false assertion must reject before later DML runs");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("P0D01"),
+        "a trigger error proves the later insert was reached: {error:?}"
+    );
+
+    tx.rollback()
+        .expect("remove the isolated trigger-sensitive target");
+}
+
+#[test]
 fn command_reclaims_expired_claim_and_replaces_expired_canonical_result() {
     let _catalog_lock = command_catalog_test_lock();
     let table_name = format!("command_sqlgen_expiry_{}", std::process::id());

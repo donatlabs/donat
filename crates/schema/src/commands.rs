@@ -808,6 +808,7 @@ fn validate_command(
         item: None,
     };
     for (index, guard) in command.guards.iter().enumerate() {
+        validate_guard_precondition_bindings(&guard.bindings, &format!("{path}.guards[{index}]"))?;
         validate_rule(
             &guard.rule,
             &guard.bindings,
@@ -1549,6 +1550,35 @@ fn validate_rule(
         ));
     }
     Ok(result)
+}
+
+/// Guards are command preconditions. They must remain independent from every
+/// command step so SQLgen can evaluate their materialized gate before any
+/// writable CTE or idempotency claim is allowed to execute.
+fn validate_guard_precondition_bindings(
+    bindings: &BTreeMap<String, CommandValue>,
+    path: &str,
+) -> Result<(), PlanError> {
+    for value in bindings.values() {
+        match value {
+            CommandValue::Step { step, .. } => {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "command guards cannot reference step '{step}'; use an assert after the referenced step"
+                    ),
+                ));
+            }
+            CommandValue::Rule { bindings, .. } => {
+                validate_guard_precondition_bindings(bindings, path)?;
+            }
+            CommandValue::Argument { .. }
+            | CommandValue::Item { .. }
+            | CommandValue::Literal { .. }
+            | CommandValue::SessionVariable { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn value_type(

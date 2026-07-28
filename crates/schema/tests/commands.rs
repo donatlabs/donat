@@ -58,7 +58,10 @@ fn metadata(commands: Vec<Json>) -> Metadata {
         "custom_types": {
             "input_objects": [{
                 "name": "OrderInput",
-                "fields": [{ "name": "status", "type": "String!" }]
+                "fields": [
+                    { "name": "status", "type": "String!" },
+                    { "name": "quantity", "type": "Int!" }
+                ]
             }]
         },
         "sources": [{
@@ -124,12 +127,20 @@ fn valid_command() -> Json {
 
 fn rules() -> RuleCatalog {
     compile_catalog(
-        &[RuleDefinition {
-            name: "customer_is_allowed".to_string(),
-            bindings: BTreeMap::from([("customer_id".to_string(), RuleType::Uuid)]),
-            result: RuleType::Bool,
-            expression: "true".to_string(),
-        }],
+        &[
+            RuleDefinition {
+                name: "customer_is_allowed".to_string(),
+                bindings: BTreeMap::from([("customer_id".to_string(), RuleType::Uuid)]),
+                result: RuleType::Bool,
+                expression: "true".to_string(),
+            },
+            RuleDefinition {
+                name: "double_quantity".to_string(),
+                bindings: BTreeMap::from([("quantity".to_string(), RuleType::Int)]),
+                result: RuleType::Int,
+                expression: "quantity * 2".to_string(),
+            },
+        ],
         &[],
     )
     .expect("rule catalog compiles")
@@ -572,6 +583,102 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
         !serialized.to_string().contains("customer_is_allowed"),
         "the raw rule name/source is absent from execution IR: {serialized:#}"
     );
+}
+
+#[test]
+fn command_planning_keeps_insert_many_rule_item_bindings_resolved() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "lines", "type": "[OrderInput!]!" }));
+    command["steps"] = json!([{
+        "name": "lines",
+        "insert_many": {
+            "table": { "schema": "public", "name": "orders" },
+            "for_each": { "arg": "lines" },
+            "object": {
+                "quantity": {
+                    "rule": "double_quantity",
+                    "with": { "quantity": { "item": "quantity" } }
+                }
+            },
+            "returning": ["quantity"]
+        }
+    }]);
+    command["result"] = json!({ "lines": { "step": "lines" } });
+
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+                lines: [{ status: "first", quantity: 2 }, { status: "second", quantity: 3 }]
+              ) { lines { quantity } }
+            }
+        "#,
+    )
+    .expect("a rule may bind the current insert_many item");
+
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected command mutation root: {roots:#?}");
+    };
+    let [
+        CommandExecutionStep::InsertMany {
+            item_fields,
+            object,
+            ..
+        },
+    ] = command.steps.as_slice()
+    else {
+        panic!(
+            "expected one resolved insert_many step: {:#?}",
+            command.steps
+        );
+    };
+    assert!(
+        item_fields.iter().any(|field| field.name == "quantity"),
+        "the executable IR retains the typed current item binding"
+    );
+    assert!(matches!(
+        object.first().map(|assignment| &assignment.value),
+        Some(CommandExecutionValue::Rule { sql, .. }) if sql.contains("\"_cmd_item\".\"quantity\"")
+    ));
+}
+
+#[test]
+fn rejects_guard_rule_bindings_that_depend_on_command_steps() {
+    let mut command = valid_command();
+    command["guards"] = json!([{
+        "rule": "customer_is_allowed",
+        "with": { "customer_id": { "step": "order", "column": "customer_id" } },
+        "message": "a guard must be a precondition"
+    }]);
+    let metadata = metadata(vec![command]);
+
+    let error = compile(&metadata, RelationKind::Table)
+        .expect_err("a guard cannot depend on a write that it must precede");
+    assert!(
+        error
+            .message
+            .contains("command guards cannot reference step 'order'"),
+        "{error:?}"
+    );
+    assert_eq!(error.path, "commands[0].guards[0]");
 }
 
 #[test]

@@ -1,0 +1,20 @@
+description: A batch Rule binds each declared GraphQL input item through the command's typed item row.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: customer
+query:
+  query: |
+    mutation CreateOrderLines {
+      create_order_lines(lines: [{ quantity: 2 }, { quantity: 3 }]) {
+        lines {
+          quantity
+        }
+      }
+    }
+response:
+  data:
+    create_order_lines:
+      lines:
+        - quantity: 4
+        - quantity: 6

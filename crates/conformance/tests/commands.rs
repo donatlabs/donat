@@ -114,6 +114,81 @@ fn create_orders_table(database_url: &str) {
         .expect("create orders table");
 }
 
+fn batch_rule_command_metadata() -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "custom_types": {
+            "input_objects": [{
+                "name": "OrderLineInput",
+                "fields": [{ "name": "quantity", "type": "Int!" }]
+            }]
+        },
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                }
+            },
+            "tables": [{
+                "table": { "schema": "public", "name": "order_lines" },
+                "select_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }]
+        }],
+        "commands": [{
+            "name": "create_order_lines",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [{ "name": "lines", "type": "[OrderLineInput!]!" }],
+            "steps": [{
+                "name": "lines",
+                "insert_many": {
+                    "table": { "schema": "public", "name": "order_lines" },
+                    "for_each": { "arg": "lines" },
+                    "object": {
+                        "quantity": {
+                            "rule": "double_quantity",
+                            "with": { "quantity": { "item": "quantity" } }
+                        }
+                    },
+                    "returning": ["quantity"]
+                }
+            }],
+            "result": { "lines": { "step": "lines" } }
+        }],
+        "rules": {
+            "rules": [{
+                "name": "double_quantity",
+                "parameters": { "quantity": "int!" },
+                "result": "int!",
+                "expression": "quantity * 2"
+            }]
+        }
+    }))
+    .expect("batch Rule command metadata deserializes")
+}
+
+fn create_order_lines_table(database_url: &str) {
+    let mut client = postgres::Client::connect(database_url, NoTls)
+        .expect("connect to the batch command suite database");
+    client
+        .batch_execute(
+            "CREATE TABLE public.order_lines (\
+                id bigserial PRIMARY KEY,\
+                quantity integer NOT NULL\
+             )",
+        )
+        .expect("create order_lines table");
+}
+
 fn validation_database(label: &str) -> (String, String) {
     let admin_url = pg_admin_url();
     let suffix = NEXT_VALIDATION_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -235,6 +310,20 @@ fn command_guard_rejection_leaves_no_order_visible_to_the_explicit_role() {
 
     suite.check_query_f(
         "commands/guard_denied_no_write.yaml",
+        donat_conformance::Transport::Http,
+    );
+}
+
+#[test]
+fn command_insert_many_rule_binds_each_graphql_item() {
+    let suite = Suite::new("command_insert_many_rule_item")
+        .initial_metadata(batch_rule_command_metadata())
+        .with_migrations()
+        .start();
+    create_order_lines_table(suite.db_url());
+
+    suite.check_query_f(
+        "commands/insert_many_rule_item.yaml",
         donat_conformance::Transport::Http,
     );
 }

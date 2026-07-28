@@ -11,7 +11,7 @@ use donat_metadata::{
     Columns, Command, CommandEffect, CommandIdempotencyKey, CommandIdempotencyScope, CommandStep,
     CommandStepOperation, CommandValue,
 };
-use donat_rules::{SqlBinding, SqlBindings, SqlExpression, lower_postgres_expression};
+use donat_rules::{RuleType, SqlBinding, SqlBindings, SqlExpression, lower_postgres_expression};
 use graphql_parser::query::{Field as GqlField, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -410,6 +410,7 @@ impl<'a> Planner<'a> {
                 let items = command_argument(arguments, arg, path)?;
                 let item = CommandItemContext {
                     fields: self.command_item_fields(
+                        command,
                         &insert_many.object,
                         &insert_many.table,
                         path,
@@ -998,6 +999,7 @@ impl<'a> Planner<'a> {
 
     fn command_item_fields(
         &self,
+        command: &CompiledCommand,
         object: &BTreeMap<String, CommandValue>,
         table: &donat_metadata::QualifiedTable,
         path: &str,
@@ -1006,6 +1008,9 @@ impl<'a> Planner<'a> {
             PlanError::validation(path, "command table is absent from the immutable catalog")
         })?;
         let mut fields = BTreeMap::new();
+        // Direct item values establish the concrete catalog type when a field
+        // is shared with a Rule binding. Rules may then safely cast that typed
+        // derived-row column to their already validated profile type.
         for (target, value) in object {
             let Some(item) = direct_command_item(value) else {
                 continue;
@@ -1024,7 +1029,67 @@ impl<'a> Planner<'a> {
                 _ => {}
             }
         }
+        for value in object.values() {
+            self.collect_command_rule_item_fields(command, value, &mut fields, path)?;
+        }
         Ok(fields)
+    }
+
+    fn collect_command_rule_item_fields(
+        &self,
+        command: &CompiledCommand,
+        value: &CommandValue,
+        fields: &mut BTreeMap<String, CommandColumn>,
+        path: &str,
+    ) -> Result<(), PlanError> {
+        let CommandValue::Rule { rule, bindings } = value else {
+            return Ok(());
+        };
+        let compiled = command.rules().rule(rule).ok_or_else(|| {
+            PlanError::validation(path, format!("unknown compiled rule '{rule}'"))
+        })?;
+        for (binding, expected_type) in &compiled.bindings {
+            let value = bindings.get(binding).ok_or_else(|| {
+                PlanError::validation(path, format!("compiled rule '{rule}' is missing a binding"))
+            })?;
+            self.collect_command_rule_item_binding(command, value, expected_type, fields, path)?;
+        }
+        Ok(())
+    }
+
+    fn collect_command_rule_item_binding(
+        &self,
+        command: &CompiledCommand,
+        value: &CommandValue,
+        expected_type: &RuleType,
+        fields: &mut BTreeMap<String, CommandColumn>,
+        path: &str,
+    ) -> Result<(), PlanError> {
+        match value {
+            CommandValue::Item { item } => {
+                let inferred = CommandColumn {
+                    name: item.clone(),
+                    pg_type: command_rule_item_pg_type(expected_type).to_owned(),
+                    nullable: command_rule_item_nullable(expected_type),
+                };
+                match fields.get(item) {
+                    // A direct item assignment uses the concrete target-column
+                    // type. The Rules lowerer explicitly casts the trusted
+                    // alias reference, so retaining that narrower type is
+                    // sound for an assignable Rule binding.
+                    Some(existing) if existing.pg_type != inferred.pg_type => {}
+                    Some(_) => {}
+                    None => {
+                        fields.insert(item.clone(), inferred);
+                    }
+                }
+                Ok(())
+            }
+            CommandValue::Rule { .. } => {
+                self.collect_command_rule_item_fields(command, value, fields, path)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn command_is_permitted(&self, command: &Command, session: &Session) -> bool {
@@ -2223,6 +2288,23 @@ fn direct_command_item(value: &CommandValue) -> Option<&str> {
         CommandValue::Item { item } => Some(item),
         _ => None,
     }
+}
+
+fn command_rule_item_pg_type(type_: &RuleType) -> &'static str {
+    match type_ {
+        RuleType::Bool => "boolean",
+        RuleType::String | RuleType::Enum { .. } => "text",
+        RuleType::Int | RuleType::Decimal => "numeric",
+        RuleType::Uuid => "uuid",
+        RuleType::Date => "date",
+        RuleType::Timestamp => "timestamptz",
+        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
+        RuleType::Nullable(inner) => command_rule_item_pg_type(inner),
+    }
+}
+
+fn command_rule_item_nullable(type_: &RuleType) -> bool {
+    matches!(type_, RuleType::Nullable(_))
 }
 
 fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTable> {

@@ -236,6 +236,12 @@ renderer requires; ADR 005 records this boundary.
   item as a named one-statement CTE and assemble its result with an explicit
   private ordinal; never rely on PostgreSQL's unspecified `RETURNING` row
   order for the public list order.
+- [ ] Materialize a typed private row for every `insert_many` item so a
+  pre-lowered Rule binding using `{ item: field }` resolves without textual SQL
+  substitution. A materialized guard gate must precede the idempotency claim
+  and every command DML CTE; each `assert` must add a gate that later DML CTEs
+  explicitly depend on. Guards are preconditions and cannot reference a step;
+  use an assert for a predicate over prior output. See ADR 007.
 - [ ] For idempotent commands, compute a canonical input/scope fingerprint,
   elect one executor and store/replay the invocation within the same statement.
   V3 `donat.command_invocations` remains the canonical fingerprint/result
