@@ -1,0 +1,66 @@
+- description: The first idempotent command invocation persists its declared result.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation CreateOrderFirst {
+        create_order(
+          id: "550e8400-e29b-41d4-a716-446655440020"
+          customer_id: "550e8400-e29b-41d4-a716-446655440001"
+          status: "draft"
+          quantity: 2
+          request_id: "550e8400-e29b-41d4-a716-446655440021"
+        ) {
+          order_id
+          status
+        }
+      }
+  response:
+    data:
+      create_order:
+        order_id: "550e8400-e29b-41d4-a716-446655440020"
+        status: draft
+
+- description: An exact retry projects the canonical result through the retry selection only.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation CreateOrderReplay {
+        create_order(
+          id: "550e8400-e29b-41d4-a716-446655440020"
+          customer_id: "550e8400-e29b-41d4-a716-446655440001"
+          status: "draft"
+          quantity: 2
+          request_id: "550e8400-e29b-41d4-a716-446655440021"
+        ) {
+          order_id
+        }
+      }
+  response:
+    data:
+      create_order:
+        order_id: "550e8400-e29b-41d4-a716-446655440020"
+
+- description: The explicit role can observe exactly one persisted domain row after replay.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      query OrdersAfterReplay {
+        orders {
+          id
+          status
+        }
+      }
+  response:
+    data:
+      orders:
+        - id: "550e8400-e29b-41d4-a716-446655440020"
+          status: draft

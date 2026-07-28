@@ -1,0 +1,39 @@
+- name: update_order_without_id
+  source: default
+  permissions:
+    - role: customer
+  arguments:
+    - name: status
+      type: String!
+  steps:
+    - name: order
+      update:
+        table:
+          schema: public
+          name: orders
+        where:
+          status: {arg: status}
+        set:
+          status: {literal: submitted}
+        returning: [id]
+  result:
+    order_id: {step: order, column: id}
+
+- name: delete_order_without_id
+  source: default
+  permissions:
+    - role: customer
+  arguments:
+    - name: status
+      type: String!
+  steps:
+    - name: order
+      delete:
+        table:
+          schema: public
+          name: orders
+        where:
+          status: {arg: status}
+        returning: [id]
+  result:
+    order_id: {step: order, column: id}
