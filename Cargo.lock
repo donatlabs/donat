@@ -744,6 +744,7 @@ dependencies = [
  "donat-schema",
  "graphql-parser",
  "insta",
+ "postgres",
  "serde_json",
 ]
 

@@ -1351,6 +1351,13 @@ fn validate_idempotency(
                         "idempotency scope must be scalar and cannot use object or list arguments",
                     ));
                 }
+                if matches!(&type_, StaticType::Scalar(name) if matches!(name.as_str(), "json" | "jsonb"))
+                {
+                    return Err(PlanError::validation(
+                        path,
+                        "idempotency scope must not use json or jsonb arguments",
+                    ));
+                }
             }
             CommandIdempotencyScope::SessionVariable { session_variable } => {
                 if secret_looking(session_variable) {
@@ -1399,11 +1406,28 @@ fn validate_idempotency_key(
     path: &str,
 ) -> Result<(), PlanError> {
     let CommandIdempotencyKey::Argument { argument } = key;
+    let declared = command
+        .arguments
+        .iter()
+        .find(|candidate| candidate.name == *argument)
+        .ok_or_else(|| PlanError::validation(path, format!("unknown argument '{argument}'")))?;
     let type_ = command_argument_type_by_name(metadata, command, argument, path)?;
     if !type_.is_scalar() {
         return Err(PlanError::validation(
             path,
             "idempotency key must be a declared scalar argument",
+        ));
+    }
+    if matches!(&type_, StaticType::Scalar(name) if matches!(name.as_str(), "json" | "jsonb")) {
+        return Err(PlanError::validation(
+            path,
+            "idempotency key must not use a json or jsonb argument",
+        ));
+    }
+    if !declared.type_.ends_with('!') {
+        return Err(PlanError::validation(
+            path,
+            "idempotency key must be a required scalar argument",
         ));
     }
     Ok(())

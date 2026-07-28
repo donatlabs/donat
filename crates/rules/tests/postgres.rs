@@ -60,6 +60,26 @@ fn typed_columns(bindings: &BTreeMap<String, RuleType>) -> SqlBindings {
 }
 
 #[test]
+fn lowerer_accepts_an_escaped_scalar_subquery_binding() {
+    let bindings = map([("prior", RuleType::Int)]);
+    let rule = compiled_rule(bindings, "prior > 0");
+    let sql = lower_postgres(
+        &rule,
+        &SqlBindings::new([(
+            "prior".to_owned(),
+            SqlBinding::expression(SqlExpression::scalar_subquery(
+                "prior step",
+                "total value",
+                RuleType::Int,
+            )),
+        )]),
+    )
+    .expect("a closed previous-step scalar binding lowers safely");
+
+    assert!(sql.contains("(SELECT \"total value\" FROM \"prior step\" LIMIT 1)"));
+}
+
+#[test]
 fn lowerer_parenthesizes_scalar_comparisons_and_arithmetic() {
     let bindings = map([
         ("amount", RuleType::Int),

@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, RelationKind, TableInfo};
-use donat_ir::{CommandExecutionStep, CommandExecutionValue, MutationRoot, Scalar};
+use donat_ir::{
+    CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar,
+};
 use donat_metadata::{Metadata, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
@@ -484,6 +486,7 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
         "scope": [{ "session_variable": "x-donat-user-id" }],
         "retention": "30d"
     });
+    command["result"]["order"] = json!({ "step": "order" });
     let mut metadata = metadata(vec![command]);
     metadata.sources[0].tables[0].insert_permissions[0]
         .permission
@@ -503,7 +506,7 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
                 status: "new"
                 quantity: 1
                 request_id: "550e8400-e29b-41d4-a716-446655440002"
-              ) { order: order_id }
+              ) { order: order_id order_row: order { id status } }
             }
         "#,
     )
@@ -530,10 +533,25 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
                 && pg_type == "uuid"
     ));
     assert!(check.is_some(), "the explicit role's insert check is in IR");
+    let order = command
+        .result
+        .iter()
+        .find(|field| field.name == "order")
+        .expect("the declared row result is resolved");
+    assert!(matches!(
+        &order.value,
+        CommandResultValue::StepRow { columns, .. }
+            if columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>()
+                == ["id", "customer_id", "status", "quantity"]
+    ));
     assert_eq!(command.guards.len(), 1);
     assert!(
         !command.guards[0].sql.is_empty(),
         "the planner lowers a compiled rule instead of carrying its name/source"
+    );
+    assert_eq!(
+        command.guards[0].error_path, "$.selectionSet.create_order",
+        "runtime command rejections use the GraphQL command-field path, not a planner-internal path"
     );
     let idempotency = command
         .idempotency
@@ -1195,6 +1213,30 @@ fn rejects_non_scalar_idempotency_scope_and_non_postgres_command_sources() {
         "scope": [{ "argument": "items" }]
     });
     assert_rejected(invalid_scope, "idempotency scope must be scalar");
+
+    let mut mutable_scope = valid_command();
+    mutable_scope["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .push(json!({ "name": "payload", "type": "jsonb!" }));
+    mutable_scope["idempotency"] = json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "argument": "payload" }]
+    });
+    assert_rejected(
+        mutable_scope,
+        "idempotency scope must not use json or jsonb",
+    );
+
+    let mut nullable_key = valid_command();
+    nullable_key["arguments"]
+        .as_array_mut()
+        .expect("arguments array")[4]["type"] = json!("uuid");
+    nullable_key["idempotency"] = json!({ "key": { "argument": "request_id" } });
+    assert_rejected(
+        nullable_key,
+        "idempotency key must be a required scalar argument",
+    );
 
     for retention in ["30", "0d", "1w", "999999999999999999999999999999999999d"] {
         let mut invalid_retention = valid_command();

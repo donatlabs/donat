@@ -232,11 +232,19 @@ renderer requires; ADR 005 records this boundary.
 - [ ] Render command steps as named CTEs with quoted identifiers and existing
   strict literal helpers. Use the typed rule SQL lowering from `donat-rules`.
   A failed `assert` calls `donat.raise_graphql_error`; a missing `select_one`
-  does the same with its declared path.
+  does the same with its declared path. Render each resolved `insert_many`
+  item as a named one-statement CTE and assemble its result with an explicit
+  private ordinal; never rely on PostgreSQL's unspecified `RETURNING` row
+  order for the public list order.
 - [ ] For idempotent commands, compute a canonical input/scope fingerprint,
-  lock or insert the invocation row within the same statement, return its
-  stored result on exact replay, and raise `validation-failed` if the key is
-  reused with different canonical input. Store final root JSON once.
+  elect one executor and store/replay the invocation within the same statement.
+  V3 `donat.command_invocations` remains the canonical fingerprint/result
+  journal; V4 `donat.command_invocation_claims` owns only the compound-key
+  first-executor election because Postgres data-modifying CTEs cannot reliably
+  update a row inserted by an earlier CTE in the same statement. Return V3's
+  stored result on exact replay, reclaim an expired compound key safely, and
+  raise `validation-failed` if the active key is reused with different canonical
+  input. Store final root JSON once. See ADR 006.
 - [ ] Preserve `CommandEffect::StartProcess` and `CommandEffect::SignalProcess`
   as typed IR variants with only the Task 2 command-side validation, but leave
   them non-executable in this core slice. Their target-process compatibility

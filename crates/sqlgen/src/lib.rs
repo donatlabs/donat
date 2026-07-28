@@ -999,6 +999,716 @@ fn geometry_sql(value: &Scalar, pg_type: &str) -> String {
 /// computes the GraphQL value of the field as a single `json` column named
 /// `root`. Permission check expressions are enforced in-statement via
 /// `donat.check_violation(...)`, which raises SQLSTATE 23514.
+fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
+    assert!(
+        matches!(ctx.dialect, donat_backend::AnyDialect::Postgres(_)),
+        "commands have only a Postgres renderer"
+    );
+    assert!(
+        command.effects.is_empty(),
+        "command effects must be rejected before SQL generation until the process outbox renderer exists"
+    );
+
+    let mut ctes = Vec::new();
+    let (execution_gate, invocation) = match &command.idempotency {
+        Some(idempotency) => {
+            let scope = command_canonical_json_array(&idempotency.scope);
+            let scope_hash = command_hash(&scope);
+            let input = command_jsonb_literal(&idempotency.input);
+            let input_hash = command_hash(&input);
+            let key = command_key_text(&idempotency.key);
+            let expires_at = idempotency
+                .retention_seconds
+                .map(|seconds| format!("statement_timestamp() + {} * interval '1 second'", seconds))
+                .unwrap_or_else(|| "'infinity'::timestamptz".to_owned());
+            ctes.push(format!(
+                "{cte} AS (INSERT INTO {schema}.{table} AS {target} ({command_name}, {scope_hash_col}, {key_col}, {claim_state}, {expires_at_col}) VALUES ({name}, {scope_hash}, {key}, 'first', {expires_at}) ON CONFLICT ({command_name}, {scope_hash_col}, {key_col}) DO UPDATE SET {claim_state} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN 'first' ELSE 'replay' END, {expires_at_col} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN EXCLUDED.{expires_at_col} ELSE {target}.{expires_at_col} END RETURNING {command_name}, {scope_hash_col}, {key_col}, {claim_state})",
+                cte = quote_ident("_cmd_claim"),
+                schema = quote_ident("donat"),
+                table = quote_ident("command_invocation_claims"),
+                target = quote_ident("_cmd_claim_target"),
+                command_name = quote_ident("command_name"),
+                scope_hash_col = quote_ident("scope_hash"),
+                key_col = quote_ident("key"),
+                claim_state = quote_ident("claim_state"),
+                expires_at_col = quote_ident("expires_at"),
+                name = quote_lit(&command.name),
+            ));
+            (
+                format!(
+                    "EXISTS (SELECT 1 FROM {claim} WHERE {claim_state} = 'first')",
+                    claim = quote_ident("_cmd_claim"),
+                    claim_state = quote_ident("claim_state"),
+                ),
+                Some(CommandInvocationSql {
+                    input_hash,
+                    error_path: idempotency.error_path.clone(),
+                    expires_at,
+                }),
+            )
+        }
+        None => ("TRUE".to_owned(), None),
+    };
+
+    for step in &command.steps {
+        if let Some(cte) = command_step_cte(ctx, step, &execution_gate) {
+            ctes.push(cte);
+        }
+    }
+
+    let result = command_full_result_json(ctx, command);
+    ctes.push(format!(
+        "{cte} AS (SELECT ({result})::jsonb AS {column})",
+        cte = quote_ident("_cmd_result"),
+        column = quote_ident("result"),
+    ));
+
+    let result_source = match &invocation {
+        Some(invocation) => {
+            ctes.push(format!(
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, {result_cte}.{result_col}, 'succeeded', {expires_at} FROM {claim} CROSS JOIN {result_cte} WHERE {claim}.{claim_state} = 'first' ON CONFLICT ({command_name}, {scope_hash}, {key}) DO UPDATE SET {input_fingerprint} = EXCLUDED.{input_fingerprint}, {result_col} = EXCLUDED.{result_col}, {status} = EXCLUDED.{status}, {expires_at_col} = EXCLUDED.{expires_at_col} RETURNING {result_col}, {input_fingerprint})",
+                cte = quote_ident("_cmd_store_first"),
+                schema = quote_ident("donat"),
+                table = quote_ident("command_invocations"),
+                result_col = quote_ident("result"),
+                status = quote_ident("status"),
+                result_cte = quote_ident("_cmd_result"),
+                claim = quote_ident("_cmd_claim"),
+                command_name = quote_ident("command_name"),
+                scope_hash = quote_ident("scope_hash"),
+                key = quote_ident("key"),
+                input_fingerprint = quote_ident("input_fingerprint"),
+                input_hash = invocation.input_hash,
+                claim_state = quote_ident("claim_state"),
+                expires_at_col = quote_ident("expires_at"),
+                expires_at = invocation.expires_at,
+            ));
+            ctes.push(format!(
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, 'null'::jsonb, 'succeeded', {expires_at} FROM {claim} WHERE {claim}.{claim_state} = 'replay' ON CONFLICT ({command_name}, {scope_hash}, {key}) DO UPDATE SET {key} = EXCLUDED.{key} RETURNING {result_col}, {input_fingerprint})",
+                cte = quote_ident("_cmd_store_replay"),
+                schema = quote_ident("donat"),
+                table = quote_ident("command_invocations"),
+                command_name = quote_ident("command_name"),
+                scope_hash = quote_ident("scope_hash"),
+                key = quote_ident("key"),
+                input_fingerprint = quote_ident("input_fingerprint"),
+                input_hash = invocation.input_hash,
+                result_col = quote_ident("result"),
+                status = quote_ident("status"),
+                expires_at_col = quote_ident("expires_at"),
+                expires_at = invocation.expires_at,
+                claim = quote_ident("_cmd_claim"),
+                claim_state = quote_ident("claim_state"),
+            ));
+            ctes.push(format!(
+                "{cte} AS (SELECT {result_col}, {input_fingerprint} FROM {store_first} UNION ALL SELECT {result_col}, {input_fingerprint} FROM {store_replay})",
+                cte = quote_ident("_cmd_invocation"),
+                result_col = quote_ident("result"),
+                input_fingerprint = quote_ident("input_fingerprint"),
+                store_first = quote_ident("_cmd_store_first"),
+                store_replay = quote_ident("_cmd_store_replay"),
+            ));
+            format!(
+                "(SELECT {result} FROM {invocation})",
+                result = quote_ident("result"),
+                invocation = quote_ident("_cmd_invocation"),
+            )
+        }
+        None => format!(
+            "(SELECT {result} FROM {cte})",
+            result = quote_ident("result"),
+            cte = quote_ident("_cmd_result"),
+        ),
+    };
+
+    let guarded_result = command_rejections(
+        ctx,
+        command,
+        &execution_gate,
+        invocation.as_ref(),
+        result_source,
+    );
+    ctes.push(format!(
+        "{cte} AS (SELECT ({guarded_result})::jsonb AS {result})",
+        cte = quote_ident("_cmd_checked"),
+        result = quote_ident("result"),
+    ));
+    let projected = command_project_result(
+        ctx,
+        &format!(
+            "(SELECT {result} FROM {cte})",
+            result = quote_ident("result"),
+            cte = quote_ident("_cmd_checked"),
+        ),
+        &command.selection,
+    );
+    format!("WITH {} SELECT {projected} AS root", ctes.join(", "))
+}
+
+struct CommandInvocationSql {
+    input_hash: String,
+    error_path: String,
+    expires_at: String,
+}
+
+fn command_step_cte(
+    ctx: &mut Ctx,
+    step: &CommandExecutionStep,
+    execution_gate: &str,
+) -> Option<String> {
+    match step {
+        CommandExecutionStep::Assert { .. } => None,
+        CommandExecutionStep::SelectOne {
+            cte,
+            table,
+            by,
+            returning,
+            filter,
+            ..
+        } => {
+            let alias = "_cmd_target";
+            let mut predicates = command_predicates(ctx, by, alias);
+            if let Some(filter) = filter {
+                predicates.push(ctx.bool_exp(filter, alias, alias));
+            }
+            predicates.push(execution_gate.to_owned());
+            let selected = command_returning_columns(returning, alias);
+            Some(format!(
+                "{cte} AS (SELECT {selected} FROM {table} AS {alias} WHERE {predicate} LIMIT 1)",
+                cte = quote_ident(cte),
+                table = command_table_sql(table),
+                alias = quote_ident(alias),
+                predicate = predicates.join(" AND "),
+            ))
+        }
+        CommandExecutionStep::Insert {
+            cte, table, object, ..
+        } => {
+            let columns: Vec<String> = object
+                .iter()
+                .map(|assignment| quote_ident(&assignment.column.name))
+                .collect();
+            let values: Vec<String> = object
+                .iter()
+                .map(|assignment| command_value_sql(ctx, &assignment.value))
+                .collect();
+            Some(format!(
+                "{cte} AS (INSERT INTO {table} ({columns}) SELECT {values} WHERE {execution_gate} RETURNING *)",
+                cte = quote_ident(cte),
+                table = command_table_sql(table),
+                columns = columns.join(", "),
+                values = values.join(", "),
+            ))
+        }
+        CommandExecutionStep::InsertMany {
+            cte,
+            table,
+            items,
+            object,
+            ..
+        } => {
+            let columns: Vec<String> = object
+                .iter()
+                .map(|assignment| quote_ident(&assignment.column.name))
+                .collect();
+            let item_rows = items
+                .as_json()
+                .as_array()
+                .expect("validated insert_many items must be a JSON array");
+            let mut item_ctes = item_rows
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let item = item
+                        .as_object()
+                        .expect("validated insert_many items must be JSON objects");
+                    let values = object
+                        .iter()
+                        .map(|assignment| command_value_sql_for_item(ctx, &assignment.value, item))
+                        .collect::<Vec<_>>();
+                    let item_cte = format!("{cte}_item_{index}");
+                    format!(
+                        "{item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} WHERE {execution_gate} RETURNING *)",
+                        item_cte = quote_ident(&item_cte),
+                        table = command_table_sql(table),
+                        columns = columns.join(", "),
+                        values = values.join(", "),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if item_ctes.is_empty() {
+                let values = object
+                    .iter()
+                    .map(|assignment| {
+                        command_value_sql_for_item(ctx, &assignment.value, &serde_json::Map::new())
+                    })
+                    .collect::<Vec<_>>();
+                let empty_item_cte = format!("{cte}_item_empty");
+                Some(format!(
+                    "{empty_item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} WHERE FALSE RETURNING *), {cte} AS (SELECT 0::bigint AS {ordinal}, {empty_item_cte}.* FROM {empty_item_cte} WHERE FALSE)",
+                    empty_item_cte = quote_ident(&empty_item_cte),
+                    table = command_table_sql(table),
+                    columns = columns.join(", "),
+                    values = values.join(", "),
+                    cte = quote_ident(cte),
+                    ordinal = quote_ident("_cmd_ordinal"),
+                ))
+            } else {
+                let ordered_rows = item_ctes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        let item_cte = format!("{cte}_item_{index}");
+                        format!(
+                            "SELECT {ordinal}::bigint AS {ordinal_column}, {item_cte}.* FROM {item_cte}",
+                            ordinal = index + 1,
+                            ordinal_column = quote_ident("_cmd_ordinal"),
+                            item_cte = quote_ident(&item_cte),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                item_ctes.push(format!(
+                    "{cte} AS ({ordered_rows})",
+                    cte = quote_ident(cte),
+                    ordered_rows = ordered_rows.join(" UNION ALL "),
+                ));
+                Some(item_ctes.join(", "))
+            }
+        }
+        CommandExecutionStep::Update {
+            cte,
+            table,
+            predicate,
+            set,
+            filter,
+            ..
+        } => {
+            let alias = "_cmd_target";
+            let sets: Vec<String> = set
+                .iter()
+                .map(|assignment| {
+                    format!(
+                        "{} = {}",
+                        quote_ident(&assignment.column.name),
+                        command_value_sql(ctx, &assignment.value)
+                    )
+                })
+                .collect();
+            let mut predicates = command_predicates(ctx, predicate, alias);
+            if let Some(filter) = filter {
+                predicates.push(ctx.bool_exp(filter, alias, alias));
+            }
+            predicates.push(execution_gate.to_owned());
+            Some(format!(
+                "{cte} AS (UPDATE {table} AS {alias} SET {sets} WHERE {predicate} RETURNING *)",
+                cte = quote_ident(cte),
+                table = command_table_sql(table),
+                alias = quote_ident(alias),
+                sets = sets.join(", "),
+                predicate = predicates.join(" AND "),
+            ))
+        }
+        CommandExecutionStep::Delete {
+            cte,
+            table,
+            predicate,
+            filter,
+            ..
+        } => {
+            let alias = "_cmd_target";
+            let mut predicates = command_predicates(ctx, predicate, alias);
+            if let Some(filter) = filter {
+                predicates.push(ctx.bool_exp(filter, alias, alias));
+            }
+            predicates.push(execution_gate.to_owned());
+            Some(format!(
+                "{cte} AS (DELETE FROM {table} AS {alias} WHERE {predicate} RETURNING *)",
+                cte = quote_ident(cte),
+                table = command_table_sql(table),
+                alias = quote_ident(alias),
+                predicate = predicates.join(" AND "),
+            ))
+        }
+    }
+}
+
+fn command_table_sql(table: &Table) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(&table.schema),
+        quote_ident(&table.name)
+    )
+}
+
+fn command_returning_columns(columns: &[CommandColumn], alias: &str) -> String {
+    if columns.is_empty() {
+        "1 AS \"_cmd_exists\"".to_owned()
+    } else {
+        columns
+            .iter()
+            .map(|column| qualified(alias, &column.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn command_predicates(
+    ctx: &mut Ctx,
+    assignments: &[CommandAssignment],
+    alias: &str,
+) -> Vec<String> {
+    assignments
+        .iter()
+        .map(|assignment| {
+            format!(
+                "{} = {}",
+                qualified(alias, &assignment.column.name),
+                command_value_sql(ctx, &assignment.value)
+            )
+        })
+        .collect()
+}
+
+fn command_value_sql(ctx: &mut Ctx, value: &CommandExecutionValue) -> String {
+    match value {
+        CommandExecutionValue::Scalar { value, pg_type } => {
+            scalar_sql(&ctx.dialect, value, pg_type)
+        }
+        CommandExecutionValue::StepColumn { cte, column } => format!(
+            "(SELECT {} FROM {} LIMIT 1)",
+            quote_ident(&column.name),
+            quote_ident(cte),
+        ),
+        CommandExecutionValue::Item { field, .. } => qualified("_cmd_item", field),
+        CommandExecutionValue::Rule { sql, pg_type } => {
+            format!("({sql})::{}", quote_ident(pg_type))
+        }
+    }
+}
+
+fn command_value_sql_for_item(
+    ctx: &mut Ctx,
+    value: &CommandExecutionValue,
+    item: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    match value {
+        CommandExecutionValue::Item { field, pg_type } => {
+            let value = item.get(field).cloned().unwrap_or(serde_json::Value::Null);
+            scalar_sql(&ctx.dialect, &Scalar::Json(value), pg_type)
+        }
+        _ => command_value_sql(ctx, value),
+    }
+}
+
+fn command_full_result_json(ctx: &mut Ctx, command: &CommandMutation) -> String {
+    let pairs = command
+        .result
+        .iter()
+        .map(|field| {
+            (
+                field.name.clone(),
+                command_result_value_sql(ctx, &field.value),
+            )
+        })
+        .collect::<Vec<_>>();
+    json_object(&ctx.dialect, &pairs)
+}
+
+fn command_result_value_sql(ctx: &mut Ctx, value: &CommandResultValue) -> String {
+    match value {
+        CommandResultValue::StepRow { cte, many, columns } => {
+            let row = command_row_json(ctx, columns, cte);
+            if *many {
+                // Only `insert_many` has a row result in the command IR. Its
+                // renderer exposes this private ordinal alongside the declared
+                // returning columns, so the JSON contract does not depend on
+                // PostgreSQL's unspecified `RETURNING` row order.
+                let order = qualified(cte, "_cmd_ordinal");
+                format!(
+                    "(SELECT {} FROM {})",
+                    json_array_agg(&ctx.dialect, &row, Some(&order)),
+                    quote_ident(cte),
+                )
+            } else {
+                format!("(SELECT {row} FROM {} LIMIT 1)", quote_ident(cte))
+            }
+        }
+        CommandResultValue::StepColumn { cte, column } => format!(
+            "(SELECT {} FROM {} LIMIT 1)",
+            ctx.column_output(cte, &column.name, &column.pg_type),
+            quote_ident(cte),
+        ),
+        CommandResultValue::Scalar { value, pg_type } => scalar_sql(&ctx.dialect, value, pg_type),
+    }
+}
+
+fn command_row_json(ctx: &mut Ctx, columns: &[CommandColumn], alias: &str) -> String {
+    let pairs = columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                ctx.column_output(alias, &column.name, &column.pg_type),
+            )
+        })
+        .collect::<Vec<_>>();
+    json_object(&ctx.dialect, &pairs)
+}
+
+fn command_rejections(
+    ctx: &mut Ctx,
+    command: &CommandMutation,
+    execution_gate: &str,
+    invocation: Option<&CommandInvocationSql>,
+    result: String,
+) -> String {
+    let mut guarded = result;
+    for rejection in command_rejection_checks(ctx, command).into_iter().rev() {
+        guarded = match rejection {
+            CommandRejection::Business {
+                condition,
+                path,
+                message,
+            } => format!(
+                "CASE WHEN ({execution_gate}) AND ({condition}) THEN donat.raise_graphql_error('validation-failed', {path}, {message}) ELSE {guarded} END",
+                path = quote_lit(&path),
+                message = quote_lit(&message),
+            ),
+            CommandRejection::Permission { condition, path } => {
+                let payload = serde_json::json!({
+                    "path": path,
+                    "message": "check constraint of an insert/update permission has failed",
+                })
+                .to_string();
+                format!(
+                    "CASE WHEN ({execution_gate}) AND ({condition}) THEN donat.check_violation({})::jsonb ELSE {guarded} END",
+                    quote_lit(&payload),
+                )
+            }
+        };
+    }
+    if let Some(invocation) = invocation {
+        guarded = format!(
+            "CASE WHEN NOT EXISTS (SELECT 1 FROM {cte} WHERE {fingerprint} = {input_hash}) THEN donat.raise_graphql_error('validation-failed', {path}, 'idempotency key was reused with different input') ELSE {guarded} END",
+            cte = quote_ident("_cmd_invocation"),
+            fingerprint = quote_ident("input_fingerprint"),
+            input_hash = invocation.input_hash,
+            path = quote_lit(&invocation.error_path),
+        );
+    }
+    guarded
+}
+
+enum CommandRejection {
+    Business {
+        condition: String,
+        path: String,
+        message: String,
+    },
+    Permission {
+        condition: String,
+        path: String,
+    },
+}
+
+fn command_rejection_checks(ctx: &mut Ctx, command: &CommandMutation) -> Vec<CommandRejection> {
+    let mut checks = command
+        .guards
+        .iter()
+        .map(|rule| CommandRejection::Business {
+            condition: format!("({}) IS NOT TRUE", rule.sql),
+            path: rule.error_path.clone(),
+            message: rule.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    for step in &command.steps {
+        match step {
+            CommandExecutionStep::Assert { name: _, rule } => {
+                checks.push(CommandRejection::Business {
+                    condition: format!("({}) IS NOT TRUE", rule.sql),
+                    path: rule.error_path.clone(),
+                    message: rule.message.clone(),
+                })
+            }
+            CommandExecutionStep::SelectOne {
+                name,
+                cte,
+                require_found,
+                error_path,
+                ..
+            } if *require_found => checks.push(CommandRejection::Business {
+                condition: format!("(SELECT count(*) FROM {}) = 0", quote_ident(cte)),
+                path: error_path.clone(),
+                message: format!("command select_one step '{name}' did not find a row"),
+            }),
+            CommandExecutionStep::Insert {
+                cte,
+                check,
+                error_path,
+                ..
+            }
+            | CommandExecutionStep::InsertMany {
+                cte,
+                check,
+                error_path,
+                ..
+            }
+            | CommandExecutionStep::Update {
+                cte,
+                check,
+                error_path,
+                ..
+            } => {
+                if let Some(check) = check {
+                    checks.push(CommandRejection::Permission {
+                        condition: format!(
+                            "(SELECT count(*) FROM {} WHERE ({}) IS NOT TRUE) > 0",
+                            quote_ident(cte),
+                            ctx.bool_exp(check, cte, cte),
+                        ),
+                        path: error_path.clone(),
+                    });
+                }
+                if let CommandExecutionStep::InsertMany {
+                    allow_empty: false,
+                    name,
+                    ..
+                } = step
+                {
+                    checks.push(CommandRejection::Business {
+                        condition: format!("(SELECT count(*) FROM {}) = 0", quote_ident(cte)),
+                        path: error_path.clone(),
+                        message: format!(
+                            "command insert_many step '{name}' requires at least one item"
+                        ),
+                    });
+                }
+                if let CommandExecutionStep::Update {
+                    require_affected: true,
+                    name,
+                    ..
+                } = step
+                {
+                    checks.push(CommandRejection::Business {
+                        condition: format!("(SELECT count(*) FROM {}) = 0", quote_ident(cte)),
+                        path: error_path.clone(),
+                        message: format!("command update step '{name}' did not affect a row"),
+                    });
+                }
+            }
+            CommandExecutionStep::Delete {
+                cte,
+                require_affected: true,
+                error_path,
+                name,
+                ..
+            } => checks.push(CommandRejection::Business {
+                condition: format!("(SELECT count(*) FROM {}) = 0", quote_ident(cte)),
+                path: error_path.clone(),
+                message: format!("command delete step '{name}' did not affect a row"),
+            }),
+            _ => {}
+        }
+    }
+    checks
+}
+
+fn command_project_result(
+    ctx: &mut Ctx,
+    result: &str,
+    selection: &[CommandResultSelection],
+) -> String {
+    if selection.is_empty() {
+        // GraphQL normally requires a command selection set, but retaining a
+        // dependency here makes every command rejection and journal update
+        // observable even for a deliberately minimal IR fixture.
+        return format!(
+            "CASE WHEN ({result}) IS NULL THEN json_build_object() ELSE json_build_object() END"
+        );
+    }
+    let pairs = selection
+        .iter()
+        .map(|selected| command_project_selection(ctx, result, selected))
+        .collect::<Vec<_>>();
+    json_object(&ctx.dialect, &pairs)
+}
+
+fn command_project_selection(
+    ctx: &mut Ctx,
+    result: &str,
+    selection: &CommandResultSelection,
+) -> (String, String) {
+    match selection {
+        CommandResultSelection::Scalar { alias, field } => {
+            (alias.clone(), format!("({result} -> {})", quote_lit(field)))
+        }
+        CommandResultSelection::Object {
+            alias,
+            field,
+            selections,
+        } => {
+            let value = format!("({result} -> {})", quote_lit(field));
+            (
+                alias.clone(),
+                command_project_object(ctx, &value, selections),
+            )
+        }
+        CommandResultSelection::List {
+            alias,
+            field,
+            selections,
+        } => {
+            let value = format!("({result} -> {})", quote_lit(field));
+            (alias.clone(), command_project_list(ctx, &value, selections))
+        }
+        CommandResultSelection::Typename { alias, value } => {
+            (alias.clone(), typename_literal(&ctx.dialect, value))
+        }
+    }
+}
+
+fn command_project_object(
+    ctx: &mut Ctx,
+    value: &str,
+    selections: &[CommandResultSelection],
+) -> String {
+    let projected = command_project_result(ctx, value, selections);
+    format!(
+        "CASE WHEN {value} IS NULL OR {value} = 'null'::jsonb THEN 'null'::jsonb ELSE ({projected})::jsonb END"
+    )
+}
+
+fn command_project_list(
+    ctx: &mut Ctx,
+    value: &str,
+    selections: &[CommandResultSelection],
+) -> String {
+    let alias = ctx.alias();
+    let item = qualified(&alias, "value");
+    let projected = command_project_object(ctx, &item, selections);
+    format!(
+        "(SELECT coalesce(jsonb_agg({projected}), '[]'::jsonb) FROM jsonb_array_elements(CASE WHEN jsonb_typeof({value}) = 'array' THEN {value} ELSE '[]'::jsonb END) AS {alias}(value))",
+        alias = quote_ident(&alias),
+    )
+}
+
+fn command_jsonb_literal(value: &Scalar) -> String {
+    format!("({})::jsonb", quote_lit(&value.as_json().to_string()))
+}
+
+fn command_canonical_json_array(values: &[Scalar]) -> String {
+    let values = values.iter().map(command_jsonb_literal).collect::<Vec<_>>();
+    format!("jsonb_build_array({})", values.join(", "))
+}
+
+fn command_hash(json: &str) -> String {
+    format!("decode(md5(({json})::text), 'hex')")
+}
+
+fn command_key_text(value: &Scalar) -> String {
+    format!("({} #>> '{{}}')", command_jsonb_literal(value))
+}
+
 pub fn mutation_to_sql(root: &MutationRoot) -> String {
     mutation_to_sql_opts(root, false)
 }
@@ -1029,9 +1739,7 @@ fn mutation_to_sql_full(
     };
     let dialect = ctx.dialect;
     match root {
-        MutationRoot::Command { .. } => {
-            panic!("command mutations require the Task 5 Postgres command renderer")
-        }
+        MutationRoot::Command { command, .. } => command_to_sql(&mut ctx, command),
         MutationRoot::Typename { value, .. } => {
             format!("SELECT {}::text AS root", quote_lit(value))
         }

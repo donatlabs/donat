@@ -120,14 +120,37 @@ fn assemble_multi_source_response(
     Json::Object(ordered)
 }
 
-fn command_execution_not_ready(roots: &[donat_ir::MutationRoot]) -> Option<Json> {
+/// Effects have no Task 5 outbox renderer. Reject them before opening a
+/// transaction or asking SQLgen for a command statement, so no journal or
+/// domain-data CTE can run without its declared durable side effect.
+fn command_execution_rejection(roots: &[donat_ir::MutationRoot]) -> Option<Json> {
+    roots
+        .iter()
+        .any(|root| {
+            matches!(
+                root,
+                donat_ir::MutationRoot::Command { command, .. } if !command.effects.is_empty()
+            )
+        })
+        .then(|| {
+            error_json(
+                "unexpected",
+                "command effects are not executable until the durable process outbox renderer is installed",
+            )
+        })
+}
+
+/// A planner should never put a command on a non-Postgres source, but this
+/// transport-side guard keeps manually constructed or future IR from reaching
+/// a backend renderer that has no command semantics.
+fn command_backend_rejection(roots: &[donat_ir::MutationRoot], backend: &str) -> Option<Json> {
     roots
         .iter()
         .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }))
         .then(|| {
             error_json(
                 "unexpected",
-                "command execution is not implemented until the Postgres command renderer is installed",
+                format!("commands require a Postgres source and cannot execute on {backend}"),
             )
         })
 }
@@ -802,7 +825,7 @@ async fn execute_parsed_full(
             roots,
             response,
         } => {
-            if let Some(error) = command_execution_not_ready(&roots) {
+            if let Some(error) = command_execution_rejection(&roots) {
                 return ok(error);
             }
             let Some(source) = source else {
@@ -818,6 +841,9 @@ async fn execute_parsed_full(
             };
             let pool = match runtime {
                 SourceRuntime::Sqlite { pool, settings, .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "SQLite") {
+                        return ok(error);
+                    }
                     drop(engine);
                     return match state
                         .execute_sqlite_mutations_at(pool, settings, &roots)
@@ -835,6 +861,9 @@ async fn execute_parsed_full(
                     settings,
                     ..
                 } => {
+                    if let Some(error) = command_backend_rejection(&roots, "MySQL") {
+                        return ok(error);
+                    }
                     let Some(catalog) = engine.catalogs.get(&source) else {
                         return ok(error_json(
                             "unexpected",
@@ -873,6 +902,9 @@ async fn execute_parsed_full(
                     };
                 }
                 SourceRuntime::Clickhouse { .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "ClickHouse") {
+                        return ok(error);
+                    }
                     return ok(error_json(
                         "unexpected",
                         format!("mutations are not supported for source '{source}'"),
@@ -1858,7 +1890,33 @@ mod tests {
     }
 
     #[test]
-    fn command_roots_fail_closed_before_sql_generation() {
+    fn effect_bearing_command_roots_fail_closed_before_sql_generation() {
+        let roots = vec![donat_ir::MutationRoot::Command {
+            alias: "submitted".to_string(),
+            command: donat_ir::CommandMutation {
+                name: "create_order".to_string(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: None,
+                effects: vec![donat_ir::CommandEffectKind::StartProcess],
+                selection: vec![],
+            },
+        }];
+
+        let error = command_execution_rejection(&roots)
+            .expect("effects stop before any command SQL can be generated");
+        assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
+        assert!(
+            error["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("effects are not executable")),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn command_roots_fail_closed_before_non_postgres_execution() {
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
             command: donat_ir::CommandMutation {
@@ -1872,13 +1930,13 @@ mod tests {
             },
         }];
 
-        let error = command_execution_not_ready(&roots)
-            .expect("Task 3 command roots stop before the absent SQL renderer");
+        let error = command_backend_rejection(&roots, "SQLite")
+            .expect("a command must never reach a non-Postgres executor");
         assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
         assert!(
             error["errors"][0]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("not implemented")),
+                .is_some_and(|message| message.contains("require a Postgres source")),
             "unexpected error: {error:#}"
         );
     }

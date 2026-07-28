@@ -546,9 +546,20 @@ pub struct CommandResultField {
 /// Closed source for a declared result field.
 #[derive(Debug, Clone, Serialize)]
 pub enum CommandResultValue {
-    StepRow { cte: String, many: bool },
-    StepColumn { cte: String, column: CommandColumn },
-    Scalar { value: Scalar, pg_type: String },
+    StepRow {
+        cte: String,
+        many: bool,
+        /// Fixed declared `returning` columns used for the canonical result.
+        columns: Vec<CommandColumn>,
+    },
+    StepColumn {
+        cte: String,
+        column: CommandColumn,
+    },
+    Scalar {
+        value: Scalar,
+        pg_type: String,
+    },
 }
 
 /// Inputs that are already resolved before SQLgen computes an idempotency

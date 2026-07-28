@@ -24,6 +24,7 @@ use crate::plan::{
 struct ResolvedCommandStep {
     cte: String,
     columns: BTreeMap<String, CommandColumn>,
+    returning: Vec<CommandColumn>,
     many: bool,
 }
 
@@ -200,6 +201,7 @@ impl<'a> Planner<'a> {
                 &resolved_steps,
                 session,
                 &step_path,
+                path,
             )?;
             steps.push(resolved);
             resolved_steps.insert(step.name.clone(), output);
@@ -217,7 +219,8 @@ impl<'a> Planner<'a> {
                     &arguments,
                     &resolved_steps,
                     None,
-                    format!("{path}.guards[{index}]"),
+                    &format!("{path}.guards[{index}]"),
+                    path.to_owned(),
                     guard
                         .message
                         .clone()
@@ -274,6 +277,7 @@ impl<'a> Planner<'a> {
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         session: &Session,
         path: &str,
+        error_path: &str,
     ) -> Result<(CommandExecutionStep, ResolvedCommandStep), PlanError> {
         let output = |cte: String, columns: &[CommandColumn], many| ResolvedCommandStep {
             cte,
@@ -282,6 +286,7 @@ impl<'a> Planner<'a> {
                 .cloned()
                 .map(|column| (column.name.clone(), column))
                 .collect(),
+            returning: columns.to_vec(),
             many,
         };
         match &step.operation {
@@ -293,7 +298,8 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     None,
-                    path.to_owned(),
+                    path,
+                    error_path.to_owned(),
                     assert
                         .message
                         .clone()
@@ -307,6 +313,7 @@ impl<'a> Planner<'a> {
                     ResolvedCommandStep {
                         cte,
                         columns: BTreeMap::new(),
+                        returning: Vec::new(),
                         many: false,
                     },
                 ))
@@ -336,7 +343,7 @@ impl<'a> Planner<'a> {
                     returning: returning.clone(),
                     require_found: select_one.require_found,
                     filter,
-                    error_path: path.to_owned(),
+                    error_path: error_path.to_owned(),
                 };
                 Ok((resolved, output(cte, &returning, false)))
             }
@@ -379,7 +386,7 @@ impl<'a> Planner<'a> {
                     object,
                     returning: returning.clone(),
                     check,
-                    error_path: path.to_owned(),
+                    error_path: error_path.to_owned(),
                 };
                 Ok((resolved, output(cte, &returning, false)))
             }
@@ -440,7 +447,7 @@ impl<'a> Planner<'a> {
                     returning: returning.clone(),
                     allow_empty: insert_many.allow_empty,
                     check,
-                    error_path: path.to_owned(),
+                    error_path: error_path.to_owned(),
                 };
                 Ok((resolved, output(cte, &returning, true)))
             }
@@ -496,7 +503,7 @@ impl<'a> Planner<'a> {
                     require_affected: update.require_affected,
                     filter,
                     check,
-                    error_path: path.to_owned(),
+                    error_path: error_path.to_owned(),
                 };
                 Ok((resolved, output(cte, &returning, false)))
             }
@@ -530,7 +537,7 @@ impl<'a> Planner<'a> {
                     returning: returning.clone(),
                     require_affected: delete.require_affected,
                     filter,
-                    error_path: path.to_owned(),
+                    error_path: error_path.to_owned(),
                 };
                 Ok((resolved, output(cte, &returning, false)))
             }
@@ -690,6 +697,7 @@ impl<'a> Planner<'a> {
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         item: Option<&CommandItemContext>,
+        diagnostic_path: &str,
         error_path: String,
         message: String,
     ) -> Result<CommandRule, PlanError> {
@@ -700,7 +708,7 @@ impl<'a> Planner<'a> {
             arguments,
             previous_steps,
             item,
-            &error_path,
+            diagnostic_path,
         )?;
         Ok(CommandRule {
             sql: expression.into_sql(),
@@ -782,7 +790,7 @@ impl<'a> Planner<'a> {
                 let column = step.columns.get(column).ok_or_else(|| {
                     PlanError::validation(path, "command rule references an unresolved step column")
                 })?;
-                Ok(SqlBinding::expression(SqlExpression::column(
+                Ok(SqlBinding::expression(SqlExpression::scalar_subquery(
                     &step.cte,
                     &column.name,
                     expected_type.clone(),
@@ -840,6 +848,7 @@ impl<'a> Planner<'a> {
                 Ok(CommandResultValue::StepRow {
                     cte: step.cte.clone(),
                     many: step.many,
+                    columns: step.returning.clone(),
                 })
             }
             CommandValue::Step {

@@ -66,6 +66,21 @@ impl SqlExpression {
         }
     }
 
+    /// A typed scalar produced by a prior command CTE. Both identifiers are
+    /// escaped here, so callers still cannot inject a SQL fragment into Rule
+    /// lowering. `LIMIT 1` matches the command compiler's single-row source
+    /// requirement for scalar step references.
+    pub fn scalar_subquery(cte: &str, column: &str, type_: RuleType) -> Self {
+        Self {
+            sql: format!(
+                "(SELECT {} FROM {} LIMIT 1)",
+                donat_sqlgen::quote_ident(column),
+                donat_sqlgen::quote_ident(cte),
+            ),
+            type_,
+        }
+    }
+
     /// Consume a SQL expression that was constructed by this module. This is
     /// the planner-to-IR hand-off for an already compiled Rule; callers cannot
     /// construct a `SqlExpression` from arbitrary text.
