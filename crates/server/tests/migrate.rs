@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use donat_server::migrate::check_consistency;
+use donat_server::migrate::{check_consistency, run_migrate};
+use serde_json::{Value as Json, json};
 use tokio_postgres::NoTls;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -8,6 +10,57 @@ static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 fn pg_url() -> String {
     std::env::var("PG_URL")
         .unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_string())
+}
+
+fn bundled_migrations_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
+}
+
+async fn fresh_migration_database(label: &str) -> (String, String, String) {
+    let admin_url = pg_url();
+    let database_name = format!(
+        "donat_{label}_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let (client, connection) = tokio_postgres::connect(&admin_url, NoTls)
+        .await
+        .expect("Postgres admin database is available");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {database_name} WITH (FORCE);"
+        ))
+        .await
+        .expect("stale isolated migration database drops");
+    client
+        .batch_execute(&format!("CREATE DATABASE {database_name};"))
+        .await
+        .expect("isolated migration database creates");
+    connection.abort();
+
+    let prefix = admin_url
+        .rsplit_once('/')
+        .expect("Postgres URL contains a database name")
+        .0
+        .to_string();
+    (
+        admin_url,
+        database_name.clone(),
+        format!("{prefix}/{database_name}"),
+    )
+}
+
+async fn drop_migration_database(admin_url: &str, database_name: &str) {
+    let (client, connection) = tokio_postgres::connect(admin_url, NoTls)
+        .await
+        .expect("Postgres admin database is available for cleanup");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!("DROP DATABASE {database_name} WITH (FORCE);"))
+        .await
+        .expect("isolated migration database drops");
+    connection.abort();
 }
 
 struct MetadataDir {
@@ -87,6 +140,188 @@ impl Drop for MetadataDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[tokio::test]
+async fn command_invocations_migration_creates_journal_and_graphql_error_helper() {
+    let (admin_url, database_name, url) = fresh_migration_database("command_journal").await;
+    run_migrate(&url, &bundled_migrations_dir())
+        .await
+        .expect("bundled migrations apply");
+
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+
+    let columns = client
+        .query(
+            "
+            SELECT attribute.attname,
+                   format_type(attribute.atttypid, attribute.atttypmod),
+                   attribute.attnotnull,
+                   COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid), '')
+            FROM pg_attribute attribute
+            JOIN pg_class relation ON relation.oid = attribute.attrelid
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+            LEFT JOIN pg_attrdef default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+            WHERE namespace.nspname = 'donat'
+              AND relation.relname = 'command_invocations'
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum
+            ",
+            &[],
+        )
+        .await
+        .expect("command journal columns query succeeds")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, bool>(2),
+                row.get::<_, String>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        vec![
+            ("command_name".into(), "text".into(), true, "".into()),
+            ("scope_hash".into(), "bytea".into(), true, "".into()),
+            ("key".into(), "text".into(), true, "".into()),
+            ("input_fingerprint".into(), "bytea".into(), true, "".into()),
+            ("result".into(), "jsonb".into(), true, "".into()),
+            (
+                "status".into(),
+                "text".into(),
+                true,
+                "'succeeded'::text".into(),
+            ),
+            (
+                "expires_at".into(),
+                "timestamp with time zone".into(),
+                true,
+                "".into(),
+            ),
+            (
+                "created_at".into(),
+                "timestamp with time zone".into(),
+                true,
+                "now()".into(),
+            ),
+        ],
+        "journal columns, PostgreSQL types, nullability, and defaults",
+    );
+
+    let primary_key_columns = client
+        .query(
+            "
+            SELECT attribute.attname
+            FROM pg_constraint constraint_row
+            CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_row.conrelid
+             AND attribute.attnum = key_column.attnum
+            WHERE constraint_row.conrelid = 'donat.command_invocations'::regclass
+              AND constraint_row.contype = 'p'
+            ORDER BY key_column.position
+            ",
+            &[],
+        )
+        .await
+        .expect("command journal primary-key query succeeds")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key_columns,
+        ["command_name", "scope_hash", "key"],
+        "the idempotency scope is exactly the primary key"
+    );
+
+    let redundant_unique_constraints: i64 = client
+        .query_one(
+            "
+            SELECT count(*)
+            FROM pg_constraint
+            WHERE conrelid = 'donat.command_invocations'::regclass
+              AND contype = 'u'
+            ",
+            &[],
+        )
+        .await
+        .expect("command journal unique-constraint query succeeds")
+        .get(0);
+    assert_eq!(
+        redundant_unique_constraints, 0,
+        "the primary key is the sole idempotency uniqueness contract"
+    );
+
+    let expiry_index: String = client
+        .query_one(
+            "SELECT pg_get_indexdef('donat.command_invocations_expires_at_idx'::regclass)",
+            &[],
+        )
+        .await
+        .expect("command journal expiry index exists")
+        .get(0);
+    assert!(
+        expiry_index.contains("ON donat.command_invocations")
+            && expiry_index.contains("(expires_at)"),
+        "retention index must target expires_at: {expiry_index}"
+    );
+
+    let function_error = client
+        .query_one(
+            "SELECT donat.raise_graphql_error($1, $2, $3)",
+            &[
+                &"validation-failed",
+                &"$.selectionSet.create_order",
+                &"customer is not allowed to order",
+            ],
+        )
+        .await
+        .expect_err("structured GraphQL helper always rejects");
+    let db = function_error
+        .as_db_error()
+        .expect("structured GraphQL helper returns a database error");
+    assert_eq!(db.code().code(), "P0D01", "dedicated SQLSTATE");
+    let payload: Json = serde_json::from_str(db.message()).expect("JSON envelope");
+    assert_eq!(
+        payload,
+        json!({
+            "kind": "donat.graphql-error.v1",
+            "code": "validation-failed",
+            "path": "$.selectionSet.create_order",
+            "message": "customer is not allowed to order",
+        })
+    );
+
+    let function_definition: String = client
+        .query_one(
+            "SELECT pg_get_functiondef('donat.raise_graphql_error(text, text, text)'::regprocedure)",
+            &[],
+        )
+        .await
+        .expect("structured GraphQL helper definition query succeeds")
+        .get(0);
+    let function_definition_upper = function_definition.to_ascii_uppercase();
+    assert!(
+        !function_definition_upper.contains("EXECUTE"),
+        "the helper must not construct or execute SQL: {function_definition}"
+    );
+    assert!(
+        !function_definition_upper.contains("SECURITY DEFINER"),
+        "the helper must not change role semantics: {function_definition}"
+    );
+
+    connection.abort();
+    drop_migration_database(&admin_url, &database_name).await;
 }
 
 #[tokio::test]

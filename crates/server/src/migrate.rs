@@ -30,6 +30,11 @@ const BUILTIN_CATALOG_MIGRATIONS: &[&str] = &[
     include_str!("../../../migrations/V2__donat_event_log.sql"),
 ];
 
+// Do not add new deploy-time catalogs here. This legacy bootstrap runs while
+// a serving snapshot stages its existing cron/event support. Command journals,
+// process journals, and their helpers must be applied through the explicit
+// `donat migrate --migrations-dir ...` path only.
+
 /// Apply all pending `.sql` migrations in `dir` to the database.
 pub async fn run_migrate(database_url: &str, dir: &Path) -> Result<()> {
     let migrations = load_sql_migrations(dir)

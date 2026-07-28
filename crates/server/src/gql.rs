@@ -1708,10 +1708,41 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Clickhouse(msg) => error_json("data-exception", msg),
     }
 }
+
+const COMMAND_GRAPHQL_ERROR_SQLSTATE: &str = "P0D01";
+const COMMAND_GRAPHQL_ERROR_KIND: &str = "donat.graphql-error.v1";
+
+fn command_graphql_error_json(message: &str) -> Option<Json> {
+    let Json::Object(payload) = serde_json::from_str::<Json>(message).ok()? else {
+        return None;
+    };
+    if payload.len() != 4
+        || payload.get("kind").and_then(Json::as_str) != Some(COMMAND_GRAPHQL_ERROR_KIND)
+    {
+        return None;
+    }
+    let code = payload.get("code").and_then(Json::as_str)?;
+    let path = payload.get("path").and_then(Json::as_str)?;
+    let message = payload.get("message").and_then(Json::as_str)?;
+    if code.is_empty() || !path.starts_with('$') {
+        return None;
+    }
+    Some(json!({
+        "errors": [{
+            "extensions": { "path": path, "code": code },
+            "message": message,
+        }]
+    }))
+}
+
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
     };
+    if db.code().code() == COMMAND_GRAPHQL_ERROR_SQLSTATE {
+        return command_graphql_error_json(db.message())
+            .unwrap_or_else(|| error_json("data-exception", "database error"));
+    }
     // Our check_violation() raises 23514 with a JSON payload carrying the
     // GraphQL error path.
     if db.code().code() == "23514" {
@@ -1803,6 +1834,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use tokio_postgres::NoTls;
 
     #[test]
     fn query_depth_guard() {
@@ -2197,6 +2229,111 @@ mod tests {
                 "extensions": { "path": "$", "code": "validation-failed" },
                 "message": "boom",
             }] })
+        );
+    }
+
+    async fn database_error_from(sql: &str) -> tokio_postgres::Error {
+        let url = std::env::var("PG_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_string()
+        });
+        let (client, connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("isolated Postgres is available");
+        let connection = tokio::spawn(async move { connection.await });
+        let error = client
+            .batch_execute(sql)
+            .await
+            .expect_err("the SQL must raise a database error");
+        connection.abort();
+        error
+    }
+
+    #[tokio::test]
+    async fn graphql_error_payloads_use_the_reserved_envelope_and_preserve_permission_checks() {
+        let structured = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed","path":"$.selectionSet.create_order","message":"customer is not allowed to order"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
+
+        let permission = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23514',
+                   MESSAGE = '{"path":"$.selectionSet.insert_author.args.objects","message":"check constraint of an insert/update permission has failed"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+
+        let malformed = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed"} private Postgres detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        let malformed_body = db_error_json(&malformed);
+        assert_eq!(
+            malformed_body,
+            error_json("data-exception", "database error")
+        );
+        assert!(
+            !malformed_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "a malformed reserved envelope must not expose PostgreSQL text"
+        );
+
+        let unrecognized = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"untrusted-error","code":"validation-failed","path":"$.selectionSet.create_order","message":"private Postgres detail"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        let unrecognized_body = db_error_json(&unrecognized);
+        assert_eq!(
+            unrecognized_body,
+            error_json("data-exception", "database error")
+        );
+        assert!(
+            !unrecognized_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "an unrecognized reserved envelope must not expose PostgreSQL text"
         );
     }
 
