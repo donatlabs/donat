@@ -1,0 +1,5 @@
+---
+source: crates/rules/tests/postgres.rs
+expression: sql
+---
+((((((("input"."limit")::numeric) IS NULL)) OR (((("input"."limit")::numeric) IS NOT NULL)))) OR (((("input"."limit")::numeric) IS NULL)))

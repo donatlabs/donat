@@ -670,6 +670,9 @@ dependencies = [
 name = "donat-rules"
 version = "0.1.0"
 dependencies = [
+ "donat-sqlgen",
+ "insta",
+ "postgres",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

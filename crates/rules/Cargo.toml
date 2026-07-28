@@ -6,6 +6,11 @@ license.workspace = true
 description = "Restricted CEL-inspired expression parser for declarative Donat rules"
 
 [dependencies]
+donat-sqlgen = { path = "../sqlgen" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+postgres = { workspace = true }

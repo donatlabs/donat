@@ -8,6 +8,7 @@
 mod eval;
 mod lexer;
 mod parser;
+mod postgres;
 mod types;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use thiserror::Error;
 
 pub use eval::{RuleBindings, compile_catalog, evaluate_bool};
 pub use parser::parse_expression;
+pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres};
 pub use types::{
     CompiledDecisionRow, CompiledDecisionTable, CompiledRule, DecisionConditionTrace,
     DecisionRejection, DecisionResult, DecisionRow, DecisionTableDefinition, DecisionTableTestCase,

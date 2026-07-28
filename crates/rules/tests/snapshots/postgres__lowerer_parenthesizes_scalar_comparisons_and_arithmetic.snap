@@ -1,0 +1,5 @@
+---
+source: crates/rules/tests/postgres.rs
+expression: sql
+---
+((((("input"."amount")::numeric) + (((("input"."tax")::numeric) * (("input"."quantity")::numeric))))) >= (((("input"."discount")::numeric) - ((5)::numeric))))

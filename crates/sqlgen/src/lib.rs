@@ -2148,6 +2148,14 @@ pub fn quote_lit(s: &str) -> String {
     donat_backend::PostgresDialect.quote_literal(s)
 }
 
+/// Render a qualified SQL column reference for the declarative rule lowerer.
+///
+/// The rule crate intentionally receives no raw identifier rendering API: both
+/// components are quoted here before they can become a SQL fragment.
+pub fn rule_qualified_column(alias: &str, column: &str) -> String {
+    format!("{}.{}", quote_ident(alias), quote_ident(column))
+}
+
 /// JSON object assembly (LEAF op #1). Delegates to the active backend
 /// dialect; keys are raw and quoted internally, values are inlined verbatim.
 fn json_object(dialect: &donat_backend::AnyDialect, pairs: &[(String, String)]) -> String {

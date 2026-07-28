@@ -1,0 +1,5 @@
+---
+source: crates/rules/tests/postgres.rs
+expression: sql
+---
+((((((((((char_length((("input"."name")::text)::text)) = ((2)::numeric))) AND (((jsonb_array_length((("input"."lines")::jsonb)::jsonb)) = ((2)::numeric))))) AND (((("input"."limit")::numeric) IS NULL)))) AND (((left((("input"."name")::text)::text, char_length(('A'::text)::text))) = (('A'::text)::text))))) AND (((right((("input"."name")::text)::text, char_length(('z'::text)::text))) = (('z'::text)::text))))
