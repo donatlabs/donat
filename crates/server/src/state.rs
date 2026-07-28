@@ -15,7 +15,7 @@ use donat_rules::{
     DecisionTestExpectation as RuleDecisionTestExpectation, ExpressionContext, ExpressionOwner,
     HitPolicy, RuleCatalog, RuleDefinition, RuleType,
 };
-use donat_schema::{CompiledMultiSourceSchema, PlanError};
+use donat_schema::{CompiledMultiSourceSchema, PlanError, compile_command_catalog};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
@@ -381,9 +381,16 @@ impl Engine {
                 ));
             }
         }
-        let compiled = Arc::new(CompiledMultiSourceSchema::compile(
+        let command_catalog = Arc::new(compile_command_catalog(
             &metadata,
             &catalogs,
+            &rule_catalog,
+            infer_function_permissions,
+        )?);
+        let compiled = Arc::new(CompiledMultiSourceSchema::compile_with_command_catalog(
+            &metadata,
+            &catalogs,
+            command_catalog.clone(),
             infer_function_permissions,
         )?);
         let allowed_queries = compile_allowed_queries(&metadata);
@@ -2018,6 +2025,28 @@ mod snapshot_tests {
         };
         assert_eq!(error.path, "rules.yaml");
         assert!(error.message.contains("duplicate rule name `duplicate`"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_commands_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.commands = serde_json::from_value(json!([
+            {
+                "name": "create_item",
+                "source": "default",
+                "permissions": [{ "role": "user" }],
+                "arguments": [],
+                "steps": [],
+                "result": {}
+            }
+        ]))
+        .expect("command metadata deserializes");
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with a non-Postgres command source is rejected before publishing");
+        };
+        assert_eq!(error.path, "commands[0]");
+        assert!(error.message.contains("requires a Postgres source"));
     }
 
     #[test]

@@ -690,10 +690,12 @@ dependencies = [
  "donat-catalog",
  "donat-ir",
  "donat-metadata",
+ "donat-rules",
  "graphql-parser",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

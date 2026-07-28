@@ -291,9 +291,13 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
         .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
 
     let mut problems = vec![];
-    if let Err(error) = crate::state::compile_rule_catalog(&metadata) {
-        problems.push(format!("{}: {}", error.path, error.message));
-    }
+    let rule_catalog = match crate::state::compile_rule_catalog(&metadata) {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            problems.push(format!("{}: {}", error.path, error.message));
+            None
+        }
+    };
 
     let (client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -303,6 +307,20 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
         .await
         .context("introspecting database")?;
     conn.abort();
+
+    if let Some(rule_catalog) = rule_catalog.as_ref() {
+        let catalogs = metadata
+            .sources
+            .iter()
+            .filter(|source| source.kind == donat_metadata::SourceKind::Postgres)
+            .map(|source| (source.name.clone(), catalog.clone()))
+            .collect();
+        if let Err(error) =
+            donat_schema::compile_command_catalog(&metadata, &catalogs, rule_catalog, true)
+        {
+            problems.push(format!("{}: {}", error.path, error.message));
+        }
+    }
 
     for source in &metadata.sources {
         if source.kind != donat_metadata::SourceKind::Postgres {

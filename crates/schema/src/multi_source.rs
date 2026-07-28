@@ -13,6 +13,7 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
+use crate::commands::CompiledCommandCatalog;
 use crate::introspection::{build_schema_json, execute_introspection_schema_lazy};
 use crate::naming::table_base_name;
 use crate::plan::{
@@ -63,6 +64,7 @@ struct RoleSchemas {
 /// Immutable schema and source-index state compiled from one metadata/catalog
 /// snapshot. It owns no references into that snapshot.
 pub struct CompiledMultiSourceSchema {
+    command_catalog: Arc<CompiledCommandCatalog>,
     source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
     relay_query_owners: HashMap<String, String>,
@@ -112,6 +114,41 @@ impl CompiledMultiSourceSchema {
         catalogs: &HashMap<String, Catalog>,
         infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
+        if !metadata.commands.is_empty() {
+            return Err(PlanError::validation(
+                "commands.yaml",
+                "commands require an immutable compiled command catalog",
+            ));
+        }
+        Self::compile_with_command_catalog(
+            metadata,
+            catalogs,
+            Arc::new(CompiledCommandCatalog::empty()),
+            infer_function_permissions,
+        )
+    }
+
+    /// Construct a serving schema from command definitions already validated
+    /// against the exact metadata, catalog, and Rules snapshots. This method
+    /// never parses command YAML or mutates command state.
+    pub fn compile_with_command_catalog(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        command_catalog: Arc<CompiledCommandCatalog>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        for command in &metadata.commands {
+            if command_catalog
+                .source(&command.source)
+                .and_then(|source| source.command(&command.name))
+                .is_none()
+            {
+                return Err(PlanError::validation(
+                    "commands.yaml",
+                    "compiled command catalog does not match metadata",
+                ));
+            }
+        }
         let source_indexes = metadata
             .sources
             .iter()
@@ -177,6 +214,7 @@ impl CompiledMultiSourceSchema {
             .collect();
 
         Ok(Self {
+            command_catalog,
             source_indexes,
             query_owners,
             relay_query_owners,
@@ -191,6 +229,11 @@ impl CompiledMultiSourceSchema {
             },
             infer_function_permissions,
         })
+    }
+
+    /// The immutable command catalog accepted with this schema snapshot.
+    pub fn command_catalog(&self) -> &CompiledCommandCatalog {
+        self.command_catalog.as_ref()
     }
 
     pub fn source_planner<'a>(
