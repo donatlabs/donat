@@ -7,12 +7,16 @@ use donat_schema::{PlanError, compile_command_catalog};
 use serde_json::{Value as Json, json};
 
 fn column(name: &str, pg_type: &str) -> ColumnInfo {
+    column_with(name, pg_type, -1, false)
+}
+
+fn column_with(name: &str, pg_type: &str, pg_typmod: i32, nullable: bool) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
-        pg_typmod: -1,
+        pg_typmod,
         native_type: None,
-        nullable: false,
+        nullable,
         has_default: false,
     }
 }
@@ -127,6 +131,67 @@ fn rules() -> RuleCatalog {
 fn compile(metadata: &Metadata, relation_kind: RelationKind) -> Result<(), PlanError> {
     let catalogs = HashMap::from([("default".to_string(), catalog(relation_kind))]);
     compile_command_catalog(metadata, &catalogs, &rules(), true).map(|_| ())
+}
+
+fn compile_with_catalog(metadata: &Metadata, catalog: Catalog) -> Result<(), PlanError> {
+    let catalogs = HashMap::from([("default".to_string(), catalog)]);
+    compile_command_catalog(metadata, &catalogs, &rules(), true).map(|_| ())
+}
+
+fn literal_target_catalog(pg_type: &str, pg_typmod: i32, nullable: bool) -> Catalog {
+    let mut catalog = catalog(RelationKind::Table);
+    let table = catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders catalog entry exists");
+    let status = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "status")
+        .expect("status catalog column exists");
+    *status = column_with("status", pg_type, pg_typmod, nullable);
+    catalog
+}
+
+fn command_with_status_literal(literal: Json) -> Json {
+    let mut command = valid_command();
+    command["steps"][0]["insert"]["object"]["status"] = json!({ "literal": literal });
+    command
+}
+
+fn assert_status_literal(
+    pg_type: &str,
+    pg_typmod: i32,
+    nullable: bool,
+    literal: Json,
+    accepts: bool,
+) {
+    let result = compile_with_catalog(
+        &metadata(vec![command_with_status_literal(literal.clone())]),
+        literal_target_catalog(pg_type, pg_typmod, nullable),
+    );
+    if accepts {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "{pg_type} ({pg_typmod}) literal should compile but failed at {}: {}",
+                error.path, error.message
+            )
+        });
+    } else {
+        let error = match result {
+            Ok(()) => panic!(
+                "{pg_type} ({pg_typmod}) literal should be rejected but compiled: {literal:?}"
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "validation-failed");
+        assert_eq!(error.path, "commands[0].steps[0]");
+        assert!(
+            error.message.contains(pg_type),
+            "database type is reported in {:?}",
+            error.message
+        );
+    }
 }
 
 fn assert_rejected(command: Json, expected: &str) {
@@ -328,15 +393,123 @@ fn rejects_wrong_scalar_and_rule_binding_types() {
 
 #[test]
 fn rejects_malformed_literals_for_resolved_column_scalars() {
-    for (column, literal, expected) in [
+    for (column, literal, database_type) in [
         ("id", json!("not-a-uuid"), "uuid"),
-        ("quantity", json!("not-an-integer"), "Int"),
+        ("quantity", json!("not-an-integer"), "int4"),
         ("order_date", json!("2026-99-99"), "date"),
         ("created_at", json!("not-a-timestamp"), "timestamp"),
     ] {
         let mut command = valid_command();
         command["steps"][0]["insert"]["object"][column] = json!({ "literal": literal });
-        assert_rejected(command, &format!("invalid literal for {expected}"));
+        assert_rejected(
+            command,
+            &format!("PostgreSQL column type '{database_type}'"),
+        );
+    }
+}
+
+#[test]
+fn command_literals_obey_concrete_postgres_scalar_descriptors() {
+    let numeric_typmod = |precision: i32, scale: i32| ((precision << 16) | (scale & 0x7ff)) + 4;
+
+    for (pg_type, pg_typmod, literal) in [
+        ("bool", -1, json!(true)),
+        ("int2", -1, json!(-32768)),
+        ("int2", -1, json!(32767)),
+        ("int2", -1, json!("-32768")),
+        ("int2", -1, json!("32767")),
+        ("int4", -1, json!(-2147483648_i64)),
+        ("int4", -1, json!(2147483647_i64)),
+        ("int4", -1, json!("-2147483648")),
+        ("int4", -1, json!("2147483647")),
+        ("int8", -1, json!(-9223372036854775808_i64)),
+        ("int8", -1, json!(9223372036854775807_i64)),
+        ("int8", -1, json!("-9223372036854775808")),
+        ("int8", -1, json!("9223372036854775807")),
+        ("float4", -1, json!(1.25)),
+        ("float4", -1, json!("1.25")),
+        ("float8", -1, json!(1.25)),
+        ("float8", -1, json!("1.25")),
+        ("numeric", numeric_typmod(5, 2), json!("999.994")),
+        ("numeric", numeric_typmod(5, 2), json!("-999.994")),
+        (
+            "decimal",
+            -1,
+            json!("123456789012345678901234567890.123456789"),
+        ),
+        ("numeric", numeric_typmod(3, -2), json!("99949")),
+        ("uuid", -1, json!("550e8400-e29b-41d4-a716-446655440000")),
+        ("date", -1, json!("2026-02-28")),
+        ("timestamp", -1, json!("2026-02-28T12:34:56.123456")),
+        ("timestamp", 0, json!("2026-02-28 12:34:56")),
+        ("timestamp", 3, json!("2026-02-28T12:34:56.123")),
+        ("timestamp", 6, json!("2026-02-28T12:34:56.123456")),
+        ("timestamptz", -1, json!("2026-02-28T12:34:56.123456+03:00")),
+        (
+            "timestamp with time zone",
+            3,
+            json!("2026-02-28T12:34:56.123Z"),
+        ),
+        ("text", -1, json!("unbounded")),
+        ("varchar", 7, json!("åßç")),
+        ("bpchar", 6, json!("åß")),
+        ("name", -1, json!("a".repeat(63))),
+        ("citext", -1, json!("Case Insensitive")),
+        ("varchar", 7, Json::Null),
+    ] {
+        assert_status_literal(
+            pg_type,
+            pg_typmod,
+            pg_type == "varchar" && literal.is_null(),
+            literal,
+            true,
+        );
+    }
+
+    for (pg_type, pg_typmod, nullable, literal) in [
+        ("bool", -1, false, json!("true")),
+        ("int2", -1, false, json!(-32769)),
+        ("int2", -1, false, json!("32768")),
+        ("int4", -1, false, json!(-2147483649_i64)),
+        ("int4", -1, false, json!("2147483648")),
+        ("int8", -1, false, json!(9223372036854775808_u64)),
+        ("int8", -1, false, json!("-9223372036854775809")),
+        ("int8", -1, false, json!("+1")),
+        ("int8", -1, false, json!("1.0")),
+        ("int8", -1, false, json!("1e2")),
+        ("float4", -1, false, json!("NaN")),
+        ("float4", -1, false, json!("Infinity")),
+        ("float8", -1, false, json!("-Infinity")),
+        ("float4", -1, false, json!("3.5e39")),
+        ("numeric", numeric_typmod(5, 2), false, json!("999.995")),
+        ("numeric", numeric_typmod(5, 2), false, json!("1e2")),
+        ("numeric", numeric_typmod(3, -2), false, json!("99950")),
+        ("numeric", 4, false, json!("1")),
+        ("uuid", -1, false, json!("550e8400e29b41d4a716446655440000")),
+        ("date", -1, false, json!("2026-02-29")),
+        ("timestamp", -1, false, json!("2026-02-28T12:34:56.1234567")),
+        ("timestamp", 0, false, json!("2026-02-28T12:34:56.1")),
+        ("timestamp", 3, false, json!("2026-02-28T12:34:56.1234")),
+        ("timestamp", 7, false, json!("2026-02-28T12:34:56")),
+        ("timestamptz", 3, false, json!("2026-02-28T12:34:56.1234Z")),
+        ("timestamp", -1, false, json!("2026-02-28T12:34:56Z")),
+        ("timestamptz", -1, false, json!("2026-02-28T12:34:56")),
+        ("varchar", 7, false, json!("åßçd")),
+        ("varchar", 3, false, json!("x")),
+        ("bpchar", 3, false, json!("x")),
+        ("name", -1, false, json!("a".repeat(64))),
+        ("text", 4, false, json!("x")),
+        ("citext", 4, false, json!("x")),
+        ("varchar", 7, false, Json::Null),
+        ("jsonb", -1, false, json!("payload")),
+        ("order_status", -1, false, json!("new")),
+        ("_int4", -1, false, json!([1, 2])),
+        ("domain_order_id", -1, false, json!("1")),
+        ("extension_scalar", -1, false, json!("1")),
+        ("bool", -1, false, json!({ "unexpected": true })),
+        ("bool", -1, false, json!([true])),
+    ] {
+        assert_status_literal(pg_type, pg_typmod, nullable, literal, false);
     }
 }
 

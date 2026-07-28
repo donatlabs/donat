@@ -2050,6 +2050,58 @@ mod snapshot_tests {
         assert!(error.message.contains("requires a Postgres source"));
     }
 
+    #[tokio::test]
+    async fn failed_out_of_range_command_literal_preserves_the_published_snapshot() {
+        let (mut metadata, catalogs, _) = candidate("item", "/tmp/item.sqlite");
+        metadata.sources[0].kind = SourceKind::Postgres;
+        let runtimes = HashMap::from([(
+            "default".to_string(),
+            stage_postgres_runtime(
+                "postgres://unused/command-literal",
+                RuntimePoolSettings::default(),
+                None,
+            )
+            .expect("unconnected Postgres runtime stages"),
+        )]);
+        let engine = Engine::compiled(metadata.clone(), catalogs.clone(), runtimes.clone(), true)
+            .expect("published snapshot without commands compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+
+        metadata.commands = serde_json::from_value(json!([{
+            "name": "create_item",
+            "source": "default",
+            "permissions": [{ "role": "user" }],
+            "steps": [{
+                "name": "item",
+                "insert": {
+                    "table": { "schema": "public", "name": "item" },
+                    "object": { "id": { "literal": "9223372036854775808" } },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "id": { "step": "item", "column": "id" } }
+        }]))
+        .expect("invalid command metadata deserializes");
+
+        let error = state
+            .publish_candidate(Engine::compiled(metadata, catalogs, runtimes, true))
+            .await
+            .expect_err("out-of-range int8 command literal rejects candidate");
+        assert_eq!(error.path, "commands[0].steps[0]");
+        assert!(error.message.contains("int8"));
+        assert!(error.message.contains("out of range"));
+
+        let current = state.engine_snapshot().await;
+        assert!(Arc::ptr_eq(
+            &old_compiled,
+            current
+                .compiled
+                .as_ref()
+                .expect("unchanged compiled snapshot"),
+        ));
+    }
+
     #[test]
     fn postgres_runtime_reuses_pool_only_for_the_same_url() {
         let first = stage_postgres_runtime(

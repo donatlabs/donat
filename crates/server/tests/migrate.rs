@@ -126,3 +126,173 @@ async fn check_consistency_collects_static_command_diagnostics() {
         "command compiler diagnostics were not collected: {problems:#?}"
     );
 }
+
+#[tokio::test]
+async fn check_consistency_rejects_out_of_range_int8_command_literal_without_writes() {
+    let table = format!(
+        "donat_command_literal_int8_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id bigint PRIMARY KEY, note varchar(3), payload jsonb);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: create_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "9223372036854775808" }}
+        returning: [id]
+  result:
+    order_id: {{ step: order, column: id }}
+"#
+        ),
+    )
+    .expect("command metadata writes");
+
+    let problems = check_consistency(&url, &metadata.path)
+        .await
+        .expect("metadata validation completes");
+    let table_still_exists: bool = client
+        .query_one(
+            "SELECT to_regclass($1) IS NOT NULL",
+            &[&format!("public.{table}")],
+        )
+        .await
+        .expect("table presence query succeeds")
+        .get(0);
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[0].steps[0]")
+                && problem.contains("int8")
+                && problem.contains("out of range")
+        }),
+        "out-of-range int8 diagnostic was not collected: {problems:#?}"
+    );
+    assert!(
+        table_still_exists,
+        "validate must not create or remove database objects"
+    );
+}
+
+#[tokio::test]
+async fn check_consistency_accepts_nullable_varchar_literal_and_rejects_jsonb_literal() {
+    let table = format!(
+        "donat_command_literal_scalars_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id uuid PRIMARY KEY, note varchar(3), payload jsonb);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: create_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "550e8400-e29b-41d4-a716-446655440000" }}
+          note: {{ literal: null }}
+        returning: [id]
+  result:
+    order_id: {{ step: order, column: id }}
+"#
+        ),
+    )
+    .expect("nullable command metadata writes");
+    let accepted = check_consistency(&url, &metadata.path)
+        .await
+        .expect("nullable metadata validation completes");
+
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: create_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "550e8400-e29b-41d4-a716-446655440000" }}
+          payload: {{ literal: "not-json" }}
+        returning: [id]
+  result:
+    order_id: {{ step: order, column: id }}
+"#
+        ),
+    )
+    .expect("unsupported-type command metadata writes");
+    let rejected = check_consistency(&url, &metadata.path)
+        .await
+        .expect("unsupported-type metadata validation completes");
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert!(
+        accepted.is_empty(),
+        "nullable varchar literal should validate: {accepted:#?}"
+    );
+    assert!(
+        rejected.iter().any(|problem| {
+            problem.contains("commands[0].steps[0]") && problem.contains("jsonb")
+        }),
+        "unsupported jsonb diagnostic was not collected: {rejected:#?}"
+    );
+}

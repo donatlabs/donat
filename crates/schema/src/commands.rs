@@ -76,6 +76,455 @@ enum StaticType {
     Rows(BTreeMap<String, StaticType>),
 }
 
+/// PostgreSQL facts that are intentionally narrower than the GraphQL-facing
+/// [`StaticType`]. This stays private to deploy-time command literal
+/// validation: arguments, items, step outputs, Rules, and the generated
+/// schema continue to use their existing static typing model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandScalarDescriptor {
+    Bool,
+    SignedInteger {
+        minimum: i128,
+        maximum: i128,
+    },
+    Float32,
+    Float64,
+    Numeric {
+        precision: Option<u16>,
+        scale: Option<i16>,
+    },
+    Uuid,
+    Date,
+    Timestamp {
+        with_time_zone: bool,
+        fractional_precision: u8,
+    },
+    Text {
+        maximum_characters: Option<usize>,
+        maximum_bytes: Option<usize>,
+    },
+}
+
+impl CommandScalarDescriptor {
+    fn from_column(column: &ColumnInfo) -> Result<Self, String> {
+        let unmodified = || {
+            if column.pg_typmod == -1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "has unsupported type modifier {}",
+                    column.pg_typmod
+                ))
+            }
+        };
+        match column.pg_type.as_str() {
+            "bool" => {
+                unmodified()?;
+                Ok(Self::Bool)
+            }
+            "int2" => {
+                unmodified()?;
+                Ok(Self::SignedInteger {
+                    minimum: i16::MIN.into(),
+                    maximum: i16::MAX.into(),
+                })
+            }
+            "int4" => {
+                unmodified()?;
+                Ok(Self::SignedInteger {
+                    minimum: i32::MIN.into(),
+                    maximum: i32::MAX.into(),
+                })
+            }
+            "int8" => {
+                unmodified()?;
+                Ok(Self::SignedInteger {
+                    minimum: i64::MIN.into(),
+                    maximum: i64::MAX.into(),
+                })
+            }
+            "float4" => {
+                unmodified()?;
+                Ok(Self::Float32)
+            }
+            "float8" => {
+                unmodified()?;
+                Ok(Self::Float64)
+            }
+            "numeric" | "decimal" => {
+                let (precision, scale) = numeric_modifier(column.pg_typmod)?;
+                Ok(Self::Numeric { precision, scale })
+            }
+            "uuid" => {
+                unmodified()?;
+                Ok(Self::Uuid)
+            }
+            "date" => {
+                unmodified()?;
+                Ok(Self::Date)
+            }
+            "timestamp" | "timestamp without time zone" => Ok(Self::Timestamp {
+                with_time_zone: false,
+                fractional_precision: timestamp_precision(column.pg_typmod)?,
+            }),
+            "timestamptz" | "timestamp with time zone" => Ok(Self::Timestamp {
+                with_time_zone: true,
+                fractional_precision: timestamp_precision(column.pg_typmod)?,
+            }),
+            "text" | "citext" => {
+                unmodified()?;
+                Ok(Self::Text {
+                    maximum_characters: None,
+                    maximum_bytes: None,
+                })
+            }
+            "varchar" | "bpchar" => {
+                let maximum_characters = match column.pg_typmod {
+                    -1 => None,
+                    modifier if modifier >= 4 => Some((modifier - 4) as usize),
+                    modifier => {
+                        return Err(format!("has malformed type modifier {modifier}"));
+                    }
+                };
+                Ok(Self::Text {
+                    maximum_characters,
+                    maximum_bytes: None,
+                })
+            }
+            "name" => {
+                unmodified()?;
+                Ok(Self::Text {
+                    maximum_characters: None,
+                    maximum_bytes: Some(63),
+                })
+            }
+            _ => Err("is not a supported command literal type".to_string()),
+        }
+    }
+
+    fn validate(&self, literal: &serde_json::Value, nullable: bool) -> Result<(), String> {
+        if literal.is_null() {
+            return if nullable {
+                Ok(())
+            } else {
+                Err("null is not allowed for a non-nullable column".to_string())
+            };
+        }
+        if matches!(
+            literal,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        ) {
+            return Err("must be a scalar value, not an object or list".to_string());
+        }
+
+        match self {
+            Self::Bool => {
+                if literal.is_boolean() {
+                    Ok(())
+                } else {
+                    Err("must be a JSON boolean".to_string())
+                }
+            }
+            Self::SignedInteger { minimum, maximum } => {
+                let number = parse_integral_literal(literal)?;
+                if number < *minimum || number > *maximum {
+                    Err("is out of range".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Float32 => parse_finite_float32(literal),
+            Self::Float64 => parse_finite_float64(literal),
+            Self::Numeric { precision, scale } => {
+                let decimal = parse_decimal_literal(literal)?;
+                if let (Some(precision), Some(scale)) = (precision, scale) {
+                    let rounded = round_decimal_to_scale(&decimal, *scale);
+                    if rounded.len() > usize::from(*precision) {
+                        return Err(format!(
+                            "exceeds numeric({precision}, {scale}) precision after rounding"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Uuid => {
+                let value = literal
+                    .as_str()
+                    .ok_or_else(|| "must be a UUID string".to_string())?;
+                let parsed =
+                    Uuid::parse_str(value).map_err(|_| "must be a canonical UUID".to_string())?;
+                if parsed.hyphenated().to_string().eq_ignore_ascii_case(value) {
+                    Ok(())
+                } else {
+                    Err("must be a canonical UUID".to_string())
+                }
+            }
+            Self::Date => {
+                let value = literal
+                    .as_str()
+                    .ok_or_else(|| "must be a YYYY-MM-DD date string".to_string())?;
+                if is_iso_date(value) && NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+                    Ok(())
+                } else {
+                    Err("must be a valid YYYY-MM-DD date".to_string())
+                }
+            }
+            Self::Timestamp {
+                with_time_zone,
+                fractional_precision,
+            } => {
+                let value = literal
+                    .as_str()
+                    .ok_or_else(|| "must be a timestamp string".to_string())?;
+                let valid = if *with_time_zone {
+                    DateTime::parse_from_rfc3339(value).is_ok()
+                } else {
+                    parse_timestamp(value).is_some()
+                };
+                if !valid {
+                    return Err(if *with_time_zone {
+                        "must be an RFC 3339 timestamp with an offset".to_string()
+                    } else {
+                        "must be a local timestamp".to_string()
+                    });
+                }
+                let digits = timestamp_fractional_digits(value, *with_time_zone)?;
+                if digits > *fractional_precision {
+                    Err(format!(
+                        "has {digits} fractional-second digits but permits at most {fractional_precision}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Text {
+                maximum_characters,
+                maximum_bytes,
+            } => {
+                let value = literal
+                    .as_str()
+                    .ok_or_else(|| "must be a string".to_string())?;
+                if let Some(maximum) = maximum_characters
+                    && value.chars().count() > *maximum
+                {
+                    return Err(format!("exceeds the {maximum}-character limit"));
+                }
+                if let Some(maximum) = maximum_bytes
+                    && value.len() > *maximum
+                {
+                    return Err(format!("exceeds the {maximum}-byte limit"));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecimalLiteral {
+    digits: String,
+    fractional_digits: usize,
+}
+
+fn numeric_modifier(pg_typmod: i32) -> Result<(Option<u16>, Option<i16>), String> {
+    if pg_typmod == -1 {
+        return Ok((None, None));
+    }
+    let modifier = pg_typmod
+        .checked_sub(4)
+        .ok_or_else(|| format!("has malformed type modifier {pg_typmod}"))?
+        as u32;
+    let low = modifier & 0xffff;
+    if low & !0x07ff != 0 {
+        return Err(format!("has malformed type modifier {pg_typmod}"));
+    }
+    let precision = (modifier >> 16) as u16;
+    let raw_scale = (low & 0x07ff) as i16;
+    let scale = if raw_scale & 0x0400 != 0 {
+        raw_scale - 0x0800
+    } else {
+        raw_scale
+    };
+    if precision == 0 || precision > 1000 || !(-1000..=1000).contains(&scale) {
+        return Err(format!("has malformed type modifier {pg_typmod}"));
+    }
+    Ok((Some(precision), Some(scale)))
+}
+
+fn timestamp_precision(pg_typmod: i32) -> Result<u8, String> {
+    match pg_typmod {
+        -1 => Ok(6),
+        0..=6 => Ok(pg_typmod as u8),
+        modifier => Err(format!("has malformed type modifier {modifier}")),
+    }
+}
+
+fn parse_integral_literal(literal: &serde_json::Value) -> Result<i128, String> {
+    let value = literal_text(literal, "must be an integral JSON number or string")?;
+    if !is_integral_decimal(&value) {
+        return Err("must be an integral JSON number or string".to_string());
+    }
+    value
+        .parse::<i128>()
+        .map_err(|_| "is out of range".to_string())
+}
+
+fn parse_finite_float32(literal: &serde_json::Value) -> Result<(), String> {
+    let value = literal_text(literal, "must be a JSON number or numeric string")?;
+    if value.trim() != value {
+        return Err("must be a JSON number or numeric string".to_string());
+    }
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|number| number.is_finite())
+        .map(|_| ())
+        .ok_or_else(|| "must be a finite float4 value".to_string())
+}
+
+fn parse_finite_float64(literal: &serde_json::Value) -> Result<(), String> {
+    let value = literal_text(literal, "must be a JSON number or numeric string")?;
+    if value.trim() != value {
+        return Err("must be a JSON number or numeric string".to_string());
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+        .map(|_| ())
+        .ok_or_else(|| "must be a finite float8 value".to_string())
+}
+
+fn literal_text(literal: &serde_json::Value, expected: &str) -> Result<String, String> {
+    match literal {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(number) => Ok(number.to_string()),
+        _ => Err(expected.to_string()),
+    }
+}
+
+fn parse_decimal_literal(literal: &serde_json::Value) -> Result<DecimalLiteral, String> {
+    let value = literal_text(literal, "must be a decimal JSON number or string")?;
+    let unsigned = value.strip_prefix('-').unwrap_or(&value);
+    if unsigned.is_empty() {
+        return Err("must use canonical decimal grammar".to_string());
+    }
+    let (integral, fractional) = match unsigned.split_once('.') {
+        Some((integral, fractional)) => (integral, Some(fractional)),
+        None => (unsigned, None),
+    };
+    if !is_unsigned_integral_decimal(integral)
+        || fractional.is_some_and(|fractional| {
+            fractional.is_empty() || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err("must use canonical decimal grammar".to_string());
+    }
+    let fractional = fractional.unwrap_or_default();
+    Ok(DecimalLiteral {
+        digits: format!("{integral}{fractional}"),
+        fractional_digits: fractional.len(),
+    })
+}
+
+fn is_integral_decimal(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    !unsigned.is_empty() && is_unsigned_integral_decimal(unsigned)
+}
+
+fn is_unsigned_integral_decimal(value: &str) -> bool {
+    matches!(value.as_bytes(), [b'0'])
+        || (value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| *byte >= b'1' && *byte <= b'9')
+            && value.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn round_decimal_to_scale(value: &DecimalLiteral, scale: i16) -> String {
+    let shift = i32::from(scale) - value.fractional_digits as i32;
+    if shift >= 0 {
+        let mut digits = value.digits.clone();
+        digits.extend(std::iter::repeat_n('0', shift as usize));
+        return trim_leading_zeroes(digits);
+    }
+
+    let discarded = (-shift) as usize;
+    let kept = value.digits.len().saturating_sub(discarded);
+    let should_round = discarded <= value.digits.len()
+        && value
+            .digits
+            .as_bytes()
+            .get(kept)
+            .is_some_and(|digit| *digit >= b'5');
+    let mut rounded = if kept == 0 {
+        "0".to_string()
+    } else {
+        value.digits[..kept].to_string()
+    };
+    if should_round {
+        rounded = increment_decimal_digits(rounded);
+    }
+    trim_leading_zeroes(rounded)
+}
+
+fn increment_decimal_digits(digits: String) -> String {
+    let mut bytes = digits.into_bytes();
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] == b'9' {
+            bytes[index] = b'0';
+        } else {
+            bytes[index] += 1;
+            return String::from_utf8(bytes).expect("decimal digits remain UTF-8");
+        }
+    }
+    bytes.insert(0, b'1');
+    String::from_utf8(bytes).expect("decimal digits remain UTF-8")
+}
+
+fn trim_leading_zeroes(value: String) -> String {
+    let trimmed = value.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn timestamp_fractional_digits(value: &str, with_time_zone: bool) -> Result<u8, String> {
+    let separator = value
+        .find('T')
+        .or_else(|| (!with_time_zone).then(|| value.find(' ')).flatten())
+        .ok_or_else(|| "must include a date-time separator".to_string())?;
+    let time_and_offset = &value[separator + 1..];
+    let time = if with_time_zone {
+        let end = time_and_offset
+            .find(|character: char| matches!(character, 'Z' | '+' | '-'))
+            .unwrap_or(time_and_offset.len());
+        &time_and_offset[..end]
+    } else {
+        time_and_offset
+    };
+    let Some((_, fraction)) = time.rsplit_once('.') else {
+        return Ok(0);
+    };
+    if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("has malformed fractional seconds".to_string());
+    }
+    u8::try_from(fraction.len()).map_err(|_| "has too many fractional-second digits".to_string())
+}
+
 impl StaticType {
     fn is_scalar(&self) -> bool {
         matches!(self, Self::Scalar(_))
@@ -617,7 +1066,17 @@ fn validate_value_against_column(
     path: &str,
 ) -> Result<(), PlanError> {
     let expected = column_type(column);
-    let actual = value_type(value, context, Some(&expected), ValueUse::Data, path)?;
+    let actual = match value {
+        CommandValue::Literal { literal } => {
+            validate_command_literal(literal, column, path)?;
+            // A descriptor has already proven the metadata value satisfies the
+            // concrete database column. Preserve the established StaticType
+            // assignment check for the rest of command compilation without
+            // leaking PostgreSQL widths or modifiers into that public model.
+            expected.clone()
+        }
+        _ => value_type(value, context, Some(&expected), ValueUse::Data, path)?,
+    };
     if !assignable(&actual, &expected) {
         return Err(PlanError::validation(
             path,
@@ -630,6 +1089,33 @@ fn validate_value_against_column(
         ));
     }
     Ok(())
+}
+
+fn validate_command_literal(
+    literal: &serde_json::Value,
+    column: &ColumnInfo,
+    path: &str,
+) -> Result<(), PlanError> {
+    let descriptor = CommandScalarDescriptor::from_column(column).map_err(|reason| {
+        PlanError::validation(
+            path,
+            format!(
+                "invalid literal for PostgreSQL column type '{}': {reason}",
+                column.pg_type
+            ),
+        )
+    })?;
+    descriptor
+        .validate(literal, column.nullable)
+        .map_err(|reason| {
+            PlanError::validation(
+                path,
+                format!(
+                    "invalid literal for PostgreSQL column type '{}': {reason}",
+                    column.pg_type
+                ),
+            )
+        })
 }
 
 fn returning_columns(
