@@ -120,11 +120,13 @@ schemas and only if their entire static result selection can be generated.
 - [ ] Add tests that reject duplicate command names, non-table targets,
   unknown columns/arguments/step references, mutable result shape, missing
   primary-key predicates for update/delete, unsafe object/list binding,
-  missing command permission, and `start_process` without command
-  idempotency. Add process-compatibility tests that reject a signal name or
-  payload type not declared by the process and reject deployment removal or an
-  incompatible replacement of a command still pinned by a non-terminal process
-  revision.
+  missing command permission, an effect without mandatory command idempotency,
+  and malformed local effect payload/correlation bindings. This task validates
+  only the bounded command-side effect form: mandatory idempotency and local
+  binding shape, without resolving a process. Defer target-process existence,
+  declared signal name, exact signal payload/correlation compatibility, and
+  rejection of removal or incompatible replacement of a command pinned by a
+  non-terminal process revision to Processes Task 7.
 - [ ] RED: run `cargo test -p donat-schema --test commands`.
   Expected: command metadata is ignored or compiler symbols do not exist.
 - [ ] Build an immutable compiled command catalog per Postgres source. Validate
@@ -217,10 +219,11 @@ schemas and only if their entire static result selection can be generated.
   stored result on exact replay, and raise `validation-failed` if the key is
   reused with different canonical input. Store final root JSON once.
 - [ ] Preserve `CommandEffect::StartProcess` and `CommandEffect::SignalProcess`
-  as typed, statically validated IR variants but leave them non-executable in
-  this core slice. Their SQL lowering, durable outbox insert, and process
-  consumer are Task 7 of `2026-07-28-declarative-processes.md`; SQL must never
-  call an HTTP connector.
+  as typed IR variants with only the Task 2 command-side validation, but leave
+  them non-executable in this core slice. Their target-process compatibility
+  validation, SQL lowering, durable outbox insert, and process consumer are
+  Task 7 of `2026-07-28-declarative-processes.md`; SQL must never call an HTTP
+  connector.
 - [ ] Add explicit match arms for `MutationRoot::Command` in all executor
   alias/table-routing matches. The Postgres path uses `mutation_to_sql_opts`;
   non-Postgres matches fail closed rather than falling through.
@@ -263,12 +266,13 @@ schemas and only if their entire static result selection can be generated.
 - [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run `cargo test --workspace --exclude donat-conformance`.
 - [ ] Rebuild the engine and run
-  `cargo test -p donat-conformance --test commands`. Defer `make conformance`
-  and the final effect fixture until the Processes plan activates
-  `start_process`.
+  `cargo test -p donat-conformance --test commands`. Defer `make conformance`,
+  full process-effect cross-validation, and the final effect fixture until
+  Processes Task 7 activates `start_process`.
 - [ ] Review command SQL snapshots and verify the following manually: no admin
   role, no GraphQL command on non-Postgres sources, no external I/O in SQL,
   exactly one SQL statement per command root, and exact structured error
   envelopes.
 - [ ] Obtain the command-core judge ACCEPT before beginning connectors. The
-  system-wide judge and full conformance gate are in the Processes plan.
+  system-wide judge, full conformance gate, and process-effect compatibility
+  checks are in Processes Task 7.
