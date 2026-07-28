@@ -492,7 +492,7 @@ fn compiled_profiles_and_traces_retain_hashes_without_raw_input() {
             .artifact
             .canonical_ast_sha256
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(&byte))
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
     );
 
     let table = approval_table(
