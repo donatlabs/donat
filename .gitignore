@@ -9,3 +9,4 @@ tests/donat/tests-py/
 .DS_Store
 *.log
 .claude/agent-memory
+.worktrees/
