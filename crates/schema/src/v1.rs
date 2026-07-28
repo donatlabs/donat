@@ -591,35 +591,34 @@ impl<'a> Planner<'a> {
                 // filter also gates which existing rows may change.
                 let mut predicate = None;
                 let mut set_ops = vec![];
-                if !update_columns.is_empty() {
-                    if let Some(update_perm) = ctx
+                if !update_columns.is_empty()
+                    && let Some(update_perm) = ctx
                         .entry
                         .update_permissions
                         .iter()
                         .find(|p| p.role == session.role)
                         .map(|p| &p.permission)
+                {
+                    if !update_perm.filter.is_null()
+                        && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
                     {
-                        if !update_perm.filter.is_null()
-                            && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
-                        {
-                            predicate = Some(self.parse_bool_exp(
-                                &update_perm.filter,
-                                &ctx,
-                                session,
-                                true,
-                                path,
-                            )?);
-                        }
-                        for (col, value) in &update_perm.set {
-                            let Some(info) = ctx.info.column(col) else {
-                                continue;
-                            };
-                            set_ops.push(SetOp::Set {
-                                column: col.clone(),
-                                pg_type: info.sql_type().to_string(),
-                                value: Scalar::Json(resolve_preset(value, session)?),
-                            });
-                        }
+                        predicate = Some(self.parse_bool_exp(
+                            &update_perm.filter,
+                            &ctx,
+                            session,
+                            true,
+                            path,
+                        )?);
+                    }
+                    for (col, value) in &update_perm.set {
+                        let Some(info) = ctx.info.column(col) else {
+                            continue;
+                        };
+                        set_ops.push(SetOp::Set {
+                            column: col.clone(),
+                            pg_type: info.sql_type().to_string(),
+                            value: Scalar::Json(resolve_preset(value, session)?),
+                        });
                     }
                 }
                 Some(OnConflict {

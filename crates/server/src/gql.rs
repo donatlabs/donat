@@ -15,6 +15,14 @@ use donat_schema::{
 
 use crate::state::{AppState, Engine, QueryError, SharedState, SourceRuntime};
 
+struct ParsedRequest<'a> {
+    body: &'a Json,
+    headers: &'a HeaderMap,
+    doc: &'a graphql_parser::query::Document<'static, String>,
+    variables: JsonMap<String, Json>,
+    operation_name: Option<&'a str>,
+}
+
 fn trace_perf_phase(phase: &'static str, started: std::time::Instant) {
     tracing::trace!(
         target: "donat::perf",
@@ -549,12 +557,14 @@ pub async fn execute_full(
     execute_parsed_full(
         state,
         session,
-        body,
         relay,
-        headers,
-        &doc,
-        variables,
-        operation_name,
+        ParsedRequest {
+            body,
+            headers,
+            doc: &doc,
+            variables,
+            operation_name,
+        },
     )
     .await
 }
@@ -585,12 +595,14 @@ pub(crate) async fn execute_preparsed_full(
     execute_parsed_full(
         state,
         session,
-        body,
         relay,
-        headers,
-        doc,
-        variables,
-        operation_name,
+        ParsedRequest {
+            body,
+            headers,
+            doc,
+            variables,
+            operation_name,
+        },
     )
     .await
 }
@@ -598,13 +610,16 @@ pub(crate) async fn execute_preparsed_full(
 async fn execute_parsed_full(
     state: &SharedState,
     session: &Session,
-    body: &Json,
     relay: bool,
-    headers: &axum::http::HeaderMap,
-    doc: &graphql_parser::query::Document<'static, String>,
-    variables: JsonMap<String, Json>,
-    operation_name: Option<&str>,
+    request: ParsedRequest<'_>,
 ) -> (axum::http::StatusCode, Json) {
+    let ParsedRequest {
+        body,
+        headers,
+        doc,
+        variables,
+        operation_name,
+    } = request;
     let routing_started = std::time::Instant::now();
     let engine = state.engine_snapshot().await;
     // Remote schema routing: operations aimed entirely at a permitted
@@ -666,11 +681,11 @@ async fn execute_parsed_full(
                 remote_body["variables"] = Json::Object(remote_variables);
                 let (status, mut resp) =
                     crate::remote::forward(state, &target, &remote_body, headers).await;
-                if let Some(ns) = &target.namespace {
-                    if resp.get("errors").is_none() {
-                        let data = resp.get("data").cloned().unwrap_or(Json::Null);
-                        resp["data"] = json!({ ns: data });
-                    }
+                if let Some(ns) = &target.namespace
+                    && resp.get("errors").is_none()
+                {
+                    let data = resp.get("data").cloned().unwrap_or(Json::Null);
+                    resp["data"] = json!({ ns: data });
                 }
                 (status, resp)
             }
@@ -691,10 +706,12 @@ async fn execute_parsed_full(
             engine,
             session,
             &ctx,
-            doc,
-            &variables,
-            operation_name,
-            headers,
+            crate::action::ActionRequest {
+                doc,
+                variables: &variables,
+                operation_name,
+                headers,
+            },
         )
         .await;
     }
@@ -1054,18 +1071,18 @@ pub(crate) async fn execute_select_internal(
         .try_get::<_, Json>(0)
         .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
     for root in &roots {
-        if let donat_ir::RootField::Select { alias, query } = root {
-            if let Some(node) = data.get_mut(alias.as_str()) {
-                resolve_remote_joins(
-                    state,
-                    engine,
-                    session,
-                    &query.fields,
-                    node,
-                    &format!("$.selectionSet.{alias}"),
-                )
-                .await?;
-            }
+        if let donat_ir::RootField::Select { alias, query } = root
+            && let Some(node) = data.get_mut(alias.as_str())
+        {
+            resolve_remote_joins(
+                state,
+                engine,
+                session,
+                &query.fields,
+                node,
+                &format!("$.selectionSet.{alias}"),
+            )
+            .await?;
         }
     }
     Ok(data)
@@ -1474,7 +1491,7 @@ fn restore_remote_join_error_paths(errors: &Json, root_field: &str) -> Json {
             && let Some(start) = path.find("__donat_rr_")
         {
             let end = path[start..]
-                .find(|character: char| character == '.' || character == '[')
+                .find(['.', '['])
                 .map(|offset| start + offset)
                 .unwrap_or(path.len());
             if let Some(extensions) = error.get_mut("extensions").and_then(Json::as_object_mut) {
@@ -1777,20 +1794,19 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
     }
     // Our check_violation() raises 23514 with a JSON payload carrying the
     // GraphQL error path.
-    if db.code().code() == "23514" {
-        if let Ok(payload) = serde_json::from_str::<Json>(db.message()) {
-            if let (Some(path), Some(message)) = (
-                payload.get("path").and_then(Json::as_str),
-                payload.get("message").and_then(Json::as_str),
-            ) {
-                return json!({
-                    "errors": [{
-                        "extensions": { "path": path, "code": "permission-error" },
-                        "message": message,
-                    }]
-                });
-            }
-        }
+    if db.code().code() == "23514"
+        && let Ok(payload) = serde_json::from_str::<Json>(db.message())
+        && let (Some(path), Some(message)) = (
+            payload.get("path").and_then(Json::as_str),
+            payload.get("message").and_then(Json::as_str),
+        )
+    {
+        return json!({
+            "errors": [{
+                "extensions": { "path": path, "code": "permission-error" },
+                "message": message,
+            }]
+        });
     }
     let (code, message) = match db.code().code() {
         "23514" => ("permission-error", db.message().to_string()),
@@ -2295,7 +2311,7 @@ mod tests {
         let (client, connection) = tokio_postgres::connect(&url, NoTls)
             .await
             .expect("isolated Postgres is available");
-        let connection = tokio::spawn(async move { connection.await });
+        let connection = tokio::spawn(connection);
         let error = client
             .batch_execute(sql)
             .await
@@ -3324,10 +3340,12 @@ mod tests {
             request_snapshot,
             &session,
             &ctx,
-            &doc,
-            &JsonMap::new(),
-            None,
-            &HeaderMap::new(),
+            crate::action::ActionRequest {
+                doc: &doc,
+                variables: &JsonMap::new(),
+                operation_name: None,
+                headers: &HeaderMap::new(),
+            },
         )
         .await;
 

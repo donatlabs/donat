@@ -675,7 +675,7 @@ fn json_rpc_generic_notification_params_arg(req: &Json) -> Result<(), String> {
     Ok(())
 }
 
-fn required_notification_params<'a>(req: &'a Json) -> Result<&'a JsonMap<String, Json>, String> {
+fn required_notification_params(req: &Json) -> Result<&JsonMap<String, Json>, String> {
     let Some(params) = req.get("params") else {
         return Err("missing required member 'params'".to_string());
     };
@@ -1923,10 +1923,10 @@ fn authority_host(authority: &str) -> Option<&str> {
         if host.is_empty() || host.contains(':') {
             return None;
         }
-        if let Some(port) = port {
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
+        if let Some(port) = port
+            && (port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
         }
         Some(host)
     }
@@ -2565,10 +2565,10 @@ async fn call_tool(
                 Err(msg) => return tool_err(msg, None),
             };
             let mut result = crud_tool(state, session, headers, &args, build_query_gql).await;
-            if result.get("isError") == Some(&Json::Bool(false)) {
-                if let Some(rows) = result.get_mut("structuredContent").map(Json::take) {
-                    result["structuredContent"] = json!({ "rows": rows });
-                }
+            if result.get("isError") == Some(&Json::Bool(false))
+                && let Some(rows) = result.get_mut("structuredContent").map(Json::take)
+            {
+                result["structuredContent"] = json!({ "rows": rows });
             }
             result
         }
@@ -3142,9 +3142,7 @@ fn selectable_for_perms(
 fn select_limit_for_perms_value(perms: &[&donat_metadata::SelectPermission]) -> Option<u64> {
     let mut max_limit = None;
     for perm in perms {
-        let Some(limit) = perm.limit else {
-            return None;
-        };
+        let limit = perm.limit?;
         max_limit = Some(max_limit.map_or(limit, |seen: u64| seen.max(limit)));
     }
     max_limit
@@ -3345,15 +3343,15 @@ fn selection_columns(
             if !is_graphql_name(col) {
                 return Err(format!("'{arg_name}' contains invalid column name"));
             }
-            if let Some(known) = catalog_cols {
-                if !known.iter().any(|name| name == col) {
-                    return Err(format!("'{arg_name}' contains unknown column"));
-                }
+            if let Some(known) = catalog_cols
+                && !known.iter().any(|name| name == col)
+            {
+                return Err(format!("'{arg_name}' contains unknown column"));
             }
-            if let Some(selectable) = selectable_cols {
-                if !selectable.iter().any(|name| name == col) {
-                    return Err(format!("'{arg_name}' contains non-selectable column"));
-                }
+            if let Some(selectable) = selectable_cols
+                && !selectable.iter().any(|name| name == col)
+            {
+                return Err(format!("'{arg_name}' contains non-selectable column"));
             }
         }
         return Ok(cols.clone());
@@ -3458,13 +3456,21 @@ fn required_object_arg<'a>(args: &'a Json, key: &str) -> Result<&'a Json, String
     object_arg(args, key)?.ok_or_else(|| format!("missing required argument '{key}'"))
 }
 
+#[derive(Clone, Copy)]
+struct WhereColumns<'a> {
+    catalog: Option<&'a [String]>,
+    selectable: Option<&'a [String]>,
+}
+
 fn where_arg<'a>(args: &'a Json, ctx: &BuildCtx) -> Result<Option<&'a Json>, String> {
     let where_arg = object_arg(args, "where")?;
     if let Some(value) = where_arg {
         validate_where_object(
             value,
-            ctx.catalog_cols,
-            ctx.selectable_cols,
+            WhereColumns {
+                catalog: ctx.catalog_cols,
+                selectable: ctx.selectable_cols,
+            },
             ctx.relationship_names,
             true,
             false,
@@ -3477,15 +3483,16 @@ fn where_arg<'a>(args: &'a Json, ctx: &BuildCtx) -> Result<Option<&'a Json>, Str
 
 fn required_where_arg<'a>(args: &'a Json, ctx: &BuildCtx) -> Result<&'a Json, String> {
     let where_arg = required_object_arg(args, "where")?;
-    let catalog_cols = ctx.catalog_cols;
-    let selectable_cols = ctx.can_select.then_some(ctx.selectable_cols).flatten();
+    let columns = WhereColumns {
+        catalog: ctx.catalog_cols,
+        selectable: ctx.can_select.then_some(ctx.selectable_cols).flatten(),
+    };
     let relationship_names = ctx.can_select.then_some(ctx.relationship_names).flatten();
     validate_where_object(
         where_arg,
-        catalog_cols,
-        selectable_cols,
+        columns,
         relationship_names,
-        catalog_cols.is_some(),
+        columns.catalog.is_some(),
         true,
         0,
         &mut 0,
@@ -3495,8 +3502,7 @@ fn required_where_arg<'a>(args: &'a Json, ctx: &BuildCtx) -> Result<&'a Json, St
 
 fn validate_where_object(
     value: &Json,
-    catalog_cols: Option<&[String]>,
-    selectable_cols: Option<&[String]>,
+    columns: WhereColumns<'_>,
     relationship_names: Option<&[String]>,
     enforce_current_table_cols: bool,
     reject_empty: bool,
@@ -3521,8 +3527,7 @@ fn validate_where_object(
         match key.as_str() {
             "_and" | "_or" => validate_where_group(
                 child,
-                catalog_cols,
-                selectable_cols,
+                columns,
                 relationship_names,
                 enforce_current_table_cols,
                 reject_empty,
@@ -3531,8 +3536,7 @@ fn validate_where_object(
             )?,
             "_not" => validate_where_object(
                 child,
-                catalog_cols,
-                selectable_cols,
+                columns,
                 relationship_names,
                 enforce_current_table_cols,
                 reject_empty,
@@ -3543,18 +3547,19 @@ fn validate_where_object(
                 if key.starts_with('_') {
                     return Err("'where' contains unknown operator".to_string());
                 }
-                let current_table_column =
-                    catalog_cols.is_some_and(|known| known.iter().any(|name| name == key));
+                let current_table_column = columns
+                    .catalog
+                    .is_some_and(|known| known.iter().any(|name| name == key));
                 if enforce_current_table_cols && current_table_column {
-                    validate_where_selectable_column(key, selectable_cols)?;
+                    validate_where_selectable_column(key, columns.selectable)?;
                 }
-                if catalog_cols.is_some()
+                if columns.catalog.is_some()
                     && !current_table_column
                     && !relationship_names.is_some_and(|known| known.iter().any(|name| name == key))
                 {
                     return Err("'where' contains unknown relationship".to_string());
                 }
-                if catalog_cols.is_some() && !current_table_column {
+                if columns.catalog.is_some() && !current_table_column {
                     validate_untyped_relationship_where_object(
                         child,
                         reject_empty,
@@ -3578,8 +3583,7 @@ fn validate_where_object(
 
 fn validate_where_group(
     value: &Json,
-    catalog_cols: Option<&[String]>,
-    selectable_cols: Option<&[String]>,
+    columns: WhereColumns<'_>,
     relationship_names: Option<&[String]>,
     enforce_current_table_cols: bool,
     reject_empty: bool,
@@ -3589,8 +3593,7 @@ fn validate_where_group(
     if value.is_object() {
         return validate_where_object(
             value,
-            catalog_cols,
-            selectable_cols,
+            columns,
             relationship_names,
             enforce_current_table_cols,
             reject_empty,
@@ -3608,8 +3611,7 @@ fn validate_where_group(
     for item in items {
         validate_where_object(
             item,
-            catalog_cols,
-            selectable_cols,
+            columns,
             relationship_names,
             enforce_current_table_cols,
             reject_empty,
@@ -3642,8 +3644,10 @@ fn validate_field_filter_value(
         } else if allow_relationship_filter {
             validate_where_object(
                 child,
-                None,
-                None,
+                WhereColumns {
+                    catalog: None,
+                    selectable: None,
+                },
                 None,
                 false,
                 reject_empty,
@@ -3736,10 +3740,10 @@ fn validate_where_selectable_column(
     column: &str,
     selectable_cols: Option<&[String]>,
 ) -> Result<(), String> {
-    if let Some(selectable) = selectable_cols {
-        if !selectable.iter().any(|name| name == column) {
-            return Err("'where' contains non-selectable column".to_string());
-        }
+    if let Some(selectable) = selectable_cols
+        && !selectable.iter().any(|name| name == column)
+    {
+        return Err("'where' contains non-selectable column".to_string());
     }
     Ok(())
 }
@@ -4055,15 +4059,15 @@ fn validate_order_by_object(
                 "'order_by' must contain at most {MCP_MAX_ORDER_BY_TERMS} columns"
             ));
         }
-        if let Some(known) = ctx.catalog_cols {
-            if !known.iter().any(|name| name == column) {
-                return Err("'order_by' contains unknown column".to_string());
-            }
+        if let Some(known) = ctx.catalog_cols
+            && !known.iter().any(|name| name == column)
+        {
+            return Err("'order_by' contains unknown column".to_string());
         }
-        if let Some(selectable) = ctx.selectable_cols {
-            if !selectable.iter().any(|name| name == column) {
-                return Err("'order_by' contains non-selectable column".to_string());
-            }
+        if let Some(selectable) = ctx.selectable_cols
+            && !selectable.iter().any(|name| name == column)
+        {
+            return Err("'order_by' contains non-selectable column".to_string());
         }
         let Some(direction) = direction.as_str() else {
             return Err("'order_by' direction must be a string".to_string());
@@ -4115,7 +4119,7 @@ fn query_limit_arg(args: &Json, select_limit: Option<u64>) -> Result<Json, Strin
     Ok(value.clone())
 }
 
-fn query_offset_arg<'a>(args: &'a Json) -> Result<Option<&'a Json>, String> {
+fn query_offset_arg(args: &Json) -> Result<Option<&Json>, String> {
     let Some(value) = non_negative_graphql_int_arg(args, "offset")? else {
         return Ok(None);
     };
@@ -4161,15 +4165,15 @@ fn validate_writable_column(
     if !is_graphql_name(column) {
         return Err(format!("'{arg_name}' contains invalid column name"));
     }
-    if let Some(known) = catalog_cols {
-        if !known.iter().any(|name| name == column) {
-            return Err(format!("'{arg_name}' contains unknown column"));
-        }
+    if let Some(known) = catalog_cols
+        && !known.iter().any(|name| name == column)
+    {
+        return Err(format!("'{arg_name}' contains unknown column"));
     }
-    if let Some(writable) = writable_cols {
-        if !writable.iter().any(|name| name == column) {
-            return Err(format!("'{arg_name}' contains non-writable column"));
-        }
+    if let Some(writable) = writable_cols
+        && !writable.iter().any(|name| name == column)
+    {
+        return Err(format!("'{arg_name}' contains non-writable column"));
     }
     Ok(())
 }

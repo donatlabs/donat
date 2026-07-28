@@ -46,7 +46,7 @@ pub async fn run_migrate(database_url: &str, dir: &Path) -> Result<()> {
     let (mut client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
         .context("connecting to database for migrate")?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
 
     ensure_engine_catalog(&client)
         .await
@@ -307,7 +307,7 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
     let (client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
         .context("connecting to database for validate")?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
     let catalog = donat_catalog::introspect(&client)
         .await
         .context("introspecting database")?;

@@ -152,17 +152,17 @@ fn validation_metadata_dir(case: &str, commands: &str, has_insert_permission: bo
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("databases")).expect("create metadata directory");
     std::fs::write(dir.join("version.yaml"), "version: 3\n").expect("write metadata version");
-    let insert_permission = has_insert_permission
-        .then_some(
-            r#"
+    let insert_permission = if has_insert_permission {
+        r#"
       insert_permissions:
         - role: customer
           permission:
             columns: "*"
             check: {}
-"#,
-        )
-        .unwrap_or("");
+"#
+    } else {
+        ""
+    };
     std::fs::write(
         dir.join("databases/databases.yaml"),
         format!(

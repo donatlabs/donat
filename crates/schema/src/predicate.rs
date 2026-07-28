@@ -10,6 +10,11 @@ use serde_json::Value as Json;
 
 use crate::plan::{PlanError, Planner, Session, TableCtx, is_session_var_name};
 
+struct ComparisonField<'a> {
+    column: &'a str,
+    scalar_type: &'a str,
+}
+
 impl Planner<'_> {
     /// Parse a bool_exp against `ctx`'s table. `is_permission` enables
     /// session-variable substitution.
@@ -99,8 +104,10 @@ impl Planner<'_> {
                     let column_path = format!("{path}.{column}");
                     let ops = self.parse_ops(
                         ctx,
-                        &db_column,
-                        &info.pg_type,
+                        ComparisonField {
+                            column: &db_column,
+                            scalar_type: &info.pg_type,
+                        },
                         sub,
                         session,
                         is_permission,
@@ -157,12 +164,11 @@ impl Planner<'_> {
                             // In user filters the remote table's own row
                             // filter applies too, so relationships can't
                             // leak invisible rows.
-                            if !is_permission {
-                                if let Some(perm) =
+                            if !is_permission
+                                && let Some(perm) =
                                     self.permission_predicate(&remote, session, path)?
-                                {
-                                    inner = BoolExp::And(vec![inner, perm]);
-                                }
+                            {
+                                inner = BoolExp::And(vec![inner, perm]);
                             }
                             conjuncts.push(BoolExp::Relationship {
                                 table: Table {
@@ -245,10 +251,10 @@ impl Planner<'_> {
                 ));
             };
             let mut inner = self.parse_bool_exp(value, &remote, session, is_permission, path)?;
-            if !is_permission {
-                if let Some(perm) = self.permission_predicate(&remote, session, path)? {
-                    inner = BoolExp::And(vec![inner, perm]);
-                }
+            if !is_permission
+                && let Some(perm) = self.permission_predicate(&remote, session, path)?
+            {
+                inner = BoolExp::And(vec![inner, perm]);
             }
             Ok(BoolExp::RowFunctionExists {
                 schema: finfo.schema.clone(),
@@ -264,8 +270,10 @@ impl Planner<'_> {
             let field_path = format!("{path}.{}", cf.name);
             let ops = self.parse_ops(
                 ctx,
-                &cf.name,
-                &pg_type,
+                ComparisonField {
+                    column: &cf.name,
+                    scalar_type: &pg_type,
+                },
                 value,
                 session,
                 is_permission,
@@ -293,13 +301,16 @@ impl Planner<'_> {
     fn parse_ops(
         &self,
         ctx: &TableCtx<'_>,
-        column: &str,
-        scalar_type: &str,
+        field: ComparisonField<'_>,
         value: &Json,
         session: &Session,
         is_permission: bool,
         path: &str,
     ) -> Result<Vec<CompareOp>, PlanError> {
+        let ComparisonField {
+            column,
+            scalar_type,
+        } = field;
         let Json::Object(ops) = value else {
             let resolved = resolve_session(value, session, is_permission, path)?;
             return Ok(vec![CompareOp::Eq(Scalar::Json(resolved))]);

@@ -143,10 +143,8 @@ impl<'a> TableCtx<'a> {
         }
         let mut max = 0u64;
         for p in &self.perms {
-            match p.limit {
-                None => return None,
-                Some(l) => max = max.max(l),
-            }
+            let l = p.limit?;
+            max = max.max(l);
         }
         Some(max)
     }
@@ -642,12 +640,9 @@ impl<'a> Planner<'a> {
         if !self.function_allowed(fentry, &session.role) {
             return None;
         }
-        let Some(finfo) = self
+        let finfo = self
             .catalog
-            .function(fentry.function.schema(), fentry.function.name())
-        else {
-            return None;
-        };
+            .function(fentry.function.schema(), fentry.function.name())?;
         let Some((rschema, rname)) = &finfo.returns_table else {
             return None;
         };
@@ -967,10 +962,10 @@ impl<'a> Planner<'a> {
         // Effective variables: provided ones + defaults from the definition.
         let mut vars = variables.clone();
         for vd in var_definitions {
-            if !vars.contains_key(&vd.name) {
-                if let Some(default) = &vd.default_value {
-                    vars.insert(vd.name.clone(), value_to_json(default, &vars, "$")?);
-                }
+            if !vars.contains_key(&vd.name)
+                && let Some(default) = &vd.default_value
+            {
+                vars.insert(vd.name.clone(), value_to_json(default, &vars, "$")?);
             }
         }
 
@@ -1012,13 +1007,12 @@ impl<'a> Planner<'a> {
                     format!("field '{}' not found in type: 'query_root'", field.name),
                 )
             };
-            if self.relay {
-                if let Some(root) =
+            if self.relay
+                && let Some(root) =
                     self.plan_relay_root(field, fragments, variables, session, &path)?
-                {
-                    out.push(root);
-                    continue;
-                }
+            {
+                out.push(root);
+                continue;
             }
             let Some(&(kind, source)) = self.roots.get(&field.name) else {
                 return Err(not_found());
@@ -1148,15 +1142,15 @@ impl<'a> Planner<'a> {
 
         let mut args = vec![];
         for (i, arg) in finfo.args.iter().enumerate() {
-            if let (Some(name), Some(sess_arg)) = (&arg.name, session_argument) {
-                if name == sess_arg {
-                    args.push(FunctionArgValue {
-                        name: arg.name.clone(),
-                        value: Scalar::Json(Json::String(session_json(session))),
-                        pg_type: arg.pg_type.clone(),
-                    });
-                    continue;
-                }
+            if let (Some(name), Some(sess_arg)) = (&arg.name, session_argument)
+                && name == sess_arg
+            {
+                args.push(FunctionArgValue {
+                    name: arg.name.clone(),
+                    value: Scalar::Json(Json::String(session_json(session))),
+                    pg_type: arg.pg_type.clone(),
+                });
+                continue;
             }
             let value = arg.name.as_ref().and_then(|n| user_args.get(n)).cloned();
             match value {
@@ -1304,13 +1298,13 @@ impl<'a> Planner<'a> {
         // merges into LIMIT; on aggregates it only caps `nodes` (the
         // aggregate itself is computed over the full filtered set).
         let mut nodes_limit = None;
-        if kind != RootKind::ByPk {
-            if let Some(perm_limit) = ctx.select_perm_limit() {
-                if kind == RootKind::Aggregate {
-                    nodes_limit = Some(perm_limit);
-                } else {
-                    limit = Some(limit.map_or(perm_limit, |l: u64| l.min(perm_limit)));
-                }
+        if kind != RootKind::ByPk
+            && let Some(perm_limit) = ctx.select_perm_limit()
+        {
+            if kind == RootKind::Aggregate {
+                nodes_limit = Some(perm_limit);
+            } else {
+                limit = Some(limit.map_or(perm_limit, |l: u64| l.min(perm_limit)));
             }
         }
 
@@ -1436,29 +1430,26 @@ impl<'a> Planner<'a> {
                     });
                     continue;
                 }
-                if let Some(base) = field.name.strip_suffix("_connection") {
-                    if let Some(rel) = ctx
+                if let Some(base) = field.name.strip_suffix("_connection")
+                    && let Some(rel) = ctx
                         .entry
                         .array_relationships
                         .iter()
                         .find(|r| r.name == base)
-                    {
-                        let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
-                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                        else {
-                            return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
-                        };
-                        let conn = self.build_connection(
-                            &remote, field, fragments, vars, session, &fpath, join,
-                        )?;
-                        out.push(OutputField {
-                            alias,
-                            value: FieldValue::NestedConnection {
-                                conn: Box::new(conn),
-                            },
-                        });
-                        continue;
-                    }
+                {
+                    let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
+                        return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
+                    };
+                    let conn = self
+                        .build_connection(&remote, field, fragments, vars, session, &fpath, join)?;
+                    out.push(OutputField {
+                        alias,
+                        value: FieldValue::NestedConnection {
+                            conn: Box::new(conn),
+                        },
+                    });
+                    continue;
                 }
             }
 
@@ -1611,16 +1602,16 @@ impl<'a> Planner<'a> {
                 // Hidden columns carry the joining values.
                 for col in &rel.donat_fields {
                     let hidden = format!("__rr__{col}");
-                    if !out.iter().any(|f: &OutputField| f.alias == hidden) {
-                        if let Some(info) = ctx.info.column(col) {
-                            out.push(OutputField {
-                                alias: hidden,
-                                value: FieldValue::Column {
-                                    column: info.name.clone(),
-                                    pg_type: info.sql_type().to_string(),
-                                },
-                            });
-                        }
+                    if !out.iter().any(|f: &OutputField| f.alias == hidden)
+                        && let Some(info) = ctx.info.column(col)
+                    {
+                        out.push(OutputField {
+                            alias: hidden,
+                            value: FieldValue::Column {
+                                column: info.name.clone(),
+                                pg_type: info.sql_type().to_string(),
+                            },
+                        });
                     }
                 }
                 // Build `query($v0: T!) { <root>(arg: $v0, lit: x) {sel} }`.
@@ -1941,86 +1932,83 @@ impl<'a> Planner<'a> {
                 }
 
                 // Aggregate over an array relationship?
-                if let Some(base) = key.strip_suffix("_aggregate") {
-                    if let Some(rel) = ctx
+                if let Some(base) = key.strip_suffix("_aggregate")
+                    && let Some(rel) = ctx
                         .entry
                         .array_relationships
                         .iter()
                         .filter(|_| self.capabilities.relationships)
                         .find(|r| r.name == base)
-                    {
-                        let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
-                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                        else {
-                            return Err(field_not_found(path, key, &ctx.type_name));
-                        };
-                        let predicate = self
-                            .permission_predicate(&remote, session, path)?
-                            .map(Box::new);
-                        let Json::Object(inner) = dir_value else {
-                            return Err(PlanError::validation(path, "expected an order_by object"));
-                        };
-                        let remote_ir_table = Table {
-                            schema: remote.info.schema.clone(),
-                            name: remote.info.name.clone(),
-                        };
-                        for (agg, agg_value) in inner {
-                            if agg == "count" {
-                                let (direction, nulls) = parse_order_direction(agg_value, path)?;
+                {
+                    let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
+                        return Err(field_not_found(path, key, &ctx.type_name));
+                    };
+                    let predicate = self
+                        .permission_predicate(&remote, session, path)?
+                        .map(Box::new);
+                    let Json::Object(inner) = dir_value else {
+                        return Err(PlanError::validation(path, "expected an order_by object"));
+                    };
+                    let remote_ir_table = Table {
+                        schema: remote.info.schema.clone(),
+                        name: remote.info.name.clone(),
+                    };
+                    for (agg, agg_value) in inner {
+                        if agg == "count" {
+                            let (direction, nulls) = parse_order_direction(agg_value, path)?;
+                            out.push(OrderBy {
+                                target: OrderByTarget::RelationshipAggregate {
+                                    table: remote_ir_table.clone(),
+                                    join: join.clone(),
+                                    function: "count".into(),
+                                    column: None,
+                                    predicate: predicate.clone(),
+                                },
+                                direction,
+                                nulls,
+                            });
+                        } else {
+                            // The function name is rendered into SQL
+                            // verbatim by sqlgen, so it must be one of the
+                            // fixed column-aggregate ops — never arbitrary
+                            // input.
+                            if !AGGREGATE_COLUMN_OPS.contains(&agg.as_str()) {
+                                return Err(field_not_found(
+                                    path,
+                                    agg,
+                                    &format!("{}_aggregate_order_by", remote.type_name),
+                                ));
+                            }
+                            let Json::Object(cols) = agg_value else {
+                                return Err(PlanError::validation(
+                                    path,
+                                    "expected an order_by object",
+                                ));
+                            };
+                            for (col, dir_value) in cols {
+                                let Some(db_col) = remote
+                                    .column_db_name(col)
+                                    .filter(|c| remote.column_allowed(c))
+                                else {
+                                    return Err(field_not_found(path, col, &remote.type_name));
+                                };
+                                let (direction, nulls) = parse_order_direction(dir_value, path)?;
                                 out.push(OrderBy {
                                     target: OrderByTarget::RelationshipAggregate {
                                         table: remote_ir_table.clone(),
                                         join: join.clone(),
-                                        function: "count".into(),
-                                        column: None,
+                                        function: agg.clone(),
+                                        column: Some(db_col),
                                         predicate: predicate.clone(),
                                     },
                                     direction,
                                     nulls,
                                 });
-                            } else {
-                                // The function name is rendered into SQL
-                                // verbatim by sqlgen, so it must be one of the
-                                // fixed column-aggregate ops — never arbitrary
-                                // input.
-                                if !AGGREGATE_COLUMN_OPS.contains(&agg.as_str()) {
-                                    return Err(field_not_found(
-                                        path,
-                                        agg,
-                                        &format!("{}_aggregate_order_by", remote.type_name),
-                                    ));
-                                }
-                                let Json::Object(cols) = agg_value else {
-                                    return Err(PlanError::validation(
-                                        path,
-                                        "expected an order_by object",
-                                    ));
-                                };
-                                for (col, dir_value) in cols {
-                                    let Some(db_col) = remote
-                                        .column_db_name(col)
-                                        .filter(|c| remote.column_allowed(c))
-                                    else {
-                                        return Err(field_not_found(path, col, &remote.type_name));
-                                    };
-                                    let (direction, nulls) =
-                                        parse_order_direction(dir_value, path)?;
-                                    out.push(OrderBy {
-                                        target: OrderByTarget::RelationshipAggregate {
-                                            table: remote_ir_table.clone(),
-                                            join: join.clone(),
-                                            function: agg.clone(),
-                                            column: Some(db_col),
-                                            predicate: predicate.clone(),
-                                        },
-                                        direction,
-                                        nulls,
-                                    });
-                                }
                             }
                         }
-                        continue;
                     }
+                    continue;
                 }
 
                 if let Some(rel) = ctx
@@ -2253,27 +2241,6 @@ impl<'a> Planner<'a> {
             path,
             format!("relationship '{}' has no using clause", rel.name),
         ))
-    }
-}
-
-#[cfg(test)]
-mod capability_source_tests {
-    use super::*;
-
-    #[test]
-    fn planner_uses_named_default_source_capabilities() {
-        let metadata: Metadata = serde_json::from_value(serde_json::json!({
-            "version": 3,
-            "sources": [
-                { "name": "primary", "kind": "postgres", "configuration": {}, "tables": [] },
-                { "name": "default", "kind": "clickhouse", "configuration": {}, "tables": [] }
-            ]
-        }))
-        .unwrap();
-        let catalog = Catalog::default();
-        let planner = Planner::new(&metadata, &catalog);
-        assert!(!planner.capabilities.mutations);
-        assert!(!planner.capabilities.relay);
     }
 }
 
@@ -2833,16 +2800,16 @@ pub(crate) fn flatten_into<'s>(
                     )
                 })?;
                 let graphql_parser::query::TypeCondition::On(on) = &fragment.type_condition;
-                if let Some(tn) = type_name {
-                    if on != tn {
-                        return Err(PlanError::validation(
-                            "$",
-                            format!(
-                                "fragment \"{}\" is defined on '{on}', not '{tn}'",
-                                spread.fragment_name
-                            ),
-                        ));
-                    }
+                if let Some(tn) = type_name
+                    && on != tn
+                {
+                    return Err(PlanError::validation(
+                        "$",
+                        format!(
+                            "fragment \"{}\" is defined on '{on}', not '{tn}'",
+                            spread.fragment_name
+                        ),
+                    ));
                 }
                 flatten_into(&fragment.selection_set, fragments, vars, type_name, out)?;
             }
@@ -2852,10 +2819,9 @@ pub(crate) fn flatten_into<'s>(
                 }
                 if let (Some(graphql_parser::query::TypeCondition::On(on)), Some(tn)) =
                     (&inline.type_condition, type_name)
+                    && on != tn
                 {
-                    if on != tn {
-                        continue;
-                    }
+                    continue;
                 }
                 flatten_into(&inline.selection_set, fragments, vars, type_name, out)?;
             }
@@ -2884,4 +2850,25 @@ fn directives_include(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod capability_source_tests {
+    use super::*;
+
+    #[test]
+    fn planner_uses_named_default_source_capabilities() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "sources": [
+                { "name": "primary", "kind": "postgres", "configuration": {}, "tables": [] },
+                { "name": "default", "kind": "clickhouse", "configuration": {}, "tables": [] }
+            ]
+        }))
+        .unwrap();
+        let catalog = Catalog::default();
+        let planner = Planner::new(&metadata, &catalog);
+        assert!(!planner.capabilities.mutations);
+        assert!(!planner.capabilities.relay);
+    }
 }

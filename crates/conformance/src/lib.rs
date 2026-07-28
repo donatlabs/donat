@@ -176,8 +176,8 @@ pub fn json_matches(exp: &Json, act: &Json, sel: Option<&SelMap>) -> bool {
                 return false;
             }
             if let Some(tree) = sel {
-                let eseq: Vec<&String> = e.keys().filter(|k| tree.contains_key(*k)).collect();
-                let aseq: Vec<&String> = a.keys().filter(|k| tree.contains_key(*k)).collect();
+                let eseq: Vec<&String> = e.keys().filter(|k| tree.contains_key(k)).collect();
+                let aseq: Vec<&String> = a.keys().filter(|k| tree.contains_key(k)).collect();
                 if eseq != aseq {
                     return false;
                 }
@@ -2090,11 +2090,11 @@ impl Running {
                 let action = args["action"].as_str().expect("action").to_string();
                 let role = args["role"].as_str().expect("role").to_string();
                 let mut md = self.metadata.borrow_mut();
-                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
-                    if !a.permissions.iter().any(|p| p.role == role) {
-                        a.permissions
-                            .push(donat_metadata::ActionPermission { role });
-                    }
+                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action)
+                    && !a.permissions.iter().any(|p| p.role == role)
+                {
+                    a.permissions
+                        .push(donat_metadata::ActionPermission { role });
                 }
             }
 
@@ -3265,6 +3265,7 @@ mod tests {
             "actions",
             "agg_relay_introspection",
             "auth_env",
+            "commands",
             "cron_triggers",
             "enabled_apis",
             "event_triggers",

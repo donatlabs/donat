@@ -1428,19 +1428,18 @@ impl<'a> Planner<'a> {
             for key in map.keys() {
                 let Some(db_key) = ctx.column_db_name(key) else {
                     let value = map.get(key).expect("key came from map");
-                    if self.capabilities.nested_inserts {
-                        if let Some(nested) =
+                    if self.capabilities.nested_inserts
+                        && let Some(nested) =
                             self.parse_nested_object_insert(ctx, key, value, session, path)?
-                        {
-                            if objects.len() != 1 {
-                                return Err(PlanError::validation(
-                                    path,
-                                    "nested object inserts support a single object",
-                                ));
-                            }
-                            nested_object_inserts.push(nested);
-                            continue;
+                    {
+                        if objects.len() != 1 {
+                            return Err(PlanError::validation(
+                                path,
+                                "nested object inserts support a single object",
+                            ));
                         }
+                        nested_object_inserts.push(nested);
+                        continue;
                     }
                     return Err(field_not_found(
                         path,
@@ -1749,51 +1748,47 @@ impl<'a> Planner<'a> {
         // restricts which existing rows may be updated, and its presets
         // are applied.
         let mut set_ops = vec![];
-        if !update_columns.is_empty() {
-            if let Some(update_perm) = ctx
+        if !update_columns.is_empty()
+            && let Some(update_perm) = ctx
                 .entry
                 .update_permissions
                 .iter()
                 .find(|p| p.role == session.role)
                 .map(|p| &p.permission)
+        {
+            if !update_perm.filter.is_null()
+                && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
             {
-                if !update_perm.filter.is_null()
-                    && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
-                {
-                    let filter_ctx = self.filter_ctx_of(ctx);
-                    let filter =
-                        self.parse_bool_exp(&update_perm.filter, &filter_ctx, session, true, path)?;
-                    predicate = Some(match predicate.take() {
-                        Some(p) => BoolExp::And(vec![p, filter]),
-                        None => filter,
-                    });
-                }
-                for (col, value) in &update_perm.set {
-                    let Some(info) = ctx.info.column(col) else {
-                        continue;
-                    };
-                    let resolved = match value {
-                        Json::String(s) if is_session_var_name(s) => {
-                            let v = session.var(s).ok_or_else(|| {
-                                PlanError::new(
-                                    "$",
-                                    "not-found",
-                                    format!(
-                                        "missing session variable: \"{}\"",
-                                        s.to_ascii_lowercase()
-                                    ),
-                                )
-                            })?;
-                            Json::String(v.to_string())
-                        }
-                        other => other.clone(),
-                    };
-                    set_ops.push(SetOp::Set {
-                        column: col.clone(),
-                        pg_type: info.sql_type().to_string(),
-                        value: Scalar::Json(resolved),
-                    });
-                }
+                let filter_ctx = self.filter_ctx_of(ctx);
+                let filter =
+                    self.parse_bool_exp(&update_perm.filter, &filter_ctx, session, true, path)?;
+                predicate = Some(match predicate.take() {
+                    Some(p) => BoolExp::And(vec![p, filter]),
+                    None => filter,
+                });
+            }
+            for (col, value) in &update_perm.set {
+                let Some(info) = ctx.info.column(col) else {
+                    continue;
+                };
+                let resolved = match value {
+                    Json::String(s) if is_session_var_name(s) => {
+                        let v = session.var(s).ok_or_else(|| {
+                            PlanError::new(
+                                "$",
+                                "not-found",
+                                format!("missing session variable: \"{}\"", s.to_ascii_lowercase()),
+                            )
+                        })?;
+                        Json::String(v.to_string())
+                    }
+                    other => other.clone(),
+                };
+                set_ops.push(SetOp::Set {
+                    column: col.clone(),
+                    pg_type: info.sql_type().to_string(),
+                    value: Scalar::Json(resolved),
+                });
             }
         }
 

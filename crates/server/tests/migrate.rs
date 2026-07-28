@@ -26,7 +26,7 @@ async fn fresh_migration_database(label: &str) -> (String, String, String) {
     let (client, connection) = tokio_postgres::connect(&admin_url, NoTls)
         .await
         .expect("Postgres admin database is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "DROP DATABASE IF EXISTS {database_name} WITH (FORCE);"
@@ -55,7 +55,7 @@ async fn drop_migration_database(admin_url: &str, database_name: &str) {
     let (client, connection) = tokio_postgres::connect(admin_url, NoTls)
         .await
         .expect("Postgres admin database is available for cleanup");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!("DROP DATABASE {database_name} WITH (FORCE);"))
         .await
@@ -152,7 +152,7 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
 
     let columns = client
         .query(
@@ -334,7 +334,7 @@ async fn command_claims_migration_elects_idempotency_executor_with_canonical_key
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
 
     let relation: Option<String> = client
         .query_one(
@@ -482,7 +482,7 @@ async fn check_consistency_collects_static_command_diagnostics() {
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{table} (id uuid PRIMARY KEY);"
@@ -520,7 +520,7 @@ async fn check_consistency_rejects_out_of_range_int8_command_literal_without_wri
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{table} (id bigint PRIMARY KEY, note varchar(3), payload jsonb);"
@@ -596,7 +596,7 @@ async fn check_consistency_collects_each_independent_invalid_command_diagnostic(
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{table} (id bigint PRIMARY KEY, payload jsonb);"
@@ -680,7 +680,7 @@ async fn check_consistency_retains_duplicate_command_name_diagnostics() {
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{table} (id bigint PRIMARY KEY, payload jsonb);"
@@ -771,7 +771,7 @@ async fn check_consistency_accepts_nullable_varchar_literal_and_rejects_jsonb_li
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("isolated Postgres is available");
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{table} (id uuid PRIMARY KEY, note varchar(3), payload jsonb);"

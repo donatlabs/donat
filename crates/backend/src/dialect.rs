@@ -829,7 +829,7 @@ mod tests {
         // geometry_sql casts via quote_ident(pg_type), i.e. `::"geometry"`.
         assert_eq!(
             d.render_scalar(&s(geo.clone()), "geometry"),
-            format!("(ST_GeomFromGeoJSON('{}'))::\"geometry\"", geo.to_string())
+            format!("(ST_GeomFromGeoJSON('{geo}'))::\"geometry\"")
         );
     }
 

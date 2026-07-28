@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value as Json, json};
 
+type ParsedRequest = (String, Json, Vec<(String, String)>);
+
 /// Shared handle to the running engine, so callback endpoints (which run a
 /// GraphQL query back against the engine) can reach it once it has spawned.
 #[derive(Clone, Default)]
@@ -69,7 +71,7 @@ pub fn spawn() -> (String, EngineHandle) {
 }
 
 /// Parse one HTTP request: returns (path, parsed-json-body, raw-headers).
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Json, Vec<(String, String)>)> {
+fn read_request(stream: &mut std::net::TcpStream) -> Option<ParsedRequest> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     // Read until we have the full header block.

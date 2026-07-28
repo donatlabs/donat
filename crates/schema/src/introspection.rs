@@ -513,35 +513,33 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             select_columns.push(gql_name);
         }
         for rel in &entry.object_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
-                        // Donat makes an FK-based object relationship
-                        // non-nullable when the local FK column(s) are NOT
-                        // NULL (the related row always exists).
-                        let base = named("OBJECT", &table_base_name(remote_entry));
-                        let ty = if object_rel_is_non_null(rel, ctx.info) {
-                            non_null(base)
-                        } else {
-                            base
-                        };
-                        fields.push(field(&rel.name, vec![], ty));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                // Donat makes an FK-based object relationship
+                // non-nullable when the local FK column(s) are NOT
+                // NULL (the related row always exists).
+                let base = named("OBJECT", &table_base_name(remote_entry));
+                let ty = if object_rel_is_non_null(rel, ctx.info) {
+                    non_null(base)
+                } else {
+                    base
+                };
+                fields.push(field(&rel.name, vec![], ty));
             }
         }
         for rel in &entry.array_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
-                        let remote_base = table_base_name(remote_entry);
-                        fields.push(field(
-                            &rel.name,
-                            select_args(&remote_base),
-                            non_null(list_of(non_null(named("OBJECT", &remote_base)))),
-                        ));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                let remote_base = table_base_name(remote_entry);
+                fields.push(field(
+                    &rel.name,
+                    select_args(&remote_base),
+                    non_null(list_of(non_null(named("OBJECT", &remote_base)))),
+                ));
             }
         }
         types.push(object_type(&base, fields));
@@ -955,7 +953,7 @@ pub(crate) fn execute_introspection_schema(
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());
         let value = match root.name.as_str() {
             "__typename" => Json::String("query_root".to_string()),
-            "__schema" => match project(&schema, &root.selection_set, &fragments, variables) {
+            "__schema" => match project(schema, &root.selection_set, &fragments, variables) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             },

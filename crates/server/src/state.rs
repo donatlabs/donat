@@ -1020,10 +1020,10 @@ fn resolve_source_url(source: &Source, default_url: &str) -> String {
             }
         };
     }
-    if source.kind == SourceKind::Clickhouse {
-        if let Some(url) = resolve_hasura_clickhouse_template(source) {
-            return url;
-        }
+    if source.kind == SourceKind::Clickhouse
+        && let Some(url) = resolve_hasura_clickhouse_template(source)
+    {
+        return url;
     }
     default_url.to_string()
 }

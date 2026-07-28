@@ -239,10 +239,10 @@ impl JwtConfig {
                                 key,
                             });
                         }
-                        if !new_keys.is_empty() {
-                            if let Ok(mut guard) = keys.write() {
-                                *guard = new_keys;
-                            }
+                        if !new_keys.is_empty()
+                            && let Ok(mut guard) = keys.write()
+                        {
+                            *guard = new_keys;
                         }
                     }
                 }
@@ -270,10 +270,10 @@ impl JwtConfig {
                     jsonwebtoken::errors::ErrorKind::InvalidToken,
                 );
                 for k in guard.iter() {
-                    if let (Some(kid), Some(tkid)) = (&k.kid, &header.kid) {
-                        if kid != tkid {
-                            continue;
-                        }
+                    if let (Some(kid), Some(tkid)) = (&k.kid, &header.kid)
+                        && kid != tkid
+                    {
+                        continue;
                     }
                     let mut validation = self.validation.clone();
                     validation.algorithms = vec![k.alg];

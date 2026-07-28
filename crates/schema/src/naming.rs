@@ -5,10 +5,10 @@ use donat_metadata::{QualifiedTable, TableEntry};
 /// The base GraphQL name of a table: `custom_name`/custom root field if set,
 /// otherwise `<name>` for the `public` schema and `<schema>_<name>` else.
 pub fn table_base_name(entry: &TableEntry) -> String {
-    if let Some(config) = &entry.configuration {
-        if let Some(custom) = &config.custom_name {
-            return custom.clone();
-        }
+    if let Some(config) = &entry.configuration
+        && let Some(custom) = &config.custom_name
+    {
+        return custom.clone();
     }
     default_base_name(&entry.table)
 }
