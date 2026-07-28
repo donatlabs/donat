@@ -1024,6 +1024,249 @@ fn rejects_command_result_type_colliding_with_its_custom_input_argument_type() {
 }
 
 #[test]
+fn rejects_command_result_type_colliding_with_a_public_action_input_type() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    command["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects[0].name = "FooBarResult".to_string();
+    metadata.actions.push(
+        serde_json::from_value(json!({
+            "name": "public_submit",
+            "definition": {
+                "handler": "https://example.invalid/public-submit",
+                "arguments": [{ "name": "input", "type": "FooBarResult!" }],
+                "output_type": "String"
+            },
+            "permissions": []
+        }))
+        .expect("public action metadata deserializes"),
+    );
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in commands[0] (source 'default') and actions[0] (action 'public_submit') -> custom_types.input_objects[0]"
+    );
+}
+
+#[test]
+fn rejects_command_row_type_colliding_with_a_public_action_output_type() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    command["steps"][0]["insert"]["returning"] = json!(["id", "status"]);
+    command["result"] = json!({ "order": { "step": "order" } });
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.objects.push(
+        serde_json::from_value(json!({
+            "name": "FooBarOrderRow",
+            "fields": [{ "name": "id", "type": "uuid!" }]
+        }))
+        .expect("public action output type metadata deserializes"),
+    );
+    metadata.actions.push(
+        serde_json::from_value(json!({
+            "name": "public_order",
+            "definition": {
+                "handler": "https://example.invalid/public-order",
+                "output_type": "FooBarOrderRow"
+            },
+            "permissions": []
+        }))
+        .expect("public action metadata deserializes"),
+    );
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarOrderRow' is visible to role 'customer' in commands[0] (source 'default') and actions[0] (action 'public_order') -> custom_types.objects[0]"
+    );
+}
+
+#[test]
+fn permits_a_command_type_matching_an_action_hidden_from_its_role() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    command["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects[0].name = "FooBarResult".to_string();
+    metadata.actions.push(
+        serde_json::from_value(json!({
+            "name": "supplier_submit",
+            "definition": {
+                "handler": "https://example.invalid/supplier-submit",
+                "arguments": [{ "name": "input", "type": "FooBarResult!" }],
+                "output_type": "String"
+            },
+            "permissions": [{ "role": "supplier" }]
+        }))
+        .expect("permissioned action metadata deserializes"),
+    );
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert!(
+        diagnostics.is_empty(),
+        "an action unavailable to customer must not reserve its types: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn accepts_a_command_argument_with_a_directly_recursive_input_object() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "tree", "type": "TreeInput!" }));
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects[0] = serde_json::from_value(json!({
+        "name": "TreeInput",
+        "fields": [{ "name": "children", "type": "[TreeInput!]" }]
+    }))
+    .expect("recursive input type metadata deserializes");
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+
+    let commands = command_catalog(&metadata, &catalogs);
+    let _schema = runtime_schema(&metadata, &catalogs, commands.clone());
+
+    let valid = r#"
+        mutation {
+          create_order(
+            id: "00000000-0000-0000-0000-000000000001"
+            customer_id: "00000000-0000-0000-0000-000000000002"
+            status: "new"
+            quantity: 1
+            request_id: "00000000-0000-0000-0000-000000000003"
+            tree: { children: [{ children: [] }] }
+          ) { order_id }
+        }
+    "#;
+    plan_runtime(&metadata, &catalogs, commands.clone(), "customer", valid)
+        .expect("a finite recursive input value plans successfully");
+
+    let invalid = r#"
+        mutation {
+          create_order(
+            id: "00000000-0000-0000-0000-000000000001"
+            customer_id: "00000000-0000-0000-0000-000000000002"
+            status: "new"
+            quantity: 1
+            request_id: "00000000-0000-0000-0000-000000000003"
+            tree: { children: ["not an input object"] }
+          ) { order_id }
+        }
+    "#;
+    let error = plan_runtime(&metadata, &catalogs, commands, "customer", invalid)
+        .expect_err("nested recursive input values keep their declared validation");
+    assert_eq!(error.message, "argument must be input object 'TreeInput'");
+}
+
+#[test]
+fn accepts_a_command_argument_with_an_indirectly_recursive_input_object() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "root", "type": "FirstInput!" }));
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects = vec![
+        serde_json::from_value(json!({
+            "name": "FirstInput",
+            "fields": [{ "name": "second", "type": "SecondInput!" }]
+        }))
+        .expect("first recursive input metadata deserializes"),
+        serde_json::from_value(json!({
+            "name": "SecondInput",
+            "fields": [{ "name": "firsts", "type": "[FirstInput!]" }]
+        }))
+        .expect("second recursive input metadata deserializes"),
+    ];
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+
+    let commands = command_catalog(&metadata, &catalogs);
+    let _schema = runtime_schema(&metadata, &catalogs, commands.clone());
+    let mutation = r#"
+        mutation {
+          create_order(
+            id: "00000000-0000-0000-0000-000000000001"
+            customer_id: "00000000-0000-0000-0000-000000000002"
+            status: "new"
+            quantity: 1
+            request_id: "00000000-0000-0000-0000-000000000003"
+            root: { second: { firsts: [{ second: { firsts: [] } }] } }
+          ) { order_id }
+        }
+    "#;
+    plan_runtime(&metadata, &catalogs, commands, "customer", mutation)
+        .expect("a finite indirectly recursive input value plans successfully");
+}
+
+#[test]
+fn detects_a_generated_type_collision_reachable_inside_a_recursive_input_cycle() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    command["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "root", "type": "RootInput!" }));
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects = vec![
+        serde_json::from_value(json!({
+            "name": "RootInput",
+            "fields": [{ "name": "result", "type": "FooBarResult!" }]
+        }))
+        .expect("recursive input root metadata deserializes"),
+        serde_json::from_value(json!({
+            "name": "FooBarResult",
+            "fields": [{ "name": "roots", "type": "[RootInput!]" }]
+        }))
+        .expect("recursive input nested metadata deserializes"),
+    ];
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in commands[0] (source 'default') and custom_types.input_objects[1]"
+    );
+}
+
+#[test]
 fn rejects_command_result_type_colliding_with_a_role_visible_table_type() {
     let mut command = valid_command();
     command["name"] = json!("foo_bar");

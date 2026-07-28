@@ -88,6 +88,11 @@ enum StaticType {
         name: String,
         fields: BTreeMap<String, StaticType>,
     },
+    /// A back-edge to an input object already being expanded during
+    /// deployment validation. It never leaves this static type checker.
+    ObjectRef {
+        name: String,
+    },
     List(Box<StaticType>),
     Row(BTreeMap<String, StaticType>),
     Rows(BTreeMap<String, StaticType>),
@@ -550,7 +555,7 @@ impl StaticType {
     fn display_name(&self) -> String {
         match self {
             Self::Scalar(name) => name.clone(),
-            Self::Object { name, .. } => format!("object {name}"),
+            Self::Object { name, .. } | Self::ObjectRef { name } => format!("object {name}"),
             Self::List(item) => format!("list<{}>", item.display_name()),
             Self::Row(_) => "row".to_string(),
             Self::Rows(_) => "list<row>".to_string(),
@@ -1081,29 +1086,31 @@ fn add_visible_custom_type_owners(
                     .command
                     .arguments
                     .iter()
-                    .map(|argument| argument.type_.as_str()),
+                    .map(|argument| (argument.type_.as_str(), None)),
             );
         }
     }
-    for action in &metadata.actions {
-        if action
-            .permissions
-            .iter()
-            .any(|permission| permission.role == role)
+    for (action_index, action) in metadata.actions.iter().enumerate() {
+        if action.permissions.is_empty()
+            || action
+                .permissions
+                .iter()
+                .any(|permission| permission.role == role)
         {
+            let action_origin = format!("actions[{action_index}] (action '{}')", action.name);
             pending.extend(
                 action
                     .definition
                     .arguments
                     .iter()
-                    .map(|argument| argument.type_.as_str()),
+                    .map(|argument| (argument.type_.as_str(), Some(action_origin.clone()))),
             );
-            pending.push(action.definition.output_type.as_str());
+            pending.push((action.definition.output_type.as_str(), Some(action_origin)));
         }
     }
 
     let mut seen = HashSet::new();
-    while let Some(type_) = pending.pop() {
+    while let Some((type_, root_origin)) = pending.pop() {
         let name = graphql_named_type_name(type_);
         if !seen.insert(name.to_string()) {
             continue;
@@ -1118,9 +1125,17 @@ fn add_visible_custom_type_owners(
             owners
                 .entry(name.to_string())
                 .or_insert_with(|| ExistingGraphqlTypeOwner {
-                    origin: format!("custom_types.input_objects[{index}]"),
+                    origin: custom_type_owner_origin(
+                        root_origin.as_deref(),
+                        format!("custom_types.input_objects[{index}]"),
+                    ),
                 });
-            pending.extend(input.fields.iter().map(|field| field.type_.as_str()));
+            pending.extend(
+                input
+                    .fields
+                    .iter()
+                    .map(|field| (field.type_.as_str(), root_origin.clone())),
+            );
             continue;
         }
         if let Some((index, object)) = metadata
@@ -1133,9 +1148,17 @@ fn add_visible_custom_type_owners(
             owners
                 .entry(name.to_string())
                 .or_insert_with(|| ExistingGraphqlTypeOwner {
-                    origin: format!("custom_types.objects[{index}]"),
+                    origin: custom_type_owner_origin(
+                        root_origin.as_deref(),
+                        format!("custom_types.objects[{index}]"),
+                    ),
                 });
-            pending.extend(object.fields.iter().map(|field| field.type_.as_str()));
+            pending.extend(
+                object
+                    .fields
+                    .iter()
+                    .map(|field| (field.type_.as_str(), root_origin.clone())),
+            );
             continue;
         }
         if let Some((index, _)) = metadata
@@ -1148,7 +1171,10 @@ fn add_visible_custom_type_owners(
             owners
                 .entry(name.to_string())
                 .or_insert_with(|| ExistingGraphqlTypeOwner {
-                    origin: format!("custom_types.enums[{index}]"),
+                    origin: custom_type_owner_origin(
+                        root_origin.as_deref(),
+                        format!("custom_types.enums[{index}]"),
+                    ),
                 });
             continue;
         }
@@ -1162,10 +1188,19 @@ fn add_visible_custom_type_owners(
             owners
                 .entry(name.to_string())
                 .or_insert_with(|| ExistingGraphqlTypeOwner {
-                    origin: format!("custom_types.scalars[{index}]"),
+                    origin: custom_type_owner_origin(
+                        root_origin.as_deref(),
+                        format!("custom_types.scalars[{index}]"),
+                    ),
                 });
         }
     }
+}
+
+fn custom_type_owner_origin(root_origin: Option<&str>, type_origin: String) -> String {
+    root_origin
+        .map(|origin| format!("{origin} -> {type_origin}"))
+        .unwrap_or(type_origin)
 }
 
 fn graphql_named_type_name(type_: &str) -> &str {
@@ -2227,6 +2262,16 @@ fn parse_command_type(
     type_: &str,
     path: &str,
 ) -> Result<StaticType, PlanError> {
+    let mut active_inputs = HashSet::new();
+    parse_command_type_with_active_inputs(metadata, type_, path, &mut active_inputs)
+}
+
+fn parse_command_type_with_active_inputs(
+    metadata: &Metadata,
+    type_: &str,
+    path: &str,
+    active_inputs: &mut HashSet<String>,
+) -> Result<StaticType, PlanError> {
     parse_type_with_named(type_, path, |name| {
         if let Some(input) = metadata
             .custom_types
@@ -2234,17 +2279,31 @@ fn parse_command_type(
             .iter()
             .find(|input| input.name == name)
         {
-            let mut fields = BTreeMap::new();
-            for field in &input.fields {
-                fields.insert(
-                    field.name.clone(),
-                    parse_command_type(metadata, &field.type_, path)?,
-                );
+            if !active_inputs.insert(name.to_string()) {
+                return Ok(Some(StaticType::ObjectRef {
+                    name: name.to_string(),
+                }));
             }
-            return Ok(Some(StaticType::Object {
-                name: name.to_string(),
-                fields,
-            }));
+            let parsed = (|| {
+                let mut fields = BTreeMap::new();
+                for field in &input.fields {
+                    fields.insert(
+                        field.name.clone(),
+                        parse_command_type_with_active_inputs(
+                            metadata,
+                            &field.type_,
+                            path,
+                            active_inputs,
+                        )?,
+                    );
+                }
+                Ok(StaticType::Object {
+                    name: name.to_string(),
+                    fields,
+                })
+            })();
+            active_inputs.remove(name);
+            return parsed.map(Some);
         }
         if metadata
             .custom_types
@@ -2266,13 +2325,12 @@ fn parse_command_type(
 fn parse_type_with_named(
     type_: &str,
     path: &str,
-    named: impl Fn(&str) -> Result<Option<StaticType>, PlanError>,
+    mut named: impl FnMut(&str) -> Result<Option<StaticType>, PlanError>,
 ) -> Result<StaticType, PlanError> {
-    fn parse(
-        source: &str,
-        path: &str,
-        named: &impl Fn(&str) -> Result<Option<StaticType>, PlanError>,
-    ) -> Result<StaticType, PlanError> {
+    fn parse<F>(source: &str, path: &str, named: &mut F) -> Result<StaticType, PlanError>
+    where
+        F: FnMut(&str) -> Result<Option<StaticType>, PlanError>,
+    {
         let source = source.strip_suffix('!').unwrap_or(source);
         if let Some(inner) = source
             .strip_prefix('[')
@@ -2299,7 +2357,7 @@ fn parse_type_with_named(
             format!("unknown command argument type '{source}'"),
         ))
     }
-    parse(type_, path, &named)
+    parse(type_, path, &mut named)
 }
 
 fn column_type(column: &ColumnInfo) -> StaticType {
