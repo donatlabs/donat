@@ -5,13 +5,22 @@
 //! `specs/004-decision-rules.md`; it never evaluates source text at request
 //! time and has no ambient access to runtime state.
 
+mod eval;
 mod lexer;
 mod parser;
+mod types;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use eval::{RuleBindings, compile_catalog, evaluate_bool};
 pub use parser::parse_expression;
+pub use types::{
+    CompiledDecisionRow, CompiledDecisionTable, CompiledRule, DecisionConditionTrace,
+    DecisionRejection, DecisionResult, DecisionRow, DecisionTableDefinition, DecisionTableTestCase,
+    DecisionTestExpectation, DecisionTrace, HitPolicy, RuleCatalog, RuleDefinition, RuleError,
+    RuleType,
+};
 
 /// Maximum UTF-8 source size for a single declarative rule expression.
 pub const MAX_EXPRESSION_BYTES: usize = 4096;
