@@ -631,7 +631,85 @@ async fn check_consistency_rejects_same_role_command_root_across_sources() {
     assert_eq!(
         problems,
         vec![
-            "commands[1]: command root 'create_order' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
+            "commands[1]: command root 'create_order' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')",
+            "commands[1]: generated command type 'CreateOrderResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn check_consistency_rejects_identical_generated_command_result_types() {
+    let table = format!(
+        "donat_command_type_collision_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("Postgres is available");
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id uuid PRIMARY KEY);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: foo_bar
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "00000000-0000-0000-0000-000000000001" }}
+        returning: [id]
+  result:
+    id: {{ step: order, column: id }}
+- name: fooBar
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "00000000-0000-0000-0000-000000000002" }}
+        returning: [id]
+  result:
+    id: {{ step: order, column: id }}
+"#
+        ),
+    )
+    .expect("collision command metadata writes");
+
+    let problems = check_consistency(&url, &metadata.path)
+        .await
+        .expect("metadata validation completes");
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert_eq!(
+        problems,
+        vec![
+            "commands[1]: generated command type 'FooBarResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
         ]
     );
 }

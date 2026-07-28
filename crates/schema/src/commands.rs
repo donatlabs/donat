@@ -17,8 +17,9 @@ use donat_metadata::{
 use donat_rules::{RuleCatalog, RuleType};
 use uuid::Uuid;
 
-use crate::naming::command_pascal_case;
-use crate::plan::{MutationKind, PlanError, Planner};
+use crate::introspection::build_schema_json;
+use crate::naming::{command_pascal_case, table_base_name};
+use crate::plan::{MutationKind, PlanError, Planner, Session};
 
 /// Immutable command definitions grouped by their Postgres source.
 #[derive(Debug, Clone)]
@@ -601,6 +602,14 @@ struct ValidatedCommand<'a> {
     command: &'a Command,
 }
 
+/// A type already emitted into a role schema before command output types are
+/// added. Diagnostics retain its metadata origin rather than exposing a
+/// misleading generic GraphQL validation error later in introspection.
+#[derive(Debug, Clone)]
+struct ExistingGraphqlTypeOwner {
+    origin: String,
+}
+
 /// Compile every command against the supplied immutable catalogs. A caller
 /// must build the Rules catalog before this function; commands never parse
 /// expressions or duplicate the Rules type checker.
@@ -721,7 +730,10 @@ fn compile_command_catalog_with_diagnostics(
         }
     }
     diagnostics.extend(validate_role_visible_command_collisions(
-        &validated, catalogs,
+        metadata,
+        &validated,
+        catalogs,
+        infer_function_permissions,
     ));
     (CompiledCommandCatalog { sources }, diagnostics)
 }
@@ -732,8 +744,10 @@ fn compile_command_catalog_with_diagnostics(
 /// roles that can actually see it. That keeps a candidate deployment honest
 /// without rejecting two source-local commands that live in disjoint schemas.
 fn validate_role_visible_command_collisions(
+    metadata: &Metadata,
     commands: &[ValidatedCommand<'_>],
     catalogs: &HashMap<String, Catalog>,
+    infer_function_permissions: bool,
 ) -> Vec<PlanError> {
     let mut diagnostics = Vec::new();
     let mut roots: HashMap<(String, String), &ValidatedCommand<'_>> = HashMap::new();
@@ -741,6 +755,7 @@ fn validate_role_visible_command_collisions(
         (String, String),
         (GeneratedCommandTypeShape, &ValidatedCommand<'_>),
     > = HashMap::new();
+    let mut existing_types_by_role = HashMap::new();
 
     for command in commands {
         let catalog = catalogs
@@ -749,6 +764,17 @@ fn validate_role_visible_command_collisions(
         let shapes = generated_command_type_shapes(command.command, catalog);
         for permission in &command.command.permissions {
             let role = permission.role.clone();
+            let existing_types = existing_types_by_role
+                .entry(role.clone())
+                .or_insert_with(|| {
+                    role_visible_existing_type_owners(
+                        metadata,
+                        commands,
+                        catalogs,
+                        &role,
+                        infer_function_permissions,
+                    )
+                });
             let root_key = (role.clone(), command.command.name.clone());
             if let Some(existing) = roots.get(&root_key)
                 && existing.source != command.source
@@ -773,21 +799,33 @@ fn validate_role_visible_command_collisions(
             for (name, shape) in &shapes {
                 let type_key = (role.clone(), name.clone());
                 if let Some((existing_shape, existing)) = generated_types.get(&type_key) {
-                    if existing_shape != shape {
-                        let path = format!("commands[{}]", command.index);
-                        diagnostics.push(PlanError::validation(
-                            &path,
-                            format!(
-                                "generated command type '{}' is visible to role '{}' in both commands[{}] (source '{}') and commands[{}] (source '{}')",
-                                name,
-                                role,
-                                existing.index,
-                                existing.source,
-                                command.index,
-                                command.source,
-                            ),
-                        ));
-                    }
+                    // Equal GraphQL shapes still cannot co-own one named type:
+                    // GraphQL has a single shared namespace, not structural
+                    // interning. Keep the shape value in the catalog only for
+                    // the focused collision tests and future diagnostics.
+                    let _same_shape = existing_shape == shape;
+                    let path = format!("commands[{}]", command.index);
+                    diagnostics.push(PlanError::validation(
+                        &path,
+                        format!(
+                            "generated command type '{}' is visible to role '{}' in both commands[{}] (source '{}') and commands[{}] (source '{}')",
+                            name,
+                            role,
+                            existing.index,
+                            existing.source,
+                            command.index,
+                            command.source,
+                        ),
+                    ));
+                } else if let Some(existing) = existing_types.get(name) {
+                    let path = format!("commands[{}]", command.index);
+                    diagnostics.push(PlanError::validation(
+                        &path,
+                        format!(
+                            "generated command type '{}' is visible to role '{}' in commands[{}] (source '{}') and {}",
+                            name, role, command.index, command.source, existing.origin,
+                        ),
+                    ));
                 } else {
                     generated_types.insert(type_key, (shape.clone(), command));
                 }
@@ -959,6 +997,184 @@ fn command_literal_scalar_name(literal: &serde_json::Value) -> &'static str {
             unreachable!("the static command compiler rejects non-scalar result literals")
         }
     }
+}
+
+/// Collect the pre-command type namespace for one role. The command-free
+/// schema build is deploy-time only: it consumes immutable metadata and
+/// catalog snapshots, never a request, a database connection, or command
+/// definitions. This keeps table visibility exactly aligned with runtime
+/// introspection, including inherited permissions and backend capabilities.
+fn role_visible_existing_type_owners(
+    metadata: &Metadata,
+    commands: &[ValidatedCommand<'_>],
+    catalogs: &HashMap<String, Catalog>,
+    role: &str,
+    infer_function_permissions: bool,
+) -> BTreeMap<String, ExistingGraphqlTypeOwner> {
+    let mut owners = BTreeMap::new();
+    let session = Session {
+        role: role.to_string(),
+        vars: HashMap::new(),
+        backend_request: false,
+    };
+
+    for (source_index, source) in metadata.sources.iter().enumerate() {
+        let Some(catalog) = catalogs.get(&source.name) else {
+            continue;
+        };
+        let mut planner = Planner::for_source(metadata, source, catalog);
+        planner.infer_function_permissions = infer_function_permissions;
+        let schema = build_schema_json(&planner, &session);
+        for type_ in schema["types"].as_array().into_iter().flatten() {
+            let Some(name) = type_["name"].as_str() else {
+                continue;
+            };
+            owners
+                .entry(name.to_string())
+                .or_insert_with(|| ExistingGraphqlTypeOwner {
+                    origin: source_type_owner(source_index, source, &planner, role, name),
+                });
+        }
+    }
+
+    add_visible_custom_type_owners(metadata, commands, role, &mut owners);
+    owners
+}
+
+fn source_type_owner(
+    source_index: usize,
+    source: &Source,
+    planner: &Planner,
+    role: &str,
+    name: &str,
+) -> String {
+    if let Some((table_index, _)) = source.tables.iter().enumerate().find(|(index, table)| {
+        planner.table_ctx(*index, role).is_some() && table_base_name(table) == name
+    }) {
+        return format!(
+            "sources[{source_index}].tables[{table_index}] (source '{}')",
+            source.name
+        );
+    }
+    format!("sources[{source_index}] (source '{}')", source.name)
+}
+
+/// Custom types are added by command/action roots, not by the ordinary table
+/// schema builder. Follow only references reachable from roots visible to this
+/// role, so two genuinely disjoint role schemas remain independent.
+fn add_visible_custom_type_owners(
+    metadata: &Metadata,
+    commands: &[ValidatedCommand<'_>],
+    role: &str,
+    owners: &mut BTreeMap<String, ExistingGraphqlTypeOwner>,
+) {
+    let mut pending = Vec::new();
+    for command in commands {
+        if command
+            .command
+            .permissions
+            .iter()
+            .any(|permission| permission.role == role)
+        {
+            pending.extend(
+                command
+                    .command
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.type_.as_str()),
+            );
+        }
+    }
+    for action in &metadata.actions {
+        if action
+            .permissions
+            .iter()
+            .any(|permission| permission.role == role)
+        {
+            pending.extend(
+                action
+                    .definition
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.type_.as_str()),
+            );
+            pending.push(action.definition.output_type.as_str());
+        }
+    }
+
+    let mut seen = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        let name = graphql_named_type_name(type_);
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        if let Some((index, input)) = metadata
+            .custom_types
+            .input_objects
+            .iter()
+            .enumerate()
+            .find(|(_, input)| input.name == name)
+        {
+            owners
+                .entry(name.to_string())
+                .or_insert_with(|| ExistingGraphqlTypeOwner {
+                    origin: format!("custom_types.input_objects[{index}]"),
+                });
+            pending.extend(input.fields.iter().map(|field| field.type_.as_str()));
+            continue;
+        }
+        if let Some((index, object)) = metadata
+            .custom_types
+            .objects
+            .iter()
+            .enumerate()
+            .find(|(_, object)| object.name == name)
+        {
+            owners
+                .entry(name.to_string())
+                .or_insert_with(|| ExistingGraphqlTypeOwner {
+                    origin: format!("custom_types.objects[{index}]"),
+                });
+            pending.extend(object.fields.iter().map(|field| field.type_.as_str()));
+            continue;
+        }
+        if let Some((index, _)) = metadata
+            .custom_types
+            .enums
+            .iter()
+            .enumerate()
+            .find(|(_, enum_)| enum_.name == name)
+        {
+            owners
+                .entry(name.to_string())
+                .or_insert_with(|| ExistingGraphqlTypeOwner {
+                    origin: format!("custom_types.enums[{index}]"),
+                });
+            continue;
+        }
+        if let Some((index, _)) = metadata
+            .custom_types
+            .scalars
+            .iter()
+            .enumerate()
+            .find(|(_, scalar)| scalar.name == name)
+        {
+            owners
+                .entry(name.to_string())
+                .or_insert_with(|| ExistingGraphqlTypeOwner {
+                    origin: format!("custom_types.scalars[{index}]"),
+                });
+        }
+    }
+}
+
+fn graphql_named_type_name(type_: &str) -> &str {
+    let type_ = type_.strip_suffix('!').unwrap_or(type_);
+    type_
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .map(graphql_named_type_name)
+        .unwrap_or(type_)
 }
 
 fn validate_command(

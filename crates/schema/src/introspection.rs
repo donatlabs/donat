@@ -380,7 +380,8 @@ fn add_command_schema(
     command: &Command,
     types: &mut Vec<Json>,
     scalars: &mut std::collections::BTreeSet<String>,
-    generated: &mut std::collections::BTreeSet<String>,
+    emitted_row_types: &mut std::collections::BTreeSet<String>,
+    emitted_input_types: &mut std::collections::BTreeSet<String>,
 ) -> Json {
     let result_name = format!("{}Result", command_pascal_case(&command.name));
     let result_fields = command
@@ -397,14 +398,12 @@ fn add_command_schema(
                     &field_definition.value,
                     types,
                     scalars,
-                    generated,
+                    emitted_row_types,
                 ),
             )
         })
         .collect();
-    if generated.insert(result_name.clone()) {
-        types.push(object_type(&result_name, result_fields));
-    }
+    types.push(object_type(&result_name, result_fields));
     let arguments = command
         .arguments
         .iter()
@@ -414,7 +413,7 @@ fn add_command_schema(
                 &argument.type_,
                 types,
                 scalars,
-                generated,
+                emitted_input_types,
             );
             input_value(
                 &argument.name,
@@ -802,15 +801,20 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         }
     }
 
-    let mut generated_command_types = std::collections::BTreeSet::new();
+    let mut emitted_command_input_types = std::collections::BTreeSet::new();
     for command in planner.command_definitions() {
         if planner.command_is_visible(command, session) {
+            // Generated output names belong to one command. The static command
+            // catalog rejects cross-command collisions, so introspection must
+            // not silently coalesce two different command definitions here.
+            let mut emitted_command_row_types = std::collections::BTreeSet::new();
             mutation_fields.push(add_command_schema(
                 planner,
                 command.definition(),
                 &mut types,
                 &mut scalars,
-                &mut generated_command_types,
+                &mut emitted_command_row_types,
+                &mut emitted_command_input_types,
             ));
         }
     }

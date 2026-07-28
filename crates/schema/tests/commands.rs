@@ -874,11 +874,16 @@ fn rejects_command_root_collisions_visible_to_the_same_role_across_sources() {
 
     let diagnostics = validate_command_catalog(&metadata, &catalogs, &rules(), true);
 
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
     assert_eq!(diagnostics[0].path, "commands[1]");
     assert_eq!(
         diagnostics[0].message,
         "command root 'create_order' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
+    );
+    assert_eq!(diagnostics[1].path, "commands[1]");
+    assert_eq!(
+        diagnostics[1].message,
+        "generated command type 'CreateOrderResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
     );
 }
 
@@ -964,6 +969,86 @@ fn rejects_pascal_cased_command_result_type_collisions_in_one_role_schema() {
 }
 
 #[test]
+fn rejects_identical_pascal_cased_command_result_type_collisions_in_one_role_schema() {
+    let mut snake_case = valid_command();
+    snake_case["name"] = json!("foo_bar");
+    snake_case["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let mut camel_case = valid_command();
+    camel_case["name"] = json!("fooBar");
+    camel_case["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let metadata = metadata(vec![snake_case, camel_case]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
+    );
+}
+
+#[test]
+fn rejects_command_result_type_colliding_with_its_custom_input_argument_type() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "payload", "type": "FooBarResult!" }));
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects[0].name = "FooBarResult".to_string();
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in commands[0] (source 'default') and custom_types.input_objects[0]"
+    );
+}
+
+#[test]
+fn rejects_command_result_type_colliding_with_a_role_visible_table_type() {
+    let mut command = valid_command();
+    command["name"] = json!("foo_bar");
+    let mut metadata = metadata(vec![command]);
+    metadata.sources[0].tables[0].configuration = Some(
+        serde_json::from_value(json!({ "custom_name": "FooBarResult" }))
+            .expect("table configuration deserializes"),
+    );
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in commands[0] (source 'default') and sources[0].tables[0] (source 'default')"
+    );
+}
+
+#[test]
 fn rejects_pascal_cased_command_row_type_collisions_in_one_role_schema() {
     let mut snake_case = valid_command();
     snake_case["name"] = json!("foo_bar");
@@ -982,11 +1067,16 @@ fn rejects_pascal_cased_command_row_type_collisions_in_one_role_schema() {
         true,
     );
 
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
     assert_eq!(diagnostics[0].path, "commands[1]");
     assert_eq!(
         diagnostics[0].message,
         "generated command type 'FooBarOrderRow' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
+    );
+    assert_eq!(diagnostics[1].path, "commands[1]");
+    assert_eq!(
+        diagnostics[1].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
     );
 }
 
