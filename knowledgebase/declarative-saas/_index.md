@@ -9,6 +9,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/002-durable-process-operational-contracts]]
 - [[decisions/004-command-literal-db-scalar-validation]]
 - [[decisions/005-executable-command-resolved-ir]]
+- [[decisions/006-command-claim-election-separate-from-canonical-result-journal]]
 
 ## Reference governance
 

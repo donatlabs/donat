@@ -325,6 +325,153 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
 }
 
 #[tokio::test]
+async fn command_claims_migration_elects_idempotency_executor_with_canonical_key() {
+    let (admin_url, database_name, url) = fresh_migration_database("command_claims").await;
+    run_migrate(&url, &bundled_migrations_dir())
+        .await
+        .expect("bundled migrations apply");
+
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+
+    let relation: Option<String> = client
+        .query_one(
+            "SELECT to_regclass('donat.command_invocation_claims')::text",
+            &[],
+        )
+        .await
+        .expect("claim relation lookup succeeds")
+        .get(0);
+    assert_eq!(
+        relation.as_deref(),
+        Some("donat.command_invocation_claims"),
+        "V4 owns only the durable first-executor claim"
+    );
+
+    let columns = client
+        .query(
+            "
+            SELECT attribute.attname,
+                   format_type(attribute.atttypid, attribute.atttypmod),
+                   attribute.attnotnull,
+                   COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid), '')
+            FROM pg_attribute attribute
+            JOIN pg_class relation ON relation.oid = attribute.attrelid
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+            LEFT JOIN pg_attrdef default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+            WHERE namespace.nspname = 'donat'
+              AND relation.relname = 'command_invocation_claims'
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum
+            ",
+            &[],
+        )
+        .await
+        .expect("claim table columns query succeeds")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, bool>(2),
+                row.get::<_, String>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        vec![
+            ("command_name".into(), "text".into(), true, "".into()),
+            ("scope_hash".into(), "bytea".into(), true, "".into()),
+            ("key".into(), "text".into(), true, "".into()),
+            ("claim_state".into(), "text".into(), true, "".into()),
+            (
+                "expires_at".into(),
+                "timestamp with time zone".into(),
+                true,
+                "".into(),
+            ),
+            (
+                "created_at".into(),
+                "timestamp with time zone".into(),
+                true,
+                "now()".into(),
+            ),
+        ],
+        "claims retain no input, result, role, or raw scope values",
+    );
+
+    let primary_key_columns = client
+        .query(
+            "
+            SELECT attribute.attname
+            FROM pg_constraint constraint_row
+            CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_row.conrelid
+             AND attribute.attnum = key_column.attnum
+            WHERE constraint_row.conrelid = 'donat.command_invocation_claims'::regclass
+              AND constraint_row.contype = 'p'
+            ORDER BY key_column.position
+            ",
+            &[],
+        )
+        .await
+        .expect("claim primary-key query succeeds")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key_columns,
+        ["command_name", "scope_hash", "key"],
+        "claim and canonical journal share exactly one idempotency identity"
+    );
+
+    let claim_state_constraint: String = client
+        .query_one(
+            "
+            SELECT pg_get_constraintdef(constraint_row.oid)
+            FROM pg_constraint constraint_row
+            WHERE constraint_row.conrelid = 'donat.command_invocation_claims'::regclass
+              AND constraint_row.contype = 'c'
+            ",
+            &[],
+        )
+        .await
+        .expect("claim state check exists")
+        .get(0);
+    assert!(
+        claim_state_constraint.contains("claim_state")
+            && claim_state_constraint.contains("first")
+            && claim_state_constraint.contains("replay"),
+        "claim state is a bounded internal election marker: {claim_state_constraint}"
+    );
+
+    let expiry_index: String = client
+        .query_one(
+            "SELECT pg_get_indexdef('donat.command_invocation_claims_expires_at_idx'::regclass)",
+            &[],
+        )
+        .await
+        .expect("claim expiry index exists")
+        .get(0);
+    assert!(
+        expiry_index.contains("ON donat.command_invocation_claims")
+            && expiry_index.contains("(expires_at)"),
+        "claim retention index must target expires_at: {expiry_index}"
+    );
+
+    connection.abort();
+    drop_migration_database(&admin_url, &database_name).await;
+}
+
+#[tokio::test]
 async fn check_consistency_collects_static_command_diagnostics() {
     let table = format!(
         "donat_command_validate_{}_{}",
