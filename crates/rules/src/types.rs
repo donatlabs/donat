@@ -4,7 +4,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::Expr;
+use crate::{Expr, Span};
+
+/// Deploy-time metadata location and owner for one source expression. The
+/// compiler receives this from the metadata adapter so the rules crate stays
+/// independent from YAML parsing while preserving user-actionable locations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionContext {
+    pub metadata_path: String,
+    pub expression_owner: ExpressionOwner,
+}
+
+/// The closed set of deploy-time sources that may contain rule expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionOwner {
+    Rule {
+        name: String,
+    },
+    DecisionCondition {
+        table_name: String,
+        row_id: String,
+        input_name: String,
+    },
+}
+
+impl ExpressionContext {
+    pub(crate) fn parser_name(&self) -> &str {
+        match &self.expression_owner {
+            ExpressionOwner::Rule { name } => name,
+            ExpressionOwner::DecisionCondition { table_name, .. } => table_name,
+        }
+    }
+}
+
+/// A stable semantic validation location. It retains only deploy-time source
+/// ownership, a byte span, and the existing redacted validation message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleDiagnostic {
+    pub context: ExpressionContext,
+    pub span: Span,
+    pub message: String,
+}
 
 /// Types admitted by the restricted declarative rule profile.
 ///
@@ -216,6 +256,13 @@ pub struct RuleCatalog {
 /// secrets, provider credentials, or serialized JSON values.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RuleError {
+    #[error("{message}")]
+    Diagnostic {
+        diagnostic: Box<RuleDiagnostic>,
+        message: String,
+        #[source]
+        source: Box<RuleError>,
+    },
     #[error(transparent)]
     Parse(#[from] crate::ParseError),
     #[error("duplicate {kind} name `{name}`")]
@@ -289,4 +336,32 @@ pub enum RuleError {
     UnknownRule { rule: String },
     #[error("rule `{rule}` reached an invalid validated expression state")]
     InternalInvariant { rule: String },
+}
+
+impl RuleError {
+    /// Return the deploy-time semantic location when the compiler has one.
+    /// Parsing and runtime evaluation errors intentionally have no diagnostic.
+    pub fn diagnostic(&self) -> Option<&RuleDiagnostic> {
+        match self {
+            Self::Diagnostic { diagnostic, .. } => Some(diagnostic),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn with_diagnostic(self, context: &ExpressionContext, span: Span) -> Self {
+        if self.diagnostic().is_some() {
+            return self;
+        }
+
+        let message = self.to_string();
+        Self::Diagnostic {
+            diagnostic: Box::new(RuleDiagnostic {
+                context: context.clone(),
+                span,
+                message: message.clone(),
+            }),
+            message,
+            source: Box::new(self),
+        }
+    }
 }

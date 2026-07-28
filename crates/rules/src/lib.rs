@@ -14,14 +14,17 @@ mod types;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use eval::{RuleBindings, compile_catalog, compile_catalog_with_declared_types, evaluate_bool};
+pub use eval::{
+    RuleBindings, compile_catalog, compile_catalog_with_declared_types,
+    compile_catalog_with_declared_types_and_contexts, evaluate_bool,
+};
 pub use parser::parse_expression;
 pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres};
 pub use types::{
     CompiledDecisionRow, CompiledDecisionTable, CompiledRule, DecisionConditionTrace,
     DecisionRejection, DecisionResult, DecisionRow, DecisionTableDefinition, DecisionTableTestCase,
-    DecisionTestExpectation, DecisionTrace, HitPolicy, RuleCatalog, RuleDefinition, RuleError,
-    RuleType,
+    DecisionTestExpectation, DecisionTrace, ExpressionContext, ExpressionOwner, HitPolicy,
+    RuleCatalog, RuleDefinition, RuleDiagnostic, RuleError, RuleType,
 };
 
 /// Maximum UTF-8 source size for a single declarative rule expression.

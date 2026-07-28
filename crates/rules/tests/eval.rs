@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use donat_rules::{
     DecisionRow, DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation,
-    HitPolicy, RuleDefinition, RuleError, RuleType, compile_catalog,
-    compile_catalog_with_declared_types,
+    ExpressionContext, ExpressionOwner, HitPolicy, RuleDefinition, RuleError, RuleType, Span,
+    compile_catalog, compile_catalog_with_declared_types,
+    compile_catalog_with_declared_types_and_contexts,
 };
 use serde_json::{Value, json};
 
@@ -26,6 +27,30 @@ fn rule(
         result,
         expression: expression.to_owned(),
     }
+}
+
+fn rule_context(index: usize, name: &str) -> ExpressionContext {
+    ExpressionContext {
+        metadata_path: format!("rules.yaml.rules[{index}].expression"),
+        expression_owner: ExpressionOwner::Rule {
+            name: name.to_owned(),
+        },
+    }
+}
+
+fn compile_rule_in_context(
+    index: usize,
+    definition: RuleDefinition,
+    declared_types: BTreeMap<String, RuleType>,
+) -> Result<donat_rules::RuleCatalog, RuleError> {
+    let context = rule_context(index, &definition.name);
+    compile_catalog_with_declared_types_and_contexts(
+        &declared_types,
+        &[definition],
+        &[],
+        &[context],
+        &[],
+    )
 }
 
 fn object(name: &str, fields: BTreeMap<String, RuleType>) -> RuleType {
@@ -136,6 +161,147 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
     .expect_err("an object field absent from the declared shape must fail validation");
     assert!(
         matches!(catalog, donat_rules::RuleError::UnknownField { ref field, .. } if field == "email")
+    );
+}
+
+#[test]
+fn semantic_rule_errors_preserve_the_originating_source_context_and_span() {
+    let cases = [
+        (
+            0,
+            rule("undeclared", BTreeMap::new(), RuleType::Bool, "missing > 0"),
+            BTreeMap::new(),
+            Span::new(0, 7),
+            "rule `undeclared` uses undeclared binding `missing`",
+        ),
+        (
+            1,
+            rule(
+                "unknown_field",
+                map([(
+                    "customer",
+                    object("Customer", map([("name", RuleType::String)])),
+                )]),
+                RuleType::Bool,
+                "customer.email == 'x'",
+            ),
+            BTreeMap::new(),
+            Span::new(0, 14),
+            "rule `unknown_field` cannot access undeclared field `email`",
+        ),
+        (
+            2,
+            rule(
+                "nullable",
+                map([("limit", RuleType::nullable(RuleType::Int))]),
+                RuleType::Bool,
+                "limit > 0",
+            ),
+            BTreeMap::new(),
+            Span::new(0, 9),
+            "rule `nullable` applies an operation to a nullable value",
+        ),
+        (
+            3,
+            rule(
+                "branches",
+                BTreeMap::new(),
+                RuleType::String,
+                "true ? 1 : 'no'",
+            ),
+            BTreeMap::new(),
+            Span::new(0, 15),
+            "rule `branches` has an incompatible conditional branch",
+        ),
+        (
+            4,
+            rule(
+                "not_an_enum",
+                BTreeMap::new(),
+                RuleType::String,
+                "NotAnEnum::symbol",
+            ),
+            map([("NotAnEnum", RuleType::String)]),
+            Span::new(0, 17),
+            "rule `not_an_enum` references undeclared enum type `NotAnEnum`",
+        ),
+    ];
+
+    for (index, definition, declared_types, span, expected_message) in cases {
+        let name = definition.name.clone();
+        let error = compile_rule_in_context(index, definition, declared_types)
+            .expect_err("each semantic validation error should retain a diagnostic");
+        let diagnostic = error
+            .diagnostic()
+            .expect("semantic validation errors should expose their diagnostic");
+
+        assert_eq!(diagnostic.context, rule_context(index, &name));
+        assert_eq!(diagnostic.span, span);
+        assert_eq!(diagnostic.message, expected_message);
+    }
+}
+
+#[test]
+fn semantic_decision_condition_errors_preserve_their_own_source_context_and_span() {
+    let table = DecisionTableDefinition {
+        name: "invoice_route".to_owned(),
+        revision: "rules-2026-07-28".to_owned(),
+        inputs: map([("amount", RuleType::Int)]),
+        output: map([("route", RuleType::String)]),
+        hit_policy: HitPolicy::First,
+        rows: vec![
+            decision_row(
+                "invalid_amount",
+                map([("amount", "amount + true")]),
+                json!({"route": "manual"}),
+            ),
+            decision_row(
+                "default",
+                map([("amount", "true")]),
+                json!({"route": "automatic"}),
+            ),
+        ],
+        test_cases: Vec::new(),
+    };
+    let context = ExpressionContext {
+        metadata_path: "rules.yaml.decision_tables[0].rows[0].when.amount".to_owned(),
+        expression_owner: ExpressionOwner::DecisionCondition {
+            table_name: "invoice_route".to_owned(),
+            row_id: "invalid_amount".to_owned(),
+            input_name: "amount".to_owned(),
+        },
+    };
+
+    let error = compile_catalog_with_declared_types_and_contexts(
+        &BTreeMap::new(),
+        &[],
+        &[table],
+        &[],
+        &[vec![
+            map([("amount", context.clone())]),
+            map([(
+                "amount",
+                ExpressionContext {
+                    metadata_path: "rules.yaml.decision_tables[0].rows[1].when.amount".to_owned(),
+                    expression_owner: ExpressionOwner::DecisionCondition {
+                        table_name: "invoice_route".to_owned(),
+                        row_id: "default".to_owned(),
+                        input_name: "amount".to_owned(),
+                    },
+                },
+            )]),
+        ]],
+    )
+    .expect_err("a decision condition with incompatible operands must be rejected");
+    let diagnostic = error
+        .diagnostic()
+        .expect("a decision condition semantic error should expose its diagnostic");
+
+    assert_eq!(diagnostic.context, context);
+    assert_eq!(diagnostic.span, Span::new(0, 13));
+    assert_eq!(
+        diagnostic.message,
+        "rule `invoice_route` has incompatible types: expected matching int or decimal operands, got int and bool"
     );
 }
 

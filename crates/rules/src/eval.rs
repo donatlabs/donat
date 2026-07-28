@@ -5,8 +5,8 @@ use serde_json::Value;
 use crate::types::{CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable};
 use crate::{
     BinaryOp, CompiledRule, DecisionConditionTrace, DecisionRejection, DecisionResult,
-    DecisionTableDefinition, DecisionTrace, Expr, ExprKind, Function, HitPolicy, Literal,
-    RuleCatalog, RuleDefinition, RuleError, RuleType, UnaryOp, parse_expression,
+    DecisionTableDefinition, DecisionTrace, Expr, ExprKind, ExpressionContext, Function, HitPolicy,
+    Literal, RuleCatalog, RuleDefinition, RuleError, RuleType, UnaryOp, parse_expression,
 };
 
 pub type RuleBindings = BTreeMap<String, Value>;
@@ -29,9 +29,44 @@ pub fn compile_catalog_with_declared_types(
     rules: &[RuleDefinition],
     tables: &[DecisionTableDefinition],
 ) -> Result<RuleCatalog, RuleError> {
+    compile_catalog_internal(declared_types, rules, tables, None, None)
+}
+
+/// Compile a catalog with the source-site locations supplied by the metadata
+/// adapter. Every rule body and decision-row condition must have one context.
+/// The legacy entry points remain context-free for crate consumers that do not
+/// originate from metadata.
+pub fn compile_catalog_with_declared_types_and_contexts(
+    declared_types: &BTreeMap<String, RuleType>,
+    rules: &[RuleDefinition],
+    tables: &[DecisionTableDefinition],
+    rule_contexts: &[ExpressionContext],
+    decision_condition_contexts: &[Vec<BTreeMap<String, ExpressionContext>>],
+) -> Result<RuleCatalog, RuleError> {
+    if rule_contexts.len() != rules.len() || decision_condition_contexts.len() != tables.len() {
+        return Err(RuleError::InternalInvariant {
+            rule: "catalog".to_owned(),
+        });
+    }
+    compile_catalog_internal(
+        declared_types,
+        rules,
+        tables,
+        Some(rule_contexts),
+        Some(decision_condition_contexts),
+    )
+}
+
+fn compile_catalog_internal(
+    declared_types: &BTreeMap<String, RuleType>,
+    rules: &[RuleDefinition],
+    tables: &[DecisionTableDefinition],
+    rule_contexts: Option<&[ExpressionContext]>,
+    decision_condition_contexts: Option<&[Vec<BTreeMap<String, ExpressionContext>>]>,
+) -> Result<RuleCatalog, RuleError> {
     let mut catalog = RuleCatalog::default();
 
-    for definition in rules {
+    for (rule_index, definition) in rules.iter().enumerate() {
         if catalog.rules.contains_key(&definition.name)
             || catalog.decision_tables.contains_key(&definition.name)
         {
@@ -40,19 +75,38 @@ pub fn compile_catalog_with_declared_types(
                 name: definition.name.clone(),
             });
         }
-        let expression = parse_expression(&definition.name, &definition.expression)?;
-        let checked = check_expression(
-            &definition.name,
-            &expression,
-            &definition.bindings,
-            declared_types,
-        )?;
+        let checked = if let Some(contexts) = rule_contexts {
+            let context = contexts
+                .get(rule_index)
+                .ok_or_else(|| RuleError::InternalInvariant {
+                    rule: definition.name.clone(),
+                })?;
+            compile_expression_in_context_with_declared_types(
+                context,
+                &definition.expression,
+                &definition.bindings,
+                declared_types,
+            )?
+        } else {
+            compile_expression(
+                &definition.name,
+                &definition.expression,
+                &definition.bindings,
+                declared_types,
+            )?
+        };
         if !is_assignable(&checked.type_, &definition.result) {
-            return Err(RuleError::InvalidRuleResult {
+            let error = RuleError::InvalidRuleResult {
                 rule: definition.name.clone(),
                 expected: definition.result.display_name(),
                 actual: checked_type_name(&checked.type_),
-            });
+            };
+            return Err(
+                match rule_contexts.and_then(|contexts| contexts.get(rule_index)) {
+                    Some(context) => error.with_diagnostic(context, checked.expression.span),
+                    None => error,
+                },
+            );
         }
         catalog.rules.insert(
             definition.name.clone(),
@@ -65,7 +119,7 @@ pub fn compile_catalog_with_declared_types(
         );
     }
 
-    for definition in tables {
+    for (table_index, definition) in tables.iter().enumerate() {
         if catalog.rules.contains_key(&definition.name)
             || catalog.decision_tables.contains_key(&definition.name)
         {
@@ -74,7 +128,11 @@ pub fn compile_catalog_with_declared_types(
                 name: definition.name.clone(),
             });
         }
-        let compiled = compile_decision_table(definition, declared_types)?;
+        let compiled = compile_decision_table(
+            definition,
+            declared_types,
+            decision_condition_contexts.and_then(|contexts| contexts.get(table_index)),
+        )?;
         catalog
             .decision_tables
             .insert(definition.name.clone(), compiled);
@@ -82,6 +140,50 @@ pub fn compile_catalog_with_declared_types(
 
     validate_decision_test_cases(&catalog, tables)?;
     Ok(catalog)
+}
+
+fn compile_expression(
+    rule_name: &str,
+    source: &str,
+    bindings: &BTreeMap<String, RuleType>,
+    declared_types: &BTreeMap<String, RuleType>,
+) -> Result<CheckedExpr, RuleError> {
+    let expression = parse_expression(rule_name, source)?;
+    check_expression(None, rule_name, &expression, bindings, declared_types)
+}
+
+fn compile_expression_in_context(
+    context: &ExpressionContext,
+    source: &str,
+    bindings: &BTreeMap<String, RuleType>,
+) -> Result<CheckedExpr, RuleError> {
+    let expression = parse_expression(context.parser_name(), source)?;
+    check_expression(
+        Some(context),
+        context.parser_name(),
+        &expression,
+        bindings,
+        &BTreeMap::new(),
+    )
+}
+
+fn compile_expression_in_context_with_declared_types(
+    context: &ExpressionContext,
+    source: &str,
+    bindings: &BTreeMap<String, RuleType>,
+    declared_types: &BTreeMap<String, RuleType>,
+) -> Result<CheckedExpr, RuleError> {
+    if declared_types.is_empty() {
+        return compile_expression_in_context(context, source, bindings);
+    }
+    let expression = parse_expression(context.parser_name(), source)?;
+    check_expression(
+        Some(context),
+        context.parser_name(),
+        &expression,
+        bindings,
+        declared_types,
+    )
 }
 
 impl RuleCatalog {
@@ -136,6 +238,7 @@ pub fn evaluate_bool(rule: &CompiledRule, bindings: &RuleBindings) -> Result<boo
 fn compile_decision_table(
     definition: &DecisionTableDefinition,
     declared_types: &BTreeMap<String, RuleType>,
+    condition_contexts: Option<&Vec<BTreeMap<String, ExpressionContext>>>,
 ) -> Result<CompiledDecisionTable, RuleError> {
     let policy = match &definition.hit_policy {
         HitPolicy::First => HitPolicy::First,
@@ -168,7 +271,7 @@ fn compile_decision_table(
 
     let mut seen_rows = BTreeSet::new();
     let mut rows = Vec::with_capacity(definition.rows.len());
-    for row in &definition.rows {
+    for (row_index, row) in definition.rows.iter().enumerate() {
         if row.id.is_empty() || !seen_rows.insert(row.id.clone()) {
             return Err(RuleError::InvalidDecisionRow {
                 table: definition.name.clone(),
@@ -180,17 +283,33 @@ fn compile_decision_table(
 
         let mut conditions = BTreeMap::new();
         for (input, source) in &row.when {
-            let expression = parse_expression(&definition.name, source)?;
-            let checked = check_expression(
-                &definition.name,
-                &expression,
-                &definition.inputs,
-                declared_types,
-            )?;
+            let checked = if let Some(contexts) = condition_contexts {
+                let context = contexts
+                    .get(row_index)
+                    .and_then(|row_contexts| row_contexts.get(input))
+                    .ok_or_else(|| RuleError::InternalInvariant {
+                        rule: definition.name.clone(),
+                    })?;
+                compile_expression_in_context_with_declared_types(
+                    context,
+                    source,
+                    &definition.inputs,
+                    declared_types,
+                )?
+            } else {
+                compile_expression(&definition.name, source, &definition.inputs, declared_types)?
+            };
             if !matches!(checked.type_, CheckedType::Concrete(RuleType::Bool)) {
-                return Err(RuleError::InvalidDecisionRow {
+                let error = RuleError::InvalidDecisionRow {
                     table: definition.name.clone(),
                     row_id: row.id.clone(),
+                };
+                let context = condition_contexts
+                    .and_then(|contexts| contexts.get(row_index))
+                    .and_then(|row_contexts| row_contexts.get(input));
+                return Err(match context {
+                    Some(context) => error.with_diagnostic(context, checked.expression.span),
+                    None => error,
                 });
             }
             conditions.insert(input.clone(), checked);
@@ -314,111 +433,135 @@ fn validate_decision_test_cases(
 }
 
 fn check_expression(
+    context: Option<&ExpressionContext>,
     rule_name: &str,
     expression: &Expr,
     bindings: &BTreeMap<String, RuleType>,
     declared_types: &BTreeMap<String, RuleType>,
 ) -> Result<CheckedExpr, RuleError> {
-    let type_ = match &expression.kind {
-        ExprKind::Literal(literal) => check_literal(rule_name, literal)?,
-        ExprKind::Name(name) => {
-            CheckedType::Concrete(bindings.get(name).cloned().ok_or_else(|| {
-                RuleError::UndeclaredName {
-                    rule: rule_name.to_owned(),
-                    name: name.clone(),
-                }
-            })?)
-        }
-        ExprKind::EnumSymbol { enum_name, symbol } => {
-            let Some(type_) = declared_types.get(enum_name) else {
-                return Err(RuleError::UnknownEnumType {
-                    rule: rule_name.to_owned(),
-                    enum_name: enum_name.clone(),
-                });
-            };
-            let RuleType::Enum { name, symbols } = type_ else {
-                return Err(RuleError::UnknownEnumType {
-                    rule: rule_name.to_owned(),
-                    enum_name: enum_name.clone(),
-                });
-            };
-            if name != enum_name || !symbols.iter().any(|candidate| candidate == symbol) {
-                return Err(RuleError::UnknownEnumSymbol {
-                    rule: rule_name.to_owned(),
-                    enum_name: enum_name.clone(),
-                    symbol: symbol.clone(),
-                });
+    (|| {
+        let type_ = match &expression.kind {
+            ExprKind::Literal(literal) => check_literal(rule_name, literal)?,
+            ExprKind::Name(name) => {
+                CheckedType::Concrete(bindings.get(name).cloned().ok_or_else(|| {
+                    RuleError::UndeclaredName {
+                        rule: rule_name.to_owned(),
+                        name: name.clone(),
+                    }
+                })?)
             }
-            CheckedType::Concrete(type_.clone())
-        }
-        ExprKind::List(items) => check_list(rule_name, items, bindings, declared_types)?,
-        ExprKind::Member { target, field } => {
-            let target = check_expression(rule_name, target, bindings, declared_types)?;
-            let object = required_concrete(rule_name, &target.type_)?;
-            match object {
-                RuleType::Object { fields, .. } => {
-                    CheckedType::Concrete(fields.get(field).cloned().ok_or_else(|| {
-                        RuleError::UnknownField {
-                            rule: rule_name.to_owned(),
-                            field: field.clone(),
-                        }
-                    })?)
+            ExprKind::EnumSymbol { enum_name, symbol } => {
+                let Some(type_) = declared_types.get(enum_name) else {
+                    return Err(RuleError::UnknownEnumType {
+                        rule: rule_name.to_owned(),
+                        enum_name: enum_name.clone(),
+                    });
+                };
+                let RuleType::Enum { name, symbols } = type_ else {
+                    return Err(RuleError::UnknownEnumType {
+                        rule: rule_name.to_owned(),
+                        enum_name: enum_name.clone(),
+                    });
+                };
+                if name != enum_name || !symbols.iter().any(|candidate| candidate == symbol) {
+                    return Err(RuleError::UnknownEnumSymbol {
+                        rule: rule_name.to_owned(),
+                        enum_name: enum_name.clone(),
+                        symbol: symbol.clone(),
+                    });
                 }
-                other => return Err(type_mismatch(rule_name, "object", other.display_name())),
+                CheckedType::Concrete(type_.clone())
             }
-        }
-        ExprKind::Index { target, index: _ } => {
-            let target = check_expression(rule_name, target, bindings, declared_types)?;
-            let list = required_concrete(rule_name, &target.type_)?;
-            match list {
-                RuleType::List(item) => CheckedType::Concrete((**item).clone()),
-                other => return Err(type_mismatch(rule_name, "list", other.display_name())),
+            ExprKind::List(items) => {
+                check_list(context, rule_name, items, bindings, declared_types)?
             }
-        }
-        ExprKind::Call {
-            function,
-            arguments,
-        } => check_call(rule_name, *function, arguments, bindings, declared_types)?,
-        ExprKind::Unary { op, operand } => {
-            let operand = check_expression(rule_name, operand, bindings, declared_types)?;
-            let operand = required_concrete(rule_name, &operand.type_)?;
-            match op {
-                UnaryOp::Not if matches!(operand, RuleType::Bool) => {
-                    CheckedType::Concrete(RuleType::Bool)
-                }
-                UnaryOp::Negate if is_numeric(operand) => CheckedType::Concrete(operand.clone()),
-                UnaryOp::Not => {
-                    return Err(type_mismatch(rule_name, "bool", operand.display_name()));
-                }
-                UnaryOp::Negate => {
-                    return Err(type_mismatch(
-                        rule_name,
-                        "int or decimal",
-                        operand.display_name(),
-                    ));
+            ExprKind::Member { target, field } => {
+                let target =
+                    check_expression(context, rule_name, target, bindings, declared_types)?;
+                let object = required_concrete(rule_name, &target.type_)?;
+                match object {
+                    RuleType::Object { fields, .. } => {
+                        CheckedType::Concrete(fields.get(field).cloned().ok_or_else(|| {
+                            RuleError::UnknownField {
+                                rule: rule_name.to_owned(),
+                                field: field.clone(),
+                            }
+                        })?)
+                    }
+                    other => return Err(type_mismatch(rule_name, "object", other.display_name())),
                 }
             }
-        }
-        ExprKind::Binary { op, left, right } => {
-            let left = check_expression(rule_name, left, bindings, declared_types)?;
-            let right = check_expression(rule_name, right, bindings, declared_types)?;
-            check_binary(rule_name, *op, &left.type_, &right.type_)?
-        }
-        ExprKind::Conditional {
-            condition,
-            when_true,
-            when_false,
-        } => {
-            let condition = check_expression(rule_name, condition, bindings, declared_types)?;
-            expect_bool(rule_name, &condition.type_)?;
-            let when_true = check_expression(rule_name, when_true, bindings, declared_types)?;
-            let when_false = check_expression(rule_name, when_false, bindings, declared_types)?;
-            merge_branch_types(rule_name, &when_true.type_, &when_false.type_)?
-        }
-    };
-    Ok(CheckedExpr {
-        expression: expression.clone(),
-        type_,
+            ExprKind::Index { target, index: _ } => {
+                let target =
+                    check_expression(context, rule_name, target, bindings, declared_types)?;
+                let list = required_concrete(rule_name, &target.type_)?;
+                match list {
+                    RuleType::List(item) => CheckedType::Concrete((**item).clone()),
+                    other => return Err(type_mismatch(rule_name, "list", other.display_name())),
+                }
+            }
+            ExprKind::Call {
+                function,
+                arguments,
+            } => check_call(
+                context,
+                rule_name,
+                *function,
+                arguments,
+                bindings,
+                declared_types,
+            )?,
+            ExprKind::Unary { op, operand } => {
+                let operand =
+                    check_expression(context, rule_name, operand, bindings, declared_types)?;
+                let operand = required_concrete(rule_name, &operand.type_)?;
+                match op {
+                    UnaryOp::Not if matches!(operand, RuleType::Bool) => {
+                        CheckedType::Concrete(RuleType::Bool)
+                    }
+                    UnaryOp::Negate if is_numeric(operand) => {
+                        CheckedType::Concrete(operand.clone())
+                    }
+                    UnaryOp::Not => {
+                        return Err(type_mismatch(rule_name, "bool", operand.display_name()));
+                    }
+                    UnaryOp::Negate => {
+                        return Err(type_mismatch(
+                            rule_name,
+                            "int or decimal",
+                            operand.display_name(),
+                        ));
+                    }
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                let left = check_expression(context, rule_name, left, bindings, declared_types)?;
+                let right = check_expression(context, rule_name, right, bindings, declared_types)?;
+                check_binary(rule_name, *op, &left.type_, &right.type_)?
+            }
+            ExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let condition =
+                    check_expression(context, rule_name, condition, bindings, declared_types)?;
+                expect_bool(rule_name, &condition.type_)?;
+                let when_true =
+                    check_expression(context, rule_name, when_true, bindings, declared_types)?;
+                let when_false =
+                    check_expression(context, rule_name, when_false, bindings, declared_types)?;
+                merge_branch_types(rule_name, &when_true.type_, &when_false.type_)?
+            }
+        };
+        Ok(CheckedExpr {
+            expression: expression.clone(),
+            type_,
+        })
+    })()
+    .map_err(|error| match context {
+        Some(context) => error.with_diagnostic(context, expression.span),
+        None => error,
     })
 }
 
@@ -444,6 +587,7 @@ fn check_literal(rule_name: &str, literal: &Literal) -> Result<CheckedType, Rule
 }
 
 fn check_list(
+    context: Option<&ExpressionContext>,
     rule_name: &str,
     items: &[Expr],
     bindings: &BTreeMap<String, RuleType>,
@@ -455,7 +599,7 @@ fn check_list(
             expected: "a non-empty typed list".to_owned(),
         });
     };
-    let first = check_expression(rule_name, first, bindings, declared_types)?;
+    let first = check_expression(context, rule_name, first, bindings, declared_types)?;
     let CheckedType::Concrete(item_type) = first.type_ else {
         return Err(RuleError::InvalidLiteral {
             rule: rule_name.to_owned(),
@@ -463,7 +607,7 @@ fn check_list(
         });
     };
     for item in rest {
-        let item = check_expression(rule_name, item, bindings, declared_types)?;
+        let item = check_expression(context, rule_name, item, bindings, declared_types)?;
         if item.type_ != CheckedType::Concrete(item_type.clone()) {
             return Err(type_mismatch(
                 rule_name,
@@ -476,6 +620,7 @@ fn check_list(
 }
 
 fn check_call(
+    context: Option<&ExpressionContext>,
     rule_name: &str,
     function: Function,
     arguments: &[Expr],
@@ -484,7 +629,7 @@ fn check_call(
 ) -> Result<CheckedType, RuleError> {
     let checked = arguments
         .iter()
-        .map(|argument| check_expression(rule_name, argument, bindings, declared_types))
+        .map(|argument| check_expression(context, rule_name, argument, bindings, declared_types))
         .collect::<Result<Vec<_>, _>>()?;
     match function {
         Function::Size if checked.len() == 1 => {
