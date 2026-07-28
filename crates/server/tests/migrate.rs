@@ -204,6 +204,181 @@ async fn check_consistency_rejects_out_of_range_int8_command_literal_without_wri
 }
 
 #[tokio::test]
+async fn check_consistency_collects_each_independent_invalid_command_diagnostic() {
+    let table = format!(
+        "donat_command_literal_many_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id bigint PRIMARY KEY, payload jsonb);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: create_first_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: first_order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "9223372036854775808" }}
+        returning: [id]
+  result:
+    order_id: {{ step: first_order, column: id }}
+- name: create_second_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: second_order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "9223372036854775807" }}
+          payload: {{ literal: "not-json" }}
+        returning: [id]
+  result:
+    order_id: {{ step: second_order, column: id }}
+"#
+        ),
+    )
+    .expect("command metadata writes");
+
+    let problems = check_consistency(&url, &metadata.path)
+        .await
+        .expect("metadata validation completes");
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[0].steps[0]") && problem.contains("int8")
+        }),
+        "first command diagnostic was not collected: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[1].steps[0]") && problem.contains("jsonb")
+        }),
+        "second command diagnostic was not collected: {problems:#?}"
+    );
+}
+
+#[tokio::test]
+async fn check_consistency_retains_duplicate_command_name_diagnostics() {
+    let table = format!(
+        "donat_command_literal_duplicate_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(async move { connection.await });
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id bigint PRIMARY KEY, payload jsonb);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: duplicate_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: first_order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "9223372036854775808" }}
+        returning: [id]
+  result:
+    order_id: {{ step: first_order, column: id }}
+- name: duplicate_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: second_order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "9223372036854775807" }}
+          payload: {{ literal: "not-json" }}
+        returning: [id]
+  result:
+    order_id: {{ step: second_order, column: id }}
+"#
+        ),
+    )
+    .expect("command metadata writes");
+
+    let problems = check_consistency(&url, &metadata.path)
+        .await
+        .expect("metadata validation completes");
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[0].steps[0]") && problem.contains("int8")
+        }),
+        "first duplicate command diagnostic was not collected: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[1]")
+                && problem.contains("duplicate command name 'duplicate_order'")
+        }),
+        "duplicate-name diagnostic was not collected: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|problem| {
+            problem.contains("commands[1].steps[0]") && problem.contains("jsonb")
+        }),
+        "second duplicate command diagnostic was not collected: {problems:#?}"
+    );
+}
+
+#[tokio::test]
 async fn check_consistency_accepts_nullable_varchar_literal_and_rejects_jsonb_literal() {
     let table = format!(
         "donat_command_literal_scalars_{}_{}",

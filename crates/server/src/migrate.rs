@@ -315,8 +315,8 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
             .filter(|source| source.kind == donat_metadata::SourceKind::Postgres)
             .map(|source| (source.name.clone(), catalog.clone()))
             .collect();
-        if let Err(error) =
-            donat_schema::compile_command_catalog(&metadata, &catalogs, rule_catalog, true)
+        for error in
+            donat_schema::validate_command_catalog(&metadata, &catalogs, rule_catalog, true)
         {
             problems.push(format!("{}: {}", error.path, error.message));
         }

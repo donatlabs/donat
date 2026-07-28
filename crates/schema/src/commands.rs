@@ -573,6 +573,40 @@ pub fn compile_command_catalog(
     rules: &RuleCatalog,
     infer_function_permissions: bool,
 ) -> Result<CompiledCommandCatalog, PlanError> {
+    let (catalog, diagnostics) = compile_command_catalog_with_diagnostics(
+        metadata,
+        catalogs,
+        rules,
+        infer_function_permissions,
+    );
+    match diagnostics.into_iter().next() {
+        Some(diagnostic) => Err(diagnostic),
+        None => Ok(catalog),
+    }
+}
+
+/// Collect every deploy-time command diagnostic in one compiler traversal.
+///
+/// `compile_command_catalog` retains its fail-closed `Result` API for
+/// candidate-engine construction. Deployment validation uses this companion
+/// to report independent invalid command definitions together instead of
+/// repeatedly compiling altered metadata subsets.
+pub fn validate_command_catalog(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    rules: &RuleCatalog,
+    infer_function_permissions: bool,
+) -> Vec<PlanError> {
+    compile_command_catalog_with_diagnostics(metadata, catalogs, rules, infer_function_permissions)
+        .1
+}
+
+fn compile_command_catalog_with_diagnostics(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    rules: &RuleCatalog,
+    infer_function_permissions: bool,
+) -> (CompiledCommandCatalog, Vec<PlanError>) {
     let mut sources = BTreeMap::new();
     for source in &metadata.sources {
         if source.kind == SourceKind::Postgres {
@@ -581,30 +615,34 @@ pub fn compile_command_catalog(
     }
 
     let mut names_by_source: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut diagnostics = Vec::new();
     for (index, command) in metadata.commands.iter().enumerate() {
         let path = format!("commands[{index}]");
-        let source = metadata
+        let Some(source) = metadata
             .sources
             .iter()
             .find(|source| source.name == command.source)
-            .ok_or_else(|| {
-                PlanError::validation(
-                    &path,
-                    format!("command source '{}' does not exist", command.source),
-                )
-            })?;
+        else {
+            diagnostics.push(PlanError::validation(
+                &path,
+                format!("command source '{}' does not exist", command.source),
+            ));
+            continue;
+        };
         if source.kind != SourceKind::Postgres {
-            return Err(PlanError::validation(
+            diagnostics.push(PlanError::validation(
                 &path,
                 format!(
                     "command source '{}' requires a Postgres source",
                     command.source
                 ),
             ));
+            continue;
         }
         let seen = names_by_source.entry(source.name.as_str()).or_default();
-        if !seen.insert(command.name.as_str()) {
-            return Err(PlanError::validation(
+        let duplicate_name = !seen.insert(command.name.as_str());
+        if duplicate_name {
+            diagnostics.push(PlanError::validation(
                 &path,
                 format!(
                     "duplicate command name '{}' for source '{}'",
@@ -612,7 +650,7 @@ pub fn compile_command_catalog(
                 ),
             ));
         }
-        validate_command(
+        if let Err(error) = validate_command(
             metadata,
             catalogs,
             source,
@@ -620,19 +658,24 @@ pub fn compile_command_catalog(
             infer_function_permissions,
             command,
             index,
-        )?;
-        sources
-            .get_mut(&source.name)
-            .expect("Postgres command source was initialized")
-            .commands
-            .insert(
-                command.name.clone(),
-                CompiledCommand {
-                    definition: command.clone(),
-                },
-            );
+        ) {
+            diagnostics.push(error);
+            continue;
+        }
+        if !duplicate_name {
+            sources
+                .get_mut(&source.name)
+                .expect("Postgres command source was initialized")
+                .commands
+                .insert(
+                    command.name.clone(),
+                    CompiledCommand {
+                        definition: command.clone(),
+                    },
+                );
+        }
     }
-    Ok(CompiledCommandCatalog { sources })
+    (CompiledCommandCatalog { sources }, diagnostics)
 }
 
 fn validate_command(
@@ -1098,8 +1141,8 @@ fn validate_command_literal(
         PlanError::validation(
             path,
             format!(
-                "invalid literal for PostgreSQL column type '{}': {reason}",
-                column.pg_type
+                "invalid literal for column '{}' with PostgreSQL column type '{}': {reason}",
+                column.name, column.pg_type
             ),
         )
     })?;
@@ -1109,8 +1152,8 @@ fn validate_command_literal(
             PlanError::validation(
                 path,
                 format!(
-                    "invalid literal for PostgreSQL column type '{}': {reason}",
-                    column.pg_type
+                    "invalid literal for column '{}' with PostgreSQL column type '{}': {reason}",
+                    column.name, column.pg_type
                 ),
             )
         })

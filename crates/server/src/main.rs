@@ -202,9 +202,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Migrate(m)) => {
             migrate::run_migrate(&database_url, &m.migrations_dir).await?;
             // Optional deploy-time DDL: reconcile per-table event-trigger
-            // Postgres triggers from the YAML metadata.
+            // Postgres triggers from the YAML metadata. Validate after schema
+            // DDL but before reconciliation so inconsistent command metadata
+            // cannot create or remove metadata-derived database objects.
             let md_dir = m.metadata_dir.clone().or_else(|| args.metadata_dir.clone());
             if let Some(dir) = md_dir {
+                let problems = migrate::check_consistency(&database_url, &dir).await?;
+                require_consistent_metadata(&problems)?;
                 let metadata = donat_metadata::load_metadata_dir(&dir)?;
                 events::reconcile(&database_url, &metadata).await?;
                 tracing::info!(dir = %dir.display(), "event triggers reconciled");
@@ -218,17 +222,8 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| args.metadata_dir.clone())
                 .ok_or_else(|| anyhow::anyhow!("validate needs --metadata-dir"))?;
             let problems = migrate::check_consistency(&database_url, &dir).await?;
-            if problems.is_empty() {
-                tracing::info!("metadata is consistent");
-                return Ok(());
-            }
-            for p in &problems {
-                tracing::error!("inconsistency: {p}");
-            }
-            anyhow::bail!(
-                "metadata validation failed: {} inconsistency(ies)",
-                problems.len()
-            );
+            require_consistent_metadata(&problems)?;
+            return Ok(());
         }
         _ => {}
     }
@@ -389,6 +384,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn require_consistent_metadata(problems: &[String]) -> anyhow::Result<()> {
+    if problems.is_empty() {
+        tracing::info!("metadata is consistent");
+        return Ok(());
+    }
+    for problem in problems {
+        tracing::error!("inconsistency: {problem}");
+    }
+    anyhow::bail!(
+        "metadata validation failed: {} inconsistency(ies)",
+        problems.len()
+    );
 }
 
 async fn healthz() -> &'static str {

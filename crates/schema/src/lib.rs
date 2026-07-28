@@ -22,6 +22,7 @@ mod v1;
 
 pub use commands::{
     CompiledCommand, CompiledCommandCatalog, CompiledSourceCommandCatalog, compile_command_catalog,
+    validate_command_catalog,
 };
 pub use introspection::execute_introspection;
 pub use multi_source::{

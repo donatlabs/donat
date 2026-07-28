@@ -514,6 +514,56 @@ fn command_literals_obey_concrete_postgres_scalar_descriptors() {
 }
 
 #[test]
+fn literal_diagnostics_identify_object_and_primary_key_target_columns() {
+    let object_error = compile_with_catalog(
+        &metadata(vec![command_with_status_literal(json!("32768"))]),
+        literal_target_catalog("int2", -1, false),
+    )
+    .expect_err("an object literal outside int2 range is rejected");
+    assert_eq!(object_error.path, "commands[0].steps[0]");
+    assert!(
+        object_error.message.contains("column 'status'") && object_error.message.contains("int2"),
+        "object literal diagnostic must name its concrete target: {}",
+        object_error.message
+    );
+
+    let mut primary_key_command = valid_command();
+    primary_key_command["steps"] = json!([{
+        "name": "order",
+        "update": {
+            "table": { "schema": "public", "name": "orders" },
+            "where": { "id": { "literal": "9223372036854775808" } },
+            "set": { "status": { "arg": "status" } },
+            "returning": ["id"]
+        }
+    }]);
+    primary_key_command["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let mut primary_key_catalog = catalog(RelationKind::Table);
+    let primary_key_column = primary_key_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders catalog entry exists")
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "id")
+        .expect("id catalog column exists");
+    *primary_key_column = column_with("id", "int8", -1, false);
+
+    let primary_key_error =
+        compile_with_catalog(&metadata(vec![primary_key_command]), primary_key_catalog)
+            .expect_err("an out-of-range primary-key literal is rejected");
+    assert_eq!(primary_key_error.path, "commands[0].steps[0]");
+    assert!(
+        primary_key_error.message.contains("column 'id'")
+            && primary_key_error.message.contains("int8"),
+        "primary-key literal diagnostic must name its concrete target: {}",
+        primary_key_error.message
+    );
+}
+
+#[test]
 fn accepts_table_permissions_inherited_by_the_explicit_command_role() {
     let mut inherited = metadata(vec![valid_command()]);
     inherited.inherited_roles = serde_json::from_value(json!([

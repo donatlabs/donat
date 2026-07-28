@@ -244,3 +244,68 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         "expected missing-table inconsistency:\n{out}"
     );
 }
+
+#[test]
+fn migrate_with_metadata_rejects_invalid_command_before_event_reconciliation() {
+    let db = fresh_db("conf_migrate_invalid_command_metadata");
+    let migrations = tmpdir("invalid_command_metadata_migrations");
+    write(
+        &migrations.join("V1__create_command_validation_orders.sql"),
+        "CREATE TABLE command_validation_orders (id bigint PRIMARY KEY);\n",
+    );
+
+    let metadata = tmpdir("invalid_command_metadata");
+    write(&metadata.join("version.yaml"), "version: 3\n");
+    write(
+        &metadata.join("databases/databases.yaml"),
+        "- name: default\n  kind: postgres\n  configuration:\n    connection_info:\n      database_url:\n        from_env: DONAT_DATABASE_URL\n  tables:\n    - table:\n        schema: public\n        name: command_validation_orders\n      select_permissions:\n        - role: customer\n          permission:\n            columns: \"*\"\n            filter: {}\n      insert_permissions:\n        - role: customer\n          permission:\n            columns: \"*\"\n            check: {}\n      event_triggers:\n        - name: blocked_command\n          definition:\n            insert:\n              columns: \"*\"\n          webhook: http://example.invalid/events\n",
+    );
+    write(
+        &metadata.join("commands.yaml"),
+        "- name: create_order\n  source: default\n  permissions:\n    - role: customer\n  steps:\n    - name: order\n      insert:\n        table:\n          schema: public\n          name: command_validation_orders\n        object:\n          id:\n            literal: \"9223372036854775808\"\n        returning: [id]\n  result:\n    order_id:\n      step: order\n      column: id\n",
+    );
+
+    let (ok, output) = run(
+        &db,
+        &[
+            "migrate",
+            "--migrations-dir",
+            migrations.to_str().unwrap(),
+            "--metadata-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let migrated_table: bool = client
+        .query_one(
+            "SELECT to_regclass('public.command_validation_orders') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let reconciled_trigger_count: i64 = client
+        .query_one(
+            "SELECT count(*)\n             FROM pg_trigger trigger\n             JOIN pg_class relation ON relation.oid = trigger.tgrelid\n             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace\n             WHERE NOT trigger.tgisinternal\n               AND namespace.nspname = 'public'\n               AND relation.relname = 'command_validation_orders'\n               AND trigger.tgname = 'donat_notify_blocked_command_insert'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+
+    assert!(
+        !ok,
+        "migrate --metadata-dir must reject the invalid command after DDL:\n{output}"
+    );
+    assert!(
+        output.contains("commands[0].steps[0]") && output.contains("int8"),
+        "migrate must report the command literal diagnostic:\n{output}"
+    );
+    assert!(
+        migrated_table,
+        "schema migration must complete before validation"
+    );
+    assert_eq!(
+        reconciled_trigger_count, 0,
+        "invalid metadata must not create event-trigger DDL during reconciliation"
+    );
+}
