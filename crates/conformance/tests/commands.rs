@@ -268,6 +268,93 @@ fn command_idempotency_rejects_changed_input_without_another_write() {
 }
 
 #[test]
+fn command_database_failures_redact_postgres_details_and_roll_back_claims() {
+    let suite = Suite::new("command_database_error_redaction")
+        .initial_metadata(command_metadata())
+        .with_migrations()
+        .start();
+    create_orders_table(suite.db_url());
+
+    let headers = vec![("X-Donat-Role".to_string(), "customer".to_string())];
+    let order_id = "550e8400-e29b-41d4-a716-446655440050";
+    let first_request_id = "550e8400-e29b-41d4-a716-446655440051";
+    let rejected_request_id = "550e8400-e29b-41d4-a716-446655440052";
+
+    let (status, first) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ create_order(id: \"{order_id}\", customer_id: \"550e8400-e29b-41d4-a716-446655440001\", status: \"first\", quantity: 1, request_id: \"{first_request_id}\") {{ order_id }} }}"
+            )
+        }),
+        &headers,
+    );
+    assert_eq!(status, 200, "first command response: {first}");
+    assert_eq!(
+        first,
+        json!({ "data": { "create_order": { "order_id": order_id } } }),
+        "first command response"
+    );
+
+    let (status, rejected) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ create_order(id: \"{order_id}\", customer_id: \"550e8400-e29b-41d4-a716-446655440001\", status: \"private-command-input-sentinel\", quantity: 1, request_id: \"{rejected_request_id}\") {{ order_id }} }}"
+            )
+        }),
+        &headers,
+    );
+    assert_eq!(status, 200, "database rejection response: {rejected}");
+    assert_eq!(
+        rejected,
+        json!({ "errors": [{
+            "extensions": { "path": "$", "code": "data-exception" },
+            "message": "command database error"
+        }]}),
+        "command database errors must use the stable generic body"
+    );
+    let rendered = rejected.to_string();
+    for sensitive_detail in [
+        order_id,
+        rejected_request_id,
+        "private-command-input-sentinel",
+        "orders",
+        "orders_pkey",
+        "duplicate key",
+    ] {
+        assert!(
+            !rendered.contains(sensitive_detail),
+            "command database error leaked {sensitive_detail:?}: {rendered}"
+        );
+    }
+
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect to inspect command rollback");
+    let domain_rows: i64 = client
+        .query_one("SELECT count(*) FROM public.orders", &[])
+        .expect("count orders")
+        .get(0);
+    assert_eq!(domain_rows, 1, "failed command must not add a domain row");
+    for catalog_table in [
+        "donat.command_invocation_claims",
+        "donat.command_invocations",
+    ] {
+        let persisted: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM {catalog_table} WHERE key = $1"),
+                &[&rejected_request_id],
+            )
+            .expect("count failed command catalog entries")
+            .get(0);
+        assert_eq!(
+            persisted, 0,
+            "failed command must roll back its entry in {catalog_table}"
+        );
+    }
+}
+
+#[test]
 fn command_is_not_exposed_to_a_role_with_only_table_mutation_permission() {
     let suite = Suite::new("command_forbidden_role")
         .initial_metadata(command_metadata())

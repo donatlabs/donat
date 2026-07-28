@@ -163,6 +163,29 @@ fn command_backend_rejection(roots: &[donat_ir::MutationRoot], backend: &str) ->
         })
 }
 
+/// The full SQL text of a command contains resolved input and idempotency
+/// values. Keep command execution observable without putting those values in
+/// the `donat::sql` log target.
+fn trace_mutation_sql(root: &donat_ir::MutationRoot, sql: &str) {
+    match root {
+        donat_ir::MutationRoot::Command { command, .. } => {
+            tracing::trace!(
+                target: "donat::sql",
+                command = %command.name,
+                statement = "command",
+                "executing command mutation"
+            );
+        }
+        donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::Insert { .. }
+        | donat_ir::MutationRoot::Update { .. }
+        | donat_ir::MutationRoot::Delete { .. }
+        | donat_ir::MutationRoot::Typename { .. } => {
+            tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+        }
+    }
+}
+
 /// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
 /// [`MAX_QUERY_DEPTH`], before the recursive parser runs. Counting raw
 /// brackets (including any inside string literals) is conservative, which is
@@ -931,7 +954,10 @@ async fn execute_parsed_full(
             };
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
-            let fields: Vec<(String, String)> = roots
+            let has_command_root = roots
+                .iter()
+                .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }));
+            let fields: Vec<(&donat_ir::MutationRoot, String, String)> = roots
                 .iter()
                 .map(|root| {
                     let alias = match root {
@@ -943,6 +969,7 @@ async fn execute_parsed_full(
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
                     (
+                        root,
                         alias,
                         donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics),
                     )
@@ -960,11 +987,17 @@ async fn execute_parsed_full(
             };
             let tx = match client.transaction().await {
                 Ok(tx) => tx,
-                Err(e) => return ok(db_error_json(&e)),
+                Err(e) => {
+                    return ok(if has_command_root {
+                        command_db_error_json(&e)
+                    } else {
+                        db_error_json(&e)
+                    });
+                }
             };
             let mut data = serde_json::Map::new();
-            for (alias, sql) in fields {
-                tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+            for (root, alias, sql) in fields {
+                trace_mutation_sql(root, &sql);
                 match tx.query_one(&sql, &[]).await {
                     Ok(row) => {
                         // Typename roots produce text, everything else json.
@@ -991,11 +1024,21 @@ async fn execute_parsed_full(
                             }
                         }
                     }
-                    Err(e) => return ok(db_error_json(&e)),
+                    Err(e) => {
+                        return ok(if matches!(root, donat_ir::MutationRoot::Command { .. }) {
+                            command_db_error_json(&e)
+                        } else {
+                            db_error_json(&e)
+                        });
+                    }
                 }
             }
             if let Err(e) = tx.commit().await {
-                return ok(db_error_json(&e));
+                return ok(if has_command_root {
+                    command_db_error_json(&e)
+                } else {
+                    db_error_json(&e)
+                });
             }
             let data = assemble_multi_source_response(&response, [Json::Object(data)]);
             ok(json!({ "data": data }))
@@ -1784,6 +1827,44 @@ fn command_graphql_error_json(message: &str) -> Option<Json> {
     }))
 }
 
+fn permission_error_json(message: &str) -> Option<Json> {
+    let Json::Object(payload) = serde_json::from_str::<Json>(message).ok()? else {
+        return None;
+    };
+    let (Some(path), Some(message)) = (
+        payload.get("path").and_then(Json::as_str),
+        payload.get("message").and_then(Json::as_str),
+    ) else {
+        return None;
+    };
+    Some(json!({
+        "errors": [{
+            "extensions": { "path": path, "code": "permission-error" },
+            "message": message,
+        }]
+    }))
+}
+
+/// Command statements can carry only the dedicated, validated business-error
+/// envelope or the established permission-check envelope. Every other driver
+/// error is deliberately opaque: command SQL embeds request values and a
+/// PostgreSQL primary message can disclose them alongside relation details.
+fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
+    let Some(db) = e.as_db_error() else {
+        return error_json("data-exception", "command database error");
+    };
+    if db.code().code() == COMMAND_GRAPHQL_ERROR_SQLSTATE {
+        return command_graphql_error_json(db.message())
+            .unwrap_or_else(|| error_json("data-exception", "command database error"));
+    }
+    if db.code().code() == "23514"
+        && let Some(body) = permission_error_json(db.message())
+    {
+        return body;
+    }
+    error_json("data-exception", "command database error")
+}
+
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
@@ -1795,18 +1876,9 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
     // Our check_violation() raises 23514 with a JSON payload carrying the
     // GraphQL error path.
     if db.code().code() == "23514"
-        && let Ok(payload) = serde_json::from_str::<Json>(db.message())
-        && let (Some(path), Some(message)) = (
-            payload.get("path").and_then(Json::as_str),
-            payload.get("message").and_then(Json::as_str),
-        )
+        && let Some(body) = permission_error_json(db.message())
     {
-        return json!({
-            "errors": [{
-                "extensions": { "path": path, "code": "permission-error" },
-                "message": message,
-            }]
-        });
+        return body;
     }
     let (code, message) = match db.code().code() {
         "23514" => ("permission-error", db.message().to_string()),
@@ -1878,7 +1950,9 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -2304,6 +2378,85 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceCapture {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn command_mutation_trace_omits_rendered_sql_and_idempotency_values() {
+        const KEY: &str = "trace-idempotency-key-sentinel";
+        const SESSION_SCOPE: &str = "trace-session-scope-sentinel";
+        const INPUT: &str = "trace-input-sentinel";
+
+        let root = donat_ir::MutationRoot::Command {
+            alias: "submit".to_owned(),
+            command: donat_ir::CommandMutation {
+                name: "create_order".to_owned(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: Some(donat_ir::CommandIdempotency {
+                    key: donat_ir::Scalar::Json(json!(KEY)),
+                    scope: vec![donat_ir::Scalar::Json(json!(SESSION_SCOPE))],
+                    input: donat_ir::Scalar::Json(json!({ "status": INPUT })),
+                    retention_seconds: None,
+                    error_path: "$.selectionSet.submit".to_owned(),
+                }),
+                effects: vec![],
+                selection: vec![],
+            },
+        };
+        let sql = donat_sqlgen::mutation_to_sql(&root);
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                sql.contains(sentinel),
+                "the SQL fixture must contain the sensitive sentinel {sentinel:?}"
+            );
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceCapture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            trace_mutation_sql(&root, &sql);
+        });
+
+        let trace = String::from_utf8(bytes.lock().expect("trace capture lock").clone())
+            .expect("trace output is utf-8");
+        assert!(
+            trace.contains("executing command mutation") && trace.contains("command=create_order"),
+            "command execution must retain a safe trace event: {trace}"
+        );
+        assert!(
+            !trace.contains(&sql),
+            "command trace must not contain the rendered SQL: {trace}"
+        );
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                !trace.contains(sentinel),
+                "command trace leaked {sentinel:?}: {trace}"
+            );
+        }
+    }
+
     async fn database_error_from(sql: &str) -> tokio_postgres::Error {
         let url = std::env::var("PG_URL").unwrap_or_else(|_| {
             "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_string()
@@ -2342,6 +2495,16 @@ mod tests {
                 "message": "customer is not allowed to order",
             }] })
         );
+        assert_eq!(
+            command_db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
 
         let permission = database_error_from(
             r#"DO $$
@@ -2355,6 +2518,16 @@ mod tests {
         .await;
         assert_eq!(
             db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+        assert_eq!(
+            command_db_error_json(&permission),
             json!({ "errors": [{
                 "extensions": {
                     "path": "$.selectionSet.insert_author.args.objects",
@@ -2379,6 +2552,10 @@ mod tests {
             malformed_body,
             error_json("data-exception", "database error")
         );
+        assert_eq!(
+            command_db_error_json(&malformed),
+            error_json("data-exception", "command database error")
+        );
         assert!(
             !malformed_body
                 .to_string()
@@ -2401,11 +2578,39 @@ mod tests {
             unrecognized_body,
             error_json("data-exception", "database error")
         );
+        assert_eq!(
+            command_db_error_json(&unrecognized),
+            error_json("data-exception", "command database error")
+        );
         assert!(
             !unrecognized_body
                 .to_string()
                 .contains("private Postgres detail"),
             "an unrecognized reserved envelope must not expose PostgreSQL text"
+        );
+
+        let ordinary_unique = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23505',
+                   MESSAGE = 'private ordinary CRUD constraint detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&ordinary_unique),
+            error_json(
+                "constraint-violation",
+                "Uniqueness violation. private ordinary CRUD constraint detail",
+            ),
+            "ordinary CRUD errors retain their established database contract"
+        );
+        assert_eq!(
+            command_db_error_json(&ordinary_unique),
+            error_json("data-exception", "command database error"),
+            "the same PostgreSQL primary message is opaque for a command root"
         );
     }
 
