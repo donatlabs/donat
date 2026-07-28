@@ -59,6 +59,7 @@ type RootOwners = HashMap<String, String>;
 struct RoleSchemas {
     standard: [Json; 2],
     relay: [Json; 2],
+    mutation_owners: [RootOwners; 2],
 }
 
 /// Immutable schema and source-index state compiled from one metadata/catalog
@@ -68,7 +69,6 @@ pub struct CompiledMultiSourceSchema {
     source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
     relay_query_owners: HashMap<String, String>,
-    mutation_owners: HashMap<String, String>,
     schema_template: Json,
     relay_id_types: HashSet<String>,
     relay_error: Option<PlanError>,
@@ -162,13 +162,8 @@ impl CompiledMultiSourceSchema {
             false,
             infer_function_permissions,
         )?;
-        let (query_owners, mutation_owners) = root_owners(&children)?;
-        let schema_template = build_role_independent_schema(
-            metadata,
-            catalogs,
-            &source_indexes,
-            command_catalog.as_ref(),
-        )?;
+        let (query_owners, standard_mutation_owners) = root_owners(&children)?;
+        let schema_template = build_role_independent_schema(metadata, catalogs, &source_indexes)?;
         let roles = metadata_roles(metadata);
         let unknown_role = denied_role_name(&roles);
         let standard = compose_role_schemas(&children, &roles)?;
@@ -215,17 +210,23 @@ impl CompiledMultiSourceSchema {
                         .remove(&role)
                         .expect("standard role schema was composed"),
                     relay: relay.remove(&role).expect("Relay role schema was composed"),
+                    mutation_owners: role_mutation_owners(
+                        &children,
+                        &standard_mutation_owners,
+                        &role,
+                    )?,
                 };
-                (role, schemas)
+                Ok((role, schemas))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, PlanError>>()?;
+        let unknown_mutation_owners =
+            role_mutation_owners(&children, &standard_mutation_owners, &unknown_role)?;
 
         Ok(Self {
             command_catalog,
             source_indexes,
             query_owners,
             relay_query_owners,
-            mutation_owners,
             schema_template,
             relay_id_types,
             relay_error,
@@ -233,6 +234,7 @@ impl CompiledMultiSourceSchema {
             unknown_role_schemas: RoleSchemas {
                 standard: unknown_standard,
                 relay: unknown_relay,
+                mutation_owners: unknown_mutation_owners,
             },
             infer_function_permissions,
         })
@@ -295,6 +297,14 @@ impl CompiledMultiSourceSchema {
             &schemas.standard
         };
         &pair[usize::from(session.backend_request)]
+    }
+
+    fn mutation_owners(&self, session: &Session) -> &RootOwners {
+        let schemas = self
+            .role_schemas
+            .get(&session.role)
+            .unwrap_or(&self.unknown_role_schemas);
+        &schemas.mutation_owners[usize::from(session.backend_request)]
     }
 }
 
@@ -386,7 +396,7 @@ impl<'a> MultiSourcePlanner<'a> {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
         }
         let owners = if is_mutation {
-            &self.compiled.mutation_owners
+            self.compiled.mutation_owners(session)
         } else if self.relay {
             &self.compiled.relay_query_owners
         } else {
@@ -566,7 +576,7 @@ fn root_owners(children: &[ChildPlanner<'_>]) -> Result<(RootOwners, RootOwners)
         )?;
         register_owners(
             &mut mutation_owners,
-            child.planner.mutation_root_names(),
+            child.planner.standard_mutation_root_names(),
             &child.source,
             "mutation",
         )?;
@@ -658,6 +668,42 @@ fn compose_role_schemas(
         .collect()
 }
 
+/// Command roots cannot share the source-global ownership table because their
+/// presence is conditional on the explicit role and its effective table
+/// permissions. Overlay them on the already validated standard roots for each
+/// cached role schema, keeping table/function ownership behavior unchanged.
+fn role_mutation_owners(
+    children: &[ChildPlanner<'_>],
+    standard_owners: &RootOwners,
+    role: &str,
+) -> Result<[RootOwners; 2], PlanError> {
+    let owners_for = |backend_request| {
+        let session = Session {
+            role: role.to_string(),
+            vars: HashMap::new(),
+            backend_request,
+        };
+        let mut owners = standard_owners.clone();
+        for child in children {
+            for command in child.planner.command_definitions() {
+                if child
+                    .planner
+                    .command_is_permitted(command.definition(), &session)
+                {
+                    register_owner(
+                        &mut owners,
+                        &command.definition().name,
+                        &child.source,
+                        "mutation",
+                    )?;
+                }
+            }
+        }
+        Ok(owners)
+    };
+    Ok([owners_for(false)?, owners_for(true)?])
+}
+
 /// Composite equivalent of [`crate::execute_introspection`].
 pub fn execute_multi_source_introspection(
     planner: &MultiSourcePlanner,
@@ -703,11 +749,14 @@ fn register_owner(
     Ok(())
 }
 
+/// Build the source-independent selection template used only to compare
+/// response-key shapes before handing an operation to a child planner. It
+/// deliberately excludes commands: command output objects are role-specific,
+/// and command roots are routed through the role-specific owner maps below.
 fn build_role_independent_schema(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
     source_indexes: &[Arc<PlannerIndex>],
-    command_catalog: &CompiledCommandCatalog,
 ) -> Result<Json, PlanError> {
     let mut validation_metadata = metadata.clone();
     let mut validation_role = "__donat_composite_schema_validation".to_string();
@@ -754,8 +803,8 @@ fn build_role_independent_schema(
             source,
             catalog,
             index.clone(),
-            command_catalog.source(&source.name),
-            true,
+            None,
+            false,
         ));
     }
     let session = Session {

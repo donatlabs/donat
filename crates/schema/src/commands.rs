@@ -17,6 +17,7 @@ use donat_metadata::{
 use donat_rules::{RuleCatalog, RuleType};
 use uuid::Uuid;
 
+use crate::naming::command_pascal_case;
 use crate::plan::{MutationKind, PlanError, Planner};
 
 /// Immutable command definitions grouped by their Postgres source.
@@ -579,6 +580,27 @@ enum ValueUse {
     Effect,
 }
 
+/// The structural GraphQL shape of one generated command result object. It
+/// exists only during deploy-time collision validation; runtime schema
+/// generation remains the single producer of introspection JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedCommandTypeShape {
+    fields: BTreeMap<String, GeneratedCommandOutputType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeneratedCommandOutputType {
+    Named(String),
+    NonNull(Box<GeneratedCommandOutputType>),
+    List(Box<GeneratedCommandOutputType>),
+}
+
+struct ValidatedCommand<'a> {
+    index: usize,
+    source: &'a str,
+    command: &'a Command,
+}
+
 /// Compile every command against the supplied immutable catalogs. A caller
 /// must build the Rules catalog before this function; commands never parse
 /// expressions or duplicate the Rules type checker.
@@ -632,6 +654,7 @@ fn compile_command_catalog_with_diagnostics(
 
     let mut names_by_source: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut diagnostics = Vec::new();
+    let mut validated = Vec::new();
     for (index, command) in metadata.commands.iter().enumerate() {
         let path = format!("commands[{index}]");
         let Some(source) = metadata
@@ -690,9 +713,252 @@ fn compile_command_catalog_with_diagnostics(
                         rules: rules_snapshot.clone(),
                     },
                 );
+            validated.push(ValidatedCommand {
+                index,
+                source: &source.name,
+                command,
+            });
         }
     }
+    diagnostics.extend(validate_role_visible_command_collisions(
+        &validated, catalogs,
+    ));
     (CompiledCommandCatalog { sources }, diagnostics)
+}
+
+/// Validate command-only names after the individual command compiler has
+/// accepted their source-local definitions. Unlike the source-independent
+/// composite ownership index, these checks project each command through the
+/// roles that can actually see it. That keeps a candidate deployment honest
+/// without rejecting two source-local commands that live in disjoint schemas.
+fn validate_role_visible_command_collisions(
+    commands: &[ValidatedCommand<'_>],
+    catalogs: &HashMap<String, Catalog>,
+) -> Vec<PlanError> {
+    let mut diagnostics = Vec::new();
+    let mut roots: HashMap<(String, String), &ValidatedCommand<'_>> = HashMap::new();
+    let mut generated_types: HashMap<
+        (String, String),
+        (GeneratedCommandTypeShape, &ValidatedCommand<'_>),
+    > = HashMap::new();
+
+    for command in commands {
+        let catalog = catalogs
+            .get(command.source)
+            .expect("validated command source retains its catalog");
+        let shapes = generated_command_type_shapes(command.command, catalog);
+        for permission in &command.command.permissions {
+            let role = permission.role.clone();
+            let root_key = (role.clone(), command.command.name.clone());
+            if let Some(existing) = roots.get(&root_key)
+                && existing.source != command.source
+            {
+                let path = format!("commands[{}]", command.index);
+                diagnostics.push(PlanError::validation(
+                    &path,
+                    format!(
+                        "command root '{}' is visible to role '{}' in both commands[{}] (source '{}') and commands[{}] (source '{}')",
+                        command.command.name,
+                        role,
+                        existing.index,
+                        existing.source,
+                        command.index,
+                        command.source,
+                    ),
+                ));
+            } else {
+                roots.insert(root_key, command);
+            }
+
+            for (name, shape) in &shapes {
+                let type_key = (role.clone(), name.clone());
+                if let Some((existing_shape, existing)) = generated_types.get(&type_key) {
+                    if existing_shape != shape {
+                        let path = format!("commands[{}]", command.index);
+                        diagnostics.push(PlanError::validation(
+                            &path,
+                            format!(
+                                "generated command type '{}' is visible to role '{}' in both commands[{}] (source '{}') and commands[{}] (source '{}')",
+                                name,
+                                role,
+                                existing.index,
+                                existing.source,
+                                command.index,
+                                command.source,
+                            ),
+                        ));
+                    }
+                } else {
+                    generated_types.insert(type_key, (shape.clone(), command));
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+fn generated_command_type_shapes(
+    command: &Command,
+    catalog: &Catalog,
+) -> BTreeMap<String, GeneratedCommandTypeShape> {
+    let mut shapes = BTreeMap::new();
+    let result_name = format!("{}Result", command_pascal_case(&command.name));
+    let mut result_fields = BTreeMap::new();
+    for field in &command.result.fields {
+        result_fields.insert(
+            field.name.clone(),
+            generated_command_result_type(command, catalog, &field.value, &mut shapes),
+        );
+    }
+    shapes.insert(
+        result_name,
+        GeneratedCommandTypeShape {
+            fields: result_fields,
+        },
+    );
+    shapes
+}
+
+fn generated_command_result_type(
+    command: &Command,
+    catalog: &Catalog,
+    value: &CommandValue,
+    shapes: &mut BTreeMap<String, GeneratedCommandTypeShape>,
+) -> GeneratedCommandOutputType {
+    let CommandValue::Step { step, column } = value else {
+        let CommandValue::Literal { literal } = value else {
+            unreachable!("the static command compiler retains only result step and literal values")
+        };
+        return GeneratedCommandOutputType::Named(command_literal_scalar_name(literal).to_string());
+    };
+    let step = command
+        .steps
+        .iter()
+        .find(|candidate| candidate.name == *step)
+        .expect("the static command compiler retains only declared result steps");
+    let table = generated_command_step_table(step)
+        .expect("the static command compiler forbids assert steps in results");
+    let info = catalog
+        .table(table.schema(), table.name())
+        .expect("the static command compiler retains catalog-backed steps");
+    if let Some(column) = column {
+        let column = info
+            .column(column)
+            .expect("the static command compiler retains returned columns");
+        let mut output = GeneratedCommandOutputType::Named(
+            generated_command_scalar_name(&column.pg_type).to_string(),
+        );
+        if !column.nullable && !generated_command_step_may_be_absent(step) {
+            output = GeneratedCommandOutputType::NonNull(Box::new(output));
+        }
+        return if generated_command_step_is_many(step) {
+            GeneratedCommandOutputType::NonNull(Box::new(GeneratedCommandOutputType::List(
+                Box::new(output),
+            )))
+        } else {
+            output
+        };
+    }
+
+    let row_name = format!(
+        "{}{}Row",
+        command_pascal_case(&command.name),
+        command_pascal_case(&step.name)
+    );
+    shapes
+        .entry(row_name.clone())
+        .or_insert_with(|| GeneratedCommandTypeShape {
+            fields: generated_command_step_returning(step)
+                .iter()
+                .map(|name| {
+                    let column = info
+                        .column(name)
+                        .expect("the static command compiler retains returned columns");
+                    let field = GeneratedCommandOutputType::Named(
+                        generated_command_scalar_name(&column.pg_type).to_string(),
+                    );
+                    let field = if column.nullable {
+                        field
+                    } else {
+                        GeneratedCommandOutputType::NonNull(Box::new(field))
+                    };
+                    (name.clone(), field)
+                })
+                .collect(),
+        });
+    let row = GeneratedCommandOutputType::Named(row_name);
+    if generated_command_step_is_many(step) {
+        GeneratedCommandOutputType::NonNull(Box::new(GeneratedCommandOutputType::List(Box::new(
+            GeneratedCommandOutputType::NonNull(Box::new(row)),
+        ))))
+    } else if generated_command_step_may_be_absent(step) {
+        row
+    } else {
+        GeneratedCommandOutputType::NonNull(Box::new(row))
+    }
+}
+
+fn generated_command_step_table(
+    step: &donat_metadata::CommandStep,
+) -> Option<&donat_metadata::QualifiedTable> {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+        CommandStepOperation::Insert { insert } => Some(&insert.table),
+        CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
+        CommandStepOperation::Update { update } => Some(&update.table),
+        CommandStepOperation::Delete { delete } => Some(&delete.table),
+        CommandStepOperation::Assert { .. } => None,
+    }
+}
+
+fn generated_command_step_returning(step: &donat_metadata::CommandStep) -> &[String] {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => &select_one.returning,
+        CommandStepOperation::Insert { insert } => &insert.returning,
+        CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
+        CommandStepOperation::Update { update } => &update.returning,
+        CommandStepOperation::Delete { delete } => &delete.returning,
+        CommandStepOperation::Assert { .. } => &[],
+    }
+}
+
+fn generated_command_step_is_many(step: &donat_metadata::CommandStep) -> bool {
+    matches!(step.operation, CommandStepOperation::InsertMany { .. })
+}
+
+fn generated_command_step_may_be_absent(step: &donat_metadata::CommandStep) -> bool {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => !select_one.require_found,
+        CommandStepOperation::Update { update } => !update.require_affected,
+        CommandStepOperation::Delete { delete } => !delete.require_affected,
+        CommandStepOperation::Assert { .. }
+        | CommandStepOperation::Insert { .. }
+        | CommandStepOperation::InsertMany { .. } => false,
+    }
+}
+
+fn generated_command_scalar_name(pg_type: &str) -> &str {
+    match pg_type {
+        "int2" | "int4" | "serial" => "Int",
+        "float4" | "float8" => "Float",
+        "text" | "varchar" | "bpchar" | "name" | "citext" => "String",
+        "bool" => "Boolean",
+        "uuid" => "uuid",
+        other => other,
+    }
+}
+
+fn command_literal_scalar_name(literal: &serde_json::Value) -> &'static str {
+    match literal {
+        serde_json::Value::Bool(_) => "Boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "Int",
+        serde_json::Value::Number(_) => "Float",
+        serde_json::Value::String(_) | serde_json::Value::Null => "String",
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            unreachable!("the static command compiler rejects non-scalar result literals")
+        }
+    }
 }
 
 fn validate_command(

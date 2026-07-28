@@ -11,7 +11,7 @@ use donat_backend::capabilities::JsonOps;
 use donat_metadata::{Columns, Command, CommandStep, CommandStepOperation, CommandValue, Metadata};
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
-use crate::naming::{root_names, table_base_name};
+use crate::naming::{command_pascal_case, root_names, table_base_name};
 use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 
 /// GraphQL scalar name for a Postgres type (Donat naming).
@@ -133,22 +133,6 @@ fn enum_type(name: &str, values: &[&str]) -> Json {
         "enumValues": enum_values,
         "possibleTypes": null,
     })
-}
-
-fn command_pascal_case(name: &str) -> String {
-    let mut output = String::new();
-    let mut capitalize = true;
-    for character in name.chars() {
-        if character == '_' || character == '-' {
-            capitalize = true;
-        } else if capitalize {
-            output.extend(character.to_uppercase());
-            capitalize = false;
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 fn command_type_reference(metadata: &Metadata, type_: &str) -> Json {

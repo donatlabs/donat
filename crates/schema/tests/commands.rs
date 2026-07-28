@@ -9,7 +9,7 @@ use donat_metadata::{Metadata, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
-    compile_command_catalog, execute_multi_source_introspection,
+    compile_command_catalog, execute_multi_source_introspection, validate_command_catalog,
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
@@ -91,6 +91,48 @@ fn metadata(commands: Vec<Json>) -> Metadata {
         "commands": commands
     }))
     .expect("command metadata deserializes")
+}
+
+fn two_source_metadata(commands: Vec<Json>) -> Metadata {
+    let mut metadata = metadata(commands);
+    let mut secondary = metadata.sources[0].clone();
+    secondary.name = "secondary".to_string();
+    secondary.tables[0].configuration = Some(
+        serde_json::from_value(json!({ "custom_name": "secondary_orders" }))
+            .expect("secondary table configuration deserializes"),
+    );
+    metadata.sources.push(secondary);
+    metadata
+}
+
+fn two_source_catalogs() -> HashMap<String, Catalog> {
+    let orders = catalog(RelationKind::Table);
+    HashMap::from([
+        ("default".to_string(), orders.clone()),
+        ("secondary".to_string(), orders),
+    ])
+}
+
+fn set_source_table_role(metadata: &mut Metadata, source_name: &str, role: &str) {
+    let source = metadata
+        .sources
+        .iter_mut()
+        .find(|source| source.name == source_name)
+        .expect("source exists");
+    for table in &mut source.tables {
+        for permission in &mut table.select_permissions {
+            permission.role = role.to_string();
+        }
+        for permission in &mut table.insert_permissions {
+            permission.role = role.to_string();
+        }
+        for permission in &mut table.update_permissions {
+            permission.role = role.to_string();
+        }
+        for permission in &mut table.delete_permissions {
+            permission.role = role.to_string();
+        }
+    }
 }
 
 fn valid_command() -> Json {
@@ -819,6 +861,132 @@ fn rejects_duplicate_command_names_within_a_source() {
         error
             .message
             .contains("duplicate command name 'create_order'")
+    );
+}
+
+#[test]
+fn rejects_command_root_collisions_visible_to_the_same_role_across_sources() {
+    let first = valid_command();
+    let mut second = valid_command();
+    second["source"] = json!("secondary");
+    let metadata = two_source_metadata(vec![first, second]);
+    let catalogs = two_source_catalogs();
+
+    let diagnostics = validate_command_catalog(&metadata, &catalogs, &rules(), true);
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "command root 'create_order' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
+    );
+}
+
+#[test]
+fn permits_same_command_root_in_disjoint_role_schemas_across_sources() {
+    let first = valid_command();
+    let mut second = valid_command();
+    second["source"] = json!("secondary");
+    second["permissions"] = json!([{ "role": "supplier" }]);
+    let mut metadata = two_source_metadata(vec![first, second]);
+    set_source_table_role(&mut metadata, "secondary", "supplier");
+    let catalogs = two_source_catalogs();
+    let commands = command_catalog(&metadata, &catalogs);
+
+    for role in ["customer", "supplier"] {
+        let data = introspect_runtime(
+            &metadata,
+            &catalogs,
+            commands.clone(),
+            role,
+            r#"{ __type(name: "mutation_root") { fields { name } } }"#,
+        );
+        assert_eq!(
+            data["__type"]["fields"]
+                .as_array()
+                .expect("role mutation schema")
+                .iter()
+                .filter(|field| field["name"] == "create_order")
+                .count(),
+            1,
+            "{role} must see exactly its one source-local command root: {data:#}"
+        );
+    }
+
+    let mutation = r#"
+        mutation {
+          create_order(
+            id: "00000000-0000-0000-0000-000000000001"
+            customer_id: "00000000-0000-0000-0000-000000000002"
+            status: "new"
+            quantity: 1
+            request_id: "00000000-0000-0000-0000-000000000003"
+          ) { order_id }
+        }
+    "#;
+    for (role, expected_source) in [("customer", "default"), ("supplier", "secondary")] {
+        let planned = plan_runtime(&metadata, &catalogs, commands.clone(), role, mutation)
+            .expect("the explicit role routes its visible command root");
+        let MultiSourcePlan::Mutation { source, .. } = planned else {
+            panic!("command must plan as a mutation");
+        };
+        assert_eq!(source.as_deref(), Some(expected_source));
+    }
+}
+
+#[test]
+fn rejects_pascal_cased_command_result_type_collisions_in_one_role_schema() {
+    let mut snake_case = valid_command();
+    snake_case["name"] = json!("foo_bar");
+    snake_case["result"] = json!({
+        "order_id": { "step": "order", "column": "id" }
+    });
+    let mut camel_case = valid_command();
+    camel_case["name"] = json!("fooBar");
+    camel_case["result"] = json!({
+        "status": { "step": "order", "column": "status" }
+    });
+    let metadata = metadata(vec![snake_case, camel_case]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
+    );
+}
+
+#[test]
+fn rejects_pascal_cased_command_row_type_collisions_in_one_role_schema() {
+    let mut snake_case = valid_command();
+    snake_case["name"] = json!("foo_bar");
+    snake_case["steps"][0]["insert"]["returning"] = json!(["id", "status"]);
+    snake_case["result"] = json!({ "order": { "step": "order" } });
+    let mut camel_case = valid_command();
+    camel_case["name"] = json!("fooBar");
+    camel_case["steps"][0]["insert"]["returning"] = json!(["id", "customer_id"]);
+    camel_case["result"] = json!({ "order": { "step": "order" } });
+    let metadata = metadata(vec![snake_case, camel_case]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'FooBarOrderRow' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
     );
 }
 

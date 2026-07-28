@@ -474,6 +474,24 @@ impl<'a> Planner<'a> {
     /// All mutation roots owned by this source. Read-only backends expose no
     /// mutation ownership even though their metadata may contain table CRUD.
     pub fn mutation_root_names(&self) -> impl Iterator<Item = &str> {
+        self.standard_mutation_root_names().chain(
+            (self.source_kind == SourceKind::Postgres)
+                .then_some(())
+                .into_iter()
+                .flat_map(|_| {
+                    self.commands.into_iter().flat_map(|commands| {
+                        commands
+                            .commands()
+                            .map(|command| command.definition().name.as_str())
+                    })
+                }),
+        )
+    }
+
+    /// Non-command mutation roots owned by this source. Composite routing
+    /// keeps these source-global; command roots are resolved per role because
+    /// their visibility is itself part of the generated role schema.
+    pub(crate) fn standard_mutation_root_names(&self) -> impl Iterator<Item = &str> {
         let table_roots = self
             .capabilities
             .mutations
@@ -486,17 +504,7 @@ impl<'a> Planner<'a> {
             .then_some(())
             .into_iter()
             .flat_map(|_| self.mutation_function_roots.keys().map(String::as_str));
-        let command_roots = (self.source_kind == SourceKind::Postgres)
-            .then_some(())
-            .into_iter()
-            .flat_map(|_| {
-                self.commands.into_iter().flat_map(|commands| {
-                    commands
-                        .commands()
-                        .map(|command| command.definition().name.as_str())
-                })
-            });
-        table_roots.chain(function_roots).chain(command_roots)
+        table_roots.chain(function_roots)
     }
 
     pub(crate) fn command_named(&self, name: &str) -> Option<&CompiledCommand> {

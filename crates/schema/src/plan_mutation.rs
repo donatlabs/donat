@@ -1092,7 +1092,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn command_is_permitted(&self, command: &Command, session: &Session) -> bool {
+    pub(crate) fn command_is_permitted(&self, command: &Command, session: &Session) -> bool {
         command
             .permissions
             .iter()

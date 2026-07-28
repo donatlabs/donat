@@ -510,6 +510,133 @@ async fn check_consistency_collects_static_command_diagnostics() {
 }
 
 #[tokio::test]
+async fn check_consistency_rejects_same_role_command_root_across_sources() {
+    let table = format!(
+        "donat_command_root_collision_{}_{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    let url = pg_url();
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (id uuid PRIMARY KEY, status text NOT NULL);"
+        ))
+        .await
+        .expect("validation table creates");
+
+    let metadata = MetadataDir::new(&table);
+    std::fs::write(
+        metadata.path.join("databases/databases.yaml"),
+        format!(
+            r#"
+- name: default
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://unused
+  tables:
+    - table:
+        schema: public
+        name: {table}
+      select_permissions:
+        - role: customer
+          permission:
+            columns: "*"
+            filter: {{}}
+      insert_permissions:
+        - role: customer
+          permission:
+            columns: "*"
+            check: {{}}
+- name: secondary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://unused
+  tables:
+    - table:
+        schema: public
+        name: {table}
+      configuration:
+        custom_name: secondary_order
+      select_permissions:
+        - role: customer
+          permission:
+            columns: "*"
+            filter: {{}}
+      insert_permissions:
+        - role: customer
+          permission:
+            columns: "*"
+            check: {{}}
+"#
+        ),
+    )
+    .expect("two-source database metadata writes");
+    std::fs::write(
+        metadata.path.join("commands.yaml"),
+        format!(
+            r#"
+- name: create_order
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "00000000-0000-0000-0000-000000000001" }}
+          status: {{ literal: new }}
+        returning: [id]
+  result:
+    id: {{ step: order, column: id }}
+- name: create_order
+  source: secondary
+  permissions:
+    - role: customer
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: {table}
+        object:
+          id: {{ literal: "00000000-0000-0000-0000-000000000002" }}
+          status: {{ literal: new }}
+        returning: [id]
+  result:
+    id: {{ step: order, column: id }}
+"#
+        ),
+    )
+    .expect("collision command metadata writes");
+
+    let problems = check_consistency(&url, &metadata.path)
+        .await
+        .expect("metadata validation completes");
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("validation table drops");
+    connection.abort();
+
+    assert_eq!(
+        problems,
+        vec![
+            "commands[1]: command root 'create_order' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'secondary')"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn check_consistency_rejects_out_of_range_int8_command_literal_without_writes() {
     let table = format!(
         "donat_command_literal_int8_{}_{}",

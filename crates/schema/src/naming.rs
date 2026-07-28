@@ -20,6 +20,25 @@ pub fn default_base_name(table: &QualifiedTable) -> String {
     }
 }
 
+/// Stable Pascal-case component used by generated command result and row type
+/// names. Command root fields themselves intentionally retain their metadata
+/// spelling; only the generated object type names use this transformation.
+pub(crate) fn command_pascal_case(name: &str) -> String {
+    let mut output = String::new();
+    let mut capitalize = true;
+    for character in name.chars() {
+        if character == '_' || character == '-' {
+            capitalize = true;
+        } else if capitalize {
+            output.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 /// GraphQL-visible column field name for a physical database column.
 ///
 /// Hasura metadata supports both the v2 `custom_column_names` map and the
