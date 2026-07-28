@@ -274,16 +274,32 @@ pub struct DecisionResult {
     pub trace: DecisionTrace,
 }
 
+/// One named, deploy-time-declared decision output. Its value remains typed
+/// business data and cannot select a runtime capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionOutputField {
+    pub name: String,
+    pub type_: RuleType,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledDecisionTable {
     pub name: String,
     pub revision: DefinitionRevision,
     pub(crate) inputs: BTreeMap<String, RuleType>,
     pub(crate) output: BTreeMap<String, RuleType>,
+    pub(crate) output_fields: BTreeMap<String, DecisionOutputField>,
     pub(crate) hit_policy: HitPolicy,
     pub rows: Vec<CompiledDecisionRow>,
     pub(crate) test_cases: Vec<CompiledDecisionTestCase>,
     pub(crate) declared_types: Vec<RuleType>,
+}
+
+impl CompiledDecisionTable {
+    /// Return the declared type of one decision output data field.
+    pub fn output_field(&self, name: &str) -> Option<&DecisionOutputField> {
+        self.output_fields.get(name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -387,8 +403,6 @@ pub enum RuleError {
     MissingDefaultRow { table: String },
     #[error("decision table `{table}` has an invalid row `{row_id}`")]
     InvalidDecisionRow { table: String, row_id: String },
-    #[error("decision table output field `{field}` is forbidden")]
-    ForbiddenDecisionOutput { field: String },
     #[error("decision table `{table}` had no matching row")]
     DecisionNoMatch {
         table: String,

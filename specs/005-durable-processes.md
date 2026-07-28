@@ -72,6 +72,10 @@ fields of that one kind, not additional state kinds. `set` may consume declared
 input, state, result, signal, or Spec 004 rule values; it cannot read a table,
 select a runtime role, or execute code.
 
+A command or process may accept a decision value only into an exactly typed data destination
+or map a declared enum at deploy time to fixed action/state targets; they
+never bind a generic output to role/permission/command/connector identifiers.
+
 ## 3. Durable data model and execution
 
 The deploy-time migration creates engine-internal tables in donat:

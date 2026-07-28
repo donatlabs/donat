@@ -30,6 +30,10 @@ native conformance harness.
 plans. The process worker consumes their public APIs; it never reimplements
 CEL-like rules, command SQL, or HTTP/Stripe protocol handling.
 
+A command or process may accept a decision value only into an exactly typed data destination
+or map a declared enum at deploy time to fixed action/state targets; they
+never bind a generic output to role/permission/command/connector identifiers.
+
 **Specification:**
 [`specs/005-durable-processes.md`](../../../specs/005-durable-processes.md)
 

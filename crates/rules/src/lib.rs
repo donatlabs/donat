@@ -24,7 +24,7 @@ pub use parser::parse_expression;
 pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres, lower_postgres_value};
 pub use types::{
     CanonicalRoot, CanonicalValue, CompiledDecisionRow, CompiledDecisionTable, CompiledRule,
-    DecisionConditionTrace, DecisionRejection, DecisionResult, DecisionRow,
+    DecisionConditionTrace, DecisionOutputField, DecisionRejection, DecisionResult, DecisionRow,
     DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation, DecisionTrace,
     DefinitionRevision, EvaluatedRuleValue, ExpressionContext, ExpressionOwner, HitPolicy,
     LoweredRuleValue, RuleArtifact, RuleCatalog, RuleDefinition, RuleDiagnostic, RuleError,

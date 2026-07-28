@@ -253,6 +253,10 @@ Spec 004 boolean expression over its declared bindings, but it cannot add a
 free-form WHERE clause. This is the Phase-1 guardrail against accidental
 set-wide writes.
 
+A command or process may accept a decision value only into an exactly typed data destination
+or map a declared enum at deploy time to fixed action/state targets; they
+never bind a generic output to role/permission/command/connector identifiers.
+
 select_one requires a complete primary-key predicate and returns exactly one
 row when require_found is true. insert writes exactly one object. insert_many accepts exactly one declared list
 argument, rejects an empty list unless allow_empty: true is set, and preserves

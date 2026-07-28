@@ -771,6 +771,106 @@ fn first_decision_table_uses_the_declared_default_row_and_preserves_its_id() {
 }
 
 #[test]
+fn decision_output_names_are_typed_data() {
+    let table = DecisionTableDefinition {
+        name: "customer_classification".to_owned(),
+        revision: "rules-2026-07-28".to_owned(),
+        inputs: map([("amount", RuleType::Int)]),
+        output: map([
+            ("role_label", RuleType::String),
+            ("permission_count", RuleType::Int),
+            ("connector_reference", RuleType::String),
+        ]),
+        hit_policy: HitPolicy::First,
+        rows: vec![decision_row(
+            "default",
+            map([("amount", "true")]),
+            json!({
+                "role_label": "priority_customer",
+                "permission_count": 3,
+                "connector_reference": "crm_account",
+            }),
+        )],
+        test_cases: vec![DecisionTableTestCase {
+            name: "classification is typed business data".to_owned(),
+            input: json!({"amount": 100}),
+            expect: DecisionTestExpectation {
+                output: json!({
+                    "role_label": "priority_customer",
+                    "permission_count": 3,
+                    "connector_reference": "crm_account",
+                }),
+                matched_row_id: "default".to_owned(),
+            },
+        }],
+    };
+
+    let catalog = compile_catalog(&[], &[table])
+        .expect("decision output field names must not determine their capability");
+    let result = catalog
+        .evaluate_decision("customer_classification", &map([("amount", json!(100))]))
+        .expect("a typed decision output should evaluate");
+
+    assert_eq!(
+        result.output,
+        json!({
+            "role_label": "priority_customer",
+            "permission_count": 3,
+            "connector_reference": "crm_account",
+        })
+    );
+}
+
+#[test]
+fn rules_expose_no_dynamic_capability_selection_api() {
+    let table = DecisionTableDefinition {
+        name: "work_routing".to_owned(),
+        revision: "rules-2026-07-28".to_owned(),
+        inputs: map([("amount", RuleType::Int)]),
+        output: map([
+            ("role_label", RuleType::String),
+            ("permission_count", RuleType::Int),
+            ("connector_reference", RuleType::String),
+        ]),
+        hit_policy: HitPolicy::First,
+        rows: vec![decision_row(
+            "default",
+            map([("amount", "true")]),
+            json!({
+                "role_label": "customer_service",
+                "permission_count": 2,
+                "connector_reference": "crm_case",
+            }),
+        )],
+        test_cases: Vec::new(),
+    };
+
+    let catalog = compile_catalog(&[], &[table])
+        .expect("Rules must expose decision values without capability selection");
+    let result = catalog
+        .evaluate_decision("work_routing", &map([("amount", json!(100))]))
+        .expect("decision evaluation returns typed data, not a capability handle");
+    let table = catalog
+        .decision_table("work_routing")
+        .expect("the compiled decision table should be inspectable");
+    let output: &donat_rules::DecisionOutputField = table
+        .output_field("permission_count")
+        .expect("a declared output has a typed data schema");
+
+    assert_eq!(
+        result.output,
+        json!({
+            "role_label": "customer_service",
+            "permission_count": 2,
+            "connector_reference": "crm_case",
+        })
+    );
+    assert_eq!(output.name, "permission_count");
+    assert_eq!(output.type_, RuleType::Int);
+    assert!(table.output_field("unknown").is_none());
+}
+
+#[test]
 fn unique_decision_tables_reject_zero_and_multiple_matches() {
     let mut zero_match = approval_table(HitPolicy::Unique);
     zero_match.rows.pop();
@@ -979,7 +1079,7 @@ fn assert_sha256_hex(value: &str, label: &str) {
 }
 
 #[test]
-fn catalog_rejects_duplicate_names_bad_default_rows_result_permissions_and_invalid_test_cases() {
+fn catalog_rejects_duplicate_names_bad_default_rows_and_invalid_test_cases() {
     let duplicate_rules = compile_catalog(
         &[
             rule("same", BTreeMap::new(), RuleType::Bool, "true"),
@@ -1000,18 +1100,6 @@ fn catalog_rejects_duplicate_names_bad_default_rows_result_permissions_and_inval
         default_error,
         donat_rules::RuleError::MissingDefaultRow { .. }
     ));
-
-    let mut forbidden_output = approval_table(HitPolicy::First);
-    forbidden_output
-        .output
-        .insert("run_as_role".to_owned(), RuleType::String);
-    forbidden_output.rows[0].output = json!({"route": "manual", "run_as_role": "bypass"});
-    forbidden_output.rows[1].output = json!({"route": "automatic", "run_as_role": "bypass"});
-    let forbidden_error = compile_catalog(&[], &[forbidden_output])
-        .expect_err("a decision result may not select a runtime role or permission");
-    assert!(
-        matches!(forbidden_error, donat_rules::RuleError::ForbiddenDecisionOutput { ref field } if field == "run_as_role")
-    );
 
     let mut wrong_test = approval_table(HitPolicy::First);
     wrong_test.test_cases[0].expect.matched_row_id = "manual_review".to_owned();

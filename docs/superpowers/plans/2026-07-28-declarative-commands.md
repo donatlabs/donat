@@ -22,6 +22,10 @@ in-memory or direct-start implementation. The same later integration activates
 the typed `signal_process` effect; it is the only way a command can recover or
 cancel a durable process.
 
+A command or process may accept a decision value only into an exactly typed data destination
+or map a declared enum at deploy time to fixed action/state targets; they
+never bind a generic output to role/permission/command/connector identifiers.
+
 **Tech stack:** Rust, Postgres 16, GraphQL parser, serde YAML, `insta`, native
 conformance harness.
 

@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::types::{
     CanonicalValue, CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable,
-    CompiledDecisionTestCase, DefinitionRevision, EvaluatedRuleValue, RuleArtifact,
-    access_result_type,
+    CompiledDecisionTestCase, DecisionOutputField, DefinitionRevision, EvaluatedRuleValue,
+    RuleArtifact, access_result_type,
 };
 use crate::{
     BinaryOp, CanonicalRoot, CompiledRule, DecisionConditionTrace, DecisionRejection,
@@ -340,13 +340,6 @@ fn compile_decision_table(
             column: "output".to_owned(),
         });
     }
-    for field in definition.output.keys() {
-        if is_permission_selecting_output(field) {
-            return Err(RuleError::ForbiddenDecisionOutput {
-                field: field.clone(),
-            });
-        }
-    }
 
     let mut seen_rows = BTreeSet::new();
     let mut rows = Vec::with_capacity(definition.rows.len());
@@ -448,6 +441,19 @@ fn compile_decision_table(
         revision: DefinitionRevision(String::new()),
         inputs: definition.inputs.clone(),
         output: definition.output.clone(),
+        output_fields: definition
+            .output
+            .iter()
+            .map(|(name, type_)| {
+                (
+                    name.clone(),
+                    DecisionOutputField {
+                        name: name.clone(),
+                        type_: type_.clone(),
+                    },
+                )
+            })
+            .collect(),
         hit_policy: policy,
         rows,
         test_cases,
@@ -948,11 +954,6 @@ fn type_mismatch(
 
 fn is_numeric(type_: &RuleType) -> bool {
     matches!(type_, RuleType::Int | RuleType::Decimal)
-}
-
-fn is_permission_selecting_output(field: &str) -> bool {
-    let normalized = field.to_ascii_lowercase();
-    normalized.contains("role") || normalized.contains("permission")
 }
 
 fn evaluate_decision_table(
