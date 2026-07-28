@@ -14,6 +14,7 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
+use crate::commands::{CompiledCommand, CompiledSourceCommandCatalog};
 use crate::naming::{column_db_name, column_graphql_name, root_names, table_base_name};
 
 /// Per-request session: an explicit role + X-Donat-*/X-Hasura-* variables
@@ -245,11 +246,28 @@ pub struct Planner<'a> {
     /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
     pub relay: bool,
     inherited_roles: &'a [donat_metadata::InheritedRole],
+    metadata: &'a Metadata,
     remote_schemas: &'a [donat_metadata::RemoteSchema],
     catalog: &'a Catalog,
     tables: &'a [TableEntry],
     functions: &'a [donat_metadata::FunctionEntry],
+    commands: Option<&'a CompiledSourceCommandCatalog>,
+    source_kind: SourceKind,
+    /// Used only while compiling the role-independent composite schema. It
+    /// contributes command type information for GraphQL validation, while the
+    /// cached role schemas and request planner still enforce explicit roles.
+    pub(crate) expose_all_commands: bool,
     index: Arc<PlannerIndex>,
+}
+
+/// Command catalog and source constraints carried by a planner.
+///
+/// Commands are source-local: a catalog may be present only for the source it
+/// was compiled against, and its roots are supported only by Postgres.
+struct CommandPlannerConfig<'a> {
+    commands: Option<&'a CompiledSourceCommandCatalog>,
+    source_kind: SourceKind,
+    expose_all_commands: bool,
 }
 
 impl std::ops::Deref for Planner<'_> {
@@ -288,6 +306,11 @@ impl<'a> Planner<'a> {
             catalog,
             &[],
             &[],
+            CommandPlannerConfig {
+                commands: None,
+                source_kind: SourceKind::Postgres,
+                expose_all_commands: false,
+            },
             Self::compile_index_parts(&[], &[], donat_backend::capabilities::postgres()),
         )
     }
@@ -310,11 +333,27 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         index: Arc<PlannerIndex>,
     ) -> Self {
+        Self::for_source_with_index_and_commands(metadata, source, catalog, index, None, false)
+    }
+
+    pub(crate) fn for_source_with_index_and_commands(
+        metadata: &'a Metadata,
+        source: &'a Source,
+        catalog: &'a Catalog,
+        index: Arc<PlannerIndex>,
+        commands: Option<&'a CompiledSourceCommandCatalog>,
+        expose_all_commands: bool,
+    ) -> Self {
         Self::from_parts(
             metadata,
             catalog,
             source.tables.as_slice(),
             source.functions.as_slice(),
+            CommandPlannerConfig {
+                commands,
+                source_kind: source.kind,
+                expose_all_commands,
+            },
             index,
         )
     }
@@ -409,16 +448,21 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         tables: &'a [TableEntry],
         functions: &'a [donat_metadata::FunctionEntry],
+        command_config: CommandPlannerConfig<'a>,
         index: Arc<PlannerIndex>,
     ) -> Self {
         Planner {
             infer_function_permissions: true,
             relay: false,
             inherited_roles: &metadata.inherited_roles,
+            metadata,
             remote_schemas: &metadata.remote_schemas,
             catalog,
             tables,
             functions,
+            commands: command_config.commands,
+            source_kind: command_config.source_kind,
+            expose_all_commands: command_config.expose_all_commands,
             index,
         }
     }
@@ -444,7 +488,35 @@ impl<'a> Planner<'a> {
             .then_some(())
             .into_iter()
             .flat_map(|_| self.mutation_function_roots.keys().map(String::as_str));
-        table_roots.chain(function_roots)
+        let command_roots = (self.source_kind == SourceKind::Postgres)
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| {
+                self.commands.into_iter().flat_map(|commands| {
+                    commands
+                        .commands()
+                        .map(|command| command.definition().name.as_str())
+                })
+            });
+        table_roots.chain(function_roots).chain(command_roots)
+    }
+
+    pub(crate) fn command_named(&self, name: &str) -> Option<&CompiledCommand> {
+        if self.source_kind != SourceKind::Postgres {
+            return None;
+        }
+        self.commands.and_then(|commands| commands.command(name))
+    }
+
+    pub(crate) fn command_definitions(&self) -> impl Iterator<Item = &CompiledCommand> {
+        (self.source_kind == SourceKind::Postgres)
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| {
+                self.commands
+                    .into_iter()
+                    .flat_map(CompiledSourceCommandCatalog::commands)
+            })
     }
 
     pub(crate) fn relay_root_names(&self) -> impl Iterator<Item = String> + '_ {
@@ -748,6 +820,14 @@ impl<'a> Planner<'a> {
 
     pub(crate) fn tables(&self) -> &'a [TableEntry] {
         self.tables
+    }
+
+    pub(crate) fn metadata(&self) -> &'a Metadata {
+        self.metadata
+    }
+
+    pub(crate) fn catalog_table(&self, table: &QualifiedTable) -> Option<&'a TableInfo> {
+        self.catalog.table(table.schema(), table.name())
     }
 
     pub(crate) fn entry_for(&self, table: &QualifiedTable) -> Option<&'a TableEntry> {

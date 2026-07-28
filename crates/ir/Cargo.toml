@@ -6,5 +6,6 @@ license.workspace = true
 description = "Intermediate representation: validated, permission-resolved query plan, independent of SQL"
 
 [dependencies]
+donat-metadata = { path = "../metadata" }
 serde = { workspace = true }
 serde_json = { workspace = true }

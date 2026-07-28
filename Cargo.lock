@@ -653,6 +653,7 @@ dependencies = [
 name = "donat-ir"
 version = "0.1.0"
 dependencies = [
+ "donat-metadata",
  "serde",
  "serde_json",
 ]

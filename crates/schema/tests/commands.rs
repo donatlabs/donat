@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, RelationKind, TableInfo};
+use donat_ir::MutationRoot;
 use donat_metadata::{Metadata, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
-use donat_schema::{PlanError, compile_command_catalog};
-use serde_json::{Value as Json, json};
+use donat_schema::{
+    CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
+    compile_command_catalog, execute_multi_source_introspection,
+};
+use serde_json::{Map as JsonMap, Value as Json, json};
 
 fn column(name: &str, pg_type: &str) -> ColumnInfo {
     column_with(name, pg_type, -1, false)
@@ -138,6 +143,78 @@ fn compile_with_catalog(metadata: &Metadata, catalog: Catalog) -> Result<(), Pla
     compile_command_catalog(metadata, &catalogs, &rules(), true).map(|_| ())
 }
 
+fn command_catalog(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+) -> Arc<donat_schema::CompiledCommandCatalog> {
+    Arc::new(
+        compile_command_catalog(metadata, catalogs, &rules(), true)
+            .expect("command catalog compiles before runtime schema construction"),
+    )
+}
+
+fn runtime_schema(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    commands: Arc<donat_schema::CompiledCommandCatalog>,
+) -> CompiledMultiSourceSchema {
+    CompiledMultiSourceSchema::compile_with_command_catalog(metadata, catalogs, commands, true)
+        .expect("runtime schema compiles from the validated command catalog")
+}
+
+fn session(role: &str) -> Session {
+    Session {
+        role: role.to_string(),
+        vars: HashMap::new(),
+        backend_request: false,
+    }
+}
+
+fn introspect_runtime(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    commands: Arc<donat_schema::CompiledCommandCatalog>,
+    role: &str,
+    query: &str,
+) -> Json {
+    let compiled = runtime_schema(metadata, catalogs, commands);
+    let planner = MultiSourcePlanner::from_compiled(metadata, catalogs, &compiled)
+        .expect("planner uses the immutable runtime schema");
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("introspection query parses")
+        .into_static();
+    execute_multi_source_introspection(&planner, &session(role), &doc, None, &JsonMap::new())
+        .expect("query is introspection")
+        .expect("introspection succeeds")
+}
+
+fn plan_runtime(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    commands: Arc<donat_schema::CompiledCommandCatalog>,
+    role: &str,
+    query: &str,
+) -> Result<MultiSourcePlan, PlanError> {
+    plan_runtime_with_variables(metadata, catalogs, commands, role, query, JsonMap::new())
+}
+
+fn plan_runtime_with_variables(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    commands: Arc<donat_schema::CompiledCommandCatalog>,
+    role: &str,
+    query: &str,
+    variables: JsonMap<String, Json>,
+) -> Result<MultiSourcePlan, PlanError> {
+    let compiled = runtime_schema(metadata, catalogs, commands);
+    let planner = MultiSourcePlanner::from_compiled(metadata, catalogs, &compiled)
+        .expect("planner uses the immutable runtime schema");
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("mutation parses")
+        .into_static();
+    planner.plan(&doc, None, &variables, &session(role))
+}
+
 fn literal_target_catalog(pg_type: &str, pg_typmod: i32, nullable: bool) -> Catalog {
     let mut catalog = catalog(RelationKind::Table);
     let table = catalog
@@ -202,6 +279,267 @@ fn assert_rejected(command: Json, expected: &str) {
         error.message.contains(expected),
         "expected {expected:?} in {:?}",
         error.message
+    );
+}
+
+#[test]
+fn command_schema_is_role_specific_and_preserves_the_metadata_field_name() {
+    let metadata = metadata(vec![valid_command()]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let query = r#"
+        {
+          root: __type(name: "mutation_root") {
+            fields {
+              name
+              args { name type { kind name ofType { kind name } } }
+              type { kind name }
+            }
+          }
+          result: __type(name: "CreateOrderResult") {
+            fields { name type { kind name ofType { kind name } } }
+          }
+        }
+    "#;
+
+    let customer = introspect_runtime(&metadata, &catalogs, commands.clone(), "customer", query);
+    let command_fields = customer["root"]["fields"]
+        .as_array()
+        .expect("mutation root fields")
+        .iter()
+        .filter(|field| field["name"] == "create_order")
+        .collect::<Vec<_>>();
+    assert_eq!(command_fields.len(), 1, "{customer:#}");
+    assert_eq!(command_fields[0]["type"]["kind"], "OBJECT");
+    assert_eq!(command_fields[0]["type"]["name"], "CreateOrderResult");
+    assert_eq!(
+        command_fields[0]["args"],
+        json!([
+            {"name": "id", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "uuid"}}},
+            {"name": "customer_id", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "uuid"}}},
+            {"name": "status", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "String"}}},
+            {"name": "quantity", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "Int"}}},
+            {"name": "request_id", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "uuid"}}}
+        ])
+    );
+    assert_eq!(
+        customer["result"]["fields"],
+        json!([
+            {"name": "order_id", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "uuid"}}},
+            {"name": "status", "type": {"kind": "NON_NULL", "name": null, "ofType": {"kind": "SCALAR", "name": "String"}}}
+        ])
+    );
+
+    let unknown = introspect_runtime(&metadata, &catalogs, commands, "unknown", query);
+    assert!(
+        unknown["root"].is_null()
+            || unknown["root"]["fields"]
+                .as_array()
+                .is_none_or(|fields| fields.iter().all(|field| field["name"] != "create_order")),
+        "an unpermitted role must not see the command: {unknown:#}"
+    );
+}
+
+#[test]
+fn command_planning_rejects_undeclared_output_and_missing_runtime_table_permission() {
+    let metadata = metadata(vec![valid_command()]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let undeclared = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands.clone(),
+        "customer",
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { missing }
+            }
+        "#,
+    )
+    .expect_err("undeclared command result selections are rejected");
+    assert!(undeclared.message.contains("missing"), "{undeclared:?}");
+
+    let mut revoked = metadata.clone();
+    revoked.sources[0].tables[0].insert_permissions.clear();
+    let permission_error = plan_runtime(
+        &revoked,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order_id }
+            }
+        "#,
+    )
+    .expect_err("command permission never bypasses a current table permission");
+    assert!(
+        permission_error.message.contains("insert permission"),
+        "{permission_error:?}"
+    );
+}
+
+#[test]
+fn command_planning_preserves_aliases_and_emits_a_sql_free_command_root() {
+    let metadata = metadata(vec![valid_command()]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation {
+              submitted: create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order: order_id }
+            }
+        "#,
+    )
+    .expect("a permitted command plans");
+    let MultiSourcePlan::Mutation { source, roots, .. } = plan else {
+        panic!("command must be a mutation plan");
+    };
+    assert_eq!(source.as_deref(), Some("default"));
+    let [MutationRoot::Command { alias, command }] = roots.as_slice() else {
+        panic!("expected one command root, got {roots:#?}");
+    };
+    assert_eq!(alias, "submitted");
+    assert_eq!(command.definition.name, "create_order");
+    assert_eq!(command.arguments["quantity"].as_json(), &json!(1));
+    let serialized = serde_json::to_value(command).expect("command IR serializes");
+    assert_eq!(serialized["selection"][0]["Scalar"]["alias"], "order");
+    assert!(
+        !serialized.to_string().to_ascii_lowercase().contains("sql"),
+        "command IR carries only validated metadata, values, and projection: {serialized:#}"
+    );
+}
+
+#[test]
+fn command_arguments_validate_resolved_variables_against_the_declared_type() {
+    let metadata = metadata(vec![valid_command()]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let error = plan_runtime_with_variables(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation Create($quantity: Int!) {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: $quantity
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order_id }
+            }
+        "#,
+        JsonMap::from_iter([(String::from("quantity"), json!("not-an-int"))]),
+    )
+    .expect_err("resolved variables must satisfy the declared command argument type");
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.path, "$.selectionSet.create_order.args.quantity");
+    assert!(error.message.contains("Int"), "{error:?}");
+}
+
+#[test]
+fn command_schema_preserves_list_item_nullability_for_declared_input_objects() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .push(json!({ "name": "lines", "type": "[OrderInput!]!" }));
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let data = introspect_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            {
+              root: __type(name: "mutation_root") {
+                fields {
+                  name
+                  args {
+                    name
+                    type { kind name ofType { kind name ofType { kind name } } }
+                  }
+                }
+              }
+              line: __type(name: "OrderInput") {
+                kind
+                inputFields { name type { kind name ofType { kind name } } }
+              }
+            }
+        "#,
+    );
+    let lines = data["root"]["fields"]
+        .as_array()
+        .expect("root fields")
+        .iter()
+        .find(|field| field["name"] == "create_order")
+        .and_then(|field| field["args"].as_array())
+        .and_then(|arguments| {
+            arguments
+                .iter()
+                .find(|argument| argument["name"] == "lines")
+        })
+        .expect("lines command argument");
+    assert_eq!(
+        lines["type"],
+        json!({
+            "kind": "NON_NULL", "name": null,
+            "ofType": {
+                "kind": "LIST", "name": null,
+                "ofType": { "kind": "NON_NULL", "name": null }
+            }
+        })
+    );
+    assert_eq!(data["line"]["kind"], "INPUT_OBJECT");
+    assert_eq!(data["line"]["inputFields"][0]["name"], "status");
+}
+
+#[test]
+fn command_roots_are_absent_from_non_postgres_sources() {
+    let metadata = metadata(vec![valid_command()]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let mut non_postgres = metadata.clone();
+    non_postgres.sources[0].kind = SourceKind::Sqlite;
+    let data = introspect_runtime(
+        &non_postgres,
+        &catalogs,
+        commands,
+        "customer",
+        r#"{ __type(name: "mutation_root") { fields { name } } }"#,
+    );
+    assert!(
+        data["__type"].is_null()
+            || data["__type"]["fields"]
+                .as_array()
+                .is_none_or(|fields| fields.iter().all(|field| field["name"] != "create_order")),
+        "a command must not be exposed through a non-Postgres source: {data:#}"
     );
 }
 

@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
-use donat_metadata::Columns;
+use donat_metadata::{Columns, Command, CommandStep, CommandStepOperation, CommandValue, Metadata};
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
 use crate::naming::{root_names, table_base_name};
@@ -133,6 +133,312 @@ fn enum_type(name: &str, values: &[&str]) -> Json {
         "enumValues": enum_values,
         "possibleTypes": null,
     })
+}
+
+fn command_pascal_case(name: &str) -> String {
+    let mut output = String::new();
+    let mut capitalize = true;
+    for character in name.chars() {
+        if character == '_' || character == '-' {
+            capitalize = true;
+        } else if capitalize {
+            output.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn command_type_reference(metadata: &Metadata, type_: &str) -> Json {
+    let (non_null_type, nullable) = match type_.strip_suffix('!') {
+        Some(inner) => (inner, false),
+        None => (type_, true),
+    };
+    let inner = if let Some(list) = non_null_type
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        list_of(command_type_reference(metadata, list))
+    } else {
+        let name = match non_null_type {
+            "Boolean" | "bool" => "Boolean".to_string(),
+            "String" | "string" | "ID" => "String".to_string(),
+            "Int" | "int" => "Int".to_string(),
+            "Float" | "float" | "decimal" => "Float".to_string(),
+            other => other.to_string(),
+        };
+        let kind = if metadata
+            .custom_types
+            .input_objects
+            .iter()
+            .any(|input| input.name == name)
+        {
+            "INPUT_OBJECT"
+        } else if metadata
+            .custom_types
+            .enums
+            .iter()
+            .any(|enum_| enum_.name == name)
+        {
+            "ENUM"
+        } else {
+            "SCALAR"
+        };
+        named(kind, &name)
+    };
+    if nullable { inner } else { non_null(inner) }
+}
+
+fn command_type_scalars(
+    metadata: &Metadata,
+    type_: &str,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) {
+    let type_ = type_.strip_suffix('!').unwrap_or(type_);
+    if let Some(inner) = type_
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        command_type_scalars(metadata, inner, types, scalars, generated);
+        return;
+    }
+    let scalar = match type_ {
+        "Boolean" | "bool" => Some("Boolean"),
+        "String" | "string" | "ID" => Some("String"),
+        "Int" | "int" => Some("Int"),
+        "Float" | "float" | "decimal" => Some("Float"),
+        "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(type_),
+        _ => None,
+    };
+    if let Some(scalar) = scalar {
+        scalars.insert(scalar.to_string());
+        return;
+    }
+    if let Some(input) = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .find(|input| input.name == type_)
+    {
+        if generated.insert(input.name.clone()) {
+            for field in &input.fields {
+                command_type_scalars(metadata, &field.type_, types, scalars, generated);
+            }
+            types.push(input_object_type(
+                &input.name,
+                input
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        input_value(&field.name, command_type_reference(metadata, &field.type_))
+                    })
+                    .collect(),
+            ));
+        }
+        return;
+    }
+    if let Some(enum_) = metadata
+        .custom_types
+        .enums
+        .iter()
+        .find(|enum_| enum_.name == type_)
+        && generated.insert(enum_.name.clone())
+    {
+        types.push(enum_type(
+            &enum_.name,
+            &enum_
+                .values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+        ));
+        return;
+    }
+    scalars.insert(type_.to_string());
+}
+
+fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTable> {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+        CommandStepOperation::Insert { insert } => Some(&insert.table),
+        CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
+        CommandStepOperation::Update { update } => Some(&update.table),
+        CommandStepOperation::Delete { delete } => Some(&delete.table),
+        CommandStepOperation::Assert { .. } => None,
+    }
+}
+
+fn command_step_returning(step: &CommandStep) -> &[String] {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => &select_one.returning,
+        CommandStepOperation::Insert { insert } => &insert.returning,
+        CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
+        CommandStepOperation::Update { update } => &update.returning,
+        CommandStepOperation::Delete { delete } => &delete.returning,
+        CommandStepOperation::Assert { .. } => &[],
+    }
+}
+
+fn command_step_is_many(step: &CommandStep) -> bool {
+    matches!(step.operation, CommandStepOperation::InsertMany { .. })
+}
+
+fn command_step_may_be_absent(step: &CommandStep) -> bool {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => !select_one.require_found,
+        CommandStepOperation::Update { update } => !update.require_affected,
+        CommandStepOperation::Delete { delete } => !delete.require_affected,
+        CommandStepOperation::Assert { .. }
+        | CommandStepOperation::Insert { .. }
+        | CommandStepOperation::InsertMany { .. } => false,
+    }
+}
+
+fn command_scalar_type(literal: &Json) -> Json {
+    let scalar = match literal {
+        Json::Bool(_) => "Boolean",
+        Json::Number(number) if number.is_i64() || number.is_u64() => "Int",
+        Json::Number(_) => "Float",
+        Json::String(_) => "String",
+        Json::Null | Json::Array(_) | Json::Object(_) => "String",
+    };
+    named("SCALAR", scalar)
+}
+
+fn command_result_type(
+    planner: &Planner,
+    command: &Command,
+    value: &CommandValue,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let CommandValue::Step { step, column } = value else {
+        if let CommandValue::Literal { literal } = value {
+            let ty = command_scalar_type(literal);
+            if let Some(name) = ty["name"].as_str() {
+                scalars.insert(name.to_string());
+            }
+            return ty;
+        }
+        unreachable!("the static command compiler limits result values to steps and literals")
+    };
+    let step = command
+        .steps
+        .iter()
+        .find(|candidate| candidate.name == *step)
+        .expect("the static command compiler retains only declared steps");
+    let table = command_step_table(step).expect("result steps cannot reference assert");
+    let info = planner
+        .catalog_table(table)
+        .expect("the static command compiler retains catalog-backed command steps");
+    if let Some(column) = column {
+        let column = info
+            .column(column)
+            .expect("the static command compiler retains returned columns");
+        let scalar = scalar_name(&column.pg_type).to_string();
+        scalars.insert(scalar.clone());
+        let field_type = if column.nullable || command_step_may_be_absent(step) {
+            named("SCALAR", &scalar)
+        } else {
+            non_null(named("SCALAR", &scalar))
+        };
+        return if command_step_is_many(step) {
+            non_null(list_of(field_type))
+        } else {
+            field_type
+        };
+    }
+
+    let row_name = format!(
+        "{}{}Row",
+        command_pascal_case(&command.name),
+        command_pascal_case(&step.name)
+    );
+    if generated.insert(row_name.clone()) {
+        let fields = command_step_returning(step)
+            .iter()
+            .map(|name| {
+                let column = info
+                    .column(name)
+                    .expect("the static command compiler retains returned columns");
+                let scalar = scalar_name(&column.pg_type).to_string();
+                scalars.insert(scalar.clone());
+                field(
+                    name,
+                    vec![],
+                    if column.nullable {
+                        named("SCALAR", &scalar)
+                    } else {
+                        non_null(named("SCALAR", &scalar))
+                    },
+                )
+            })
+            .collect();
+        types.push(object_type(&row_name, fields));
+    }
+    let row = named("OBJECT", &row_name);
+    if command_step_is_many(step) {
+        non_null(list_of(non_null(row)))
+    } else if command_step_may_be_absent(step) {
+        row
+    } else {
+        non_null(row)
+    }
+}
+
+fn add_command_schema(
+    planner: &Planner,
+    command: &Command,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let result_name = format!("{}Result", command_pascal_case(&command.name));
+    let result_fields = command
+        .result
+        .fields
+        .iter()
+        .map(|field_definition| {
+            field(
+                &field_definition.name,
+                vec![],
+                command_result_type(
+                    planner,
+                    command,
+                    &field_definition.value,
+                    types,
+                    scalars,
+                    generated,
+                ),
+            )
+        })
+        .collect();
+    if generated.insert(result_name.clone()) {
+        types.push(object_type(&result_name, result_fields));
+    }
+    let arguments = command
+        .arguments
+        .iter()
+        .map(|argument| {
+            command_type_scalars(
+                planner.metadata(),
+                &argument.type_,
+                types,
+                scalars,
+                generated,
+            );
+            input_value(
+                &argument.name,
+                command_type_reference(planner.metadata(), &argument.type_),
+            )
+        })
+        .collect();
+    field(&command.name, arguments, named("OBJECT", &result_name))
 }
 
 const ORDER_BY_VALUES: &[&str] = &[
@@ -510,6 +816,19 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
                 )],
                 named("OBJECT", &format!("{base}_mutation_response")),
+            ));
+        }
+    }
+
+    let mut generated_command_types = std::collections::BTreeSet::new();
+    for command in planner.command_definitions() {
+        if planner.command_is_visible(command, session) {
+            mutation_fields.push(add_command_schema(
+                planner,
+                command.definition(),
+                &mut types,
+                &mut scalars,
+                &mut generated_command_types,
             ));
         }
     }

@@ -158,10 +158,17 @@ impl CompiledMultiSourceSchema {
             metadata,
             catalogs,
             &source_indexes,
+            Some(command_catalog.as_ref()),
+            false,
             infer_function_permissions,
         )?;
         let (query_owners, mutation_owners) = root_owners(&children)?;
-        let schema_template = build_role_independent_schema(metadata, catalogs, &source_indexes)?;
+        let schema_template = build_role_independent_schema(
+            metadata,
+            catalogs,
+            &source_indexes,
+            command_catalog.as_ref(),
+        )?;
         let roles = metadata_roles(metadata);
         let unknown_role = denied_role_name(&roles);
         let standard = compose_role_schemas(&children, &roles)?;
@@ -265,8 +272,14 @@ impl CompiledMultiSourceSchema {
             .source_indexes
             .get(index)
             .ok_or_else(|| PlanError::new("$", "unexpected", "compiled source index is missing"))?;
-        let mut planner =
-            Planner::for_source_with_index(metadata, source, catalog, source_index.clone());
+        let mut planner = Planner::for_source_with_index_and_commands(
+            metadata,
+            source,
+            catalog,
+            source_index.clone(),
+            self.command_catalog.source(&source.name),
+            false,
+        );
         planner.infer_function_permissions = self.infer_function_permissions;
         Ok(planner)
     }
@@ -295,6 +308,8 @@ impl<'a> MultiSourcePlanner<'a> {
             metadata,
             catalogs,
             &compiled.source_indexes,
+            Some(compiled.command_catalog.as_ref()),
+            false,
             compiled.infer_function_permissions,
         )?;
         Ok(Self {
@@ -499,6 +514,8 @@ fn build_children<'a>(
     metadata: &'a Metadata,
     catalogs: &'a HashMap<String, Catalog>,
     source_indexes: &[Arc<PlannerIndex>],
+    commands: Option<&'a CompiledCommandCatalog>,
+    expose_all_commands: bool,
     infer_function_permissions: bool,
 ) -> Result<Vec<ChildPlanner<'a>>, PlanError> {
     if metadata.sources.len() != source_indexes.len() {
@@ -520,8 +537,14 @@ fn build_children<'a>(
                     format!("catalog for source '{}' not found", source.name),
                 )
             })?;
-            let mut planner =
-                Planner::for_source_with_index(metadata, source, catalog, index.clone());
+            let mut planner = Planner::for_source_with_index_and_commands(
+                metadata,
+                source,
+                catalog,
+                index.clone(),
+                commands.and_then(|commands| commands.source(&source.name)),
+                expose_all_commands,
+            );
             planner.infer_function_permissions = infer_function_permissions;
             Ok(ChildPlanner {
                 source: source.name.clone(),
@@ -553,6 +576,14 @@ fn root_owners(children: &[ChildPlanner<'_>]) -> Result<(RootOwners, RootOwners)
 
 fn metadata_roles(metadata: &Metadata) -> BTreeSet<String> {
     let mut roles = BTreeSet::new();
+    for command in &metadata.commands {
+        roles.extend(
+            command
+                .permissions
+                .iter()
+                .map(|permission| permission.role.clone()),
+        );
+    }
     for inherited in &metadata.inherited_roles {
         roles.insert(inherited.role_name.clone());
         roles.extend(inherited.role_set.iter().cloned());
@@ -676,6 +707,7 @@ fn build_role_independent_schema(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
     source_indexes: &[Arc<PlannerIndex>],
+    command_catalog: &CompiledCommandCatalog,
 ) -> Result<Json, PlanError> {
     let mut validation_metadata = metadata.clone();
     let mut validation_role = "__donat_composite_schema_validation".to_string();
@@ -717,11 +749,13 @@ fn build_role_independent_schema(
                 format!("catalog for source '{}' not found", source.name),
             )
         })?;
-        planners.push(Planner::for_source_with_index(
+        planners.push(Planner::for_source_with_index_and_commands(
             &validation_metadata,
             source,
             catalog,
             index.clone(),
+            command_catalog.source(&source.name),
+            true,
         ));
     }
     let session = Session {

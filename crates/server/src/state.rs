@@ -1271,6 +1271,7 @@ impl AppState {
                     | donat_ir::MutationRoot::Insert { alias, .. }
                     | donat_ir::MutationRoot::Update { alias, .. }
                     | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
                 (alias, donat_sqlgen::sqlite_mutation_plan(m))
@@ -1416,6 +1417,7 @@ impl AppState {
                         (alias.clone(), pk_of(&delete.table))
                     }
                     donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
                 };
                 (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))

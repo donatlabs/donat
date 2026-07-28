@@ -48,6 +48,12 @@ impl CompiledSourceCommandCatalog {
     pub fn command(&self, name: &str) -> Option<&CompiledCommand> {
         self.commands.get(name)
     }
+
+    /// Iteration is intentionally source-local and deterministic. Request
+    /// planning consumes this immutable snapshot; it never reads YAML.
+    pub(crate) fn commands(&self) -> impl Iterator<Item = &CompiledCommand> {
+        self.commands.values()
+    }
 }
 
 /// A command definition accepted by the static compiler.

@@ -3,12 +3,15 @@
 //! everywhere, there is no admin bypass: the mutation root only exists for
 //! a role that has the corresponding permission.
 
+use std::collections::BTreeMap;
+
 use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
-use donat_metadata::Columns;
+use donat_metadata::{Columns, Command, CommandStep, CommandStepOperation, CommandValue};
 use graphql_parser::query::{Field as GqlField, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json};
 
+use crate::commands::CompiledCommand;
 use crate::plan::{
     Fragments, MutationKind, PlanError, Planner, Session, TableCtx, field_not_found, flatten,
     is_session_var_name, unexpected_arg, value_to_json,
@@ -41,6 +44,9 @@ impl<'a> Planner<'a> {
                 || self.any_role_perm(&t.update_permissions, &session.role)
                 || self.any_role_perm(&t.delete_permissions, &session.role)
         }) || self.role_has_function_mutation(&session.role)
+            || self
+                .command_definitions()
+                .any(|command| self.command_is_visible(command, session))
     }
 
     pub(crate) fn plan_mutation(
@@ -83,6 +89,13 @@ impl<'a> Planner<'a> {
                 out.push(MutationRoot::FunctionCall { alias, query });
                 continue;
             }
+            if let Some(result) = self.try_plan_command(field, fragments, vars, session, &path) {
+                out.push(MutationRoot::Command {
+                    alias,
+                    command: result?,
+                });
+                continue;
+            }
             let Some(&(kind, idx)) = self.mutation_roots.get(&field.name) else {
                 return Err(not_found());
             };
@@ -117,6 +130,383 @@ impl<'a> Planner<'a> {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
         }
         Ok(out)
+    }
+
+    pub(crate) fn command_is_visible(&self, command: &CompiledCommand, session: &Session) -> bool {
+        if self.expose_all_commands {
+            return true;
+        }
+        self.command_is_permitted(command.definition(), session)
+            && self
+                .validate_command_runtime_permissions(command.definition(), session, "$")
+                .is_ok()
+    }
+
+    fn try_plan_command(
+        &self,
+        field: &GqlField<'static, String>,
+        fragments: &Fragments,
+        vars: &JsonMap<String, Json>,
+        session: &Session,
+        path: &str,
+    ) -> Option<Result<CommandMutation, PlanError>> {
+        let command = self.command_named(&field.name)?;
+        if !self.command_is_permitted(command.definition(), session) {
+            return None;
+        }
+        Some((|| {
+            self.validate_command_runtime_permissions(command.definition(), session, path)?;
+            let arguments =
+                self.parse_command_arguments(command.definition(), field, vars, path)?;
+            let selection =
+                self.plan_command_selection(command.definition(), field, fragments, vars, path)?;
+            Ok(CommandMutation {
+                definition: command.definition().clone(),
+                arguments,
+                selection,
+            })
+        })())
+    }
+
+    fn command_is_permitted(&self, command: &Command, session: &Session) -> bool {
+        command
+            .permissions
+            .iter()
+            .any(|permission| permission.role == session.role)
+    }
+
+    fn validate_command_runtime_permissions(
+        &self,
+        command: &Command,
+        session: &Session,
+        path: &str,
+    ) -> Result<(), PlanError> {
+        for (index, step) in command.steps.iter().enumerate() {
+            let step_path = format!("{path}.steps[{index}]");
+            let Some(table) = command_step_table(step) else {
+                continue;
+            };
+            let entry = self.entry_for(table).ok_or_else(|| {
+                PlanError::validation(
+                    &step_path,
+                    format!(
+                        "command target '{}.{}' is not tracked",
+                        table.schema(),
+                        table.name()
+                    ),
+                )
+            })?;
+            let info = self.catalog_table(table).ok_or_else(|| {
+                PlanError::validation(
+                    &step_path,
+                    format!(
+                        "command target '{}.{}' does not exist in the catalog",
+                        table.schema(),
+                        table.name()
+                    ),
+                )
+            })?;
+            let select = self
+                .table_ctx_by_name(table, &session.role)
+                .ok_or_else(|| {
+                    PlanError::validation(
+                        &step_path,
+                        format!(
+                            "role '{}' lacks select permission on table '{}.{}'",
+                            session.role, info.schema, info.name
+                        ),
+                    )
+                })?;
+            let require_select = |columns: Vec<&String>| -> Result<(), PlanError> {
+                for column in columns {
+                    if !select.column_allowed(column) {
+                        return Err(PlanError::validation(
+                            &step_path,
+                            format!(
+                                "role '{}' lacks select permission for column '{}' on table '{}.{}'",
+                                session.role, column, info.schema, info.name
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            };
+            match &step.operation {
+                CommandStepOperation::SelectOne { select_one } => {
+                    require_select(
+                        select_one
+                            .by
+                            .keys()
+                            .chain(select_one.returning.iter())
+                            .collect(),
+                    )?;
+                }
+                CommandStepOperation::Insert { insert } => {
+                    let permission = self
+                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
+                            !permission.backend_only || session.backend_request
+                        })
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks insert permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_command_columns(
+                        &permission.columns,
+                        insert.object.keys(),
+                        "insert",
+                        &session.role,
+                        info,
+                        &step_path,
+                    )?;
+                    require_select(insert.returning.iter().collect())?;
+                }
+                CommandStepOperation::InsertMany { insert_many } => {
+                    let permission = self
+                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
+                            !permission.backend_only || session.backend_request
+                        })
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks insert permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_command_columns(
+                        &permission.columns,
+                        insert_many.object.keys(),
+                        "insert",
+                        &session.role,
+                        info,
+                        &step_path,
+                    )?;
+                    require_select(insert_many.returning.iter().collect())?;
+                }
+                CommandStepOperation::Update { update } => {
+                    let permission = self
+                        .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks update permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_command_columns(
+                        &permission.columns,
+                        update.set.keys(),
+                        "update",
+                        &session.role,
+                        info,
+                        &step_path,
+                    )?;
+                    require_select(
+                        update
+                            .predicate
+                            .keys()
+                            .chain(update.returning.iter())
+                            .collect(),
+                    )?;
+                }
+                CommandStepOperation::Delete { delete } => {
+                    self.resolve_role_perm(&entry.delete_permissions, &session.role, |_| true)
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks delete permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_select(
+                        delete
+                            .predicate
+                            .keys()
+                            .chain(delete.returning.iter())
+                            .collect(),
+                    )?;
+                }
+                CommandStepOperation::Assert { .. } => unreachable!("asserts have no table"),
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_command_arguments(
+        &self,
+        command: &Command,
+        field: &GqlField<'static, String>,
+        vars: &JsonMap<String, Json>,
+        path: &str,
+    ) -> Result<BTreeMap<String, Scalar>, PlanError> {
+        let mut arguments = BTreeMap::new();
+        for (name, value) in &field.arguments {
+            let definition = command
+                .arguments
+                .iter()
+                .find(|argument| argument.name == *name)
+                .ok_or_else(|| unexpected_arg(path, name))?;
+            let value = value_to_json(value, vars, path)?;
+            validate_command_argument_value(
+                self.metadata(),
+                &definition.type_,
+                &value,
+                &format!("{path}.args.{name}"),
+            )?;
+            arguments.insert(name.clone(), Scalar::Json(value));
+        }
+        for definition in &command.arguments {
+            if definition.type_.ends_with('!') && !arguments.contains_key(&definition.name) {
+                return Err(PlanError::validation(
+                    path,
+                    format!("missing required field argument: \"{}\"", definition.name),
+                ));
+            }
+        }
+        Ok(arguments)
+    }
+
+    fn plan_command_selection(
+        &self,
+        command: &Command,
+        field: &GqlField<'static, String>,
+        fragments: &Fragments,
+        vars: &JsonMap<String, Json>,
+        path: &str,
+    ) -> Result<Vec<CommandResultSelection>, PlanError> {
+        let result_type = format!("{}Result", command_pascal_case(&command.name));
+        let fields = flatten(&field.selection_set, fragments, vars, Some(&result_type))?;
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                path,
+                format!("missing selection set for type '{result_type}'"),
+            ));
+        }
+        fields
+            .iter()
+            .map(|selected| {
+                let alias = selected
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| selected.name.clone());
+                if selected.name == "__typename" {
+                    return Ok(CommandResultSelection::Typename {
+                        alias,
+                        value: result_type.clone(),
+                    });
+                }
+                let result = command
+                    .result
+                    .get(&selected.name)
+                    .ok_or_else(|| field_not_found(path, &selected.name, &result_type))?;
+                match result {
+                    CommandValue::Step { step, column: None } => {
+                        let step = command
+                            .steps
+                            .iter()
+                            .find(|candidate| candidate.name == *step)
+                            .expect("the static compiler retains result steps");
+                        let selections = self.plan_command_row_selection(
+                            command, step, selected, fragments, vars, path,
+                        )?;
+                        if command_step_is_many(step) {
+                            Ok(CommandResultSelection::List {
+                                alias,
+                                field: selected.name.clone(),
+                                selections,
+                            })
+                        } else {
+                            Ok(CommandResultSelection::Object {
+                                alias,
+                                field: selected.name.clone(),
+                                selections,
+                            })
+                        }
+                    }
+                    CommandValue::Step {
+                        column: Some(..), ..
+                    }
+                    | CommandValue::Literal { .. } => {
+                        if !selected.selection_set.items.is_empty() {
+                            return Err(PlanError::validation(
+                                path,
+                                format!("field '{}' must not have a selection set", selected.name),
+                            ));
+                        }
+                        Ok(CommandResultSelection::Scalar {
+                            alias,
+                            field: selected.name.clone(),
+                        })
+                    }
+                    _ => unreachable!("the static command compiler limits result values"),
+                }
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_command_row_selection(
+        &self,
+        command: &Command,
+        step: &CommandStep,
+        field: &GqlField<'static, String>,
+        fragments: &Fragments,
+        vars: &JsonMap<String, Json>,
+        path: &str,
+    ) -> Result<Vec<CommandResultSelection>, PlanError> {
+        let row_type = format!(
+            "{}{}Row",
+            command_pascal_case(&command.name),
+            command_pascal_case(&step.name)
+        );
+        let fields = flatten(&field.selection_set, fragments, vars, Some(&row_type))?;
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                path,
+                format!("missing selection set for type '{row_type}'"),
+            ));
+        }
+        fields
+            .iter()
+            .map(|selected| {
+                let alias = selected
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| selected.name.clone());
+                if selected.name == "__typename" {
+                    return Ok(CommandResultSelection::Typename {
+                        alias,
+                        value: row_type.clone(),
+                    });
+                }
+                if !command_step_returning(step)
+                    .iter()
+                    .any(|column| column == &selected.name)
+                {
+                    return Err(field_not_found(path, &selected.name, &row_type));
+                }
+                if !selected.selection_set.items.is_empty() {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("field '{}' must not have a selection set", selected.name),
+                    ));
+                }
+                Ok(CommandResultSelection::Scalar {
+                    alias,
+                    field: selected.name.clone(),
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -941,4 +1331,213 @@ impl<'a> Planner<'a> {
         }
         Ok(MutationOutput::Response(out))
     }
+}
+
+fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTable> {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+        CommandStepOperation::Insert { insert } => Some(&insert.table),
+        CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
+        CommandStepOperation::Update { update } => Some(&update.table),
+        CommandStepOperation::Delete { delete } => Some(&delete.table),
+        CommandStepOperation::Assert { .. } => None,
+    }
+}
+
+fn command_step_returning(step: &CommandStep) -> &[String] {
+    match &step.operation {
+        CommandStepOperation::SelectOne { select_one } => &select_one.returning,
+        CommandStepOperation::Insert { insert } => &insert.returning,
+        CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
+        CommandStepOperation::Update { update } => &update.returning,
+        CommandStepOperation::Delete { delete } => &delete.returning,
+        CommandStepOperation::Assert { .. } => &[],
+    }
+}
+
+fn command_step_is_many(step: &CommandStep) -> bool {
+    matches!(step.operation, CommandStepOperation::InsertMany { .. })
+}
+
+fn command_pascal_case(name: &str) -> String {
+    let mut output = String::new();
+    let mut capitalize = true;
+    for character in name.chars() {
+        if character == '_' || character == '-' {
+            capitalize = true;
+        } else if capitalize {
+            output.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn require_command_columns<'a>(
+    allowed: &Columns,
+    columns: impl IntoIterator<Item = &'a String>,
+    operation: &str,
+    role: &str,
+    table: &donat_catalog::TableInfo,
+    path: &str,
+) -> Result<(), PlanError> {
+    for column in columns {
+        let permitted = match allowed {
+            Columns::Star => true,
+            Columns::List(allowed) => allowed.iter().any(|allowed| allowed == column),
+        };
+        if !permitted {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "role '{role}' lacks {operation} permission for column '{column}' on table '{}.{}'",
+                    table.schema, table.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_command_argument_value(
+    metadata: &donat_metadata::Metadata,
+    type_: &str,
+    value: &Json,
+    path: &str,
+) -> Result<(), PlanError> {
+    let (type_, nullable) = match type_.strip_suffix('!') {
+        Some(inner) => (inner, false),
+        None => (type_, true),
+    };
+    if value.is_null() {
+        return if nullable {
+            Ok(())
+        } else {
+            Err(PlanError::validation(
+                path,
+                "null is not allowed for a non-null argument",
+            ))
+        };
+    }
+    if let Some(inner) = type_
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        return match value {
+            Json::Array(items) => items.iter().enumerate().try_for_each(|(index, item)| {
+                validate_command_argument_value(metadata, inner, item, &format!("{path}[{index}]"))
+            }),
+            item => validate_command_argument_value(metadata, inner, item, path),
+        };
+    }
+    let builtin_valid = match type_ {
+        "Boolean" | "bool" => Some(value.is_boolean()),
+        "String" | "string" | "ID" | "uuid" | "date" | "timestamp" | "timestamptz" => {
+            Some(value.is_string())
+        }
+        "Int" | "int" => Some(
+            value
+                .as_i64()
+                .is_some_and(|number| (i32::MIN as i64..=i32::MAX as i64).contains(&number))
+                || value
+                    .as_u64()
+                    .is_some_and(|number| number <= i32::MAX as u64),
+        ),
+        "Float" | "float" | "decimal" => Some(value.is_number()),
+        "json" | "jsonb" => Some(true),
+        _ => None,
+    };
+    if let Some(valid) = builtin_valid {
+        return if valid {
+            Ok(())
+        } else {
+            Err(PlanError::validation(
+                path,
+                format!("argument does not match declared type '{type_}'"),
+            ))
+        };
+    }
+    if let Some(input) = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .find(|input| input.name == type_)
+    {
+        let object = value.as_object().ok_or_else(|| {
+            PlanError::validation(path, format!("argument must be input object '{type_}'"))
+        })?;
+        for field in object.keys() {
+            if !input
+                .fields
+                .iter()
+                .any(|candidate| candidate.name == *field)
+            {
+                return Err(PlanError::validation(
+                    path,
+                    format!("field '{field}' is not declared by input object '{type_}'"),
+                ));
+            }
+        }
+        for field in &input.fields {
+            match object.get(&field.name) {
+                Some(value) => validate_command_argument_value(
+                    metadata,
+                    &field.type_,
+                    value,
+                    &format!("{path}.{}", field.name),
+                )?,
+                None if field.type_.ends_with('!') => {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("missing required input field: \"{}\"", field.name),
+                    ));
+                }
+                None => {}
+            }
+        }
+        return Ok(());
+    }
+    if let Some(enum_) = metadata
+        .custom_types
+        .enums
+        .iter()
+        .find(|enum_| enum_.name == type_)
+    {
+        let value = value.as_str().ok_or_else(|| {
+            PlanError::validation(path, format!("argument must be enum '{type_}'"))
+        })?;
+        return if enum_
+            .values
+            .iter()
+            .any(|candidate| candidate.value == value)
+        {
+            Ok(())
+        } else {
+            Err(PlanError::validation(
+                path,
+                format!("'{value}' is not a value of enum '{type_}'"),
+            ))
+        };
+    }
+    if metadata
+        .custom_types
+        .scalars
+        .iter()
+        .any(|scalar| scalar.name == type_)
+    {
+        return if value.is_array() || value.is_object() {
+            Err(PlanError::validation(
+                path,
+                format!("argument must be a scalar '{type_}'"),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    Err(PlanError::validation(
+        path,
+        format!("unknown command argument type '{type_}'"),
+    ))
 }

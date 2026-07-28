@@ -7,6 +7,8 @@
 //! permissions) is testable without a database; everything below it (sqlgen,
 //! executor) is the only code that knows Postgres exists.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -407,6 +409,49 @@ pub enum MutationRoot {
     Delete {
         alias: String,
         delete: DeleteMutation,
+    },
+    /// A validated declarative command. It is intentionally SQL-free: Task 5
+    /// lowers this immutable command declaration to one Postgres statement.
+    Command {
+        alias: String,
+        command: CommandMutation,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
+}
+
+/// The command payload crossing the SQL-free planner/renderer boundary.
+///
+/// The command definition is copied from the immutable deployment catalog, so
+/// SQLgen never parses mutable YAML or consults runtime metadata. Arguments
+/// have already been validated against the command's declared GraphQL types.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandMutation {
+    pub definition: donat_metadata::Command,
+    pub arguments: BTreeMap<String, Scalar>,
+    pub selection: Vec<CommandResultSelection>,
+}
+
+/// Client projection of a declared command result. Commands do not expose
+/// arbitrary table fields: every selection is rooted in the command's fixed
+/// result mapping and, for row values, the step's fixed `returning` list.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandResultSelection {
+    Scalar {
+        alias: String,
+        field: String,
+    },
+    Object {
+        alias: String,
+        field: String,
+        selections: Vec<CommandResultSelection>,
+    },
+    List {
+        alias: String,
+        field: String,
+        selections: Vec<CommandResultSelection>,
     },
     Typename {
         alias: String,

@@ -1029,6 +1029,9 @@ fn mutation_to_sql_full(
     };
     let dialect = ctx.dialect;
     match root {
+        MutationRoot::Command { .. } => {
+            panic!("command mutations require the Task 5 Postgres command renderer")
+        }
         MutationRoot::Typename { value, .. } => {
             format!("SELECT {}::text AS root", quote_lit(value))
         }
@@ -1311,6 +1314,9 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
         dialect,
     };
     match root {
+        MutationRoot::Command { .. } => {
+            panic!("command mutations are Postgres-only and have no SQLite renderer")
+        }
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
             single_row_output: false,
@@ -1701,6 +1707,9 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
         dialect,
     };
     match root {
+        MutationRoot::Command { .. } => {
+            panic!("command mutations are Postgres-only and have no MySQL renderer")
+        }
         MutationRoot::Typename { value, .. } => MySqlMutationPlan {
             dml_sql: String::new(),
             single_row_output: false,

@@ -120,6 +120,18 @@ fn assemble_multi_source_response(
     Json::Object(ordered)
 }
 
+fn command_execution_not_ready(roots: &[donat_ir::MutationRoot]) -> Option<Json> {
+    roots
+        .iter()
+        .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }))
+        .then(|| {
+            error_json(
+                "unexpected",
+                "command execution is not implemented until the Postgres command renderer is installed",
+            )
+        })
+}
+
 /// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
 /// [`MAX_QUERY_DEPTH`], before the recursive parser runs. Counting raw
 /// brackets (including any inside string literals) is conservative, which is
@@ -790,6 +802,9 @@ async fn execute_parsed_full(
             roots,
             response,
         } => {
+            if let Some(error) = command_execution_not_ready(&roots) {
+                return ok(error);
+            }
             let Some(source) = source else {
                 drop(engine);
                 let data = assemble_multi_source_response(&response, std::iter::empty());
@@ -834,6 +849,7 @@ async fn execute_parsed_full(
                                 donat_ir::MutationRoot::Update { update, .. } => &update.table,
                                 donat_ir::MutationRoot::Delete { delete, .. } => &delete.table,
                                 donat_ir::MutationRoot::FunctionCall { .. }
+                                | donat_ir::MutationRoot::Command { .. }
                                 | donat_ir::MutationRoot::Typename { .. } => return None,
                             };
                             let key = format!("{}.{}", table.schema, table.name);
@@ -874,6 +890,7 @@ async fn execute_parsed_full(
                         | donat_ir::MutationRoot::Insert { alias, .. }
                         | donat_ir::MutationRoot::Update { alias, .. }
                         | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Command { alias, .. }
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
                     (
@@ -1806,6 +1823,34 @@ mod tests {
         assert!(!ct_eq(b"secret", b"secrey"));
         assert!(!ct_eq(b"secret", b"secre"));
         assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn command_roots_fail_closed_before_sql_generation() {
+        let definition = serde_json::from_value(json!({
+            "name": "create_order",
+            "source": "default",
+            "permissions": [{ "role": "customer" }]
+        }))
+        .expect("command metadata deserializes");
+        let roots = vec![donat_ir::MutationRoot::Command {
+            alias: "submitted".to_string(),
+            command: donat_ir::CommandMutation {
+                definition,
+                arguments: std::collections::BTreeMap::new(),
+                selection: vec![],
+            },
+        }];
+
+        let error = command_execution_not_ready(&roots)
+            .expect("Task 3 command roots stop before the absent SQL renderer");
+        assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
+        assert!(
+            error["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not implemented")),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
