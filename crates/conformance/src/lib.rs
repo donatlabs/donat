@@ -938,6 +938,7 @@ fn default_metadata_with_configuration(
         custom_types: Default::default(),
         cron_triggers: vec![],
         rest_endpoints: vec![],
+        rules: Default::default(),
     }
 }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use donat_metadata::{
     Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
-    RemoteSchema, RestEndpoint, SelectPermission, SourceKind, TableConfiguration,
+    RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration,
     load_metadata_dir,
 };
 use serde_json::json;
@@ -585,4 +585,56 @@ fn existing_fixture_directory_still_loads() {
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert_eq!(md.sources.len(), 1);
     assert_eq!(md.sources[0].tables.len(), 2);
+}
+
+#[test]
+fn rules_wrapper_round_trips_declared_types_and_expression_source() {
+    // A declarative rule keeps its source text and declared types in metadata;
+    // parsing and source locations belong to the future donat-rules crate.
+    let yaml = r#"
+rules:
+  - name: order_request_is_well_formed
+    parameters:
+      lines: "[CreateOrderLine!]!"
+    result: bool!
+    expression: "size(lines) > 0"
+decision_tables:
+  - name: invoice_approval
+    inputs:
+      amount: decimal!
+    output:
+      route: string!
+    hit_policy: first
+    rows:
+      - id: default
+        when: { amount: "true" }
+        output: { route: manual_approval }
+    test_cases:
+      - name: default route
+        input: { amount: 100 }
+        expect:
+          output: { route: manual_approval }
+          matched_row_id: default
+"#;
+
+    let rules: RulesMetadata = serde_yaml::from_str(yaml).expect("rules wrapper must deserialize");
+    assert_eq!(rules.rules.len(), 1);
+    assert_eq!(rules.rules[0].parameters["lines"], "[CreateOrderLine!]!");
+    assert_eq!(rules.rules[0].result, "bool!");
+    assert_eq!(rules.rules[0].expression, "size(lines) > 0");
+    assert_eq!(rules.decision_tables.len(), 1);
+    assert_eq!(rules.decision_tables[0].rows[0].when["amount"], "true");
+    assert_eq!(
+        rules.decision_tables[0].test_cases[0].expect.matched_row_id,
+        "default"
+    );
+
+    let round_trip: RulesMetadata =
+        serde_json::from_value(serde_json::to_value(&rules).expect("rules wrapper must serialize"))
+            .expect("serialized rules wrapper must deserialize");
+    assert_eq!(round_trip.rules[0].expression, "size(lines) > 0");
+    assert_eq!(
+        round_trip.decision_tables[0].test_cases[0].expect.output["route"],
+        json!("manual_approval")
+    );
 }

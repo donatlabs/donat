@@ -81,6 +81,7 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         custom_types,
         cron_triggers: load_section(dir, "cron_triggers.yaml")?,
         rest_endpoints: load_section(dir, "rest_endpoints.yaml")?,
+        rules: load_section(dir, "rules.yaml")?,
     })
 }
 
@@ -110,19 +111,19 @@ fn load_actions(
     Ok((parsed.actions, parsed.custom_types))
 }
 
-/// Load an optional top-level list section (`!include`-resolved). Returns an
-/// empty vec when the file is absent or blank.
-fn load_section<T: serde::de::DeserializeOwned>(
+/// Load an optional top-level section (`!include`-resolved). Returns the
+/// section's default value when the file is absent or blank.
+fn load_section<T: serde::de::DeserializeOwned + Default>(
     dir: &Path,
     file: &str,
-) -> Result<Vec<T>, LoadError> {
+) -> Result<T, LoadError> {
     let path = dir.join(file);
     if !path.exists() {
-        return Ok(vec![]);
+        return Ok(T::default());
     }
     let value = load_yaml_resolved(&path)?;
     if value.is_null() {
-        return Ok(vec![]);
+        return Ok(T::default());
     }
     serde_yaml::from_value(value).map_err(|source| LoadError::Yaml { path, source })
 }

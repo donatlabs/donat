@@ -265,6 +265,8 @@ fn top_level_sections_absent_default_to_empty() {
     assert!(md.query_collections.is_empty());
     assert!(md.allowlist.is_empty());
     assert!(md.remote_schemas.is_empty());
+    assert!(md.rules.rules.is_empty());
+    assert!(md.rules.decision_tables.is_empty());
 }
 
 #[test]

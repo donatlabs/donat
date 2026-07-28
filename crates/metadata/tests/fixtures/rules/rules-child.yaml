@@ -1,0 +1,16 @@
+- name: invoice_approval
+  inputs:
+    amount: decimal!
+  output:
+    route: string!
+  hit_policy: first
+  rows:
+    - id: default
+      when: { amount: "true" }
+      output: { route: manual_approval }
+  test_cases:
+    - name: default route
+      input: { amount: 100 }
+      expect:
+        output: { route: manual_approval }
+        matched_row_id: default

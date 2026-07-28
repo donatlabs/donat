@@ -1,0 +1,7 @@
+rules:
+  - name: order_request_is_well_formed
+    parameters:
+      lines: "[CreateOrderLine!]!"
+    result: bool!
+    expression: "size(lines) > 0"
+decision_tables: "!include rules-child.yaml"

@@ -9,6 +9,10 @@ fn fixture_dir() -> &'static Path {
     ))
 }
 
+fn rules_fixture_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rules"))
+}
+
 #[test]
 fn loads_v2_metadata_directory() {
     let md = load_metadata_dir(fixture_dir()).expect("metadata should load");
@@ -94,4 +98,23 @@ fn loads_actions_and_custom_types() {
     assert_eq!(md.custom_types.objects.len(), 1);
     assert_eq!(md.custom_types.objects[0].name, "OutObject");
     assert_eq!(md.custom_types.scalars[0].name, "myCustomScalar");
+}
+
+#[test]
+fn loads_rules_wrapper_with_quoted_include() {
+    let md = load_metadata_dir(rules_fixture_dir()).expect("rules metadata should load");
+
+    assert_eq!(md.rules.rules.len(), 1);
+    assert_eq!(md.rules.rules[0].name, "order_request_is_well_formed");
+    assert_eq!(md.rules.rules[0].parameters["lines"], "[CreateOrderLine!]!");
+    assert_eq!(md.rules.rules[0].expression, "size(lines) > 0");
+    assert_eq!(md.rules.decision_tables.len(), 1);
+    assert_eq!(md.rules.decision_tables[0].name, "invoice_approval");
+    assert_eq!(md.rules.decision_tables[0].rows[0].id, "default");
+    assert_eq!(
+        md.rules.decision_tables[0].test_cases[0]
+            .expect
+            .matched_row_id,
+        "default"
+    );
 }

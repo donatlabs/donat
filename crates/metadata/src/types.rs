@@ -37,6 +37,83 @@ pub struct Metadata {
     /// REST endpoints exposing saved queries over templated URLs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rest_endpoints: Vec<RestEndpoint>,
+    /// Declarative rules and decision tables from the single `rules.yaml`
+    /// wrapper. They are deploy-time metadata; the rules crate parses their
+    /// source expressions when metadata is validated.
+    #[serde(default, skip_serializing_if = "RulesMetadata::is_empty")]
+    pub rules: RulesMetadata,
+}
+
+/// The single `rules.yaml` metadata wrapper. Rules and decision tables share
+/// one deploy-time section so they cannot be loaded or mutated independently.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RulesMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_tables: Vec<DecisionTableDefinition>,
+}
+
+impl RulesMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.decision_tables.is_empty()
+    }
+}
+
+/// A named CEL-profile expression. The metadata crate intentionally preserves
+/// parameter/result type declarations and source text as strings; parsing,
+/// typing, and source locations are owned by `donat-rules`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuleDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, String>,
+    pub result: String,
+    pub expression: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A named, ordered decision table. It is metadata, not a database relation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DecisionTableDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
+    pub output: BTreeMap<String, String>,
+    pub hit_policy: String,
+    #[serde(default)]
+    pub rows: Vec<DecisionRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_cases: Vec<DecisionTableTestCase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A single ordered decision-table row. Conditions remain expression source
+/// strings until the rule catalog validates them against the declared inputs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DecisionRow {
+    pub id: String,
+    pub when: BTreeMap<String, String>,
+    pub output: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A deploy-time assertion over one decision-table input and its expected
+/// complete output. The rule catalog executes these before publishing metadata.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DecisionTableTestCase {
+    pub name: String,
+    pub input: serde_json::Value,
+    pub expect: DecisionTableExpectation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DecisionTableExpectation {
+    pub output: serde_json::Value,
+    pub matched_row_id: String,
 }
 
 /// A custom GraphQL field (query or mutation) resolved by calling an HTTP
