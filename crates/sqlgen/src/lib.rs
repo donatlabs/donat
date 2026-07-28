@@ -92,6 +92,16 @@ struct RelationshipCteOverride {
     cte: String,
 }
 
+struct MutationSelectOptions<'a> {
+    cte: &'a str,
+    dml: &'a str,
+    check: Option<&'a BoolExp>,
+    check_path: &'a str,
+    extra_ctes: Vec<String>,
+    extra_checks: Vec<(String, &'a BoolExp, String, Vec<RelationshipCteOverride>)>,
+    output: &'a MutationOutput,
+}
+
 /// Join condition pairs against an enclosing table alias:
 /// (local column on the outer table, remote column on the inner table).
 type OuterJoin<'a> = (&'a [(String, String)], &'a str);
@@ -165,7 +175,7 @@ impl Ctx {
         if let Some(page) = &conn.page {
             q.limit = Some(page.size + 1);
         }
-        let (tail, _) = self.from_where_order(&q, &alias, outer);
+        let (tail, _) = self.render_select_tail(&q, &alias, outer);
 
         let arr = self.alias();
         let raw = format!("{}.a", quote_ident(&arr));
@@ -288,7 +298,7 @@ impl Ctx {
 
         let alias = self.alias();
         let row_json = self.row_json(&q.fields, &alias);
-        let (tail, rendered_order) = self.from_where_order(q, &alias, outer);
+        let (tail, rendered_order) = self.render_select_tail(q, &alias, outer);
         let distinct = distinct_clause(q, &alias);
 
         if q.single {
@@ -333,7 +343,7 @@ impl Ctx {
     fn aggregate_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
         let dialect = self.dialect;
         let inner_alias = self.alias();
-        let (tail, _) = self.from_where_order(q, &inner_alias, outer);
+        let (tail, _) = self.render_select_tail(q, &inner_alias, outer);
         let distinct = distinct_clause(q, &inner_alias);
         let outer_alias = self.alias();
         let oa = quote_ident(&outer_alias);
@@ -459,7 +469,7 @@ impl Ctx {
     }
 
     /// `FROM .. WHERE .. ORDER BY .. LIMIT .. OFFSET ..` for one select.
-    fn from_where_order(
+    fn render_select_tail(
         &mut self,
         q: &SelectQuery,
         alias: &str,
@@ -1159,15 +1169,15 @@ fn mutation_to_sql_full(
                     ));
                 }
             }
-            ctx.mutation_select_with_extra_ctes(
-                "ins",
-                &stmt,
-                insert.check.as_ref(),
-                &insert.check_path,
+            ctx.mutation_select(MutationSelectOptions {
+                cte: "ins",
+                dml: &stmt,
+                check: insert.check.as_ref(),
+                check_path: &insert.check_path,
                 extra_ctes,
                 extra_checks,
-                &insert.output,
-            )
+                output: &insert.output,
+            })
         }
         MutationRoot::Update { update, .. } => {
             let sets: Vec<String> = update
@@ -1215,13 +1225,15 @@ fn mutation_to_sql_full(
                 stmt.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
             }
             stmt.push_str(" RETURNING *");
-            ctx.mutation_select(
-                "upd",
-                &stmt,
-                update.check.as_ref(),
-                &update.check_path,
-                &update.output,
-            )
+            ctx.mutation_select(MutationSelectOptions {
+                cte: "upd",
+                dml: &stmt,
+                check: update.check.as_ref(),
+                check_path: &update.check_path,
+                extra_ctes: vec![],
+                extra_checks: vec![],
+                output: &update.output,
+            })
         }
         MutationRoot::Delete { delete, .. } => {
             let alias = "_del_target".to_string();
@@ -1235,7 +1247,15 @@ fn mutation_to_sql_full(
                 stmt.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
             }
             stmt.push_str(" RETURNING *");
-            ctx.mutation_select("del", &stmt, None, "$", &delete.output)
+            ctx.mutation_select(MutationSelectOptions {
+                cte: "del",
+                dml: &stmt,
+                check: None,
+                check_path: "$",
+                extra_ctes: vec![],
+                extra_checks: vec![],
+                output: &delete.output,
+            })
         }
     }
 }
@@ -1936,27 +1956,16 @@ impl Ctx {
 impl Ctx {
     /// Wrap a DML statement in a CTE and select the GraphQL response from
     /// its RETURNING set, enforcing the permission check expression.
-    fn mutation_select(
-        &mut self,
-        cte: &str,
-        dml: &str,
-        check: Option<&BoolExp>,
-        check_path: &str,
-        output: &MutationOutput,
-    ) -> String {
-        self.mutation_select_with_extra_ctes(cte, dml, check, check_path, vec![], vec![], output)
-    }
-
-    fn mutation_select_with_extra_ctes(
-        &mut self,
-        cte: &str,
-        dml: &str,
-        check: Option<&BoolExp>,
-        check_path: &str,
-        extra_ctes: Vec<String>,
-        extra_checks: Vec<(String, &BoolExp, String, Vec<RelationshipCteOverride>)>,
-        output: &MutationOutput,
-    ) -> String {
+    fn mutation_select(&mut self, options: MutationSelectOptions<'_>) -> String {
+        let MutationSelectOptions {
+            cte,
+            dml,
+            check,
+            check_path,
+            extra_ctes,
+            extra_checks,
+            output,
+        } = options;
         let dialect = self.dialect;
         let cte_ident = quote_ident(cte);
         let result = match output {

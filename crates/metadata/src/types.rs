@@ -855,16 +855,11 @@ pub struct DeletePermission {
 }
 
 /// Column list: either an explicit list or `"*"`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Columns {
+    #[default]
     Star,
     List(Vec<String>),
-}
-
-impl Default for Columns {
-    fn default() -> Self {
-        Columns::Star
-    }
 }
 
 impl<'de> Deserialize<'de> for Columns {
