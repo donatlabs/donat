@@ -2716,6 +2716,84 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn public_actions_execute_for_an_explicit_role_and_restricted_actions_stay_hidden() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::Json(json!("called")) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [
+                {
+                    "name": "public_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": []
+                },
+                {
+                    "name": "restricted_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": [{ "role": "owner" }]
+                }
+            ]
+        }))
+        .expect("action metadata deserializes");
+        let state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        let customer = Session {
+            role: "customer".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let (_, public) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { public_action }"
+            }),
+        )
+        .await;
+        assert_eq!(public, json!({ "data": { "public_action": "called" } }));
+
+        let (_, restricted) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { restricted_action }"
+            }),
+        )
+        .await;
+        assert_eq!(
+            restricted["errors"][0]["message"],
+            json!("field \"restricted_action\" not found in type: 'query_root'")
+        );
+
+        let no_role = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
+            .expect_err("a public action never supplies a missing classic role");
+        assert_eq!(
+            no_role["errors"][0]["message"],
+            json!("x-donat-role header is required (this engine has no admin role)")
+        );
+        server.abort();
+    }
+
     fn empty_metadata() -> donat_metadata::Metadata {
         serde_json::from_value(json!({ "version": 3, "sources": [] }))
             .expect("empty metadata deserializes")

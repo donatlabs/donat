@@ -543,6 +543,20 @@ pub struct ActionPermission {
     pub role: String,
 }
 
+/// Whether an Action is visible to one already-authenticated classic role.
+///
+/// Action permissions deliberately use direct role membership: inherited-role
+/// expansion is not part of the legacy Action contract. An empty list is
+/// public only *within* the explicit-role GraphQL surface; request
+/// authentication still has to supply a role before this helper is called.
+pub fn action_visible_to_role(action: &ActionEntry, role: &str) -> bool {
+    action.permissions.is_empty()
+        || action
+            .permissions
+            .iter()
+            .any(|permission| permission.role == role)
+}
+
 /// A recurring scheduled trigger: the engine POSTs `payload` to `webhook`
 /// on the cron `schedule`. Field names match Donat's `CronTriggerMetadata`
 /// so exported metadata loads without translation.

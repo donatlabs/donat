@@ -17,7 +17,10 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use donat_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable};
+use donat_metadata::{
+    ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable,
+    action_visible_to_role,
+};
 use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
@@ -179,11 +182,7 @@ async fn resolve_action_item(
     let Some(action) = ctx.find(&field.name) else {
         return Err(action_field_not_found(ctx, field));
     };
-    if !action
-        .permissions
-        .iter()
-        .any(|permission| permission.role == session.role)
-    {
+    if !action_visible_to_role(action, &session.role) {
         return Err(action_field_not_found(ctx, field));
     }
     let value = call_action(ActionInvocation {

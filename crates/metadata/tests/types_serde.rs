@@ -6,10 +6,10 @@
 use std::path::Path;
 
 use donat_metadata::{
-    Columns, Command, CommandEffect, CommandIdempotencyKey, CommandStepOperation, CommandValue,
-    CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
-    RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration,
-    load_metadata_dir,
+    ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandStepOperation,
+    CommandValue, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
+    QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission, SourceKind,
+    TableConfiguration, action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -69,6 +69,29 @@ fn columns_round_trip_serialization() {
     assert_eq!(
         serde_json::to_value(Columns::List(vec!["a".into()])).unwrap(),
         json!(["a"])
+    );
+}
+
+#[test]
+fn empty_action_permissions_are_visible_to_any_explicit_role_without_inheritance() {
+    let public: ActionEntry = serde_json::from_value(json!({
+        "name": "public_action",
+        "definition": { "handler": "https://example.invalid/action" },
+        "permissions": []
+    }))
+    .expect("public action metadata deserializes");
+    let restricted: ActionEntry = serde_json::from_value(json!({
+        "name": "restricted_action",
+        "definition": { "handler": "https://example.invalid/action" },
+        "permissions": [{ "role": "owner" }]
+    }))
+    .expect("restricted action metadata deserializes");
+
+    assert!(action_visible_to_role(&public, "customer"));
+    assert!(action_visible_to_role(&restricted, "owner"));
+    assert!(
+        !action_visible_to_role(&restricted, "member"),
+        "Action permissions retain their existing exact-role semantics"
     );
 }
 

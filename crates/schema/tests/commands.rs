@@ -1094,10 +1094,10 @@ fn rejects_command_row_type_colliding_with_a_public_action_output_type() {
     );
 
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(diagnostics[0].path, "commands[0].steps[0]");
     assert_eq!(
         diagnostics[0].message,
-        "generated command type 'FooBarOrderRow' is visible to role 'customer' in commands[0] (source 'default') and actions[0] (action 'public_order') -> custom_types.objects[0]"
+        "generated command type 'FooBarOrderRow' is visible to role 'customer' in commands[0].steps[0] (step 'order') and actions[0] (action 'public_order') -> custom_types.objects[0]"
     );
 }
 
@@ -1311,15 +1311,155 @@ fn rejects_pascal_cased_command_row_type_collisions_in_one_role_schema() {
     );
 
     assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].path, "commands[1]");
+    assert_eq!(diagnostics[0].path, "commands[1].steps[0]");
     assert_eq!(
         diagnostics[0].message,
-        "generated command type 'FooBarOrderRow' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
+        "generated command type 'FooBarOrderRow' is visible to role 'customer' in both commands[0].steps[0] (step 'order') and commands[1].steps[0] (step 'order')"
     );
     assert_eq!(diagnostics[1].path, "commands[1]");
     assert_eq!(
         diagnostics[1].message,
         "generated command type 'FooBarResult' is visible to role 'customer' in both commands[0] (source 'default') and commands[1] (source 'default')"
+    );
+}
+
+#[test]
+fn rejects_normalized_row_type_collision_between_steps_in_one_command_with_distinct_shapes() {
+    let mut command = valid_command();
+    let insert = command["steps"][0]["insert"].clone();
+    command["steps"] = json!([
+        {
+            "name": "order_line",
+            "insert": {
+                "table": insert["table"].clone(),
+                "object": insert["object"].clone(),
+                "returning": ["id"]
+            }
+        },
+        {
+            "name": "orderLine",
+            "insert": {
+                "table": insert["table"].clone(),
+                "object": insert["object"].clone(),
+                "returning": ["status"]
+            }
+        }
+    ]);
+    command["result"] = json!({
+        "first": { "step": "order_line" },
+        "second": { "step": "orderLine" }
+    });
+    let metadata = metadata(vec![command]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0].steps[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'CreateOrderOrderLineRow' is visible to role 'customer' in both commands[0].steps[0] (step 'order_line') and commands[0].steps[1] (step 'orderLine')"
+    );
+}
+
+#[test]
+fn rejects_normalized_row_type_collision_between_steps_in_one_command_with_equal_shapes() {
+    let mut command = valid_command();
+    let insert = command["steps"][0]["insert"].clone();
+    command["steps"] = json!([
+        {
+            "name": "order_line",
+            "insert": {
+                "table": insert["table"].clone(),
+                "object": insert["object"].clone(),
+                "returning": ["id"]
+            }
+        },
+        {
+            "name": "orderLine",
+            "insert": {
+                "table": insert["table"].clone(),
+                "object": insert["object"].clone(),
+                "returning": ["id"]
+            }
+        }
+    ]);
+    command["result"] = json!({
+        "first": { "step": "order_line" },
+        "second": { "step": "orderLine" }
+    });
+    let metadata = metadata(vec![command]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0].steps[1]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'CreateOrderOrderLineRow' is visible to role 'customer' in both commands[0].steps[0] (step 'order_line') and commands[0].steps[1] (step 'orderLine')"
+    );
+}
+
+#[test]
+fn rejects_step_row_type_name_that_is_not_a_legal_graphql_name() {
+    let mut command = valid_command();
+    command["steps"][0]["name"] = json!("order!");
+    command["result"] = json!({ "order": { "step": "order!" } });
+    command["steps"][0]["insert"]["returning"] = json!(["id"]);
+    let metadata = metadata(vec![command]);
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0].steps[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "generated command type 'CreateOrderOrder!Row' for role 'customer' at commands[0].steps[0] (step 'order!') is not a valid GraphQL name"
+    );
+}
+
+#[test]
+fn rejects_command_root_collision_with_a_query_action_visible_to_the_same_role() {
+    let mut metadata = metadata(vec![valid_command()]);
+    metadata.actions.push(
+        serde_json::from_value(json!({
+            "name": "create_order",
+            "definition": {
+                "type": "query",
+                "handler": "https://example.invalid/action",
+                "output_type": "String"
+            },
+            "permissions": [{ "role": "customer" }]
+        }))
+        .expect("query action metadata deserializes"),
+    );
+
+    let diagnostics = validate_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    );
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0]");
+    assert_eq!(
+        diagnostics[0].message,
+        "command root 'create_order' is visible to role 'customer' in commands[0] (source 'default') and actions[0] (action 'create_order', type 'query')"
     );
 }
 
@@ -1735,8 +1875,8 @@ fn rejects_invalid_graphql_command_names_and_mutation_root_collisions() {
         .expect("action metadata deserializes"),
     );
     let error = compile(&action_collision, RelationKind::Table)
-        .expect_err("command cannot collide with an action mutation root");
-    assert!(error.message.contains("collides with action mutation"));
+        .expect_err("command cannot collide with an action root");
+    assert!(error.message.contains("actions[0]"));
 
     let mut function_collision = metadata(vec![valid_command()]);
     function_collision.sources[0].functions.push(
