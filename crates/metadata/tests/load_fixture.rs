@@ -13,6 +13,13 @@ fn rules_fixture_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rules"))
 }
 
+fn rules_types_only_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rules-types-only"
+    ))
+}
+
 #[test]
 fn loads_v2_metadata_directory() {
     let md = load_metadata_dir(fixture_dir()).expect("metadata should load");
@@ -117,4 +124,20 @@ fn loads_rules_wrapper_with_quoted_include() {
             .matched_row_id,
         "default"
     );
+}
+
+#[test]
+fn loads_types_only_rules_wrapper() {
+    let md = load_metadata_dir(rules_types_only_fixture_dir())
+        .expect("types-only rules metadata should load");
+
+    assert_eq!(md.rules.types.len(), 1);
+    assert_eq!(md.rules.types[0].name, "OrderStatus");
+    assert_eq!(
+        md.rules.types[0].enum_values.as_deref(),
+        Some(&["draft".to_owned(), "submitted".to_owned()][..])
+    );
+    assert!(md.rules.rules.is_empty());
+    assert!(md.rules.decision_tables.is_empty());
+    assert!(!md.rules.is_empty());
 }

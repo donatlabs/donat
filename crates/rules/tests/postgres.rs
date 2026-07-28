@@ -14,6 +14,13 @@ fn map<T>(pairs: impl IntoIterator<Item = (&'static str, T)>) -> BTreeMap<String
         .collect()
 }
 
+fn object(name: &str, fields: BTreeMap<String, RuleType>) -> RuleType {
+    RuleType::Object {
+        name: name.to_owned(),
+        fields,
+    }
+}
+
 fn compiled_rule(
     bindings: BTreeMap<String, RuleType>,
     expression: &str,
@@ -77,16 +84,19 @@ fn lowerer_uses_is_null_for_nullable_equality() {
 fn lowerer_extracts_nested_typed_json_objects_and_lists() {
     let bindings = map([(
         "customer",
-        RuleType::Object(map([
-            (
-                "addresses",
-                RuleType::List(Box::new(RuleType::Object(map([(
-                    "country",
-                    RuleType::String,
-                )])))),
-            ),
-            ("tags", RuleType::List(Box::new(RuleType::Int))),
-        ])),
+        object(
+            "Customer",
+            map([
+                (
+                    "addresses",
+                    RuleType::List(Box::new(object(
+                        "Address",
+                        map([("country", RuleType::String)]),
+                    ))),
+                ),
+                ("tags", RuleType::List(Box::new(RuleType::Int))),
+            ]),
+        ),
     )]);
     let rule = compiled_rule(
         bindings.clone(),
@@ -187,16 +197,19 @@ fn postgres_differential_matches_rust_for_bounded_generated_closed_contexts() {
         ("limit", RuleType::nullable(RuleType::Int)),
         (
             "customer",
-            RuleType::Object(map([
-                (
-                    "addresses",
-                    RuleType::List(Box::new(RuleType::Object(map([(
-                        "country",
-                        RuleType::String,
-                    )])))),
-                ),
-                ("tags", RuleType::List(Box::new(RuleType::Int))),
-            ])),
+            object(
+                "Customer",
+                map([
+                    (
+                        "addresses",
+                        RuleType::List(Box::new(object(
+                            "Address",
+                            map([("country", RuleType::String)]),
+                        ))),
+                    ),
+                    ("tags", RuleType::List(Box::new(RuleType::Int))),
+                ]),
+            ),
         ),
     ]);
     let context_rule = compiled_rule(

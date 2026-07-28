@@ -3348,6 +3348,22 @@ mod tests {
         assert!(rules.contains("is_ready"));
         assert!(rules.contains("decision_tables"));
 
+        let mut with_types_only = empty_metadata();
+        with_types_only.rules = serde_json::from_value(json!({
+            "types": [{
+                "name": "OrderStatus",
+                "enum": ["draft", "submitted"]
+            }]
+        }))
+        .expect("types-only rule metadata deserializes");
+        let with_types_only_dir =
+            Running::write_metadata_snapshot("rules_types_only_wrapper", &with_types_only);
+        let types_only = std::fs::read_to_string(with_types_only_dir.join("rules.yaml"))
+            .expect("a types-only wrapper is serialized");
+        assert!(types_only.contains("OrderStatus"));
+        assert!(!types_only.contains("rules:"));
+        assert!(!types_only.contains("decision_tables:"));
+
         let without_rules_dir =
             Running::write_metadata_snapshot("empty_rules_wrapper", &empty_metadata());
         assert!(
@@ -3356,6 +3372,8 @@ mod tests {
         );
 
         std::fs::remove_dir_all(with_rules_dir).expect("remove rules metadata directory");
+        std::fs::remove_dir_all(with_types_only_dir)
+            .expect("remove types-only rules metadata directory");
         std::fs::remove_dir_all(without_rules_dir).expect("remove empty metadata directory");
     }
 

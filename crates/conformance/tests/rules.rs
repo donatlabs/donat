@@ -16,6 +16,13 @@ const UNIQUE_NO_MATCH: &str = include_str!("../fixtures/rules/unique_no_match.ya
 const UNIQUE_MULTIPLE_MATCHES: &str =
     include_str!("../fixtures/rules/unique_multiple_matches.yaml");
 const FAILING_TEST_CASE: &str = include_str!("../fixtures/rules/failing_test_case.yaml");
+const OBJECT_ENUM_VALID: &str = include_str!("../fixtures/rules/object_enum_valid.yaml");
+const TYPE_CYCLE: &str = include_str!("../fixtures/rules/type_cycle.yaml");
+const DUPLICATE_TYPE: &str = include_str!("../fixtures/rules/duplicate_type.yaml");
+const PRIMITIVE_TYPE_COLLISION: &str =
+    include_str!("../fixtures/rules/primitive_type_collision.yaml");
+const UNKNOWN_TYPE_REFERENCE: &str = include_str!("../fixtures/rules/unknown_type_reference.yaml");
+const AMBIGUOUS_TYPE_BODY: &str = include_str!("../fixtures/rules/ambiguous_type_body.yaml");
 
 fn with_db(admin_url: &str, db: &str) -> String {
     let (prefix, _) = admin_url.rsplit_once('/').expect("PG_URL has a db path");
@@ -112,4 +119,60 @@ fn validate_accepts_an_ordinary_metadata_directory_without_rules() {
     let metadata = metadata_dir("no_rules", None);
     let (ok, output) = validate(&db, &metadata);
     assert!(ok, "metadata without rules must remain valid:\n{output}");
+}
+
+#[test]
+fn validate_resolves_declared_object_and_enum_types_before_publishing_metadata() {
+    let db = fresh_db("conf_rules_object_enum_types");
+    let metadata = metadata_dir("object_enum_valid", Some(OBJECT_ENUM_VALID));
+    let (ok, output) = validate(&db, &metadata);
+    assert!(
+        ok,
+        "declared object and enum types must validate:\n{output}"
+    );
+}
+
+#[test]
+fn validate_rejects_non_finite_or_unknown_declared_rule_types() {
+    let db = fresh_db("conf_rules_invalid_declared_types");
+    let cases = [
+        ("type_cycle", TYPE_CYCLE, "cycle"),
+        (
+            "duplicate_type",
+            DUPLICATE_TYPE,
+            "duplicate declared rule type",
+        ),
+        (
+            "primitive_type_collision",
+            PRIMITIVE_TYPE_COLLISION,
+            "collides with scalar profile type",
+        ),
+        (
+            "unknown_type_reference",
+            UNKNOWN_TYPE_REFERENCE,
+            "unknown declared rule type",
+        ),
+        (
+            "ambiguous_type_body",
+            AMBIGUOUS_TYPE_BODY,
+            "exactly one of object or enum",
+        ),
+    ];
+
+    for (case, rules, expected) in cases {
+        let metadata = metadata_dir(case, Some(rules));
+        let (ok, output) = validate(&db, &metadata);
+        assert!(
+            !ok,
+            "{case}: invalid declared types unexpectedly validated:\n{output}"
+        );
+        assert!(
+            output.contains("rules.yaml.types"),
+            "{case}: missing type path:\n{output}"
+        );
+        assert!(
+            output.contains(expected),
+            "{case}: missing error detail:\n{output}"
+        );
+    }
 }

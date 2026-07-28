@@ -260,6 +260,28 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Name(name) => {
                 self.advance()?;
+                if matches!(self.current.kind, TokenKind::Colon) {
+                    self.advance()?;
+                    if !matches!(self.current.kind, TokenKind::Colon) {
+                        return Err(self.error_at_current("a second ':' in an enum symbol"));
+                    }
+                    self.advance()?;
+                    let Token {
+                        kind: TokenKind::Name(symbol),
+                        span,
+                    } = self.current.clone()
+                    else {
+                        return Err(self.error_at_current("an enum symbol name"));
+                    };
+                    self.advance()?;
+                    return Ok(Expr::new(
+                        Span::new(token.span.start, span.end),
+                        ExprKind::EnumSymbol {
+                            enum_name: name,
+                            symbol,
+                        },
+                    ));
+                }
                 if !matches!(self.current.kind, TokenKind::LeftParen) {
                     return Ok(Expr::new(token.span, ExprKind::Name(name)));
                 }
@@ -423,7 +445,7 @@ fn expression_depth(expression: &Expr) -> usize {
     while let Some((current, depth)) = pending.pop() {
         maximum = maximum.max(depth);
         match &current.kind {
-            ExprKind::Literal(_) | ExprKind::Name(_) => {}
+            ExprKind::Literal(_) | ExprKind::Name(_) | ExprKind::EnumSymbol { .. } => {}
             ExprKind::List(items)
             | ExprKind::Call {
                 arguments: items, ..

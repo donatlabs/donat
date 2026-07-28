@@ -111,6 +111,13 @@ fn lower_expression(
     let sql = match &expression.kind {
         ExprKind::Literal(literal) => lower_literal(&rule.name, literal)?,
         ExprKind::Name(name) => lower_binding(rule, bindings, name)?,
+        // Value lowering is introduced as a dedicated later slice. Task 1
+        // keeps enum declarations and type checking deploy-time-only.
+        ExprKind::EnumSymbol { .. } => {
+            return Err(RuleError::InternalInvariant {
+                rule: rule.name.clone(),
+            });
+        }
         ExprKind::List(items) => {
             let items = items
                 .iter()
@@ -121,7 +128,7 @@ fn lower_expression(
         ExprKind::Member { target, field } => {
             let target = lower_expression(rule, bindings, target)?;
             let target_type = concrete_type(&rule.name, &target.type_)?;
-            let RuleType::Object(fields) = strip_nullable(target_type) else {
+            let RuleType::Object { fields, .. } = strip_nullable(target_type) else {
                 return Err(RuleError::InternalInvariant {
                     rule: rule.name.clone(),
                 });
@@ -205,6 +212,7 @@ fn infer_expression_type(
             .cloned()
             .map(ExpressionType::Concrete)
             .ok_or_else(invariant),
+        ExprKind::EnumSymbol { .. } => Err(invariant()),
         ExprKind::List(items) => {
             let first = items.first().ok_or_else(invariant)?;
             let ExpressionType::Concrete(item_type) = infer_expression_type(rule, first)? else {
@@ -215,7 +223,7 @@ fn infer_expression_type(
             ))))
         }
         ExprKind::Member { target, field } => {
-            let ExpressionType::Concrete(RuleType::Object(fields)) =
+            let ExpressionType::Concrete(RuleType::Object { fields, .. }) =
                 infer_expression_type(rule, target)?
             else {
                 return Err(invariant());
@@ -390,7 +398,7 @@ fn lower_value_literal(
                 .ok_or_else(|| invalid_binding(binding_name, type_))?;
             Ok(format!("{}::timestamptz", donat_sqlgen::quote_lit(value)))
         }
-        RuleType::Enum(symbols) => {
+        RuleType::Enum { symbols, .. } => {
             let value = value
                 .as_str()
                 .filter(|value| symbols.iter().any(|symbol| symbol == *value))
@@ -425,7 +433,7 @@ fn lower_value_literal(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("jsonb_build_array({})", items.join(", ")))
         }
-        RuleType::Object(fields) => {
+        RuleType::Object { fields, .. } => {
             let object = value
                 .as_object()
                 .ok_or_else(|| invalid_literal(rule_name, type_))?;
@@ -566,7 +574,7 @@ fn json_index(target: &str, index: usize, type_: &RuleType) -> String {
 
 fn json_value(value: String, type_: &RuleType) -> String {
     match strip_nullable(type_) {
-        RuleType::List(_) | RuleType::Object(_) => {
+        RuleType::List(_) | RuleType::Object { .. } => {
             format!("NULLIF(({value}), 'null'::jsonb)")
         }
         type_ => format!(
@@ -602,12 +610,12 @@ fn strip_nullable(type_: &RuleType) -> &RuleType {
 fn postgres_type(type_: &RuleType) -> &'static str {
     match strip_nullable(type_) {
         RuleType::Bool => "boolean",
-        RuleType::String | RuleType::Enum(_) => "text",
+        RuleType::String | RuleType::Enum { .. } => "text",
         RuleType::Int | RuleType::Decimal => "numeric",
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",
-        RuleType::List(_) | RuleType::Object(_) => "jsonb",
+        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
         RuleType::Nullable(_) => unreachable!("nullable types are unwrapped above"),
     }
 }

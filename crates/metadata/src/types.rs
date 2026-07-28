@@ -48,6 +48,10 @@ pub struct Metadata {
 /// one deploy-time section so they cannot be loaded or mutated independently.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RulesMetadata {
+    /// Finite named types used by the CEL profile. They stay in the same
+    /// deploy-time wrapper as rules and decision tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<RuleTypeDeclaration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -56,8 +60,20 @@ pub struct RulesMetadata {
 
 impl RulesMetadata {
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty() && self.decision_tables.is_empty()
+        self.types.is_empty() && self.rules.is_empty() && self.decision_tables.is_empty()
     }
+}
+
+/// One finite named object or enum declaration from `rules.yaml`. Validation
+/// that exactly one body is present and that references form an acyclic graph
+/// belongs to deploy-time catalog compilation, where metadata paths are known.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuleTypeDeclaration {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<BTreeMap<String, String>>,
+    #[serde(rename = "enum", default, skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<String>>,
 }
 
 /// A named CEL-profile expression. The metadata crate intentionally preserves

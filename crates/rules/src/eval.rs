@@ -17,6 +17,18 @@ pub fn compile_catalog(
     rules: &[RuleDefinition],
     tables: &[DecisionTableDefinition],
 ) -> Result<RuleCatalog, RuleError> {
+    compile_catalog_with_declared_types(&BTreeMap::new(), rules, tables)
+}
+
+/// Compile a closed rules catalog with the finite named declarations resolved
+/// by the deploy-time metadata adapter. This keeps `donat-rules` independent
+/// from the metadata crate while making enum symbols nominal at every source
+/// site.
+pub fn compile_catalog_with_declared_types(
+    declared_types: &BTreeMap<String, RuleType>,
+    rules: &[RuleDefinition],
+    tables: &[DecisionTableDefinition],
+) -> Result<RuleCatalog, RuleError> {
     let mut catalog = RuleCatalog::default();
 
     for definition in rules {
@@ -29,7 +41,12 @@ pub fn compile_catalog(
             });
         }
         let expression = parse_expression(&definition.name, &definition.expression)?;
-        let checked = check_expression(&definition.name, &expression, &definition.bindings)?;
+        let checked = check_expression(
+            &definition.name,
+            &expression,
+            &definition.bindings,
+            declared_types,
+        )?;
         if !is_assignable(&checked.type_, &definition.result) {
             return Err(RuleError::InvalidRuleResult {
                 rule: definition.name.clone(),
@@ -57,7 +74,7 @@ pub fn compile_catalog(
                 name: definition.name.clone(),
             });
         }
-        let compiled = compile_decision_table(definition)?;
+        let compiled = compile_decision_table(definition, declared_types)?;
         catalog
             .decision_tables
             .insert(definition.name.clone(), compiled);
@@ -118,6 +135,7 @@ pub fn evaluate_bool(rule: &CompiledRule, bindings: &RuleBindings) -> Result<boo
 
 fn compile_decision_table(
     definition: &DecisionTableDefinition,
+    declared_types: &BTreeMap<String, RuleType>,
 ) -> Result<CompiledDecisionTable, RuleError> {
     let policy = match &definition.hit_policy {
         HitPolicy::First => HitPolicy::First,
@@ -163,7 +181,12 @@ fn compile_decision_table(
         let mut conditions = BTreeMap::new();
         for (input, source) in &row.when {
             let expression = parse_expression(&definition.name, source)?;
-            let checked = check_expression(&definition.name, &expression, &definition.inputs)?;
+            let checked = check_expression(
+                &definition.name,
+                &expression,
+                &definition.inputs,
+                declared_types,
+            )?;
             if !matches!(checked.type_, CheckedType::Concrete(RuleType::Bool)) {
                 return Err(RuleError::InvalidDecisionRow {
                     table: definition.name.clone(),
@@ -294,6 +317,7 @@ fn check_expression(
     rule_name: &str,
     expression: &Expr,
     bindings: &BTreeMap<String, RuleType>,
+    declared_types: &BTreeMap<String, RuleType>,
 ) -> Result<CheckedExpr, RuleError> {
     let type_ = match &expression.kind {
         ExprKind::Literal(literal) => check_literal(rule_name, literal)?,
@@ -305,12 +329,34 @@ fn check_expression(
                 }
             })?)
         }
-        ExprKind::List(items) => check_list(rule_name, items, bindings)?,
+        ExprKind::EnumSymbol { enum_name, symbol } => {
+            let Some(type_) = declared_types.get(enum_name) else {
+                return Err(RuleError::UnknownEnumType {
+                    rule: rule_name.to_owned(),
+                    enum_name: enum_name.clone(),
+                });
+            };
+            let RuleType::Enum { name, symbols } = type_ else {
+                return Err(RuleError::UnknownEnumType {
+                    rule: rule_name.to_owned(),
+                    enum_name: enum_name.clone(),
+                });
+            };
+            if name != enum_name || !symbols.iter().any(|candidate| candidate == symbol) {
+                return Err(RuleError::UnknownEnumSymbol {
+                    rule: rule_name.to_owned(),
+                    enum_name: enum_name.clone(),
+                    symbol: symbol.clone(),
+                });
+            }
+            CheckedType::Concrete(type_.clone())
+        }
+        ExprKind::List(items) => check_list(rule_name, items, bindings, declared_types)?,
         ExprKind::Member { target, field } => {
-            let target = check_expression(rule_name, target, bindings)?;
+            let target = check_expression(rule_name, target, bindings, declared_types)?;
             let object = required_concrete(rule_name, &target.type_)?;
             match object {
-                RuleType::Object(fields) => {
+                RuleType::Object { fields, .. } => {
                     CheckedType::Concrete(fields.get(field).cloned().ok_or_else(|| {
                         RuleError::UnknownField {
                             rule: rule_name.to_owned(),
@@ -322,7 +368,7 @@ fn check_expression(
             }
         }
         ExprKind::Index { target, index: _ } => {
-            let target = check_expression(rule_name, target, bindings)?;
+            let target = check_expression(rule_name, target, bindings, declared_types)?;
             let list = required_concrete(rule_name, &target.type_)?;
             match list {
                 RuleType::List(item) => CheckedType::Concrete((**item).clone()),
@@ -332,9 +378,9 @@ fn check_expression(
         ExprKind::Call {
             function,
             arguments,
-        } => check_call(rule_name, *function, arguments, bindings)?,
+        } => check_call(rule_name, *function, arguments, bindings, declared_types)?,
         ExprKind::Unary { op, operand } => {
-            let operand = check_expression(rule_name, operand, bindings)?;
+            let operand = check_expression(rule_name, operand, bindings, declared_types)?;
             let operand = required_concrete(rule_name, &operand.type_)?;
             match op {
                 UnaryOp::Not if matches!(operand, RuleType::Bool) => {
@@ -354,8 +400,8 @@ fn check_expression(
             }
         }
         ExprKind::Binary { op, left, right } => {
-            let left = check_expression(rule_name, left, bindings)?;
-            let right = check_expression(rule_name, right, bindings)?;
+            let left = check_expression(rule_name, left, bindings, declared_types)?;
+            let right = check_expression(rule_name, right, bindings, declared_types)?;
             check_binary(rule_name, *op, &left.type_, &right.type_)?
         }
         ExprKind::Conditional {
@@ -363,10 +409,10 @@ fn check_expression(
             when_true,
             when_false,
         } => {
-            let condition = check_expression(rule_name, condition, bindings)?;
+            let condition = check_expression(rule_name, condition, bindings, declared_types)?;
             expect_bool(rule_name, &condition.type_)?;
-            let when_true = check_expression(rule_name, when_true, bindings)?;
-            let when_false = check_expression(rule_name, when_false, bindings)?;
+            let when_true = check_expression(rule_name, when_true, bindings, declared_types)?;
+            let when_false = check_expression(rule_name, when_false, bindings, declared_types)?;
             merge_branch_types(rule_name, &when_true.type_, &when_false.type_)?
         }
     };
@@ -401,6 +447,7 @@ fn check_list(
     rule_name: &str,
     items: &[Expr],
     bindings: &BTreeMap<String, RuleType>,
+    declared_types: &BTreeMap<String, RuleType>,
 ) -> Result<CheckedType, RuleError> {
     let Some((first, rest)) = items.split_first() else {
         return Err(RuleError::InvalidLiteral {
@@ -408,7 +455,7 @@ fn check_list(
             expected: "a non-empty typed list".to_owned(),
         });
     };
-    let first = check_expression(rule_name, first, bindings)?;
+    let first = check_expression(rule_name, first, bindings, declared_types)?;
     let CheckedType::Concrete(item_type) = first.type_ else {
         return Err(RuleError::InvalidLiteral {
             rule: rule_name.to_owned(),
@@ -416,7 +463,7 @@ fn check_list(
         });
     };
     for item in rest {
-        let item = check_expression(rule_name, item, bindings)?;
+        let item = check_expression(rule_name, item, bindings, declared_types)?;
         if item.type_ != CheckedType::Concrete(item_type.clone()) {
             return Err(type_mismatch(
                 rule_name,
@@ -433,10 +480,11 @@ fn check_call(
     function: Function,
     arguments: &[Expr],
     bindings: &BTreeMap<String, RuleType>,
+    declared_types: &BTreeMap<String, RuleType>,
 ) -> Result<CheckedType, RuleError> {
     let checked = arguments
         .iter()
-        .map(|argument| check_expression(rule_name, argument, bindings))
+        .map(|argument| check_expression(rule_name, argument, bindings, declared_types))
         .collect::<Result<Vec<_>, _>>()?;
     match function {
         Function::Size if checked.len() == 1 => {
@@ -808,10 +856,13 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
             .as_str()
             .filter(|value| is_canonical_timestamp(value))
             .map(|value| RuntimeValue::Timestamp(value.to_owned())),
-        RuleType::Enum(symbols) => value
+        RuleType::Enum { name, symbols } => value
             .as_str()
             .filter(|value| symbols.iter().any(|symbol| symbol == value))
-            .map(|value| RuntimeValue::Enum(value.to_owned())),
+            .map(|value| RuntimeValue::Enum {
+                enum_name: name.clone(),
+                symbol: value.to_owned(),
+            }),
         RuleType::List(item_type) => value.as_array().and_then(|items| {
             items
                 .iter()
@@ -819,7 +870,7 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
                 .collect::<Option<Vec<_>>>()
                 .map(RuntimeValue::List)
         }),
-        RuleType::Object(fields) => value.as_object().and_then(|object| {
+        RuleType::Object { fields, .. } => value.as_object().and_then(|object| {
             fields
                 .iter()
                 .map(|(field, type_)| {
@@ -950,6 +1001,10 @@ fn evaluate_expression(
             .get(name)
             .cloned()
             .ok_or_else(|| RuleError::MissingBinding { name: name.clone() }),
+        ExprKind::EnumSymbol { enum_name, symbol } => Ok(RuntimeValue::Enum {
+            enum_name: enum_name.clone(),
+            symbol: symbol.clone(),
+        }),
         ExprKind::List(items) => items
             .iter()
             .map(|item| evaluate_expression(rule_name, item, context))
@@ -1255,7 +1310,7 @@ enum RuntimeValue {
     Uuid(String),
     Date(String),
     Timestamp(String),
-    Enum(String),
+    Enum { enum_name: String, symbol: String },
     List(Vec<RuntimeValue>),
     Object(BTreeMap<String, RuntimeValue>),
 }
@@ -1271,7 +1326,7 @@ impl RuntimeValue {
             Self::Uuid(_) => "uuid",
             Self::Date(_) => "date",
             Self::Timestamp(_) => "timestamp",
-            Self::Enum(_) => "enum",
+            Self::Enum { .. } => "enum",
             Self::List(_) => "list",
             Self::Object(_) => "object",
         }

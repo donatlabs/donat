@@ -8,7 +8,7 @@ use std::sync::Arc;
 use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
-use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_metadata::{DatabaseUrl, Metadata, RuleTypeDeclaration, Source, SourceKind};
 use donat_rules::{
     DecisionRow as RuleDecisionRow, DecisionTableDefinition as RuleDecisionTableDefinition,
     DecisionTableTestCase as RuleDecisionTableTestCase,
@@ -405,9 +405,10 @@ impl Engine {
 /// Translate the YAML metadata shape into the strict rules crate model and
 /// compile it before a candidate snapshot can publish.
 ///
-/// The adapter deliberately admits only the Phase-1 scalar/list type profile.
-/// Unknown GraphQL names are not silently widened to strings or JSON values.
+/// The adapter resolves named declarations before compiling executable source.
+/// Unknown names are never silently widened to strings or JSON values.
 pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, PlanError> {
+    let declared_types = resolve_declared_rule_types(&metadata.rules.types)?;
     let rules = metadata
         .rules
         .rules
@@ -417,8 +418,12 @@ pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, P
             let path = format!("rules.yaml.rules[{index}]");
             Ok(RuleDefinition {
                 name: definition.name.clone(),
-                bindings: compile_rule_types(&definition.parameters, &path)?,
-                result: parse_rule_type(&definition.result, &format!("{path}.result"))?,
+                bindings: compile_rule_types(&definition.parameters, &declared_types, &path)?,
+                result: parse_rule_type_ref(
+                    &definition.result,
+                    &declared_types,
+                    &format!("{path}.result"),
+                )?,
                 expression: definition.expression.clone(),
             })
         })
@@ -436,8 +441,16 @@ pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, P
                 // This deploy-time catalog has no separately mutable table
                 // revision, so the stable declared name scopes its trace.
                 revision: definition.name.clone(),
-                inputs: compile_rule_types(&definition.inputs, &format!("{path}.inputs"))?,
-                output: compile_rule_types(&definition.output, &format!("{path}.output"))?,
+                inputs: compile_rule_types(
+                    &definition.inputs,
+                    &declared_types,
+                    &format!("{path}.inputs"),
+                )?,
+                output: compile_rule_types(
+                    &definition.output,
+                    &declared_types,
+                    &format!("{path}.output"),
+                )?,
                 hit_policy: HitPolicy::from_metadata(&definition.hit_policy),
                 rows: definition
                     .rows
@@ -465,35 +478,55 @@ pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, P
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
 
-    donat_rules::compile_catalog(&rules, &tables).map_err(|error| {
-        PlanError::validation(
-            "rules.yaml",
-            format!("declarative rule validation failed: {error}"),
-        )
-    })
+    donat_rules::compile_catalog_with_declared_types(&declared_types, &rules, &tables).map_err(
+        |error| {
+            PlanError::validation(
+                "rules.yaml",
+                format!("declarative rule validation failed: {error}"),
+            )
+        },
+    )
 }
 
 fn compile_rule_types(
     types: &BTreeMap<String, String>,
+    declared: &BTreeMap<String, RuleType>,
     path: &str,
 ) -> Result<BTreeMap<String, RuleType>, PlanError> {
     types
         .iter()
         .map(|(name, type_)| {
-            parse_rule_type(type_, &format!("{path}.{name}")).map(|type_| (name.clone(), type_))
+            parse_rule_type_ref(type_, declared, &format!("{path}.{name}"))
+                .map(|type_| (name.clone(), type_))
         })
         .collect()
 }
 
-fn parse_rule_type(source: &str, path: &str) -> Result<RuleType, PlanError> {
+fn parse_rule_type_ref(
+    source: &str,
+    declared: &BTreeMap<String, RuleType>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
     let (source, required) = source
         .strip_suffix('!')
         .map_or((source, false), |inner| (inner, true));
-    let type_ = if source.starts_with('[') && source.ends_with(']') {
-        RuleType::List(Box::new(parse_rule_type(
-            &source[1..source.len() - 1],
+    if source.is_empty() {
+        return Err(PlanError::validation(
             path,
-        )?))
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(parse_rule_type_ref(inner, declared, path)?))
     } else {
         match source {
             "bool" => RuleType::Bool,
@@ -503,12 +536,9 @@ fn parse_rule_type(source: &str, path: &str) -> Result<RuleType, PlanError> {
             "uuid" => RuleType::Uuid,
             "date" => RuleType::Date,
             "timestamp" => RuleType::Timestamp,
-            _ => {
-                return Err(PlanError::validation(
-                    path,
-                    format!("unsupported rule type `{source}`"),
-                ));
-            }
+            _ => declared.get(source).cloned().ok_or_else(|| {
+                PlanError::validation(path, format!("unsupported rule type `{source}`"))
+            })?,
         }
     };
     Ok(if required {
@@ -516,6 +546,213 @@ fn parse_rule_type(source: &str, path: &str) -> Result<RuleType, PlanError> {
     } else {
         RuleType::nullable(type_)
     })
+}
+
+#[derive(Debug, Clone)]
+enum TypeResolution {
+    Visiting,
+    Resolved(RuleType),
+}
+
+fn resolve_declared_rule_types(
+    declarations: &[RuleTypeDeclaration],
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    let mut positions = BTreeMap::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let path = format!("rules.yaml.types[{index}]");
+        if declaration.name.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "declared rule type name cannot be empty",
+            ));
+        }
+        if is_scalar_rule_type_name(&declaration.name) {
+            return Err(PlanError::validation(
+                &path,
+                format!(
+                    "declared rule type `{}` collides with scalar profile type",
+                    declaration.name
+                ),
+            ));
+        }
+        if positions.insert(declaration.name.clone(), index).is_some() {
+            return Err(PlanError::validation(
+                &path,
+                format!("duplicate declared rule type `{}`", declaration.name),
+            ));
+        }
+        if declaration.object.is_some() == declaration.enum_values.is_some() {
+            return Err(PlanError::validation(
+                &path,
+                "a declared rule type requires exactly one of object or enum",
+            ));
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+    for name in positions.keys() {
+        resolve_declared_rule_type(name, declarations, &positions, &mut resolved)?;
+    }
+    resolved
+        .into_iter()
+        .map(|(name, resolution)| match resolution {
+            TypeResolution::Resolved(type_) => Ok((name, type_)),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                "declared rule type resolution did not finish",
+            )),
+        })
+        .collect()
+}
+
+fn resolve_declared_rule_type(
+    name: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+) -> Result<RuleType, PlanError> {
+    if let Some(resolution) = resolved.get(name) {
+        return match resolution {
+            TypeResolution::Resolved(type_) => Ok(type_.clone()),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                format!("declared rule type cycle includes `{name}`"),
+            )),
+        };
+    }
+    let index = *positions.get(name).ok_or_else(|| {
+        PlanError::validation(
+            "rules.yaml.types",
+            format!("unknown declared rule type `{name}`"),
+        )
+    })?;
+    let declaration = &declarations[index];
+    let path = format!("rules.yaml.types[{index}]");
+    resolved.insert(name.to_owned(), TypeResolution::Visiting);
+
+    let type_ = if let Some(symbols) = &declaration.enum_values {
+        if symbols.is_empty() || symbols.iter().any(String::is_empty) {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires non-empty symbols",
+            ));
+        }
+        let unique = symbols.iter().collect::<HashSet<_>>();
+        if unique.len() != symbols.len() {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires unique symbols",
+            ));
+        }
+        RuleType::Enum {
+            name: declaration.name.clone(),
+            symbols: symbols.clone(),
+        }
+    } else if let Some(fields) = &declaration.object {
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "an object declaration requires at least one field",
+            ));
+        }
+        let fields = fields
+            .iter()
+            .map(|(field, source)| {
+                if field.is_empty() {
+                    return Err(PlanError::validation(
+                        &format!("{path}.object"),
+                        "an object field name cannot be empty",
+                    ));
+                }
+                resolve_declared_type_ref(
+                    source,
+                    declarations,
+                    positions,
+                    resolved,
+                    &format!("{path}.object.{field}"),
+                )
+                .map(|type_| (field.clone(), type_))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        RuleType::Object {
+            name: declaration.name.clone(),
+            fields,
+        }
+    } else {
+        return Err(PlanError::validation(
+            &path,
+            "a declared rule type requires exactly one of object or enum",
+        ));
+    };
+    resolved.insert(name.to_owned(), TypeResolution::Resolved(type_.clone()));
+    Ok(type_)
+}
+
+fn resolve_declared_type_ref(
+    source: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    if source.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(resolve_declared_type_ref(
+            inner,
+            declarations,
+            positions,
+            resolved,
+            path,
+        )?))
+    } else if let Some(scalar) = scalar_rule_type(source) {
+        scalar
+    } else if positions.contains_key(source) {
+        resolve_declared_rule_type(source, declarations, positions, resolved)?
+    } else {
+        return Err(PlanError::validation(
+            path,
+            format!("unknown declared rule type `{source}`"),
+        ));
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
+}
+
+fn scalar_rule_type(source: &str) -> Option<RuleType> {
+    match source {
+        "bool" => Some(RuleType::Bool),
+        "string" => Some(RuleType::String),
+        "int" => Some(RuleType::Int),
+        "decimal" => Some(RuleType::Decimal),
+        "uuid" => Some(RuleType::Uuid),
+        "date" => Some(RuleType::Date),
+        "timestamp" => Some(RuleType::Timestamp),
+        _ => None,
+    }
+}
+
+fn is_scalar_rule_type_name(source: &str) -> bool {
+    scalar_rule_type(source).is_some()
 }
 
 fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {

@@ -19,9 +19,15 @@ pub enum RuleType {
     Uuid,
     Date,
     Timestamp,
-    Enum(Vec<String>),
+    Enum {
+        name: String,
+        symbols: Vec<String>,
+    },
     List(Box<RuleType>),
-    Object(BTreeMap<String, RuleType>),
+    Object {
+        name: String,
+        fields: BTreeMap<String, RuleType>,
+    },
     Nullable(Box<RuleType>),
 }
 
@@ -43,9 +49,9 @@ impl RuleType {
             Self::Uuid => "uuid".to_owned(),
             Self::Date => "date".to_owned(),
             Self::Timestamp => "timestamp".to_owned(),
-            Self::Enum(_) => "enum".to_owned(),
+            Self::Enum { name, .. } => format!("enum {name}"),
             Self::List(inner) => format!("list<{}>", inner.display_name()),
-            Self::Object(_) => "object".to_owned(),
+            Self::Object { name, .. } => format!("object {name}"),
             Self::Nullable(inner) => format!("nullable<{}>", inner.display_name()),
         }
     }
@@ -216,6 +222,14 @@ pub enum RuleError {
     DuplicateName { kind: &'static str, name: String },
     #[error("rule `{rule}` uses undeclared binding `{name}`")]
     UndeclaredName { rule: String, name: String },
+    #[error("rule `{rule}` references undeclared enum type `{enum_name}`")]
+    UnknownEnumType { rule: String, enum_name: String },
+    #[error("rule `{rule}` references unknown enum symbol `{enum_name}::{symbol}`")]
+    UnknownEnumSymbol {
+        rule: String,
+        enum_name: String,
+        symbol: String,
+    },
     #[error("rule `{rule}` cannot access undeclared field `{field}`")]
     UnknownField { rule: String, field: String },
     #[error("rule `{rule}` has incompatible types: expected {expected}, got {actual}")]

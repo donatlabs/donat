@@ -257,6 +257,17 @@ fn parses_each_allowed_function() {
 }
 
 #[test]
+fn parses_nominal_enum_symbols_with_the_declaring_type_name() {
+    let expression = parse("OrderStatus::draft");
+
+    assert!(matches!(
+        expression.kind,
+        ExprKind::EnumSymbol { ref enum_name, ref symbol }
+            if enum_name == "OrderStatus" && symbol == "draft"
+    ));
+}
+
+#[test]
 fn rejects_unknown_syntax_with_rule_and_offset() {
     let error = reject("a @ b");
 

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use donat_rules::{
     DecisionRow, DecisionTableDefinition, DecisionTableTestCase, DecisionTestExpectation,
-    HitPolicy, RuleDefinition, RuleType, compile_catalog,
+    HitPolicy, RuleDefinition, RuleError, RuleType, compile_catalog,
+    compile_catalog_with_declared_types,
 };
 use serde_json::{Value, json};
 
@@ -24,6 +25,13 @@ fn rule(
         bindings,
         result,
         expression: expression.to_owned(),
+    }
+}
+
+fn object(name: &str, fields: BTreeMap<String, RuleType>) -> RuleType {
+    RuleType::Object {
+        name: name.to_owned(),
+        fields,
     }
 }
 
@@ -86,7 +94,7 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
             ("active", RuleType::Bool),
             (
                 "customer",
-                RuleType::Object(map([("name", RuleType::String)])),
+                object("Customer", map([("name", RuleType::String)])),
             ),
         ]),
         RuleType::Bool,
@@ -118,7 +126,7 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
             "policy",
             map([(
                 "customer",
-                RuleType::Object(map([("name", RuleType::String)])),
+                object("Customer", map([("name", RuleType::String)])),
             )]),
             RuleType::Bool,
             "customer.email == 'ada@example.test'",
@@ -209,6 +217,72 @@ fn rejects_implicit_numeric_and_uuid_string_conversions() {
     )
     .expect_err("a UUID cannot compare to a string literal without a typed cast form");
     assert!(matches!(uuid, donat_rules::RuleError::TypeMismatch { .. }));
+}
+
+#[test]
+fn enum_symbols_are_nominal_and_reject_unknown_symbols() {
+    let order_status = RuleType::Enum {
+        name: "OrderStatus".to_owned(),
+        symbols: vec!["draft".to_owned(), "submitted".to_owned()],
+    };
+    let other_status = RuleType::Enum {
+        name: "OtherStatus".to_owned(),
+        symbols: vec!["draft".to_owned()],
+    };
+    let declared = BTreeMap::from([
+        ("OrderStatus".to_owned(), order_status.clone()),
+        ("OtherStatus".to_owned(), other_status),
+    ]);
+
+    let catalog = compile_catalog_with_declared_types(
+        &declared,
+        &[rule(
+            "order_is_draft",
+            BTreeMap::new(),
+            RuleType::Bool,
+            "OrderStatus::draft == OrderStatus::draft",
+        )],
+        &[],
+    )
+    .expect("a declared enum symbol must compile with its nominal type");
+    let compiled_rule = catalog
+        .rule("order_is_draft")
+        .expect("the nominal enum rule remains evaluable");
+    assert!(
+        catalog
+            .evaluate_bool(compiled_rule, &BTreeMap::new())
+            .expect("a same-enum literal comparison evaluates")
+    );
+
+    let unknown = compile_catalog_with_declared_types(
+        &declared,
+        &[rule(
+            "unknown_status",
+            BTreeMap::new(),
+            RuleType::Bool,
+            "OrderStatus::missing == OrderStatus::draft",
+        )],
+        &[],
+    )
+    .expect_err("symbols absent from their declared enum must fail at deploy time");
+    assert!(matches!(
+        unknown,
+        RuleError::UnknownEnumSymbol { ref enum_name, ref symbol, .. }
+            if enum_name == "OrderStatus" && symbol == "missing"
+    ));
+
+    let incompatible = compile_catalog_with_declared_types(
+        &declared,
+        &[rule(
+            "nominal_statuses",
+            BTreeMap::new(),
+            RuleType::Bool,
+            "OrderStatus::draft == OtherStatus::draft",
+        )],
+        &[],
+    )
+    .expect_err("same symbol text from different enum declarations must not compare");
+    assert!(matches!(incompatible, RuleError::TypeMismatch { .. }));
 }
 
 #[test]

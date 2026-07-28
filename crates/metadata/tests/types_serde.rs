@@ -638,3 +638,50 @@ decision_tables:
         json!("manual_approval")
     );
 }
+
+#[test]
+fn types_only_rules_wrapper_is_retained_without_empty_rule_sections() {
+    let rules: RulesMetadata = serde_yaml::from_str(
+        r#"
+types:
+  - name: OrderStatus
+    enum: [draft, submitted]
+  - name: CreateOrderLine
+    object:
+      sku: string!
+      status: OrderStatus!
+"#,
+    )
+    .expect("a types-only rules wrapper must deserialize");
+
+    assert_eq!(rules.types.len(), 2);
+    assert_eq!(rules.types[0].name, "OrderStatus");
+    assert_eq!(
+        rules.types[0].enum_values.as_deref(),
+        Some(&["draft".to_owned(), "submitted".to_owned()][..])
+    );
+    assert_eq!(
+        rules.types[1].object.as_ref().expect("object declaration")["status"],
+        "OrderStatus!"
+    );
+    assert!(rules.rules.is_empty());
+    assert!(rules.decision_tables.is_empty());
+    assert!(
+        !rules.is_empty(),
+        "declared types keep the one wrapper present"
+    );
+
+    let serialized = serde_json::to_value(&rules).expect("rules wrapper serializes");
+    assert!(
+        serialized.get("types").is_some(),
+        "types must remain in the wrapper"
+    );
+    assert!(serialized.get("rules").is_none(), "empty rules are omitted");
+    assert!(
+        serialized.get("decision_tables").is_none(),
+        "empty decision tables are omitted"
+    );
+    let round_trip: RulesMetadata = serde_json::from_value(serialized)
+        .expect("types-only wrapper must round-trip through serialization");
+    assert_eq!(round_trip.types.len(), 2);
+}

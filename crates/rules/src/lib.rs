@@ -14,7 +14,7 @@ mod types;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use eval::{RuleBindings, compile_catalog, evaluate_bool};
+pub use eval::{RuleBindings, compile_catalog, compile_catalog_with_declared_types, evaluate_bool};
 pub use parser::parse_expression;
 pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres};
 pub use types::{
@@ -64,6 +64,12 @@ impl Expr {
 pub enum ExprKind {
     Literal(Literal),
     Name(String),
+    /// A nominal enum value. The declaration name is retained rather than
+    /// reducing the token to a string, so overlapping symbols never compare.
+    EnumSymbol {
+        enum_name: String,
+        symbol: String,
+    },
     List(Vec<Expr>),
     Member {
         target: Box<Expr>,
