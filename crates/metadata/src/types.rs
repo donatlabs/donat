@@ -9,7 +9,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{MapAccess, Visitor},
+    ser::SerializeMap,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Metadata {
@@ -37,11 +41,339 @@ pub struct Metadata {
     /// REST endpoints exposing saved queries over templated URLs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rest_endpoints: Vec<RestEndpoint>,
+    /// Declarative domain commands from the optional `commands.yaml` section.
+    /// They are deploy-time declarations only; catalog compilation validates
+    /// their references before any command can be exposed or executed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<Command>,
     /// Declarative rules and decision tables from the single `rules.yaml`
     /// wrapper. They are deploy-time metadata; the rules crate parses their
     /// source expressions when metadata is validated.
     #[serde(default, skip_serializing_if = "RulesMetadata::is_empty")]
     pub rules: RulesMetadata,
+}
+
+/// A named, deploy-time domain operation. The metadata crate preserves the
+/// complete declaration without validating source, catalog, rule, process, or
+/// permission references; those checks need the compiled catalog.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Command {
+    pub name: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<CommandPermission>,
+    #[serde(default, deserialize_with = "deserialize_command_arguments")]
+    pub arguments: Vec<CommandArgument>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<CommandGuard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<CommandStep>,
+    #[serde(default, skip_serializing_if = "CommandResult::is_empty")]
+    pub result: CommandResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<CommandIdempotency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<CommandEffect>,
+}
+
+/// A classic explicit role allowed to invoke a command. This is an additional
+/// gate; later validation still requires the role's table permissions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandPermission {
+    pub role: String,
+}
+
+/// An insertion-ordered result mapping. Command results are exposed in the
+/// exact order declared in metadata, so a sorted map would change the public
+/// command contract while loading YAML.
+#[derive(Debug, Clone, Default)]
+pub struct CommandResult {
+    pub fields: Vec<CommandResultField>,
+}
+
+impl CommandResult {
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&CommandValue> {
+        self.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| &field.value)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.fields.iter().map(|field| &field.name)
+    }
+}
+
+/// One named entry in a [`CommandResult`].
+#[derive(Debug, Clone)]
+pub struct CommandResultField {
+    pub name: String,
+    pub value: CommandValue,
+}
+
+impl<'de> Deserialize<'de> for CommandResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandResultVisitor;
+
+        impl<'de> Visitor<'de> for CommandResultVisitor {
+            type Value = CommandResult;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a mapping of command result fields")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut fields = Vec::new();
+                while let Some((name, value)) = map.next_entry()? {
+                    fields.push(CommandResultField { name, value });
+                }
+                Ok(CommandResult { fields })
+            }
+        }
+
+        deserializer.deserialize_map(CommandResultVisitor)
+    }
+}
+
+impl Serialize for CommandResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for field in &self.fields {
+            map.serialize_entry(&field.name, &field.value)?;
+        }
+        map.end()
+    }
+}
+
+/// A typed command argument. The canonical metadata form is an ordered list;
+/// the accepted mapping shorthand normalizes to this list during loading.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandArgument {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn deserialize_command_arguments<'de, D>(deserializer: D) -> Result<Vec<CommandArgument>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Arguments {
+        List(Vec<CommandArgument>),
+        Mapping(BTreeMap<String, String>),
+    }
+
+    Ok(match Option::<Arguments>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Arguments::List(arguments)) => arguments,
+        Some(Arguments::Mapping(arguments)) => arguments
+            .into_iter()
+            .map(|(name, type_)| CommandArgument {
+                name,
+                type_,
+                description: None,
+            })
+            .collect(),
+    })
+}
+
+/// A named boolean rule evaluated before the command steps execute.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandGuard {
+    pub rule: String,
+    #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One named command operation. Exactly one operation key is retained by the
+/// externally tagged enum; operation-specific safety checks remain deferred to
+/// catalog compilation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandStep {
+    pub name: String,
+    #[serde(flatten)]
+    pub operation: CommandStepOperation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandStepOperation {
+    SelectOne { select_one: SelectOneCommandStep },
+    Insert { insert: InsertCommandStep },
+    InsertMany { insert_many: InsertManyCommandStep },
+    Update { update: UpdateCommandStep },
+    Delete { delete: DeleteCommandStep },
+    Assert { assert: AssertCommandStep },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SelectOneCommandStep {
+    pub table: QualifiedTable,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_found: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InsertCommandStep {
+    pub table: QualifiedTable,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InsertManyCommandStep {
+    pub table: QualifiedTable,
+    pub for_each: CommandValue,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UpdateCommandStep {
+    pub table: QualifiedTable,
+    #[serde(rename = "where", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub predicate: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_affected: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeleteCommandStep {
+    pub table: QualifiedTable,
+    #[serde(rename = "where", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub predicate: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_affected: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AssertCommandStep {
+    pub rule: String,
+    #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A closed, SQL-free reference used by command steps, results, guards, and
+/// process effects. No variant can carry a SQL fragment or identifier template.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandValue {
+    Argument {
+        arg: String,
+    },
+    Item {
+        item: String,
+    },
+    Step {
+        step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<String>,
+    },
+    Literal {
+        literal: serde_json::Value,
+    },
+    Rule {
+        rule: String,
+        #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+        bindings: BTreeMap<String, CommandValue>,
+    },
+    SessionVariable {
+        session_variable: String,
+    },
+}
+
+/// Optional replay protection for a command. Its scope is deliberately typed
+/// so a later validator can reject non-deterministic declarations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandIdempotency {
+    pub key: CommandIdempotencyKey,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<CommandIdempotencyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
+}
+
+/// An idempotency key is intentionally separate from an ordinary command
+/// value: command objects use `{ arg: ... }`, while the canonical
+/// idempotency surface uses `{ argument: ... }`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandIdempotencyKey {
+    Argument { argument: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandIdempotencyScope {
+    Argument { argument: String },
+    SessionVariable { session_variable: String },
+}
+
+/// A durable hand-off requested by a command. It is only metadata in this
+/// slice; no process rows, runtime calls, or mutation behavior are created.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandEffect {
+    StartProcess { start_process: StartProcessEffect },
+    SignalProcess { signal_process: SignalProcessEffect },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StartProcessEffect {
+    pub process: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<CommandIdempotencyKey>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SignalProcessEffect {
+    pub process: String,
+    pub signal: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub correlate: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub payload: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<CommandIdempotencyKey>,
 }
 
 /// The single `rules.yaml` metadata wrapper. Rules and decision tables share

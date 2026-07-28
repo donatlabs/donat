@@ -2188,6 +2188,7 @@ mod tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
@@ -2678,6 +2679,7 @@ mod tests {
                         TableInfo {
                             schema: "main".to_string(),
                             name: table.to_string(),
+                            relation_kind: donat_catalog::RelationKind::Table,
                             columns: vec![ColumnInfo {
                                 name: "id".to_string(),
                                 pg_type: "int4".to_string(),
@@ -3032,6 +3034,7 @@ mod tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "user".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),

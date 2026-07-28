@@ -81,6 +81,7 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         custom_types,
         cron_triggers: load_section(dir, "cron_triggers.yaml")?,
         rest_endpoints: load_section(dir, "rest_endpoints.yaml")?,
+        commands: load_section(dir, "commands.yaml")?,
         rules: load_section(dir, "rules.yaml")?,
     })
 }

@@ -55,9 +55,38 @@ pub struct FunctionArg {
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
+    /// The source relation kind. Postgres values retain the `pg_class.relkind`
+    /// distinction so later command validation cannot mistake a view for an
+    /// ordinary writable table.
+    pub relation_kind: RelationKind,
     pub columns: Vec<ColumnInfo>,
     pub primary_key: Vec<String>,
     pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// Relation categories currently returned by the catalog query. The enum
+/// intentionally models only `pg_class.relkind` values the existing query
+/// includes; unknown values are not silently coerced to ordinary tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    ForeignTable,
+    PartitionedTable,
+}
+
+impl RelationKind {
+    fn from_postgres_relkind(relkind: i8) -> Option<Self> {
+        match relkind as u8 as char {
+            'r' => Some(Self::Table),
+            'v' => Some(Self::View),
+            'm' => Some(Self::MaterializedView),
+            'f' => Some(Self::ForeignTable),
+            'p' => Some(Self::PartitionedTable),
+            _ => None,
+        }
+    }
 }
 
 impl TableInfo {
@@ -97,7 +126,8 @@ pub struct ForeignKey {
 const COLUMNS_SQL: &str = r#"
 SELECT n.nspname, c.relname, a.attname, t.typname,
        NOT a.attnotnull AS nullable,
-       a.atthasdef AS has_default
+       a.atthasdef AS has_default,
+       c.relkind
 FROM pg_attribute a
 JOIN pg_class c ON a.attrelid = c.oid
 JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -176,10 +206,13 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
     for row in client.query(COLUMNS_SQL, &[]).await? {
         let schema: String = row.get(0);
         let table: String = row.get(1);
+        let relation_kind = RelationKind::from_postgres_relkind(row.get(6))
+            .expect("COLUMNS_SQL must only return supported pg_class.relkind values");
         let key = format!("{schema}.{table}");
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema,
             name: table,
+            relation_kind,
             columns: vec![],
             primary_key: vec![],
             foreign_keys: vec![],
@@ -391,6 +424,7 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
             TableInfo {
                 schema: "main".to_string(),
                 name: table,
+                relation_kind: RelationKind::Table,
                 columns,
                 primary_key,
                 foreign_keys,
@@ -432,6 +466,7 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: schema.to_string(),
             name: table.clone(),
+            relation_kind: RelationKind::Table,
             columns: vec![],
             primary_key: vec![],
             foreign_keys: vec![],
@@ -584,6 +619,7 @@ pub fn clickhouse_catalog_from_json_each_row(
         let table = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: database.to_string(),
             name: row.table.clone(),
+            relation_kind: RelationKind::Table,
             columns: Vec::new(),
             primary_key: Vec::new(),
             foreign_keys: Vec::new(),

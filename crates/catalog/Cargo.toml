@@ -11,3 +11,7 @@ serde_json = { workspace = true }
 tokio-postgres = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }

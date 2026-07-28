@@ -278,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
             custom_types: Default::default(),
             cron_triggers: vec![],
             rest_endpoints: vec![],
+            commands: vec![],
             rules: Default::default(),
         },
     };

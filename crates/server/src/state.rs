@@ -1877,6 +1877,7 @@ mod snapshot_tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),

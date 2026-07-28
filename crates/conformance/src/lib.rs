@@ -938,6 +938,7 @@ fn default_metadata_with_configuration(
         custom_types: Default::default(),
         cron_triggers: vec![],
         rest_endpoints: vec![],
+        commands: vec![],
         rules: Default::default(),
     }
 }
@@ -2190,6 +2191,13 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.commands.is_empty() {
+            std::fs::write(
+                dir.join("commands.yaml"),
+                serde_yaml::to_string(&md.commands).expect("serialize commands"),
+            )
+            .unwrap();
+        }
         if !md.rules.is_empty() {
             std::fs::write(
                 dir.join("rules.yaml"),
@@ -3375,6 +3383,43 @@ mod tests {
         std::fs::remove_dir_all(with_types_only_dir)
             .expect("remove types-only rules metadata directory");
         std::fs::remove_dir_all(without_rules_dir).expect("remove empty metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_nonempty_commands_section() {
+        let mut metadata = empty_metadata();
+        metadata.commands = serde_json::from_value(json!([{
+            "name": "create_order",
+            "source": "default",
+            "permissions": [{"role": "customer"}],
+            "steps": [{
+                "name": "order",
+                "insert": {
+                    "table": {"schema": "public", "name": "orders"},
+                    "object": {"status": {"literal": "draft"}},
+                    "returning": ["id"]
+                }
+            }],
+            "result": {"order_id": {"step": "order", "column": "id"}}
+            ,"effects": [{
+                "start_process": {
+                    "process": "checkout_order",
+                    "idempotency_key": {"argument": "request_id"}
+                }
+            }]
+        }]))
+        .expect("command metadata deserializes");
+
+        let dir = Running::write_metadata_snapshot("commands_section", &metadata);
+        let commands = std::fs::read_to_string(dir.join("commands.yaml"))
+            .expect("nonempty commands section is serialized");
+        assert!(commands.contains("create_order"));
+        assert!(commands.contains("argument: request_id"));
+
+        let reloaded = donat_metadata::load_metadata_dir(&dir)
+            .expect("serialized command metadata reloads through the directory loader");
+        assert_eq!(reloaded.commands[0].name, "create_order");
+        std::fs::remove_dir_all(dir).expect("remove commands metadata directory");
     }
 
     fn tempdir(tag: &str) -> PathBuf {

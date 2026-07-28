@@ -144,6 +144,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("name", "text"),
@@ -160,6 +161,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "profile".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![col("author_id", "int4"), col("bio", "text")],
             primary_key: vec!["author_id".into()],
             foreign_keys: vec![ForeignKey {
@@ -175,6 +177,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("title", "text"),

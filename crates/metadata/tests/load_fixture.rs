@@ -20,6 +20,13 @@ fn rules_types_only_fixture_dir() -> &'static Path {
     ))
 }
 
+fn commands_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/commands"
+    ))
+}
+
 #[test]
 fn loads_v2_metadata_directory() {
     let md = load_metadata_dir(fixture_dir()).expect("metadata should load");
@@ -140,4 +147,17 @@ fn loads_types_only_rules_wrapper() {
     assert!(md.rules.rules.is_empty());
     assert!(md.rules.decision_tables.is_empty());
     assert!(!md.rules.is_empty());
+}
+
+#[test]
+fn loads_commands_section_with_quoted_include() {
+    let md = load_metadata_dir(commands_fixture_dir()).expect("commands metadata should load");
+
+    assert_eq!(md.commands.len(), 1);
+    let command = &md.commands[0];
+    assert_eq!(command.name, "create_order");
+    assert_eq!(command.source, "default");
+    assert_eq!(command.permissions[0].role, "customer");
+    assert_eq!(command.steps.len(), 2);
+    assert_eq!(command.effects.len(), 1);
 }

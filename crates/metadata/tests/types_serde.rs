@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use donat_metadata::{
-    Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
+    Columns, Command, CommandEffect, CommandIdempotencyKey, CommandStepOperation, CommandValue,
+    CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
     RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration,
     load_metadata_dir,
 };
@@ -684,4 +685,246 @@ types:
     let round_trip: RulesMetadata = serde_json::from_value(serialized)
         .expect("types-only wrapper must round-trip through serialization");
     assert_eq!(round_trip.types.len(), 2);
+}
+
+#[test]
+fn commands_deserialize_all_step_and_value_forms() {
+    // This exercises parsing only. Cross-step references, table targets, and
+    // rule names are deliberately validated later by catalog compilation.
+    let commands: Vec<Command> = serde_yaml::from_str(
+        r#"
+- name: complete_order
+  source: default
+  permissions:
+    - role: customer
+  arguments:
+    - name: order_id
+      type: uuid!
+    - name: lines
+      type: "[CreateOrderLine!]!"
+  guards:
+    - rule: order_request_is_well_formed
+      with:
+        lines: { arg: lines }
+      message: order request is not valid
+  steps:
+    - name: existing_order
+      select_one:
+        table: public.orders
+        by:
+          id: { arg: order_id }
+        returning: [id, customer_id]
+    - name: order
+      insert:
+        table: public.orders
+        object:
+          customer_id: { step: existing_order, column: customer_id }
+          status: { literal: draft }
+        returning: [id, customer_id, status]
+    - name: lines
+      insert_many:
+        table: public.order_lines
+        for_each: { arg: lines }
+        object:
+          order_id: { step: order, column: id }
+          sku: { item: sku }
+          quantity: { item: quantity }
+        returning: [id, sku, quantity]
+    - name: approved_order
+      update:
+        table: public.orders
+        where:
+          id: { step: order, column: id }
+        set:
+          status:
+            rule: next_order_status
+            with:
+              current: { literal: draft }
+        returning: [id, status]
+    - name: obsolete_order
+      delete:
+        table: public.obsolete_orders
+        where:
+          id: { arg: order_id }
+        returning: [id]
+    - name: order_is_approved
+      assert:
+        rule: order_is_approved
+        with:
+          status: { step: approved_order, column: status }
+        message: order must be approved
+  result:
+    order_id: { step: order, column: id }
+    line_items: { step: lines }
+"#,
+    )
+    .expect("the complete command surface must deserialize");
+
+    let command = &commands[0];
+    assert_eq!(command.arguments[0].name, "order_id");
+    assert_eq!(command.guards[0].rule, "order_request_is_well_formed");
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::SelectOne { .. }
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Insert { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::InsertMany { .. }
+    ));
+    assert!(matches!(
+        &command.steps[3].operation,
+        CommandStepOperation::Update { .. }
+    ));
+    assert!(matches!(
+        &command.steps[4].operation,
+        CommandStepOperation::Delete { .. }
+    ));
+    assert!(matches!(
+        &command.steps[5].operation,
+        CommandStepOperation::Assert { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::InsertMany { insert_many }
+            if matches!(&insert_many.object["sku"], CommandValue::Item { .. })
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Insert { insert }
+            if matches!(&insert.object["status"], CommandValue::Literal { .. })
+    ));
+    assert!(matches!(
+        &command.steps[3].operation,
+        CommandStepOperation::Update { update }
+            if matches!(&update.set["status"], CommandValue::Rule { .. })
+    ));
+    assert!(matches!(
+        command.result.get("order_id"),
+        Some(CommandValue::Step { .. })
+    ));
+    assert_eq!(
+        command
+            .result
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["order_id", "line_items"],
+        "command result fields must retain declaration order"
+    );
+
+    let serialized = serde_yaml::to_string(&commands)
+        .expect("command metadata must serialize for an order-preserving round trip");
+    let reloaded: Vec<Command> =
+        serde_yaml::from_str(&serialized).expect("serialized command metadata must deserialize");
+    assert_eq!(
+        reloaded[0]
+            .result
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["order_id", "line_items"],
+        "a command result round trip must retain declaration order"
+    );
+}
+
+#[test]
+fn commands_retain_unvalidated_duplicate_names_and_effect_references() {
+    // Name uniqueness and process contracts are catalog-validation concerns;
+    // loading metadata must retain these declarations for that later phase.
+    let commands: Vec<Command> = serde_yaml::from_str(
+        r#"
+- name: duplicate_command
+  source: default
+  effects:
+    - start_process:
+        process: checkout_order
+        input:
+          order_id: { arg: order_id }
+- name: duplicate_command
+  source: default
+  effects:
+    - signal_process:
+        process: checkout_order
+        signal: approval_recorded
+        correlate:
+          unknown_correlation: { arg: undeclared_correlation }
+        payload:
+          unknown_payload: { arg: undeclared_payload }
+          actor: { session_variable: x-donat-user-id }
+        idempotency_key: { argument: undeclared_idempotency }
+"#,
+    )
+    .expect("unvalidated command declarations must deserialize");
+
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].name, commands[1].name);
+    assert!(commands[0].idempotency.is_none());
+    match &commands[0].effects[0] {
+        CommandEffect::StartProcess {
+            start_process: effect,
+        } => {
+            assert!(effect.idempotency_key.is_none());
+            assert!(matches!(
+                &effect.input["order_id"],
+                CommandValue::Argument { .. }
+            ));
+        }
+        other => panic!("expected start_process effect, got {other:?}"),
+    }
+    match &commands[1].effects[0] {
+        CommandEffect::SignalProcess {
+            signal_process: effect,
+        } => {
+            assert!(matches!(
+                &effect.correlate["unknown_correlation"],
+                CommandValue::Argument { .. }
+            ));
+            assert!(matches!(
+                &effect.payload["unknown_payload"],
+                CommandValue::Argument { .. }
+            ));
+            assert!(matches!(
+                &effect.payload["actor"],
+                CommandValue::SessionVariable { .. }
+            ));
+            assert!(matches!(
+                &effect.idempotency_key,
+                Some(CommandIdempotencyKey::Argument { .. })
+            ));
+        }
+        other => panic!("expected signal_process effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn command_argument_mapping_shorthand_normalizes_to_the_canonical_list() {
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: create_order
+source: default
+arguments:
+  customer_id: uuid!
+  lines: "[CreateOrderLine!]!"
+"#,
+    )
+    .expect("argument mapping shorthand must deserialize");
+
+    assert_eq!(command.arguments.len(), 2);
+    assert_eq!(command.arguments[0].name, "customer_id");
+    assert_eq!(command.arguments[0].type_, "uuid!");
+    assert_eq!(command.arguments[1].name, "lines");
+}
+
+#[test]
+fn commands_absent_from_directory_yield_empty_vec() {
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
+    let md = load_metadata_dir(dir).expect("fixture metadata should load");
+    assert!(md.commands.is_empty());
 }

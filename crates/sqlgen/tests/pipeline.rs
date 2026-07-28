@@ -34,6 +34,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("name", "text", false),
@@ -49,6 +50,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("title", "text", false),

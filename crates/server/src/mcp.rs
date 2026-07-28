@@ -4424,6 +4424,7 @@ mod tests {
                 donat_catalog::TableInfo {
                     schema: "analytics".to_string(),
                     name: "events".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![donat_catalog::ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
