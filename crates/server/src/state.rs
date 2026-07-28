@@ -82,7 +82,8 @@ pub struct AppState {
     /// --hge-bin mode).
     pub default_url: String,
     pub admin_secret: Option<String>,
-    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: fallback role only for untrusted
+    /// requests whose supplied identity cannot be accepted.
     pub unauthorized_role: Option<String>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,

@@ -954,6 +954,7 @@ pub struct Suite {
     name: String,
     backend: Option<BackendId>,
     env: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
@@ -969,6 +970,7 @@ impl Suite {
             name: name.to_string(),
             backend: None,
             env: vec![],
+            request_headers: vec![],
             args: vec![],
             admin_secret: None,
             webhook: None,
@@ -1058,6 +1060,16 @@ impl Suite {
         self
     }
 
+    /// Add an HTTP/WebSocket request header to every fixture request in this
+    /// suite unless a fixture provides the same header explicitly. This keeps
+    /// suites that exercise one classic role explicit without rewriting each
+    /// copied fixture.
+    pub fn request_header(mut self, name: &str, value: &str) -> Self {
+        self.request_headers
+            .push((name.to_string(), value.to_string()));
+        self
+    }
+
     pub fn env(mut self, k: &str, v: &str) -> Self {
         self.env.push((k.to_string(), v.to_string()));
         self
@@ -1122,6 +1134,7 @@ impl Suite {
             name: self.name,
             backend,
             env: self.env,
+            request_headers: self.request_headers,
             args: self.args,
             admin_secret: self.admin_secret,
             webhook: self.webhook,
@@ -1167,6 +1180,7 @@ pub struct Running {
     pub name: String,
     pub backend: BackendId,
     env: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
@@ -1181,6 +1195,26 @@ pub struct Running {
     /// The spawned engine, started on first request (`ensure_engine`).
     engine: RefCell<Option<EngineProc>>,
     http: reqwest::blocking::Client,
+}
+
+fn is_role_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-donat-role") || name.eq_ignore_ascii_case("x-hasura-role")
+}
+
+fn merge_request_headers(
+    defaults: &[(String, String)],
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    for (name, value) in defaults {
+        let overridden = headers.iter().any(|(existing, _)| {
+            existing.eq_ignore_ascii_case(name)
+                || (is_role_header(existing) && is_role_header(name))
+        });
+        if !overridden {
+            headers.push((name.clone(), value.clone()));
+        }
+    }
+    headers
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2321,7 +2355,12 @@ impl Running {
 
         // Let webhook callback endpoints reach the now-running engine.
         if let Some(handle) = &self.webhook {
-            handle.set(&proc.base_url, self.admin_secret.clone());
+            let role = self
+                .request_headers
+                .iter()
+                .find(|(name, _)| is_role_header(name))
+                .map(|(_, value)| value.clone());
+            handle.set(&proc.base_url, self.admin_secret.clone(), role);
         }
         *self.engine.borrow_mut() = Some(proc);
     }
@@ -2418,6 +2457,7 @@ impl Running {
             return (200, json!({"message": "success"}));
         }
         self.ensure_engine();
+        let headers = merge_request_headers(&self.request_headers, headers.to_vec());
         let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
         let mut req = self.http.post(format!("{base}{path}")).json(body);
         let has_accept = headers
@@ -2436,7 +2476,7 @@ impl Running {
         {
             req = req.header("MCP-Protocol-Version", "2025-06-18");
         }
-        for (k, v) in headers {
+        for (k, v) in &headers {
             req = req.header(k, v);
         }
         let resp = req.send().expect("http request failed");
@@ -2447,6 +2487,7 @@ impl Running {
     }
 
     fn auth_headers(&self, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+        headers = merge_request_headers(&self.request_headers, headers);
         if let Some(secret) = &self.admin_secret {
             headers.push(("X-Donat-Admin-Secret".to_string(), secret.clone()));
         }
@@ -2821,6 +2862,26 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn suite_request_headers_are_case_insensitive_and_never_override_fixture_roles() {
+        let defaults = vec![
+            ("X-Donat-Role".to_string(), "tester".to_string()),
+            ("X-Trace-Mode".to_string(), "suite".to_string()),
+        ];
+        let fixture = vec![
+            ("x-hasura-role".to_string(), "fixture-role".to_string()),
+            ("x-trace-mode".to_string(), "fixture".to_string()),
+        ];
+
+        assert_eq!(
+            merge_request_headers(&defaults, fixture),
+            vec![
+                ("x-hasura-role".to_string(), "fixture-role".to_string()),
+                ("x-trace-mode".to_string(), "fixture".to_string()),
+            ]
+        );
     }
 
     #[test]

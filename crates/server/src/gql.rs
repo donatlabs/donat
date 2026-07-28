@@ -293,10 +293,7 @@ pub fn session_from_headers(
     };
     // No admin role: a trusted request must name an explicit role (an
     // unauthorized-role fallback applies only to the untrusted branch above).
-    match donat_role
-        .or(hasura_role)
-        .or_else(|| unauthorized_role.map(str::to_string))
-    {
+    match donat_role.or(hasura_role) {
         Some(role) => {
             vars.insert("x-donat-role".to_string(), role.clone());
             vars.insert("x-hasura-role".to_string(), role.clone());
@@ -2791,6 +2788,96 @@ mod tests {
             no_role["errors"][0]["message"],
             json!("x-donat-role header is required (this engine has no admin role)")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trusted_request_without_role_is_denied_before_public_action_even_with_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!("called"))
+                    },
+                ),
+            )
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [{
+                "name": "public_action",
+                "definition": {
+                    "type": "query",
+                    "handler": format!("http://{address}/"),
+                    "output_type": "String"
+                },
+                "permissions": []
+            }]
+        }))
+        .expect("action metadata deserializes");
+        let mut state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        Arc::get_mut(&mut state)
+            .expect("state is not shared before test setup")
+            .unauthorized_role = Some("anonymous".to_string());
+
+        let roleless_headers = HeaderMap::new();
+        let roleless = resolve_session(&state, &roleless_headers).await;
+        if let Ok(session) = &roleless {
+            let (status, response) = execute_full(
+                &state,
+                session,
+                &json!({ "query": "query { public_action }" }),
+                false,
+                &roleless_headers,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a trusted request without an explicit role must be denied before a public Action webhook can run"
+        );
+        let (status, response) = roleless.expect_err("a trusted request without a role is denied");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            response,
+            json!({
+                "errors": [{
+                    "extensions": { "path": "$", "code": "access-denied" },
+                    "message": "x-donat-role header is required (this engine has no admin role)"
+                }]
+            })
+        );
+
+        let customer_headers = headers(&[("x-donat-role", "customer")]);
+        let customer = resolve_session(&state, &customer_headers)
+            .await
+            .expect("an explicit role resolves even when a fallback is configured");
+        let (status, response) = execute_full(
+            &state,
+            &customer,
+            &json!({ "query": "query { public_action }" }),
+            false,
+            &customer_headers,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
