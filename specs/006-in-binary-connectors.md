@@ -89,12 +89,12 @@ contract equivalent to:
         operation: &str,
         input: serde_json::Value,
         context: ActivityContext,
-    ) -> Result<ConnectorResult, ConnectorError>;
+    ) -> Result<ConnectorResult, ConnectorFailure>;
 
     fn verify_webhook(
         &self,
         request: VerifiedWebhookRequest,
-    ) -> Result<InboundSignal, ConnectorError>;
+    ) -> Result<InboundSignal, WebhookRejection>;
 
 ActivityContext carries a stable idempotency key, deadline, trace ID, and
 redacting logger. It does not carry database credentials or a mutable process
@@ -109,11 +109,29 @@ redacted.
 
 ## 4. Failure and test contract
 
-Connector errors are classified as transport, timeout, http_429, http_5xx,
-authentication, validation, permanent, or invariant. The first four are
-eligible only for the activity's declared retry_on list; the remaining classes
-take the matching process on_error route. No connector silently turns a non-2xx
-response into success.
+`ConnectorErrorClass` is a closed activity-execution enum with exactly these
+values: `transport`, `timeout`, `http_429`, `http_5xx`, `authentication`,
+`validation`, `permanent`, and `invariant`. Every failed `execute` returns a
+`ConnectorFailure { class: ConnectorErrorClass, code, safe_message,
+retry_after }`; modules cannot return an ad-hoc class or a retry decision. The
+process worker is the only owner of policy: `retry_on` accepts only
+`transport`, `timeout`, `http_429`, and `http_5xx`; a matching failure is
+retried only while attempts remain. Every other class, every retryable class
+not selected by `retry_on`, and the worker-generated `retry_exhausted` outcome
+are sent through the process activity's declared `on_error` routes and
+mandatory fallback (Spec 005). `invariant` is always a non-retryable
+activity failure and must therefore reach that routing contract. No connector
+silently turns a non-2xx response into success.
+
+Configuration failures are not `ConnectorErrorClass` values: static metadata
+configuration fails `validate`/`migrate`, and unavailable required environment
+values prevent the affected connector from starting before it can execute an
+activity. Inbound webhook outcomes are likewise outside activity routing:
+unknown instance, body-limit rejection, invalid signature, malformed verified
+payload, duplicate provider event, unmatched or ambiguous correlation,
+guard-false, and unexpected process state are bounded ingress/audit outcomes.
+They may create zero or one durable process signal according to Spec 005; they
+never enter an activity's `retry_on` or `on_error` table.
 
 | Behavior | First failing test | Test double / reference |
 | --- | --- | --- |
@@ -163,9 +181,32 @@ pub trait ConnectorModule: Send + Sync {
     fn validate_config(&self, config: &serde_json::Value) -> Result<ValidatedConfig, ConfigError>;
     fn validate_operation(&self, operation: &str, input_schema: &TypeShape)
         -> Result<(), ConfigError>;
-    fn classify_error(&self, error: &ConnectorError) -> RetryDisposition;
+    async fn execute(
+        &self,
+        operation: &str,
+        input: serde_json::Value,
+        context: ActivityContext,
+    ) -> Result<ConnectorResult, ConnectorFailure>;
     fn verify_webhook(&self, raw: VerifiedWebhookRequest)
-        -> Result<VerifiedInboundEvent, WebhookError>;
+        -> Result<VerifiedInboundEvent, WebhookRejection>;
+}
+
+pub enum ConnectorErrorClass {
+    Transport,
+    Timeout,
+    Http429,
+    Http5xx,
+    Authentication,
+    Validation,
+    Permanent,
+    Invariant,
+}
+
+pub struct ConnectorFailure {
+    pub class: ConnectorErrorClass,
+    pub code: &'static str,
+    pub safe_message: String,
+    pub retry_after: Option<std::time::Duration>,
 }
 
 async fn execute_activity(
@@ -173,7 +214,7 @@ async fn execute_activity(
     operation: &str,
     input: serde_json::Value,
     context: ActivityContext,
-) -> Result<ConnectorResult, ConnectorError>;
+) -> Result<ConnectorResult, ConnectorFailure>;
 ~~~
 
 The worker, not the module, owns activity-job persistence, leases, retries,
@@ -235,7 +276,7 @@ enabled operation is declared at deploy time:
         tracking_url: { json_pointer: /tracking_url, type: string }
       idempotency: { header: Idempotency-Key }
       error_classification:
-        retryable_5xx: [500, 502, 503, 504]
+        http_5xx: [500, 502, 503, 504]
       capacity:
         max_in_flight: 8
         rate_limit: { permits: 20, per: 1s, burst: 8 }
@@ -246,7 +287,7 @@ method is one of GET, POST, PUT, PATCH, or DELETE. path is an absolute path
 with statically named, percent-encoded path parameters. It cannot contain a
 scheme, authority, userinfo, fragment, dot-segment, or runtime-computed host.
 Query keys, header names, JSON pointers, request body keys, success statuses,
-and retry statuses are static metadata. Input may fill only a declared value
+and error-classification statuses are static metadata. Input may fill only a declared value
 slot with a type-compatible value.
 
 The client follows no redirects. It applies an operation deadline from the
@@ -299,17 +340,24 @@ test.
 
 ## 9. Errors, retries, and observability
 
+The first seven rows below enumerate all eight `ConnectorErrorClass`
+activity-execution values: the HTTP status row contains `validation`,
+`authentication`, and `permanent`, while the final activity row is the explicit
+`invariant` class. The remaining rows are explicitly outside activity routing
+and must not be converted into `retry_on` or `on_error` values.
+
 | Condition | Connector classification | Worker behavior |
 | --- | --- | --- |
 | DNS, TLS, connection reset | transport | schedule only when retry_on includes transport |
 | connector deadline or HTTP 408 | timeout | schedule only when retry_on includes timeout |
 | HTTP 429 | http_429 | honor later Retry-After and retain key when listed |
-| declared retryable HTTP 5xx | http_5xx | schedule only when retry_on includes http_5xx |
+| declared HTTP 5xx | http_5xx | schedule only when retry_on includes http_5xx |
 | HTTP 400, 401, 403, 404, unsupported status | validation, authentication, or permanent | append typed failure event without implicit retry |
 | malformed declared JSON response | validation | preserve redacted protocol diagnostic |
-| module configuration invalid | configuration | server does not start the connector instance |
-| invalid inbound signature | webhook rejection | audit verification outcome; no process signal |
-| duplicate verified provider event | duplicate | return accepted response; no second signal |
+| module invariant violation | invariant | append typed failure event; mandatory process fallback remains available |
+| module configuration invalid | outside activity: ConfigError | `validate`/`migrate` rejects it, or server startup refuses the instance |
+| invalid inbound signature or body | outside activity: WebhookRejection | audit verification outcome; no process signal |
+| duplicate verified provider event | outside activity: ingress outcome | return accepted response; no second signal |
 
 ConnectorResult includes a typed success value or a redacted diagnostic with
 classification, provider status, retry-after, and safe correlation IDs. It
@@ -341,6 +389,8 @@ runtime.
 | stripe_retry_holds_idempotency_key | two-attempt stub | both requests carry exactly the same key |
 | stripe_signature_precedes_json | endpoint integration | invalid signature with malformed body creates no process signal |
 | stripe_duplicate_event_is_safe | process integration | same event.id creates one inbound row and one transition |
+| connector_error_class_is_closed | connector plus process integration | only the eight declared classes reach activity retry/routing; invariant takes the declared failure path |
+| connector_config_and_webhook_are_not_activity_failures | metadata plus endpoint integration | configuration prevents startup and inbound audit outcomes never enter retry_on/on_error |
 | connector_error_never_leaks_secret | unit and conformance | body, header, and environment sentinels do not appear in response/log fixture |
 
 The stripe-mock contract suite is a separately marked integration test and

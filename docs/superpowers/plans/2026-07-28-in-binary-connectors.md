@@ -36,8 +36,8 @@ pub struct ConnectorRegistry { /* instance -> module + validated config */ }
 
 pub trait ConnectorModule: Send + Sync {
     fn definition(&self) -> ConnectorDefinition;
-    fn validate_config(&self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
-    fn validate_operation(&self, operation: &ConnectorOperation) -> Result<(), ConnectorError>;
+    fn validate_config(&self, config: &ConnectorConfig) -> Result<(), ConnectorConfigError>;
+    fn validate_operation(&self, operation: &ConnectorOperation) -> Result<(), ConnectorConfigError>;
     async fn execute(
         &self,
         operation: ValidatedOperation,
@@ -47,14 +47,19 @@ pub trait ConnectorModule: Send + Sync {
         &self,
         config: &ResolvedConnectorConfig,
         request: &InboundRequest,
-    ) -> Result<VerifiedWebhook, ConnectorFailure>;
+    ) -> Result<VerifiedWebhook, WebhookRejection>;
+}
+
+pub enum ConnectorErrorClass {
+    Transport, Timeout, Http429, Http5xx,
+    Authentication, Validation, Permanent, Invariant,
 }
 
 pub struct ConnectorFailure {
-    pub class: FailureClass, // Transport | Timeout | Http429 | Http5xx |
-                             // Authentication | Validation | Permanent | Invariant
+    pub class: ConnectorErrorClass,
     pub code: &'static str,
     pub safe_message: String,
+    pub retry_after: Option<Duration>,
 }
 
 // server state publishes a fully validated immutable registry.
@@ -82,7 +87,8 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   instance names, unknown module, missing required config, static URL with a
   user-info component, non-secret endpoint/credential identities, operation
   capacity, and a secret reference that is an environment variable name rather
-  than a secret literal.
+  than a secret literal. Assert that configuration errors reject validation or
+  startup and cannot be represented as an activity `ConnectorErrorClass`.
 - [ ] RED: run `cargo test -p donat-metadata connectors` and
   `cargo test -p donat-server connector_startup`. Expected: no connector
   metadata or startup validation exists.
@@ -131,11 +137,14 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   unspecified, and non-global addresses. Re-check the connected peer where
   the HTTP client exposes it; otherwise record this as a documented resolver
   limitation and keep redirects disabled.
-- [ ] Classify DNS/connect errors as transport, operation deadline as timeout,
-  429 as http_429, declared 5xx as http_5xx, malformed responses as validation,
-  and 401/403 as authentication. Do not encode retry policy in the module: the
-  pinned process activity decides which typed outcomes are retryable. Return
-  only provider-safe messages.
+- [ ] Classify every failed `execute` into the closed `ConnectorErrorClass`:
+  DNS/connect errors are `transport`, operation deadline is `timeout`, 429 is
+  `http_429`, declared 5xx is `http_5xx`, malformed responses are
+  `validation`, 401/403 is `authentication`, unsupported non-success status
+  is `permanent`, and a violated module contract is `invariant`. Do not encode
+  retry policy in the module: the pinned process activity decides which typed
+  outcomes are retryable and routes every non-retried class through `on_error`.
+  Return only provider-safe messages.
 - [ ] GREEN: run `cargo test -p donat-server --test connectors_http` and
   `cargo test -p donat-server connectors`. Expected: local tests demonstrate
   no open redirect or private-address bypass.
@@ -160,8 +169,9 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   user request fields.
 - [ ] Define a typed `ConnectorOperation` union. For HTTP it contains only a
   named static operation, declared input bindings, static base/path/query/header
-  templates, JSON body template, expected response extraction, and retry
-  policy. Reject values not declared by its module schema.
+  templates, JSON body template, expected response extraction, and static
+  status-to-`ConnectorErrorClass` mapping. Retry policy belongs only to the
+  process activity. Reject values not declared by its module schema.
 - [ ] Validate operations in registry construction and again at job dispatch;
   canonicalize input JSON before calculating its request fingerprint. Attach
   a connector idempotency header only when metadata declares its exact name.
@@ -226,7 +236,9 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] Add tests that `POST /v1/connectors/{instance}/webhooks` routes raw bytes
   only to a declared instance, rejects unknown instance before body parsing,
   rejects signature failures, applies the 1 MiB body limit, and returns no
-  internal configuration/secret data in failure bodies.
+  internal configuration/secret data in failure bodies. Assert that every
+  rejection/duplicate ingress outcome is recorded as webhook audit state and
+  cannot be converted into an activity retry or `on_error` input.
 - [ ] RED: run `cargo test -p donat-server --test connector_webhook`.
   Expected: route is absent.
 - [ ] Add the one route outside GraphQL and preserve existing enabled API
@@ -249,9 +261,10 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 
 - [ ] Add conformance cases for metadata validation, unavailable secret env,
   HTTP path encoding, redirect/private-address denial, retry classification
-  observable through a controlled local endpoint, Stripe request shape, and
-  Stripe signature rejection. Do not claim delivery success until the process
-  journal test exists.
+  observable through a controlled local endpoint, every closed activity error
+  class including invariant, configuration rejection outside activity routing,
+  Stripe request shape, and Stripe signature rejection outside activity
+  routing. Do not claim delivery success until the process journal test exists.
 - [ ] RED: rebuild and run
   `cargo test -p donat-conformance --test connectors`. Expected: new fixtures
   fail before implementation; record exact public responses.

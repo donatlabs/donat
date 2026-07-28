@@ -80,16 +80,17 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
   that a directory lacking the file loads with empty rule and decision-table
   vectors.
 - [ ] RED: run `cargo test -p donat-metadata rules`. Expected: compile failure
-  because `Metadata::rules`, `Metadata::decision_tables`, and their YAML types
-  do not exist.
+  because `Metadata::rules` and its single-wrapper YAML type do not exist.
 - [ ] Define serde-owned `RuleDefinition`, `DecisionTableDefinition`,
   `DecisionRow`, declared binding types, and source-location-free expression
   fields in `types.rs`. Keep source text as `String`; parsing belongs only to
   `donat-rules`.
 - [ ] Load the `rules.yaml` wrapper through existing `load_section`, and add an
-  empty wrapper/default to every explicit `Metadata` literal, including
-  `crates/server/src/main.rs` and conformance builders once compiler errors
-  identify them. Do not introduce `decision_tables.yaml`.
+  empty `RulesMetadata { rules, decision_tables }` wrapper/default to every
+  explicit `Metadata` literal, including `crates/server/src/main.rs` and
+  conformance builders once compiler errors identify them. `Metadata::rules`
+  is the only rules surface: do not add `Metadata::decision_tables`, a second
+  loader call, or `decision_tables.yaml`.
 - [ ] GREEN: run `cargo test -p donat-metadata` and
   `cargo test -p donat-conformance --lib metadata`. Expected: metadata
   round-trips preserve the new sections and existing fixtures are unchanged.
@@ -200,9 +201,10 @@ bytes, AST depth at most 64, and a literal list has at most 256 elements.
 - [ ] Compile a `RuleCatalog` during candidate engine construction after
   metadata load. Have `migrate::check_consistency` collect its validation
   errors, and have serving startup reject invalid metadata before listening.
-- [ ] Extend `ConformanceBuilder::write_metadata_dir` to serialize both new
-  YAML files only when non-empty. Do not add any HTTP endpoint that changes
-  rules or decision tables.
+- [ ] Extend `ConformanceBuilder::write_metadata_dir` to serialize the one
+  `rules.yaml` wrapper only when either its `rules` or `decision_tables` list
+  is non-empty. Do not add any HTTP endpoint that changes rules or decision
+  tables.
 - [ ] GREEN: rebuild the binary and run the focused conformance test, then
   `cargo test -p donat-server` and `cargo test -p donat-metadata`.
 - [ ] Commit this deploy-validation slice and obtain judge ACCEPT.

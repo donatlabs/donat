@@ -6,10 +6,12 @@ replacement for the existing GraphQL Actions endpoint.
 
 ## 1. Goal and hard boundary
 
-A process is a metadata-defined durable state machine. It starts from a domain
-command event, waits for a connector result, an authenticated inbound signal,
-or a timer, and then transitions by running a declarative command or queuing
-another connector activity.
+A process is a metadata-defined durable state machine. A domain command writes
+a pinned process-start outbox request, and the start worker consumes that
+request into the initial process event and instance. The instance then waits
+for a connector result, an authenticated inbound signal, or a timer, and
+transitions by running a declarative command or queuing another connector
+activity.
 
 The runtime is part of the single donat binary and stores its durable state in
 Postgres. It reuses the established journal pattern: deploy-time DDL through
@@ -18,8 +20,11 @@ at-least-once delivery, idempotent handlers, and per-attempt logs. The serving
 binary never creates DDL.
 
 An external request is never made while a database transaction is open. A
-command transaction atomically writes the process start event or activity job;
-the poller claims it and performs I/O only after that transaction commits.
+command transaction atomically writes only a pinned process-start outbox
+request, never a process event or activity job. The start worker consumes that
+request in a later short transaction; only a process state transition may
+enqueue an activity job, and its poller performs I/O only after that transition
+commits.
 
 ## 2. Metadata surface
 
@@ -34,11 +39,38 @@ must be explicitly listed on that command and retain every currently effective
 table permission. There is no administrator role, implicit workflow identity,
 or permission bypass.
 
-Every command transition declares `on_rejection`. Every activity declares an
-ordered `on_error` routing table with a mandatory fallback. A state is exactly
-one of terminal, activity, `wait_for_signal`, `wait_for_command`, or timer
-waiting. `set` may consume declared input, state, result, signal, or Spec 004
-rule values; it cannot read a table, select a runtime role, or execute code.
+Every command transition declares `on_rejection`. Every activity declares this
+single ordered error-routing form; no list-only or `default` spelling is
+accepted:
+
+~~~yaml
+on_error:
+  routes:
+    - kinds: [authentication, validation]
+      next: manual_review
+  fallback:
+    next: failed
+~~~
+
+`routes` is a non-empty ordered list. `kinds` contains one or more distinct
+`ActivityFailureKind` values and no value may appear in more than one route.
+`fallback` is mandatory, has exactly one `next`, and handles every activity
+failure not selected by an earlier route. It is therefore the declared outcome
+for every non-retried connector class not named above, including `invariant`,
+and for `retry_exhausted`. The closed kinds are the eight
+`ConnectorErrorClass` values from Spec 006 (`transport`, `timeout`,
+`http_429`, `http_5xx`, `authentication`, `validation`, `permanent`, and
+`invariant`) plus the worker-only `retry_exhausted` outcome. `retry_on` may
+name only `transport`, `timeout`, `http_429`, and `http_5xx`; the worker
+retries a matching connector failure only while attempts remain. Metadata
+validation rejects an absent `fallback`, an empty/duplicate/unknown route
+kind, a duplicate route kind, a non-retryable `retry_on` entry, or an invalid
+target. A state has exactly one kind discriminator: terminal, activity,
+`wait_for_signal`, `wait_for_command`, or timer waiting. An activity's
+`on_success`/`on_error` and a wait state's nested `on_signal`/`timeout` are
+fields of that one kind, not additional state kinds. `set` may consume declared
+input, state, result, signal, or Spec 004 rule values; it cannot read a table,
+select a runtime role, or execute code.
 
 ## 3. Durable data model and execution
 
@@ -85,7 +117,7 @@ algorithm.
 
 | Behavior | First failing test | Regression proof |
 | --- | --- | --- |
-| Command starts one instance | commands/process conformance fixture | command result and start event commit atomically |
+| Command starts one instance | commands/process conformance fixture | command result and pinned process-start request commit atomically; the start worker creates one initial event and instance |
 | Worker crash after claim | process integration test | restart completes exactly one transition audit record |
 | Connector retry | recording connector stub | stable idempotency key is reused and attempts are logged |
 | Duplicate Stripe webhook | webhook conformance fixture | exactly one signal transition occurs |
@@ -160,38 +192,43 @@ explicitly:
           checkout_url: { result: url }
         next: awaiting_payment
       on_error:
-        - kinds: [authentication, validation]
-          next: manual_review
-        - kinds: [permanent, retry_exhausted, timeout]
+        routes:
+          - kinds: [authentication, validation]
+            next: manual_review
+          - kinds: [permanent, invariant, timeout, retry_exhausted]
+            next: failed
+        fallback:
           next: failed
     awaiting_payment:
-      on_signal:
+      wait_for_signal:
         connector: stripe
         event: checkout.session.completed
         provider_event_id: { event: id }
         correlate:
           order_id: { event: data.object.client_reference_id }
-        guard:
-          rule: payment_matches_order
-          with:
-            order_id: { state: order_id }
-            checkout_order_id: { event: data.object.client_reference_id }
-        command:
-          name: mark_order_paid
-          run_as_role: payment_worker
-          input:
-            order_id: { state: order_id }
-        next: completed
-        on_rejection: failed
-      after:
-        30d:
+        on_signal:
+          guard:
+            rule: payment_matches_order
+            with:
+              order_id: { state: order_id }
+              checkout_order_id: { event: data.object.client_reference_id }
           command:
-            name: expire_order
-            run_as_role: order_worker
+            name: mark_order_paid
+            run_as_role: payment_worker
             input:
               order_id: { state: order_id }
-          next: expired
+          next: completed
           on_rejection: failed
+        timeout:
+          after: 30d
+          on_timeout:
+            command:
+              name: expire_order
+              run_as_role: order_worker
+              input:
+                order_id: { state: order_id }
+            next: expired
+            on_rejection: failed
     completed: { terminal: true }
     manual_review: { terminal: true }
     failed: { terminal: true }
@@ -207,14 +244,22 @@ environment variable.
 
 The canonical form has exactly one start command in Phase 1. A command may
 start multiple processes through separate Spec 003 effects, but one process
-definition cannot have multiple start sources. `wait_for_command` declares an
-exact signal name, typed payload, and correlation. The optional cancellation
-block is similarly typed and is accepted while the instance is non-terminal.
-Only a validated Spec 003 `signal_process` effect may append either form; this
-is the domain-safe mechanism for approval, correction, and cancellation without
-a generic process-management endpoint. Start input, every state set, activity
-input, command input, signal payload, correlation field, and rule binding is
-checked against its declared type at metadata validation time.
+definition cannot have multiple start sources. A state has exactly one kind
+discriminator; activity transition fields do not create another kind.
+`wait_for_signal` contains one verified connector signal mapping and one
+`on_signal` transition; its optional nested `timeout` has exactly `after` and
+`on_timeout` transition keys. `wait_for_command` has the same nested
+`on_signal` and optional `timeout` form, but additionally declares its exact
+command-signal name, typed payload, and correlation. A timer-only state uses
+`timer: { after: <duration>, on_timeout: <transition> }`; `after` is never a
+sibling of `wait_for_signal`, `wait_for_command`, or another state kind. The
+optional cancellation block is similarly typed and is accepted while the
+instance is non-terminal. Only a validated Spec 003 `signal_process` effect
+may append a command signal or cancellation; this is the domain-safe mechanism
+for approval, correction, and cancellation without a generic
+process-management endpoint. Start input, every state set, activity input,
+command input, signal payload, correlation field, and rule binding is checked
+against its declared type at metadata validation time.
 
 During donat migrate --metadata-dir, the engine canonicalizes each valid
 process definition and derives a revision from its canonical JSON plus the
@@ -380,9 +425,9 @@ non-zero exit status, not a replay or recovery action.
 | guard evaluates false | consume event and log guard_false | remains in current state; no retry |
 | command business rejection | consume event and log command_rejected | follows required explicitly declared on_rejection |
 | connector retryable error | release job to scheduled with computed retry time | state remains unchanged |
-| schedule-to-start or start-to-close timeout | append typed timeout event | follows matching on_error route |
-| connector authentication, validation, or permanent error | append typed activity-failed event | follows matching on_error route |
-| retry limit reached | append typed retry_exhausted event | follows matching on_error route |
+| schedule-to-start or start-to-close timeout | append typed timeout event | follows matching on_error route or mandatory fallback |
+| connector authentication, validation, permanent, or invariant error | append typed activity-failed event | follows matching on_error route or mandatory fallback |
+| retry limit reached | append typed retry_exhausted event | follows matching on_error route or mandatory fallback |
 | capacity unavailable | retain scheduled job without a provider call | state remains unchanged |
 | serialization key busy | retain scheduled job without a provider call | state remains unchanged |
 | domain cancellation signal | consume signal, cancel unclaimed jobs | follows declared on_cancel route |
@@ -413,6 +458,8 @@ tries to reverse arbitrary prior SQL.
 | process_activity_timeouts_are_distinct | controlled DB clock and connector stub | schedule-to-start makes no call; start-to-close yields stale completion |
 | process_activity_capacity_is_global | two engine processes and recording connector | per-operation limit and rate limit hold across workers |
 | process_retry_jitter_is_reproducible | unit plus integration | same activity ID and attempt produces the same delayed retry |
+| process_error_routes_are_total | metadata plus activity integration | the only `on_error` grammar has routes plus fallback; every non-retried class, including invariant, and retry exhaustion take a declared path |
+| process_wait_signal_timeout_is_one_state_kind | metadata plus timer integration | a wait state accepts nested timeout; a sibling `on_signal`/`after` shape and multiple outer state kinds are rejected |
 | process_signal_signature_before_parse | HTTP endpoint test | malformed JSON with bad signature is rejected before event JSON handling |
 | process_signal_deduplicates | two identical webhook requests | one inbound row and one transition |
 | process_correlation_is_unique | integration | zero and multiple candidate instances are audit-only |

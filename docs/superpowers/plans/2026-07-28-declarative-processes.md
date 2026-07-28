@@ -39,10 +39,78 @@ CEL-like rules, command SQL, or HTTP/Stripe protocol handling.
 // metadata/types.rs
 pub struct ProcessDefinition {
     pub name: String,
-    pub source: Option<String>,
+    pub source: String,
     pub input: BTreeMap<String, ProcessInputType>,
-    pub initial_state: String,
+    pub state: BTreeMap<String, ProcessStateType>,
+    pub initial_state: BTreeMap<String, Binding>,
+    pub initial: String,
     pub states: BTreeMap<String, ProcessState>,
+}
+
+pub enum ProcessState {
+    // Deserialized only from the literal mapping `terminal: true`.
+    Terminal,
+    Activity {
+        activity: ActivityDefinition,
+        on_success: Transition,
+        on_error: ActivityErrorRoutes,
+    },
+    WaitForSignal { wait_for_signal: SignalWait },
+    WaitForCommand { wait_for_command: CommandSignalWait },
+    Timer { timer: TimerWait },
+}
+
+pub struct SignalWait {
+    pub connector: String,
+    pub event: String,
+    pub provider_event_id: Binding,
+    pub correlate: BTreeMap<String, Binding>,
+    pub on_signal: Transition,
+    pub timeout: Option<WaitTimeout>,
+}
+
+pub struct CommandSignalWait {
+    pub signal: String,
+    pub correlate: BTreeMap<String, ProcessInputType>,
+    pub payload: BTreeMap<String, ProcessInputType>,
+    pub on_signal: Transition,
+    pub timeout: Option<WaitTimeout>,
+}
+
+pub struct WaitTimeout {
+    pub after: DurationSpec,
+    pub on_timeout: Transition,
+}
+
+pub struct TimerWait {
+    pub after: DurationSpec,
+    pub on_timeout: Transition,
+}
+
+pub struct ActivityErrorRoutes {
+    pub routes: Vec<ActivityErrorRoute>,
+    pub fallback: ErrorTransition,
+}
+
+pub struct ActivityErrorRoute {
+    pub kinds: Vec<ActivityFailureKind>,
+    pub next: String,
+}
+
+pub struct ErrorTransition {
+    pub next: String,
+}
+
+pub enum ActivityFailureKind {
+    Transport,
+    Timeout,
+    Http429,
+    Http5xx,
+    Authentication,
+    Validation,
+    Permanent,
+    Invariant,
+    RetryExhausted,
 }
 
 // server/processes.rs
@@ -96,18 +164,27 @@ instances, change a definition, or set an instance role.
   source, non-terminal state with no transition, nondeterministic signal
   correlation, unknown connector/rule/command, missing fixed `run_as_role`,
   missing required `on_rejection` command transition, missing ordered
-  `on_error` fallback, unsupported error class, invalid schedule-to-start or
-  start-to-close timeout, missing capacity declaration, and cancellation
-  signal without an `on_cancel` state.
+  `on_error.fallback`, empty/duplicate/unknown `on_error.routes[].kinds`, a
+  non-retryable `retry_on` value including `invariant`, invalid
+  schedule-to-start or start-to-close timeout, missing capacity declaration,
+  a bare sibling `on_signal`/`after` form instead of a
+  `wait_for_signal.timeout` mapping, a wait timeout missing either `after` or
+  `on_timeout`, multiple state-kind discriminators, and cancellation signal
+  without an `on_cancel` state.
 - [ ] RED: run `cargo test -p donat-metadata processes` and
   `cargo test -p donat-server --test process_definition`. Expected: no process
   metadata section or compiler exists.
-- [ ] Define full serde types for inputs, states, activity/timer/signal
-  transitions, rule guards, explicit command calls, retry policy, typed
-  `on_error` routes, separate activity timeouts, cancellation, and
-  `on_rejection`. Load `processes.yaml` with `load_section`, update all
-  `Metadata` literals, and write the file from the conformance builder when
-  non-empty.
+- [ ] Define the tagged `ProcessState` union above so a state has exactly one
+  kind discriminator (not necessarily one map field: activity transition
+  fields belong to the activity kind). Define `SignalWait` and
+  `CommandSignalWait` with one `on_signal`
+  transition and an optional nested `WaitTimeout { after, on_timeout }`; define
+  `TimerWait { after, on_timeout }` for timer-only states. Define the one
+  `ActivityErrorRoutes { routes, fallback }` form using the closed
+  `ActivityFailureKind` set, separate activity timeouts, cancellation, rule
+  guards, explicit command calls, retry policy, and `on_rejection`. Load
+  `processes.yaml` with `load_section`, update all `Metadata` literals, and
+  write the file from the conformance builder when non-empty.
 - [ ] Compile a process definition catalog during `check_consistency` and
   serving candidate construction. Verify every referenced command has a
   command permission for its `run_as_role` and that each command's underlying
@@ -115,7 +192,13 @@ instances, change a definition, or set an instance role.
   command-provided signal, validate exact payload and correlation typing.
 - [ ] Require an explicit `source` that resolves to Postgres. Reject all
   non-Postgres process definitions in this release. Validate a total,
-  deterministic transition graph before any journal row can be created.
+  deterministic transition graph before any journal row can be created. For
+  every activity, allow `retry_on` only for transport, timeout, http_429, and
+  http_5xx; require the single `on_error.routes` plus `on_error.fallback`
+  shape, validate every route target, map each `ConnectorErrorClass` to its
+  same-named `ActivityFailureKind`, and use the fallback as the declared path
+  for all unmatched non-retried classes including invariant and the
+  worker-generated retry_exhausted outcome.
 - [ ] GREEN: run `cargo test -p donat-metadata`,
   `cargo test -p donat-server --test process_definition`, and
   `cargo test --workspace --no-run`.
@@ -233,7 +316,9 @@ instances, change a definition, or set an instance role.
 
 - [ ] Add tests for claim by one worker, concurrent second worker skip,
   expired-lease reclamation, stale completion ignored/audited, retryable
-  failure backoff, typed authentication/validation/permanent error routes,
+  failure backoff, all eight closed connector error classes, `invariant`
+  taking the required fallback when no earlier route matches, retry exhaustion
+  taking the declared failure path,
   schedule-to-start expiry without a provider call, start-to-close stale
   completion, global operation capacity and configured same-resource
   serialization across two engine processes,
@@ -258,8 +343,11 @@ instances, change a definition, or set an instance role.
   calculated with deterministic full jitter from logical activity ID and
   persisted attempt count; do not use unrecorded random state. Retry-After may
   postpone but not accelerate. Exhausted retries and all non-retried typed
-  connector failures follow the declared ordered `on_error` route. Phase 1
-  implements no heartbeat extension for a long HTTP call.
+  connector failures follow the declared ordered `on_error.routes` then
+  mandatory `on_error.fallback` route. Configuration failures and inbound
+  webhook outcomes are not `ConnectorErrorClass` activity failures and never
+  enter this worker path. Phase 1 implements no heartbeat extension for a long
+  HTTP call.
 - [ ] GREEN: run `cargo test -p donat-server --test process_activity` and the
   connector HTTP/Stripe test suites. Verify existing cron/event loops were not
   reused if they keep a database transaction across HTTP.
@@ -280,7 +368,9 @@ instances, change a definition, or set an instance role.
   for signature verification before parse, provider-event dedupe, correlation
   to exactly one instance, accepted/duplicate/unmatched/ambiguous/guard-false
   and unexpected-state audit outcomes, and retrying a post-verification database failure without
-  acknowledging HTTP. Add a command-signal test proving typed cancellation
+  acknowledging HTTP. Add a wait-for-signal timeout test proving its nested
+  `on_timeout` transition fires without treating the state as a second timer
+  state. Add a command-signal test proving typed cancellation
   takes its declared on_cancel transition, cancels only unclaimed work, and
   makes an in-flight completion audit-only.
 - [ ] RED: run `cargo test -p donat-server --test process_timer` and
@@ -374,8 +464,9 @@ instances, change a definition, or set an instance role.
 - Modify: `crates/conformance/src/lib.rs`
 
 - [ ] Add native suites for happy-path Checkout, false guard, command
-  rejection, typed retryable/permanent/ambiguous connector failures, duplicate
-  signed webhook, every webhook audit outcome, timer, command-to-process start
+  rejection, all closed connector failure classes including invariant and
+  retry exhaustion, duplicate signed webhook, every webhook audit outcome,
+  nested wait timeout, timer, command-to-process start
   and signal idempotency, domain cancellation, two engine instances, global
   operation capacity, crash after claim before HTTP, both activity timeout
   classes, stale completion, definition upgrade with old instance pinning,

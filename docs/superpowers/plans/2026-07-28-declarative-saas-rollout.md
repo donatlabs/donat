@@ -141,9 +141,27 @@ pub enum MutationRoot {
 // Connector modules are compiled into the server binary.
 pub trait ConnectorModule: Send + Sync {
     fn definition(&self) -> ConnectorDefinition;
-    fn validate_config(&self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
-    fn validate_operation(&self, operation: &ConnectorOperation) -> Result<(), ConnectorError>;
-    fn verify_webhook(&self, request: &InboundRequest) -> Result<VerifiedWebhook, ConnectorError>;
+    fn validate_config(&self, config: &ConnectorConfig) -> Result<(), ConnectorConfigError>;
+    fn validate_operation(&self, operation: &ConnectorOperation) -> Result<(), ConnectorConfigError>;
+    async fn execute(
+        &self,
+        operation: ValidatedOperation,
+        request: ConnectorRequest,
+    ) -> Result<ConnectorSuccess, ConnectorFailure>;
+    fn verify_webhook(&self, request: &InboundRequest) -> Result<VerifiedWebhook, WebhookRejection>;
+}
+
+pub enum ConnectorErrorClass {
+    Transport, Timeout, Http429, Http5xx,
+    Authentication, Validation, Permanent, Invariant,
+}
+
+// Only execute failures use this class. Configuration and inbound-webhook
+// outcomes never enter a process activity retry_on/on_error route.
+pub struct ConnectorFailure {
+    pub class: ConnectorErrorClass,
+    pub code: &'static str,
+    pub safe_message: String,
 }
 ```
 
