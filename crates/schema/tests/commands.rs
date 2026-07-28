@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, RelationKind, TableInfo};
-use donat_ir::MutationRoot;
+use donat_ir::{CommandExecutionStep, CommandExecutionValue, MutationRoot, Scalar};
 use donat_metadata::{Metadata, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
@@ -170,6 +170,20 @@ fn session(role: &str) -> Session {
     }
 }
 
+fn session_with_vars<'a>(
+    role: &str,
+    vars: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Session {
+    Session {
+        role: role.to_string(),
+        vars: vars
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        backend_request: false,
+    }
+}
+
 fn introspect_runtime(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
@@ -213,6 +227,22 @@ fn plan_runtime_with_variables(
         .expect("mutation parses")
         .into_static();
     planner.plan(&doc, None, &variables, &session(role))
+}
+
+fn plan_runtime_for_session(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    commands: Arc<donat_schema::CompiledCommandCatalog>,
+    session: Session,
+    query: &str,
+) -> Result<MultiSourcePlan, PlanError> {
+    let compiled = runtime_schema(metadata, catalogs, commands);
+    let planner = MultiSourcePlanner::from_compiled(metadata, catalogs, &compiled)
+        .expect("planner uses the immutable runtime schema");
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("mutation parses")
+        .into_static();
+    planner.plan(&doc, None, &JsonMap::new(), &session)
 }
 
 fn literal_target_catalog(pg_type: &str, pg_typmod: i32, nullable: bool) -> Catalog {
@@ -392,7 +422,7 @@ fn command_planning_rejects_undeclared_output_and_missing_runtime_table_permissi
 }
 
 #[test]
-fn command_planning_preserves_aliases_and_emits_a_sql_free_command_root() {
+fn command_planning_preserves_aliases_and_emits_a_resolved_command_root() {
     let metadata = metadata(vec![valid_command()]);
     let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
     let commands = command_catalog(&metadata, &catalogs);
@@ -422,13 +452,107 @@ fn command_planning_preserves_aliases_and_emits_a_sql_free_command_root() {
         panic!("expected one command root, got {roots:#?}");
     };
     assert_eq!(alias, "submitted");
-    assert_eq!(command.definition.name, "create_order");
-    assert_eq!(command.arguments["quantity"].as_json(), &json!(1));
+    assert_eq!(command.name, "create_order");
+    let [CommandExecutionStep::Insert { object, .. }] = command.steps.as_slice() else {
+        panic!("expected one resolved insert step: {command:#?}");
+    };
+    assert!(matches!(
+        object
+            .iter()
+            .find(|assignment| assignment.column.name == "quantity")
+            .map(|assignment| &assignment.value),
+        Some(CommandExecutionValue::Scalar { value, .. }) if value.as_json() == &json!(1)
+    ));
     let serialized = serde_json::to_value(command).expect("command IR serializes");
     assert_eq!(serialized["selection"][0]["Scalar"]["alias"], "order");
     assert!(
-        !serialized.to_string().to_ascii_lowercase().contains("sql"),
-        "command IR carries only validated metadata, values, and projection: {serialized:#}"
+        serialized.get("definition").is_none(),
+        "command IR never carries raw metadata: {serialized:#}"
+    );
+}
+
+#[test]
+fn command_planning_resolves_execution_facts_without_raw_metadata() {
+    let mut command = valid_command();
+    command["guards"] = json!([{
+        "rule": "customer_is_allowed",
+        "with": { "customer_id": { "arg": "customer_id" } },
+        "message": "customer is not allowed to order"
+    }]);
+    command["idempotency"] = json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "session_variable": "x-donat-user-id" }],
+        "retention": "30d"
+    });
+    let mut metadata = metadata(vec![command]);
+    metadata.sources[0].tables[0].insert_permissions[0]
+        .permission
+        .check = json!({ "customer_id": { "_eq": "X-Donat-User-Id" } });
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime_for_session(
+        &metadata,
+        &catalogs,
+        commands,
+        session_with_vars("customer", [("x-donat-user-id", "customer-7")]),
+        r#"
+            mutation {
+              submitted: create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order: order_id }
+            }
+        "#,
+    )
+    .expect("a permitted command plans into executable IR");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must be a mutation plan");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root, got {roots:#?}");
+    };
+
+    assert_eq!(command.name, "create_order");
+    let [CommandExecutionStep::Insert { object, check, .. }] = command.steps.as_slice() else {
+        panic!("expected the resolved insert step: {command:#?}");
+    };
+    let customer_id = object
+        .iter()
+        .find(|assignment| assignment.column.name == "customer_id")
+        .expect("customer_id assignment is resolved");
+    assert!(matches!(
+        &customer_id.value,
+        CommandExecutionValue::Scalar { value, pg_type }
+            if value == &Scalar::Json(json!("550e8400-e29b-41d4-a716-446655440001"))
+                && pg_type == "uuid"
+    ));
+    assert!(check.is_some(), "the explicit role's insert check is in IR");
+    assert_eq!(command.guards.len(), 1);
+    assert!(
+        !command.guards[0].sql.is_empty(),
+        "the planner lowers a compiled rule instead of carrying its name/source"
+    );
+    let idempotency = command
+        .idempotency
+        .as_ref()
+        .expect("idempotency is resolved");
+    assert_eq!(
+        idempotency.scope,
+        vec![Scalar::Json(json!("customer-7"))],
+        "declared session scope is resolved before SQLgen"
+    );
+    assert_eq!(idempotency.retention_seconds, Some(30 * 24 * 60 * 60));
+    let serialized = serde_json::to_value(command).expect("execution IR serializes");
+    assert!(
+        serialized.get("definition").is_none(),
+        "raw metadata is absent"
+    );
+    assert!(
+        !serialized.to_string().contains("customer_is_allowed"),
+        "the raw rule name/source is absent from execution IR: {serialized:#}"
     );
 }
 
@@ -1071,6 +1195,15 @@ fn rejects_non_scalar_idempotency_scope_and_non_postgres_command_sources() {
         "scope": [{ "argument": "items" }]
     });
     assert_rejected(invalid_scope, "idempotency scope must be scalar");
+
+    for retention in ["30", "0d", "1w", "999999999999999999999999999999999999d"] {
+        let mut invalid_retention = valid_command();
+        invalid_retention["idempotency"] = json!({
+            "key": { "argument": "request_id" },
+            "retention": retention
+        });
+        assert_rejected(invalid_retention, "idempotency retention");
+    }
 
     let mut sqlite_metadata = metadata(vec![valid_command()]);
     sqlite_metadata.sources[0].kind = SourceKind::Sqlite;

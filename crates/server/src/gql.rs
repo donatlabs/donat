@@ -1859,17 +1859,15 @@ mod tests {
 
     #[test]
     fn command_roots_fail_closed_before_sql_generation() {
-        let definition = serde_json::from_value(json!({
-            "name": "create_order",
-            "source": "default",
-            "permissions": [{ "role": "customer" }]
-        }))
-        .expect("command metadata deserializes");
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
             command: donat_ir::CommandMutation {
-                definition,
-                arguments: std::collections::BTreeMap::new(),
+                name: "create_order".to_string(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: None,
+                effects: vec![],
                 selection: vec![],
             },
         }];

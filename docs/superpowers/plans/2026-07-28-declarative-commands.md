@@ -209,6 +209,13 @@ to amend or fix this task's range, then obtain fresh review.
 
 ### Task 5: Generate a single Postgres CTE statement for each command root
 
+Before SQL rendering, the planner must lower every executable command into a
+resolved SQL-free IR. SQLgen must never reparse raw command metadata or query
+the catalog, Rules catalog, or request session at runtime. The IR carries only
+the typed targets/values, explicit-role filters and checks, safe pre-lowered
+Rule facts, and resolved declared idempotency inputs that the one-statement
+renderer requires; ADR 005 records this boundary.
+
 **Files:**
 - Modify: `crates/sqlgen/src/lib.rs`, `crates/server/src/gql.rs`
 - Add: `crates/sqlgen/tests/commands.rs`, `crates/sqlgen/tests/snapshots/`

@@ -7,8 +7,6 @@
 //! permissions) is testable without a database; everything below it (sqlgen,
 //! executor) is the only code that knows Postgres exists.
 
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -422,16 +420,154 @@ pub enum MutationRoot {
     },
 }
 
-/// The command payload crossing the SQL-free planner/renderer boundary.
+/// The fully resolved command payload crossing the planner/renderer boundary.
 ///
-/// The command definition is copied from the immutable deployment catalog, so
-/// SQLgen never parses mutable YAML or consults runtime metadata. Arguments
-/// have already been validated against the command's declared GraphQL types.
+/// SQLgen receives no raw command metadata, catalog, Rule catalog, role, or
+/// request session. Every SQL-relevant identifier, concrete type, role
+/// predicate/check, Rule expression, and idempotency input is resolved by the
+/// source-local planner before this value is constructed.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandMutation {
-    pub definition: donat_metadata::Command,
-    pub arguments: BTreeMap<String, Scalar>,
+    pub name: String,
+    pub steps: Vec<CommandExecutionStep>,
+    pub guards: Vec<CommandRule>,
+    pub result: Vec<CommandResultField>,
+    pub idempotency: Option<CommandIdempotency>,
+    pub effects: Vec<CommandEffectKind>,
     pub selection: Vec<CommandResultSelection>,
+}
+
+/// One deploy-time tracked column resolved for a command operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandColumn {
+    pub name: String,
+    pub pg_type: String,
+    pub nullable: bool,
+}
+
+/// A named command CTE operation with all table and explicit-role facts
+/// resolved by the planner.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandExecutionStep {
+    SelectOne {
+        name: String,
+        cte: String,
+        table: Table,
+        by: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_found: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    Insert {
+        name: String,
+        cte: String,
+        table: Table,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    InsertMany {
+        name: String,
+        cte: String,
+        table: Table,
+        items: Scalar,
+        item_fields: Vec<CommandColumn>,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        allow_empty: bool,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    Update {
+        name: String,
+        cte: String,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        set: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    Delete {
+        name: String,
+        cte: String,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    Assert {
+        name: String,
+        rule: CommandRule,
+    },
+}
+
+/// One concrete target-column assignment in a command operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandAssignment {
+    pub column: CommandColumn,
+    pub value: CommandExecutionValue,
+}
+
+/// A typed, closed source for a command value. The renderer never interprets
+/// an argument name, metadata literal, Rule name, or session-variable name.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandExecutionValue {
+    Scalar { value: Scalar, pg_type: String },
+    StepColumn { cte: String, column: CommandColumn },
+    Item { field: String, pg_type: String },
+    Rule { sql: String, pg_type: String },
+}
+
+/// A Rule expression lowered from the immutable Rules catalog with closed SQL
+/// bindings. `sql` comes only from `donat-rules`; SQLgen does not parse rule
+/// source or resolve a rule name.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandRule {
+    pub sql: String,
+    pub pg_type: String,
+    pub error_path: String,
+    pub message: String,
+}
+
+/// One immutable declared result field, after resolving its producer.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandResultField {
+    pub name: String,
+    pub value: CommandResultValue,
+}
+
+/// Closed source for a declared result field.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandResultValue {
+    StepRow { cte: String, many: bool },
+    StepColumn { cte: String, column: CommandColumn },
+    Scalar { value: Scalar, pg_type: String },
+}
+
+/// Inputs that are already resolved before SQLgen computes an idempotency
+/// fingerprint or journal lookup. Scope order is metadata order.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandIdempotency {
+    pub key: Scalar,
+    pub scope: Vec<Scalar>,
+    pub input: Scalar,
+    pub retention_seconds: Option<u64>,
+    pub error_path: String,
+}
+
+/// Effects remain a typed, non-executable boundary until the process runtime
+/// owns their compatibility validation and durable outbox CTEs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CommandEffectKind {
+    StartProcess,
+    SignalProcess,
 }
 
 /// Client projection of a declared command result. Commands do not expose

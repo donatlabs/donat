@@ -21,7 +21,10 @@ pub use eval::{
     evaluate_value,
 };
 pub use parser::parse_expression;
-pub use postgres::{SqlBinding, SqlBindings, SqlExpression, lower_postgres, lower_postgres_value};
+pub use postgres::{
+    SqlBinding, SqlBindings, SqlExpression, lower_postgres, lower_postgres_expression,
+    lower_postgres_value,
+};
 pub use types::{
     CanonicalRoot, CanonicalValue, CompiledDecisionRow, CompiledDecisionTable, CompiledRule,
     DecisionConditionTrace, DecisionOutputField, DecisionRejection, DecisionResult, DecisionRow,

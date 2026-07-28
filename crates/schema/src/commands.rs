@@ -6,6 +6,7 @@
 //! consulting mutable command definitions.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use donat_catalog::{Catalog, ColumnInfo, RelationKind, TableInfo};
@@ -60,6 +61,7 @@ impl CompiledSourceCommandCatalog {
 #[derive(Debug, Clone)]
 pub struct CompiledCommand {
     definition: Command,
+    rules: Arc<RuleCatalog>,
 }
 
 impl CompiledCommand {
@@ -67,6 +69,13 @@ impl CompiledCommand {
     /// shared reference; metadata mutations never update this snapshot.
     pub fn definition(&self) -> &Command {
         &self.definition
+    }
+
+    /// The immutable Rule catalog compiled with this command snapshot. It is
+    /// available only to the request planner so SQLgen never reparses a rule
+    /// name or source expression.
+    pub(crate) fn rules(&self) -> &RuleCatalog {
+        self.rules.as_ref()
     }
 }
 
@@ -613,6 +622,7 @@ fn compile_command_catalog_with_diagnostics(
     rules: &RuleCatalog,
     infer_function_permissions: bool,
 ) -> (CompiledCommandCatalog, Vec<PlanError>) {
+    let rules_snapshot = Arc::new(rules.clone());
     let mut sources = BTreeMap::new();
     for source in &metadata.sources {
         if source.kind == SourceKind::Postgres {
@@ -677,6 +687,7 @@ fn compile_command_catalog_with_diagnostics(
                     command.name.clone(),
                     CompiledCommand {
                         definition: command.clone(),
+                        rules: rules_snapshot.clone(),
                     },
                 );
         }
@@ -1326,6 +1337,10 @@ fn validate_idempotency(
         return Ok(());
     };
     validate_idempotency_key(metadata, &idempotency.key, command, path)?;
+    if let Some(retention) = &idempotency.retention {
+        command_retention_seconds(retention)
+            .map_err(|message| PlanError::validation(path, message))?;
+    }
     for scope in &idempotency.scope {
         match scope {
             CommandIdempotencyScope::Argument { argument } => {
@@ -1348,6 +1363,33 @@ fn validate_idempotency(
         }
     }
     Ok(())
+}
+
+/// Parse the deliberately narrow command retention grammar at deployment
+/// time, so SQLgen receives a typed duration rather than raw metadata text.
+pub(crate) fn command_retention_seconds(value: &str) -> Result<u64, String> {
+    let Some((amount, unit)) = value
+        .strip_suffix('s')
+        .map(|amount| (amount, 1_u64))
+        .or_else(|| value.strip_suffix('m').map(|amount| (amount, 60)))
+        .or_else(|| value.strip_suffix('h').map(|amount| (amount, 60 * 60)))
+        .or_else(|| value.strip_suffix('d').map(|amount| (amount, 24 * 60 * 60)))
+    else {
+        return Err(
+            "command idempotency retention must use a positive s, m, h, or d duration".to_string(),
+        );
+    };
+    let amount = amount.parse::<u64>().map_err(|_| {
+        "command idempotency retention must use a positive s, m, h, or d duration".to_string()
+    })?;
+    if amount == 0 {
+        return Err(
+            "command idempotency retention must use a positive s, m, h, or d duration".to_string(),
+        );
+    }
+    amount.checked_mul(unit).ok_or_else(|| {
+        "command idempotency retention exceeds the supported duration range".to_string()
+    })
 }
 
 fn validate_idempotency_key(

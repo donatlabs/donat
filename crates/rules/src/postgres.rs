@@ -65,6 +65,13 @@ impl SqlExpression {
             type_,
         }
     }
+
+    /// Consume a SQL expression that was constructed by this module. This is
+    /// the planner-to-IR hand-off for an already compiled Rule; callers cannot
+    /// construct a `SqlExpression` from arbitrary text.
+    pub fn into_sql(self) -> String {
+        self.sql
+    }
 }
 
 /// Lower a fully type-checked declarative rule to one parenthesized Postgres
@@ -74,6 +81,21 @@ pub fn lower_postgres_value(
     rule: &CompiledRule,
     bindings: &SqlBindings,
 ) -> Result<LoweredRuleValue, RuleError> {
+    let expression = lower_postgres_expression(rule, bindings)?;
+    Ok(LoweredRuleValue {
+        sql: expression.sql,
+        type_: expression.type_,
+    })
+}
+
+/// Lower a fully type-checked Rule to an opaque SQL expression that can be
+/// used as a binding when another already-compiled Rule consumes its result.
+/// Its fields stay private, so it remains impossible to smuggle raw command
+/// metadata or CEL source through this API.
+pub fn lower_postgres_expression(
+    rule: &CompiledRule,
+    bindings: &SqlBindings,
+) -> Result<SqlExpression, RuleError> {
     for name in bindings.names() {
         if !rule.bindings.contains_key(name) {
             return Err(RuleError::UnexpectedBinding { name: name.clone() });
@@ -86,7 +108,7 @@ pub fn lower_postgres_value(
     }
 
     let lowered = lower_expression(rule, bindings, &rule.expression.expression)?;
-    Ok(LoweredRuleValue {
+    Ok(SqlExpression {
         sql: lowered.sql,
         type_: rule.result.clone(),
     })
@@ -95,15 +117,15 @@ pub fn lower_postgres_value(
 /// Lower a fully type-checked boolean declarative rule to one parenthesized
 /// Postgres expression.
 pub fn lower_postgres(rule: &CompiledRule, bindings: &SqlBindings) -> Result<String, RuleError> {
-    let lowered = lower_postgres_value(rule, bindings)?;
-    if lowered.type_ != RuleType::Bool {
+    let expression = lower_postgres_expression(rule, bindings)?;
+    if expression.type_ != RuleType::Bool {
         return Err(RuleError::InvalidRuleResult {
             rule: rule.name.clone(),
             expected: "bool".to_owned(),
-            actual: lowered.type_.display_name(),
+            actual: expression.type_.display_name(),
         });
     }
-    Ok(lowered.sql)
+    Ok(expression.into_sql())
 }
 
 struct LoweredExpression {
