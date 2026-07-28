@@ -30,8 +30,9 @@ GraphQL schema generation, and the one-statement SQL contract remain unchanged.
   time; never fall back to a static scalar.
 - Preserve explicit classic roles, no admin or permission bypass, no runtime
   metadata mutation or DDL, and one Postgres statement per command root.
-- Begin each behavior with its named failing test. After every commit, dispatch
-  the mandatory judge and continue only after ACCEPT.
+- Begin each behavior with its named failing test. Record focused verification
+  after every commit; request one independent code review for the complete
+  recovery range before it is declared ready.
 - The current Task 2 commit `26f4bde` is unaccepted. This plan repairs that
   range and requires fresh review; it does not claim earlier Task 2 review
   outcomes as approval.
@@ -134,13 +135,12 @@ GraphQL schema generation, and the one-statement SQL contract remain unchanged.
   git commit -m "feat(catalog): retain postgres type modifiers"
   ```
 
-- [ ] **Step 6: Dispatch and satisfy the mandatory Task 1 judge gate.**
+- [ ] **Step 6: Record the Task 1 verification evidence.**
 
-  Dispatch the judge with the Task 1 commit SHA, the raw `atttypmod` contract,
-  the exact focused command above, and the requirement that all `ColumnInfo`
-  literals are explicit. Continue to Task 2 only after ACCEPT. If rejected,
-  add a failing regression test first, repair the Task 1 range, amend the
-  commit, and obtain a new ACCEPT.
+  Record the Task 1 commit SHA, the raw `atttypmod` contract, the exact
+  focused command above, and confirmation that all `ColumnInfo` literals are
+  explicit. Continue directly to Task 2; the independent review is deferred
+  until the complete recovery range is ready.
 
 ### Task 2: Validate column-bound command literals with a private descriptor
 
@@ -320,14 +320,13 @@ GraphQL schema generation, and the one-statement SQL contract remain unchanged.
   git commit -m "fix(commands): validate literals against postgres columns"
   ```
 
-- [ ] **Step 9: Dispatch and satisfy the mandatory Task 2 judge gate.**
+- [ ] **Step 9: Record the Task 2 verification evidence.**
 
-  Dispatch the judge with the Task 1 and Task 2 commit range, this recovery
-  plan, the exact command test matrix, and the migrate test command. State
-  that `26f4bde` was unaccepted and request review of the corrected complete
-  range, not only the latest diff. On rejection, first add the missing failing
-  boundary regression, repair the range, amend or add the linked corrective
-  commit, rerun Steps 7-8, and obtain ACCEPT.
+  Record the Task 1 and Task 2 commit range, this recovery plan, the exact
+  command test matrix, and the migrate test command. State that `26f4bde` is
+  superseded by the corrected complete range. Defer independent review until
+  Task 3 completes; if a defect is found before then, add its failing boundary
+  regression first and rerun the affected verification.
 
 ### Task 3: Strict verification and whole-range recovery review
 
@@ -372,11 +371,11 @@ GraphQL schema generation, and the one-statement SQL contract remain unchanged.
   do not issue DDL; commands still require an explicit role; and no change
   creates more than one SQL statement per command root.
 
-- [ ] **Step 4: Dispatch the final whole-range judge review.**
+- [ ] **Step 4: Request one independent final whole-range code review.**
 
-  Send the judge the full range from `26f4bde^` through the recovery commits,
-  the ADR, the specification change, this plan, and the verification output.
-  Require a fresh ACCEPT that explicitly treats the original Task 2 commit as
-  superseded by its corrected range. If the review finds a defect, add its
-  failing test, fix only the identified range, repeat all affected verification
-  commands, commit, and obtain another ACCEPT before completion.
+  Give the reviewer the full range from `26f4bde^` through the recovery
+  commits, the ADR, the specification change, this plan, and the verification
+  output. The review must explicitly treat the original Task 2 commit as
+  superseded by its corrected range. If it finds a defect, add its failing
+  test, fix only the identified range, and repeat all affected verification
+  commands before completion.

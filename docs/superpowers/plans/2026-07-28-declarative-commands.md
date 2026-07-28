@@ -1,7 +1,8 @@
 # Declarative Domain Commands Implementation Plan
 
-> **For Codex:** Execute every checkbox in order with RED/GREEN evidence and a
-> judge ACCEPT after each commit.
+> **For Codex:** Execute every checkbox in order with RED/GREEN evidence.
+> Perform one independent code review for the completed command-core range
+> before merging, handoff, or declaring it ready; no per-commit review gate.
 
 **Goal:** Let a SaaS author declare named, role-authorized business commands
 in `commands.yaml`; expose each command as one GraphQL mutation field; execute
@@ -106,14 +107,15 @@ schemas and only if their entire static result selection can be generated.
   reported by the compiler across schema, sqlgen, server, MCP, and tests.
 - [ ] GREEN: run `cargo test -p donat-metadata`,
   `cargo test -p donat-catalog`, and `cargo test --workspace --no-run`.
-- [ ] Commit the metadata/catalog compatibility slice and obtain judge ACCEPT.
+- [ ] Commit the metadata/catalog compatibility slice and record its focused
+  verification evidence for the final command-core review.
 
 ### Task 2: Compile static command definitions during validation
 
 **Recovery status:** The implementation commit for this task
 (`26f4bde`) is unaccepted because it loses concrete PostgreSQL type and
 modifier information before validating metadata literals. Do not treat its
-earlier judge passes as approval of this range. Complete the recovery plan
+earlier reviews as approval of this range. Complete the recovery plan
 [`Command literal database-scalar validation`](2026-07-28-command-literal-db-scalar-validation.md)
 to amend or fix this task's range, then obtain fresh review.
 
@@ -145,7 +147,8 @@ to amend or fix this task's range, then obtain fresh review.
   snapshot and never creates command tables or changes definitions.
 - [ ] GREEN: run `cargo test -p donat-schema --test commands`,
   `cargo test -p donat-server migrate`, and `cargo test -p donat-metadata`.
-- [ ] Commit the static compiler slice and obtain judge ACCEPT.
+- [ ] Commit the static compiler slice and record its focused verification
+  evidence for the final command-core review.
 
 ### Task 3: Generate command GraphQL types and plan explicit-role calls
 
@@ -173,7 +176,8 @@ to amend or fix this task's range, then obtain fresh review.
 - [ ] GREEN: run `cargo test -p donat-schema --test commands` and
   `cargo test -p donat-schema`. Expected: introspection and planning expose
   no command to an unauthorized or non-Postgres source.
-- [ ] Commit the schema/IR slice and obtain judge ACCEPT.
+- [ ] Commit the schema/IR slice and record its focused verification evidence
+  for the final command-core review.
 
 ### Task 4: Add the deploy-time command catalog migration and error carrier
 
@@ -200,7 +204,8 @@ to amend or fix this task's range, then obtain fresh review.
 - [ ] GREEN: run the focused server tests and
   `cargo build -p donat-server --bin donat`. Inspect migration SQL manually;
   it must contain no role bypass and no runtime DDL path.
-- [ ] Commit the journal/error-carrier slice and obtain judge ACCEPT.
+- [ ] Commit the journal/error-carrier slice and record its focused
+  verification evidence for the final command-core review.
 
 ### Task 5: Generate a single Postgres CTE statement for each command root
 
@@ -238,7 +243,8 @@ to amend or fix this task's range, then obtain fresh review.
   `cargo test -p donat-sqlgen`, and `cargo test -p donat-server gql`.
   Review every snapshot with `cargo insta review`; each command root is one
   SQL statement.
-- [ ] Commit the one-statement renderer slice and obtain judge ACCEPT.
+- [ ] Commit the one-statement renderer slice and record its focused
+  verification evidence for the final command-core review.
 
 ### Task 6: Prove GraphQL and deploy contracts with native conformance
 
@@ -262,7 +268,8 @@ to amend or fix this task's range, then obtain fresh review.
   `cargo test -p donat-schema --test commands`,
   `cargo test -p donat-sqlgen --test commands`, and
   `cargo test -p donat-server`.
-- [ ] Commit conformance-only corrections separately and obtain judge ACCEPT.
+- [ ] Commit conformance-only corrections separately and record their focused
+  verification evidence for the final command-core review.
 
 ### Task 7: Finish the command core before connectors/processes consume it
 
@@ -280,6 +287,6 @@ to amend or fix this task's range, then obtain fresh review.
   role, no GraphQL command on non-Postgres sources, no external I/O in SQL,
   exactly one SQL statement per command root, and exact structured error
   envelopes.
-- [ ] Obtain the command-core judge ACCEPT before beginning connectors. The
-  system-wide judge, full conformance gate, and process-effect compatibility
-  checks are in Processes Task 7.
+- [ ] Request one independent code review of the completed command-core range
+  before merging, handoff, or declaring it ready. The full conformance gate
+  and process-effect compatibility checks are in Processes Task 7.

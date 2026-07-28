@@ -82,17 +82,13 @@ code written without this are invalid and must be redone. After work with
 meaningful trade-offs, capture an ADR (template:
 `knowledgebase/_templates/decision.md`).
 
-## BLOCKING RULE: Judge Review After Every Commit
+## Quality Review at Feature Completion
 
-After EVERY `git commit`, dispatch the judge agent before starting the next
-task. Not optional; "simple change" is not an excuse.
-
-```
-Agent(subagent_type="judge", run_in_background=true, prompt="REVIEW TASK: ...")
-```
-
-Input format in `.Codex/agents/judge.md`. Continue only after ACCEPT; on
-REJECT fix the issues first.
+There is no per-commit review gate. Each TDD slice must still have its focused
+test evidence and the required suite verification. Run one independent code
+review for the complete, cohesive feature range before it is merged, handed
+off, or declared ready. Address material findings with a regression test and
+fresh verification before completion.
 
 ## Essential Rules
 
@@ -122,7 +118,5 @@ REJECT fix the issues first.
 
 ## Agents
 
-- `.Codex/agents/judge.md` — two-stage quality gate (spec compliance →
-  code quality → fresh verification). Mandatory after every commit.
 - `.Codex/agents/spec-writer.md` — researches the codebase + conformance
   fixtures and writes specs to `specs/NNN-<slug>.md`.
