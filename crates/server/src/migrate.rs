@@ -295,7 +295,17 @@ pub async fn check_consistency(database_url: &str, metadata_dir: &Path) -> Resul
     let metadata = donat_metadata::load_metadata_dir(metadata_dir)
         .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
 
-    let mut problems = vec![];
+    // Connector configuration is deploy-time-only. Validate every static
+    // shape before opening a database connection and never resolve an
+    // environment value here; serving startup owns that narrow check.
+    let mut problems = crate::state::validate_connector_metadata(&metadata)
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !problems.is_empty() {
+        return Ok(problems);
+    }
+
     let rule_catalog = match crate::state::compile_rule_catalog(&metadata) {
         Ok(catalog) => Some(catalog),
         Err(error) => {

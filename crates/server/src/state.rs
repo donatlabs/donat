@@ -8,7 +8,10 @@ use std::sync::Arc;
 use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
-use donat_metadata::{DatabaseUrl, Metadata, RuleTypeDeclaration, Source, SourceKind};
+use donat_metadata::{
+    ConnectorBaseUrl, ConnectorConfig, ConnectorInstance, DatabaseUrl, Metadata,
+    RuleTypeDeclaration, Source, SourceKind,
+};
 use donat_rules::{
     DecisionRow as RuleDecisionRow, DecisionTableDefinition as RuleDecisionTableDefinition,
     DecisionTableTestCase as RuleDecisionTableTestCase,
@@ -21,6 +24,277 @@ use tokio::sync::RwLock;
 
 const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
+
+/// A deploy-time connector configuration error. This intentionally remains
+/// separate from the future activity `ConnectorErrorClass`: a connector that
+/// cannot be configured never reaches activity execution or retry routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorConfigError {
+    pub path: String,
+    pub message: String,
+}
+
+impl ConnectorConfigError {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for ConnectorConfigError {}
+
+/// A pre-listen connector failure. It exposes static metadata paths or the
+/// missing environment variable name, never a resolved environment value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorStartupError {
+    Static(ConnectorConfigError),
+    MissingEnvironment { instance: String, variable: String },
+}
+
+impl std::fmt::Display for ConnectorStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(error) => error.fmt(formatter),
+            Self::MissingEnvironment { instance, variable } => write!(
+                formatter,
+                "connector instance `{instance}` requires environment variable `{variable}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorStartupError {}
+
+/// Validate the connector declarations that are knowable from deploy-time
+/// metadata. This is deliberately not a registry or protocol validator: Task
+/// 2 owns compiled module definitions and Task 3 owns request templates.
+pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigError> {
+    let mut errors = Vec::new();
+    let mut instance_names = HashSet::new();
+
+    for (index, connector) in metadata.connectors.iter().enumerate() {
+        let path = format!("connectors.yaml[{index}]");
+        if !instance_names.insert(connector.name.as_str()) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                format!("duplicate connector instance name `{}`", connector.name),
+            ));
+        }
+        if connector.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                "connector instance name is required",
+            ));
+        }
+
+        if !matches!(connector.module.as_str(), "http" | "stripe") {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.module"),
+                format!("unknown connector module `{}`", connector.module),
+            ));
+        }
+
+        validate_connector_config(connector, &path, &mut errors);
+        validate_connector_operations(connector, &path, &mut errors);
+    }
+
+    errors
+}
+
+/// Resolve the names declared by [`validate_connector_metadata`] immediately
+/// before the listener is bound. Values are inspected only for availability
+/// and discarded in place, so no resolved credential can be added to metadata,
+/// logs, or an activity error.
+pub fn validate_connector_startup(metadata: &Metadata) -> Result<(), ConnectorStartupError> {
+    if let Some(error) = validate_connector_metadata(metadata).into_iter().next() {
+        return Err(ConnectorStartupError::Static(error));
+    }
+
+    for connector in &metadata.connectors {
+        for (_, variable) in connector_environment_variables(&connector.config) {
+            let available = std::env::var_os(variable)
+                .is_some_and(|value| !value.as_encoded_bytes().is_empty());
+            if !available {
+                return Err(ConnectorStartupError::MissingEnvironment {
+                    instance: connector.name.clone(),
+                    variable: variable.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_config(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    let config = &connector.config;
+    if config.endpoint_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.endpoint_identity"),
+            "endpoint_identity is required and must be a non-secret label",
+        ));
+    }
+    if config.credential_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.credential_identity"),
+            "credential_identity is required and must be a non-secret label",
+        ));
+    }
+
+    match connector.module.as_str() {
+        "http" => {
+            if config.base_url.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    "base_url is required for the http connector",
+                ));
+            }
+        }
+        "stripe" => {
+            if config.secret_key.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.secret_key"),
+                    "secret_key is required for the stripe connector",
+                ));
+            }
+            if config.webhook_secret.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.webhook_secret"),
+                    "webhook_secret is required for the stripe connector",
+                ));
+            }
+            if config.api_version.as_deref().is_none_or(str::is_empty) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.api_version"),
+                    "api_version is required for the stripe connector",
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(ConnectorBaseUrl::Literal(base_url)) = &config.base_url {
+        match reqwest::Url::parse(base_url) {
+            Ok(url) if !url.username().is_empty() || url.password().is_some() => {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    "base URL must not contain userinfo",
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(ConnectorConfigError::new(
+                format!("{path}.config.base_url"),
+                "base_url must be an absolute URL",
+            )),
+        }
+    }
+
+    for (field, variable) in connector_environment_variables(config) {
+        if !valid_environment_variable_name(variable) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.config.{field}"),
+                format!("value_from_env `{variable}` is not a valid environment variable name"),
+            ));
+        }
+    }
+}
+
+fn validate_connector_operations(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    for (index, operation) in connector.operations.iter().enumerate() {
+        let operation_path = format!("{path}.operations[{index}]");
+        if operation.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.name"),
+                "connector operation name is required",
+            ));
+        }
+        let Some(capacity) = operation.capacity.as_ref() else {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity"),
+                "capacity is required for every connector operation",
+            ));
+            continue;
+        };
+        if capacity.max_in_flight == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.max_in_flight"),
+                "max_in_flight must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.permits == 0 || capacity.rate_limit.burst == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit"),
+                "rate_limit permits and burst must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.per.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit.per"),
+                "rate_limit per is required",
+            ));
+        }
+        if capacity
+            .serialize_by
+            .as_ref()
+            .is_some_and(|serialize_by| serialize_by.input.is_empty())
+        {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.serialize_by.input"),
+                "serialize_by input is required when configured",
+            ));
+        }
+    }
+}
+
+fn connector_environment_variables(config: &ConnectorConfig) -> impl Iterator<Item = (&str, &str)> {
+    let base_url = match config.base_url.as_ref() {
+        Some(ConnectorBaseUrl::FromEnv(reference)) => {
+            Some(("base_url", reference.value_from_env.as_str()))
+        }
+        _ => None,
+    };
+    base_url
+        .into_iter()
+        .chain(
+            config
+                .headers
+                .iter()
+                .map(|header| ("headers.value_from_env", header.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .secret_key
+                .iter()
+                .map(|reference| ("secret_key", reference.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .webhook_secret
+                .iter()
+                .map(|reference| ("webhook_secret", reference.value_from_env.as_str())),
+        )
+}
+
+fn valid_environment_variable_name(variable: &str) -> bool {
+    let mut chars = variable.chars();
+    matches!(chars.next(), Some(character) if character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
 
 fn trace_perf_phase(backend: &'static str, phase: &'static str, started: std::time::Instant) {
     tracing::trace!(

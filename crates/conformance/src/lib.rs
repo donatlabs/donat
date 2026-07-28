@@ -940,6 +940,7 @@ fn default_metadata_with_configuration(
         rest_endpoints: vec![],
         commands: vec![],
         rules: Default::default(),
+        connectors: vec![],
     }
 }
 
@@ -2239,6 +2240,13 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.connectors.is_empty() {
+            std::fs::write(
+                dir.join("connectors.yaml"),
+                serde_yaml::to_string(&md.connectors).expect("serialize connectors"),
+            )
+            .unwrap();
+        }
         if !md.actions.is_empty() || !md.custom_types.is_empty() {
             // Both live together in actions.yaml, the donat-cli export layout.
             let doc = json!({
@@ -3482,6 +3490,52 @@ mod tests {
             .expect("serialized command metadata reloads through the directory loader");
         assert_eq!(reloaded.commands[0].name, "create_order");
         std::fs::remove_dir_all(dir).expect("remove commands metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_connectors_section() {
+        let mut with_connectors = empty_metadata();
+        with_connectors.connectors = serde_json::from_value(json!([{
+            "name": "logistics_api",
+            "module": "http",
+            "config": {
+                "endpoint_identity": "logistics_prod_eu_2026_07",
+                "credential_identity": "logistics_primary",
+                "base_url": "https://logistics.example.test"
+            },
+            "operations": [{
+                "name": "create_shipment",
+                "capacity": {
+                    "max_in_flight": 8,
+                    "rate_limit": { "permits": 20, "per": "1s", "burst": 8 }
+                }
+            }]
+        }]))
+        .expect("connector metadata deserializes");
+
+        let with_connectors_dir =
+            Running::write_metadata_snapshot("connectors_section", &with_connectors);
+        let connectors = std::fs::read_to_string(with_connectors_dir.join("connectors.yaml"))
+            .expect("nonempty connectors section is serialized");
+        assert!(connectors.contains("logistics_api"));
+        assert_eq!(
+            donat_metadata::load_metadata_dir(&with_connectors_dir)
+                .expect("serialized connector metadata reloads")
+                .connectors[0]
+                .name,
+            "logistics_api"
+        );
+
+        let without_connectors_dir =
+            Running::write_metadata_snapshot("empty_connectors_section", &empty_metadata());
+        assert!(
+            !without_connectors_dir.join("connectors.yaml").exists(),
+            "an empty connector list must not create connectors.yaml"
+        );
+
+        std::fs::remove_dir_all(with_connectors_dir).expect("remove connector metadata directory");
+        std::fs::remove_dir_all(without_connectors_dir)
+            .expect("remove empty connector metadata directory");
     }
 
     fn tempdir(tag: &str) -> PathBuf {

@@ -27,6 +27,13 @@ fn commands_fixture_dir() -> &'static Path {
     ))
 }
 
+fn connectors_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/connectors"
+    ))
+}
+
 #[test]
 fn loads_v2_metadata_directory() {
     let md = load_metadata_dir(fixture_dir()).expect("metadata should load");
@@ -160,4 +167,23 @@ fn loads_commands_section_with_quoted_include() {
     assert_eq!(command.permissions[0].role, "customer");
     assert_eq!(command.steps.len(), 2);
     assert_eq!(command.effects.len(), 1);
+}
+
+#[test]
+fn loads_connectors_section_with_quoted_include() {
+    let md = load_metadata_dir(connectors_fixture_dir()).expect("connector metadata should load");
+
+    assert_eq!(md.connectors.len(), 1);
+    let connector = &md.connectors[0];
+    assert_eq!(connector.name, "logistics_api");
+    assert_eq!(connector.module, "http");
+    assert_eq!(connector.operations[0].name, "create_shipment");
+    assert_eq!(
+        connector.operations[0]
+            .capacity
+            .as_ref()
+            .expect("operation capacity")
+            .max_in_flight,
+        8
+    );
 }

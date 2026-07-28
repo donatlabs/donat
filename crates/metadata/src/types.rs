@@ -51,6 +51,115 @@ pub struct Metadata {
     /// source expressions when metadata is validated.
     #[serde(default, skip_serializing_if = "RulesMetadata::is_empty")]
     pub rules: RulesMetadata,
+    /// Compiled connector instances declared in the optional `connectors.yaml`
+    /// section. They remain deploy-time metadata: values resolved from the
+    /// environment are never written back into this structure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connectors: Vec<ConnectorInstance>,
+}
+
+/// One named deployment instance of a connector module compiled into the
+/// serving binary. The metadata can select only an instance and a module name;
+/// it cannot provide code, a package, or another runtime implementation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConnectorInstance {
+    pub name: String,
+    pub module: String,
+    #[serde(default)]
+    pub config: ConnectorConfig,
+    #[serde(default)]
+    pub operations: Vec<ConnectorOperation>,
+}
+
+/// The currently supported, deploy-time connector configuration surface.
+///
+/// `http` and `stripe` are the only built-in module names. Module-specific
+/// validation happens in the server crate so it can remain aligned with the
+/// compiled module table; this type only accepts fields that are safe to keep
+/// in metadata. A secret can appear only as [`SecretRef`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint_identity: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<ConnectorBaseUrl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ConnectorHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<SecretRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<SecretRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+/// A configured HTTP base URL. A literal URL is non-secret metadata; a value
+/// read at server startup is represented by its environment variable name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ConnectorBaseUrl {
+    Literal(String),
+    FromEnv(SecretRef),
+}
+
+/// A secret reference in deployment metadata. It intentionally retains only
+/// the environment variable *name*; resolution occurs at startup and the
+/// value is never serialized into [`Metadata`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    pub value_from_env: String,
+}
+
+/// A static connector header whose value is read from the named environment
+/// variable. This spelling matches the connector YAML profile, while secret
+/// fields such as `secret_key` use [`SecretRef`] directly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorHeader {
+    pub name: String,
+    pub value_from_env: String,
+}
+
+/// An enabled, named connector operation. Task 1 keeps the declaration
+/// deliberately small; Task 3 adds module-specific request and response
+/// templates without making caller input capable of selecting transport data.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorOperation {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<ConnectorCapacity>,
+}
+
+/// Shared operation limits enforced by the future process worker, not a
+/// per-process connector client.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorCapacity {
+    pub max_in_flight: u32,
+    pub rate_limit: ConnectorRateLimit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialize_by: Option<ConnectorSerializeBy>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRateLimit {
+    pub permits: u32,
+    pub per: String,
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorSerializeBy {
+    pub input: String,
 }
 
 /// A named, deploy-time domain operation. The metadata crate preserves the

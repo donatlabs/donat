@@ -83,6 +83,7 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         rest_endpoints: load_section(dir, "rest_endpoints.yaml")?,
         commands: load_section(dir, "commands.yaml")?,
         rules: load_section(dir, "rules.yaml")?,
+        connectors: load_section(dir, "connectors.yaml")?,
     })
 }
 

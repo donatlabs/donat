@@ -7,9 +7,9 @@ use std::path::Path;
 
 use donat_metadata::{
     ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandStepOperation,
-    CommandValue, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry,
-    QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission, SourceKind,
-    TableConfiguration, action_visible_to_role, load_metadata_dir,
+    CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger, DatabaseUrl, InsertPermission,
+    Metadata, PermissionEntry, QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata,
+    SelectPermission, SourceKind, TableConfiguration, action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -950,4 +950,90 @@ fn commands_absent_from_directory_yield_empty_vec() {
     ));
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert!(md.commands.is_empty());
+}
+
+#[test]
+fn connectors_deserialize_secret_references_and_named_operation_capacity() {
+    // This fails if a future change turns a secret reference into a literal
+    // configuration value, or loses the worker-owned capacity declaration.
+    let connectors: Vec<ConnectorInstance> = serde_yaml::from_str(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+    headers:
+      - name: Authorization
+        value_from_env: LOGISTICS_TOKEN
+  operations:
+    - name: create_shipment
+      capacity:
+        max_in_flight: 8
+        rate_limit: { permits: 20, per: 1s, burst: 8 }
+        serialize_by: { input: order_id }
+"#,
+    )
+    .expect("connector metadata deserializes");
+
+    let connector = &connectors[0];
+    assert_eq!(connector.name, "logistics_api");
+    assert_eq!(connector.module, "http");
+    assert_eq!(
+        connector.config.endpoint_identity,
+        "logistics_prod_eu_2026_07"
+    );
+    assert_eq!(connector.config.credential_identity, "logistics_primary");
+    assert!(matches!(
+        connector.config.base_url.as_ref(),
+        Some(ConnectorBaseUrl::Literal(value)) if value == "https://logistics.example.test"
+    ));
+    assert_eq!(
+        connector.config.headers[0].value_from_env,
+        "LOGISTICS_TOKEN"
+    );
+    let capacity = connector.operations[0]
+        .capacity
+        .as_ref()
+        .expect("operation capacity is retained");
+    assert_eq!(capacity.max_in_flight, 8);
+    assert_eq!(capacity.rate_limit.permits, 20);
+    assert_eq!(capacity.rate_limit.per, "1s");
+    assert_eq!(capacity.rate_limit.burst, 8);
+    assert_eq!(
+        capacity
+            .serialize_by
+            .as_ref()
+            .expect("serialization is retained")
+            .input,
+        "order_id"
+    );
+
+    let literal_secret = serde_yaml::from_str::<Vec<ConnectorInstance>>(
+        r#"
+- name: stripe
+  module: stripe
+  config:
+    endpoint_identity: stripe_api_2025_06_30
+    credential_identity: stripe_primary
+    secret_key: sk_live_literal_secret
+"#,
+    )
+    .expect_err("secret references require a value_from_env mapping, never a literal");
+    assert!(
+        literal_secret.to_string().contains("secret_key"),
+        "literal secrets must fail at the secret field: {literal_secret}"
+    );
+}
+
+#[test]
+fn connectors_absent_from_directory_yield_empty_vec() {
+    // Existing metadata directories remain valid without a new top-level file.
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
+    let metadata = load_metadata_dir(dir).expect("fixture metadata should load");
+    assert!(metadata.connectors.is_empty());
 }

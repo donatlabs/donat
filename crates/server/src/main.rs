@@ -275,9 +275,15 @@ async fn main() -> anyhow::Result<()> {
             rest_endpoints: vec![],
             commands: vec![],
             rules: Default::default(),
+            connectors: vec![],
         },
     };
     ensure_default_source(&mut metadata);
+
+    // Connector environment values are required before this process opens a
+    // listener. The validator retains and reports variable names only; it
+    // discards resolved values so they cannot enter metadata or runtime logs.
+    state::validate_connector_startup(&metadata)?;
 
     if let Some(jwt) = &jwt {
         jwt.spawn_refresher(reqwest::Client::new());
