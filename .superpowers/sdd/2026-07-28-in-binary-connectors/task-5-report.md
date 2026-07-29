@@ -25,11 +25,17 @@ process worker. Adding an in-memory queue or a new persistent state model in
 this task would falsely acknowledge provider delivery or pre-empt the process
 plan.
 
-Therefore Task 5 deliberately records no ingress state. The verified-event
-test proves the safe observable boundary: the route completes verification and
-returns `503` with an empty body, so the provider retains the event. Duplicate
-handling, one durable audit row per ingress outcome, correlation, and durable
-acknowledgement remain Task 6 responsibilities.
+Therefore Task 5 deliberately records no ingress state and does **not**
+satisfy the audit or duplicate-ingress persistence requirement. The
+verified-event test proves only the safe observable boundary: the route
+completes verification and returns `503` with an empty body, so the provider
+retains the event. Duplicate handling, one durable audit row per ingress
+outcome, correlation, and durable acknowledgement belong to the durable
+process ingress/journal implementation in
+`docs/superpowers/plans/2026-07-28-declarative-processes.md`, **Task 6:
+Process timers and verified inbound events**. Connector-plan Task 6 is
+conformance-only and proves the temporary `503`/no-acknowledgement boundary;
+it does not implement persistence.
 
 ## TDD evidence
 
@@ -63,6 +69,59 @@ cargo test -p donat-server action::tests                                 # pass 
 cargo test -p donat-server events::tests                                 # pass (3 lib + 3 bin)
 cargo test -p donat-server                                               # pass (all server targets)
 cargo test -p donat-metadata                                             # pass (57)
+cargo clippy -p donat-server --all-targets -- -D warnings                # pass
+cargo build -p donat-server --bin donat                                  # pass
+DONAT_BIN=/home/dev/.cache/donat-runtime-target/debug/donat \
+  PG_URL=postgresql://postgres:postgres@127.0.0.1:15433/postgres \
+  cargo test -p donat-conformance --quiet -- --test-threads=4            # pass, PTY exit_code: 0
+```
+
+## Fix Round 1 — independent review
+
+### Regression coverage
+
+The review identified that the original tests did not prove that a *declared*
+non-webhook module was indistinguishable from an unknown instance. The fixture
+now compiles both a Stripe `payments` instance and a declared HTTP `logistics`
+instance. The new mounted-route test proves `POST` to `logistics` and to an
+unknown instance both return the same empty `404` response.
+
+The existing implementation already selected only Stripe instances, so the
+new regression was verified with a controlled temporary mutation that returned
+`400` for `logistics`. Its RED result was:
+
+```text
+declared_http_instance_is_indistinguishable_from_an_unknown_webhook_instance
+assertion `left == right` failed
+  left: 400
+ right: 404
+```
+
+The mutation was removed before the final implementation and is not present in
+the commit.
+
+### Durable ingress ownership correction
+
+Review also found an inaccurate statement that connector-plan Task 6 would
+own durable audit, duplicate-ingress, and acknowledgement persistence. The
+actual owner already exists in `specs/005-durable-processes.md` and
+`docs/superpowers/plans/2026-07-28-declarative-processes.md`, **Task 6:
+Process timers and verified inbound events**. It creates `process_inbound_events`,
+deduplicates provider IDs, writes redacted audit outcomes, correlates process
+signals, and returns success only after commit.
+
+The accepted durable-process ADR was amended to make that ownership explicit.
+The connector plan now states that Task 5 does not satisfy the audit/duplicate
+persistence checklist, and that connector-plan Task 6 is conformance-only: it
+proves the temporary `503` / no-acknowledgement boundary and implements no
+process persistence.
+
+### Fix-round GREEN verification
+
+```text
+cargo fmt --check                                                        # pass
+cargo test -p donat-server --test connector_webhook                     # pass (5)
+cargo test -p donat-server                                               # pass (all server targets)
 cargo clippy -p donat-server --all-targets -- -D warnings                # pass
 cargo build -p donat-server --bin donat                                  # pass
 DONAT_BIN=/home/dev/.cache/donat-runtime-target/debug/donat \

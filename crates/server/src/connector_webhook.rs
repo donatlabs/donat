@@ -10,8 +10,8 @@
 //! acknowledgement: returning a 2xx response before durable acceptance would
 //! lose a provider event.  In particular, this module owns no queue, retry
 //! state, audit record, process signal, activity failure, or `on_error`
-//! input.  Task 6 will introduce the durable transaction that can safely turn
-//! a verified event into an acknowledgement.
+//! input. The durable process ingress implementation will introduce the
+//! transaction that can safely turn a verified event into an acknowledgement.
 
 use axum::{
     Router,

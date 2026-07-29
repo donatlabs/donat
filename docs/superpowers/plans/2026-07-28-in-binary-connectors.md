@@ -237,9 +237,13 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
 - [ ] Add tests that `POST /v1/connectors/{instance}/webhooks` routes raw bytes
   only to a declared instance, rejects unknown instance before body parsing,
   rejects signature failures, applies the 1 MiB body limit, and returns no
-  internal configuration/secret data in failure bodies. Assert that every
-  rejection/duplicate ingress outcome is recorded as webhook audit state and
-  cannot be converted into an activity retry or `on_error` input.
+  internal configuration/secret data in failure bodies. Assert that a declared
+  module without an inbound verifier is indistinguishable from an unknown
+  instance, and that no inbound outcome becomes an activity retry or `on_error`
+  input. This task deliberately does **not** persist audit or duplicate-ingress
+  state; that belongs to the durable process ingress/journal implementation in
+  `2026-07-28-declarative-processes.md`, **Task 6: Process timers and verified
+  inbound events**.
 - [ ] RED: run `cargo test -p donat-server --test connector_webhook`.
   Expected: route is absent.
 - [ ] Add the one route outside GraphQL and preserve existing enabled API
@@ -248,12 +252,18 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   after the process layer has durably accepted it in the later plan.
 - [ ] Until the processes plan adds journal persistence, have a verified webhook
   return a documented `503` without acknowledging delivery; this prevents an
-  accepted event from being lost. Do not add an in-memory queue.
+  accepted event from being lost. Do not add an in-memory queue, duplicate
+  cache, or separate persistence model.
 - [ ] GREEN: run `cargo test -p donat-server --test connector_webhook` and all
   existing action/event webhook tests to prove their routes did not change.
 - [ ] Commit the inbound-route boundary.
 
 ### Task 6: Prove the connector boundary before processes integrate it
+
+This is a conformance-only task. It neither implements durable process ingress
+nor creates audit/deduplication persistence; those responsibilities remain in
+`2026-07-28-declarative-processes.md`, **Task 6: Process timers and verified
+inbound events**.
 
 **Files:**
 - Add: `crates/conformance/tests/connectors.rs`,
@@ -265,7 +275,9 @@ TLS policy. `verify_webhook` consumes raw bytes before JSON parsing.
   observable through a controlled local endpoint, every closed activity error
   class including invariant, configuration rejection outside activity routing,
   Stripe request shape, and Stripe signature rejection outside activity
-  routing. Do not claim delivery success until the process journal test exists.
+  routing. Prove the temporary verified-event `503` and lack of delivery
+  acknowledgement; do not claim delivery success, durable audit persistence,
+  or duplicate handling until the durable process ingress/journal task exists.
 - [ ] RED: rebuild and run
   `cargo test -p donat-conformance --test connectors`. Expected: new fixtures
   fail before implementation; record exact public responses.

@@ -59,6 +59,19 @@ observability for the internal journal. The binary may additionally expose only
 read-only inspect and offline history-verification CLI subcommands; they never
 mutate history or invoke a command or connector.
 
+Inbound connector webhooks are durable process ingress, not connector-route
+or conformance responsibilities. The durable process ingress implementation
+must write `process_inbound_events`, deduplicate the verified provider event
+identity, persist one redacted audit outcome, correlate at most one pinned
+process instance, and acknowledge a provider only after that transaction
+commits. Until that implementation exists, the connector route verifies raw
+bytes then returns `503` for a verified event without acknowledgement; it adds
+no in-memory queue, duplicate cache, or standalone persistence model. The
+connector conformance task proves that temporary `503` boundary only. The
+process plan's **Task 6: Process timers and verified inbound events** owns the
+durable ingress, audit, deduplication, correlation, and success-acknowledgement
+work.
+
 ## Alternatives
 
 | Option | Why not |
