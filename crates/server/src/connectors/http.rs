@@ -26,25 +26,15 @@ use super::{
 
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
-/// The deploy-time network policy.  `public_only` is the safe default;
-/// private access needs an explicit configuration choice and is used by local
-/// test servers only through the same capability.
+/// Private network access is never a deployment capability.  This test-only
+/// switch exists solely so unit tests can exercise a local Axum server through
+/// the real transport.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkPolicy {
+enum NetworkPolicy {
     PublicOnly,
+    #[cfg(test)]
     PrivateAllowed,
-}
-
-impl NetworkPolicy {
-    fn from_metadata(value: Option<&str>) -> Result<Self, HttpConfigError> {
-        match value.unwrap_or("public_only") {
-            "public_only" => Ok(Self::PublicOnly),
-            "private_allowed" => Ok(Self::PrivateAllowed),
-            _ => Err(HttpConfigError::new(
-                "network_policy must be public_only or private_allowed",
-            )),
-        }
-    }
 }
 
 /// One static credential or integration header resolved from deploy-time
@@ -69,16 +59,13 @@ impl ConfiguredHeader {
 #[derive(Clone)]
 pub struct HttpConnectorConfig {
     base_url: Url,
+    #[cfg(test)]
     network_policy: NetworkPolicy,
     headers: HeaderMap,
 }
 
 impl HttpConnectorConfig {
-    pub fn new(
-        base_url: &str,
-        network_policy: NetworkPolicy,
-        headers: Vec<ConfiguredHeader>,
-    ) -> Result<Self, HttpConfigError> {
+    pub fn new(base_url: &str, headers: Vec<ConfiguredHeader>) -> Result<Self, HttpConfigError> {
         let base_url = Url::parse(base_url)
             .map_err(|_| HttpConfigError::new("base_url must be an absolute HTTP(S) URL"))?;
         if !matches!(base_url.scheme(), "http" | "https")
@@ -98,9 +85,21 @@ impl HttpConnectorConfig {
         }
         Ok(Self {
             base_url,
-            network_policy,
+            #[cfg(test)]
+            network_policy: NetworkPolicy::PublicOnly,
             headers: resolved_headers,
         })
+    }
+
+    fn permits_private_destinations(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.network_policy == NetworkPolicy::PrivateAllowed
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 }
 
@@ -405,6 +404,7 @@ pub struct PreparedHttpRequest {
 #[derive(Debug, Clone)]
 pub struct RawHttpResponse {
     pub status: StatusCode,
+    peer: Option<SocketAddr>,
     headers: HeaderMap,
     body: Vec<u8>,
 }
@@ -413,9 +413,18 @@ impl RawHttpResponse {
     pub fn json(status: StatusCode, value: JsonValue) -> Self {
         Self {
             status,
+            peer: None,
             headers: HeaderMap::new(),
             body: serde_json::to_vec(&value).expect("JSON test response serializes"),
         }
+    }
+
+    /// Set the connected peer for an injected transport.  The HTTP connector
+    /// validates this against its second vetted DNS result before accepting a
+    /// public-only response.
+    pub fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.peer = Some(peer);
+        self
     }
 }
 
@@ -464,11 +473,24 @@ pub trait HttpTransport: Send + Sync {
     ) -> BoxFuture<'a, Result<RawHttpResponse, TransportError>>;
 }
 
-pub struct ReqwestTransport;
+pub struct ReqwestTransport {
+    #[cfg(test)]
+    test_proxy: Option<reqwest::Proxy>,
+}
 
 impl ReqwestTransport {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            test_proxy: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_proxy_for_test(proxy: reqwest::Proxy) -> Self {
+        Self {
+            test_proxy: Some(proxy),
+        }
     }
 }
 
@@ -497,22 +519,36 @@ impl HttpTransport for ReqwestTransport {
                 .ok_or_else(|| TransportError::new("missing port"))?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(TransportError::new("deadline elapsed"));
+                return Err(TransportError::timeout());
             }
             let addresses = destination
                 .into_iter()
                 .map(|address| SocketAddr::new(address, port))
                 .collect::<Vec<_>>();
-            let client = Client::builder()
-                // Redirects would require a fresh static-destination policy
-                // check and could become an SSRF bypass, so never follow them.
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(remaining)
-                // Pin reqwest's lookup to the second, immediately-before-
-                // connect resolver result that this module just vetted.
-                .resolve_to_addrs(host, &addresses)
-                .build()
-                .map_err(|_| TransportError::new("client construction failed"))?;
+            let client = {
+                let builder = Client::builder();
+                #[cfg(test)]
+                let builder = match &self.test_proxy {
+                    Some(proxy) => builder.proxy(proxy.clone()),
+                    None => builder,
+                };
+                builder
+                    // Redirects would require a fresh static-destination policy
+                    // check and could become an SSRF bypass, so never follow them.
+                    .redirect(reqwest::redirect::Policy::none())
+                    // System and environment proxy configuration would create an
+                    // unchecked connection hop outside the vetted destination set.
+                    .no_proxy()
+                    // Activity retries are owned by the engine.  A transport retry
+                    // could duplicate a provider-side effect before routing sees it.
+                    .retry(reqwest::retry::never())
+                    .timeout(remaining)
+                    // Pin reqwest's lookup to the second, immediately-before-
+                    // connect resolver result that this module just vetted.
+                    .resolve_to_addrs(host, &addresses)
+                    .build()
+                    .map_err(|_| TransportError::new("client construction failed"))?
+            };
             let response = client
                 .request(request.method, request.url)
                 .headers(request.headers)
@@ -528,6 +564,7 @@ impl HttpTransport for ReqwestTransport {
                 })?;
             let status = response.status();
             let headers = response.headers().clone();
+            let peer = response.remote_addr();
             let mut stream = response.bytes_stream();
             let mut body = Vec::new();
             while let Some(chunk) = stream.next().await {
@@ -545,6 +582,7 @@ impl HttpTransport for ReqwestTransport {
             }
             Ok(RawHttpResponse {
                 status,
+                peer,
                 headers,
                 body,
             })
@@ -595,11 +633,14 @@ impl HttpConnector {
                 ConfiguredHeader::new(&header.name, &value)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let config = HttpConnectorConfig::new(
-            &base_url,
-            NetworkPolicy::from_metadata(config.network_policy.as_deref())?,
-            headers,
-        )?;
+        if config
+            .network_policy
+            .as_deref()
+            .is_some_and(|policy| policy != "public_only")
+        {
+            return Err(HttpConfigError::new("network_policy must be public_only"));
+        }
+        let config = HttpConnectorConfig::new(&base_url, headers)?;
         Ok(Self::with_components(
             config,
             Arc::new(SystemResolver),
@@ -616,6 +657,10 @@ impl HttpConnector {
         if context.deadline <= tokio::time::Instant::now() {
             return Err(timeout_failure());
         }
+        // Reject an unsafe initial lookup before rendering path, query, or body
+        // templates.  This keeps untrusted input out of a request whose
+        // declared destination is already disallowed.
+        self.resolve_under_deadline(context.deadline).await?;
         let request = self.prepare_request(operation, &input)?;
         if request.body.len() > MAX_HTTP_BODY_BYTES {
             return Err(invariant_failure(
@@ -626,7 +671,6 @@ impl HttpConnector {
         // Check resolution at request start and again directly before handing
         // the pinned result to reqwest.  A DNS rebinding between the two is
         // rejected; a new per-request reqwest client avoids connection reuse.
-        self.resolve_under_deadline(context.deadline).await?;
         let destination = self.resolve_under_deadline(context.deadline).await?;
         let response = tokio::time::timeout_at(
             context.deadline,
@@ -642,6 +686,7 @@ impl HttpConnector {
                 validation_failure("connector response exceeds the 1 MiB limit")
             }
         })?;
+        self.validate_connected_peer(&destination, response.peer)?;
         self.decode_response(operation, response)
     }
 
@@ -666,7 +711,7 @@ impl HttpConnector {
         if addresses.is_empty() {
             return Err(transport_failure());
         }
-        if self.config.network_policy == NetworkPolicy::PublicOnly
+        if !self.config.permits_private_destinations()
             && addresses.iter().any(|address| !is_public_address(*address))
         {
             return Err(invariant_failure(
@@ -674,6 +719,27 @@ impl HttpConnector {
             ));
         }
         Ok(addresses)
+    }
+
+    fn validate_connected_peer(
+        &self,
+        destination: &[IpAddr],
+        peer: Option<SocketAddr>,
+    ) -> Result<(), ConnectorFailure> {
+        if self.config.permits_private_destinations() {
+            return Ok(());
+        }
+        let Some(peer) = peer else {
+            return Err(invariant_failure(
+                "connector network policy could not verify the connected peer",
+            ));
+        };
+        if !is_public_address(peer.ip()) || !destination.contains(&peer.ip()) {
+            return Err(invariant_failure(
+                "connector network policy rejected the connected peer",
+            ));
+        }
+        Ok(())
     }
 
     fn prepare_request(
@@ -957,8 +1023,440 @@ fn invariant_failure(message: &'static str) -> ConnectorFailure {
     )
 }
 
-// `reqwest` 0.12 exposes response metadata but not the connected peer socket
-// through its high-level API.  We therefore validate DNS twice and pin the
-// second result with `resolve_to_addrs`, create a fresh client per request, and
-// disable redirects.  A future transport that exposes the peer must add a
-// post-connect check before making the request body observable to a provider.
+// `reqwest` 0.12 exposes the connected peer through `Response::remote_addr`.
+// We validate DNS twice, pin the second result with `resolve_to_addrs`, disable
+// proxies and redirects, and reject a response unless that observed peer is a
+// public member of the second vetted destination set.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{
+        Json, Router,
+        extract::{OriginalUri, Path, State},
+        http::HeaderMap,
+        response::{IntoResponse, Response},
+        routing::{any, get, post},
+    };
+    use serde_json::{Value as JsonValue, json};
+
+    struct LocalServer {
+        base_url: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl LocalServer {
+        async fn start(router: Router) -> Self {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("local test listener binds");
+            let address = listener
+                .local_addr()
+                .expect("local test listener has an address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("local test server serves");
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                task,
+            }
+        }
+    }
+
+    impl Drop for LocalServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn request_to(base_url: &str) -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method: Method::POST,
+            url: Url::parse(&format!("{base_url}/operation")).expect("static test URL is valid"),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn local_connector(base_url: &str) -> HttpConnector {
+        let mut config = HttpConnectorConfig::new(
+            base_url,
+            vec![
+                ConfiguredHeader::new("Authorization", "test-credential")
+                    .expect("fixed credential header is valid"),
+            ],
+        )
+        .expect("local static base URL is valid");
+        config.network_policy = NetworkPolicy::PrivateAllowed;
+        HttpConnector::with_components(
+            config,
+            Arc::new(SystemResolver),
+            Arc::new(ReqwestTransport::new()),
+        )
+    }
+
+    fn context() -> ExecutionContext {
+        ExecutionContext::with_deadline(tokio::time::Instant::now() + Duration::from_secs(1))
+    }
+
+    fn operation(path: &str) -> HttpOperation {
+        HttpOperation::builder("test_operation", HttpMethod::Post, path)
+            .success_statuses([StatusCode::OK])
+            .build()
+            .expect("static operation declaration is valid")
+    }
+
+    #[tokio::test]
+    async fn local_test_connector_encodes_static_paths_queries_headers_and_json_without_host_input()
+    {
+        async fn echo_item(
+            OriginalUri(uri): OriginalUri,
+            headers: HeaderMap,
+            Json(body): Json<JsonValue>,
+        ) -> Json<JsonValue> {
+            Json(json!({
+                "uri": uri.to_string(),
+                "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                "operation_header": headers.get("x-operation").and_then(|value| value.to_str().ok()),
+                "body": body,
+            }))
+        }
+
+        let server =
+            LocalServer::start(Router::new().route("/v1/items/{id}", post(echo_item))).await;
+        let operation = HttpOperation::builder(
+            "create_item",
+            HttpMethod::Post,
+            "/v1/items/{input.order_id}",
+        )
+        .query_input("search", "search")
+        .static_header("X-Operation", "fixed")
+        .body(JsonTemplate::object([(
+            "order_id",
+            JsonTemplate::input("order_id"),
+        )]))
+        .success_statuses([StatusCode::OK])
+        .response_pointer("uri", "/uri", true)
+        .response_pointer("authorization", "/authorization", true)
+        .response_pointer("operation_header", "/operation_header", true)
+        .response_pointer("body_order_id", "/body/order_id", true)
+        .build()
+        .expect("declared operation is valid");
+
+        let result = local_connector(&server.base_url)
+            .execute(
+                &operation,
+                json!({
+                    "order_id": "a/b ? #",
+                    "search": "one/two & three",
+                    "unbound_url": "https://attacker.invalid/should-not-be-used",
+                }),
+                context(),
+            )
+            .await
+            .expect("static endpoint request succeeds");
+
+        assert_eq!(
+            result.output,
+            json!({
+                "uri": "/v1/items/a%2Fb%20%3F%20%23?search=one%2Ftwo%20%26%20three",
+                "authorization": "test-credential",
+                "operation_header": "fixed",
+                "body_order_id": "a/b ? #",
+            }),
+            "declared path and query slots are percent-encoded while the input cannot choose a host"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_test_connector_extracts_declared_json_pointers() {
+        async fn response() -> Json<JsonValue> {
+            Json(
+                json!({"id": "ship_123", "tracking": {"url": "https://tracking.example.test/123"}}),
+            )
+        }
+
+        let server = LocalServer::start(Router::new().route("/response", post(response))).await;
+        let operation = HttpOperation::builder("extract", HttpMethod::Post, "/response")
+            .success_statuses([StatusCode::OK])
+            .response_pointer("shipment_id", "/id", true)
+            .response_pointer("tracking_url", "/tracking/url", false)
+            .build()
+            .expect("response declaration is valid");
+        let result = local_connector(&server.base_url)
+            .execute(&operation, json!({}), context())
+            .await
+            .expect("JSON response satisfies the declared extraction");
+
+        assert_eq!(
+            result.output,
+            json!({
+                "shipment_id": "ship_123",
+                "tracking_url": "https://tracking.example.test/123",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn local_test_connector_never_follows_redirects() {
+        async fn redirect() -> impl IntoResponse {
+            (StatusCode::FOUND, [("location", "/redirect-target")])
+        }
+        async fn redirect_target(State(hits): State<Arc<AtomicUsize>>) -> impl IntoResponse {
+            hits.fetch_add(1, Ordering::Relaxed);
+            Json(json!({"unexpected": true}))
+        }
+
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let server = LocalServer::start(
+            Router::new()
+                .route("/redirect", post(redirect))
+                .route("/redirect-target", get(redirect_target))
+                .with_state(target_hits.clone()),
+        )
+        .await;
+        let failure = local_connector(&server.base_url)
+            .execute(&operation("/redirect"), json!({}), context())
+            .await
+            .expect_err("redirect status is not followed");
+
+        assert_eq!(failure.class, ConnectorErrorClass::Permanent);
+        assert_eq!(target_hits.load(Ordering::Relaxed), 0);
+        assert!(!failure.safe_message.contains("redirect-target"));
+    }
+
+    #[tokio::test]
+    async fn local_test_connector_bounds_request_and_response_bodies() {
+        async fn oversized_response() -> Response {
+            (StatusCode::OK, "x".repeat(MAX_HTTP_BODY_BYTES + 1)).into_response()
+        }
+
+        let request_failure = local_connector("http://127.0.0.1:9")
+            .execute(
+                &HttpOperation::builder("oversized_request", HttpMethod::Post, "/unused")
+                    .body(JsonTemplate::literal(
+                        json!({"payload": "x".repeat(MAX_HTTP_BODY_BYTES)}),
+                    ))
+                    .success_statuses([StatusCode::OK])
+                    .build()
+                    .expect("declared request is valid"),
+                json!({}),
+                context(),
+            )
+            .await
+            .expect_err("the module refuses an oversized request before connecting");
+        assert_eq!(request_failure.class, ConnectorErrorClass::Invariant);
+
+        let server =
+            LocalServer::start(Router::new().route("/large", post(oversized_response))).await;
+        let response_failure = local_connector(&server.base_url)
+            .execute(&operation("/large"), json!({}), context())
+            .await
+            .expect_err("the module refuses an oversized provider response");
+        assert_eq!(response_failure.class, ConnectorErrorClass::Validation);
+    }
+
+    #[tokio::test]
+    async fn local_test_connector_enforces_deadline_and_closed_status_classes() {
+        async fn slow() -> Json<JsonValue> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Json(json!({"ok": true}))
+        }
+        async fn status(Path(status): Path<u16>) -> Response {
+            (
+                StatusCode::from_u16(status).expect("test status is valid"),
+                "provider response body must not leak",
+            )
+                .into_response()
+        }
+        async fn malformed() -> impl IntoResponse {
+            (StatusCode::OK, "not JSON")
+        }
+
+        let server = LocalServer::start(
+            Router::new()
+                .route("/slow", post(slow))
+                .route("/status/{status}", post(status))
+                .route("/malformed", post(malformed)),
+        )
+        .await;
+        let connector = local_connector(&server.base_url);
+        let deadline_failure = connector
+            .execute(
+                &operation("/slow"),
+                json!({}),
+                ExecutionContext::with_deadline(
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                ),
+            )
+            .await
+            .expect_err("the finite activity deadline is enforced");
+        assert_eq!(deadline_failure.class, ConnectorErrorClass::Timeout);
+
+        for (path, operation, expected) in [
+            (
+                "/status/429",
+                operation("/status/429"),
+                ConnectorErrorClass::Http429,
+            ),
+            (
+                "/status/503",
+                HttpOperation::builder("declared_5xx", HttpMethod::Post, "/status/503")
+                    .success_statuses([StatusCode::OK])
+                    .declared_5xx([StatusCode::SERVICE_UNAVAILABLE])
+                    .build()
+                    .expect("5xx declaration is valid"),
+                ConnectorErrorClass::Http5xx,
+            ),
+            (
+                "/status/401",
+                operation("/status/401"),
+                ConnectorErrorClass::Authentication,
+            ),
+            (
+                "/status/403",
+                operation("/status/403"),
+                ConnectorErrorClass::Authentication,
+            ),
+            (
+                "/status/400",
+                operation("/status/400"),
+                ConnectorErrorClass::Validation,
+            ),
+            (
+                "/status/404",
+                operation("/status/404"),
+                ConnectorErrorClass::Permanent,
+            ),
+        ] {
+            let failure = connector
+                .execute(&operation, json!({}), context())
+                .await
+                .expect_err("non-success provider status fails the operation");
+            assert_eq!(failure.class, expected, "status path {path}");
+            assert!(
+                !failure
+                    .safe_message
+                    .contains("provider response body must not leak")
+            );
+        }
+        let malformed_failure = connector
+            .execute(&operation("/malformed"), json!({}), context())
+            .await
+            .expect_err("successful response must still satisfy the JSON contract");
+        assert_eq!(malformed_failure.class, ConnectorErrorClass::Validation);
+    }
+
+    #[tokio::test]
+    async fn elapsed_deadline_before_client_construction_is_a_timeout() {
+        let request = PreparedHttpRequest {
+            method: Method::POST,
+            url: Url::parse("https://provider.example.test/operation")
+                .expect("static test URL is valid"),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let error = ReqwestTransport::new()
+            .execute(
+                request,
+                &[IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))],
+                tokio::time::Instant::now() - Duration::from_millis(1),
+            )
+            .await
+            .expect_err("a deadline that elapses before client setup is typed as timeout");
+
+        assert!(matches!(error.kind, TransportErrorKind::Timeout));
+    }
+
+    #[tokio::test]
+    async fn reqwest_transport_does_not_retry_a_protocol_nack() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("nack test listener binds");
+        let address = listener
+            .local_addr()
+            .expect("nack test listener has an address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let observed_connections = connections.clone();
+        let listener_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("initial connection arrives");
+            observed_connections.fetch_add(1, Ordering::Relaxed);
+            drop(socket);
+            if let Ok(Ok((_socket, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                observed_connections.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let request = PreparedHttpRequest {
+            method: Method::GET,
+            url: Url::parse(&format!("http://{address}/nack")).expect("test URL is valid"),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let error = ReqwestTransport::new()
+            .execute(
+                request,
+                &[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect_err("a protocol nack is surfaced to engine-owned retry routing");
+        listener_task.await.expect("nack listener finishes");
+
+        assert!(matches!(error.kind, TransportErrorKind::Transport));
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reqwest_transport_discards_a_configured_proxy_before_connecting() {
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_counter = proxy_hits.clone();
+        let proxy = LocalServer::start(Router::new().fallback(any(move || {
+            let proxy_counter = proxy_counter.clone();
+            async move {
+                proxy_counter.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::BAD_GATEWAY, "proxy was contacted")
+            }
+        })))
+        .await;
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_counter = target_hits.clone();
+        let target = LocalServer::start(Router::new().fallback(any(move || {
+            let target_counter = target_counter.clone();
+            async move {
+                target_counter.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::OK, "direct target")
+            }
+        })))
+        .await;
+        // The test seam installs a proxy immediately before production policy
+        // is applied.  `no_proxy()` must clear it without mutating global
+        // process environment shared by parallel tests.
+        let response = ReqwestTransport::with_proxy_for_test(
+            reqwest::Proxy::all(&proxy.base_url).expect("test proxy URL is valid"),
+        )
+        .execute(
+            request_to(&target.base_url),
+            &[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("transport reaches the vetted destination directly");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.peer.map(|peer| peer.ip()),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "the production reqwest path records the actual connected peer"
+        );
+        assert_eq!(target_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(proxy_hits.load(Ordering::Relaxed), 0);
+    }
+}
