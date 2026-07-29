@@ -96,11 +96,78 @@ pub fn lower_postgres_value(
     rule: &CompiledRule,
     bindings: &SqlBindings,
 ) -> Result<LoweredRuleValue, RuleError> {
+    validate_direct_value_literal(rule, bindings)?;
     let expression = lower_postgres_expression(rule, bindings)?;
     Ok(LoweredRuleValue {
-        sql: expression.sql,
+        sql: lower_canonical_value(&expression.sql, &expression.type_),
         type_: expression.type_,
     })
+}
+
+fn validate_direct_value_literal(
+    rule: &CompiledRule,
+    bindings: &SqlBindings,
+) -> Result<(), RuleError> {
+    let ExprKind::Name(name) = &rule.expression.expression.kind else {
+        return Ok(());
+    };
+    let Some(SqlBinding::Literal(value)) = bindings.get(name) else {
+        return Ok(());
+    };
+    validate_complete_value_literal(name, &rule.result, value)
+}
+
+fn validate_complete_value_literal(
+    binding_name: &str,
+    type_: &RuleType,
+    value: &Value,
+) -> Result<(), RuleError> {
+    match type_ {
+        RuleType::Nullable(inner) if value.is_null() => Ok(()),
+        RuleType::Nullable(inner) => validate_complete_value_literal(binding_name, inner, value),
+        RuleType::List(item_type) => value
+            .as_array()
+            .ok_or_else(|| invalid_binding(binding_name, type_))?
+            .iter()
+            .try_for_each(|item| validate_complete_value_literal(binding_name, item_type, item)),
+        RuleType::Object { fields, .. } => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid_binding(binding_name, type_))?;
+            for (field, field_type) in fields {
+                match object.get(field) {
+                    Some(field_value) => {
+                        validate_complete_value_literal(binding_name, field_type, field_value)?;
+                    }
+                    None if field_type.accepts_null() => {}
+                    None => return Err(invalid_binding(binding_name, type_)),
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn lower_canonical_value(expression: &str, type_: &RuleType) -> String {
+    if !matches!(strip_nullable(type_), RuleType::Timestamp) {
+        return expression.to_owned();
+    }
+
+    // `timestamptz` renders in the PostgreSQL session time zone. The value API
+    // returns a canonical profile JSON value, so terminal timestamp results are
+    // rendered from a UTC wall-clock timestamp instead of relying on that
+    // session setting. Expression lowering remains `timestamptz` for typed
+    // comparisons and command bindings.
+    let utc = format!("(({}) AT TIME ZONE 'UTC')", expression);
+    let seconds = format!("to_char({utc}, 'YYYY-MM-DD\"T\"HH24:MI:SS')");
+    let fraction = format!("rtrim(to_char({utc}, 'US'), '0')");
+    let text = format!(
+        "(({seconds}) || (CASE WHEN ({fraction}) = '' THEN 'Z' ELSE ('.' || ({fraction}) || 'Z') END))"
+    );
+    format!(
+        "(CASE WHEN (({expression}) IS NULL) THEN 'null'::jsonb ELSE to_jsonb(({text})::text) END)"
+    )
 }
 
 /// Lower a fully type-checked Rule to an opaque SQL expression that can be
@@ -206,7 +273,7 @@ fn lower_expression(
             let operand = lower_expression(rule, bindings, operand)?;
             match op {
                 UnaryOp::Not => format!("(NOT ({}))", operand.sql),
-                UnaryOp::Negate => format!("(-({}))", operand.sql),
+                UnaryOp::Negate => lower_numeric_negate(&operand),
             }
         }
         ExprKind::Binary { op, left, right } => {
@@ -567,6 +634,7 @@ fn lower_call(
 }
 
 fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpression) -> String {
+    let left_type = left.type_.clone();
     match operation {
         BinaryOp::Or => format!(
             "(CASE WHEN ({}) THEN TRUE ELSE ({}) END)",
@@ -594,27 +662,187 @@ fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpr
         BinaryOp::LessThanOrEqual => format!("(({}) <= ({}))", left.sql, right.sql),
         BinaryOp::GreaterThan => format!("(({}) > ({}))", left.sql, right.sql),
         BinaryOp::GreaterThanOrEqual => format!("(({}) >= ({}))", left.sql, right.sql),
-        BinaryOp::Add => format!("(({}) + ({}))", left.sql, right.sql),
-        BinaryOp::Subtract => format!("(({}) - ({}))", left.sql, right.sql),
-        BinaryOp::Multiply => format!("(({}) * ({}))", left.sql, right.sql),
-        BinaryOp::Divide if matches!(left.type_, ExpressionType::Concrete(RuleType::Int)) => {
-            format!("trunc(({}) / ({}))", left.sql, right.sql)
+        BinaryOp::Add => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "+"),
+        BinaryOp::Subtract => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "-"),
+        BinaryOp::Multiply => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "*"),
+        BinaryOp::Divide if matches!(left_type, ExpressionType::Concrete(RuleType::Int)) => {
+            checked_i128_result(&format!("trunc(({}) / ({}))", left.sql, right.sql))
         }
-        BinaryOp::Divide if matches!(left.type_, ExpressionType::Concrete(RuleType::Decimal)) => {
-            decimal_divide(&left.sql, &right.sql)
+        BinaryOp::Divide if matches!(left_type, ExpressionType::Concrete(RuleType::Decimal)) => {
+            lower_checked_decimal_divide(&left.sql, &right.sql)
         }
         BinaryOp::Divide => format!("(({}) / ({}))", left.sql, right.sql),
     }
 }
 
-fn decimal_divide(left: &str, right: &str) -> String {
-    // Decimal::checked_div preserves at least 18 fractional digits and truncates
-    // toward zero. `trim_scale` makes PostgreSQL's runtime numeric scale match
-    // Decimal::normalized before deriving the target scale.
+fn lower_numeric_negate(operand: &LoweredExpression) -> String {
+    let value = format!("(-({}))", operand.sql);
+    match &operand.type_ {
+        ExpressionType::Concrete(RuleType::Int) => checked_i128_result(&value),
+        ExpressionType::Concrete(RuleType::Decimal) => lower_checked_decimal_negate(&operand.sql),
+        _ => value,
+    }
+}
+
+fn lower_checked_numeric_binary(
+    type_: &ExpressionType,
+    left: &str,
+    right: &str,
+    operator: &str,
+) -> String {
+    let value = format!("(({left}) {operator} ({right}))");
+    match type_ {
+        ExpressionType::Concrete(RuleType::Int) => checked_i128_result(&value),
+        ExpressionType::Concrete(RuleType::Decimal) => match operator {
+            "+" | "-" => lower_checked_decimal_binary(left, right, operator),
+            "*" => lower_checked_decimal_multiply(left, right),
+            _ => value,
+        },
+        _ => value,
+    }
+}
+
+fn checked_i128_result(value: &str) -> String {
+    const I128_MIN: &str = "-170141183460469231731687303715884105728";
+    const I128_MAX: &str = "170141183460469231731687303715884105727";
+    format!(
+        "(CASE WHEN (({value}) BETWEEN ({I128_MIN})::numeric AND ({I128_MAX})::numeric) THEN ({value}) ELSE {} END)",
+        arithmetic_overflow_rejection()
+    )
+}
+
+struct DecimalParts {
+    coefficient: String,
+    scale: String,
+}
+
+fn decimal_parts(value: &str) -> DecimalParts {
+    let normalized = format!("trim_scale(({value})::numeric)");
+    let scale = format!("scale({normalized})");
+    let coefficient = format!("(({normalized}) * power(10::numeric, ({scale})))");
+    DecimalParts { coefficient, scale }
+}
+
+fn lower_checked_decimal_binary(left: &str, right: &str, operator: &str) -> String {
+    let left = decimal_parts(left);
+    let right = decimal_parts(right);
+    let scale = format!("greatest(({}), ({}))", left.scale, right.scale);
+    let left_coefficient = decimal_scaled_coefficient(&left, &scale);
+    let right_coefficient = decimal_scaled_coefficient(&right, &scale);
+    let result_coefficient = format!("(({left_coefficient}) {operator} ({right_coefficient}))");
+    let mut conditions = vec![
+        i128_range_condition(&left_coefficient),
+        i128_range_condition(&right_coefficient),
+    ];
+    if operator == "-" {
+        // Decimal::checked_sub first negates the right coefficient, so the
+        // minimum i128 is rejected before the subsequent checked addition.
+        conditions.push(format!(
+            "(({}) <> (-170141183460469231731687303715884105728)::numeric)",
+            right.coefficient
+        ));
+    }
+    conditions.push(i128_range_condition(&result_coefficient));
+    checked_decimal_value(&result_coefficient, &scale, conditions)
+}
+
+fn lower_checked_decimal_multiply(left: &str, right: &str) -> String {
+    let left = decimal_parts(left);
+    let right = decimal_parts(right);
+    let coefficient = format!("(({}) * ({}))", left.coefficient, right.coefficient);
+    let scale = format!("(({}) + ({}))", left.scale, right.scale);
+    checked_decimal_value(
+        &coefficient,
+        &scale,
+        vec![
+            i128_range_condition(&left.coefficient),
+            i128_range_condition(&right.coefficient),
+            i128_range_condition(&coefficient),
+        ],
+    )
+}
+
+fn lower_checked_decimal_divide(left: &str, right: &str) -> String {
+    let left_parts = decimal_parts(left);
+    let right_parts = decimal_parts(right);
     let target_scale = format!(
-        "greatest(18, scale(trim_scale(({left})::numeric)) - scale(trim_scale(({right})::numeric)))"
+        "greatest(18, ({}) - ({}))",
+        left_parts.scale, right_parts.scale
     );
-    format!("(trim_scale(trunc((({left}) / ({right})), {target_scale})))")
+    let exponent = format!(
+        "(({target_scale}) + ({}) - ({}))",
+        right_parts.scale, left_parts.scale
+    );
+    let numerator = format!(
+        "(({}) * power(10::numeric, ({exponent})))",
+        left_parts.coefficient
+    );
+    let quotient = format!("trunc(({numerator}) / ({}))", right_parts.coefficient);
+    checked_decimal_value(
+        &quotient,
+        &target_scale,
+        vec![
+            i128_range_condition(&left_parts.coefficient),
+            i128_range_condition(&right_parts.coefficient),
+            format!("(({}) <> 0::numeric)", right_parts.coefficient),
+            i128_range_condition(&numerator),
+            i128_range_condition(&quotient),
+        ],
+    )
+}
+
+fn lower_checked_decimal_negate(value: &str) -> String {
+    let parts = decimal_parts(value);
+    let coefficient = format!("(-({}))", parts.coefficient);
+    checked_decimal_value(
+        &coefficient,
+        &parts.scale,
+        vec![
+            i128_range_condition(&parts.coefficient),
+            format!(
+                "(({}) <> (-170141183460469231731687303715884105728)::numeric)",
+                parts.coefficient
+            ),
+        ],
+    )
+}
+
+fn decimal_scaled_coefficient(parts: &DecimalParts, scale: &str) -> String {
+    format!(
+        "(({}) * power(10::numeric, (({}) - ({}))))",
+        parts.coefficient, scale, parts.scale
+    )
+}
+
+fn checked_decimal_value(value: &str, scale: &str, conditions: Vec<String>) -> String {
+    let normalized = format!("trim_scale((({value})::numeric) / power(10::numeric, ({scale})))");
+    format!(
+        "(CASE WHEN ({}) THEN ({normalized}) ELSE {} END)",
+        all_conditions(conditions),
+        arithmetic_overflow_rejection()
+    )
+}
+
+fn i128_range_condition(value: &str) -> String {
+    const I128_MIN: &str = "-170141183460469231731687303715884105728";
+    const I128_MAX: &str = "170141183460469231731687303715884105727";
+    format!("(({value}) BETWEEN ({I128_MIN})::numeric AND ({I128_MAX})::numeric)")
+}
+
+fn all_conditions(conditions: Vec<String>) -> String {
+    conditions
+        .into_iter()
+        .rev()
+        .fold("TRUE".to_owned(), |next, condition| {
+            format!("(CASE WHEN ({condition}) THEN ({next}) ELSE FALSE END)")
+        })
+}
+
+fn arithmetic_overflow_rejection() -> &'static str {
+    // `current_setting` is stable rather than immutable, so PostgreSQL does
+    // not constant-fold this deliberate zero divisor before the surrounding
+    // CASE decides whether the bounded profile has overflowed.
+    "((1::numeric) / (0::numeric * current_setting('server_version_num')::numeric))"
 }
 
 fn json_access(target: &str, field: &str, type_: &RuleType) -> String {

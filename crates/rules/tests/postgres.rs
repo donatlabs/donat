@@ -5,7 +5,7 @@ use donat_rules::{
     compile_catalog_with_declared_types, evaluate_bool, evaluate_value, lower_postgres,
     lower_postgres_value,
 };
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, error::SqlState};
 use serde_json::{Value, json};
 
 fn map<T>(pairs: impl IntoIterator<Item = (&'static str, T)>) -> BTreeMap<String, T> {
@@ -59,6 +59,13 @@ fn typed_columns(bindings: &BTreeMap<String, RuleType>) -> SqlBindings {
     }))
 }
 
+fn has_raw_boolean_operator(sql: &str) -> bool {
+    // Arithmetic range guards legitimately use `BETWEEN ... AND ...`. Raw
+    // profile boolean lowering, by contrast, would retain this parenthesized
+    // binary shape instead of the required `CASE` expression.
+    sql.contains(") AND (") || sql.contains(") OR (")
+}
+
 #[test]
 fn lowerer_accepts_an_escaped_scalar_subquery_binding() {
     let bindings = map([("prior", RuleType::Int)]);
@@ -108,7 +115,7 @@ fn lowerer_uses_is_null_for_nullable_equality() {
 
     insta::assert_snapshot!(sql);
     assert!(
-        !sql.contains(" AND ") && !sql.contains(" OR "),
+        !has_raw_boolean_operator(&sql),
         "profile boolean operators must lower through CASE: {sql}"
     );
 }
@@ -132,7 +139,7 @@ fn lowerer_extracts_nested_typed_json_objects_and_lists() {
 
     insta::assert_snapshot!(sql);
     assert!(
-        !sql.contains(" AND ") && !sql.contains(" OR "),
+        !has_raw_boolean_operator(&sql),
         "profile boolean operators must lower through CASE: {sql}"
     );
 }
@@ -154,7 +161,7 @@ fn lowerer_supports_each_allowed_function() {
 
     insta::assert_snapshot!(sql);
     assert!(
-        !sql.contains(" AND ") && !sql.contains(" OR "),
+        !has_raw_boolean_operator(&sql),
         "profile boolean operators must lower through CASE: {sql}"
     );
 }
@@ -176,7 +183,7 @@ fn lowerer_short_circuits_runtime_division_with_typed_columns() {
             "the operator must lower through CASE: {expression}"
         );
         assert!(
-            !expression.contains(" AND ") && !expression.contains(" OR "),
+            !has_raw_boolean_operator(&expression),
             "the lowerer must not emit raw boolean operators: {expression}"
         );
 
@@ -305,6 +312,112 @@ fn lower_postgres_value_matches_live_postgres() {
 }
 
 #[test]
+fn object_value_rejects_missing_non_null_members_in_rust_and_postgres() {
+    let customer = object("Customer", map([("name", RuleType::String)]));
+    let rule = compiled_value_rule(customer.clone(), map([("customer", customer)]), "customer");
+    let bindings = map([("customer", json!({}))]);
+    let rust_error = evaluate_value(&rule, &bindings)
+        .expect_err("a direct object value must retain required-member semantics");
+    assert!(matches!(rust_error, RuleError::InvalidRuleResult { .. }));
+
+    let sql_bindings = SqlBindings::new([("customer".to_owned(), SqlBinding::literal(json!({})))]);
+    let mut client = postgres_client();
+    let postgres_error = lower_postgres_value(&rule, &sql_bindings)
+        .expect_err("Postgres value lowering must reject the same required member");
+    assert!(matches!(
+        postgres_error,
+        RuleError::InvalidBinding { ref name, .. } if name == "customer"
+    ));
+
+    // The total-access contract is not weakened: a member consumer can still
+    // observe this missing key as null. This direct value path is stricter
+    // because `Customer!` cannot serialize a missing `string!` member.
+    let member_rule = compiled_value_rule(
+        RuleType::nullable(RuleType::String),
+        map([(
+            "customer",
+            object("Customer", map([("name", RuleType::String)])),
+        )]),
+        "customer.name",
+    );
+    assert_postgres_matches_rust(
+        &mut client,
+        &member_rule,
+        bindings,
+        "total missing object member access",
+    );
+}
+
+#[test]
+fn lowerer_rejects_i128_arithmetic_overflow_like_the_rust_evaluator() {
+    let decimal_maximum_at_scale_one = "17014118346046923173168730371588410572.7";
+    let cases = [
+        format!("{} + 1 > {}", i128::MAX, i128::MAX),
+        format!("{decimal_maximum_at_scale_one} + 0.1 > 0.0"),
+        format!("{decimal_maximum_at_scale_one} * 10.0 > 0.0"),
+    ];
+    let mut client = postgres_client();
+
+    for source in cases {
+        let rule = compiled_rule(BTreeMap::new(), &source);
+        let rust_error = evaluate_bool(&rule, &BTreeMap::new())
+            .expect_err("the bounded Rust profile must reject arithmetic overflow");
+        assert!(matches!(rust_error, RuleError::InvalidLiteral { .. }));
+
+        let expression = lower_postgres(&rule, &SqlBindings::default())
+            .expect("a validated arithmetic rule should lower to a runtime rejection");
+        let postgres_error = client
+            .query_one(&format!("SELECT {expression} AS value"), &[])
+            .expect_err("Postgres must reject the same bounded arithmetic overflow");
+        assert_eq!(
+            postgres_error.as_db_error().map(|error| error.code()),
+            Some(&SqlState::DIVISION_BY_ZERO),
+            "overflow rejection must use the normal runtime arithmetic path: {postgres_error}",
+        );
+    }
+}
+
+#[test]
+fn timestamp_value_lowering_is_utc_canonical_outside_a_utc_session() {
+    let rule = compiled_value_rule(
+        RuleType::Timestamp,
+        map([("created_at", RuleType::Timestamp)]),
+        "created_at",
+    );
+    let timestamp = "2026-07-29T14:30:15.120+02:00";
+    let bindings = map([("created_at", json!(timestamp))]);
+    let expected = evaluate_value(&rule, &bindings)
+        .expect("the Rust evaluator should normalize the typed timestamp to UTC");
+    let lowered = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([(
+            "created_at".to_owned(),
+            SqlBinding::literal(json!(timestamp)),
+        )]),
+    )
+    .expect("the timestamp value rule should lower");
+    let mut client = postgres_client();
+    client
+        .batch_execute("SET TIME ZONE 'Asia/Kolkata'")
+        .expect("the live differential must run outside UTC");
+
+    let actual = client
+        .query_one(
+            &format!(
+                "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
+                lowered.sql
+            ),
+            &[],
+        )
+        .expect("the lowered timestamp value should execute in PostgreSQL")
+        .get::<_, String>("value")
+        .parse::<Value>()
+        .expect("PostgreSQL JSON output should parse");
+
+    assert_eq!(actual, expected.value);
+}
+
+#[test]
 fn lower_postgres_rejects_non_bool_rule() {
     let rule = compiled_value_rule(RuleType::String, map([("name", RuleType::String)]), "name");
     let error = lower_postgres(
@@ -352,7 +465,7 @@ fn lowerer_matches_rust_decimal_division_scale_and_truncation() {
         let expression = lower_postgres(&rule, &SqlBindings::default())
             .expect("a closed decimal expression should lower");
         assert!(
-            expression.contains("trim_scale(trunc"),
+            expression.contains("trunc(") && expression.contains("greatest(18"),
             "the {case} fixture must use Decimal::checked_div semantics: {expression}"
         );
         let actual = client

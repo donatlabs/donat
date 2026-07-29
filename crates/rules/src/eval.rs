@@ -874,13 +874,21 @@ fn check_equality(
                 rule: rule_name.to_owned(),
             })
         }
-        (CheckedType::Concrete(left), CheckedType::Concrete(right)) if left == right => Ok(()),
+        (CheckedType::Concrete(left), CheckedType::Concrete(right))
+            if left == right && supports_whole_value_equality(left) =>
+        {
+            Ok(())
+        }
         _ => Err(type_mismatch(
             rule_name,
             checked_type_name(left),
             checked_type_name(right),
         )),
     }
+}
+
+fn supports_whole_value_equality(type_: &RuleType) -> bool {
+    !matches!(type_, RuleType::List(_) | RuleType::Object { .. })
 }
 
 fn merge_branch_types(
@@ -1308,12 +1316,14 @@ fn canonical_timestamp_utc(value: &str) -> Option<String> {
             day = 1;
         }
     }
+    let fraction = value[19..zone_start]
+        .trim_end_matches('0')
+        .trim_end_matches('.');
     Some(format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{}{}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{}{fraction}Z",
         utc_minutes / 60,
         utc_minutes % 60,
         &value[17..19],
-        &value[19..zone_start],
     ))
 }
 
@@ -1697,7 +1707,19 @@ impl RuntimeValue {
                     values
                         .get(field)
                         .ok_or_else(invariant)
-                        .and_then(|value| value.canonical_json(rule_name, type_))
+                        .and_then(|value| match value {
+                            // A missing declared object member is represented as
+                            // a total-access null at decode time, but a direct
+                            // whole-object result must not weaken `field!` into
+                            // a JSON null. Member access has already consumed
+                            // this value before canonical result validation.
+                            Self::Null => Err(RuleError::InvalidRuleResult {
+                                rule: rule_name.to_owned(),
+                                expected: type_.display_name(),
+                                actual: "null".to_owned(),
+                            }),
+                            value => value.canonical_json(rule_name, type_),
+                        })
                         .map(|value| (field.clone(), value))
                 })
                 .collect::<Result<serde_json::Map<_, _>, _>>()

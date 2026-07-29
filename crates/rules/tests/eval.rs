@@ -538,6 +538,37 @@ fn permits_only_explicit_null_checks_for_nullable_values() {
 }
 
 #[test]
+fn deploy_validation_rejects_whole_value_equality_for_lists_and_objects() {
+    let customer = object("Customer", map([("name", RuleType::String)]));
+    let cases = [
+        (
+            "items",
+            RuleType::List(Box::new(RuleType::Int)),
+            "items == items",
+        ),
+        ("customer", customer, "customer == customer"),
+    ];
+
+    for (binding, type_, expression) in cases {
+        let error = compile_catalog(
+            &[rule(
+                "policy",
+                map([(binding, type_)]),
+                RuleType::Bool,
+                expression,
+            )],
+            &[],
+        )
+        .expect_err("the profile must not allow whole collection equality");
+
+        assert!(
+            matches!(error, RuleError::TypeMismatch { .. }),
+            "whole collection equality must be rejected for {expression}: {error}",
+        );
+    }
+}
+
+#[test]
 fn static_access_is_nullable_total_and_has_no_flow_sensitive_refinement() {
     let out_of_range = rule(
         "policy",
