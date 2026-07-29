@@ -30,8 +30,12 @@ native conformance harness, Postgres conformance service.
   JavaScript, WASM, shared library, package URL, donor source, or dynamic
   plugin.
 - No connector exposes `If`, `Switch`, `Merge`, `Code`, `Wait`, loops,
-  item/paired-item flow, subworkflows, send-and-wait, UI callbacks, or business
-  orchestration. Pagination is bounded transport inside one operation.
+  item/paired-item flow, subworkflows, AI nodes, send-and-wait, UI callbacks,
+  or business orchestration. Pagination is bounded transport inside one
+  operation.
+- Port scope is integration plumbing and typed provider operations only;
+  Rules, Commands, and Processes remain the sole owners of logical flow and
+  orchestration.
 - No GraphQL, REST, MCP, webhook, or administrative route executes an outbound
   connector operation. Direct provider calls in this plan exist only in
   internal Rust tests against Donat-owned local stubs.
@@ -51,8 +55,15 @@ native conformance harness, Postgres conformance service.
 - `donat-connector-catalog` imports ABI-owned IDs directly. No string,
   wrapper, parser, serializer, `From`, or `Into` copy may bridge catalog,
   generated entries, `ConnectorIo`, or processor lookup.
+- Every ABI ID is a transparent typed wrapper around the same
+  const-constructible, `Copy`, 96-byte inline representation. Generated
+  statics and host/processor calls pass those exact values by copy.
 - Acquisition and codegen are sibling crates over the catalog. Neither is a
   server dependency; codegen never acquires donor bytes.
+- Generated Rust and `catalog.digest` are generator-owned. A manifest task
+  renders to a temporary directory, reviews the complete diff, updates
+  checked-in output through the generator, and runs `generate --check`; no
+  task hand-edits generated output or the digest.
 - Phase-1 source licenses are exactly `MIT`, `Apache-2.0`, `BSD-2-Clause`,
   `BSD-3-Clause`, `ISC`, or `0BSD`. Every dependency and embedded artifact has
   a closed disposition.
@@ -71,7 +82,7 @@ native conformance harness, Postgres conformance service.
   `cargo fmt --all -- --check`, rebuild `donat`, run
   `cargo test -p donat-conformance --test connectors`, then run
   `cargo test -p donat-conformance`.
-- After Task 15, request one independent code review over the complete
+- After Task 17, request one independent code review over the complete
   implementation range and resolve its findings before integration. If the
   selected SDD execution workflow requires a fresh reviewer per task, follow
   that workflow instead; do not add another named post-commit gate.
@@ -121,60 +132,52 @@ crates/server/src/connectors/executor.rs
 crates/server/src/connectors/catalog.rs
 ```
 
-Inline binary/multipart, provider continuation URLs, durable polling
+External inline-binary JSON, multipart transport, connector/process
+descriptor admission, provider continuation URLs, durable polling
 checkpoints, and every process journal integration are outside this plan.
-Inline bytes remain prohibited until `donat-value-contract` passes the Spec
-007 Section 9 acceptance vectors and Spec 005 accepts that value in process
-descriptors and journals.
+The shared value crate owns the inert bounded inline-byte value and exact
+canonical-size vectors in the single Spec 005 Task-1 implementation commit;
+no external adapter may admit it until the later gates are accepted.
 
 ---
 
-### Task 1: Create the single canonical value-contract owner
+### Task 1: Reuse the single Spec 005 value-contract implementation unit
 
-**Files:**
+This is a cross-plan ledger alias, not a second implementation task. The
+authoritative implementation unit is Task 1 in
+`docs/superpowers/plans/2026-07-28-declarative-processes.md`. It creates
+`donat-value-contract`, the `donat-ir` re-export, and command descriptors in
+one commit. If that commit is already present, do not recreate, reimplement,
+or recommit any file here. Record its hash and run the connector-specific
+verification below. Task 2 cannot start until this shared commit is green.
+
+Spec 005's canonical Task 1 is authoritative, and it must declare the exact
+superset interface below before either plan executes. If it still declares
+only `BoundedInlineBytes { bytes }` or `try_new(bytes, maximum_decoded_bytes)`,
+stop: the process-plan owner must align that same canonical task first. This
+connector plan does not silently redefine the shared unit, append a follow-up
+commit, or create a connector-owned variant.
+
+**Files owned by the one shared commit:**
 
 - Create: `crates/value-contract/Cargo.toml`
 - Create: `crates/value-contract/src/lib.rs`
-- Create: `crates/value-contract/src/types.rs`
-- Create: `crates/value-contract/src/value.rs`
 - Create: `crates/value-contract/tests/value_contract.rs`
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 - Modify: `crates/ir/Cargo.toml`
+- Create: `crates/ir/src/value_contract.rs`
 - Modify: `crates/ir/src/lib.rs`
-- Modify: `crates/ir/tests/ir_structure.rs`
+- Create: `crates/ir/tests/value_contract_adapter.rs`
+- Modify: `crates/schema/Cargo.toml`
+- Modify: `crates/schema/src/commands.rs`
+- Modify: `crates/schema/src/lib.rs`
+- Modify: `crates/schema/tests/commands.rs`
 
-**Interfaces:**
-
-- Consumes: the exact version-1 type grammar and scalar aliases in Spec 005
-  Section 2.1.
-- Produces:
+**Shared interface required by processes and connectors:**
 
 ```rust
 pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
-
-pub struct ValueContractCatalog {
-    pub roots: BTreeMap<String, ValueContractField>,
-    pub named_objects: BTreeMap<String, ValueObjectContract>,
-}
-
-pub struct ValueContractField {
-    pub required: bool,
-    pub type_ref: TypeRef,
-}
-
-pub struct TypeRef {
-    pub nullable: bool,
-    pub value_type: ValueType,
-}
-
-pub enum ValueType {
-    Scalar { scalar: ValueScalar },
-    Enum { name: String, values: Vec<String> },
-    Object { fields: BTreeMap<String, ValueContractField> },
-    List { element: Box<TypeRef> },
-    Ref { name: String },
-}
 
 pub enum TypedValue {
     Null,
@@ -183,104 +186,139 @@ pub enum TypedValue {
     Number(CanonicalNumber),
     List(Vec<TypedValue>),
     Object(BTreeMap<String, TypedValue>),
+    InlineBytes(BoundedInlineBytes),
 }
 
-pub fn parse_type_ref(input: &str) -> Result<TypeRef, ValueContractError>;
-pub fn validate_value(
-    contract: &ValueContractCatalog,
-    root: &str,
+pub struct BoundedInlineBytes {
+    bytes: Vec<u8>,
+    media_type: BoundedMediaType,
+    file_name: Option<BoundedFileName>,
+}
+
+struct BoundedMediaType(String);
+struct BoundedFileName(String);
+
+impl BoundedInlineBytes {
+    pub fn try_new(
+        bytes: Vec<u8>,
+        media_type: &str,
+        file_name: Option<&str>,
+        maximum_decoded_bytes: usize,
+    ) -> Result<Self, ValueContractError>;
+
+    pub fn as_slice(&self) -> &[u8];
+    pub fn media_type(&self) -> &str;
+    pub fn file_name(&self) -> Option<&str>;
+}
+
+pub fn canonical_size(
     value: &TypedValue,
-) -> Result<(), ValueContractError>;
-pub fn canonical_size(value: &TypedValue) -> Result<usize, ValueContractError>;
+) -> Result<usize, ValueContractError>;
 ```
 
-- `donat-ir` publicly re-exports these exact types and defines no duplicate.
+`BoundedMediaType` accepts at most 255 ASCII bytes. `BoundedFileName` accepts
+at most 255 UTF-8 bytes and is data, never a path. Construction rejects a
+decoded-byte bound above 131,072. Complete-value validation rejects more than
+16 inline values, more than 131,072 aggregate decoded bytes, or more than
+262,144 canonical bytes. The lower crate accounts for the exact future
+`$binary`/`file_name`/`media_type` JCS representation without exposing a JSON
+encoder. Metadata, JSON/form connector descriptors, multipart, commands, and
+process journals reject `InlineBytes` until the separate binary gate lands.
 
-- [ ] **Step 1: Add the failing canonical-language and ownership tests**
-
-```rust
-#[test]
-fn value_type_language_is_closed_and_canonical() {
-    assert_eq!(parse_type_ref("[uuid!]!").unwrap().to_string(), "[uuid!]!");
-    assert!(parse_type_ref(" [uuid!]!").is_err());
-    assert!(parse_type_ref("$unknown").is_err());
-}
-
-#[test]
-fn value_contract_has_one_owner() {
-    fn accepts_ir_type(_: donat_ir::TypeRef) {}
-    accepts_ir_type(donat_value_contract::parse_type_ref("string!").unwrap());
-}
-```
-
-Add structural assertions to `ir_structure.rs` that `donat-ir` depends on and
-re-exports `donat-value-contract`, and that the old crate contains no second
-`ValueType`, `TypeRef`, or `TypedValue` declaration.
-
-- [ ] **Step 2: Run RED**
-
-Run:
+- [ ] **Step 1: Check whether the shared unit already has a commit**
 
 ```bash
-cargo test -p donat-value-contract --no-default-features
-cargo test -p donat-ir value_contract
+shared_value_commit=$(git log -1 --format=%H -- crates/value-contract)
+if test -n "$shared_value_commit"; then
+  git show --stat --oneline "$shared_value_commit"
+fi
 ```
 
-Expected: Cargo reports that package `donat-value-contract` does not exist.
+If the crate is absent, execute the canonical Spec 005 Task 1. If it exists,
+inspect that commit rather than creating another owner. In either case,
+compare the authoritative task text and implementation with the exact
+`BoundedMediaType`, `BoundedFileName`, four-argument constructor, accessors,
+limits, and vectors above. Stop on any mismatch; do not repair it in a second
+connector commit.
 
-- [ ] **Step 3: Implement the lower crate and IR re-export**
+- [ ] **Step 2: Put connector byte acceptance in the same shared RED test**
 
-Start `lib.rs` with:
+Before the canonical Task-1 commit, add these exact tests to
+`crates/value-contract/tests/value_contract.rs`:
 
-```rust
-#![no_std]
-#![forbid(unsafe_code)]
+- `value_type_language_is_closed_and_canonical`;
+- `value_contract_has_one_owner`;
+- `inline_bytes_have_one_inert_owner`;
+- `inline_binary_canonical_size_vectors_are_exact`;
+- `inline_binary_count_and_decoded_bounds_are_exact`;
+- `inline_binary_external_adapters_remain_disabled`.
 
-extern crate alloc;
+The independent size helper must assert:
 
-mod types;
-mod value;
-
-pub use types::*;
-pub use value::*;
+```text
+131,072 zero bytes, application/octet-stream, no filename -> 174,817 bytes
+131,073 decoded bytes                              -> rejected before encoding
+accepted binary + 87,303-byte "padding" string     -> 262,144 bytes
+accepted binary + 87,304-byte "padding" string     -> 262,145 and rejected
+17 inline-byte values                              -> rejected
 ```
 
-Use `alloc::collections::BTreeMap`, checked constructors, exact alias
-normalization, UTF-8 lexical object order, checked arithmetic, and no
-`serde_json::Value`. Keep metadata/Rule adapters in `donat-ir`.
-
-- [ ] **Step 4: Prove the mechanical no-OS boundary**
-
-Run:
+- [ ] **Step 3: Run the shared RED commands**
 
 ```bash
-cargo check -p donat-value-contract --target thumbv7em-none-eabihf \
-  --no-default-features --offline --locked
+cargo test -p donat-value-contract inline_binary
+cargo test -p donat-ir --test value_contract_adapter
+cargo check -p donat-value-contract --no-default-features \
+  --target thumbv7em-none-eabi
+```
+
+Expected when the shared unit is absent: Cargo reports that
+`donat-value-contract` does not exist. Expected when an incomplete shared
+implementation exists: one of the exact inline-byte ownership, size, count,
+or adapter-gate assertions fails.
+
+- [ ] **Step 4: Implement only through canonical Spec 005 Task 1**
+
+Follow the canonical task's complete value, IR, schema, and command-descriptor
+steps after its text contains the exact superset interface above. Implement
+inert bytes and checked size accounting in that same lower crate and commit.
+Do not add a connector-local value type, serde adapter, multipart encoder,
+process admission, or a second value-contract commit.
+
+- [ ] **Step 5: Run shared GREEN and connector-specific verification**
+
+```bash
+cargo test -p donat-value-contract
+cargo test -p donat-ir
+cargo test -p donat-schema --test commands
+cargo check -p donat-value-contract --no-default-features \
+  --target thumbv7em-none-eabi
 cargo tree -p donat-value-contract --target all \
   --edges normal,build,no-dev --no-default-features --offline --locked
 ```
 
-Expected: the target check passes and the normal/build closure contains only
-`donat-value-contract`.
+Expected: the inline-byte vectors pass, `donat-ir` re-exports the exact types,
+and the dependency closure contains only the local value crate.
 
-- [ ] **Step 5: Run GREEN and regressions**
+- [ ] **Step 6: Record the one shared commit; do not create another**
 
-Run:
-
-```bash
-cargo test -p donat-value-contract --no-default-features
-cargo test -p donat-ir
-cargo test --workspace --no-run
-```
-
-Expected: all commands pass.
-
-- [ ] **Step 6: Commit the value-owner slice**
+If the canonical task was executed now, use its one prescribed commit:
 
 ```bash
-git add Cargo.toml Cargo.lock crates/value-contract crates/ir
-git commit -m "feat(value): add canonical value contract owner"
+git add Cargo.toml Cargo.lock crates/value-contract crates/ir \
+  crates/schema/Cargo.toml crates/schema/src crates/schema/tests
+git commit -m "feat(processes): publish closed command contracts"
 ```
+
+Then record and verify the same hash in the implementation task/PR notes:
+
+```bash
+shared_value_commit=$(git log -1 --format=%H -- crates/value-contract)
+test -n "$shared_value_commit"
+git show --name-only --format=fuller "$shared_value_commit"
+```
+
+Task 2 consumes this exact commit. There is no connector Task-1 commit.
 
 
 ---
@@ -300,23 +338,41 @@ git commit -m "feat(value): add canonical value contract owner"
 
 **Interfaces:**
 
+- Starts only after the single shared Task-1 commit is recorded and green.
 - Consumes: `donat_value_contract::TypedValue`.
-- Produces exact owned newtypes:
+- Produces one exact const/static-safe storage representation and transparent
+  typed wrappers:
 
 ```rust
-pub struct ConnectorId(String);
-pub struct OperationId(String);
-pub struct CompiledStepId(String);
-pub struct ProcessorFamilyId(String);
-pub struct AuthenticatorId(String);
-pub struct CodecId(String);
-pub struct NormalizerId(String);
-pub struct TriggerId(String);
-pub struct CredentialSpecId(String);
-pub struct CredentialFieldId(String);
-pub struct CapabilityId(String);
-pub struct BindingSlotId(String);
-pub struct OriginId(String);
+pub const ABI_ID_CAPACITY: usize = 96;
+
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct InlineId {
+    len: u8,
+    bytes: [u8; ABI_ID_CAPACITY],
+}
+
+impl InlineId {
+    pub const fn literal(value: &'static str) -> Self;
+    pub fn parse(value: &str) -> Result<Self, AbiError>;
+    pub fn as_str(&self) -> &str;
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ConnectorId(InlineId);
+
+// The same transparent shape is used for:
+// OperationId, CompiledStepId, ProcessorFamilyId, AuthenticatorId, CodecId,
+// NormalizerId, TriggerId, CredentialSpecId, CredentialFieldId, CapabilityId,
+// BindingSlotId, and OriginId.
+
+impl ConnectorId {
+    pub const fn literal(value: &'static str) -> Self;
+    pub fn parse(value: &str) -> Result<Self, AbiError>;
+    pub fn as_str(&self) -> &str;
+}
 
 pub struct NonEmptyVec<T> {
     head: T,
@@ -337,6 +393,16 @@ pub trait ConnectorIo: Send + Sync {
     ) -> BoxFuture<'a, Result<BoundedTransportResponse, ConnectorFailure>>;
 }
 ```
+
+The single validator accepts `1..=96` ASCII bytes matching
+`[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?`. Both `literal` and `parse` call that
+validator; the const path panics at compile time for an invalid literal and
+the runtime path returns `AbiError`. Neither path allocates. `InlineId` is 97
+bytes with alignment 1; every wrapper has the same size/alignment and is
+`Copy`. Generated entries use `ConnectorId::literal("serpapi")`; a static
+step uses `CompiledStepId::literal("search")`. `ConnectorIo::call` and private
+processor lookup continue taking the typed ID by value because the value is
+copied directly from the static.
 
 The same crate owns checked constructors for bounded safe strings/bytes/maps
 and these envelopes:
@@ -380,10 +446,11 @@ message, optional clamped retry delay, and allowlisted bounded correlation
 IDs. It has no raw body, URL, header, credential, provider message, process
 policy, or unbounded collection.
 
-Each ID has `parse(&str) -> Result<Self, AbiError>` and `as_str(&self) ->
-&str`; no blanket `From<String>` or public tuple field permits unchecked
-identity construction. `ConnectorFailure` uses the existing eight error
-classes and bounded safe fields.
+No ID contains `String`, `Vec`, `Box`, `&'static str`, or a public tuple
+field. There is no blanket `From`/`Into`, clone-to-call, runtime reparsing of
+generated IDs, serialization round-trip, lazy static, or startup ID table.
+`ConnectorFailure` uses the existing eight error classes and bounded safe
+fields.
 
 - [ ] **Step 1: Write failing ID, bound, and object-safety tests**
 
@@ -393,6 +460,21 @@ fn abi_ids_are_canonical_and_bounded() {
     assert!(ConnectorId::parse("serpapi").is_ok());
     assert!(ConnectorId::parse("").is_err());
     assert!(ConnectorId::parse("Serp API").is_err());
+    assert!(ConnectorId::parse(&"a".repeat(96)).is_ok());
+    assert!(ConnectorId::parse(&"a".repeat(97)).is_err());
+}
+
+const SERPAPI: ConnectorId = ConnectorId::literal("serpapi");
+static STEPS: [CompiledStepId; 1] = [CompiledStepId::literal("search")];
+
+#[test]
+fn abi_ids_are_const_constructible_and_copy_from_statics() {
+    fn takes_step(_: CompiledStepId) {}
+    let step = STEPS[0];
+    takes_step(step);
+    takes_step(step);
+    assert_eq!(SERPAPI.as_str(), "serpapi");
+    assert_eq!(core::mem::size_of::<InlineId>(), 97);
 }
 
 #[test]
@@ -404,8 +486,14 @@ fn host_traits_are_object_safe_send_and_sync() {
 }
 ```
 
-Add boundary tests for oversized strings, headers, binding maps, transport
-bytes, retry delay, nesting, and canonical output size.
+Also reject leading/trailing separators, punctuation outside the grammar
+(including adjacent invalid characters), non-ASCII, uppercase, embedded NUL,
+and all boundary lengths. Add compile assignments proving every typed wrapper
+is `Copy`, const-constructible, and the exact type consumed by generated
+descriptors, `ConnectorIo`, and private lookup without `.clone()`, `.parse()`,
+`String`, or wrapper conversion. Add boundary tests for oversized safe
+strings, headers, binding maps, transport bytes, retry delay, nesting, and
+canonical output size.
 
 - [ ] **Step 2: Run RED**
 
@@ -418,7 +506,9 @@ Expected: Cargo reports that package `donat-connector-abi` does not exist.
 - [ ] **Step 3: Implement the neutral ABI**
 
 Begin `lib.rs` with the same `no_std`, `forbid(unsafe_code)`, and `alloc`
-directives as Task 1. Keep URL, reqwest, serde JSON, Tokio, database,
+directives as the shared value crate. Implement the typed wrappers with one
+private macro over `InlineId`; the macro must not create a second storage
+shape or validator. Keep URL, reqwest, serde JSON, Tokio, database,
 filesystem, environment, role, process, retry-policy, and raw credential types
 out of every public field and signature.
 
@@ -438,6 +528,10 @@ Expected: only `donat-connector-abi` and the local value-contract crate appear.
 ```bash
 cargo test -p donat-connector-abi --no-default-features
 cargo test -p donat-value-contract --no-default-features
+if rg -n 'String|Box<str>|Vec<u8>|OnceLock|LazyLock|\\.parse\\(' \
+  crates/connector-abi/src/ids.rs; then
+  exit 1
+fi
 ```
 
 - [ ] **Step 6: Commit the ABI foundation**
@@ -466,8 +560,12 @@ git commit -m "feat(connectors): add neutral connector ABI"
 - Create: `crates/connector-catalog/tests/fixtures/missing-license-file-hash.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/missing-side-effect-step.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/unknown-effect.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/serpapi-npm-record.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/provider-contract-record.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/donat-owned-record.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/npm-repository-mismatch.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/open-dependency-disposition.yaml`
 - Create: `crates/connector-catalog/sources/records/donat-owned-http-v1.yaml`
-- Create: `crates/connector-catalog/manifests/donat-owned-http-v1.yaml`
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
@@ -479,21 +577,115 @@ git commit -m "feat(connectors): add neutral connector ABI"
 ```rust
 pub struct ConnectorSourceRecord {
     pub record_version: u32,
-    pub source_id: String,
-    pub source_kind: SourceKind,
-    pub repository: ImmutableRepository,
+    pub record_id: SourceRecordId,
+    pub subject: SourceSubject,
     pub artifact_hashes: Vec<ArtifactHash>,
     pub license: LicenseDecision,
+    pub notice: NoticeIdentity,
     pub entrypoints: Vec<SourcePath>,
     pub dependencies: Vec<DependencyDecision>,
     pub embedded_material: Vec<EmbeddedMaterialDecision>,
-    pub provider_contract: ProviderContractEvidence,
+    pub provider_contracts: Vec<ProviderContractReference>,
+    pub compatibility: CompatibilityDecision,
+    pub admission: AdmissionState,
     pub safety_findings: SafetyFindings,
-    pub approved_operations: Vec<OperationId>,
     pub reviewer: ReviewIdentity,
     pub approval_date: Date,
-    pub proposed_destinations: Vec<RepoPath>,
-    pub red_tests: Vec<TestId>,
+    pub proposed_manifest: Option<RepoPath>,
+    pub proposed_destinations: NonEmptyVec<RepoPath>,
+    pub red_tests: NonEmptyVec<TestId>,
+}
+
+pub struct SourceRecordId(String);
+pub struct ProviderContractId(String);
+pub struct ProviderFactId(String);
+
+pub enum SourceSubject {
+    ExactNpm(ExactNpmPackage),
+    ProviderArtifact(ExactProviderArtifact),
+    DonatOwned(DonatOwnedSource),
+}
+
+pub struct ExactNpmPackage {
+    pub name: String,
+    pub version: ExactSemver,
+    pub tarball_url: ExactHttpsUrl,
+    pub integrity: NpmIntegrity,
+    pub repository: ImmutableRepository,
+    pub npm_git_head: GitCommit,
+    pub package_repository: RepositoryUrl,
+}
+
+pub struct NpmIntegrity {
+    pub algorithm: Sha512,
+    pub digest: [u8; 64],
+}
+
+pub struct ImmutableRepository {
+    pub url: RepositoryUrl,
+    pub commit: GitCommit,
+    pub tree: GitTree,
+}
+
+pub struct ExactProviderArtifact {
+    pub provider: String,
+    pub evidence: NonEmptyVec<ProviderEvidenceArtifact>,
+}
+
+pub struct ProviderEvidenceArtifact {
+    pub source: ImmutableProviderEvidenceSource,
+    pub accessed_on: Date,
+    pub content_sha256: Hash256,
+    pub terms: EvidenceTermsDisposition,
+    pub facts: NonEmptyVec<ProviderFact>,
+}
+
+pub enum ImmutableProviderEvidenceSource {
+    RepositoryFile {
+        repository: RepositoryUrl,
+        commit: GitCommit,
+        path: SourcePath,
+    },
+    VersionedArtifact {
+        url: ExactHttpsUrl,
+        provider_revision: NonEmptyString,
+    },
+}
+
+pub struct ProviderFact {
+    pub fact_id: ProviderFactId,
+    pub location: ExactFactLocation,
+    pub normalized_value: CanonicalProviderValue,
+}
+
+pub struct ProviderContractReference {
+    pub source_record_id: SourceRecordId,
+    pub contract_id: ProviderContractId,
+    pub required_facts: NonEmptyVec<ProviderFactId>,
+}
+
+pub struct DonatOwnedSource {
+    pub repository_commit: GitCommit,
+    pub files: NonEmptyVec<RepoFileHash>,
+}
+
+pub enum CompatibilityDecision {
+    TierA,
+    TierB,
+    TierC,
+    Rejected,
+}
+
+pub enum AdmissionState {
+    InventoryOnly {
+        findings: NonEmptyVec<FindingId>,
+    },
+    ApprovedForPort {
+        operations: NonEmptyVec<OperationId>,
+    },
+    EvidenceAccepted {
+        contracts: NonEmptyVec<ProviderContractId>,
+    },
 }
 
 pub struct OperationSpec {
@@ -517,6 +709,13 @@ pub enum OperationEffect {
 `LicenseDecision` accepts only the six Phase-1 identifiers and one selected
 allowed branch for dual licensing. `DependencyDisposition` is exactly
 `Shipped`, `BuildOnly`, `TypeOnlyReplaced`, `BehaviorOnly`, or `Rejected`.
+`NoticeIdentity` contains a stable notice ID, license-file path/hash, required
+copyright lines, and the planned notice-bundle destination. Exact npm loading
+decodes one canonical `sha512-...` SRI value into the structured 64-byte
+digest and requires `npm_git_head == repository.commit`, exact package
+name/version, tarball URL, package repository mapping, and tree identity.
+Every dependency and embedded artifact has one explicit closed disposition.
+Every proposed manifest/destination is a normalized repository-relative path.
 
 - [ ] **Step 1: Write failing strictness, effect, and hash-vector tests**
 
@@ -534,6 +733,15 @@ fn operation_effect_is_closed() {
     assert!(compile(missing_side_effect_step_fixture()).is_err());
     assert!(compile(unknown_effect_fixture()).is_err());
 }
+
+#[test]
+fn serpapi_npm_record_round_trips_without_information_loss() {
+    let record = load_record("tests/fixtures/serpapi-npm-record.yaml").unwrap();
+    let encoded = canonical_yaml(&record).unwrap();
+    assert_eq!(load_record_bytes(&encoded).unwrap(), record);
+    assert_eq!(record.compatibility, CompatibilityDecision::TierA);
+    assert!(matches!(record.admission, AdmissionState::InventoryOnly { .. }));
+}
 ```
 
 Independently construct and assert all four Spec 007 Section 5.1
@@ -546,9 +754,14 @@ semantic {"a":1,"b":[true,null,"x"]} 2f7116c006c1fdfccdd12b1fa954cd94feffee889ce
 provenance {"a":1,"b":[true,null,"x"]} 4e31e445b6c8d06e6b93fd5cc66731b850a84853dd4ee28d6a76663138217a23
 ```
 
-Add
-`catalog_descriptor_ids_match_connector_io` as a compile-only assignment from
-normalized descriptor fields to `ConnectorIo` parameters.
+Add `source_record_variants_are_closed`,
+`npm_integrity_and_repository_mapping_are_exact`,
+`provider_contract_reference_requires_matching_record_and_facts`,
+`provider_evidence_acceptance_is_closed_and_non_executable`,
+`dependency_and_embedded_dispositions_are_closed`,
+`notice_and_destination_fields_are_required`, and
+`catalog_descriptor_ids_match_connector_io`. The last test assigns normalized
+descriptor IDs directly to `ConnectorIo` parameters.
 
 - [ ] **Step 2: Run RED**
 
@@ -571,8 +784,21 @@ pub fn provenance_sha256(
 ```
 
 Validate that every side-effecting step has exactly one evidence-backed entry
-and that read-only steps have none. Inventory-only records never enter the
-executable catalog.
+and that read-only steps have none. Validate all three source variants before
+canonicalization. A provider artifact has no npm fields; a Donat-owned record
+has no external package claim; an npm record cannot omit or flatten SRI and
+repository mapping. A mutable provider URL plus access date/hash is not an
+immutable source identity and is rejected. Every provider fact names its
+exact location and normalized value. Every provider-contract reference
+resolves to a distinct matching `ProviderArtifact` record, normalized
+contract, and complete fact set. `EvidenceAccepted` is valid only for a
+`ProviderArtifact`; `ApprovedForPort` is valid only for a donor or Donat-owned
+operation source. The three catalog-local provenance IDs use one strict
+`1..=96`-byte ASCII grammar
+`[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?` and reject unknown, empty, duplicate, or
+mismatched references. The provider-contract round-trip fixture exercises
+`EvidenceAccepted`; that state can never generate an operation entry.
+Inventory-only records never enter the executable catalog.
 
 - [ ] **Step 4: Run GREEN and review snapshots**
 
@@ -582,8 +808,9 @@ cargo insta test -p donat-connector-catalog
 cargo insta review
 ```
 
-Expected: vectors and strict negative fixtures pass; reviewed snapshots contain
-no source description or UI metadata.
+Expected: the exact SerpAPI-shaped npm fixture round-trips, provider and
+Donat-owned variants remain distinct, every mismatch/open disposition fails,
+and reviewed snapshots contain no source description or UI metadata.
 
 - [ ] **Step 5: Commit the neutral catalog**
 
@@ -609,6 +836,7 @@ git commit -m "feat(connectors): add normalized connector catalog"
 - Create: `crates/connector-acquire/tests/source_admission.rs`
 - Create: `crates/connector-acquire/tests/hostile_archives.rs`
 - Create: `crates/connector-acquire/tests/imperative_inventory.rs`
+- Modify: `.gitignore`
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
@@ -619,13 +847,38 @@ git commit -m "feat(connectors): add normalized connector catalog"
 - Produces development-only commands:
 
 ```text
-donat-connector-acquire inspect --record <candidate.yaml> --output <review-dir>
-donat-connector-acquire verify --record <approved.yaml>
+donat-connector-acquire acquire-review \
+  --artifact-url <exact-https-url> \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  [--provider-repository-url <exact-https-git-url> \
+   --provider-commit <full-commit>] \
+  [--provider-evidence-url <exact-https-url>]... \
+  --output <ignored-quarantine-directory>
+donat-connector-acquire check-record --record <approved.yaml>
+donat-connector-acquire verify \
+  --record <approved.yaml> \
+  --artifact <local-artifact> \
+  --source-tree <local-source-tree>
 ```
 
-`inspect` writes only an ignored candidate review bundle. `verify` fails
-closed and writes no source or generated Rust. Neither command executes donor
-scripts, binaries, tests, Node, or JavaScript.
+`acquire-review` is the only networked command and writes an ignored
+mode-`0700` quarantine plus candidate review bundle.
+`.donat/connector-quarantine/` is added to `.gitignore`. `check-record` is
+offline and checks only schema/internal consistency; it never claims byte
+verification. `verify` is offline, requires explicit local artifact and
+source-tree paths, and recomputes artifact integrity, repository tree, every
+admitted file hash, and the license hash from those bytes. Neither offline
+command writes source or generated Rust. No command executes donor scripts,
+binaries, tests, Node, or JavaScript.
+
+Provider repository/evidence inputs are optional, repeatable review inputs.
+For a repository provider artifact, acquisition emits the checked-out tree
+and a deterministic local `provider-source.tar`; for mutable URL candidates,
+it emits a local `provider-evidence.bundle` that can prove byte identity for a
+rejection test but cannot invent an immutable provider revision. Offline
+`verify` treats either local bundle as the explicit `--artifact` and never
+reaches the network.
 
 - [ ] **Step 1: Add synthetic hostile-archive RED tests**
 
@@ -675,7 +928,18 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 5: Run GREEN**
+- [ ] **Step 5: Prove record-only and byte-verification modes differ**
+
+Add tests `check_record_does_not_claim_byte_verification`,
+`verify_requires_artifact_and_source_tree`,
+`verify_recomputes_every_recorded_hash`, and
+`network_is_available_only_to_acquire_review`. Add
+`provider_repository_emits_offline_artifact_and_tree` and
+`mutable_provider_url_cannot_become_immutable_evidence`. A record that repeats
+expected hash strings passes `check-record` but fails `verify` against one
+changed artifact byte or source file.
+
+- [ ] **Step 6: Run GREEN**
 
 ```bash
 cargo test -p donat-connector-acquire --test source_admission
@@ -683,10 +947,10 @@ cargo test -p donat-connector-acquire --test hostile_archives
 cargo test -p donat-connector-acquire --test imperative_inventory
 ```
 
-- [ ] **Step 6: Commit the acquisition tool**
+- [ ] **Step 7: Commit the acquisition tool**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/connector-acquire
+git add .gitignore Cargo.toml Cargo.lock crates/connector-acquire
 git commit -m "feat(connectors): add hostile source acquisition gate"
 ```
 
@@ -703,6 +967,9 @@ git commit -m "feat(connectors): add hostile source acquisition gate"
 - Create: `crates/connector-codegen/src/render.rs`
 - Create: `crates/connector-codegen/src/check.rs`
 - Create: `crates/connector-codegen/tests/deterministic_catalog.rs`
+- Create:
+  `crates/connector-codegen/tests/snapshots/deterministic_catalog__donat_owned_http.snap`
+- Create: `crates/connector-catalog/manifests/donat-owned-http-v1.yaml`
 - Create: `crates/connector-catalog/src/generated/mod.rs`
 - Create: `crates/connector-catalog/src/generated/donat_owned_http.rs`
 - Create: `crates/connector-catalog/src/generated/catalog.digest`
@@ -733,6 +1000,12 @@ pub struct GeneratedConnectorEntry {
 pub static CONNECTORS: &[GeneratedConnectorEntry] = &[/* sorted entries */];
 ```
 
+Every rendered identity is emitted as an ABI const literal, for example
+`ConnectorId::literal("donat.http")` and
+`CompiledStepId::literal("request")`. Generated code contains no owned
+`String`, lazy initialization, parse call, deserialization, clone, or
+conversion bridge for an identity.
+
 - [ ] **Step 1: Write the failing determinism and drift tests**
 
 ```rust
@@ -747,7 +1020,9 @@ fn generated_catalog_is_checked_in_and_deterministic() {
 
 Also test deleted output, extra output, changed byte, unsorted IDs, duplicate
 ID, manifest/source-record mismatch, semantic/provenance mismatch, and an
-unexpected path.
+unexpected path. Add a renderer assertion that rejects output containing
+identity `.parse()`, `String::`, `.to_owned()`, `.to_string()`, `.clone()`,
+`OnceLock`, or `LazyLock`, and compile the emitted statics in a const context.
 
 - [ ] **Step 2: Run RED**
 
@@ -770,7 +1045,31 @@ Add `generated_catalog_ids_match_abi` in the catalog crate. It assigns every
 actual checked-in connector, operation, step, processor-family, credential,
 and capability ID directly to the corresponding ABI type.
 
-- [ ] **Step 5: Run GREEN and inspect output**
+- [ ] **Step 5: Render the first manifest to a temporary directory**
+
+Create `donat-owned-http-v1.yaml` only after its matching Donat-owned source
+record from Task 3 is green. Render and review before updating checked-in
+output:
+
+```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+Review the manifest, renderer, renderer tests, snapshot, every generated Rust
+byte, and the digest. Then update only through the generator:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
+```
+
+Never hand-edit `donat_owned_http.rs`, `mod.rs`, or `catalog.digest`.
+
+- [ ] **Step 6: Run GREEN and inspect output**
 
 ```bash
 cargo test -p donat-connector-codegen --test deterministic_catalog
@@ -780,10 +1079,11 @@ cargo insta test -p donat-connector-codegen
 cargo insta review
 ```
 
-- [ ] **Step 6: Commit the codegen slice**
+- [ ] **Step 7: Commit the codegen slice**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/connector-codegen \
+  crates/connector-catalog/manifests/donat-owned-http-v1.yaml \
   crates/connector-catalog/src/generated crates/connector-catalog/src/lib.rs
 git commit -m "feat(connectors): generate checked-in static catalog"
 ```
@@ -959,11 +1259,13 @@ git commit -m "feat(connectors): seal native processor boundary"
 - Create: `crates/server/tests/compile_fail/credential_capability_serialize.stderr`
 - Create: `crates/server/tests/compile_fail/credential_capability_expose.rs`
 - Create: `crates/server/tests/compile_fail/credential_capability_expose.stderr`
+- Create: `crates/server/tests/connector_credentials_compile_fail.rs`
 - Modify: `crates/metadata/src/types.rs`
 - Modify: `crates/metadata/src/loader.rs`
-- Modify: `crates/metadata/tests/loader.rs`
+- Modify: `crates/metadata/tests/types_serde.rs`
 - Modify: `crates/server/src/connectors/mod.rs`
 - Modify: `crates/server/src/state.rs`
+- Modify: `Cargo.toml`
 - Modify: `crates/server/Cargo.toml`
 - Modify: `Cargo.lock`
 
@@ -972,18 +1274,27 @@ git commit -m "feat(connectors): seal native processor boundary"
 ```yaml
 connectors:
   - name: search
-    source: serpapi
-    credential:
-      spec: serpapi-api-key-v1
-      fields:
-        api_key:
-          value_from_env: SERPAPI_API_KEY
+    module: serpapi
+    config:
+      endpoint_identity: serpapi_public_v1
+      credential_identity: serpapi_primary
+      credential:
+        spec: serpapi.api_key.v1
+        fields:
+          api_key:
+            value_from_env: SERPAPI_API_KEY
+    operations:
+      - name: search.google
 ```
 
-Legacy `module`/`config` connector instances continue to deserialize until
-their Task-13 migration. The new branch is strict and accepts no literal
-credential value, runtime resolver kind, package URL, implementation path, or
-credential operation.
+This extends the existing `ConnectorInstance { name, module, config,
+operations }`; it does not add a second untagged branch. Existing HTTP and
+Stripe fields continue to deserialize. `module` selects the compiled catalog
+connector, endpoint/credential identities stay in `config`, and enabled
+operations stay explicit. `source` remains absent here: it is reserved for
+the distinct Spec 005 database/process source binding. The credential object
+accepts no literal value, runtime resolver kind, package URL, implementation
+path, or credential operation.
 
 **Server interfaces:**
 
@@ -1026,24 +1337,40 @@ Add exact tests:
 Use an in-memory fake resolver whose value changes between calls and whose
 call log records only reference identities. Use compile-fail fixtures for the
 forbidden trait implementations and raw getter.
+`connector_credentials_compile_fail.rs` is the exact trybuild runner:
+
+```rust
+#[test]
+fn credential_capability_surface_is_sealed() {
+    let tests = trybuild::TestCases::new();
+    tests.compile_fail("tests/compile_fail/credential_capability_*.rs");
+}
+```
+
+Add `trybuild = "1.0"` to workspace dependencies and
+`trybuild = { workspace = true }` to `donat-server` dev-dependencies; commit
+the resulting exact lockfile version.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
 cargo test -p donat-metadata community_credential
 cargo test -p donat-server --test connector_credentials
+cargo test -p donat-server --test connector_credentials_compile_fail
 ```
 
-Expected: the new YAML field `source` is unknown and the server test target is
+Expected: `config.credential` is unknown and both new server test targets are
 absent.
 
 - [ ] **Step 3: Implement strict metadata selection**
 
-Represent legacy and catalog-backed instances as a strict untagged enum whose
-branches cannot overlap. Validate the `CredentialSpecId` against the generated
-catalog, every field against the selected spec, and every environment
-variable name before the listener opens. Store only the source instance,
-credential identity, and references in the immutable registry.
+Add the strict optional credential object to existing `ConnectorConfig`.
+Validate `module` against the generated catalog, `CredentialSpecId` against
+that module, every credential field against the selected spec, every enabled
+operation against the module, and every environment variable name before the
+listener opens. Store only module/instance identity, endpoint identity,
+credential identity, enabled operations, and secret references in the
+immutable registry.
 
 - [ ] **Step 4: Implement read-only resolution and opaque consumption**
 
@@ -1059,20 +1386,25 @@ never receive raw credential bytes.
 ```bash
 cargo test -p donat-metadata community_credential
 cargo test -p donat-server --test connector_credentials
-rg -n "CredentialCapability.*(Clone|Debug|Serialize)|fn (get|expose|value)" \
-  crates/server/src/connectors
+cargo test -p donat-server --test connector_credentials_compile_fail
+if rg -n "CredentialCapability.*(Clone|Debug|Serialize)|fn (get|expose|value)" \
+  crates/server/src/connectors/credentials.rs; then
+  exit 1
+fi
 ```
 
-Expected: both test commands pass and the scan has no capability trait
-derivation or raw-value API match.
+Expected: all tests pass and the inverted scan exits zero only when there is
+no capability trait derivation or raw-value API match.
 
 - [ ] **Step 6: Commit the credential boundary**
 
 ```bash
-git add crates/metadata crates/server/src/connectors/credentials.rs \
+git add Cargo.toml Cargo.lock crates/metadata \
+  crates/server/src/connectors/credentials.rs \
   crates/server/src/connectors/mod.rs crates/server/src/state.rs \
-  crates/server/tests/connector_credentials.rs crates/server/Cargo.toml \
-  Cargo.lock
+  crates/server/tests/connector_credentials.rs \
+  crates/server/tests/connector_credentials_compile_fail.rs \
+  crates/server/tests/compile_fail crates/server/Cargo.toml
 git commit -m "feat(connectors): add per-use credential capabilities"
 ```
 
@@ -1208,10 +1540,17 @@ git commit -m "refactor(connectors): centralize fixed-origin execution"
 - Create: `crates/conformance/fixtures/connectors/catalog_startup/query.graphql`
 - Create: `crates/conformance/fixtures/connectors/catalog_startup/expected.json`
 - Create: `crates/conformance/tests/connector_public_surfaces.rs`
+- Create: `crates/connector-catalog/sources/records/donat-owned-stripe-v1.yaml`
 - Create: `crates/connector-catalog/manifests/donat-owned-stripe-compat-v1.yaml`
-- Create: `crates/connector-catalog/src/generated/donat_owned_stripe_compat.rs`
-- Modify: `crates/connector-catalog/src/generated/mod.rs`
-- Modify: `crates/connector-catalog/src/generated/catalog.digest`
+- Generate: `crates/connector-catalog/src/generated/donat_owned_stripe_compat.rs`
+- Generate: `crates/connector-catalog/src/generated/mod.rs`
+- Generate: `crates/connector-catalog/src/generated/catalog.digest`
+- Create: `crates/connector-codegen/tests/donat_owned_stripe.rs`
+- Create:
+  `crates/connector-codegen/tests/snapshots/donat_owned_stripe__compat.snap`
+- Modify: `crates/connector-codegen/src/render.rs`
+- Modify: `crates/connector-codegen/tests/deterministic_catalog.rs`
+- Create: `scripts/check_connector_public_surfaces.py`
 - Modify: `crates/server/src/connectors/mod.rs`
 - Modify: `crates/server/src/state.rs`
 - Modify: `crates/server/src/main.rs`
@@ -1228,7 +1567,7 @@ pub struct ConnectorRegistry {
 }
 
 struct CatalogInstance {
-    source: &'static GeneratedConnectorEntry,
+    module: &'static GeneratedConnectorEntry,
     credential: Option<CredentialInstanceBinding>,
 }
 ```
@@ -1243,10 +1582,12 @@ catch-all executor.
 Add exact tests:
 
 - `catalog_instance_selects_only_generated_connector`;
-- `unknown_source_fails_before_listen`;
-- `inventory_only_source_fails_before_listen`;
+- `unknown_module_fails_before_listen`;
+- `inventory_only_module_cannot_enable_an_operation`;
 - `generated_processor_id_resolves_without_conversion`;
 - `registry_has_no_dynamic_registration_or_fallback`;
+- `stripe_manifest_requires_matching_donat_owned_record`;
+- `unrelated_donat_owned_record_cannot_satisfy_stripe_manifest`;
 - `unknown_webhook_instance_is_exact_empty_404`;
 - `graphql_rest_mcp_and_metadata_have_no_connector_execution_surface`.
 
@@ -1272,41 +1613,96 @@ contains the hand-written `RegistryInstance` branches.
 
 - [ ] **Step 3: Implement immutable catalog selection**
 
-Compile instance source and operation lookup entirely at startup. Join exact
+Compile instance module and operation lookup entirely at startup. Join exact
 ABI-owned IDs without strings, parsing, serialization, or wrapper copying.
-Unknown source, unknown operation, credential mismatch, unresolved processor,
+Unknown module, unknown operation, credential mismatch, unresolved processor,
 or unsupported manifest feature is a startup error. Keep inventory-only
 records outside generated executable entries.
 
-- [ ] **Step 4: Delete the generic module dispatch shape**
+- [ ] **Step 4: Create the Donat-owned Stripe record before its manifest**
+
+Pin the implementation-base Git commit and recomputed SHA-256 values for
+`crates/server/src/connectors/stripe.rs`,
+`crates/server/src/connector_webhook.rs`,
+`crates/server/tests/connectors_stripe.rs`, and
+`crates/server/tests/connector_webhook.rs`. The
+`DonatOwnedSource` record names the exact compatibility RED tests and proposes
+both manifests:
+
+```text
+crates/connector-catalog/manifests/donat-owned-stripe-compat-v1.yaml
+crates/connector-catalog/manifests/donat-owned-stripe-webhook-v1.yaml
+```
+
+It also enumerates the processor/server/generated destinations used by Tasks
+13, 15, and 16. Create and validate this record before either manifest.
+`donat-owned-http-v1.yaml` must fail the Stripe manifest/source identity
+check.
+
+- [ ] **Step 5: Render and review the compatibility entry**
+
+Create the manifest only after Step 4 passes. Never create or edit generated
+Rust or `catalog.digest` by hand:
+
+```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+Review every path/byte in the diff. Then update through the generator and
+prove reproducibility:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
+cargo run -p donat-connector-codegen -- generate --check
+cargo insta test -p donat-connector-codegen donat_owned_stripe
+cargo insta review
+```
+
+- [ ] **Step 6: Delete the generic module dispatch shape**
 
 Delete `ConnectorModule`, `ConnectorDefinition`, `RegistryInstance`,
 `built_in_module_names`, and the `"http"`/`"stripe"` module match only after
-equivalent static entries are present. Until Task 13 migrates Stripe, its
+equivalent static entries are present. Until Task 15 migrates Stripe, its
 generated Donat-owned compatibility entry contains configuration and trigger
 identity but no executable `OperationSpec`; a private fixed server function
 pointer reaches the existing adapter for its direct Rust behavior oracle.
 There is no string dispatch or process/public exposure. Preserve every current
 inbound webhook result and the exact empty-body 404.
 
-- [ ] **Step 5: Run GREEN and public-surface proof**
+- [ ] **Step 7: Run GREEN and scoped public-surface proof**
 
 ```bash
 cargo test -p donat-server --test connector_catalog
 cargo test -p donat-server --test connector_webhook
 cargo test -p donat-conformance --test connectors
 cargo test -p donat-conformance --test connector_public_surfaces
-rg -n "/execute|execute_connector|RegistryInstance|register_connector" \
-  crates/server/src crates/schema/src crates/conformance
+python3 scripts/check_connector_public_surfaces.py
+if rg -n "RegistryInstance|register_connector" \
+  crates/server/src/connectors crates/server/src/main.rs; then
+  exit 1
+fi
+cargo run -p donat-connector-codegen -- generate --check
 ```
 
-Expected: tests pass; the scan has no public connector-execution route or
-dynamic registry implementation.
+The structural checker examines only runtime registrations in
+`crates/server/src/main.rs`, `crates/server/src/lib.rs`,
+`crates/server/src/connector_webhook.rs`, `crates/server/src/rest.rs`,
+`crates/server/src/mcp.rs`, and `crates/schema/src/lib.rs`. It does not scan
+tests/fixtures, so the required negative `/execute` request remains legal.
+Its self-test inserts a synthetic route/tool/field registration and requires
+rejection.
 
-- [ ] **Step 6: Commit the static registry**
+- [ ] **Step 8: Commit the static registry**
 
 ```bash
-git add crates/connector-catalog crates/server crates/conformance Cargo.lock
+git add Cargo.lock crates/connector-catalog \
+  crates/connector-codegen/src/render.rs crates/connector-codegen/tests \
+  crates/server crates/conformance scripts/check_connector_public_surfaces.py
 git commit -m "refactor(connectors): consume the static connector catalog"
 ```
 
@@ -1318,6 +1714,10 @@ git commit -m "refactor(connectors): consume the static connector catalog"
 **Files:**
 
 - Create: `crates/connector-catalog/sources/records/serpapi-0.1.10.yaml`
+- Create:
+  `crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml`
+- Create:
+  `crates/connector-catalog/sources/provider-contracts/serpapi-search-v1.yaml`
 - Create: `crates/connector-acquire/tests/serpapi_admission.rs`
 - Modify: `knowledgebase/declarative-saas/reference-porting-register.md`
 
@@ -1328,6 +1728,7 @@ repository: https://github.com/serpapi/n8n-nodes-serpapi
 commit: e48b778878c043f30277b932c4c129804efee66d
 git_tree: 6916ca97c870b5045200a207dfaf9cb40341f24d
 package: n8n-nodes-serpapi@0.1.10
+tarball: https://registry.npmjs.org/n8n-nodes-serpapi/-/n8n-nodes-serpapi-0.1.10.tgz
 npm_integrity: sha512-E9tAU4c9mhNWr07s6RGeqzyrlQO8y42YvtMjPWuLf+tIEM8muU/RIgtp+ojhaoNVCP+jfrwmsSC75OIuoMVS9A==
 license: MIT
 license_sha256: 053cb0df9afcf71ac340bdddccb3c25b280a8645e64ba93a709ebc0fbe0f4e35
@@ -1349,7 +1750,79 @@ credentials/SerpApi.credentials.ts
   ab56494793bedf8636d5dc511ff678deaa76e2d1dabadca70412a3ac4f413ab9
 ```
 
-- [ ] **Step 1: Add the Donat-owned RED admission tests**
+**Pinned provider-contract evidence (immutable, behavior-only):**
+
+```text
+repository: https://github.com/serpapi/serpapi-python
+commit: f0cc2fea09bab5884825cbb7bd74f845c8713ea6
+git_tree: 8226e5b0a1a7500afc7876232447451c411aa59d
+license: MIT
+LICENSE:
+  736f1be87b07e93f70a7d98e0428c250b0a18283b5de62f2b4da2b4778086293
+README.md:
+  8c9a18b072a22c641124945dc30307c799f2b34244b98b899f777cd22bc5e883
+serpapi/core.py:
+  f3f25be8053323dfc5ab58f841c626bac4eb1ecbf06b4ff2616481feee0aae6a
+serpapi/http.py:
+  d9fb4f908ce472d2a8e05bef41f7493dbfd710e37c78eef305c9dcd98399a845
+tests/example_search_google_test.py:
+  f63b1953fbd43552795f1545e298a495f3b2c08d15d584e01ffc570f302f6c8d
+```
+
+This official SerpApi repository is an immutable `ProviderArtifact` used
+behavior-only; no provider wrapper code or fixture is copied or translated.
+The record pins exact fact locations and normalized facts:
+
+- `serpapi/core.py:34-77`: Google-capable search, `GET`, JSON default, and
+  typed result construction;
+- `serpapi/http.py:11-69`: fixed `https://serpapi.com`, API-key query binding,
+  and generic HTTP-error propagation;
+- `tests/example_search_google_test.py:6-14`: a successful Google query has
+  `organic_results`;
+- `README.md:48-70`: `400` missing-parameter, `401` authentication, and `429`
+  throughput/account-limit examples.
+
+The mutable pages at `https://serpapi.com/search-api`,
+`https://serpapi.com/organic-results`, and
+`https://serpapi.com/api-status-and-error-codes` are discovery links only.
+Their dynamic HTML is neither hashed nor admitted. Missing
+`/organic_results` becomes an empty list as a Donat-owned totalization, not a
+provider promise. Exact `[200]` success, rejection of a `200` body containing
+a top-level `error`, and generic `403`/`5xx` normalization are conservative
+Donat-owned restrictions under Task 8; `requests.raise_for_status()` is not
+misrepresented as an exact-200 check. No other provider-specific response or
+error assumption is admitted.
+
+`serpapi-search-provider-v1.yaml` uses the strict `ProviderArtifact` subject
+and owns these immutable provider facts. `serpapi-0.1.10.yaml` uses
+`ExactNpm` and references that provider-contract record; one source record
+never pretends to have two subjects.
+
+- [ ] **Step 1: Acquire exact bytes into ignored quarantine**
+
+This is the explicit networked review step:
+
+```bash
+quarantine=.donat/connector-quarantine/serpapi-0.1.10
+test ! -e "$quarantine"
+cargo run -p donat-connector-acquire -- acquire-review \
+  --artifact-url \
+  https://registry.npmjs.org/n8n-nodes-serpapi/-/n8n-nodes-serpapi-0.1.10.tgz \
+  --expected-integrity \
+  sha512-E9tAU4c9mhNWr07s6RGeqzyrlQO8y42YvtMjPWuLf+tIEM8muU/RIgtp+ojhaoNVCP+jfrwmsSC75OIuoMVS9A== \
+  --repository-url https://github.com/serpapi/n8n-nodes-serpapi.git \
+  --commit e48b778878c043f30277b932c4c129804efee66d \
+  --provider-repository-url https://github.com/serpapi/serpapi-python.git \
+  --provider-commit f0cc2fea09bab5884825cbb7bd74f845c8713ea6 \
+  --output "$quarantine"
+```
+
+Inspect the quarantine inventory, donor source tree, tarball, provider source
+tree, both repository trees, every admitted file hash, both licenses, scripts,
+dependencies, and embedded material. Nothing under
+`.donat/connector-quarantine/` is staged.
+
+- [ ] **Step 2: Add the Donat-owned RED admission tests**
 
 Add exact tests:
 
@@ -1358,53 +1831,95 @@ Add exact tests:
 - `serpapi_license_and_notice_are_complete`;
 - `serpapi_dependency_dispositions_are_closed`;
 - `serpapi_n8n_workflow_is_type_only_replaced`;
+- `serpapi_provider_repository_covers_only_pinned_protocol_facts`;
+- `serpapi_success_body_and_unmapped_status_normalization_is_donat_owned`;
+- `serpapi_npm_record_references_matching_provider_contract`;
 - `serpapi_record_is_not_executable_without_manifest`.
 
 The test owns expected identities and hashes in Rust; it does not trust values
 parsed from the record itself.
 
-- [ ] **Step 2: Run RED before creating the record**
+- [ ] **Step 3: Run RED before creating the record**
 
 ```bash
 cargo test -p donat-connector-acquire --test serpapi_admission
 ```
 
 Expected: the test fails because
-`sources/records/serpapi-0.1.10.yaml` is absent.
+`sources/records/serpapi-0.1.10.yaml`,
+`sources/records/serpapi-search-provider-v1.yaml`, and the normalized
+provider contract are absent.
 
-- [ ] **Step 3: Create the complete pre-port record**
+- [ ] **Step 4: Create the complete provider and donor pre-port records**
 
 Record `n8n-workflow: "*"` as `TypeOnlyReplaced`; record all other package,
 embedded, and tool dependencies with a closed disposition. Approve only
 Google search descriptor inventory, the fixed `https://serpapi.com` provider
-origin, `GET /search.json`, query encoding, JSON decoding, and static API-key
-credential shape. Classify any imperative/function-valued source as a
-reviewed work item. Mark the source record inventory-only because no
-normalized manifest or Donat-owned behavior test exists yet.
+origin, `GET /search.json`, query encoding, JSON decoding, static API-key
+credential shape, the `/organic_results` example, and the exact
+`400`/`401`/`429` examples in the pinned provider repository. Record exact
+`[200]` success, top-level-error rejection on a `200` body, missing-as-empty,
+and generic `403`/`5xx` normalization separately as conservative Donat-owned
+behavior. Classify any imperative/function-valued source as a reviewed work
+item. Use the complete Task-3 `ExactNpm` structure, Tier A compatibility,
+proposed manifest/destinations, notice identity, repository mapping, and
+`ApprovedForPort { operations: [search.google] }` state only after the exact
+RED tests from Step 2 exist. Approval authorizes the narrow port; it does not
+make anything executable without a matching generated manifest.
 
-- [ ] **Step 4: Add the register pre-port row**
+Create the strict `ProviderArtifact` record and normalized provider contract
+first, then create the `ExactNpm` donor record that references them. The
+provider record contains no npm fields; the donor record cannot inline or
+rewrite the provider facts. Mark the provider record
+`EvidenceAccepted { contracts: [serpapi.search.v1] }`; that state authorizes
+only the fact contract, not executable catalog entry generation.
 
-Add an admission row with the exact commit, git tree, npm integrity, five
-per-file hashes, MIT license hash and notice, proposed destinations, RED test
-IDs, and reviewer. Do not add a derivative destination, generated file,
-runtime adapter, notice bundle, or executable manifest in this task.
+- [ ] **Step 5: Add the register pre-port row**
 
-- [ ] **Step 5: Run GREEN and verify offline**
+Add separate linked admission rows for the donor and provider records. Record
+the exact donor commit/tree, npm integrity, five per-file hashes, MIT license
+hash and notice, proposed destinations, RED test IDs, the provider repository
+commit/tree, five provider file hashes and fact IDs, the Donat-owned
+normalization facts, and reviewer. Record proposed destinations without
+creating a derivative destination, generated file, runtime adapter, notice
+bundle, or executable manifest in this task.
+
+- [ ] **Step 6: Check the record, then verify it against quarantined bytes**
 
 ```bash
 cargo test -p donat-connector-acquire --test serpapi_admission
-cargo run -p donat-connector-acquire -- verify \
+cargo run -p donat-connector-acquire -- check-record \
   --record crates/connector-catalog/sources/records/serpapi-0.1.10.yaml
+cargo run -p donat-connector-acquire -- check-record \
+  --record \
+  crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml
+cargo run -p donat-connector-acquire -- verify \
+  --record crates/connector-catalog/sources/records/serpapi-0.1.10.yaml \
+  --artifact .donat/connector-quarantine/serpapi-0.1.10/package.tgz \
+  --source-tree .donat/connector-quarantine/serpapi-0.1.10/source
+cargo run -p donat-connector-acquire -- verify \
+  --record \
+  crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml \
+  --artifact \
+  .donat/connector-quarantine/serpapi-0.1.10/provider-source.tar \
+  --source-tree \
+  .donat/connector-quarantine/serpapi-0.1.10/provider-source
 cargo test -p donat-connector-catalog source_record
 ```
 
-Expected: the record verifies from pinned local test material, remains
-inventory-only, and no donor script or JavaScript executes.
+Expected: `check-record` proves only internal consistency; `verify` recomputes
+the npm integrity, both Git trees, and every donor/provider source and license
+hash from explicit local bytes. The donor record is approved only for the
+narrow port, the provider record is accepted only for its fact contract, no
+manifest is executable yet, and no donor or provider-wrapper script or
+JavaScript executes.
 
-- [ ] **Step 6: Commit admission separately**
+- [ ] **Step 7: Commit admission separately**
 
 ```bash
 git add crates/connector-catalog/sources/records/serpapi-0.1.10.yaml \
+  crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml \
+  crates/connector-catalog/sources/provider-contracts/serpapi-search-v1.yaml \
   crates/connector-acquire/tests/serpapi_admission.rs \
   knowledgebase/declarative-saas/reference-porting-register.md
 git commit -m "docs(connectors): admit pinned SerpAPI source"
@@ -1418,19 +1933,21 @@ git commit -m "docs(connectors): admit pinned SerpAPI source"
 **Files:**
 
 - Create: `crates/connector-catalog/manifests/serpapi-0.1.10.yaml`
-- Create: `crates/connector-catalog/src/generated/serpapi.rs`
+- Generate: `crates/connector-catalog/src/generated/serpapi.rs`
+- Generate: `crates/connector-catalog/src/generated/mod.rs`
+- Generate: `crates/connector-catalog/src/generated/catalog.digest`
 - Create: `crates/connector-codegen/tests/serpapi_compile.rs`
 - Create: `crates/connector-codegen/tests/snapshots/serpapi_compile__canonical_ir.snap`
+- Modify: `crates/connector-codegen/src/render.rs`
 - Create: `crates/metadata/tests/fixtures/connectors/serpapi.yaml`
 - Create: `crates/server/tests/connectors_serpapi.rs`
 - Create: `crates/conformance/fixtures/connectors/serpapi_startup/metadata.yaml`
 - Create: `crates/conformance/fixtures/connectors/serpapi_startup/query.graphql`
 - Create: `crates/conformance/fixtures/connectors/serpapi_startup/expected.json`
 - Create: `THIRD_PARTY_NOTICES.md`
-- Modify: `crates/connector-catalog/src/generated/mod.rs`
-- Modify: `crates/connector-catalog/src/generated/catalog.digest`
+- Create: `policy/connector-legal-notices.toml`
 - Modify: `crates/connector-codegen/tests/deterministic_catalog.rs`
-- Modify: `crates/metadata/tests/loader.rs`
+- Modify: `crates/metadata/tests/types_serde.rs`
 - Modify: `crates/server/src/connectors/catalog.rs`
 - Modify: `crates/conformance/tests/connectors.rs`
 - Modify: `knowledgebase/declarative-saas/reference-porting-register.md`
@@ -1479,6 +1996,7 @@ output:
   results:
     type: "[json!]!"
     from_json_pointer: /organic_results
+    missing: empty_list
 bounds:
   calls: 1
   pages: 1
@@ -1496,6 +2014,7 @@ Create the test files first, without a manifest, generated entry, runtime
 adapter, or notice. Add exact tests:
 
 - `serpapi_exact_source_compiles`;
+- `serpapi_manifest_requires_matching_provider_record_and_facts`;
 - `serpapi_canonical_ir_matches_reviewed_contract`;
 - `serpapi_prepared_request_is_fixed_and_headerless`;
 - `serpapi_query_is_encoded_once`;
@@ -1521,13 +2040,39 @@ register before creating derivative files.
 
 - [ ] **Step 3: Add one normalized manifest and generate Rust**
 
-Translate only the admitted Google-search fields whose five source hashes are
-fixed in Task 10. Put the source-record ID, full commit, git tree, package
-integrity, each contributing source path/hash, license/notice ID, RED tests,
-and destination paths in the manifest header. Run generation, inspect the
-Rust and digest, and reject any imported display name, icon, UI condition,
-workflow item, expression, function body, JavaScript, arbitrary engine, or
-arbitrary request field.
+Translate only donor fields covered by Task 10's five source hashes and
+provider facts covered by its exact immutable official-repository commit,
+tree, file hashes, and fact locations. Fixed origin, `GET /search`, JSON
+default, API-key binding, the `/organic_results` example, and
+`400`/`401`/`429` examples cite those provider fact IDs; they are not
+attributed to the n8n donor. Exact `[200]` success, top-level-error rejection
+on a `200` body, missing-as-empty, and generic `403`/`5xx` normalization cite
+separate Donat-owned fact IDs. Put the source-record ID, provider-record ID,
+both full commits/trees, package integrity, contributing source paths/hashes,
+provider and Donat-owned fact IDs, license/notice ID, RED tests, and
+destination paths in the manifest header. Reject any display name, icon, UI
+condition, workflow item, expression, function body, JavaScript, arbitrary
+engine, or arbitrary request field.
+
+Render to a temporary directory and review before updating checked-in output:
+
+```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+After inspecting every changed path/byte, run:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
+cargo run -p donat-connector-codegen -- generate --check
+```
+
+Never edit `serpapi.rs`, `mod.rs`, or `catalog.digest` manually.
 
 - [ ] **Step 4: Complete notices and per-file port records**
 
@@ -1546,9 +2091,17 @@ path, adaptation boundary, exact RED test, reviewed generation command, and
 reviewer/date. `package.json` and `LICENSE.md` remain provenance inputs rather
 than translated code and retain their admission entries.
 
+Compute the complete notice bundle's SHA-256 after review and record the exact
+lower-case 64-hex digest with path `THIRD_PARTY_NOTICES.md` in
+`policy/connector-legal-notices.toml`. The policy allows the whole file only
+when that exact hash matches; it does not allow an `n8n` package, source path,
+symbol, or dependency identity.
+
 - [ ] **Step 5: Wire metadata and internal direct execution**
 
-Accept the Task-7 `source: serpapi` instance and its API-key reference.
+Accept the Task-7 `module: serpapi` instance, endpoint/credential identities,
+enabled `search.google` operation, and API-key reference. Do not add a
+connector metadata `source`; the future Spec 005 source binding is distinct.
 Execution remains an internal registry method used only by Rust tests; add no
 route, GraphQL field, REST endpoint, MCP tool, command syntax, or process
 descriptor. The shared executor performs the fixed request and validates the
@@ -1571,16 +2124,21 @@ cargo test -p donat-conformance --test connectors serpapi_startup
 - [ ] **Step 7: Prove SUL absence**
 
 ```bash
-rg -n "n8n-workflow|IExecuteFunctions|INodeType|pairedItem|\\$node|\\$workflow" \
+if rg -n "n8n-workflow|IExecuteFunctions|INodeType|pairedItem|\\$node|\\$workflow" \
   crates/connector-catalog/manifests/serpapi-0.1.10.yaml \
   crates/connector-catalog/src/generated/serpapi.rs \
-  crates/server/tests/connectors_serpapi.rs THIRD_PARTY_NOTICES.md
+  crates/server/tests/connectors_serpapi.rs; then
+  exit 1
+fi
+notice_sha256=$(sha256sum THIRD_PARTY_NOTICES.md | cut -d' ' -f1)
+rg -q "sha256 = \"${notice_sha256}\"" policy/connector-legal-notices.toml
 cargo tree -p donat-server --target all --edges normal,build,no-dev \
   --offline --locked
 ```
 
-Expected: the source scan has no SUL API match and the runtime tree contains
-no npm, n8n, Node, JavaScript, or donor package.
+Expected: the inverted source scan exits zero with no SUL API match, the exact
+legal notice hash is allowlisted, and the runtime tree contains no npm, n8n
+runtime dependency, Node, JavaScript, or donor package.
 
 - [ ] **Step 8: Commit the derivative port**
 
@@ -1588,7 +2146,7 @@ no npm, n8n, Node, JavaScript, or donor package.
 git add crates/connector-catalog crates/connector-codegen \
   crates/metadata/tests crates/server/src/connectors/catalog.rs \
   crates/server/tests/connectors_serpapi.rs crates/conformance \
-  THIRD_PARTY_NOTICES.md \
+  THIRD_PARTY_NOTICES.md policy/connector-legal-notices.toml \
   knowledgebase/declarative-saas/reference-porting-register.md
 git commit -m "feat(connectors): add admitted SerpAPI search"
 ```
@@ -1608,8 +2166,13 @@ git commit -m "feat(connectors): add admitted SerpAPI search"
 - Modify: `crates/connector-catalog/src/model.rs`
 - Modify: `crates/connector-catalog/src/lib.rs`
 - Modify: `crates/connector-catalog/manifests/donat-owned-http-v1.yaml`
-- Modify: `crates/connector-catalog/src/generated/donat_owned_http.rs`
-- Modify: `crates/connector-catalog/src/generated/catalog.digest`
+- Generate: `crates/connector-catalog/src/generated/donat_owned_http.rs`
+- Generate: `crates/connector-catalog/src/generated/mod.rs`
+- Generate: `crates/connector-catalog/src/generated/catalog.digest`
+- Modify: `crates/connector-codegen/src/render.rs`
+- Modify: `crates/connector-codegen/tests/deterministic_catalog.rs`
+- Create:
+  `crates/connector-codegen/tests/snapshots/deterministic_catalog__pagination.snap`
 - Modify: `crates/server/src/connectors/executor.rs`
 - Modify: `crates/server/src/connectors/mod.rs`
 
@@ -1685,6 +2248,19 @@ no cursor, checkpoint, lease, retry, or workflow static data.
 - [ ] **Step 5: Regenerate and run GREEN**
 
 ```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+Review the renderer, manifest, snapshot, generated Rust, and digest diff.
+Then update only through the generator:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
 cargo test -p donat-connector-catalog --test pagination_plan
 cargo test -p donat-server --test connector_pagination
 cargo run -p donat-connector-codegen -- generate --check
@@ -1695,7 +2271,8 @@ cargo insta review
 - [ ] **Step 6: Commit the bounded pagination slice**
 
 ```bash
-git add crates/connector-catalog crates/server/src/connectors \
+git add crates/connector-catalog crates/connector-codegen/src/render.rs \
+  crates/connector-codegen/tests crates/server/src/connectors \
   crates/server/tests/connector_pagination.rs
 git commit -m "feat(connectors): add bounded compiled pagination"
 ```
@@ -1703,105 +2280,326 @@ git commit -m "feat(connectors): add bounded compiled pagination"
 
 ---
 
-### Task 13: Migrate Stripe through the compiled-step processor ABI
+### Task 13: Prove the Stripe processor boundary without changing runtime routing
 
 **Files:**
 
-- Create: `crates/connector-catalog/sources/records/stripe-checkout-v1.yaml`
-- Create: `crates/connector-catalog/manifests/stripe-checkout-v1.yaml`
-- Create on the admitted branch only:
-  `crates/connector-catalog/sources/provider-contracts/stripe-idempotency-v1.yaml`
-- Create on the admitted branch only:
-  `crates/connector-catalog/src/generated/stripe_checkout.rs`
-- Create: `crates/connector-catalog/tests/stripe_admission.rs`
 - Create: `crates/connector-processors/src/stripe_checkout.rs`
 - Create: `crates/connector-processors/tests/stripe_checkout.rs`
 - Modify: `crates/connector-processors/src/registry.rs`
-- Modify: `crates/connector-catalog/src/generated/mod.rs`
-- Modify: `crates/connector-catalog/src/generated/catalog.digest`
-- Modify: `crates/server/src/connectors/stripe.rs`
-- Modify: `crates/server/src/connectors/catalog.rs`
-- Modify: `crates/server/tests/connectors_stripe.rs`
-- Modify: `knowledgebase/declarative-saas/reference-porting-register.md`
 
-**Migration boundary:**
+**Proof boundary:**
 
-- Existing independently authored Donat Rust and Donat-owned tests are the
-  behavior oracle.
-- The processor validates typed input, creates bindings only for
-  `CompiledStepId("create_session")`, calls `ConnectorIo`, and normalizes
-  `id`, `url`, `status`, and `expires_at`.
-- The server retains fixed `https://api.stripe.com`, form encoding,
-  authorization and idempotency headers, credential materialization, reqwest,
-  DNS/peer checks, JSON codec, UUID/text/time, crypto, clock, deadline, and
-  control.
-- No n8n Stripe source, fixture, description, helper, or runtime type is used.
+- This task is processor-only. It creates no `OperationSpec`, manifest,
+  generated catalog entry, server route, credential mapping, or transport
+  adapter.
+- The current server-owned Stripe adapter, static inventory entry, and all
+  existing request/result/error tests remain byte-for-byte unchanged.
+- Independently authored Donat behavior is the oracle. No n8n Stripe source,
+  fixture, description, helper, workflow mechanic, or runtime type is used.
+- The processor accepts typed input, binds only the ABI-owned
+  `CompiledStepId` for `create_session`, calls a fake `ConnectorIo` in tests,
+  and normalizes `id`, `url`, `status`, and `expires_at`. It cannot construct
+  transport, credentials, headers, retry state, or process state.
 
-- [ ] **Step 1: Add the Donat-owned RED migration tests**
+- [ ] **Step 1: Add the processor-only RED tests**
 
-Before adding the processor or generated entry, add exact tests:
+Add exact tests:
 
-- `stripe_processor_preserves_existing_request_result_and_error_contract`;
+- `stripe_processor_preserves_donat_owned_input_and_result_contract`;
 - `stripe_processor_calls_only_create_session_step`;
+- `stripe_processor_passes_exact_copy_abi_ids_without_conversion`;
 - `stripe_processor_cannot_construct_transport_or_credentials`;
 - `stripe_processor_observes_control_checks`;
-- `stripe_catalog_effect_requires_immutable_provider_evidence`;
-- `stripe_without_retention_evidence_is_inventory_only`;
-- `stripe_existing_form_header_result_and_error_tests_remain_unchanged`.
+- `stripe_processor_registry_is_private_and_static`;
+- `stripe_runtime_adapter_is_unchanged_by_processor_proof`.
 
-The first test reuses independently authored values but does not copy current
-implementation code into its expected result.
+The last test is a repository-structure assertion over the pre-existing
+runtime registration files. The processor test uses only fake `ConnectorIo`
+and Donat-owned values; it must not depend on `donat-server`.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
 cargo test -p donat-connector-processors --test stripe_checkout
-cargo test -p donat-connector-catalog --test stripe_admission
-cargo test -p donat-server --test connectors_stripe stripe_processor
+cargo test -p donat-connector-processors
 ```
 
-Expected: no Stripe processor/manifest exists and the current server module
-still performs transport directly.
+Expected: the processor family and private registry entry do not exist.
+Existing server tests remain green because this task does not touch their
+path:
 
-- [ ] **Step 3: Close the provider-evidence gate before executable admission**
+```bash
+cargo test -p donat-server --test connectors_stripe
+```
 
-Start from the pinned behavior-only Stripe OpenAPI identity:
+- [ ] **Step 3: Implement the narrow processor only**
+
+Implement pure input validation, exact compiled-step bindings, and result
+normalization. Register the sealed processor family/version in the private
+processor lookup. Preserve the exact ABI-owned `Copy` typed IDs from the
+static lookup through `ConnectorIo`; do not parse or allocate an ID bridge.
+Do not edit `crates/server`, `crates/connector-catalog`, metadata, or
+conformance fixtures.
+
+- [ ] **Step 4: Run GREEN and boundary checks**
+
+```bash
+cargo test -p donat-connector-processors --test stripe_checkout
+cargo test -p donat-connector-processors
+cargo test -p donat-server --test connectors_stripe
+python3 scripts/check_connector_processor_boundary.py
+```
+
+- [ ] **Step 5: Commit only the processor proof**
+
+```bash
+git add crates/connector-processors/src/stripe_checkout.rs \
+  crates/connector-processors/src/registry.rs \
+  crates/connector-processors/tests/stripe_checkout.rs
+git commit -m "feat(connectors): prove Stripe processor boundary"
+```
+
+
+---
+
+### Task 14: Admit immutable Stripe idempotency evidence or stop
+
+**Files:**
+
+- Create on acceptance:
+  `crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml`
+- Create on acceptance:
+  `crates/connector-catalog/sources/provider-contracts/stripe-idempotency-v1.yaml`
+- Create: `crates/connector-catalog/tests/stripe_provider_evidence.rs`
+- Create:
+  `crates/connector-catalog/tests/fixtures/stripe-mutable-evidence-rejected.yaml`
+- Modify on acceptance:
+  `knowledgebase/declarative-saas/reference-porting-register.md`
+
+**Hard gate:**
+
+This task must finish with an `EvidenceAccepted` provider-artifact source
+record before Task 15 starts. It creates no executable operation or server
+routing.
+If immutable provider evidence cannot prove every required fact, the task
+leaves Stripe inventory-only, records the rejected candidate in test
+fixtures rather than the accepted register, and the implementation plan
+stops before Task 15. The successful Task 13 processor proof remains inert.
+
+The accepted record pins all four contract values:
+
+```yaml
+fixed_binding: { header: Idempotency-Key }
+scope: stripe.account.v1
+minimum_retention_ms: 86400000
+clock_safety_margin_ms: 300000
+```
+
+The header, account scope, and minimum retention require Stripe-authored
+evidence. The positive clock margin is a Donat-owned conservative policy
+recorded in the same contract with `origin: donat_policy`; it must not be
+misattributed to Stripe.
+
+- [ ] **Step 1: Add strict RED evidence tests**
+
+Add exact tests:
+
+- `stripe_provider_contract_rejects_mutable_locator_only`;
+- `stripe_provider_contract_requires_exact_header_scope_and_retention`;
+- `stripe_provider_contract_records_positive_donat_clock_margin`;
+- `stripe_provider_contract_hashes_complete_evidence_bytes`;
+- `stripe_provider_contract_is_offline_reverifiable`;
+- `stripe_operation_spec_requires_accepted_provider_contract`;
+- `stripe_unaccepted_provider_contract_remains_inventory_only`.
+
+The tests use the closed `ProviderArtifact` source-record variant from Task
+3. A test assertion, existing adapter behavior, blog post, mutable page
+locator, or OpenAPI endpoint shape cannot substitute for retention evidence.
+
+- [ ] **Step 2: Record candidate evidence identities without admitting them**
+
+The acquisition review starts from these exact behavior-only identities:
 
 ```text
-repository: https://github.com/stripe/openapi
-commit: 6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69
-source: openapi/spec3.json
-sha256: e24a26de4188fd64dec4c043d5d3726277fdcb07556a493ea481c305b0a223d8
-license: MIT
+Stripe OpenAPI:
+  repository: https://github.com/stripe/openapi
+  commit: 6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69
+  source: openapi/spec3.json
+  sha256: e24a26de4188fd64dec4c043d5d3726277fdcb07556a493ea481c305b0a223d8
+  license: MIT
+
+Stripe idempotent requests page:
+  url: https://docs.stripe.com/api/idempotent_requests?lang=curl
+  accessed_utc: 2026-07-29
+
+Stripe low-level errors page:
+  url: https://docs.stripe.com/error-low-level?locale=en-GB
+  accessed_utc: 2026-07-29
 ```
 
-The provider-contract record must additionally pin immutable evidence for all
-four executable facts: exact `Idempotency-Key` header binding, Stripe-account
-API namespace, conservative minimum retention of 86,400,000 ms, and a
-300,000 ms positive clock margin. Record the immutable URL/revision, complete
-document SHA-256, extracted fact locations, retrieval date, license/terms
-disposition, and reviewer.
+The two documentation URLs are mutable candidate locators. Their current
+bytes are deliberately not assigned a reproducible-hash or admission claim.
+An accepted record must add a Stripe-owned immutable revision or immutable
+provider artifact, complete-byte SHA-256, exact fact locations, retrieval
+date, terms/redistribution disposition, and reviewer. Do not check copied
+Stripe HTML into the repository unless its redistribution terms have been
+reviewed and recorded.
 
-If any of those facts lacks immutable admissible evidence, stop executable
-admission: keep `stripe-checkout-v1.yaml` as inventory-only, make
-`stripe_without_retention_evidence_is_inventory_only` pass, omit
-`stripe_checkout.rs` from generated executable entries, and continue only
-with the processor migration under Donat-owned direct tests. A current web
-page, example assertion, or the existing request test cannot substitute for
-retention evidence.
+- [ ] **Step 3: Quarantine network acquisition and verify offline**
 
-- [ ] **Step 4: Implement the narrow processor and server-owned adapter**
+Network access is allowed only for the explicit acquisition command:
 
-Move only pure validation/binding/result normalization into
-`stripe_checkout.rs`. Delete Stripe's duplicate reqwest/DNS/peer transport and
-route `create_session` through the shared `ConnectorIo`. Register the sealed
-processor family/version privately. Preserve exact form field ordering,
-header behavior, result fields, error classes/codes, one-call bound, and
-redaction.
+```bash
+stripe_review_dir=.donat/connector-quarantine/stripe-idempotency-v1
+test ! -e "$stripe_review_dir"
+cargo run -p donat-connector-acquire -- acquire-review \
+  --provider-evidence-url \
+  'https://docs.stripe.com/api/idempotent_requests?lang=curl' \
+  --provider-evidence-url \
+  'https://docs.stripe.com/error-low-level?locale=en-GB' \
+  --repository-url https://github.com/stripe/openapi.git \
+  --commit 6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69 \
+  --output "$stripe_review_dir"
+```
 
-- [ ] **Step 5: Generate the catalog entry only if the gate passed**
+That command acquires the named mutable candidates for rejection testing. If
+review finds a qualifying immutable Stripe artifact, replace those two
+candidate locators with the exact immutable identities and expected hashes
+from the proposed record. The reviewed bytes then pass the offline command:
 
-When all immutable evidence is present, compile exactly:
+```bash
+cargo run -p donat-connector-acquire -- verify \
+  --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
+  --artifact "$stripe_review_dir/provider-evidence.bundle" \
+  --source-tree "$stripe_review_dir/openapi"
+```
+
+`verify` must fail on any byte, fact location, source identity, selected
+terms, or disposition mismatch. `check-record` is syntax-only and cannot
+admit the contract.
+
+- [ ] **Step 4: Run the acceptance gate**
+
+```bash
+cargo test -p donat-connector-catalog --test stripe_provider_evidence
+cargo run -p donat-connector-acquire -- check-record \
+  --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml
+cargo run -p donat-connector-acquire -- verify \
+  --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
+  --artifact "$stripe_review_dir/provider-evidence.bundle" \
+  --source-tree "$stripe_review_dir/openapi"
+```
+
+Expected on acceptance: all facts and complete evidence bytes verify and the
+record is `EvidenceAccepted`. Otherwise, keep the negative inventory test
+green and stop; do not create an approximation of Task 15.
+
+- [ ] **Step 5: Commit the evidence result without crossing the gate**
+
+On acceptance, commit the exact record, normalized provider contract, tests,
+rejected-candidate fixture, and register entry:
+
+```bash
+git add crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
+  crates/connector-catalog/sources/provider-contracts/stripe-idempotency-v1.yaml \
+  crates/connector-catalog/tests/stripe_provider_evidence.rs \
+  crates/connector-catalog/tests/fixtures/stripe-mutable-evidence-rejected.yaml \
+  knowledgebase/declarative-saas/reference-porting-register.md
+git commit -m "docs(connectors): admit Stripe idempotency contract"
+```
+
+Record this accepted commit hash as Task 15's non-negotiable prerequisite.
+If acceptance fails, commit only the negative fixture/test that keeps Stripe
+inventory-only:
+
+```bash
+git add crates/connector-catalog/tests/stripe_provider_evidence.rs \
+  crates/connector-catalog/tests/fixtures/stripe-mutable-evidence-rejected.yaml
+git commit -m "test(connectors): keep Stripe inventory-only without evidence"
+```
+
+Then stop this plan. That negative commit is not an accepted evidence commit
+and can never satisfy Task 15's precondition.
+
+
+---
+
+### Task 15: Migrate Stripe transport after the evidence gate
+
+**Files:**
+
+- Create: `crates/connector-catalog/manifests/stripe-checkout-v1.yaml`
+- Generate: `crates/connector-catalog/src/generated/stripe_checkout.rs`
+- Create: `crates/connector-catalog/tests/stripe_admission.rs`
+- Modify: `crates/connector-codegen/src/render.rs`
+- Modify: `crates/connector-codegen/tests/deterministic_catalog.rs`
+- Create: `crates/connector-codegen/tests/stripe_checkout.rs`
+- Create:
+  `crates/connector-codegen/tests/snapshots/stripe_checkout__canonical_ir.snap`
+- Generate: `crates/connector-catalog/src/generated/mod.rs`
+- Generate: `crates/connector-catalog/src/generated/catalog.digest`
+- Modify: `crates/server/src/connectors/stripe.rs`
+- Modify: `crates/server/src/connectors/catalog.rs`
+- Modify: `crates/server/tests/connectors_stripe.rs`
+
+**Precondition:**
+
+Task 14 has one reviewed `EvidenceAccepted` source record and commit proving
+the exact four-value contract. Verify and record that commit before RED. If
+the record is absent, inventory-only, mutable-locator-only, or fails offline
+verification, do not start this task.
+
+Only this task may create Stripe's executable `OperationSpec`, route
+`create_session` through shared `ConnectorIo`, and delete the old duplicate
+Stripe transport. The server retains fixed `https://api.stripe.com`, form
+encoding, authorization and idempotency header materialization, credentials,
+reqwest, DNS/peer checks, JSON codec, UUID/text/time, crypto, clock, deadline,
+and control.
+
+- [ ] **Step 1: Verify the evidence precondition**
+
+```bash
+accepted_stripe_evidence_commit=$(git log -1 --format=%H -- \
+  crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml)
+test -n "$accepted_stripe_evidence_commit"
+git merge-base --is-ancestor "$accepted_stripe_evidence_commit" HEAD
+stripe_review_dir=.donat/connector-quarantine/stripe-idempotency-v1
+test -f "$stripe_review_dir/provider-evidence.bundle"
+test -d "$stripe_review_dir/openapi"
+cargo test -p donat-connector-catalog --test stripe_provider_evidence
+cargo run -p donat-connector-acquire -- verify \
+  --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
+  --artifact "$stripe_review_dir/provider-evidence.bundle" \
+  --source-tree "$stripe_review_dir/openapi"
+```
+
+- [ ] **Step 2: Add RED migration and unchanged-oracle tests**
+
+Add exact tests:
+
+- `stripe_operation_requires_accepted_matching_provider_contract`;
+- `stripe_operation_compiles_exact_effect_values`;
+- `stripe_generated_ids_are_const_copy_abi_values`;
+- `stripe_routes_create_session_through_connector_io`;
+- `stripe_legacy_transport_is_absent_after_migration`;
+- `stripe_existing_form_header_result_and_error_tests_remain_unchanged`;
+- `stripe_processor_calls_connector_io_once`;
+- `stripe_migration_adds_no_process_dispatch_or_retry_state`.
+
+Run:
+
+```bash
+cargo test -p donat-connector-catalog --test stripe_admission
+cargo test -p donat-server --test connectors_stripe
+```
+
+Expected: the accepted evidence exists, but no executable Stripe operation or
+shared-executor route exists and the old adapter still owns transport.
+
+- [ ] **Step 3: Add the evidence-bound manifest**
+
+Compile exactly:
 
 ```yaml
 id: checkout.create_session
@@ -1817,52 +2615,94 @@ effect:
 processor: stripe.checkout.create_session.v1
 ```
 
-If the gate did not pass, the codegen negative test proves there is no
-executable Stripe entry. Neither branch adds process dispatch, a first-attempt
-timestamp, retry/takeover behavior, or an idempotency-horizon assumption.
+The manifest cites both the matching Donat-owned Stripe source record from
+Task 9 and the accepted provider-contract record from Task 14. Codegen
+rejects any value not exactly supported by those records.
+
+- [ ] **Step 4: Render to a temporary directory and review**
+
+```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+Review the manifest, renderer, renderer tests, snapshots, generated Rust, and
+digest. Update generated output only through the generator:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
+cargo run -p donat-connector-codegen -- generate --check
+cargo insta test -p donat-connector-codegen
+cargo insta review
+```
+
+Never hand-edit `stripe_checkout.rs`, `mod.rs`, or `catalog.digest`.
+
+- [ ] **Step 5: Route through the shared executor and remove old transport**
+
+Move only pure validation/binding/result normalization to the Task 13
+processor. Route the accepted operation through shared `ConnectorIo`; then
+delete Stripe's duplicate reqwest/DNS/peer implementation. Preserve exact
+form ordering, header behavior, result fields, error classes/codes, one-call
+bound, and redaction. Add no first-attempt timestamp, retry/takeover path,
+idempotency-window assumption, process dispatch, or public execution route.
 
 - [ ] **Step 6: Run GREEN and the unchanged behavior oracle**
 
 ```bash
-cargo test -p donat-connector-processors --test stripe_checkout
 cargo test -p donat-connector-catalog --test stripe_admission
+cargo test -p donat-connector-processors --test stripe_checkout
 cargo test -p donat-server --test connectors_stripe
 cargo test -p donat-server --test connector_executor
 cargo run -p donat-connector-codegen -- generate --check
 python3 scripts/check_connector_processor_boundary.py
 ```
 
-- [ ] **Step 7: Commit the Stripe migration**
+- [ ] **Step 7: Commit the executable migration**
 
 ```bash
-git add crates/connector-catalog crates/connector-processors \
-  crates/server/src/connectors crates/server/tests/connectors_stripe.rs \
-  knowledgebase/declarative-saas/reference-porting-register.md
+git add crates/connector-catalog/manifests/stripe-checkout-v1.yaml \
+  crates/connector-catalog/src/generated crates/connector-catalog/tests/stripe_admission.rs \
+  crates/connector-codegen/src/render.rs crates/connector-codegen/tests \
+  crates/server/src/connectors crates/server/tests/connectors_stripe.rs
 git commit -m "refactor(connectors): migrate Stripe to compiled steps"
 ```
 
 
 ---
 
-### Task 14: Generalize two-stage webhook dispatch and retain `503`
+### Task 16: Generalize two-stage webhook dispatch and retain `503`
 
 **Files:**
 
 - Create: `crates/connector-processors/src/stripe_webhook.rs`
 - Create: `crates/connector-processors/tests/stripe_webhook.rs`
 - Create: `crates/connector-catalog/manifests/donat-owned-stripe-webhook-v1.yaml`
-- Create: `crates/connector-catalog/src/generated/donat_owned_stripe_webhook.rs`
+- Generate: `crates/connector-catalog/src/generated/donat_owned_stripe_webhook.rs`
 - Create: `crates/server/src/connectors/webhooks.rs`
 - Create: `crates/server/tests/connector_webhook_ordering.rs`
 - Modify: `crates/connector-processors/src/registry.rs`
-- Modify: `crates/connector-catalog/src/generated/mod.rs`
-- Modify: `crates/connector-catalog/src/generated/catalog.digest`
+- Modify: `crates/connector-codegen/src/render.rs`
+- Modify: `crates/connector-codegen/tests/deterministic_catalog.rs`
+- Create: `crates/connector-codegen/tests/stripe_webhook.rs`
+- Create:
+  `crates/connector-codegen/tests/snapshots/stripe_webhook__canonical_trigger.snap`
+- Generate: `crates/connector-catalog/src/generated/mod.rs`
+- Generate: `crates/connector-catalog/src/generated/catalog.digest`
 - Modify: `crates/server/src/connectors/stripe.rs`
 - Modify: `crates/server/src/connectors/catalog.rs`
 - Modify: `crates/server/src/connectors/codec.rs`
 - Modify: `crates/server/src/connector_webhook.rs`
 - Modify: `crates/server/tests/connector_webhook.rs`
 - Modify: `crates/conformance/tests/connectors.rs`
+
+The manifest must cite the matching `DonatOwned` Stripe source record created
+in Task 9. Codegen rejects an unrelated source record. Generated Rust and the
+digest remain generator-owned.
 
 **Two-stage boundary:**
 
@@ -1880,7 +2720,7 @@ Only the server codec can consume `AuthenticatedRawBody`. The authenticator
 cannot parse JSON or reveal secret/tag bytes; the normalizer never sees
 unauthenticated raw bytes.
 
-- [ ] **Step 1: Add RED ordering and route-matrix tests**
+- [ ] **Step 1: Add RED ordering, provenance, and route-matrix tests**
 
 Add exact tests:
 
@@ -1888,6 +2728,7 @@ Add exact tests:
 - `invalid_signature_never_invokes_codec`;
 - `authenticated_raw_body_is_opaque_to_processors`;
 - `normalizer_receives_only_typed_decoded_value`;
+- `webhook_manifest_requires_matching_donat_owned_record`;
 - `webhook_registry_returns_only_declared_static_trigger`;
 - `unknown_or_no_verifier_is_empty_404_before_body_read`;
 - `oversized_declared_webhook_is_empty_413`;
@@ -1931,7 +2772,28 @@ wildcard, generic webhook registration, runtime code, subscription lifecycle,
 queue, table, audit row, dedupe, correlation, process signal, or success
 acknowledgement.
 
-- [ ] **Step 5: Run GREEN and native conformance**
+- [ ] **Step 5: Render to a temporary directory and review**
+
+```bash
+generated_review_dir=$(mktemp -d)
+trap 'rm -rf "$generated_review_dir"' EXIT
+cargo run -p donat-connector-codegen -- generate \
+  --output "$generated_review_dir"
+diff -ru -- crates/connector-catalog/src/generated "$generated_review_dir" || true
+```
+
+Review the manifest, renderer, tests, snapshots, generated Rust, and digest.
+Then update only through the generator:
+
+```bash
+cargo run -p donat-connector-codegen -- generate \
+  --output crates/connector-catalog/src/generated
+cargo run -p donat-connector-codegen -- generate --check
+cargo insta test -p donat-connector-codegen
+cargo insta review
+```
+
+- [ ] **Step 6: Run GREEN and native conformance**
 
 ```bash
 cargo test -p donat-connector-processors --test stripe_webhook
@@ -1939,27 +2801,32 @@ cargo test -p donat-server --test connector_webhook_ordering
 cargo test -p donat-server --test connector_webhook
 cargo build -p donat-server --bin donat
 cargo test -p donat-conformance --test connectors webhook
+cargo run -p donat-connector-codegen -- generate --check
 python3 scripts/check_connector_processor_boundary.py
 ```
 
-- [ ] **Step 6: Commit the generic webhook boundary**
+- [ ] **Step 7: Commit the generic webhook boundary**
 
 ```bash
-git add crates/connector-processors crates/connector-catalog \
-  crates/server/src/connectors crates/server/src/connector_webhook.rs \
-  crates/server/tests crates/conformance/tests/connectors.rs
+git add crates/connector-processors \
+  crates/connector-catalog/manifests/donat-owned-stripe-webhook-v1.yaml \
+  crates/connector-catalog/src/generated crates/connector-codegen/src/render.rs \
+  crates/connector-codegen/tests crates/server/src/connectors \
+  crates/server/src/connector_webhook.rs crates/server/tests \
+  crates/conformance/tests/connectors.rs
 git commit -m "refactor(connectors): generalize webhook verification"
 ```
 
 
 ---
 
-### Task 15: Prove the runtime package is static and source-free
+### Task 17: Prove the runtime package is static and source-free
 
 **Files:**
 
 - Create: `policy/connector-runtime-package.toml`
 - Create: `scripts/check_connector_runtime_package.py`
+- Modify: `policy/connector-legal-notices.toml`
 - Modify: `crates/conformance/tests/connector_public_surfaces.rs`
 - Modify: `.github/workflows/ci.yml`
 - Modify: `.github/workflows/release.yml`
@@ -1975,20 +2842,54 @@ git commit -m "refactor(connectors): generalize webhook verification"
 - The runtime dependency closure contains server, static catalog, ABI,
   processors, and value contract; it excludes acquisition, codegen, donor
   packages/source trees, npm/Node/JavaScript/WASM, n8n/SUL, build scripts,
-  dynamic libraries/plugins, and runtime discovery/configuration.
+  dynamic libraries/plugins, runtime discovery/configuration, and every
+  workflow/logical-node mechanic.
+- `THIRD_PARTY_NOTICES.md` is the sole content exception: the scanner accepts
+  that exact regular-file path only when its complete SHA-256 equals the
+  lowercase digest in `policy/connector-legal-notices.toml`. It treats the
+  matching notice as opaque legal text. The exception does not allow an n8n
+  dependency, donor file, source path, package name, SUL text, or workflow
+  API anywhere else.
 
-- [ ] **Step 1: Write the failing package and public-surface checks**
+- [ ] **Step 1: Establish the real RED condition**
 
-The Python check builds fixture package trees and asserts exact rejection of:
+First run the already-existing public-surface target unchanged:
 
+```bash
+cargo test -p donat-conformance --test connector_public_surfaces
+```
+
+Expected: the baseline target exists and is green. It is not the RED.
+
+Add the new assertion
+`runtime_package_allows_only_hashed_legal_notice` plus fixture cases for:
+
+- the exact whole-file notice hash at exact path, which is accepted;
+- a one-byte-tampered notice, renamed notice, second notice, symlink, or
+  unlisted notice, which is rejected;
 - donor `.ts`, `.js`, `.mjs`, `.cjs`, npm tarball, or `node_modules`;
 - acquisition/codegen binary or dependency;
 - `.wasm`, unexpected shared library, plugin directory, package URL, or
   runtime registration manifest;
-- `n8n`, `n8n-workflow`, workflow-node APIs, or donor source material;
+- n8n/SUL code, dependency, source path, workflow-node API, `If`, `Switch`,
+  `Merge`, `Code`, `Wait`, loop, item/paired-item, subworkflow, AI-node, or
+  send-and-wait material outside the exact hashed notice;
 - a binary dependency tree absent from the checked-in policy.
 
-Add exact conformance tests:
+Run the new focused assertion:
+
+```bash
+cargo test -p donat-conformance --test connector_public_surfaces \
+  runtime_package_allows_only_hashed_legal_notice
+python3 scripts/check_connector_runtime_package.py --self-test
+```
+
+Expected RED: the new package script/policy and new assertion behavior are
+missing. Do not claim that the existing conformance target is absent.
+
+- [ ] **Step 2: Retain negative public-surface coverage**
+
+Keep or add exact conformance tests:
 
 - `public_surfaces_cannot_execute_connectors`;
 - `post_connector_execute_is_empty_404`;
@@ -1998,14 +2899,9 @@ Add exact conformance tests:
 - `commands_cannot_plan_connector_io`;
 - `webhook_route_preserves_phase1_boundary`.
 
-- [ ] **Step 2: Run RED**
-
-```bash
-python3 scripts/check_connector_runtime_package.py --self-test
-cargo test -p donat-conformance --test connector_public_surfaces
-```
-
-Expected: the policy/script and conformance target do not exist.
+The route scan is limited to runtime registration sources. The negative
+`POST /v1/connectors/{instance}/execute` test is valid evidence and must not
+cause the structural scanner to report a public route.
 
 - [ ] **Step 3: Implement separate locked package proof**
 
@@ -2018,11 +2914,12 @@ cargo tree -p donat-server --target all \
   --edges normal,build,no-dev --offline --locked
 ```
 
-It copies only `target/release/donat`, `THIRD_PARTY_NOTICES.md`, and a
-canonicalized runtime-tree/SBOM record into the package directory, then scans
-that directory and dependency closure against the closed policy. It never
-scans or packages the tooling-bearing workspace `target` directory. The
-Docker final stage copies the same release binary and notice only.
+It copies only `target/release/donat`, the exact-hash
+`THIRD_PARTY_NOTICES.md`, and a canonicalized runtime-tree/SBOM record into
+the package directory, then scans that directory and dependency closure
+against the closed policy. It never scans or packages the tooling-bearing
+workspace `target` directory. The Docker final stage copies the same release
+binary and exact notice only.
 
 - [ ] **Step 4: Wire clean offline CI**
 
@@ -2052,12 +2949,13 @@ make test
 ```
 
 Inspect the package inventory emitted by the script; it must name exactly the
-binary, notice, and canonical runtime-tree/SBOM record.
+binary, exact-hash notice, and canonical runtime-tree/SBOM record.
 
 - [ ] **Step 6: Commit the release proof**
 
 ```bash
 git add policy/connector-runtime-package.toml \
+  policy/connector-legal-notices.toml \
   scripts/check_connector_runtime_package.py .github/workflows \
   Dockerfile crates/conformance
 git commit -m "ci(connectors): prove static source-free runtime package"
@@ -2068,7 +2966,7 @@ git commit -m "ci(connectors): prove static source-free runtime package"
 
 ## Explicit Process-Gated Integration Handoff
 
-This plan stops after Task 15. The following work starts only when the named
+This plan stops after Task 17. The following work starts only when the named
 Spec 005 prerequisite is implemented and green; none belongs in a factory
 crate, compatibility adapter, or server-local persistence table:
 
@@ -2110,15 +3008,18 @@ crate/native conformance test, scoped commit, and independent review.
 
 - [ ] Tasks execute in dependency order:
   `value -> ABI -> catalog -> acquisition/codegen siblings -> processors ->
-  credentials -> executor -> registry -> SerpAPI -> pagination -> Stripe ->
-  webhooks -> package proof`.
+  credentials -> executor -> registry -> SerpAPI -> pagination -> Stripe
+  processor proof -> Stripe evidence admission -> Stripe executable migration
+  -> webhooks -> package proof`.
 - [ ] Every donor derivative starts only after an approved immutable
   source/version/tree/artifact/per-file hash, license/notice, destination, RED
   test, reviewer, and register entry.
 - [ ] SerpAPI is the sole derivative port in this plan; Stripe is an
   independent Donat implementation plus behavior-only provider references.
 - [ ] `n8n-workflow` remains `TypeOnlyReplaced`; inspected n8n built-ins remain
-  behavior-only and no workflow/logical/UI node enters catalog or runtime.
+  behavior-only and no `If`/`Switch`/`Merge`/`Code`/`Wait`, loop,
+  item/paired-item, subworkflow, AI-node, send-and-wait, or other
+  workflow/logical/UI node enters catalog or runtime.
 - [ ] Every operation is headerless `ReadOnly` or has evidence for each
   `ProviderIdempotent` side-effect step; unsupported mutation remains
   inventory-only.

@@ -45,7 +45,7 @@ build scripts, or release-image components.
 
 The implementation order is:
 
-1. the shared `donat-value-contract` owner;
+1. the shared `donat-value-contract` owner from Spec 005 Task 1;
 2. neutral connector IDs, envelopes, and host traits in
    `donat-connector-abi`;
 3. source records, normalized IR, hashes, and checked-in entries in
@@ -58,6 +58,22 @@ This decision supersedes ADR 009 only where that decision assigned the shared
 value/type contract to `donat-ir`: `donat-value-contract` is now the owner and
 `donat-ir` re-exports it. ADR 009's source-local compilation, journal,
 transaction, and process-runtime decisions remain unchanged.
+
+Spec 005 Task 1 and the connector factory's value-contract prerequisite are
+one implementation unit and one commit. The connector plan may record and
+verify that shared commit, but it must never create or implement a second
+value crate. The shared type owns inert `InlineBytes(BoundedInlineBytes)` and
+its canonical-size accounting immediately; external JSON encoding, multipart
+transport, connector descriptor admission, and process persistence remain
+disabled until the separate binary gate is accepted.
+
+Spec 005's canonical task text is authoritative and must first declare the
+shared superset: private bounded media-type and filename newtypes,
+`BoundedInlineBytes { bytes, media_type, file_name }`, the four-argument
+constructor, accessors, and exact size/count vectors. If the authoritative
+task still describes a bytes-only value, execution stops for cross-plan
+alignment; the connector plan cannot silently redefine it or append a second
+commit.
 
 Dependency arrows below mean “depends on”:
 
@@ -85,6 +101,15 @@ credential, and capability IDs directly; they do not create string or wrapper
 copies. Acquisition and code generation are siblings over the catalog.
 Processors do not depend on catalog, acquisition, code generation, server, or
 third-party runtime crates.
+
+Every ABI identity has one const-constructible representation:
+`InlineId { len: u8, bytes: [u8; 96] }`, wrapped by transparent typed IDs.
+The accepted ASCII grammar is
+`[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?`; length is `1..=96`. A const literal
+constructor and the runtime parser call the same byte validator. The storage
+and every typed wrapper are `Copy`, so checked-in generated statics,
+`ConnectorIo`, and the private processor lookup pass the exact ABI type by
+value without a `String`, clone, parse, serialization, or conversion bridge.
 
 The value, ABI, and processor crates are unpublished `#![no_std] + alloc`
 crates with empty default features, no `std` feature, build script, unsafe
@@ -116,11 +141,21 @@ compare-and-swap, delete, or administration method. Interactive OAuth,
 refresh-token persistence, credential CRUD, and tenant onboarding require a
 separate decision.
 
+Deploy-time connector metadata retains the existing
+`name`/`module`/`config`/`operations` separation. `module` selects the
+compiled catalog connector; endpoint and credential identities remain under
+`config`; enabled operations remain explicit. A future `source` field denotes
+the distinct Spec 005 database/process source binding and never aliases a
+catalog module ID.
+
 The generated catalog and every derivative artifact are repository-visible
 and deterministic. Code generation reads only checked-in source records and
 normalized manifests, writes checked-in Rust, and supports an offline
-`generate --check`. Ordinary Cargo builds never acquire, inspect, or execute
-donor material.
+`generate --check`. Generated Rust and its digest are generator-owned and are
+never hand-edited: each manifest change renders to a temporary directory,
+receives diff review, updates checked-in output through the generator, and
+then passes `generate --check`. Ordinary Cargo builds never acquire, inspect,
+or execute donor material.
 
 Source admission is exact-version and fail-closed. Phase 1 accepts only
 `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, or `0BSD`; an
@@ -132,6 +167,13 @@ embedded-material disposition, destination, Donat-owned failing test, and
 reviewer. The first derivative port creates
 `THIRD_PARTY_NOTICES.md`. Repository review is the admission authority; Phase
 1 does not claim a cryptographic signer or trust-root protocol.
+
+Source records are closed variants for exact npm packages, provider-contract
+evidence, and Donat-owned source. They retain structured artifact integrity,
+repository/tarball mapping, compatibility tier, inventory/admission state,
+notices, proposed manifest and destination paths, and closed dependency and
+embedded-material dispositions. A manifest can cite only the matching record;
+an unrelated Donat-owned record cannot supply provenance.
 
 The `n8n-workflow` peer dependency is always `TypeOnlyReplaced`: its bytes are
 not compiler input, linked code, generated material, fixtures, or shipped
@@ -147,10 +189,10 @@ provider webhooks/polling, bounded binary transport, and narrow protocol
 processors. It adds no connector UI, arbitrary HTTP request, generic
 connector execution route, runtime metadata mutation, admin role, or
 permission bypass. It does not import or emulate n8n `If`, `Switch`, `Merge`,
-`Code`, `Wait`, loops, items/paired items, subworkflows, send-and-wait, or
-other logical/workflow nodes. Rules, Commands, and Processes continue to own
-business decisions, database work, branching, retries, waits, and
-orchestration.
+`Code`, `Wait`, loops, items/paired items, subworkflows, AI nodes,
+send-and-wait, or other logical/workflow nodes. Rules, Commands, and Processes
+continue to own business decisions, database work, branching, retries, waits,
+and orchestration.
 
 Process-independent factory slices may use direct internal server harnesses
 only. No public GraphQL, REST, MCP, or administrative execution endpoint is
@@ -160,6 +202,16 @@ webhook acknowledgement, polling checkpoint persistence, and revision
 retirement are deferred until their exact Spec 005 source-local prerequisites
 and tests are green. The temporary verified-webhook response remains an empty
 `503` after successful verification.
+
+Stripe work is split into three independently committed tasks. A
+processor-only proof may exercise a narrow processor against fake
+`ConnectorIo` while leaving the current adapter and inventory entry intact. A
+separate evidence task must accept an immutable provider record proving the
+exact idempotency binding, scope, and conservative retention, while recording
+the positive clock margin as Donat-owned policy. Only the final executable
+migration creates an `OperationSpec`, routes through shared transport, or
+deletes the old Stripe transport; it does not start if the evidence task
+cannot pass.
 
 ## Alternatives
 
