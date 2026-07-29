@@ -179,6 +179,19 @@ commit, or create a connector-owned variant.
 ```rust
 pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
 
+pub enum CanonicalNumber {
+    I64(i64),
+    U64(u64),
+    Decimal(CanonicalDecimal),
+}
+
+pub struct CanonicalDecimal(String);
+
+impl CanonicalDecimal {
+    pub fn try_new(value: &str) -> Result<Self, ValueContractError>;
+    pub fn as_str(&self) -> &str;
+}
+
 pub enum TypedValue {
     Null,
     Boolean(bool),
@@ -216,6 +229,22 @@ pub fn canonical_size(
 ) -> Result<usize, ValueContractError>;
 ```
 
+The identifier grammar has no implicit GraphQL-reserved-name rule:
+`__bad` is valid because it matches the declared grammar; only a future
+explicit metadata rule may reserve a prefix. `CanonicalDecimal` has one
+checked constructor and no public tuple field or unchecked constructor. It
+accepts only an already minimal fixed-point JSON number: no whitespace,
+leading plus, exponent, leading integer zero, negative zero, trailing decimal
+point, or trailing fractional zero. Zero is exactly `0`; a non-zero value is
+an optional `-`, either a non-zero integer with an optional fraction or `0`
+with a required non-zero-ending fraction, and any fraction ends in `1..=9`.
+The exact ASCII grammar is
+`0|-?(?:[1-9][0-9]*(?:\.[0-9]*[1-9])?|0\.[0-9]*[1-9])`.
+Thus `-12.5`, `0.01`, and `10` are valid, while `-12.50e+2`, `-12.50`,
+`01`, `-0`, `0.0`, and `1.` are rejected. `canonical_size` counts exactly
+`CanonicalDecimal::as_str()` and never accepts arbitrary caller-owned number
+spelling.
+
 `BoundedMediaType` accepts at most 255 ASCII bytes. `BoundedFileName` accepts
 at most 255 UTF-8 bytes and is data, never a path. Construction rejects a
 decoded-byte bound above 131,072. Complete-value validation rejects more than
@@ -237,21 +266,32 @@ fi
 If the crate is absent, execute the canonical Spec 005 Task 1. If it exists,
 inspect that commit rather than creating another owner. In either case,
 compare the authoritative task text and implementation with the exact
+`CanonicalDecimal` representation, checked constructor, `as_str`, grammar,
+examples, canonical-size rule, `__bad` identifier behavior,
 `BoundedMediaType`, `BoundedFileName`, four-argument constructor, accessors,
-limits, and vectors above. Stop on any mismatch; do not repair it in a second
-connector commit.
+limits, tests, and vectors above. Stop on any mismatch; do not repair it in a
+second connector commit.
 
-- [ ] **Step 2: Put connector byte acceptance in the same shared RED test**
+- [ ] **Step 2: Put connector prerequisites in the same shared RED test**
 
 Before the canonical Task-1 commit, add these exact tests to
 `crates/value-contract/tests/value_contract.rs`:
 
 - `value_type_language_is_closed_and_canonical`;
 - `value_contract_has_one_owner`;
+- `value_type_identifier_grammar_has_no_implicit_reserved_prefix`;
+- `canonical_decimal_spelling_is_exact`;
 - `inline_bytes_have_one_inert_owner`;
 - `inline_binary_canonical_size_vectors_are_exact`;
 - `inline_binary_count_and_decoded_bounds_are_exact`;
 - `inline_binary_external_adapters_remain_disabled`.
+
+Assert that `__bad` parses because the declared identifier grammar has no
+reserved-prefix exception. Construct decimals only through
+`CanonicalDecimal::try_new`; accept `-12.5`, `0.01`, and `10`, and reject
+`-12.50e+2`, `-12.50`, `01`, `-0`, `0.0`, `1.`, whitespace, plus, and
+non-finite spellings. Prove that the private canonical spelling returned by
+`as_str` is exactly what `canonical_size` counts.
 
 The independent size helper must assert:
 
@@ -266,6 +306,9 @@ accepted binary + 87,304-byte "padding" string     -> 262,145 and rejected
 - [ ] **Step 3: Run the shared RED commands**
 
 ```bash
+cargo test -p donat-value-contract canonical_decimal_spelling_is_exact
+cargo test -p donat-value-contract \
+  value_type_identifier_grammar_has_no_implicit_reserved_prefix
 cargo test -p donat-value-contract inline_binary
 cargo test -p donat-ir --test value_contract_adapter
 cargo check -p donat-value-contract --no-default-features \
@@ -274,20 +317,26 @@ cargo check -p donat-value-contract --no-default-features \
 
 Expected when the shared unit is absent: Cargo reports that
 `donat-value-contract` does not exist. Expected when an incomplete shared
-implementation exists: one of the exact inline-byte ownership, size, count,
-or adapter-gate assertions fails.
+implementation exists: the exact decimal spelling, identifier grammar,
+inline-byte ownership, size, count, or adapter-gate assertion fails.
 
 - [ ] **Step 4: Implement only through canonical Spec 005 Task 1**
 
 Follow the canonical task's complete value, IR, schema, and command-descriptor
 steps after its text contains the exact superset interface above. Implement
-inert bytes and checked size accounting in that same lower crate and commit.
-Do not add a connector-local value type, serde adapter, multipart encoder,
-process admission, or a second value-contract commit.
+`CanonicalDecimal` with its private checked spelling in that same lower crate;
+do not expose `Decimal(String)` or normalize an ambiguous caller spelling
+implicitly. Keep `__bad` valid under the declared identifier grammar.
+Implement inert bytes and checked size accounting in the same shared unit and
+commit. Do not add a connector-local value type, serde adapter, multipart
+encoder, process admission, or a second value-contract commit.
 
 - [ ] **Step 5: Run shared GREEN and connector-specific verification**
 
 ```bash
+cargo test -p donat-value-contract canonical_decimal_spelling_is_exact
+cargo test -p donat-value-contract \
+  value_type_identifier_grammar_has_no_implicit_reserved_prefix
 cargo test -p donat-value-contract
 cargo test -p donat-ir
 cargo test -p donat-schema --test commands
@@ -297,8 +346,10 @@ cargo tree -p donat-value-contract --target all \
   --edges normal,build,no-dev --no-default-features --offline --locked
 ```
 
-Expected: the inline-byte vectors pass, `donat-ir` re-exports the exact types,
-and the dependency closure contains only the local value crate.
+Expected: the exact decimal spelling and identifier grammar tests pass, the
+inline-byte vectors pass, `donat-ir` re-exports `CanonicalDecimal` and the
+other exact types, and the dependency closure contains only the local value
+crate.
 
 - [ ] **Step 6: Record the one shared commit; do not create another**
 

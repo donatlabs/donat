@@ -68,12 +68,21 @@ transport, connector descriptor admission, and process persistence remain
 disabled until the separate binary gate is accepted.
 
 Spec 005's canonical task text is authoritative and must first declare the
-shared superset: private bounded media-type and filename newtypes,
-`BoundedInlineBytes { bytes, media_type, file_name }`, the four-argument
-constructor, accessors, and exact size/count vectors. If the authoritative
-task still describes a bytes-only value, execution stops for cross-plan
-alignment; the connector plan cannot silently redefine it or append a second
-commit.
+shared superset. That contract includes the public `CanonicalDecimal` type
+with a private tuple field, its sole checked `try_new` constructor and
+`as_str` accessor, and the exact minimal fixed-point grammar
+`0|-?(?:[1-9][0-9]*(?:\.[0-9]*[1-9])?|0\.[0-9]*[1-9])`. It accepts
+`-12.5`, `0.01`, and `10`, rejects exponent, redundant fractional zero,
+leading-zero, negative-zero, zero-fraction, trailing-point, whitespace, plus,
+and non-finite spellings, and makes `canonical_size` count only the checked
+`as_str` spelling. The identifier grammar has no implicit reserved-prefix
+exception, so `__bad` remains valid unless a future explicit metadata rule
+reserves it. The same contract includes private bounded media-type and
+filename newtypes, `BoundedInlineBytes { bytes, media_type, file_name }`, the
+four-argument constructor, accessors, and exact size/count vectors. If the
+authoritative task differs, execution stops for cross-plan alignment; the
+connector plan follows and re-exports that same shared unit rather than
+silently redefining it or appending a second commit.
 
 Dependency arrows below mean “depends on”:
 
