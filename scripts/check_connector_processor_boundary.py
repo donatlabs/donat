@@ -325,6 +325,40 @@ def yaml_without_comments(source: str) -> list[str]:
     return lines
 
 
+def yaml_key_indentation(match: re.Match[str]) -> int:
+    return len(match.group("indent")) + len(match.groupdict().get("dash") or "")
+
+
+def yaml_block_scalar_content(lines: list[str]) -> set[int]:
+    content: set[int] = set()
+    header_pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<dash>-\s*)?.+:\s*[|>][1-9+-]*\s*$"
+    )
+    index = 0
+    while index < len(lines):
+        if index in content:
+            index += 1
+            continue
+        match = header_pattern.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        indentation = yaml_key_indentation(match)
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if not line.strip():
+                content.add(index)
+                index += 1
+                continue
+            line_indentation = len(line) - len(line.lstrip())
+            if line_indentation <= indentation:
+                break
+            content.add(index)
+            index += 1
+    return content
+
+
 def yaml_scalar(
     lines: list[str],
     index: int,
@@ -359,15 +393,21 @@ def yaml_scalar(
 
 def workflow_run_commands(source: str) -> list[str]:
     lines = yaml_without_comments(source)
+    block_content = yaml_block_scalar_content(lines)
     commands: list[str] = []
     index = 0
-    run_pattern = re.compile(r"^(?P<indent>\s*)(?:-\s*)?run\s*:\s*(?P<value>.*)$")
+    run_pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<dash>-\s*)?run\s*:\s*(?P<value>.*)$"
+    )
     while index < len(lines):
+        if index in block_content:
+            index += 1
+            continue
         match = run_pattern.match(lines[index])
         if not match:
             index += 1
             continue
-        indentation = len(match.group("indent"))
+        indentation = yaml_key_indentation(match)
         value = match.group("value").strip()
         scalar, index = yaml_scalar(lines, index, indentation, value)
         commands.append(scalar)
@@ -376,23 +416,32 @@ def workflow_run_commands(source: str) -> list[str]:
 
 def workflow_rustflags(source: str) -> list[str]:
     lines = yaml_without_comments(source)
+    block_content = yaml_block_scalar_content(lines)
     values: list[str] = []
-    env_pattern = re.compile(r"^(?P<indent>\s*)(?:-\s*)?env\s*:\s*$")
+    env_pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<dash>-\s*)?env\s*:\s*$"
+    )
     rustflags_pattern = re.compile(
         r"^(?P<indent>\s*)(?:RUSTFLAGS|\"RUSTFLAGS\"|'RUSTFLAGS')"
         r"\s*:\s*(?P<value>.*)$"
     )
     index = 0
     while index < len(lines):
+        if index in block_content:
+            index += 1
+            continue
         env_match = env_pattern.match(lines[index])
         if not env_match:
             index += 1
             continue
-        env_indentation = len(env_match.group("indent"))
+        env_indentation = yaml_key_indentation(env_match)
         index += 1
         entry_indentation: int | None = None
         while index < len(lines):
             line = lines[index]
+            if index in block_content:
+                index += 1
+                continue
             if not line.strip():
                 index += 1
                 continue
@@ -1465,6 +1514,44 @@ def fixtures() -> tuple[Fixture, ...]:
             "  DESCRIPTION: |-\n"
             '    RUSTFLAGS: "-A clippy::result_large_err"\n'
             "jobs: {}\n",
+            None,
+        ),
+        Fixture(
+            ".github/workflows/non-env-literal-block-decoy.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: example/action@v1\n"
+            "        with:\n"
+            "          content: |-\n"
+            "            env:\n"
+            '              RUSTFLAGS: "-A clippy::result_large_err"\n',
+            None,
+        ),
+        Fixture(
+            ".github/workflows/non-env-folded-block-decoy.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: example/action@v1\n"
+            "        with:\n"
+            "          content: >+\n"
+            "            env:\n"
+            "              RUSTFLAGS: --cap-lints warn\n",
+            None,
+        ),
+        Fixture(
+            ".github/workflows/non-run-literal-block-decoy.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: example/action@v1\n"
+            "        with:\n"
+            "          content: |-\n"
+            "            run: cargo clippy -- -A clippy::result_large_err\n",
             None,
         ),
         Fixture(
