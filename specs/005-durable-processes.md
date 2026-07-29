@@ -95,7 +95,7 @@ The closed canonical scalar vocabulary and aliases are:
 | `int32` | `Int`, `int`, `int32` | integral number in signed 32-bit range |
 | `int64` | `int64` | integral number in signed 64-bit range |
 | `uint64` | `uint64` | integral number in unsigned 64-bit range |
-| `decimal` | `Float`, `float`, `decimal` | finite JSON number |
+| `decimal` | `Float`, `float`, `decimal` | canonical finite fixed-point JSON number |
 | `uuid` | `uuid` | canonical UUID string |
 | `date` | `date` | `YYYY-MM-DD` string |
 | `timestamp` | `timestamp` | local ISO-8601 `YYYY-MM-DDTHH:MM:SS[.ffffff]`, with no offset |
@@ -172,7 +172,14 @@ pub struct ValueObjectContract {
 pub enum CanonicalNumber {
     I64(i64),
     U64(u64),
-    Decimal(String),
+    Decimal(CanonicalDecimal),
+}
+
+pub struct CanonicalDecimal(String);
+
+impl CanonicalDecimal {
+    pub fn try_new(value: &str) -> Result<Self, ValueContractError>;
+    pub fn as_str(&self) -> &str;
 }
 
 pub enum TypedValue {
@@ -223,6 +230,23 @@ Assignability is exact after alias normalization except that any JSON-shaped
 contract is assignable to `json`; nominal enum, object, and custom-scalar
 names never widen to one another.
 
+The declared identifier grammar has no implicit GraphQL-reserved-name rule.
+`__bad` is a valid identifier because it matches the grammar; only an explicit
+future metadata rule may reserve a prefix.
+
+`CanonicalDecimal` has a private field, one checked constructor, and no
+unchecked construction path. It accepts only an already minimal fixed-point
+JSON number: no whitespace, leading plus, exponent, leading integer zero,
+negative zero, trailing decimal point, or trailing fractional zero. Zero is
+exactly `0`; a non-zero value is an optional `-`, either a non-zero integer
+with an optional fraction or `0` with a required non-zero-ending fraction,
+and any fraction ends in `1..=9`. The exact ASCII grammar is
+`0|-?(?:[1-9][0-9]*(?:\.[0-9]*[1-9])?|0\.[0-9]*[1-9])`.
+Thus `-12.5`, `0.01`, and `10` are valid,
+while `-12.50e+2`, `-12.50`, `01`, `-0`, `0.0`, and `1.` are rejected.
+`canonical_size` counts exactly `CanonicalDecimal::as_str()`, so arbitrary
+caller-owned JSON-number spellings cannot change a canonical byte count.
+
 `BoundedMediaType` accepts at most 255 ASCII bytes. `BoundedFileName` accepts
 at most 255 UTF-8 bytes and is data, never a filesystem path. Construction
 of both private newtypes occurs only inside `BoundedInlineBytes::try_new`;
@@ -230,18 +254,51 @@ there is no unchecked or exported constructor. Inline-byte construction
 requires `bytes.len() <= maximum_decoded_bytes <= 131_072`. Complete-value
 validation rejects more than 16 inline values, more than 131,072 aggregate
 decoded bytes, or more than 262,144 canonical bytes. `canonical_size`
-accounts for the exact future JCS object containing `$binary`, optional
-`file_name`, and `media_type`, without exposing a JSON encoder.
+accounts for the exact future representation without exposing a JSON encoder.
+Bytes use the RFC 4648 base64url alphabet without `=` padding. The root JCS
+value is exactly:
+
+~~~json
+{"$binary":"<unpadded-base64url>","media_type":"<ASCII>"}
+~~~
+
+or, when a file name is present:
+
+~~~json
+{"$binary":"<unpadded-base64url>","file_name":"<UTF-8>","media_type":"<ASCII>"}
+~~~
+
+Those are the RFC 8785 JCS member orders (`$binary`, optional `file_name`,
+`media_type`); there is no alternate spelling or custom ordering rule.
+Production sizing uses private checked-arithmetic helpers. Unpadded base64url
+length is
+`4 * (decoded_len / 3) + { 0, 2, 3 }[decoded_len % 3]`, with every
+multiplication and addition checked. JCS string sizing counts the surrounding
+quotes, unchanged UTF-8 bytes, the two-byte escapes for quote, reverse
+solidus, backspace, tab, line feed, form feed, and carriage return, and
+lowercase `\u00xx` for the remaining U+0000..U+001F controls, also with
+checked addition. The lower crate has no `serde_json` dependency and neither
+helper allocates encoded JSON.
 
 The exact canonical-size vectors are:
 
 - 131,072 zero bytes with `application/octet-stream` and no file name:
   174,817 bytes;
 - 131,073 decoded bytes: rejected before encoding;
-- that accepted binary plus an 87,303-byte `padding` string: 262,144 bytes;
-- that accepted binary plus an 87,304-byte `padding` string: 262,145 bytes
-  and rejected;
+- the exact outer object
+  `{"binary": <that accepted root binary>, "padding": "a" * 87,303}`:
+  262,144 bytes;
+- the same outer object with 87,304 `a` bytes: 262,145 bytes and rejected;
 - 17 inline-byte values: rejected.
+
+The outer descriptions denote `TypedValue::Object` values with the exact keys
+`binary` and `padding`. Their serialized JCS bytes are
+`{"binary":<root-binary-object>,"padding":"aaa..."}` with no spaces.
+Tests construct zero bytes and filler independently. Their oracle does not
+call `canonical_size` or any production JSON encoder: it independently
+implements the checked RFC 4648 length/encoding and RFC 8785 escaping rules,
+constructs the expected bytes, and asserts the root member order, base64url
+alphabet, absence of padding, escaping, and exact lengths.
 
 `InlineBytes` is inert at this stage. Metadata, external JSON/form encoding,
 connector descriptor admission, multipart transport, commands, and process
@@ -299,108 +356,69 @@ The existing command compiler remains the only command compiler.
 `CompiledCommand` owns its `CommandDescriptor`; process compilation never
 reconstructs command types from raw metadata.
 
-### 2.3 Connector descriptors
+### 2.3 Accepted connector ABI and catalog
 
-`crates/server/src/connectors/mod.rs` publishes immutable
-`ConnectorOperationDescriptor` values:
+Processes do not define connector descriptor types. The accepted
+community-connector implementation owns the complete boundary:
+
+- `donat-connector-abi` owns the const/static-safe `ConnectorId`,
+  `OperationId`, `CompiledStepId`, `TriggerId`, processor/authenticator/codec/
+  normalizer IDs, bounded envelopes, and host traits;
+- `donat-connector-catalog` owns `OperationSpec`, `TriggerSpec`,
+  `OperationEffect`, fixed idempotency bindings, capacity/bounds, type
+  contracts, semantic/provenance hashes, and generated static entries; and
+- the server `ConnectorRegistry` binds deploy-time connector instances to
+  those generated entries and is the one catalog consumed by process
+  compilation, reconciliation, workers, and ingress.
+
+The Process Task-2 ledger records reviewed ancestor commits for the connector
+ABI, normalized catalog, shared executor, static registry, and two-stage
+webhook implementation, plus the single shared value-contract commit. Process
+implementation stops if any recorded prerequisite is absent or fails its
+owning tests. It never repairs the gap by adding server-local operation/event
+descriptor structs, string-backed step/scope/header wrappers, or a second
+effect enum.
+
+The process compiler consumes these exact external owners:
 
 ~~~rust
-pub struct ConnectorOperationDescriptor {
-    pub instance_name: String,
-    pub module_name: String,
-    pub module_semantic_version: String,
-    pub runtime_abi: u32,
-    pub operation_name: String,
-    pub operation_version: String,
-    pub input: ValueContractCatalog,
-    pub output: ValueContractCatalog,
-    pub effect: OperationEffect,
-    pub capacity: ConnectorCapacityContract,
-    pub endpoint_identity: String,
-    pub credential_identity: String,
-    pub configuration_fingerprint: String,
-}
+pub use donat_connector_abi::{
+    CompiledStepId, ConnectorId, OperationId, TriggerId,
+};
+pub use donat_connector_catalog::{
+    FixedIdempotencyBinding, OperationEffect, OperationSpec,
+    ProviderIdempotentStep, TriggerSpec,
+};
 
-pub enum OperationEffect {
-    ReadOnly,
-    ProviderIdempotent {
-        side_effect_steps: NonEmptyVec<ProviderIdempotentStep>,
-    },
-}
-
-pub struct ProviderIdempotentStep {
-    pub step: CompiledStepId,
-    pub fixed_binding: FixedIdempotencyBinding,
-    pub scope: ProviderIdempotencyScope,
-    pub minimum_retention_ms: NonZeroU64,
-    pub clock_safety_margin_ms: NonZeroU64,
-}
-
-pub enum FixedIdempotencyBinding {
-    Header { name: StaticHeaderName },
-    BodyField { pointer: StaticBodyPointer },
-}
-
-pub struct NonEmptyVec<T> {
-    pub first: T,
-    pub rest: Vec<T>,
-}
-
-pub struct CompiledStepId(pub String);
-pub struct StaticHeaderName(pub String);
-pub struct StaticBodyPointer(pub String);
-pub struct ProviderIdempotencyScope(pub String);
-
-pub struct ConnectorCapacityContract {
-    pub max_in_flight: u32,
-    pub rate_limit: ConnectorRateLimitContract,
-    pub serialize_by: Option<String>,
-}
-
-pub struct ConnectorRateLimitContract {
-    pub permits: u32,
-    pub per_milliseconds: u64,
-    pub burst: u32,
-}
-
-pub struct ConnectorInboundEventDescriptor {
-    pub instance_name: String,
-    pub module_name: String,
-    pub module_semantic_version: String,
-    pub runtime_abi: u32,
-    pub event_name: String,
-    pub event_version: String,
-    pub output: ValueContractCatalog,
-    pub provider_event_id_field: String,
-    pub endpoint_identity: String,
-    pub credential_identity: String,
-    pub configuration_fingerprint: String,
-}
-
-pub struct ConnectorDescriptorCatalog {
-    pub operations:
-        BTreeMap<(String, String), ConnectorOperationDescriptor>,
-    pub inbound_events:
-        BTreeMap<(String, String), ConnectorInboundEventDescriptor>,
-}
+pub fn compile_process_catalog(
+    metadata: &Metadata,
+    commands: &CompiledCommandCatalog,
+    rules: &RuleCatalog,
+    connectors: &ConnectorRegistry,
+) -> Result<CompiledProcessCatalog, PlanError>;
 ~~~
 
-The four string newtypes have checked constructors: values are non-empty,
-bounded, canonical, and static; header names and JSON pointers are validated
-before descriptor publication.
+Metadata source names and connector-instance names remain deployment
+identities. Connector/module/operation/step/trigger identities are parsed once
+into the exact ABI types and pass from generated statics through registry,
+compiler, pinned dependency, and worker without a `String` copy, wrapper
+conversion, serialization round-trip, or runtime reparse.
 
-The capacity contract contains `max_in_flight`, the exact
-`permits`/`per`/`burst` rate policy, and the optional typed scalar
-`serialize_by` input name. `OperationEffect` is closed. `ReadOnly` has no
-binding and is admitted only when immutable provider evidence proves that no
-compiled step mutates provider state. `ProviderIdempotent` contains exactly
-one entry for every side-effecting compiled step and none for read-only
-steps. Each entry fixes the step, one header/body binding, the
-provider-documented uniqueness scope, conservative minimum retention, and a
-positive clock margin strictly smaller than that retention. Missing,
-duplicate, unproven, or unbounded fields reject executable descriptor
-publication. A non-idempotent side effect may remain inventory-only, but there
-is no executable third effect variant and `max_attempts: 1` is not an escape.
+An immutable process revision pins the catalog-owned `OperationSpec` or
+`TriggerSpec` plus its source-bound non-secret deployment fingerprint,
+endpoint and credential identities, runtime ABI, exact schemas/bounds/effect,
+and catalog hashes. It also pins the compiler-calculated activity horizon.
+Resolved secret values and raw environment-derived URLs are never persisted.
+There is one executable lookup path through `ConnectorRegistry`; inventory
+records are absent from it.
+
+The catalog-owned `OperationEffect` remains closed to headerless `ReadOnly`
+or `ProviderIdempotent`. The latter contains exactly one evidence-backed fixed
+header/body binding, provider uniqueness scope, conservative minimum
+retention, and positive clock margin for every side-effecting compiled step.
+Missing, duplicate, unproven, or unbounded fields keep an operation
+inventory-only. There is no third executable effect and `max_attempts: 1` is
+not an escape.
 
 For each side-effecting step, workers derive the key exactly as:
 
@@ -415,76 +433,30 @@ base64url_no_pad(SHA256(
 
 The same key is applied only to that step's fixed binding on every retry or
 takeover. Another step or scope never reuses it.
-The configuration fingerprint retains the current non-secret module,
-operation, endpoint, credential-class, capacity, protocol, environment-name,
-resolved-HTTP-endpoint-digest, effect, binding, scope, retention, and margin
-material; it never retains a resolved secret or raw environment-derived base
-URL.
 
-Verified inbound events use a sibling
-`ConnectorInboundEventDescriptor` containing instance/module/version/ABI,
-event name and version, exact verified output contract, provider-event-ID
-field, endpoint/credential identities, and the same non-secret configuration
-fingerprint. This descriptor is produced by the same compiled connector
-registry, not a process-owned protocol compiler.
+`TriggerSpec::Webhook` owns the authenticator, server codec, pure normalizer,
+verified event ID/type/output, selected headers, raw-body limit, redaction,
+and exact ABI IDs. Raw authentication precedes parsing. Durable dedupe,
+delivery audit, correlation, process transition, and acknowledgement remain
+Process Task 12 responsibilities rather than connector persistence.
 
-Declarative HTTP operation metadata adds the exact fields
-`input: BTreeMap<String, String>` and `effect: ConnectorOperationEffect`.
-Each input value uses the version-1 type-reference grammar above and resolves
-named types only through `metadata.custom_types`. The metadata effect uses the
-same closed `read_only` or `provider_idempotent.side_effect_steps` shape as
-the descriptor; declarative HTTP has one compiled step named `request`, while
-generated/static connector operations may declare multiple named steps.
-Existing v2 `idempotency: { header: "Idempotency-Key" }` metadata still
-deserializes for inventory/reporting compatibility, but without fixed scope,
-retention, and margin it cannot publish an executable operation descriptor or
-be referenced by a Process.
-Every `{input.<name>}` path slot and every `{ input: <name> }` query, request
-header, and recursive body slot must name an entry in that mapping and be
-assignable to its normalized contract. Path and header inputs must normalize
-to a non-null scalar other than `json`; query inputs may be scalar or a list
-of scalar values; body inputs may use any declared contract. Dispatch rejects
-missing required inputs, null for a non-null contract, type mismatch, and
-undeclared extra inputs before DNS or request rendering. A declared input used
-only by `serialize_by` is valid; every other declared input must be used by the
-fixed request template. Response field type declarations use the same grammar
-and form the output contract.
+Existing v2 declarative HTTP/idempotency metadata remains loadable under the
+connector plan's compatibility rules. An incomplete legacy
+`idempotency: { header: "Idempotency-Key" }` declaration has no proven scope,
+retention, or margin and therefore cannot enter executable lookup or be
+referenced by a Process.
 
-The existing static request-header YAML remains valid. The exact
-backward-compatible serde types are:
+Stripe mutation execution is likewise inventory-only unless the connector
+plan's separate immutable provider-evidence task succeeds and its later
+executable migration commit is recorded. A processor-only proof,
+compatibility entry, mutable provider page, or negative evidence commit does
+not make that operation executable. An independently accepted two-stage
+Stripe webhook trigger does not establish mutation idempotency. Process
+conformance uses accepted Donat-owned catalog fixtures when the optional
+mutation gate has not passed.
 
-~~~rust
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConnectorRequestHeader {
-    pub name: String,
-    #[serde(flatten)]
-    pub value: ConnectorRequestHeaderValue,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum ConnectorRequestHeaderValue {
-    Static { value: String },
-    Input { input: String },
-}
-~~~
-
-~~~yaml
-input:
-  order_id: uuid!
-  request_trace: string!
-headers:
-  - name: X-Request-Source
-    value: donat
-  - name: X-Request-Trace
-    input: request_trace
-~~~
-
-Exactly one of `value` or `input` is accepted. Header names remain
-deploy-time static; input never selects a name, credential header, method,
-authority, or URL. Serialized legacy `{ name, value }` entries round-trip
-unchanged.
+For example, an accepted catalog-owned provider-idempotent test operation may
+contain:
 
 ~~~yaml
 effect:
@@ -500,21 +472,14 @@ effect:
 
 The positive numeric fields use checked `u64`; configuration admission
 requires `clock_safety_margin_ms < minimum_retention_ms`. The source evidence,
-normalized effect, semantic hash, descriptor, configuration fingerprint, and
+normalized effect, semantic hash, catalog spec, configuration fingerprint, and
 pinned process revision all retain the exact values.
 
-Stripe does not accept a metadata-defined HTTP schema. The built-in
-`stripe` module publishes a fixed descriptor for
-`checkout.create_session`, operation version `v1`, module semantic version
-`0.1.0`, and runtime ABI `1`. Its input is the exact object
-`{ mode: CheckoutMode!, success_url: string!, cancel_url: string!,
-client_reference_id: uuid!, line_items: [CheckoutLineItem!]! }`, where
-`CheckoutMode` is `payment | subscription | setup` and
-`CheckoutLineItem` is `{ price: string!, quantity: uint64! }`. Its output is
-`{ id: string!, url: string!, status: string!, expires_at: int64! }`.
-The fixed verified `checkout.session.completed` event exposes
-`{ provider_event_id: string!, checkout_session_id: string!,
-client_reference_id: uuid!, payment_status: string! }`.
+No Stripe mutation operation is assumed by this specification. If its
+evidence/migration gates later pass, Processes consume the resulting
+catalog-owned operation through the same registry path. Any independently
+accepted webhook trigger is consumed through `TriggerSpec` and grants no
+operation capability.
 
 ### 2.4 Process-effect catalog and candidate order
 
@@ -564,10 +529,10 @@ its immutable `CompiledProcessCatalog`. Candidate construction in
 1. `compile_rule_catalog` compiles Rules.
 2. `compile_command_catalog` compiles source-qualified commands and their
    pre-process `CommandDescriptor` values without resolving process revisions.
-3. `ConnectorRegistry::descriptors` supplies the already compiled connector
-   operation and inbound-event descriptors.
+3. The accepted `ConnectorRegistry` supplies exact catalog-owned
+   `OperationSpec` and `TriggerSpec` values with ABI-owned identities.
 4. `processes::definition::compile_process_catalog` compiles source-qualified
-   process definitions against those command, Rule, and connector descriptors
+   process definitions against those command, Rule, and connector catalog specs
    and derives immutable revisions.
 5. The server-owned free function
    `processes::definition::build_process_effect_contract_catalog` consumes
@@ -588,6 +553,7 @@ Each published `Engine` snapshot uses these exact field names:
 
 ~~~rust
 pub command_catalog: Arc<CompiledCommandCatalog>,
+pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
 pub process_catalog: Arc<CompiledProcessCatalog>,
 pub deployed_process_catalog: Arc<DeployedProcessCatalog>,
 pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
@@ -595,6 +561,9 @@ pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
 
 `process_catalog` is the metadata candidate used to finalize effects;
 workers and history verification consume only `deployed_process_catalog`.
+Process command transitions resolve executable commands only through the
+co-published `finalized_command_catalog`; the pre-process command catalog is
+not an executable fallback. All five values come from one candidate snapshot.
 No compiler is duplicated and no dependency points from `donat-schema` to
 `donat-server`.
 
@@ -838,7 +807,8 @@ pub enum ProcessValueBinding {
 ~~~
 
 The exact complete YAML form is illustrated below. It includes every state
-variant and every binding spelling:
+variant and every binding spelling. `donat_checkout_fixture` is an accepted
+Donat-owned catalog fixture, not Stripe or another provider admission claim:
 
 ~~~yaml
 - name: checkout_order
@@ -871,8 +841,8 @@ variant and every binding spelling:
   states:
     create_checkout:
       activity:
-        connector: stripe
-        operation: checkout.create_session
+        connector: donat_checkout_fixture
+        operation: checkout.create
         input:
           mode: { literal: payment }
           success_url: { literal: "https://shop.example/success" }
@@ -904,8 +874,8 @@ variant and every binding spelling:
           next: cooldown
     awaiting_payment:
       wait_for_signal:
-        connector: stripe
-        event: checkout.session.completed
+        connector: donat_checkout_fixture
+        event: checkout.completed
         provider_event_id: { event: provider_event_id }
         correlate:
           order_id:
@@ -1075,7 +1045,7 @@ The binding context is exact:
 `command_result` always names a field in the result of the command in that
 same transition; it is unavailable to that command's own input/session
 bindings and is not durable ambient state unless copied by `set`.
-`verified_signal` names a field in the selected connector event descriptor or
+`verified_signal` names a field in the selected catalog-owned `TriggerSpec` or
 the `wait_for_command.payload` contract. Rule bindings recursively obey the
 row's context. No binding can read caller headers, ambient GraphQL session
 data, an unverified payload field, a connector-selected role, arbitrary JSON
@@ -1168,7 +1138,7 @@ JSON containing:
 - normalized process input/state/signal contracts;
 - referenced Rule profile version and canonical AST hashes;
 - referenced pre-process command descriptors and fingerprints;
-- referenced connector operation/inbound descriptors and configuration
+- referenced connector operation/trigger catalog specs and configuration
   fingerprints;
 - the process runtime ABI.
 
@@ -1180,9 +1150,9 @@ pub struct ProcessDependencyDescriptors {
     pub commands: BTreeMap<(String, String), CommandDescriptor>,
     pub rules: BTreeMap<String, PinnedRuleBundle>,
     pub connector_operations:
-        BTreeMap<(String, String), PinnedConnectorOperation>,
+        BTreeMap<(String, OperationId), PinnedConnectorOperation>,
     pub connector_inbound_events:
-        BTreeMap<(String, String), PinnedConnectorInboundEvent>,
+        BTreeMap<(String, TriggerId), PinnedConnectorInboundEvent>,
 }
 
 pub struct PinnedRuleBundle {
@@ -1195,14 +1165,18 @@ pub struct PinnedRuleBundle {
 
 pub struct PinnedConnectorOperation {
     pub source_name: String,
-    pub descriptor: ConnectorOperationDescriptor,
+    pub connector_instance: String,
+    pub spec: OperationSpec,
+    pub deployment_fingerprint: Hash256,
     pub activity_send_horizons_ms:
         BTreeMap<String, BTreeMap<CompiledStepId, u64>>,
 }
 
 pub struct PinnedConnectorInboundEvent {
     pub source_name: String,
-    pub descriptor: ConnectorInboundEventDescriptor,
+    pub connector_instance: String,
+    pub trigger: TriggerSpec,
+    pub deployment_fingerprint: Hash256,
 }
 ~~~
 
@@ -1210,9 +1184,9 @@ The Rule bundle contains only the referenced definitions and their transitive
 named-type closure. Loading it calls
 `donat_rules::compile_catalog_with_declared_types` and compares both stored
 hash maps before a worker may claim the revision. A pinned connector entry
-stores its owning metadata source beside the non-secret descriptor. For every
+stores its owning metadata source beside the non-secret catalog spec. For every
 activity state using that operation it also stores the compiler's
-per-side-effect-step `maximum_send_horizon_ms`; the descriptor retains the
+per-side-effect-step `maximum_send_horizon_ms`; the `OperationSpec` retains the
 matching fixed binding, scope, retention, and margin. A fresh binary
 recomputes every horizon before accepting the persisted revision. Current
 metadata may not bind that connector instance to another source while an
@@ -1294,6 +1268,16 @@ The command's first execution generates a new UUID. An unexpired exact replay
 returns the stored result and preserves that UUID. Reclaiming an expired
 idempotency tuple is a new execution generation: it writes a new UUID even
 though `(command_identity, scope_hash, key)` is reused.
+
+The migration and compatible command writer are one implementation unit and
+one commit. In the same Task 6 that makes the column non-null, the existing
+one-statement claim/result CTE explicitly supplies `gen_random_uuid()` on a
+successful first or expired generation and selects the stored UUID on replay;
+it does not rely on a column default. Task 6 runs command regressions and the
+full native conformance crate, so there is no green checkpoint where V6 has
+landed but an existing writer omits the column. Task 7 only adds the typed
+internal `CommandExecutionResult` projection/decoder for that already-correct
+stored identity.
 
 `crates/ir/src/lib.rs` replaces `CommandEffectKind` with these closed resolved
 values:
@@ -1724,6 +1708,19 @@ Session {
 The mapping is evaluated only from the compiled sources allowed in Section 3;
 no request headers or ambient GraphQL session are available.
 
+The executable entry point accepts the finalized owner, never a bare
+pre-process command:
+
+~~~rust
+pub async fn execute_process_command_in_savepoint(
+    transaction: &tokio_postgres::Transaction<'_>,
+    command: &FinalizedCompiledCommand,
+    role: &str,
+    arguments: TypedValue,
+    session_variables: BTreeMap<String, TypedValue>,
+) -> anyhow::Result<ProcessCommandOutcome>;
+~~~
+
 The command's one SQL statement executes inside a nested savepoint. Only a
 database error with SQLSTATE `P0D01` and a valid exact
 `donat.graphql-error.v1` envelope is a command business rejection. For that
@@ -1767,6 +1764,28 @@ Each Postgres `ProcessRuntime` owns a cloned
 Non-Postgres variants are rejected before a worker is created; no abstract
 pool type or cross-backend process executor is introduced.
 
+~~~rust
+pub struct ProcessRuntime {
+    pub source_name: String,
+    pub pool: deadpool_postgres::Pool,
+    pub deployed_catalog: Arc<DeployedSourceProcessCatalog>,
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    pub connector_registry: Arc<ConnectorRegistry>,
+}
+~~~
+
+Both command catalogs come from the same published Engine snapshot.
+Reconciliation and descriptor checks may inspect `command_catalog`; process
+command execution resolves the source/name in
+`finalized_command_catalog` and passes the resulting
+`FinalizedCompiledCommand` to the shared planner. That planner lowers its
+finalized start/signal effects exactly as GraphQL command execution does.
+Applied transition commands therefore commit domain DML, the command
+generation, and all effect outboxes in the command's one statement inside the
+savepoint. A business rejection rolls all of those command writes back before
+the outer `on_rejection` transition commits.
+
 ## 9. Activities, leases, retries, and capacity
 
 A state transition gives each activity one deterministic
@@ -1803,7 +1822,7 @@ An activity claim uses this exact transaction protocol:
    job-then-bucket order and an activity references exactly one bucket, so no
    transaction holds multiple bucket locks. A fingerprint mismatch is an
    invariant failure; reconciliation may replace/reset a bucket policy only
-   after no active or live-retired revision references the prior descriptor.
+   after no active or live-retired revision references the prior catalog spec.
 5. Mark expired unreleased reservations for this bucket released at `db_now`.
    Count only rows with `released_at IS NULL AND expires_at > db_now`.
    Reject capacity when that count is `>= max_in_flight`. If
@@ -1892,6 +1911,15 @@ The connector endpoint remains
 binding selects exactly one process source. The connector verifies the raw
 bytes before parsing and returns only its typed verified event contract.
 
+The connector-owned raw-verification responses remain unchanged:
+
+| Pre-persistence outcome | Exact response |
+| --- | --- |
+| unknown connector instance or no webhook verifier | empty `404 Not Found` |
+| raw body exceeds the connector bound | empty `413 Payload Too Large` |
+| missing, malformed, expired, unsupported, or invalid verification | empty `400 Bad Request` |
+| successful verification before durable Process ingress exists | empty `503 Service Unavailable` |
+
 Inbound persistence is deliberately split:
 
 - `process_inbound_events` is only the verified provider-event dedupe ledger,
@@ -1918,9 +1946,24 @@ provider text. A duplicate remains independently auditable but links to no new
 event because it creates none; the original accepted delivery remains linked.
 
 The route acknowledges a verified provider event only after the complete
-transaction commits. A post-verification database failure is not
-acknowledged, so the provider can retry. Payload digests and redacted metadata
-are retained; raw bodies and secrets are not retained by this Phase-1 schema.
+transaction commits. Every successfully committed verified outcome has the
+same exact response:
+
+| Committed verified outcome | Exact response |
+| --- | --- |
+| `accepted` | empty `204 No Content` |
+| `duplicate` | empty `204 No Content` |
+| `unmatched` | empty `204 No Content` |
+| `ambiguous` | empty `204 No Content` |
+| `guard_false` | empty `204 No Content` |
+| `unexpected_state` | empty `204 No Content` |
+
+A post-verification persistence or transition database failure returns empty
+`503 Service Unavailable`, so the provider can retry. It never returns a
+success status or body before commit. The durable matrix does not change the
+raw `404`/`413`/`400` verification matrix above. Payload digests and redacted
+metadata are retained; raw bodies and secrets are not retained by this
+Phase-1 schema.
 
 The command-signal worker consumes only a typed
 `process_signal_requests` outbox row. It uses the stored source, process,
@@ -1970,16 +2013,20 @@ a native conformance fixture. The focused identifiers are normative:
 | Test ID | Level | Required proof |
 | --- | --- | --- |
 | `value_type_language_is_closed_and_canonical` | value-contract unit | aliases, scalar JSON semantics, named refs, recursion, requiredness, and assignability use one parser in the `no_std + alloc` owner |
+| `value_type_identifier_grammar_has_no_implicit_reserved_prefix` | value-contract unit | `__bad` is accepted because the declared identifier grammar contains no reserved-prefix exception |
+| `canonical_decimal_spelling_is_exact` | value-contract unit | only the private minimal fixed-point spelling constructs; exponent, plus, leading/trailing zero ambiguity, negative zero, and arbitrary `String` construction reject |
 | `value_contract_timestamp_grammar_is_exact` | value-contract unit | local timestamp accepts only valid `T`-separated no-offset values with zero-to-six fractional digits; timestamptz requires `Z`/offset |
 | `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
 | `value_contract_has_one_owner` | workspace policy | process and connector plans name the same Task-1 crate and commit; no connector-local value implementation exists |
 | `inline_bytes_have_one_inert_owner` | value-contract/workspace | the lower crate alone owns bytes, bounded media type/file name, and canonical accounting while every external adapter remains gated |
-| `inline_binary_canonical_size_vectors_are_exact` | value-contract unit | the 174,817-byte binary and 262,144/262,145-byte complete-value vectors match the future JCS representation exactly |
+| `inline_binary_canonical_size_vectors_are_exact` | value-contract unit | an independent checked oracle proves unpadded RFC 4648 base64url, root/outer JCS order and escaping, and the 174,817/262,144/262,145-byte vectors |
 | `inline_binary_count_and_decoded_bounds_are_exact` | value-contract unit | 131,072 aggregate decoded bytes and 16 inline values are accepted boundaries; one-byte/one-value excess rejects |
 | `inline_binary_external_adapters_remain_disabled` | boundary unit | metadata, JSON/form, connector admission, multipart, commands, and process journals reject `InlineBytes` |
 | `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
-| `connector_descriptor_is_typed_and_non_secret` | server unit | HTTP/Stripe descriptors contain exact contracts and no secret values |
-| `connector_effect_model_is_closed_and_per_step` | server unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |
+| `process_connector_ledger_uses_catalog_specs_without_local_descriptors` | cross-plan boundary | Processes consume accepted `OperationSpec`/`TriggerSpec` and ABI IDs; no server-local string descriptor model exists |
+| `process_connector_registry_is_the_only_task_3_to_14_catalog` | cross-plan boundary | compiler, reconcile, activity, ingress, and rolling tests use one accepted static registry |
+| `process_connector_inventory_only_stripe_mutation_is_not_executable` | connector/process boundary | Stripe mutation is absent from process operation lookup until immutable evidence and executable migration commits both pass; a webhook trigger grants no operation |
+| `connector_effect_model_is_closed_and_per_step` | connector catalog unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |
 | `connector_effect_retention_boundary_is_exact` | process compiler | every step accepts horizon equality, rejects one millisecond over, uses checked arithmetic, and includes final takeover grace for `max_attempts: 1` and the final attempt |
 | `connector_effect_multistep_coverage_is_total` | process compiler | every side-effecting step has one independent binding/scope/window and read-only steps have none |
 | `http_template_slots_require_declared_types` | metadata/server unit | path/query/header/body slots reject undeclared or incompatible input |
@@ -1994,9 +2041,10 @@ a native conformance fixture. The focused identifiers are normative:
 | `serve_with_readonly_role_issues_no_ddl` | state/Postgres | startup succeeds without schema-create privilege and SQL capture contains no DDL |
 | `process_v6_schema_is_exact` | migrate integration | every Section 7 column/key/index exists and no command-journal FK exists |
 | `process_sources_sharing_database_are_isolated` | Postgres integration | identical names, UUIDs, and semantic keys in two source namespaces do not collide |
-| `process_live_connector_rebind_is_rejected` | reconcile integration | active/live-retired source-A descriptor prevents binding that instance to source B |
+| `process_live_connector_rebind_is_rejected` | reconcile integration | active/live-retired source-A catalog spec prevents binding that instance to source B |
 | `process_retired_revision_reloads_and_is_available` | restart integration | fresh Engine hash-verifies and exposes non-terminal retired A without executing it |
 | `process_retired_revision_reloads_and_completes` | restart integration | A starts, explicit retirement rejects new start, fresh Engine loads and completes/verifies A |
+| `command_v6_writer_remains_compatible` | command conformance/Postgres | the V6 migration and all existing command writers are green together; first/expired claims populate UUID and replay preserves it |
 | `command_invocation_id_replays_unchanged` | SQLgen/Postgres | exact replay preserves UUID |
 | `command_invocation_id_changes_after_expiry` | SQLgen/Postgres | expired-key execution gets a new UUID |
 | `command_effect_positions_share_generation` | SQLgen/Postgres | multiple positions copy one invocation UUID and remain individually unique |
@@ -2007,6 +2055,7 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_command_later_assert_commits_on_rejection` | Postgres integration | valid write then later assert rolls back domain DML while one rejection transition commits |
 | `process_command_guard_prevents_first_write` | Postgres integration | a false guard reaches no domain CTE and follows the declared rejection behavior |
 | `process_command_database_error_aborts_outer` | Postgres integration | non-P0D01 error commits no process writes |
+| `process_transition_command_executes_finalized_effects_atomically` | command/process integration | transition commands with finalized start and signal effects commit domain DML, generation, and outboxes together; rejection rolls every command write back |
 | `process_activity_does_not_hold_tx` | recording connector/Postgres observer | provider stub accepts only after another connection sees committed job and capacity intent |
 | `process_provider_logic_is_activity_only` | planner/runtime | command planning/execution cannot invoke a connector; only a committed activity dispatch can |
 | `process_lease_takeover_is_safe` | two binaries | read-only takeover is headerless; provider mutation reuses each stable step key; one transition and stale audit |
@@ -2018,6 +2067,8 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_inbound_audit_is_split` | webhook integration | accepted plus duplicate create two deliveries, one dedupe row, one transition |
 | `process_accepted_delivery_links_instance_history` | webhook/inspect integration | accepted row links source/instance/event and appears in that instance timeline |
 | `process_invalid_signature_is_audit_only` | webhook integration | invalid signature creates delivery only and permits absent provider ID |
+| `process_raw_webhook_response_matrix_is_unchanged` | webhook integration | unknown/no verifier, oversized, and verification rejection remain exact empty 404/413/400 |
+| `process_verified_inbound_ack_matrix_is_exact` | webhook integration | every committed accepted/duplicate/unmatched/ambiguous/guard_false/unexpected_state outcome is empty 204; post-verification DB failure is empty 503 |
 | `process_signal_is_not_buffered` | command/webhook integration | early/late signal cannot advance a later wait |
 | `process_revision_runtime_abi_is_fenced` | rolling deployment | incompatible worker cannot claim pinned work |
 | `process_grammar_has_no_workflow_nodes_or_items` | metadata/runtime | the five state variants are closed; node/item/loop/subworkflow spellings reject |
@@ -2053,9 +2104,11 @@ Temporal, AWS Step Functions, Inngest, Stripe, and Airbyte remain
 behavior/test-category references under
 `knowledgebase/declarative-saas/reference-porting-register.md`.
 This process contract copies no upstream source, fixture, generated artifact,
-schema, or large text. Stripe Checkout contracts are independently expressed
-by the fixed Rust descriptor already admitted under the existing Stripe
-records. No n8n-derived code, fixture, module, or reference is added. In
+schema, or large text. Stripe mutation remains inventory-only for this Process
+specification unless the connector plan's separate immutable-evidence and
+executable-migration gates pass; an independently accepted webhook trigger
+grants no operation and no idempotency fact is invented here. No n8n-derived
+code, fixture, module, or reference is added. In
 particular this design does not port logical/workflow nodes, item or
 paired-item semantics, loops, batching-as-workflow, or subworkflows.
 

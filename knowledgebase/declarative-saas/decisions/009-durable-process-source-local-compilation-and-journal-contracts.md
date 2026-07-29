@@ -37,19 +37,46 @@ dependency, and exposes no `serde_json::Value`. `donat-ir` depends on and
 re-exports those types without a second representation; metadata/Rule
 normalization adapters may live in IR.
 
+The type-reference identifier grammar has no implicit reserved-prefix
+exception, so `__bad` remains valid. Decimal values use a private
+`CanonicalDecimal` constructor and an already minimal fixed-point spelling:
+no exponent, leading plus, noncanonical integer leading zero, negative zero,
+trailing point, or trailing fractional zero. Canonical sizing counts that
+checked spelling, not an arbitrary `String`.
+
+Inline bytes are sized against their exact future RFC 8785 representation:
+the byte string is RFC 4648 base64url without padding, and the root object is
+`{"$binary":"...","media_type":"..."}` or
+`{"$binary":"...","file_name":"...","media_type":"..."}` in that JCS order.
+Production and independent test-oracle helpers use checked arithmetic for
+base64 expansion and JCS string escaping; the lower crate does not acquire a
+JSON dependency or external adapter.
+
 `donat-schema` compiles commands to public pre-process descriptors whose
 canonical fingerprints include raw effect declarations but no resolved process
-revision. The existing connector registry publishes public typed
-operation/event descriptors. The server-owned process compiler consumes those
-descriptors and Rules, derives revisions, and exposes them through a
-schema-owned neutral effect-contract interface. Schema then finalizes command
-effects and compiles the serving schema. Each `Engine` snapshot retains the
-metadata process catalog plus a hash-verified `DeployedProcessCatalog`
-containing the declared active and every non-terminal live-retired revision;
-no compiler is duplicated and schema never depends on server. Persisted Rule
-dependencies retain their source definitions and named-type closure so a fresh
-binary can recompile and verify an old revision rather than interpreting it
-through current metadata.
+revision. The accepted connector-factory plan owns exact ABI IDs and the
+catalog-owned `OperationSpec`, `TriggerSpec`, effects, bounds, and generated
+entries. Its server `ConnectorRegistry` is the one catalog consumed by every
+process compiler and runtime stage. The Process Task-2 ledger records the
+reviewed ABI/catalog/executor/registry/webhook commits; it does not create
+server-local string descriptors or a second effect model. Inventory-only
+entries are not executable, and Stripe mutation remains inventory-only unless
+its separate immutable-evidence and executable-migration gates both pass. An
+independently accepted webhook trigger grants no mutation capability.
+
+The server-owned process compiler consumes that registry and Rules, derives
+revisions, and exposes them through a schema-owned neutral effect-contract
+interface. Schema then finalizes command effects and compiles the serving
+schema. Each `Engine` snapshot retains both the pre-process
+`CompiledCommandCatalog` and the corresponding `FinalizedCommandCatalog`, the
+metadata process catalog, and a hash-verified `DeployedProcessCatalog`
+containing the declared active and every non-terminal live-retired revision.
+Each `ProcessRuntime` receives both command catalogs from that same snapshot;
+process command execution resolves only `FinalizedCompiledCommand`. No
+compiler is duplicated and schema never depends on server. Persisted Rule
+dependencies retain their source definitions and named-type closure so a
+fresh binary can recompile and verify an old revision rather than interpreting
+it through current metadata.
 
 The neutral effect catalog is built by the server-owned free function
 `build_process_effect_contract_catalog(&CompiledProcessCatalog) ->
@@ -80,13 +107,22 @@ coordination while old work remains.
 
 V6 gives each completed command execution generation a durable
 `invocation_id uuid`. Exact replay preserves it; expired-key re-execution gets
-a new UUID. Every process-effect outbox copies it and is unique by invocation
-and effect position, with no retention-coupling foreign key to the command
-journal. A process command runs its one statement in a savepoint owned by the
-outer process transition. Only the established valid `P0D01`
-`donat.graphql-error.v1` rejection is rolled back to that savepoint and turned
-into one committed `on_rejection` transition; every other database error
-aborts the outer transaction.
+a new UUID. The V6 migration and compatible one-statement writer are one
+implementation task and commit: first/expired successful generations
+explicitly supply a fresh database UUID, replay selects the stored UUID, and
+the full command/conformance regressions pass before the task is green. The
+next task exposes that already-correct identity through the typed internal
+result decoder rather than repairing the writer.
+
+Every process-effect outbox copies the generation UUID and is unique by
+invocation and effect position, with no retention-coupling foreign key to the
+command journal. A process command runs its finalized command and effects in
+one statement inside a savepoint owned by the outer process transition.
+Applied domain DML, generation, and start/signal outboxes commit together.
+Only the established valid `P0D01` `donat.graphql-error.v1` rejection is
+rolled back to that savepoint and turned into one committed `on_rejection`
+transition; every command DML/journal/outbox write rolls back, and every other
+database error aborts the outer transaction.
 
 `crates/server/src/commands.rs` owns the shared strict decoder
 `decode_command_business_rejection(&tokio_postgres::Error) ->
@@ -144,6 +180,15 @@ invalid-signature attempt. Invalid signatures write audit only; verified
 deliveries write audit and dedupe atomically. An accepted delivery stores
 source-qualified instance and event foreign keys in that same transaction so
 instance inspection never infers history from redacted payloads.
+
+Raw connector verification keeps its exact empty `404` unknown/no-verifier,
+`413` oversized-body, and `400` verification-rejection responses; successful
+verification remains empty `503` until durable ingress exists. Thereafter
+every committed `accepted`, `duplicate`, `unmatched`, `ambiguous`,
+`guard_false`, or `unexpected_state` verified outcome returns empty `204`.
+A post-verification persistence/transition database failure returns empty
+`503`. No verified outcome is acknowledged before its source-local
+audit/dedupe/transition transaction commits.
 
 Stopping new starts is explicit metadata lifecycle, not omission.
 `lifecycle: retired` keeps the definition and dependencies resolvable while a

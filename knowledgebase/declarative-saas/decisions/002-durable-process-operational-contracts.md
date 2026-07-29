@@ -98,6 +98,17 @@ audit, deduplication, correlation, and success acknowledgement. The exact
 source-local journal and transaction contract is recorded in
 [[009-durable-process-source-local-compilation-and-journal-contracts]].
 
+The raw connector-verification matrix remains exact: unknown instance or no
+verifier is empty `404`, an oversized raw body is empty `413`,
+missing/malformed/expired/unsupported/invalid verification is empty `400`,
+and successful verification before durable ingress exists is empty `503`.
+After durable ingress exists, every successfully committed verified outcome—
+`accepted`, `duplicate`, `unmatched`, `ambiguous`, `guard_false`, or
+`unexpected_state`—returns empty `204 No Content`. A post-verification
+persistence or transition database failure returns empty
+`503 Service Unavailable`. No verified result is acknowledged before its
+source-local audit/dedupe/transition transaction commits.
+
 ## Alternatives
 
 | Option | Why not |
