@@ -956,6 +956,12 @@ fn collect_required_session_variables(
     infer_function_permissions: bool,
 ) -> Result<BTreeMap<String, BTreeMap<String, TypeRef>>, PlanError> {
     let mut planner = Planner::for_source(metadata, source, catalog);
+    let declared_custom_scalars = metadata
+        .custom_types
+        .scalars
+        .iter()
+        .map(|scalar| scalar.name.as_str())
+        .collect::<BTreeSet<_>>();
     // Command effects are table-only, so function-permission inference cannot
     // change these session contracts. Retain the caller's planner mode so the
     // descriptor path never constructs a differently configured snapshot.
@@ -989,6 +995,7 @@ fn collect_required_session_variables(
                         &filter_context,
                         role,
                         &mut required,
+                        &declared_custom_scalars,
                         path,
                     )?;
                 }
@@ -1006,6 +1013,7 @@ fn collect_required_session_variables(
                             &filter_context,
                             role,
                             &mut required,
+                            &declared_custom_scalars,
                             path,
                         )?;
                         for (column, value) in &permission.set {
@@ -1014,6 +1022,7 @@ fn collect_required_session_variables(
                                 info.column(column),
                                 role,
                                 &mut required,
+                                &declared_custom_scalars,
                                 path,
                             )?;
                         }
@@ -1029,6 +1038,7 @@ fn collect_required_session_variables(
                             &filter_context,
                             role,
                             &mut required,
+                            &declared_custom_scalars,
                             path,
                         )?;
                         if let Some(check) = &permission.check {
@@ -1038,6 +1048,7 @@ fn collect_required_session_variables(
                                 &filter_context,
                                 role,
                                 &mut required,
+                                &declared_custom_scalars,
                                 path,
                             )?;
                         }
@@ -1047,6 +1058,7 @@ fn collect_required_session_variables(
                                 info.column(column),
                                 role,
                                 &mut required,
+                                &declared_custom_scalars,
                                 path,
                             )?;
                         }
@@ -1062,6 +1074,7 @@ fn collect_required_session_variables(
                             &filter_context,
                             role,
                             &mut required,
+                            &declared_custom_scalars,
                             path,
                         )?;
                     }
@@ -1113,15 +1126,22 @@ fn collect_sessions_from_predicate(
     context: &TableCtx<'_>,
     role: &str,
     required: &mut BTreeMap<String, TypeRef>,
+    declared_custom_scalars: &BTreeSet<&str>,
     path: &str,
 ) -> Result<(), PlanError> {
     for session_use in planner.collect_permission_session_uses(value, context, path)? {
         let contract = match session_use.operand {
-            PermissionSessionOperand::Scalar(column) => required_column_contract(&column, path)?,
+            PermissionSessionOperand::Scalar(column) => {
+                required_column_contract(&column, declared_custom_scalars, path)?
+            }
             PermissionSessionOperand::List(column) => TypeRef {
                 nullable: false,
                 value_type: ValueType::List {
-                    element: Box::new(required_column_contract(&column, path)?),
+                    element: Box::new(required_column_contract(
+                        &column,
+                        declared_custom_scalars,
+                        path,
+                    )?),
                 },
             },
             PermissionSessionOperand::Boolean => required_boolean_contract(),
@@ -1144,6 +1164,7 @@ fn collect_session_preset(
     column: Option<&ColumnInfo>,
     role: &str,
     required: &mut BTreeMap<String, TypeRef>,
+    declared_custom_scalars: &BTreeSet<&str>,
     path: &str,
 ) -> Result<(), PlanError> {
     let serde_json::Value::String(name) = value else {
@@ -1158,12 +1179,16 @@ fn collect_session_preset(
         required,
         role,
         name,
-        required_column_contract(column, path)?,
+        required_column_contract(column, declared_custom_scalars, path)?,
         path,
     )
 }
 
-fn required_column_contract(column: &ColumnInfo, path: &str) -> Result<TypeRef, PlanError> {
+fn required_column_contract(
+    column: &ColumnInfo,
+    declared_custom_scalars: &BTreeSet<&str>,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
     let scalar = match column.pg_type.as_str() {
         "bool" => ValueScalar::Boolean,
         "int2" | "int4" | "serial" => ValueScalar::Int32,
@@ -1175,7 +1200,7 @@ fn required_column_contract(column: &ColumnInfo, path: &str) -> Result<TypeRef, 
         "timestamptz" | "timestamp with time zone" => ValueScalar::TimestampTz,
         "json" | "jsonb" => ValueScalar::Json,
         "text" | "varchar" | "bpchar" | "name" | "citext" => ValueScalar::String,
-        name if is_graphql_name(name) => ValueScalar::Custom {
+        name if declared_custom_scalars.contains(name) => ValueScalar::Custom {
             name: name.to_owned(),
         },
         name => {

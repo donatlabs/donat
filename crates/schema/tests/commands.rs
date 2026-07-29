@@ -6,7 +6,7 @@ use donat_ir::{
     CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar, TypeRef,
     ValueScalar, ValueType,
 };
-use donat_metadata::{Metadata, SourceKind};
+use donat_metadata::{Metadata, ScalarType, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
@@ -2541,6 +2541,13 @@ fn required_scalar(scalar: ValueScalar) -> TypeRef {
     }
 }
 
+fn declare_custom_scalar(metadata: &mut Metadata, name: &str) {
+    metadata.custom_types.scalars.push(ScalarType {
+        name: name.to_owned(),
+        description: None,
+    });
+}
+
 #[test]
 fn command_descriptor_exposes_exact_contract() {
     let metadata = descriptor_metadata("X-Donat-Actor-Id");
@@ -2673,7 +2680,7 @@ fn command_descriptor_session_contracts_follow_predicate_operators_and_tables() 
 
 #[test]
 fn command_descriptor_session_contracts_follow_operator_operand_types() {
-    let (metadata, mut catalog) = predicate_descriptor_fixture(json!({
+    let (mut metadata, mut catalog) = predicate_descriptor_fixture(json!({
         "_and": [
             { "document": { "_has_key": "X-Donat-Document-Key" } },
             { "document": { "_has_keys_any": "X-Donat-Document-Keys" } },
@@ -2683,6 +2690,7 @@ fn command_descriptor_session_contracts_follow_operator_operand_types() {
             }}}
         ]
     }));
+    declare_custom_scalar(&mut metadata, "geometry");
     catalog
         .tables
         .get_mut("public.orders")
@@ -2723,6 +2731,56 @@ fn command_descriptor_session_contracts_follow_operator_operand_types() {
             name: "geometry".to_owned(),
         }),
         "_st_d_within.from consumes the geo column value"
+    );
+}
+
+#[test]
+fn command_descriptor_rejects_undeclared_source_scalar_contract() {
+    let (metadata, mut catalog) = predicate_descriptor_fixture(json!({
+        "path": { "_eq": "X-Donat-Path" }
+    }));
+    catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders catalog")
+        .columns
+        .push(column("path", "ltree"));
+
+    let error = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect_err("a GraphQL-safe PostgreSQL type is not an implicit custom scalar");
+
+    assert_eq!(error.path, "commands[0]");
+    assert_eq!(
+        error.message,
+        "column scalar 'ltree' has no closed session-variable contract"
+    );
+}
+
+#[test]
+fn command_descriptor_accepts_declared_custom_source_scalar_contract() {
+    let (mut metadata, mut catalog) = predicate_descriptor_fixture(json!({
+        "path": { "_eq": "X-Donat-Path" }
+    }));
+    declare_custom_scalar(&mut metadata, "ltree");
+    catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders catalog")
+        .columns
+        .push(column("path", "ltree"));
+
+    let descriptor = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect("an explicitly declared source scalar has a closed nominal contract")
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor()
+        .clone();
+
+    assert_eq!(
+        descriptor.required_session_variables["customer"]["x-donat-path"],
+        required_scalar(ValueScalar::Custom {
+            name: "ltree".to_owned(),
+        })
     );
 }
 
