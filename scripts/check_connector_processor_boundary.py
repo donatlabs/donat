@@ -69,10 +69,20 @@ class RustToken:
 
 
 @dataclass(frozen=True)
+class RustUseLeaf:
+    start: int
+    path: tuple[str, ...]
+    alias: str | None
+    public: bool
+
+
+@dataclass(frozen=True)
 class RustUse:
     start: int
     tokens: tuple[RustToken, ...]
     public: bool
+    leaves: tuple[RustUseLeaf, ...]
+    parsed: bool
 
 
 @dataclass(frozen=True)
@@ -265,6 +275,93 @@ def rust_tokens(source: str) -> list[RustToken]:
     return tokens
 
 
+def rust_use_leaves(
+    tokens: tuple[RustToken, ...],
+    public: bool,
+) -> tuple[RustUseLeaf, ...] | None:
+    def finish_leaf(
+        start: int,
+        path: tuple[str, ...],
+        cursor: int,
+    ) -> tuple[list[RustUseLeaf], int] | None:
+        alias: str | None = None
+        if cursor < len(tokens) and rust_keyword(tokens[cursor], "as"):
+            cursor += 1
+            if cursor >= len(tokens):
+                return None
+            alias_token = tokens[cursor]
+            if not (alias_token.identifier or alias_token.value == "_"):
+                return None
+            alias = alias_token.value
+            cursor += 1
+        return [RustUseLeaf(start, path, alias, public)], cursor
+
+    def parse_tree(
+        cursor: int,
+        inherited: tuple[str, ...],
+    ) -> tuple[list[RustUseLeaf], int] | None:
+        if cursor >= len(tokens):
+            return None
+        if tokens[cursor].value == "::":
+            cursor += 1
+            if cursor >= len(tokens):
+                return None
+
+        start = tokens[cursor].offset
+        path = inherited
+        if tokens[cursor].value == "{":
+            cursor += 1
+            leaves: list[RustUseLeaf] = []
+            if cursor < len(tokens) and tokens[cursor].value == "}":
+                return leaves, cursor + 1
+            while cursor < len(tokens):
+                parsed = parse_tree(cursor, path)
+                if parsed is None:
+                    return None
+                branch_leaves, cursor = parsed
+                leaves.extend(branch_leaves)
+                if cursor >= len(tokens):
+                    return None
+                if tokens[cursor].value == "}":
+                    return leaves, cursor + 1
+                if tokens[cursor].value != ",":
+                    return None
+                cursor += 1
+                if cursor < len(tokens) and tokens[cursor].value == "}":
+                    return leaves, cursor + 1
+            return None
+
+        if tokens[cursor].value == "*":
+            return finish_leaf(start, path, cursor + 1)
+
+        while cursor < len(tokens):
+            segment = tokens[cursor]
+            if not segment.identifier or rust_keyword(segment, "as"):
+                return None
+            if rust_keyword(segment, "self"):
+                return finish_leaf(start, path, cursor + 1)
+            path += (segment.value,)
+            cursor += 1
+            if cursor >= len(tokens) or tokens[cursor].value != "::":
+                return finish_leaf(start, path, cursor)
+            cursor += 1
+            if cursor >= len(tokens):
+                return None
+            if tokens[cursor].value == "{":
+                return parse_tree(cursor, path)
+            if tokens[cursor].value == "*":
+                return finish_leaf(start, path, cursor + 1)
+        return None
+
+    parsed = parse_tree(0, ())
+    if parsed is None:
+        return None
+    leaves, cursor = parsed
+    if cursor != len(tokens):
+        return None
+    return tuple(leaves)
+
+
 def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
     statements: list[RustUse] = []
     for index, token in enumerate(tokens):
@@ -280,38 +377,35 @@ def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
             cursor -= 1
         prefix = tokens[statement_start:index]
         public = any(rust_keyword(item, "pub") for item in prefix)
+        statement_tokens = tuple(tokens[index + 1 : end])
+        leaves = rust_use_leaves(statement_tokens, public)
         statements.append(
             RustUse(
                 tokens[statement_start].offset,
-                tuple(tokens[index + 1 : end]),
+                statement_tokens,
                 public,
+                leaves if leaves is not None else (),
+                leaves is not None,
             )
         )
     return statements
 
 
 def rust_use_mentions(statement: RustUse, name: str) -> bool:
+    if statement.parsed:
+        return any(name in leaf.path for leaf in statement.leaves)
     return any(rust_name(token, name) for token in statement.tokens)
 
 
 def rust_use_aliases(statement: RustUse, name: str) -> bool:
-    tokens = statement.tokens
-    for index, token in enumerate(tokens):
-        if not rust_name(token, name):
-            continue
-        cursor = index + 1
-        while cursor < len(tokens):
-            candidate = tokens[cursor]
-            if candidate.value in (",", "}", ";"):
-                break
-            if (
-                rust_keyword(candidate, "as")
-                and cursor + 1 < len(tokens)
-                and tokens[cursor + 1].identifier
-            ):
-                return True
-            cursor += 1
-    return False
+    if statement.parsed:
+        return any(
+            leaf.alias is not None and name in leaf.path
+            for leaf in statement.leaves
+        )
+    mentioned = rust_use_mentions(statement, name)
+    has_alias = any(rust_keyword(token, "as") for token in statement.tokens)
+    return mentioned and has_alias
 
 
 def rust_type_aliases(tokens: list[RustToken]) -> list[RustTypeAlias]:
@@ -1805,6 +1899,116 @@ def fixtures() -> tuple[Fixture, ...]:
             "// host_construction::transport_response();\n"
             'const TEXT: &str = "StaticErrorCode::literal(\\\"bad\\\")";\n'
             "/* catalog_construction::static_error_code(value); */",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_host_self_alias.rs",
+            "use donat_connector_abi::host_construction::{"
+            "transport_response, self as host_api};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-catalog/src/grouped_catalog_self_alias.rs",
+            "use donat_connector_abi::catalog_construction::{"
+            "static_error_code, self as catalog_api};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_host_member_alias.rs",
+            "use donat_connector_abi::host_construction::{"
+            "authorized_correlations, transport_response as make};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-catalog/src/nested_catalog_member_alias.rs",
+            "use donat_connector_abi::{catalog_construction::{"
+            "static_safe_message, static_error_code as make_code}, CapabilityId};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/unrelated_sibling_alias.rs",
+            "use donat_connector_abi::{host_construction, "
+            "harmless::{Thing as Alias}};",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_raw_keyword_alias.rs",
+            "use donat_connector_abi::host_construction::{"
+            "transport_response, self as r#use};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_unaliased_self.rs",
+            "use donat_connector_abi::host_construction::{"
+            "transport_response, self};",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/leading_global_reexport.rs",
+            "pub(crate) use ::donat_connector_abi::StaticErrorCode;",
+            "static-literal-reexport: StaticErrorCode::literal cannot be re-exported "
+            "outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/restricted_visibility_reexport.rs",
+            "pub(in crate) use donat_connector_abi::StaticSafeMessage;",
+            "static-literal-reexport: StaticSafeMessage::literal cannot be "
+            "re-exported outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/nested_host_self_alias.rs",
+            "use outer::{donat_connector_abi::{host_construction::{"
+            "transport_response, self as host_api,},},};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/host_as_underscore.rs",
+            "use donat_connector_abi::host_construction as _;",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/host_empty_group.rs",
+            "use donat_connector_abi::host_construction::{};",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/host_glob.rs",
+            "use donat_connector_abi::host_construction::*;",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_static_types.rs",
+            "use donat_connector_abi::{CapabilityId, "
+            "StaticErrorCode as ErrorCode, StaticSafeMessage as SafeMessage};",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/connector-processors/src/grouped_host_traits.rs",
+            "use donat_connector_abi::{TypedBindings, "
+            "ConnectorIo as Io, ProcessorControl as Control};",
+            "host-trait-alias: ConnectorIo cannot be aliased outside approved host "
+            "implementation roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/protected_macro_use_fallback.rs",
+            "macro_rules! import_host { ($alias:ident) => { "
+            "use donat_connector_abi::host_construction as $alias; }; }",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/grouped_noncode_decoys.rs",
+            "use donat_connector_abi::{host_construction, harmless};\n"
+            "// harmless::{Thing as host_construction}\n"
+            'const TEXT: &str = r#"{StaticErrorCode as Alias}"#;',
             None,
         ),
         Fixture(
