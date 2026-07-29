@@ -683,12 +683,39 @@ fn command_insert_many_rule_binds_each_graphql_item() {
 }
 
 #[test]
-fn command_idempotency_replays_the_requested_projection_without_a_second_write() {
+fn command_idempotency_replays_a_wider_projection_from_the_complete_canonical_result() {
     let suite = Suite::new("command_idempotency_replay")
         .initial_metadata(command_metadata())
         .with_migrations()
         .start();
     create_orders_table(suite.db_url());
+
+    suite.check_query_f(
+        "commands/idempotency_first_narrow.yaml",
+        donat_conformance::Transport::Http,
+    );
+
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect to inspect the canonical command result");
+    let stored_result: String = client
+        .query_one(
+            "SELECT result::text \
+             FROM donat.command_invocations \
+             WHERE command_name = $1 AND key = $2",
+            &[&"create_order", &"550e8400-e29b-41d4-a716-446655440021"],
+        )
+        .expect("load the persisted canonical command result")
+        .get(0);
+    let stored_result: serde_json::Value =
+        serde_json::from_str(&stored_result).expect("canonical result is valid JSON");
+    assert_eq!(
+        stored_result,
+        json!({
+            "order_id": "550e8400-e29b-41d4-a716-446655440020",
+            "status": "draft"
+        }),
+        "V3 retains every declared result field independently of the first GraphQL selection"
+    );
 
     suite.check_query_f(
         "commands/idempotency_replay.yaml",
