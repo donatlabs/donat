@@ -125,7 +125,7 @@ and preserve declared value order.
 The lower crate exports these immutable types:
 
 ~~~rust
-pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
+pub const VALUE_TYPE_LANGUAGE_VERSION: u32 = 1;
 
 pub struct ValueContractCatalog {
     pub roots: BTreeMap<String, ValueContractField>,
@@ -447,20 +447,27 @@ into the exact ABI types and pass from generated statics through registry,
 compiler, pinned dependency, and worker without a `String` copy, wrapper
 conversion, serialization round-trip, or runtime reparse.
 
-An immutable process revision pins the catalog-owned `OperationSpec` or
-`TriggerSpec` plus its source-bound non-secret deployment fingerprint,
-endpoint and credential identities, and compiler-calculated activity horizon.
-`OperationSpec` is already the complete self-contained catalog snapshot: it
+An immutable process revision pins the catalog-owned behavioral
+`OperationSpec` or `TriggerSpec` plus a `CatalogIdentityEnvelopeV1` and the
+compiler-calculated activity horizon. `OperationSpec` is the complete
+non-circular behavioral snapshot: it
 includes connector/operation stable SemVer, runtime/value epochs, complete
 input/output contracts and recomputed hashes, optional versioned credential,
 resolved origin closure, ordered compiled steps and transforms, optional
-versioned processor, effect, pagination, complete error map,
+processor ID plus `implementation_revision`, effect, pagination, complete
+error map,
 capacity/rate/typed serialization defaults, every step/operation bound, stored
-selected-header capabilities, exact provenance, and fact bindings. The
-revision persists that value without restating a smaller process-owned shape.
+selected-header capabilities, and resolved fact values. It contains no source,
+artifact, license, notice, review, or fact-origin identity. The envelope
+separately pins canonical/source-record schema epochs, sorted source-record
+IDs and record hashes, semantic/provenance hashes, every referenced
+input/output/named value-contract hash, the complete operation/trigger
+snapshot identity, and the source-bound non-secret deployment fingerprint
+defined from `DeploymentMaterialV1` in ADR 012. The revision persists both
+without restating a smaller process-owned shape.
 Connector/credential/operation/trigger/event versions are SemVer cores without
 Phase-1 prerelease/build metadata; schema/runtime and processor-like
-implementation revisions are integer epochs.
+implementation revisions are `u32` epochs named `implementation_revision`.
 Resolved secret values and raw environment-derived URLs are never persisted.
 There is one executable lookup path through `ConnectorRegistry`; inventory
 records are absent from it.
@@ -531,8 +538,10 @@ effect:
 
 The positive numeric fields use checked `u64`; configuration admission
 requires `clock_safety_margin_ms < minimum_retention_ms`. The source evidence,
-normalized effect, semantic hash, catalog spec, configuration fingerprint, and
-pinned process revision all retain the exact values.
+normalized behavioral effect, semantic hash, and pinned process revision
+retain the exact values. Their source origins contribute to provenance; the
+deployment selection contributes through the exact `DeploymentMaterialV1`
+fingerprint in `CatalogIdentityEnvelopeV1`.
 
 No Stripe mutation operation is assumed by this specification. If its
 evidence/migration gates later pass, Processes consume the resulting
@@ -1226,7 +1235,7 @@ pub struct PinnedConnectorOperation {
     pub source_name: String,
     pub connector_instance: String,
     pub spec: OperationSpec,
-    pub deployment_fingerprint: Hash256,
+    pub catalog_identity: CatalogIdentityEnvelopeV1,
     pub activity_send_horizons_ms:
         BTreeMap<String, BTreeMap<CompiledStepId, u64>>,
 }
@@ -1235,7 +1244,40 @@ pub struct PinnedConnectorInboundEvent {
     pub source_name: String,
     pub connector_instance: String,
     pub trigger: TriggerSpec,
+    pub catalog_identity: CatalogIdentityEnvelopeV1,
+}
+
+pub struct CatalogIdentityEnvelopeV1 {
+    pub canonical_schema_epoch: u32,
+    pub source_record_schema_epoch: u32,
+    pub source_records: Vec<SourceIdentityMaterialV1>,
+    pub semantic_sha256: Hash256,
+    pub provenance_sha256: Hash256,
+    pub value_contracts: Vec<ValueContractIdentityV1>,
+    pub snapshot_identity: CatalogSnapshotIdentityV1,
     pub deployment_fingerprint: Hash256,
+}
+
+pub struct ValueContractIdentityV1 {
+    pub use_site: ValueContractUseSiteId,
+    pub value_contract_sha256: Hash256,
+}
+
+pub enum CatalogSnapshotIdentityV1 {
+    Operation {
+        connector: ConnectorId,
+        connector_version: StableSemver,
+        operation: OperationId,
+        operation_version: StableSemver,
+        snapshot_sha256: Hash256,
+    },
+    Trigger {
+        connector: ConnectorId,
+        connector_version: StableSemver,
+        trigger: TriggerId,
+        trigger_version: StableSemver,
+        snapshot_sha256: Hash256,
+    },
 }
 ~~~
 
@@ -1243,18 +1285,26 @@ The Rule bundle contains only the referenced definitions and their transitive
 named-type closure. Loading it calls
 `donat_rules::compile_catalog_with_declared_types` and compares both stored
 hash maps before a worker may claim the revision. A pinned connector entry
-stores its owning metadata source beside the exact complete non-secret
-catalog `OperationSpec`; it is not a projection and cannot omit a catalog
-field. The persisted value therefore pins connector/credential/operation
-versions, runtime/value/schema epochs, every value-contract/record/semantic/
-provenance hash, defaults, resolved origins, processor implementation
-revisions, selected-header capabilities, mappings, effects, pagination/error
-plan, bounds, provenance, and fact bindings. For every activity state using
+stores its owning metadata source beside the exact complete behavioral
+catalog `OperationSpec`; it is not a projection and cannot omit a behavioral
+field. `catalog_identity` is the exact ADR-012
+`CatalogIdentityEnvelopeV1`, not a process-owned summary. It pins canonical
+and source-record schema epochs; sorted `(SourceRecordId, record_sha256)`
+identities; semantic and provenance hashes; every referenced input, output,
+event, named, and transitive value-contract hash; the complete operation or
+trigger snapshot identity; and the separately computed
+`deployment_fingerprint`. The deployment fingerprint is
+`SHA256("donat.connector.deployment.v1\0" ||
+JCS(DeploymentMaterialV1))`; that closed material stores source/instance,
+connector, endpoint-reference, credential-reference, resolver, non-secret
+configuration, enabled operation/trigger, and override identities, never
+secret values or resolved URLs. For every activity state using
 that operation it also stores the compiler's
 per-side-effect-step `maximum_send_horizon_ms`; the `OperationSpec` retains the
 matching fixed binding, scope, retention, and margin. A fresh binary
-recomputes every contract hash and horizon and compares the complete snapshot
-before accepting the persisted revision. Current
+recomputes every hash, snapshot identity, deployment material, and horizon and
+compares the behavioral snapshot and every envelope field before accepting
+the persisted revision. Current
 metadata may not bind that connector instance to another source while an
 active or non-terminal live-retired revision retains the old binding.
 
@@ -2103,7 +2153,9 @@ a native conformance fixture. The focused identifiers are normative:
 | `command_descriptor_rejects_incompatible_session_variable_uses` | schema unit | incompatible permission-column uses of one role/name fail before serving |
 | `is_null_permission_session_string_is_strict_boolean` | planner unit | resolved permission-session text accepts only case-insensitive true/false and rejects all other text |
 | `process_connector_ledger_uses_catalog_specs_without_local_descriptors` | cross-plan boundary | Processes consume accepted `OperationSpec`/`TriggerSpec` and ABI IDs; no server-local string descriptor model exists |
-| `process_pins_complete_operation_snapshot` | process compiler/restart | the persisted `OperationSpec` retains every connector/operation/credential version, epoch, contract/hash, default, origin, ordered step/transform, processor revision, effect, pagination/error plan, bound, selected-header capability, provenance, and fact binding; any omitted/changed field rejects reload |
+| `process_pins_complete_operation_snapshot` | process compiler/restart | the persisted behavioral `OperationSpec` retains every connector/operation/credential version, epoch, contract/hash, default, origin, ordered step/transform, `implementation_revision`, effect, pagination/error plan, bound, selected-header capability, and resolved fact value; any omitted/changed field rejects reload |
+| `process_pins_complete_catalog_identity_envelope` | process compiler/restart | operation and inbound-event pins persist and field-for-field compare canonical/source-record epochs, sorted source IDs/hashes, semantic/provenance hashes, every referenced value-contract hash, complete snapshot identity, and deployment fingerprint |
+| `process_deployment_fingerprint_is_exact_and_secret_free` | process compiler/restart | independent JCS/domain vectors cover every `DeploymentMaterialV1` field; one-field mutation changes the fingerprint, while changing a resolved secret value does not enter persisted bytes |
 | `process_runtime_never_derives_header_capabilities` | cross-plan source policy | executor/process source consumes only catalog-stored header/capability mappings and selected-action allowlists; no capability domain/hash derivation or caller-provided allowlist path exists |
 | `process_connector_registry_is_the_only_task_3_to_14_catalog` | cross-plan boundary | compiler, reconcile, activity, ingress, and rolling tests use one accepted static registry |
 | `process_connector_inventory_only_stripe_mutation_is_not_executable` | connector/process boundary | Stripe mutation is absent from process operation lookup until immutable evidence and executable migration commits both pass; a webhook trigger grants no operation |

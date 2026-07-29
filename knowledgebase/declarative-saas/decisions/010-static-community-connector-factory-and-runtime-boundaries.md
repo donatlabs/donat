@@ -197,19 +197,30 @@ exact ABI-owned ID. Credential validation and webhook lookup borrow those
 generated catalog types directly; the server defines no replacement
 descriptor.
 
-`OperationSpec` is the complete self-contained versioned snapshot from
+`OperationSpec` is the complete self-contained behavioral snapshot from
 [[012-canonical-catalog-projections-and-persisted-header-capabilities]], not a
 summary. It retains connector and operation SemVer, runtime/value epochs,
 recomputed input/output contract hashes, optional versioned credential,
 resolved origin closure, ordered compiled steps and transforms, optional
-versioned operation processor, effect, pagination, complete error map,
+operation processor ID plus `implementation_revision`, effect, pagination,
+complete error map,
 capacity/rate/typed serialization defaults, all step/operation bounds, exact
-provenance and fact bindings, and persisted selected-header capabilities.
+resolved fact values, and persisted selected-header capabilities. It contains
+no source, artifact, license, notice, review, or fact-origin identity.
+Provenance and deployment identity instead live in the separate
+`CatalogIdentityEnvelopeV1` persisted beside a pinned operation or trigger.
+That envelope carries schema epochs, sorted source-record identities, all
+referenced value-contract hashes, semantic/provenance hashes, the complete
+behavioral snapshot identity, and the exact non-secret
+`DeploymentMaterialV1` fingerprint. Reload compares both behavioral snapshot
+and envelope field-for-field.
 Processorless declarative operations have exactly one step; multiple steps
-require the versioned static operation processor. Connector, credential,
+require the static operation processor reference with
+`implementation_revision`. Connector, credential,
 operation, trigger, and event versions are SemVer cores without Phase-1
-prerelease/build metadata; implementation and schema versions are integer
-epochs.
+prerelease/build metadata; every schema/runtime/implementation epoch is
+`u32`, and processor-like references always call it
+`implementation_revision`.
 
 Source admission is exact-version and fail-closed. Phase 1 accepts only
 `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, or `0BSD`; an

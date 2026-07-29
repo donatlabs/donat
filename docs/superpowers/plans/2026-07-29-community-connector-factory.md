@@ -178,7 +178,7 @@ commit, or create a connector-owned variant.
 **Shared interface required by processes and connectors:**
 
 ```rust
-pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
+pub const VALUE_TYPE_LANGUAGE_VERSION: u32 = 1;
 
 pub enum CanonicalNumber {
     I64(i64),
@@ -771,6 +771,16 @@ git commit -m "fix(connectors): enforce safe connector ABI"
 - Create: `crates/connector-catalog/tests/contract_facts.rs`
 - Create: `crates/connector-catalog/tests/canonical_hashes.rs`
 - Create: `crates/connector-catalog/tests/type_identity.rs`
+- Create: `crates/connector-catalog/tests/raw_ijson.rs`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/escaped-noncharacter.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/unescaped-noncharacter.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/lone-surrogate.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/invalid-surrogate-pair.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/invalid-utf8.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/duplicate-decoded-name.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/number-outside-binary64.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/recursive-utf16-order.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/recursive-utf16-order.expected.json`
 - Create: `crates/connector-catalog/tests/fixtures/missing-license-file-hash.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/missing-side-effect-step.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/unknown-effect.yaml`
@@ -785,6 +795,8 @@ git commit -m "fix(connectors): enforce safe connector ABI"
 - Create: `crates/connector-catalog/tests/fixtures/npm-provenance-mismatch.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/open-dependency-disposition.yaml`
 - Create: `crates/connector-catalog/sources/records/donat-owned-http-v1.yaml`
+- Modify: `crates/value-contract/src/lib.rs`
+- Modify: `crates/value-contract/tests/value_contract.rs`
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
@@ -1237,8 +1249,7 @@ pub struct OperationSpec {
     pub rate: RateDefaults,
     pub serialization_key_default: Option<TypedSerializationKeyDefault>,
     pub bounds: OperationBounds,
-    pub provenance: NonEmptyVec<ManifestProvenanceReference>,
-    pub fact_bindings: Vec<ResolvedFactBinding>,
+    pub resolved_fact_values: Vec<ResolvedFactValue>,
 }
 
 pub enum OperationEffect {
@@ -1253,10 +1264,22 @@ The version taxonomy is closed. Connector, credential, operation, trigger,
 and event versions are stable SemVer cores; Phase 1 rejects prerelease/build.
 Runtime ABI, canonical/source-record schema, classifier/generator, and every
 static processor/authenticator/codec/normalizer implementation revision are
-integer epochs. A processorless declarative operation has exactly one step;
+`u32` epochs named `implementation_revision`. A processorless declarative operation has exactly one step;
 multiple steps require `operation_processor`.
 
-Task 3 also owns the exact closed projection types from Spec 007 Section 5.1:
+Before consuming the value-language epoch, Task 3 starts with this compile-time
+RED assertion against the Task-1 owner:
+
+```rust
+const _: u32 = donat_value_contract::VALUE_TYPE_LANGUAGE_VERSION;
+```
+
+If Task 1 still exposes `u16`, this must fail. Task 3 then changes the owner
+constant and its unit assertion to `u32`; no cast or conversion is permitted.
+
+Task 3 also owns the exact closed projection types from Spec 007 Section 5.1
+and ADR 012. These are independent canonical projection structs, never Serde
+views of provenance-bearing runtime descriptors:
 
 ```rust
 pub struct SourceRecordMaterialV1 {
@@ -1284,24 +1307,24 @@ pub struct SemanticMaterialV1 {
     pub canonical_schema_epoch: u32,
     pub value_language_epoch: u32,
     pub connector: SemanticConnectorIdentity,
-    pub credentials: Vec<CredentialSpec>,
-    pub origins: Vec<FixedOrigin>,
-    pub operations: Vec<OperationSpec>,
-    pub triggers: Vec<TriggerSpec>,
-    pub resolved_fact_values: Vec<ResolvedFactValue>,
+    pub credentials: Vec<SemanticCredentialMaterialV1>,
+    pub origins: Vec<SemanticOriginMaterialV1>,
+    pub operations: Vec<SemanticOperationMaterialV1>,
+    pub triggers: Vec<SemanticTriggerMaterialV1>,
+    pub resolved_fact_values: Vec<ResolvedFactValueMaterialV1>,
 }
 pub struct ProvenanceMaterialV1 {
     pub canonical_schema_epoch: u32,
     pub connector: ProvenanceConnectorIdentity,
-    pub sources: Vec<SourceIdentityAndRecordHash>,
-    pub artifacts: Vec<ArtifactDecision>,
-    pub files: Vec<FileDecision>,
-    pub licenses: Vec<LicenseDecision>,
-    pub dependencies: Vec<DependencyDecision>,
-    pub embedded_material: Vec<EmbeddedMaterialDecision>,
-    pub notices: Vec<NoticeIdentity>,
-    pub resolved_fact_origins: Vec<ResolvedFactOrigin>,
-    pub donat_policy_ids: Vec<ResolvedPolicyUse>,
+    pub sources: Vec<SourceIdentityMaterialV1>,
+    pub artifacts: Vec<ArtifactDecisionMaterialV1>,
+    pub files: Vec<FileDecisionMaterialV1>,
+    pub licenses: Vec<LicenseDecisionMaterialV1>,
+    pub dependencies: Vec<DependencyDecisionMaterialV1>,
+    pub embedded_material: Vec<EmbeddedDecisionMaterialV1>,
+    pub notices: Vec<NoticeMaterialV1>,
+    pub resolved_fact_origins: Vec<ResolvedFactOriginMaterialV1>,
+    pub donat_policy_ids: Vec<DonatPolicyId>,
     pub classifier_epoch: u32,
     pub generator_epoch: u32,
 }
@@ -1311,6 +1334,14 @@ pub struct ValueContractMaterialV1 {
     pub named_objects: CanonicalNamedObjects,
 }
 ```
+
+Implement every recursive projection named above, including semantic
+credential/auth/origin/step/binding/request/response/transform/processor/
+effect/pagination/error/bounds/trigger types and provenance source/artifact/
+file/license/notice/fact-origin types, exactly as ADR 012 lists them through
+primitive leaves. `SemanticOperationMaterialV1` and
+`SemanticTriggerMaterialV1` must not contain or serialize `OperationSpec`,
+`TriggerSpec`, `ManifestProvenanceReference`, or any fact origin.
 
 `SourceRecordMaterialV1` is the exact field-for-field projection of the
 complete struct declared immediately above; its compile-time equality/coverage
@@ -1349,7 +1380,9 @@ Compute record hashes, resolved manifest/value-contract hashes, semantic hash,
 provenance hash, then generated Rust/tree digest. No material contains its own
 result. Resolved evidence stays one `(value, origin)` binding: semantic
 material receives the value and provenance material the exact matching
-origin.
+origin. Origin-only mutation must preserve semantic bytes/hash; value-only
+mutation must preserve direct provenance-origin bytes, while final provenance
+still changes through its required `semantic_sha256`.
 
 Task 3 canonicalizes each selected header to ASCII lower case and derives its
 stored capability exactly:
@@ -1449,6 +1482,43 @@ provenance {"a":1,"b":[true,null,"x"]} 4e31e445b6c8d06e6b93fd5cc66731b850a84853d
 value-contract {"a":1,"b":[true,null,"x"]} e74426ca8fb7b23e99f1f14f4a6d281575489c33312e27df9e9005f37158d4ab
 ```
 
+Also reproduce the exact four valid nonempty full-material canonical byte
+lines and hashes in ADR 012. Do not obtain expected bytes from the production
+serializer. Assert every top-level and nested material field is covered, null
+and empty vectors remain explicit, and each one-field mutation changes only
+the applicable direct domain.
+
+`raw_ijson.rs` reads fixture bytes without first passing through a Unicode
+string or `serde_json::Value`:
+
+```rust
+assert_raw_error("escaped-noncharacter.json",
+                 "catalog_jcs_disallowed_unicode");
+assert_raw_error("unescaped-noncharacter.json",
+                 "catalog_jcs_disallowed_unicode");
+assert_raw_error("lone-surrogate.json",
+                 "catalog_jcs_invalid_surrogate");
+assert_raw_error("invalid-surrogate-pair.json",
+                 "catalog_jcs_invalid_surrogate");
+assert_raw_error("invalid-utf8.json", "catalog_jcs_invalid_utf8");
+assert_raw_error("duplicate-decoded-name.json",
+                 "catalog_jcs_duplicate_member");
+assert_raw_error("number-outside-binary64.json",
+                 "catalog_jcs_number_not_i_json");
+assert_eq!(
+    canonicalize_raw(fixture_bytes("recursive-utf16-order.json")).unwrap(),
+    include_bytes!("fixtures/canonical/recursive-utf16-order.expected.json"),
+);
+```
+
+The duplicate fixture is `{"a":1,"\u0061":2}`. Numeric cases include `1e400`
+and `9007199254740992`. Unicode cases include escaped and raw U+FDD0,
+`\ud800`, and `\ud800\u0041`. The ordering fixture nests U+10000 and U+FFFD
+keys at two object levels and expects U+10000 first by unsigned UTF-16 units.
+Add the expected-byte fixture to the Task-3 file list. These six error codes
+are closed; no generic parser message or replacement-character recovery is
+accepted.
+
 Add `source_record_variants_are_closed`,
 `npm_integrity_and_repository_mapping_are_exact`,
 `npm_signature_provenance_tag_maintainer_and_owner_state_is_exact`,
@@ -1457,6 +1527,10 @@ Add `source_record_variants_are_closed`,
 `contract_fact_origins_are_closed_and_non_substitutable`,
 `donat_policy_cannot_satisfy_required_provider_evidence`,
 `contract_fact_semantic_and_provenance_hashes_are_separate`,
+`semantic_projection_uses_no_provenance_bearing_runtime_descriptor`,
+`origin_only_mutation_preserves_semantic_hash`,
+`value_only_mutation_preserves_direct_origin_material`,
+`final_provenance_commits_semantic_hash`,
 `canonical_projection_domains_and_calculation_order_are_exact`,
 `canonical_projection_one_field_mutations_are_separate`,
 `typed_value_projection_tags_do_not_collide`,
@@ -1480,9 +1554,11 @@ Add `source_record_variants_are_closed`,
 `manifest_provenance_references_match_exact_records`. Round-trip one complete
 manifest containing a credential, fixed origin, compiled step, error map,
 operation, webhook trigger, poll trigger, bounds, and provenance references;
-the operation includes every complete snapshot field, stable SemVer/epoch
+the operation includes every complete behavioral snapshot field, stable SemVer/epoch
 distinction, recomputed input/output hash, ordered transforms, processor
-revision, defaults, selected-header mapping, and fact binding.
+`implementation_revision`, defaults, selected-header mapping, and resolved
+fact value. Assert the separately constructed provenance material retains all
+source/artifact/license/notice/fact-origin identities.
 Reject every unknown enum tag, unknown nested field, unbounded declaration,
 missing reference, dynamic destination, and raw provider message. The final
 identity test assigns normalized descriptor IDs directly to `ConnectorIo`
@@ -1790,6 +1866,11 @@ donat-connector-codegen generate --output <temporary-directory>
 and immutable generated entries:
 
 ```rust
+pub struct GeneratedVersionedProcessorReference<Id> {
+    pub id: Id,
+    pub implementation_revision: u32,
+}
+
 pub struct GeneratedCredentialSpec {
     pub credential: CredentialSpecId,
     pub version: StableSemver,
@@ -1831,8 +1912,8 @@ pub struct GeneratedOperationEntry {
     pub serialization_key_default:
         Option<GeneratedTypedSerializationKeyDefault>,
     pub bounds: GeneratedOperationBounds,
-    pub provenance: &'static [GeneratedProvenanceReference],
-    pub fact_bindings: &'static [GeneratedResolvedFactBinding],
+    pub resolved_fact_values: &'static [GeneratedResolvedFactValue],
+    pub catalog_identity: GeneratedCatalogIdentity,
 }
 
 pub struct GeneratedTriggerSpec {
@@ -1843,8 +1924,18 @@ pub struct GeneratedTriggerSpec {
     pub event_version: StableSemver,
     pub runtime_abi_epoch: u32,
     pub kind: GeneratedTriggerKind,
-    pub provenance: &'static [GeneratedProvenanceReference],
-    pub fact_bindings: &'static [GeneratedResolvedFactBinding],
+    pub resolved_fact_values: &'static [GeneratedResolvedFactValue],
+    pub catalog_identity: GeneratedCatalogIdentity,
+}
+
+pub struct GeneratedCatalogIdentity {
+    pub canonical_schema_epoch: u32,
+    pub source_record_schema_epoch: u32,
+    pub source_records: &'static [GeneratedSourceIdentity],
+    pub semantic_sha256: Hash256,
+    pub provenance_sha256: Hash256,
+    pub value_contracts: &'static [GeneratedValueContractIdentity],
+    pub snapshot_identity: GeneratedSnapshotIdentity,
 }
 
 pub struct GeneratedSourceIdentity {
@@ -1913,12 +2004,18 @@ identity `.parse()`, `String::`, `.to_owned()`, `.to_string()`, `.clone()`,
 `OnceLock`, or `LazyLock`, and compile the emitted credentials, operations,
 triggers, source identities, legal identities, and all ABI IDs in a const
 context. Assert exact field-for-field equality between each normalized
-`OperationSpec` and `GeneratedOperationEntry`. Reject a generated entry that
+behavioral `OperationSpec` and `GeneratedOperationEntry`. Separately assert
+field-for-field equality of every normalized and generated portable catalog
+identity. The process compiler combines that identity with its independently
+computed `deployment_fingerprint` to form ADR 012's
+`CatalogIdentityEnvelopeV1`. Reject a generated entry that
 omits any version/epoch, value contract/hash, versioned credential, matching
-source-record hash, license/notice identity, contract-fact value/origin, fixed
-step/origin, selected-header mapping, transform/processor revision,
+source-record hash, license/notice identity, portable catalog identity, fixed
+step/origin, selected-header mapping, transform/processor
+`implementation_revision`,
 effect/pagination/error map, capacity/rate/serialization default, bound,
-provenance/fact binding, auth plan, or trigger field.
+resolved fact value, snapshot identity, auth plan, or
+trigger field.
 
 - [ ] **Step 2: Run RED**
 
@@ -2048,7 +2145,7 @@ pub struct ProcessorHandle {
 
 pub fn lookup_operation_processor(
     family: ProcessorFamilyId,
-    version: u16,
+    implementation_revision: u32,
 ) -> Option<ProcessorHandle>;
 ```
 
@@ -2388,6 +2485,11 @@ control checks, DNS resolution, address vetting, peer validation, reqwest,
 status/header/body capture, decoding, bounds, redaction, and error mapping.
 No public method accepts a raw URL, method, header name, auth value, or
 arbitrary request object.
+
+Every transform, operation, authentication, codec, normalizer, and pagination
+lookup passed into this executor is keyed by the generated ABI-owned ID plus
+`implementation_revision: u32`. Task 8 neither truncates that epoch nor
+renames it to `version`.
 
 Task 8 is the only production caller of `host_construction`. It captures only
 compiled selected response headers, ASCII-case-insensitively matches each
@@ -3185,7 +3287,7 @@ pub enum PaginationPlan {
     LinkRelation(LinkRelationPlan),
     Processor {
         family: ProcessorFamilyId,
-        version: u16,
+        implementation_revision: u32,
     },
 }
 ```
@@ -3334,7 +3436,8 @@ cargo test -p donat-server --test connectors_stripe
 - [ ] **Step 3: Implement the narrow processor only**
 
 Implement pure input validation, exact compiled-step bindings, and result
-normalization. Register the sealed processor family/version in the private
+normalization. Register the sealed
+`(processor_id, implementation_revision: u32)` in the private
 processor lookup. Preserve the exact ABI-owned `Copy` typed IDs from the
 static lookup through `ConnectorIo`; do not parse or allocate an ID bridge.
 Do not edit `crates/server`, `crates/connector-catalog`, metadata, or
@@ -4021,14 +4124,19 @@ crate, compatibility adapter, or server-local persistence table:
 6. Add poll scheduling/checkpoint persistence only after Spec 005 defines its
    missing schema, transaction, restart, locking, and database-clock
    semantics. A pure poll ABI test is not authorization to invent storage.
-7. Pin the complete catalog-owned `OperationSpec` into process revisions:
-   every connector/credential/operation version, runtime/value/schema epoch,
-   record/semantic/provenance/value-contract/configuration hash, default,
-   resolved origin, ordered step/transform, processor implementation revision,
-   effect, pagination/error plan, bound, selected-header capability,
-   provenance, and fact binding. Retain live-retired versions only after Spec
-   005 revision reconcile/reload tests prove one-field changes and complete
-   restart verification.
+7. Pin the complete behavioral catalog-owned `OperationSpec` plus
+   `CatalogIdentityEnvelopeV1` into process revisions. The snapshot retains
+   every connector/credential/operation version, runtime/value epoch, default,
+   resolved origin/value, ordered step/transform,
+   `implementation_revision`, effect, pagination/error plan, bound, and
+   selected-header capability. The envelope separately retains canonical and
+   source-record epochs, sorted source IDs/record hashes, semantic/provenance
+   hashes, every referenced value-contract hash, complete operation snapshot
+   identity, and
+   `SHA256("donat.connector.deployment.v1\0" ||
+   JCS(DeploymentMaterialV1))`. Secret values never enter that material.
+   Retain live-retired versions only after Spec 005 reload tests compare both
+   snapshot and envelope field-for-field and reject each one-field change.
 8. Add inline binary/multipart only after `donat-value-contract` implements
    the exact Spec 007 Section 9 base64url/JCS vectors and Spec 005 accepts that
    value in descriptors and journals.
