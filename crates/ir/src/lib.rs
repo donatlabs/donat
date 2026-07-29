@@ -428,6 +428,7 @@ pub enum MutationRoot {
 /// source-local planner before this value is constructed.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandMutation {
+    pub identity: CommandIdentity,
     pub name: String,
     pub steps: Vec<CommandExecutionStep>,
     pub guards: Vec<CommandRule>,
@@ -435,6 +436,18 @@ pub struct CommandMutation {
     pub idempotency: Option<CommandIdempotency>,
     pub effects: Vec<CommandEffectKind>,
     pub selection: Vec<CommandResultSelection>,
+}
+
+/// Stable execution identity for command journals and durable consumers.
+///
+/// A metadata name alone is source-local, while one command can authorize
+/// multiple classic roles. Keeping all three components distinct prevents a
+/// replay or claim elected for one source/role from crossing into another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandIdentity {
+    pub source: String,
+    pub name: String,
+    pub role: String,
 }
 
 /// One deploy-time tracked column resolved for a command operation.

@@ -428,7 +428,7 @@ pub struct CommandStep {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum CommandStepOperation {
     SelectOne { select_one: SelectOneCommandStep },
     Insert { insert: InsertCommandStep },
@@ -506,7 +506,7 @@ pub struct AssertCommandStep {
 /// A closed, SQL-free reference used by command steps, results, guards, and
 /// process effects. No variant can carry a SQL fragment or identifier template.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum CommandValue {
     Argument {
         arg: String,
@@ -547,13 +547,13 @@ pub struct CommandIdempotency {
 /// value: command objects use `{ arg: ... }`, while the canonical
 /// idempotency surface uses `{ argument: ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum CommandIdempotencyKey {
     Argument { argument: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum CommandIdempotencyScope {
     Argument { argument: String },
     SessionVariable { session_variable: String },
@@ -562,7 +562,7 @@ pub enum CommandIdempotencyScope {
 /// A durable hand-off requested by a command. It is only metadata in this
 /// slice; no process rows, runtime calls, or mutation behavior are created.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum CommandEffect {
     StartProcess { start_process: StartProcessEffect },
     SignalProcess { signal_process: SignalProcessEffect },

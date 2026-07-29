@@ -226,6 +226,11 @@ fn command_mutation_keeps_resolved_execution_facts_and_projection() {
     let root = MutationRoot::Command {
         alias: "submitted".into(),
         command: CommandMutation {
+            identity: CommandIdentity {
+                source: "default".into(),
+                name: "create_order".into(),
+                role: "customer".into(),
+            },
             name: "create_order".into(),
             steps: vec![CommandExecutionStep::Insert {
                 name: "order".into(),

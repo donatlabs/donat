@@ -11,6 +11,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/005-executable-command-resolved-ir]]
 - [[decisions/006-command-claim-election-separate-from-canonical-result-journal]]
 - [[decisions/007-command-cte-gates-and-batch-rule-items]]
+- [[decisions/008-source-and-role-qualified-command-identity]]
 
 ## Reference governance
 

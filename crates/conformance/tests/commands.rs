@@ -114,6 +114,128 @@ fn create_orders_table(database_url: &str) {
         .expect("create orders table");
 }
 
+fn source_and_role_qualified_command_metadata() -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                }
+            },
+            "tables": [{
+                "table": { "schema": "public", "name": "buyer_orders" },
+                "select_permissions": [{
+                    "role": "buyer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "buyer",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }]
+        }, {
+            "name": "secondary",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                }
+            },
+            "tables": [{
+                "table": { "schema": "public", "name": "merchant_orders" },
+                "select_permissions": [{
+                    "role": "merchant",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "merchant",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }]
+        }],
+        "commands": [{
+            "name": "create_order",
+            "source": "default",
+            "permissions": [{ "role": "buyer" }],
+            "arguments": [
+                { "name": "id", "type": "uuid!" },
+                { "name": "tenant", "type": "String!" },
+                { "name": "status", "type": "String!" },
+                { "name": "request_id", "type": "uuid!" }
+            ],
+            "steps": [{
+                "name": "order",
+                "insert": {
+                    "table": { "schema": "public", "name": "buyer_orders" },
+                    "object": {
+                        "id": { "arg": "id" },
+                        "tenant": { "arg": "tenant" },
+                        "status": { "arg": "status" }
+                    },
+                    "returning": ["status"]
+                }
+            }],
+            "result": { "status": { "step": "order", "column": "status" } },
+            "idempotency": {
+                "key": { "argument": "request_id" },
+                "scope": [{ "argument": "tenant" }],
+                "retention": "1d"
+            }
+        }, {
+            "name": "create_order",
+            "source": "secondary",
+            "permissions": [{ "role": "merchant" }],
+            "arguments": [
+                { "name": "id", "type": "uuid!" },
+                { "name": "tenant", "type": "String!" },
+                { "name": "status", "type": "String!" },
+                { "name": "request_id", "type": "uuid!" }
+            ],
+            "steps": [{
+                "name": "order",
+                "insert": {
+                    "table": { "schema": "public", "name": "merchant_orders" },
+                    "object": {
+                        "id": { "arg": "id" },
+                        "tenant": { "arg": "tenant" },
+                        "status": { "arg": "status" }
+                    },
+                    "returning": ["status"]
+                }
+            }],
+            "result": { "status": { "step": "order", "column": "status" } },
+            "idempotency": {
+                "key": { "argument": "request_id" },
+                "scope": [{ "argument": "tenant" }],
+                "retention": "1d"
+            }
+        }]
+    }))
+    .expect("source- and role-qualified command metadata deserializes")
+}
+
+fn create_qualified_command_tables(database_url: &str) {
+    let mut client = postgres::Client::connect(database_url, NoTls)
+        .expect("connect to the qualified command suite database");
+    client
+        .batch_execute(
+            "CREATE TABLE public.buyer_orders (\
+                id uuid PRIMARY KEY,\
+                tenant text NOT NULL,\
+                status text NOT NULL\
+             );\
+             CREATE TABLE public.merchant_orders (\
+                id uuid PRIMARY KEY,\
+                tenant text NOT NULL,\
+                status text NOT NULL\
+             )",
+        )
+        .expect("create source-local command tables");
+}
+
 fn batch_rule_command_metadata() -> Metadata {
     serde_json::from_value(json!({
         "version": 3,
@@ -680,6 +802,186 @@ fn command_insert_many_rule_binds_each_graphql_item() {
         "commands/insert_many_rule_item.yaml",
         donat_conformance::Transport::Http,
     );
+
+    let headers = vec![("X-Donat-Role".to_string(), "customer".to_string())];
+    let (status, response) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": "mutation { create_order_lines(lines: { quantity: 4 }) { lines { quantity } } }"
+        }),
+        &headers,
+    );
+    assert_eq!(status, 200, "singleton list coercion response: {response}");
+    assert_eq!(
+        response,
+        json!({
+            "data": {
+                "create_order_lines": {
+                    "lines": [{ "quantity": 8 }]
+                }
+            }
+        }),
+        "GraphQL must coerce one input object to the command list before insert_many"
+    );
+}
+
+#[test]
+fn command_idempotency_is_isolated_by_source_and_explicit_role() {
+    let suite = Suite::new("command_source_role_identity")
+        .initial_metadata(source_and_role_qualified_command_metadata())
+        .with_migrations()
+        .start();
+    create_qualified_command_tables(suite.db_url());
+
+    let request_id = "550e8400-e29b-41d4-a716-446655440091";
+    let tenant = "tenant-identity-sentinel";
+    for (role, id, expected_status) in [
+        (
+            "buyer",
+            "550e8400-e29b-41d4-a716-446655440092",
+            "buyer-created",
+        ),
+        (
+            "merchant",
+            "550e8400-e29b-41d4-a716-446655440093",
+            "merchant-created",
+        ),
+    ] {
+        let headers = vec![("X-Donat-Role".to_string(), role.to_string())];
+        let (status, response) = suite.post(
+            "/v1/graphql",
+            &json!({
+                "query": format!(
+                    "mutation {{ create_order(id: \"{id}\", tenant: \"{tenant}\", status: \"{expected_status}\", request_id: \"{request_id}\") {{ status }} }}"
+                )
+            }),
+            &headers,
+        );
+        assert_eq!(status, 200, "{role} command response: {response}");
+        assert_eq!(
+            response,
+            json!({ "data": { "create_order": { "status": expected_status } } }),
+            "the same command name/key must execute within the {role} identity"
+        );
+    }
+
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect to inspect qualified command executions");
+    for table in ["buyer_orders", "merchant_orders"] {
+        let rows: i64 = client
+            .query_one(&format!("SELECT count(*) FROM public.{table}"), &[])
+            .unwrap_or_else(|error| panic!("count {table}: {error}"))
+            .get(0);
+        assert_eq!(rows, 1, "each source-local command must execute once");
+    }
+    let identities = client
+        .query(
+            "SELECT command_identity \
+             FROM donat.command_invocations \
+             WHERE command_name = 'create_order' AND key = $1 \
+             ORDER BY command_identity",
+            &[&request_id],
+        )
+        .expect("read source- and role-qualified invocation identities")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0], identities[1]);
+    for identity in identities {
+        assert!(
+            !identity.contains(request_id) && !identity.contains(tenant),
+            "qualified identity must not retain a raw key or scope value: {identity}"
+        );
+    }
+}
+
+#[test]
+fn command_legacy_unqualified_retry_fails_closed_before_domain_write() {
+    let suite = Suite::new("command_legacy_identity_gate")
+        .initial_metadata(command_metadata())
+        .with_migrations()
+        .start();
+    create_orders_table(suite.db_url());
+
+    let request_id = "550e8400-e29b-41d4-a716-446655440095";
+    let customer_id = "550e8400-e29b-41d4-a716-446655440001";
+    let headers = vec![("X-Donat-Role".to_string(), "customer".to_string())];
+    let (bootstrap_status, bootstrap) = suite.post(
+        "/v1/graphql",
+        &json!({ "query": "query { __typename }" }),
+        &headers,
+    );
+    assert_eq!(
+        bootstrap_status, 200,
+        "start the migrated command engine before seeding legacy state: {bootstrap}"
+    );
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect to seed a preserved pre-V5 command");
+    client
+        .execute(
+            "INSERT INTO public.orders (id, customer_id, status, quantity) \
+             VALUES ('550e8400-e29b-41d4-a716-446655440094', $1::text::uuid, 'legacy', 1)",
+            &[&customer_id],
+        )
+        .expect("seed the domain effect completed before V5");
+    client
+        .execute(
+            "INSERT INTO donat.command_invocations \
+                (command_identity, command_name, scope_hash, key, input_fingerprint, result, expires_at) \
+             VALUES (\
+                'legacy-unqualified:6372656174655f6f72646572',\
+                'create_order',\
+                decode(md5((jsonb_build_array(to_jsonb($1::text)))::text), 'hex'),\
+                $2,\
+                decode('01', 'hex'),\
+                '{\"order_id\":\"550e8400-e29b-41d4-a716-446655440094\",\"status\":\"legacy\"}'::jsonb,\
+                statement_timestamp() + interval '1 day'\
+             )",
+            &[&customer_id, &request_id],
+        )
+        .expect("seed the unattributable completed invocation");
+
+    let (status, response) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ create_order(id: \"550e8400-e29b-41d4-a716-446655440096\", customer_id: \"{customer_id}\", status: \"new\", quantity: 1, request_id: \"{request_id}\") {{ order_id }} }}"
+            )
+        }),
+        &headers,
+    );
+    assert_eq!(status, 200, "legacy-key rejection response: {response}");
+    assert_eq!(
+        response,
+        json!({
+            "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed"
+                },
+                "message": "legacy idempotency key cannot be replayed safely after command identity migration"
+            }]
+        }),
+        "the structured P0D01 envelope must survive GraphQL decoding"
+    );
+    let rendered = response.to_string();
+    assert!(!rendered.contains(request_id));
+    assert!(!rendered.contains(customer_id));
+
+    let domain_rows: i64 = client
+        .query_one("SELECT count(*) FROM public.orders", &[])
+        .expect("count domain rows after legacy retry")
+        .get(0);
+    assert_eq!(domain_rows, 1, "legacy retry must not duplicate the write");
+    let claims: i64 = client
+        .query_one(
+            "SELECT count(*) FROM donat.command_invocation_claims WHERE key = $1",
+            &[&request_id],
+        )
+        .expect("count claims after legacy retry")
+        .get(0);
+    assert_eq!(claims, 0, "legacy rejection must precede claim election");
 }
 
 #[test]

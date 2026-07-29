@@ -257,6 +257,11 @@ impl<'a> Planner<'a> {
             .collect();
 
         Ok(CommandMutation {
+            identity: CommandIdentity {
+                source: command.source().to_owned(),
+                name: definition.name.clone(),
+                role: session.role.clone(),
+            },
             name: definition.name.clone(),
             steps,
             guards,
@@ -1281,7 +1286,7 @@ impl<'a> Planner<'a> {
                 .find(|argument| argument.name == *name)
                 .ok_or_else(|| unexpected_arg(path, name))?;
             let value = value_to_json(value, vars, path)?;
-            validate_command_argument_value(
+            let value = coerce_command_argument_value(
                 self.metadata(),
                 &definition.type_,
                 &value,
@@ -1290,11 +1295,14 @@ impl<'a> Planner<'a> {
             arguments.insert(name.clone(), Scalar::Json(value));
         }
         for definition in &command.arguments {
-            if definition.type_.ends_with('!') && !arguments.contains_key(&definition.name) {
-                return Err(PlanError::validation(
-                    path,
-                    format!("missing required field argument: \"{}\"", definition.name),
-                ));
+            if !arguments.contains_key(&definition.name) {
+                if definition.type_.ends_with('!') {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("missing required field argument: \"{}\"", definition.name),
+                    ));
+                }
+                arguments.insert(definition.name.clone(), Scalar::Json(Json::Null));
             }
         }
         Ok(arguments)
@@ -2375,19 +2383,19 @@ fn require_command_columns<'a>(
     Ok(())
 }
 
-fn validate_command_argument_value(
+fn coerce_command_argument_value(
     metadata: &donat_metadata::Metadata,
     type_: &str,
     value: &Json,
     path: &str,
-) -> Result<(), PlanError> {
+) -> Result<Json, PlanError> {
     let (type_, nullable) = match type_.strip_suffix('!') {
         Some(inner) => (inner, false),
         None => (type_, true),
     };
     if value.is_null() {
         return if nullable {
-            Ok(())
+            Ok(Json::Null)
         } else {
             Err(PlanError::validation(
                 path,
@@ -2399,12 +2407,22 @@ fn validate_command_argument_value(
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
     {
-        return match value {
-            Json::Array(items) => items.iter().enumerate().try_for_each(|(index, item)| {
-                validate_command_argument_value(metadata, inner, item, &format!("{path}[{index}]"))
-            }),
-            item => validate_command_argument_value(metadata, inner, item, path),
+        let items = match value {
+            Json::Array(items) => items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    coerce_command_argument_value(
+                        metadata,
+                        inner,
+                        item,
+                        &format!("{path}[{index}]"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            item => vec![coerce_command_argument_value(metadata, inner, item, path)?],
         };
+        return Ok(Json::Array(items));
     }
     let builtin_valid = match type_ {
         "Boolean" | "bool" => Some(value.is_boolean()),
@@ -2425,7 +2443,7 @@ fn validate_command_argument_value(
     };
     if let Some(valid) = builtin_valid {
         return if valid {
-            Ok(())
+            Ok(value.clone())
         } else {
             Err(PlanError::validation(
                 path,
@@ -2454,14 +2472,20 @@ fn validate_command_argument_value(
                 ));
             }
         }
+        let mut coerced = object.clone();
         for field in &input.fields {
             match object.get(&field.name) {
-                Some(value) => validate_command_argument_value(
-                    metadata,
-                    &field.type_,
-                    value,
-                    &format!("{path}.{}", field.name),
-                )?,
+                Some(value) => {
+                    coerced.insert(
+                        field.name.clone(),
+                        coerce_command_argument_value(
+                            metadata,
+                            &field.type_,
+                            value,
+                            &format!("{path}.{}", field.name),
+                        )?,
+                    );
+                }
                 None if field.type_.ends_with('!') => {
                     return Err(PlanError::validation(
                         path,
@@ -2471,7 +2495,7 @@ fn validate_command_argument_value(
                 None => {}
             }
         }
-        return Ok(());
+        return Ok(Json::Object(coerced));
     }
     if let Some(enum_) = metadata
         .custom_types
@@ -2487,7 +2511,7 @@ fn validate_command_argument_value(
             .iter()
             .any(|candidate| candidate.value == value)
         {
-            Ok(())
+            Ok(Json::String(value.to_string()))
         } else {
             Err(PlanError::validation(
                 path,
@@ -2507,7 +2531,7 @@ fn validate_command_argument_value(
                 format!("argument must be a scalar '{type_}'"),
             ))
         } else {
-            Ok(())
+            Ok(value.clone())
         };
     }
     Err(PlanError::validation(

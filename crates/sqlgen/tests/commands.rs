@@ -44,6 +44,14 @@ fn root(command: CommandMutation) -> MutationRoot {
     }
 }
 
+fn command_identity(name: &str) -> CommandIdentity {
+    CommandIdentity {
+        source: "default".to_owned(),
+        name: name.to_owned(),
+        role: "customer".to_owned(),
+    }
+}
+
 fn order_row_result(cte: &str) -> CommandResultValue {
     CommandResultValue::StepRow {
         cte: cte.to_owned(),
@@ -69,6 +77,30 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
         "../../../migrations/V4__donat_command_claims.sql"
     ))
     .expect("command claim election catalog installs");
+    let identity_columns: i64 = tx
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name IN ('command_invocations', 'command_invocation_claims') \
+               AND column_name = 'command_identity'",
+            &[],
+        )
+        .expect("inspect command identity migration state")
+        .get(0);
+    match identity_columns {
+        0 => tx
+            .batch_execute(include_str!(
+                "../../../migrations/V5__qualify_command_identity.sql"
+            ))
+            .expect("source/role-qualified command identity installs"),
+        2 => {}
+        count => panic!("partial command identity migration in test catalog: {count} columns"),
+    }
+}
+
+fn install_command_identity_catalog(tx: &mut Transaction<'_>) {
+    install_command_catalog(tx);
 }
 
 fn install_check_violation_helper(tx: &mut Transaction<'_>) {
@@ -95,6 +127,26 @@ fn install_command_catalog_client(client: &mut Client) {
             "../../../migrations/V4__donat_command_claims.sql"
         ))
         .expect("command claim election catalog installs");
+    let identity_columns: i64 = client
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name IN ('command_invocations', 'command_invocation_claims') \
+               AND column_name = 'command_identity'",
+            &[],
+        )
+        .expect("inspect command identity migration state")
+        .get(0);
+    match identity_columns {
+        0 => client
+            .batch_execute(include_str!(
+                "../../../migrations/V5__qualify_command_identity.sql"
+            ))
+            .expect("source/role-qualified command identity installs"),
+        2 => {}
+        count => panic!("partial command identity migration in test catalog: {count} columns"),
+    }
 }
 
 fn command_catalog_test_lock() -> MutexGuard<'static, ()> {
@@ -119,6 +171,7 @@ fn idempotent_insert_root_with_id(
     status: &str,
 ) -> MutationRoot {
     root(CommandMutation {
+        identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![CommandExecutionStep::Insert {
             name: "order".to_owned(),
@@ -160,6 +213,7 @@ fn command_renderer_lowers_guard_and_session_scoped_idempotency() {
     let root = MutationRoot::Command {
         alias: "submitted".to_owned(),
         command: CommandMutation {
+            identity: command_identity("create_order"),
             name: "create_order".to_owned(),
             steps: vec![],
             guards: vec![CommandRule {
@@ -195,6 +249,7 @@ fn command_renderer_lowers_guard_and_session_scoped_idempotency() {
 #[should_panic(expected = "command effects must be rejected before SQL generation")]
 fn command_renderer_defensively_refuses_effect_bearing_ir() {
     let _ = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("create_order"),
         name: "create_order".to_owned(),
         steps: vec![],
         guards: vec![],
@@ -203,6 +258,43 @@ fn command_renderer_defensively_refuses_effect_bearing_ir() {
         effects: vec![CommandEffectKind::StartProcess],
         selection: vec![],
     }));
+}
+
+#[test]
+fn command_renderer_fails_closed_for_non_list_insert_many_ir() {
+    let malformed = root(CommandMutation {
+        identity: command_identity("malformed_batch"),
+        name: "malformed_batch".to_owned(),
+        steps: vec![CommandExecutionStep::InsertMany {
+            name: "lines".to_owned(),
+            cte: "_cmd_step_0".to_owned(),
+            table: table("orders"),
+            items: Scalar::Json(json!({ "quantity": 2 })),
+            item_fields: vec![column("quantity", "int4")],
+            object: vec![assignment("quantity", "int4", json!(2))],
+            returning: vec![column("quantity", "int4")],
+            allow_empty: false,
+            check: None,
+            error_path: "$.selectionSet.malformed_batch".to_owned(),
+        }],
+        guards: vec![],
+        result: vec![],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![],
+    });
+
+    let rendered = std::panic::catch_unwind(|| donat_sqlgen::mutation_to_sql(&malformed))
+        .expect("malformed closed IR must not panic the serving process");
+    assert!(
+        rendered.contains("raise_graphql_error")
+            && rendered.contains("insert_many items must be a list of objects"),
+        "malformed IR must render one fail-closed structured rejection: {rendered}"
+    );
+    assert!(
+        !rendered.contains("INSERT INTO \"public\".\"orders\""),
+        "fail-closed rendering must contain no domain write: {rendered}"
+    );
 }
 
 #[test]
@@ -276,6 +368,140 @@ fn command_idempotency_executes_once_replays_and_rejects_changed_input() {
 
     tx.rollback()
         .expect("remove the isolated command target and journal rows");
+}
+
+#[test]
+fn command_idempotency_identity_separates_source_and_explicit_role() {
+    let _catalog_lock = command_catalog_test_lock();
+    let suffix = std::process::id();
+    let first_table = format!("command_identity_first_{suffix}");
+    let second_table = format!("command_identity_second_{suffix}");
+    let command_name = format!("shared_create_order_{suffix}");
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start source/role identity transaction");
+    install_command_identity_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        "CREATE TABLE \"public\".\"{first_table}\" (id uuid PRIMARY KEY, status text NOT NULL); \
+         CREATE TABLE \"public\".\"{second_table}\" (id uuid PRIMARY KEY, status text NOT NULL)"
+    ))
+    .expect("create identity-isolated command targets");
+
+    let mut first = idempotent_insert_root_with_id(
+        &command_name,
+        &first_table,
+        "550e8400-e29b-41d4-a716-446655440071",
+        "buyer",
+    );
+    let MutationRoot::Command { command, .. } = &mut first else {
+        unreachable!()
+    };
+    command.identity.source = "default".to_owned();
+    command.identity.role = "buyer".to_owned();
+
+    let mut second = idempotent_insert_root_with_id(
+        &command_name,
+        &second_table,
+        "550e8400-e29b-41d4-a716-446655440072",
+        "merchant",
+    );
+    let MutationRoot::Command { command, .. } = &mut second else {
+        unreachable!()
+    };
+    command.identity.source = "secondary".to_owned();
+    command.identity.role = "merchant".to_owned();
+
+    tx.execute(&donat_sqlgen::mutation_to_sql(&first), &[])
+        .expect("first source/role execution succeeds");
+    tx.execute(&donat_sqlgen::mutation_to_sql(&second), &[])
+        .expect("same command name/key in another source/role executes independently");
+
+    for table in [&first_table, &second_table] {
+        let count: i64 = tx
+            .query_one(&format!("SELECT count(*) FROM \"public\".\"{table}\""), &[])
+            .expect("count source-local command rows")
+            .get(0);
+        assert_eq!(count, 1, "each source-local command must execute once");
+    }
+    let identities: i64 = tx
+        .query_one(
+            "SELECT count(DISTINCT command_identity) FROM donat.command_invocations WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("count qualified journal identities")
+        .get(0);
+    assert_eq!(
+        identities, 2,
+        "source and role must qualify the journal key"
+    );
+    tx.rollback().expect("remove identity-isolation fixtures");
+}
+
+#[test]
+fn command_legacy_unqualified_key_fails_closed_without_a_domain_write() {
+    let _catalog_lock = command_catalog_test_lock();
+    let suffix = std::process::id();
+    let table_name = format!("command_legacy_gate_{suffix}");
+    let command_name = format!("legacy_create_order_{suffix}");
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start legacy identity transaction");
+    install_command_identity_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        "CREATE TABLE \"public\".\"{table_name}\" (id uuid PRIMARY KEY, status text NOT NULL); \
+         INSERT INTO \"public\".\"{table_name}\" VALUES ('550e8400-e29b-41d4-a716-446655440080', 'legacy')"
+    ))
+    .expect("seed the pre-upgrade domain write");
+    tx.execute(
+        "INSERT INTO donat.command_invocations \
+         (command_identity, command_name, scope_hash, key, input_fingerprint, result, expires_at) \
+         VALUES ('legacy-unqualified:' || encode(convert_to($1, 'UTF8'), 'hex'), $1, \
+                 decode(md5((jsonb_build_array('\"tenant-1\"'::jsonb))::text), 'hex'), \
+                 'request-1', decode('01', 'hex'), '{\"status\":\"legacy\"}'::jsonb, \
+                 statement_timestamp() + interval '1 day')",
+        &[&command_name],
+    )
+    .expect("seed a preserved pre-V5 completed invocation");
+
+    let invocation = idempotent_insert_root_with_id(
+        &command_name,
+        &table_name,
+        "550e8400-e29b-41d4-a716-446655440081",
+        "new",
+    );
+    tx.batch_execute("SAVEPOINT legacy_key")
+        .expect("isolate the expected legacy-key rejection");
+    let error = tx
+        .execute(&donat_sqlgen::mutation_to_sql(&invocation), &[])
+        .expect_err("an unattributable pre-V5 key must fail closed");
+    assert_eq!(error.code().map(|code| code.code()), Some("P0D01"));
+    let payload: Json = serde_json::from_str(
+        error
+            .as_db_error()
+            .expect("legacy rejection is a database error")
+            .message(),
+    )
+    .expect("structured legacy error");
+    assert_eq!(
+        payload["message"],
+        "legacy idempotency key cannot be replayed safely after command identity migration"
+    );
+    tx.batch_execute("ROLLBACK TO SAVEPOINT legacy_key")
+        .expect("rollback expected legacy-key rejection");
+    let rows: i64 = tx
+        .query_one(
+            &format!("SELECT count(*) FROM \"public\".\"{table_name}\""),
+            &[],
+        )
+        .expect("count domain rows after legacy rejection")
+        .get(0);
+    assert_eq!(
+        rows, 1,
+        "upgrade safety must prevent a duplicate domain write"
+    );
+    tx.rollback().expect("remove legacy gate fixtures");
 }
 
 #[test]
@@ -372,6 +598,7 @@ fn command_insert_many_rule_binding_uses_each_current_item_value() {
     .expect("create the command target table");
 
     let command = root(CommandMutation {
+        identity: command_identity("item_rule_batch"),
         name: "item_rule_batch".to_owned(),
         steps: vec![CommandExecutionStep::InsertMany {
             name: "lines".to_owned(),
@@ -516,6 +743,7 @@ fn command_assertion_rejection_does_not_reach_later_dml_trigger() {
     .expect("create trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        identity: command_identity("assert_trigger_command"),
         name: "assert_trigger_command".to_owned(),
         steps: vec![
             CommandExecutionStep::Assert {
@@ -605,6 +833,7 @@ fn command_required_update_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-update trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        identity: command_identity("required_update_trigger_command"),
         name: "required_update_trigger_command".to_owned(),
         steps: vec![
             CommandExecutionStep::Update {
@@ -710,6 +939,7 @@ fn command_required_select_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-select trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        identity: command_identity("required_select_trigger_command"),
         name: "required_select_trigger_command".to_owned(),
         steps: vec![
             CommandExecutionStep::SelectOne {
@@ -813,6 +1043,7 @@ fn command_required_delete_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-delete trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        identity: command_identity("required_delete_trigger_command"),
         name: "required_delete_trigger_command".to_owned(),
         steps: vec![
             CommandExecutionStep::Delete {
@@ -968,6 +1199,7 @@ fn command_insert_many_executes_postgres_typed_items_in_declared_input_order() {
     install_check_violation_helper(&mut tx);
 
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("create_lines"),
         name: "create_lines".to_owned(),
         steps: vec![CommandExecutionStep::InsertMany {
             name: "lines".to_owned(),
@@ -1186,6 +1418,7 @@ fn command_concurrent_retry_waits_for_claim_and_replays_one_canonical_result() {
 #[test]
 fn command_renderer_snapshots_guarded_insert_and_declared_projection() {
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("create_order"),
         name: "create_order".to_owned(),
         steps: vec![CommandExecutionStep::Insert {
             name: "order".to_owned(),
@@ -1240,6 +1473,7 @@ fn command_renderer_snapshots_guarded_insert_and_declared_projection() {
 fn command_renderer_snapshots_select_one_then_update() {
     let order_id = column("id", "uuid");
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("approve_order"),
         name: "approve_order".to_owned(),
         steps: vec![
             CommandExecutionStep::SelectOne {
@@ -1306,6 +1540,7 @@ fn command_renderer_snapshots_select_one_then_update() {
 fn command_renderer_snapshots_insert_many_and_assert() {
     let order_id = column("id", "uuid");
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("create_order_lines"),
         name: "create_order_lines".to_owned(),
         steps: vec![
             CommandExecutionStep::Insert {

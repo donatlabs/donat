@@ -1009,6 +1009,29 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
         "command effects must be rejected before SQL generation until the process outbox renderer exists"
     );
 
+    if let Some(error_path) = command.steps.iter().find_map(|step| match step {
+        CommandExecutionStep::InsertMany {
+            items, error_path, ..
+        } if items
+            .as_json()
+            .as_array()
+            .is_none_or(|items| items.iter().any(|item| !item.is_object())) =>
+        {
+            Some(error_path)
+        }
+        _ => None,
+    }) {
+        return format!(
+            "SELECT {schema}.{function}({code}, {path}, {message}) AS {root}",
+            schema = quote_ident("donat"),
+            function = quote_ident("raise_graphql_error"),
+            code = quote_lit("validation-failed"),
+            path = quote_lit(error_path),
+            message = quote_lit("insert_many items must be a list of objects"),
+            root = quote_ident("root"),
+        );
+    }
+
     let mut ctes = Vec::new();
     let guard_cte = "_cmd_guard_gate";
     ctes.push(command_rule_gate_cte(guard_cte, &command.guards, "TRUE"));
@@ -1024,24 +1047,52 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 .retention_seconds
                 .map(|seconds| format!("statement_timestamp() + {} * interval '1 second'", seconds))
                 .unwrap_or_else(|| "'infinity'::timestamptz".to_owned());
+            let identity = command_identity_text(&command.identity);
+            let legacy_identity = command_legacy_identity_text(&command.identity.name);
+            let legacy_gate_cte = "_cmd_legacy_identity_gate";
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} AS {target} ({command_name}, {scope_hash_col}, {key_col}, {claim_state}, {expires_at_col}) SELECT {name}, {scope_hash}, {key}, 'first', {expires_at} FROM {guard_cte} ON CONFLICT ({command_name}, {scope_hash_col}, {key_col}) DO UPDATE SET {claim_state} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN 'first' ELSE 'replay' END, {expires_at_col} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN EXCLUDED.{expires_at_col} ELSE {target}.{expires_at_col} END RETURNING {command_name}, {scope_hash_col}, {key_col}, {claim_state})",
+                "{cte} AS MATERIALIZED (SELECT TRUE AS {ok} FROM {guard_cte} WHERE CASE WHEN EXISTS (SELECT 1 FROM {schema}.{journal} WHERE {stored_identity} = {legacy_identity} AND {command_name} = {name} AND {scope_hash_col} = {scope_hash} AND {key_col} = {key}) OR EXISTS (SELECT 1 FROM {schema}.{claims} WHERE {stored_identity} = {legacy_identity} AND {command_name} = {name} AND {scope_hash_col} = {scope_hash} AND {key_col} = {key}) THEN ({schema}.{raise_error}('validation-failed', {error_path}, {message}) IS NULL) ELSE TRUE END)",
+                cte = quote_ident(legacy_gate_cte),
+                ok = quote_ident("ok"),
+                guard_cte = quote_ident(guard_cte),
+                schema = quote_ident("donat"),
+                journal = quote_ident("command_invocations"),
+                claims = quote_ident("command_invocation_claims"),
+                stored_identity = quote_ident("command_identity"),
+                legacy_identity = quote_lit(&legacy_identity),
+                command_name = quote_ident("command_name"),
+                name = quote_lit(&command.identity.name),
+                scope_hash_col = quote_ident("scope_hash"),
+                scope_hash = scope_hash,
+                key_col = quote_ident("key"),
+                key = key,
+                raise_error = quote_ident("raise_graphql_error"),
+                error_path = quote_lit(&idempotency.error_path),
+                message = quote_lit(
+                    "legacy idempotency key cannot be replayed safely after command identity migration"
+                ),
+            ));
+            ctes.push(format!(
+                "{cte} AS (INSERT INTO {schema}.{table} AS {target} ({command_identity}, {command_name}, {scope_hash_col}, {key_col}, {claim_state}, {expires_at_col}) SELECT {identity}, {name}, {scope_hash}, {key}, 'first', {expires_at} FROM {legacy_gate_cte} ON CONFLICT ({command_identity}, {scope_hash_col}, {key_col}) DO UPDATE SET {claim_state} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN 'first' ELSE 'replay' END, {expires_at_col} = CASE WHEN {target}.{expires_at_col} <= statement_timestamp() THEN EXCLUDED.{expires_at_col} ELSE {target}.{expires_at_col} END RETURNING {command_identity}, {command_name}, {scope_hash_col}, {key_col}, {claim_state})",
                 cte = quote_ident("_cmd_claim"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocation_claims"),
                 target = quote_ident("_cmd_claim_target"),
+                command_identity = quote_ident("command_identity"),
                 command_name = quote_ident("command_name"),
                 scope_hash_col = quote_ident("scope_hash"),
                 key_col = quote_ident("key"),
                 claim_state = quote_ident("claim_state"),
                 expires_at_col = quote_ident("expires_at"),
-                name = quote_lit(&command.name),
-                guard_cte = quote_ident(guard_cte),
+                identity = quote_lit(&identity),
+                name = quote_lit(&command.identity.name),
+                legacy_gate_cte = quote_ident(legacy_gate_cte),
             ));
+            let identity_gate = command_gate_exists(legacy_gate_cte);
             (
                 format!(
-                    "({guard_gate}) AND EXISTS (SELECT 1 FROM {claim} WHERE {claim_state} = 'first')",
-                    guard_gate = guard_gate,
+                    "({identity_gate}) AND EXISTS (SELECT 1 FROM {claim} WHERE {claim_state} = 'first')",
+                    identity_gate = identity_gate,
                     claim = quote_ident("_cmd_claim"),
                     claim_state = quote_ident("claim_state"),
                 ),
@@ -1097,7 +1148,7 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
     let result_source = match &invocation {
         Some(invocation) => {
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} ({command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, {result_cte}.{result_col}, 'succeeded', {expires_at} FROM {claim} CROSS JOIN {result_cte} WHERE {claim}.{claim_state} = 'first' ON CONFLICT ({command_name}, {scope_hash}, {key}) DO UPDATE SET {input_fingerprint} = EXCLUDED.{input_fingerprint}, {result_col} = EXCLUDED.{result_col}, {status} = EXCLUDED.{status}, {expires_at_col} = EXCLUDED.{expires_at_col} RETURNING {result_col}, {input_fingerprint})",
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, {result_cte}.{result_col}, 'succeeded', {expires_at} FROM {claim} CROSS JOIN {result_cte} WHERE {claim}.{claim_state} = 'first' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {input_fingerprint} = EXCLUDED.{input_fingerprint}, {result_col} = EXCLUDED.{result_col}, {status} = EXCLUDED.{status}, {expires_at_col} = EXCLUDED.{expires_at_col} RETURNING {result_col}, {input_fingerprint})",
                 cte = quote_ident("_cmd_store_first"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocations"),
@@ -1105,6 +1156,7 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 status = quote_ident("status"),
                 result_cte = quote_ident("_cmd_result"),
                 claim = quote_ident("_cmd_claim"),
+                command_identity = quote_ident("command_identity"),
                 command_name = quote_ident("command_name"),
                 scope_hash = quote_ident("scope_hash"),
                 key = quote_ident("key"),
@@ -1115,10 +1167,11 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 expires_at = invocation.expires_at,
             ));
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} ({command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, 'null'::jsonb, 'succeeded', {expires_at} FROM {claim} WHERE {claim}.{claim_state} = 'replay' ON CONFLICT ({command_name}, {scope_hash}, {key}) DO UPDATE SET {key} = EXCLUDED.{key} RETURNING {result_col}, {input_fingerprint})",
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, 'null'::jsonb, 'succeeded', {expires_at} FROM {claim} WHERE {claim}.{claim_state} = 'replay' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {key} = EXCLUDED.{key} RETURNING {result_col}, {input_fingerprint})",
                 cte = quote_ident("_cmd_store_replay"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocations"),
+                command_identity = quote_ident("command_identity"),
                 command_name = quote_ident("command_name"),
                 scope_hash = quote_ident("scope_hash"),
                 key = quote_ident("key"),
@@ -1321,31 +1374,26 @@ fn command_step_cte(
                 .iter()
                 .map(|assignment| quote_ident(&assignment.column.name))
                 .collect();
-            let item_rows = items
-                .as_json()
-                .as_array()
-                .expect("validated insert_many items must be a JSON array");
+            let item_rows = items.as_json().as_array().map(Vec::as_slice).unwrap_or(&[]);
             let mut item_ctes = item_rows
                 .iter()
                 .enumerate()
-                .map(|(index, item)| {
-                    let item = item
-                        .as_object()
-                        .expect("validated insert_many items must be JSON objects");
+                .filter_map(|(index, item)| {
+                    let item = item.as_object()?;
                     let values = object
                         .iter()
                         .map(|assignment| command_value_sql_for_item(ctx, &assignment.value, item))
                         .collect::<Vec<_>>();
                     let item_source = command_item_source_sql(ctx, item_fields, item);
                     let item_cte = format!("{cte}_item_{index}");
-                    format!(
+                    Some(format!(
                         "{item_cte} AS (INSERT INTO {table} ({columns}) SELECT {values} FROM ({item_source}) AS {item_alias} WHERE {execution_gate} RETURNING *)",
                         item_cte = quote_ident(&item_cte),
                         table = command_table_sql(table),
                         columns = columns.join(", "),
                         values = values.join(", "),
                         item_alias = quote_ident("_cmd_item"),
-                    )
+                    ))
                 })
                 .collect::<Vec<_>>();
             if item_ctes.is_empty() {
@@ -1834,6 +1882,31 @@ fn command_hash(json: &str) -> String {
 
 fn command_key_text(value: &Scalar) -> String {
     format!("({} #>> '{{}}')", command_jsonb_literal(value))
+}
+
+fn command_identity_text(identity: &CommandIdentity) -> String {
+    fn component(value: &str) -> String {
+        format!("{}:{value}", value.len())
+    }
+
+    format!(
+        "v1:{}{}{}",
+        component(&identity.source),
+        component(&identity.name),
+        component(&identity.role),
+    )
+}
+
+fn command_legacy_identity_text(name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut identity = String::with_capacity("legacy-unqualified:".len() + name.len() * 2);
+    identity.push_str("legacy-unqualified:");
+    for byte in name.bytes() {
+        identity.push(char::from(HEX[usize::from(byte >> 4)]));
+        identity.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    identity
 }
 
 pub fn mutation_to_sql(root: &MutationRoot) -> String {

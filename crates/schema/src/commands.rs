@@ -63,11 +63,18 @@ impl CompiledSourceCommandCatalog {
 /// A command definition accepted by the static compiler.
 #[derive(Debug, Clone)]
 pub struct CompiledCommand {
+    source: String,
     definition: Command,
     rules: Arc<RuleCatalog>,
 }
 
 impl CompiledCommand {
+    /// The source that owned this definition when the immutable catalog was
+    /// compiled. The raw command name is only source-local.
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
     /// The trusted, immutable source definition. Request paths receive only a
     /// shared reference; metadata mutations never update this snapshot.
     pub fn definition(&self) -> &Command {
@@ -97,6 +104,7 @@ enum StaticType {
     List(Box<StaticType>),
     Row(BTreeMap<String, StaticType>),
     Rows(BTreeMap<String, StaticType>),
+    Nullable(Box<StaticType>),
 }
 
 /// PostgreSQL facts that are intentionally narrower than the GraphQL-facing
@@ -549,8 +557,28 @@ fn timestamp_fractional_digits(value: &str, with_time_zone: bool) -> Result<u8, 
 }
 
 impl StaticType {
+    fn nullable(inner: Self) -> Self {
+        if matches!(inner, Self::Nullable(_)) {
+            inner
+        } else {
+            Self::Nullable(Box::new(inner))
+        }
+    }
+
     fn is_scalar(&self) -> bool {
-        matches!(self, Self::Scalar(_))
+        match self {
+            Self::Scalar(_) => true,
+            Self::Nullable(inner) => inner.is_scalar(),
+            _ => false,
+        }
+    }
+
+    fn scalar_name(&self) -> Option<&str> {
+        match self {
+            Self::Scalar(name) => Some(name),
+            Self::Nullable(inner) => inner.scalar_name(),
+            _ => None,
+        }
     }
 
     fn display_name(&self) -> String {
@@ -560,6 +588,7 @@ impl StaticType {
             Self::List(item) => format!("list<{}>", item.display_name()),
             Self::Row(_) => "row".to_string(),
             Self::Rows(_) => "list<row>".to_string(),
+            Self::Nullable(inner) => format!("nullable {}", inner.display_name()),
         }
     }
 }
@@ -568,6 +597,7 @@ impl StaticType {
 struct StepOutput {
     fields: BTreeMap<String, StaticType>,
     many: bool,
+    may_be_absent: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -720,6 +750,7 @@ fn compile_command_catalog_with_diagnostics(
                 .insert(
                     command.name.clone(),
                     CompiledCommand {
+                        source: source.name.clone(),
                         definition: command.clone(),
                         rules: rules_snapshot.clone(),
                     },
@@ -1221,6 +1252,7 @@ fn validate_step(
             Ok(StepOutput {
                 fields: BTreeMap::new(),
                 many: false,
+                may_be_absent: false,
             })
         }
         CommandStepOperation::SelectOne { select_one } => {
@@ -1239,10 +1271,17 @@ fn validate_step(
             Ok(StepOutput {
                 fields: returning,
                 many: false,
+                may_be_absent: !select_one.require_found,
             })
         }
         CommandStepOperation::Insert { insert } => {
             let (entry, info) = command_target(source, catalog, &insert.table, path)?;
+            if insert.object.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "insert object must contain at least one column assignment",
+                ));
+            }
             validate_object(&insert.object, info, context, path)?;
             let returning = returning_columns(&insert.returning, info, path)?;
             for role in roles {
@@ -1280,10 +1319,17 @@ fn validate_step(
             Ok(StepOutput {
                 fields: returning,
                 many: false,
+                may_be_absent: false,
             })
         }
         CommandStepOperation::InsertMany { insert_many } => {
             let (entry, info) = command_target(source, catalog, &insert_many.table, path)?;
+            if insert_many.object.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "insert_many object must contain at least one column assignment",
+                ));
+            }
             let item_fields = insert_many_item_fields(&insert_many.for_each, context, path)?;
             let item_context = ValueContext {
                 item: Some(&item_fields),
@@ -1326,11 +1372,18 @@ fn validate_step(
             Ok(StepOutput {
                 fields: returning,
                 many: true,
+                may_be_absent: false,
             })
         }
         CommandStepOperation::Update { update } => {
             let (entry, info) = command_target(source, catalog, &update.table, path)?;
             validate_primary_key_predicate(&update.predicate, info, context, path)?;
+            if update.set.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "update set must contain at least one column assignment",
+                ));
+            }
             validate_object(&update.set, info, context, path)?;
             let returning = returning_columns(&update.returning, info, path)?;
             for role in roles {
@@ -1366,6 +1419,7 @@ fn validate_step(
             Ok(StepOutput {
                 fields: returning,
                 many: false,
+                may_be_absent: !update.require_affected,
             })
         }
         CommandStepOperation::Delete { delete } => {
@@ -1398,6 +1452,7 @@ fn validate_step(
             Ok(StepOutput {
                 fields: returning,
                 many: false,
+                may_be_absent: !delete.require_affected,
             })
         }
     }
@@ -1693,6 +1748,18 @@ fn validate_result(
             ));
         }
         match &field.value {
+            CommandValue::Literal { literal }
+                if literal.as_i64().is_some_and(|value| {
+                    !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value)
+                }) || literal
+                    .as_u64()
+                    .is_some_and(|value| value > i32::MAX as u64) =>
+            {
+                return Err(PlanError::validation(
+                    path,
+                    "integral command result literal is outside the GraphQL Int range",
+                ));
+            }
             CommandValue::Step { .. } | CommandValue::Literal { .. } => {
                 value_type(&field.value, context, None, ValueUse::Data, path)?;
             }
@@ -1730,8 +1797,7 @@ fn validate_idempotency(
                         "idempotency scope must be scalar and cannot use object or list arguments",
                     ));
                 }
-                if matches!(&type_, StaticType::Scalar(name) if matches!(name.as_str(), "json" | "jsonb"))
-                {
+                if matches!(type_.scalar_name(), Some("json" | "jsonb")) {
                     return Err(PlanError::validation(
                         path,
                         "idempotency scope must not use json or jsonb arguments",
@@ -1797,7 +1863,7 @@ fn validate_idempotency_key(
             "idempotency key must be a declared scalar argument",
         ));
     }
-    if matches!(&type_, StaticType::Scalar(name) if matches!(name.as_str(), "json" | "jsonb")) {
+    if matches!(type_.scalar_name(), Some("json" | "jsonb")) {
         return Err(PlanError::validation(
             path,
             "idempotency key must not use a json or jsonb argument",
@@ -1997,6 +2063,8 @@ fn value_type(
                     })?;
                     if output.many {
                         Ok(StaticType::List(Box::new(field)))
+                    } else if output.may_be_absent {
+                        Ok(StaticType::nullable(field))
                     } else {
                         Ok(field)
                     }
@@ -2046,12 +2114,21 @@ fn literal_type(
                 StaticType::Scalar("String".to_string())
             }
         }
-        serde_json::Value::Null => expected.cloned().ok_or_else(|| {
-            PlanError::validation(
-                path,
-                "null command literals require an explicit typed destination",
-            )
-        })?,
+        serde_json::Value::Null => match expected {
+            Some(expected @ StaticType::Nullable(_)) => expected.clone(),
+            Some(_) => {
+                return Err(PlanError::validation(
+                    path,
+                    "null command literals require a nullable typed destination",
+                ));
+            }
+            None => {
+                return Err(PlanError::validation(
+                    path,
+                    "null command literals require an explicit typed destination",
+                ));
+            }
+        },
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             return Err(PlanError::validation(
                 path,
@@ -2067,10 +2144,10 @@ fn validate_string_literal(
     expected: &StaticType,
     path: &str,
 ) -> Result<(), PlanError> {
-    let StaticType::Scalar(scalar) = expected else {
+    let Some(scalar) = expected.scalar_name() else {
         return Ok(());
     };
-    let valid = match scalar.as_str() {
+    let valid = match scalar {
         "Boolean" => matches!(value, "true" | "false"),
         "Int" => value.parse::<i32>().is_ok(),
         "Float" => value.parse::<f64>().is_ok_and(|number| number.is_finite()),
@@ -2192,31 +2269,40 @@ fn parse_type_with_named(
     where
         F: FnMut(&str) -> Result<Option<StaticType>, PlanError>,
     {
-        let source = source.strip_suffix('!').unwrap_or(source);
-        if let Some(inner) = source
+        let (source, required) = match source.strip_suffix('!') {
+            Some(inner) => (inner, true),
+            None => (source, false),
+        };
+        let parsed = if let Some(inner) = source
             .strip_prefix('[')
             .and_then(|inner| inner.strip_suffix(']'))
         {
-            return Ok(StaticType::List(Box::new(parse(inner, path, named)?)));
-        }
-        let builtin = match source {
-            "Boolean" | "bool" => Some("Boolean"),
-            "String" | "string" | "ID" => Some("String"),
-            "Int" | "int" => Some("Int"),
-            "Float" | "float" | "decimal" => Some("Float"),
-            "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(source),
-            _ => None,
+            StaticType::List(Box::new(parse(inner, path, named)?))
+        } else {
+            let builtin = match source {
+                "Boolean" | "bool" => Some("Boolean"),
+                "String" | "string" | "ID" => Some("String"),
+                "Int" | "int" => Some("Int"),
+                "Float" | "float" | "decimal" => Some("Float"),
+                "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(source),
+                _ => None,
+            };
+            if let Some(name) = builtin {
+                StaticType::Scalar(name.to_string())
+            } else if let Some(type_) = named(source)? {
+                type_
+            } else {
+                return Err(PlanError::validation(
+                    path,
+                    format!("unknown command argument type '{source}'"),
+                ));
+            }
         };
-        if let Some(name) = builtin {
-            return Ok(StaticType::Scalar(name.to_string()));
-        }
-        if let Some(type_) = named(source)? {
-            return Ok(type_);
-        }
-        Err(PlanError::validation(
-            path,
-            format!("unknown command argument type '{source}'"),
-        ))
+        Ok(if required {
+            parsed
+        } else {
+            StaticType::nullable(parsed)
+        })
     }
     parse(type_, path, &mut named)
 }
@@ -2231,7 +2317,12 @@ fn column_type(column: &ColumnInfo) -> StaticType {
         "timestamptz" | "timestamp with time zone" => "timestamptz",
         other => other,
     };
-    StaticType::Scalar(scalar.to_string())
+    let scalar = StaticType::Scalar(scalar.to_string());
+    if column.nullable {
+        StaticType::nullable(scalar)
+    } else {
+        scalar
+    }
 }
 
 fn rule_type(type_: &RuleType) -> StaticType {
@@ -2252,12 +2343,20 @@ fn rule_type(type_: &RuleType) -> StaticType {
                 .map(|(name, type_)| (name.clone(), rule_type(type_)))
                 .collect(),
         },
-        RuleType::Nullable(inner) => rule_type(inner),
+        RuleType::Nullable(inner) => StaticType::nullable(rule_type(inner)),
     }
 }
 
 fn assignable(actual: &StaticType, expected: &StaticType) -> bool {
-    actual == expected
+    match (actual, expected) {
+        (StaticType::Nullable(actual), StaticType::Nullable(expected)) => {
+            assignable(actual, expected)
+        }
+        (StaticType::Nullable(_), _) => false,
+        (actual, StaticType::Nullable(expected)) => assignable(actual, expected),
+        (StaticType::List(actual), StaticType::List(expected)) => assignable(actual, expected),
+        _ => actual == expected,
+    }
 }
 
 fn secret_looking(name: &str) -> bool {

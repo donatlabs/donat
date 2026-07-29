@@ -527,6 +527,56 @@ fn command_planning_preserves_aliases_and_emits_a_resolved_command_root() {
 }
 
 #[test]
+fn command_execution_identity_is_source_and_explicit_role_qualified() {
+    let mut default_command = valid_command();
+    default_command["permissions"] = json!([{ "role": "buyer" }]);
+    let mut secondary_command = valid_command();
+    secondary_command["source"] = json!("secondary");
+    secondary_command["permissions"] = json!([{ "role": "merchant" }]);
+    let mut metadata = two_source_metadata(vec![default_command, secondary_command]);
+    set_source_table_role(&mut metadata, "default", "buyer");
+    set_source_table_role(&mut metadata, "secondary", "merchant");
+    let catalogs = two_source_catalogs();
+    let commands = command_catalog(&metadata, &catalogs);
+    let query = r#"
+        mutation {
+          create_order(
+            id: "550e8400-e29b-41d4-a716-446655440000"
+            customer_id: "550e8400-e29b-41d4-a716-446655440001"
+            status: "new"
+            quantity: 1
+            request_id: "550e8400-e29b-41d4-a716-446655440002"
+          ) { order_id }
+        }
+    "#;
+
+    let identity_for = |role| {
+        let plan = plan_runtime(&metadata, &catalogs, commands.clone(), role, query)
+            .expect("the disjoint role resolves its source-local command");
+        let MultiSourcePlan::Mutation { roots, .. } = plan else {
+            panic!("command must plan as a mutation");
+        };
+        let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+            panic!("expected one command root");
+        };
+        command.identity.clone()
+    };
+
+    let buyer = identity_for("buyer");
+    let merchant = identity_for("merchant");
+    assert_eq!(buyer.source, "default");
+    assert_eq!(buyer.name, "create_order");
+    assert_eq!(buyer.role, "buyer");
+    assert_eq!(merchant.source, "secondary");
+    assert_eq!(merchant.name, "create_order");
+    assert_eq!(merchant.role, "merchant");
+    assert_ne!(
+        buyer, merchant,
+        "journal identity must not cross source/role"
+    );
+}
+
+#[test]
 fn command_planning_resolves_execution_facts_without_raw_metadata() {
     let mut command = valid_command();
     command["guards"] = json!([{
@@ -700,6 +750,66 @@ fn command_planning_keeps_insert_many_rule_item_bindings_resolved() {
         object.first().map(|assignment| &assignment.value),
         Some(CommandExecutionValue::Rule { sql, .. }) if sql.contains("\"_cmd_item\".\"quantity\"")
     ));
+}
+
+#[test]
+fn command_planning_normalizes_graphql_single_object_list_coercion() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments are an array")
+        .push(json!({ "name": "lines", "type": "[OrderInput!]!" }));
+    command["steps"] = json!([{
+        "name": "lines",
+        "insert_many": {
+            "table": { "schema": "public", "name": "orders" },
+            "for_each": { "arg": "lines" },
+            "object": {
+                "status": { "item": "status" },
+                "quantity": { "item": "quantity" }
+            },
+            "returning": ["status", "quantity"]
+        }
+    }]);
+    command["result"] = json!({ "lines": { "step": "lines" } });
+
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+                lines: { status: "only", quantity: 2 }
+              ) { lines { status quantity } }
+            }
+        "#,
+    )
+    .expect("GraphQL coerces one input object to a one-element list");
+
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    let [CommandExecutionStep::InsertMany { items, .. }] = command.steps.as_slice() else {
+        panic!("expected one insert_many step");
+    };
+    assert_eq!(
+        items.as_json(),
+        &json!([{ "status": "only", "quantity": 2 }]),
+        "the SQL-free boundary must carry canonical list-shaped input"
+    );
 }
 
 #[test]
@@ -1544,6 +1654,259 @@ fn rejects_update_and_delete_without_every_primary_key_predicate() {
             command["result"] = json!({ "order_id": { "step": "remove", "column": "id" } });
         }
         assert_rejected(command, "requires every primary-key column");
+    }
+}
+
+#[test]
+fn rejects_empty_command_write_objects_before_serving() {
+    let mut empty_insert = valid_command();
+    empty_insert["steps"][0]["insert"]["object"] = json!({});
+    assert_rejected(
+        empty_insert,
+        "insert object must contain at least one column assignment",
+    );
+
+    let mut empty_insert_many = valid_command();
+    empty_insert_many["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .push(json!({ "name": "items", "type": "[OrderInput!]!" }));
+    empty_insert_many["steps"] = json!([{
+        "name": "orders",
+        "insert_many": {
+            "table": { "schema": "public", "name": "orders" },
+            "for_each": { "arg": "items" },
+            "object": {},
+            "returning": ["id"]
+        }
+    }]);
+    empty_insert_many["result"] = json!({ "orders": { "step": "orders" } });
+    assert_rejected(
+        empty_insert_many,
+        "insert_many object must contain at least one column assignment",
+    );
+
+    let mut empty_update = valid_command();
+    empty_update["steps"] = json!([{
+        "name": "order",
+        "update": {
+            "table": { "schema": "public", "name": "orders" },
+            "where": { "id": { "arg": "id" } },
+            "set": {},
+            "returning": ["id"]
+        }
+    }]);
+    empty_update["result"] = json!({ "order_id": { "step": "order", "column": "id" } });
+    assert_rejected(
+        empty_update,
+        "update set must contain at least one column assignment",
+    );
+}
+
+#[test]
+fn command_assignability_preserves_argument_item_column_and_step_nullability() {
+    let mut optional_argument = valid_command();
+    optional_argument["arguments"][2]["type"] = json!("String");
+    assert_rejected(
+        optional_argument,
+        "nullable String is not assignable to column 'status' (String)",
+    );
+
+    let mut nullable_input_item = valid_command();
+    nullable_input_item["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .push(json!({ "name": "items", "type": "[OrderInput!]!" }));
+    nullable_input_item["steps"] = json!([{
+        "name": "orders",
+        "insert_many": {
+            "table": { "schema": "public", "name": "orders" },
+            "for_each": { "arg": "items" },
+            "object": { "status": { "item": "status" } },
+            "returning": ["id"]
+        }
+    }]);
+    nullable_input_item["result"] = json!({ "orders": { "step": "orders" } });
+    let mut nullable_item_metadata = metadata(vec![nullable_input_item]);
+    nullable_item_metadata.custom_types.input_objects[0].fields[0].type_ = "String".to_string();
+    let error = compile(&nullable_item_metadata, RelationKind::Table)
+        .expect_err("a nullable item field cannot feed a required column");
+    assert!(
+        error
+            .message
+            .contains("nullable String is not assignable to column 'status' (String)"),
+        "{error:?}"
+    );
+
+    let mut optional_step = valid_command();
+    optional_step["steps"] = json!([
+        {
+            "name": "maybe_order",
+            "select_one": {
+                "table": { "schema": "public", "name": "orders" },
+                "by": { "id": { "arg": "id" } },
+                "returning": ["status"],
+                "require_found": false
+            }
+        },
+        {
+            "name": "copy",
+            "insert": {
+                "table": { "schema": "public", "name": "orders" },
+                "object": {
+                    "id": { "arg": "request_id" },
+                    "status": { "step": "maybe_order", "column": "status" }
+                },
+                "returning": ["id"]
+            }
+        }
+    ]);
+    optional_step["result"] = json!({ "order_id": { "step": "copy", "column": "id" } });
+    assert_rejected(
+        optional_step,
+        "nullable String is not assignable to column 'status' (String)",
+    );
+
+    let mut nullable_column_catalog = catalog(RelationKind::Table);
+    nullable_column_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .columns
+        .push(column_with("optional_status", "text", -1, true));
+    let mut nullable_column_step = valid_command();
+    nullable_column_step["steps"] = json!([
+        {
+            "name": "source",
+            "select_one": {
+                "table": { "schema": "public", "name": "orders" },
+                "by": { "id": { "arg": "id" } },
+                "returning": ["optional_status"]
+            }
+        },
+        {
+            "name": "copy",
+            "insert": {
+                "table": { "schema": "public", "name": "orders" },
+                "object": {
+                    "id": { "arg": "request_id" },
+                    "status": { "step": "source", "column": "optional_status" }
+                },
+                "returning": ["id"]
+            }
+        }
+    ]);
+    nullable_column_step["result"] = json!({ "order_id": { "step": "copy", "column": "id" } });
+    let error = compile_with_catalog(
+        &metadata(vec![nullable_column_step]),
+        nullable_column_catalog,
+    )
+    .expect_err("a nullable returned column cannot feed a required column");
+    assert!(
+        error
+            .message
+            .contains("nullable String is not assignable to column 'status' (String)"),
+        "{error:?}"
+    );
+
+    let mut nullable_rule_value = valid_command();
+    nullable_rule_value["steps"][0]["insert"]["object"]["status"] =
+        json!({ "rule": "maybe_status" });
+    let nullable_rules = compile_catalog(
+        &[RuleDefinition {
+            name: "maybe_status".to_string(),
+            bindings: BTreeMap::new(),
+            result: RuleType::nullable(RuleType::String),
+            expression: "null".to_string(),
+        }],
+        &[],
+    )
+    .expect("nullable value Rule compiles");
+    let error = compile_command_catalog(
+        &metadata(vec![nullable_rule_value]),
+        &HashMap::from([("default".to_string(), catalog(RelationKind::Table))]),
+        &nullable_rules,
+        true,
+    )
+    .expect_err("a nullable Rule result cannot feed a required column");
+    assert!(
+        error
+            .message
+            .contains("rule 'maybe_status' must return String"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn nullable_command_arguments_may_be_omitted_or_null_only_for_nullable_columns() {
+    let mut command = valid_command();
+    command["arguments"][2]["type"] = json!("String");
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([(
+        "default".to_string(),
+        literal_target_catalog("text", -1, true),
+    )]);
+    let commands = command_catalog(&metadata, &catalogs);
+
+    for status_argument in ["", "status: null"] {
+        let plan = plan_runtime(
+            &metadata,
+            &catalogs,
+            commands.clone(),
+            &session("customer").role,
+            &format!(
+                r#"
+                mutation {{
+                  create_order(
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                    {status_argument}
+                    quantity: 1
+                    request_id: "550e8400-e29b-41d4-a716-446655440002"
+                  ) {{ order_id }}
+                }}
+                "#
+            ),
+        )
+        .expect("a nullable destination accepts omitted and explicit-null optional arguments");
+        let MultiSourcePlan::Mutation { roots, .. } = plan else {
+            panic!("command must plan as a mutation");
+        };
+        let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+            panic!("expected one command root");
+        };
+        let [CommandExecutionStep::Insert { object, .. }] = command.steps.as_slice() else {
+            panic!("expected insert command step");
+        };
+        assert!(matches!(
+            object
+                .iter()
+                .find(|assignment| assignment.column.name == "status")
+                .map(|assignment| &assignment.value),
+            Some(CommandExecutionValue::Scalar { value, .. }) if value.as_json().is_null()
+        ));
+    }
+}
+
+#[test]
+fn command_result_integral_literals_are_limited_to_graphql_int_range() {
+    for boundary in [json!(i32::MIN), json!(i32::MAX)] {
+        let mut command = valid_command();
+        command["result"]["boundary"] = json!({ "literal": boundary });
+        compile(&metadata(vec![command]), RelationKind::Table)
+            .expect("GraphQL Int boundaries are valid result literals");
+    }
+
+    for outside in [
+        json!(i64::from(i32::MIN) - 1),
+        json!(i64::from(i32::MAX) + 1),
+    ] {
+        let mut command = valid_command();
+        command["result"]["outside"] = json!({ "literal": outside });
+        assert_rejected(
+            command,
+            "integral command result literal is outside the GraphQL Int range",
+        );
     }
 }
 

@@ -213,6 +213,7 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
                 true,
                 "now()".into(),
             ),
+            ("command_identity".into(), "text".into(), true, "".into()),
         ],
         "journal columns, PostgreSQL types, nullability, and defaults",
     );
@@ -240,8 +241,8 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key_columns,
-        ["command_name", "scope_hash", "key"],
-        "the idempotency scope is exactly the primary key"
+        ["command_identity", "scope_hash", "key"],
+        "the qualified execution identity and hashed scope own replay uniqueness"
     );
 
     let redundant_unique_constraints: i64 = client
@@ -402,8 +403,9 @@ async fn command_claims_migration_elects_idempotency_executor_with_canonical_key
                 true,
                 "now()".into(),
             ),
+            ("command_identity".into(), "text".into(), true, "".into()),
         ],
-        "claims retain no input, result, role, or raw scope values",
+        "claims retain no input, result, or raw scope values",
     );
 
     let primary_key_columns = client
@@ -429,8 +431,8 @@ async fn command_claims_migration_elects_idempotency_executor_with_canonical_key
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key_columns,
-        ["command_name", "scope_hash", "key"],
-        "claim and canonical journal share exactly one idempotency identity"
+        ["command_identity", "scope_hash", "key"],
+        "claim and canonical journal share the qualified idempotency identity"
     );
 
     let claim_state_constraint: String = client
@@ -439,7 +441,7 @@ async fn command_claims_migration_elects_idempotency_executor_with_canonical_key
             SELECT pg_get_constraintdef(constraint_row.oid)
             FROM pg_constraint constraint_row
             WHERE constraint_row.conrelid = 'donat.command_invocation_claims'::regclass
-              AND constraint_row.contype = 'c'
+              AND constraint_row.conname = 'command_invocation_claims_claim_state_check'
             ",
             &[],
         )
@@ -468,6 +470,123 @@ async fn command_claims_migration_elects_idempotency_executor_with_canonical_key
     );
 
     connection.abort();
+    drop_migration_database(&admin_url, &database_name).await;
+}
+
+#[tokio::test]
+async fn command_identity_migration_quarantines_preexisting_unqualified_keys() {
+    let (admin_url, database_name, url) =
+        fresh_migration_database("command_identity_upgrade").await;
+    let staged = std::env::temp_dir().join(format!(
+        "donat-command-identity-migrations-{}-{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&staged).expect("staged migration directory creates");
+    for name in [
+        "V1__donat_cron.sql",
+        "V2__donat_event_log.sql",
+        "V3__donat_commands.sql",
+        "V4__donat_command_claims.sql",
+    ] {
+        std::fs::copy(bundled_migrations_dir().join(name), staged.join(name))
+            .unwrap_or_else(|error| panic!("stage {name}: {error}"));
+    }
+    run_migrate(&url, &staged)
+        .await
+        .expect("pre-V5 migrations apply");
+
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("isolated Postgres is available");
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(
+            r#"
+            INSERT INTO donat.command_invocations
+                (command_name, scope_hash, key, input_fingerprint, result, expires_at)
+            VALUES
+                ('create_order', decode('01', 'hex'), 'legacy-key',
+                 decode('02', 'hex'), '{"status":"legacy"}'::jsonb,
+                 statement_timestamp() + interval '1 day');
+            INSERT INTO donat.command_invocation_claims
+                (command_name, scope_hash, key, claim_state, expires_at)
+            VALUES
+                ('create_order', decode('01', 'hex'), 'legacy-key', 'replay',
+                 statement_timestamp() + interval '1 day');
+            "#,
+        )
+        .await
+        .expect("seed pre-V5 journal identity");
+
+    let v5 = "V5__qualify_command_identity.sql";
+    std::fs::copy(bundled_migrations_dir().join(v5), staged.join(v5))
+        .unwrap_or_else(|error| panic!("stage {v5}: {error}"));
+    run_migrate(&url, &staged)
+        .await
+        .expect("V5 identity migration applies to an existing journal");
+
+    for table in ["command_invocations", "command_invocation_claims"] {
+        let identity: String = client
+            .query_one(
+                &format!(
+                    "SELECT command_identity FROM donat.{table} WHERE command_name = 'create_order' AND key = 'legacy-key'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("read migrated {table} identity: {error}"))
+            .get(0);
+        assert_eq!(
+            identity, "legacy-unqualified:6372656174655f6f72646572",
+            "V5 must deterministically quarantine rather than invent source/role attribution"
+        );
+
+        let primary_key = client
+            .query(
+                &format!(
+                    r#"
+                    SELECT attribute.attname
+                    FROM pg_constraint constraint_row
+                    CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                        AS key_column(attnum, position)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = constraint_row.conrelid
+                     AND attribute.attnum = key_column.attnum
+                    WHERE constraint_row.conrelid = 'donat.{table}'::regclass
+                      AND constraint_row.contype = 'p'
+                    ORDER BY key_column.position
+                    "#
+                ),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("read migrated {table} primary key: {error}"))
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primary_key,
+            ["command_identity", "scope_hash", "key"],
+            "V5 identity owns election/replay uniqueness in {table}"
+        );
+    }
+
+    let preserved: Json = client
+        .query_one(
+            "SELECT result FROM donat.command_invocations WHERE key = 'legacy-key'",
+            &[],
+        )
+        .await
+        .expect("read preserved legacy result")
+        .get(0);
+    assert_eq!(preserved, json!({ "status": "legacy" }));
+
+    run_migrate(&url, &staged)
+        .await
+        .expect("the complete staged migration set remains idempotent");
+    connection.abort();
+    std::fs::remove_dir_all(&staged).expect("staged migration directory removes");
     drop_migration_database(&admin_url, &database_name).await;
 }
 

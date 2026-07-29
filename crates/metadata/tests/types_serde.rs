@@ -924,6 +924,83 @@ fn commands_retain_unvalidated_duplicate_names_and_effect_references() {
 }
 
 #[test]
+fn command_closed_unions_reject_multiple_discriminators_and_unknown_keys() {
+    let invalid_documents = [
+        (
+            "step operation",
+            r#"
+name: create_order
+source: default
+steps:
+  - name: write
+    insert:
+      table: public.orders
+      object: { status: { literal: draft } }
+    delete:
+      table: public.orders
+      where: { id: { arg: id } }
+"#,
+        ),
+        (
+            "command value",
+            r#"
+name: create_order
+source: default
+steps:
+  - name: write
+    insert:
+      table: public.orders
+      object:
+        status: { arg: status, literal: draft }
+"#,
+        ),
+        (
+            "idempotency key",
+            r#"
+name: create_order
+source: default
+idempotency:
+  key: { argument: request_id, unknown: value }
+"#,
+        ),
+        (
+            "idempotency scope",
+            r#"
+name: create_order
+source: default
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: customer_id, session_variable: x-donat-user-id }
+"#,
+        ),
+        (
+            "command effect",
+            r#"
+name: create_order
+source: default
+effects:
+  - start_process:
+      process: checkout_order
+    signal_process:
+      process: checkout_order
+      signal: approved
+"#,
+        ),
+    ];
+
+    for (kind, document) in invalid_documents {
+        let error = serde_yaml::from_str::<Command>(document)
+            .expect_err(&format!("ambiguous {kind} must be rejected"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field") || rendered.contains("did not match"),
+            "{kind} must fail as a closed union, got: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn command_argument_mapping_shorthand_normalizes_to_the_canonical_list() {
     let command: Command = serde_yaml::from_str(
         r#"

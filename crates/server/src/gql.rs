@@ -1981,6 +1981,11 @@ mod tests {
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
             command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_string(),
+                    name: "create_order".to_string(),
+                    role: "customer".to_string(),
+                },
                 name: "create_order".to_string(),
                 steps: vec![],
                 guards: vec![],
@@ -2007,6 +2012,11 @@ mod tests {
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
             command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_string(),
+                    name: "create_order".to_string(),
+                    role: "customer".to_string(),
+                },
                 name: "create_order".to_string(),
                 steps: vec![],
                 guards: vec![],
@@ -2401,6 +2411,11 @@ mod tests {
         let root = donat_ir::MutationRoot::Command {
             alias: "submit".to_owned(),
             command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_owned(),
+                    name: "create_order".to_owned(),
+                    role: "customer".to_owned(),
+                },
                 name: "create_order".to_owned(),
                 steps: vec![],
                 guards: vec![],
