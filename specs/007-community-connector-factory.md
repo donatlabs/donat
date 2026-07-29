@@ -730,6 +730,7 @@ In this graph `A -> B` means crate `A` depends on crate `B`:
 ```text
 donat-ir                    -> donat-value-contract
 donat-connector-catalog     -> donat-value-contract
+donat-connector-catalog     -> donat-connector-abi
 donat-connector-abi         -> donat-value-contract
 donat-connector-processors  -> donat-connector-abi
 donat-connector-processors  -> donat-value-contract
@@ -754,13 +755,16 @@ superseding ADR before the value-contract slice lands.
 
 `donat-connector-catalog` explicitly owns `ConnectorSourceRecord`, the
 normalized connector IR, canonical record/manifest/descriptor hashes, and the
-checked-in generated catalog. It may use serde and pure hashing but does not
-depend on `donat-ir`, server, Tokio, reqwest, filesystem, or network
+checked-in generated catalog. It imports the ABI-owned connector, operation,
+compiled-step, processor, authenticator, codec, normalizer, credential, and
+capability ID/envelope types directly. It never defines a catalog-local string
+copy or conversion type for them. Catalog may use serde and pure hashing but
+does not depend on `donat-ir`, server, Tokio, reqwest, filesystem, or network
 libraries. `donat-connector-acquire` and `donat-connector-codegen` are sibling
 development/CI crates that each depend on the catalog; neither depends on the
-other. Acquisition alone owns HTTPS/archive handling. Codegen reads
-checked-in records/manifests and writes checked-in Rust. Neither is a server
-dependency or runtime image component.
+other. Acquisition alone owns HTTPS/archive handling. Codegen reads checked-in
+records/manifests and writes checked-in Rust. Neither is a server dependency
+or runtime image component.
 
 `donat-connector-abi` owns neutral IDs, bounded envelopes, errors, contexts,
 and server-implemented host capability traits. The processor crate owns sealed
@@ -780,6 +784,10 @@ closure contains only local path dependencies on `donat-connector-abi` and
 no third-party runtime, build, or procedural-macro dependencies in that
 closure. A future exception requires an exact version/checksum/features/target
 and transitive-closure review; it is not part of Phase 1.
+
+The catalog-to-ABI edge is one-way. It does not pull catalog serde/hashing,
+generated entries, acquisition, or codegen into the ABI or processor
+dependency closure.
 
 The server exclusively owns and implements `ConnectorIo`,
 `ProcessorControl`, credential and cryptographic primitives, JSON/form/URL and
@@ -882,6 +890,15 @@ are private. Its public lookup accepts only generated admitted IDs and returns
 an opaque processor handle; the server cannot implement/register an alternate
 processor or provide a dynamic fallback. CI rejects implementation blocks
 outside this crate.
+
+A compile-only `catalog_abi_id_types_are_identical` test assigns IDs from
+normalized catalog descriptors and checked-in generated entries directly to
+the ABI-owned parameter types of `ConnectorIo` and processor lookup. The
+assignments use the exact same Rust types: no `String`, `&str`, parse,
+serialization round-trip, `From`/`Into`, wrapper copy, or other conversion is
+permitted. The catalog slice first proves descriptor/generated-entry and
+`ConnectorIo` identity; the later processor slice extends the same assertion
+to private-table lookup.
 
 ### 7.3 Auxiliary object-safe ABIs
 
@@ -1322,7 +1339,8 @@ first implementation slice.
 | Spec 007 capability | May land before the process runtime? | Exact prerequisite | Boundary until the prerequisite is green |
 | --- | --- | --- | --- |
 | shared canonical value/type contract | yes | accepted ADR ownership update, then Spec 005 Task 1 implemented in `donat-value-contract` with `donat-ir` re-export and `value_type_language_is_closed_and_canonical` | no parallel value type in catalog, ABI, or IR |
-| normalized catalog model, source records, canonical hashes, and checked-in generated-table shape | yes | shared value contract above | model/tests only; no acquisition, generation, or executable operation yet |
+| neutral connector ABI ID/envelope foundation | yes | shared value contract above | IDs, envelopes, and host traits only; no catalog descriptors, processor implementation, or registry |
+| normalized catalog model, source records, canonical hashes, and checked-in generated-table shape | yes | shared value contract plus compiling ABI ID/envelope foundation | model/tests only; all connector IDs import the exact ABI types; no acquisition, generation, or executable operation yet |
 | hostile acquisition, licensing/notices, and update inventory | yes | compiling `donat-connector-catalog` source-record model | development tooling only; no donor source enters a runtime dependency |
 | deterministic checked-in Rust generation | yes | compiling catalog model and manifest validation | codegen uses checked-in inputs only and cannot acquire sources |
 | static catalog, read-only credential capability, fixed-origin transport, error mapping, and a direct server-side SerpAPI harness | yes | value contract, catalog, and process-independent ABI/runtime slices | no Process descriptor or public execution route |
@@ -1356,18 +1374,19 @@ standalone slice before the next row begins:
 | Order | Files | Deliverable and RED gate |
 | ---: | --- | --- |
 | 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
-| 1 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and neutral normalized IR, canonical hashes, per-step effect validation, and no dynamic control |
-| 2a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for hostile HTTPS/archive acquisition; synthetic extraction/license/dependency tests |
-| 2b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust and `generate --check`; no acquisition dependency, `build.rs`, or Cargo-time generation |
-| 3 | **Create** `crates/connector-abi/`, `crates/connector-processors/`, and boundary policy/checker | local-only no-OS ABI/processor closure, sealed private registry, opaque host capabilities, and independent Cloudinary-shaped proof |
-| 4 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
-| 5 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
-| 6 | modify `crates/server/src/connectors/mod.rs`; **Create** `crates/server/src/connectors/catalog.rs` | immutable generated catalog and registry dispatch through processor-crate lookup with no runtime registration/discovery |
-| 7 | admit SerpAPI records/manifests/notices; extend server tests | first Tier A exact request/result/error/fingerprint proof through a Donat-owned local provider stub; no public execution route |
-| 8 | modify Stripe connector/tests | compiled-step processor migration without moving transport, codec, crypto, clock, UUID/text/time, or credentials into the processor crate |
-| 9 | generalize two-stage webhook authentication/codec/normalization and Stripe adapter/tests | bounded raw authentication before server parsing, existing route matrix, and verified-event `503` unchanged |
-| 10 | add a selected real donor to pure pagination/auth/verifier/poll ABI as needed | processor-specific tests only; no process scheduling or ingress persistence |
-| 11 | extend sibling acquisition/codegen update commands | exact-version re-admission and semantic/provenance diff; never automatic admission |
+| 1 | **Create** `crates/connector-abi/` and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, bounded envelopes, and host traits over the value contract; no processor implementation |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and neutral normalized IR importing exact ABI IDs, canonical hashes, per-step effect validation, and descriptor/generated-entry-to-`ConnectorIo` type-identity assertion |
+| 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for hostile HTTPS/archive acquisition; synthetic extraction/license/dependency tests |
+| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust and `generate --check`; no acquisition dependency, `build.rs`, or Cargo-time generation |
+| 4 | **Create** `crates/connector-processors/` and complete the boundary checker | local-only no-OS processor implementation closure, sealed private registry, processor-lookup extension of the ABI ID identity assertion, opaque host capabilities, and independent Cloudinary-shaped proof |
+| 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
+| 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
+| 7 | modify `crates/server/src/connectors/mod.rs`; **Create** `crates/server/src/connectors/catalog.rs` | immutable generated catalog and registry dispatch through processor-crate lookup with no runtime registration/discovery |
+| 8 | admit SerpAPI records/manifests/notices; extend server tests | first Tier A exact request/result/error/fingerprint proof through a Donat-owned local provider stub; no public execution route |
+| 9 | modify Stripe connector/tests | compiled-step processor migration without moving transport, codec, crypto, clock, UUID/text/time, or credentials into the processor crate |
+| 10 | generalize two-stage webhook authentication/codec/normalization and Stripe adapter/tests | bounded raw authentication before server parsing, existing route matrix, and verified-event `503` unchanged |
+| 11 | add a selected real donor to pure pagination/auth/verifier/poll ABI as needed | processor-specific tests only; no process scheduling or ingress persistence |
+| 12 | extend sibling acquisition/codegen update commands | exact-version re-admission and semantic/provenance diff; never automatic admission |
 
 The first derivative port also creates root `THIRD_PARTY_NOTICES.md` and
 updates `knowledgebase/declarative-saas/reference-porting-register.md` in the
@@ -1409,6 +1428,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | ID | Level | Required proof |
 | --- | --- | --- |
 | `value_contract_has_one_owner` | value/IR compile | the no-std value crate owns types/canonical sizing, `donat-ir` re-exports them, and catalog/ABI compile against the same type identity without a conversion copy |
+| `catalog_abi_id_types_are_identical` | ABI/catalog/processor compile | normalized descriptors, checked-in generated entries, `ConnectorIo`, and private processor lookup accept the exact ABI-owned ID types with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
 | `source_record_requires_exact_artifacts` | catalog/acquisition unit | catalog-owned records reject missing or mismatched exact version, integrity, repository/tree/license/file hash, provenance mapping, entrypoint, closed dependency/embedded-material decision, reviewer, destination, RED test, or notice; unknown fields fail at every nesting level |
 | `hostile_archive_is_never_trusted` | acquisition integration | HTTPS/host/three-redirect policy, hash-before-extract, every archive size/count/depth ceiling, normalized-path collisions, links/special/sparse/unknown entries, no-follow replacement, cleanup, and an unexecuted package-script sentinel are pinned |
 | `license_and_dependency_disposition_is_closed` | admission unit | only the six Section 3.1 SPDX choices and an explicit allowed dual-license selection pass; every dependency has one closed disposition |
@@ -1449,10 +1469,16 @@ webhook bytes, and payloads. Tests never call a live provider API.
 Representative focused commands for the implementation:
 
 ```bash
-# Shared value owner and catalog model compile before either sibling tool.
+# Shared value owner, then ABI ID/envelope foundation, then catalog.
 cargo test -p donat-value-contract --no-default-features
 cargo test -p donat-ir value_contract
+cargo check -p donat-value-contract --target thumbv7em-none-eabihf \
+  --no-default-features --offline --locked
+cargo test -p donat-connector-abi --no-default-features
+cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
+  --no-default-features --offline --locked
 cargo test -p donat-connector-catalog
+cargo test -p donat-connector-catalog catalog_abi_id_types_are_identical
 
 # Acquisition and codegen are independent siblings over that catalog.
 cargo test -p donat-connector-acquire --test source_admission
@@ -1462,19 +1488,15 @@ cargo test -p donat-connector-codegen --test serpapi_compile
 cargo insta test -p donat-connector-codegen
 cargo insta review
 
-# The local-only native processor policy is checked on a no-OS target before
-# any real processor is admitted.
-cargo check -p donat-value-contract --target thumbv7em-none-eabihf \
-  --no-default-features --offline --locked
-cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
-  --no-default-features --offline --locked
+# The later local-only processor implementation is checked on a no-OS target
+# before any real processor is admitted.
 cargo check -p donat-connector-processors --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo tree -p donat-connector-processors --target all \
   --edges normal,build,no-dev --no-default-features --offline --locked
 
-cargo test -p donat-connector-abi --no-default-features
 cargo test -p donat-connector-processors --no-default-features
+cargo test -p donat-connector-processors catalog_abi_id_types_are_identical
 
 # Metadata, credential, egress, pagination, error, and adapter slices.
 cargo test -p donat-metadata connectors
