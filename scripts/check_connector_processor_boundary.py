@@ -125,6 +125,103 @@ def blank_rust_noncode(source: str) -> str:
                 return cursor + 1, b'"' + hashes
         return None
 
+    def scalar_end(offset: int) -> int | None:
+        if offset >= len(data):
+            return None
+        first = data[offset]
+        if first < 0x80:
+            if first in (10, 13, 39, 92):
+                return None
+            return offset + 1
+        width = (
+            2
+            if 0xC2 <= first <= 0xDF
+            else 3
+            if 0xE0 <= first <= 0xEF
+            else 4
+            if 0xF0 <= first <= 0xF4
+            else 0
+        )
+        if not width or offset + width > len(data):
+            return None
+        try:
+            data[offset : offset + width].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return offset + width
+
+    def escaped_character_end(offset: int, byte: bool) -> int | None:
+        if offset >= len(data) or data[offset] != 92:
+            return None
+        cursor = offset + 1
+        if cursor >= len(data):
+            return None
+        if data[cursor] in b"nrt0\\\\\'\"":
+            return cursor + 1
+        if data[cursor] == ord("x"):
+            end = cursor + 3
+            if end > len(data) or any(
+                character not in b"0123456789abcdefABCDEF"
+                for character in data[cursor + 1 : end]
+            ):
+                return None
+            if not byte and int(data[cursor + 1 : end], 16) > 0x7F:
+                return None
+            return end
+        if byte or data[cursor] != ord("u") or cursor + 1 >= len(data):
+            return None
+        if data[cursor + 1] != ord("{"):
+            return None
+        cursor += 2
+        digits: list[int] = []
+        underscore = False
+        while cursor < len(data) and data[cursor] != ord("}"):
+            character = data[cursor]
+            if character in b"0123456789abcdefABCDEF":
+                digits.append(character)
+                underscore = False
+            elif character == ord("_") and digits and not underscore:
+                underscore = True
+            else:
+                return None
+            cursor += 1
+        if (
+            cursor >= len(data)
+            or not digits
+            or underscore
+            or len(digits) > 6
+        ):
+            return None
+        value = int(bytes(digits), 16)
+        if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+            return None
+        return cursor + 1
+
+    def character_end(offset: int, byte: bool) -> int | None:
+        if offset >= len(data):
+            return None
+        if data[offset] == 92:
+            end = escaped_character_end(offset, byte)
+        else:
+            end = scalar_end(offset)
+            if byte and end is not None and data[offset] >= 0x80:
+                return None
+        if end is not None and end < len(data) and data[end] == 39:
+            return end + 1
+        return None
+
+    def follows_identifier(offset: int) -> bool:
+        if offset == 0:
+            return False
+        previous = data[offset - 1 : offset]
+        return (
+            data[offset - 1] >= 0x80
+            or b"0" <= previous <= b"9"
+            or b"A" <= previous <= b"Z"
+            or b"a" <= previous <= b"z"
+            or previous == b"_"
+        )
+
     index = 0
     while index < len(data):
         if data.startswith(b"//", index):
@@ -182,29 +279,24 @@ def blank_rust_noncode(source: str) -> str:
             index = cursor
             continue
 
-        char_start = index
-        if data[index : index + 2] == b"b'":
-            cursor = index + 2
-        elif data[index : index + 1] == b"'":
-            cursor = index + 1
+        if data[index : index + 2] == b"b'" and not follows_identifier(index):
+            char_start = index
+            character = index + 2
+            byte_character = True
+        elif (
+            data[index : index + 1] == b"'"
+            and not follows_identifier(index)
+        ):
+            char_start = index
+            character = index + 1
+            byte_character = False
         else:
-            cursor = -1
-        if cursor >= 0:
-            escaped = False
-            closing = -1
-            while cursor < len(data) and data[cursor] not in (10, 13, 32, 9):
-                byte = data[cursor]
-                cursor += 1
-                if escaped:
-                    escaped = False
-                elif byte == 92:
-                    escaped = True
-                elif byte == 39:
-                    closing = cursor
-                    break
-            if closing >= 0:
-                blank(char_start, closing)
-                index = closing
+            character = -1
+        if character >= 0:
+            end = character_end(character, byte_character)
+            if end is not None:
+                blank(char_start, end)
+                index = end
                 continue
 
         index += 1
@@ -338,7 +430,10 @@ def rust_use_leaves(
             segment = tokens[cursor]
             if not segment.identifier or rust_keyword(segment, "as"):
                 return None
-            if rust_keyword(segment, "self"):
+            if rust_keyword(segment, "self") and (
+                cursor + 1 >= len(tokens)
+                or tokens[cursor + 1].value != "::"
+            ):
                 return finish_leaf(start, path, cursor + 1)
             path += (segment.value,)
             cursor += 1
@@ -1546,6 +1641,150 @@ def fixtures() -> tuple[Fixture, ...]:
             "fn lifetimes<'host_construction>(value: "
             "&'host_construction str) -> &'host_construction str { value }",
             None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/complete_noncode_literal_decoys.rs",
+            'const BYTE: &[u8] = b"host_construction StaticErrorCode ConnectorIo";\n'
+            'const C: &core::ffi::CStr = c"host_construction StaticErrorCode ConnectorIo";\n'
+            'const RAW_BYTE: &[u8] = br#"host_construction StaticErrorCode ConnectorIo"#;\n'
+            'const REVERSED_RAW_BYTE: &[u8] = rb#"host_construction StaticErrorCode ConnectorIo"#;\n'
+            'const RAW_C: &core::ffi::CStr = cr#"host_construction StaticErrorCode ConnectorIo"#;\n'
+            'const REVERSED_RAW_C: &core::ffi::CStr = rc#"host_construction StaticErrorCode ConnectorIo"#;\n'
+            "const BYTE_CHARACTER: u8 = b'h';\n"
+            "const BYTE_CHARACTER_ESCAPE: u8 = b'\\\\x68';\n"
+            "const CHARACTER: char = 'h';\n"
+            "const CHARACTER_ESCAPE: char = '\\\\u{68}';\n"
+            "const CHARACTER_SIMPLE_ESCAPE: char = '\\\\n';",
+            None,
+        ),
+        *(
+            Fixture(
+                (
+                    f"crates/server/src/connectors/label_{kind}_{name}.rs"
+                    if kind == "static_literal"
+                    else f"crates/connector-processors/src/label_{kind}_{name}.rs"
+                ),
+                source,
+                expected,
+            )
+            for name, separator in RUST_PATTERN_WHITESPACE_CASES
+            for kind, source, expected in (
+                (
+                    "namespace",
+                    f"fn{separator}probe(){separator}"
+                    "{"
+                    f"'scan:{separator}loop{separator}"
+                    "{"
+                    f"{separator}host_construction::transport_response();"
+                    f"{separator}break{separator}'scan;"
+                    "}}",
+                    "restricted-namespace-wrapper: restricted construction calls "
+                    "cannot be forwarded outside approved producers",
+                ),
+                (
+                    "static_literal",
+                    f"fn{separator}probe(){separator}"
+                    "{"
+                    f"'scan:{separator}loop{separator}"
+                    "{"
+                    f"{separator}StaticErrorCode::literal(\"connector_failed\");"
+                    f"{separator}break{separator}'scan;"
+                    "}}",
+                    "static-literal-wrapper: StaticErrorCode::literal cannot be "
+                    "forwarded by a function outside STATIC_LITERAL_ROOTS",
+                ),
+                (
+                    "host_trait",
+                    f"fn{separator}probe(){separator}"
+                    "{"
+                    f"'scan:{separator}loop{separator}"
+                    "{"
+                    f"{separator}use{separator}donat_connector_abi::"
+                    f"ConnectorIo{separator}as{separator}Io;{separator}break"
+                    f"{separator}'scan;"
+                    "}}",
+                    "host-trait-alias: ConnectorIo cannot be aliased outside approved "
+                    "host implementation roots",
+                ),
+            )
+        ),
+        *(
+            Fixture(
+                (
+                    f"crates/server/src/connectors/lifetime_{kind}_{name}.rs"
+                    if kind == "static_literal"
+                    else f"crates/connector-processors/src/lifetime_{kind}_{name}.rs"
+                ),
+                source,
+                expected,
+            )
+            for name, separator in RUST_PATTERN_WHITESPACE_CASES
+            for kind, source, expected in (
+                (
+                    "namespace",
+                    f"fn{separator}probe<'scan>(value:{separator}&'scan{separator}str)"
+                    f"{separator}"
+                    "{"
+                    f"{separator}host_construction::transport_response();"
+                    f"{separator}let{separator}_='x';"
+                    "}",
+                    "restricted-namespace-wrapper: restricted construction calls "
+                    "cannot be forwarded outside approved producers",
+                ),
+                (
+                    "static_literal",
+                    f"fn{separator}probe<'scan>(value:{separator}&'scan{separator}str)"
+                    f"{separator}"
+                    "{"
+                    f"{separator}StaticErrorCode::literal(\"connector_failed\");"
+                    f"{separator}let{separator}_='x';"
+                    "}",
+                    "static-literal-wrapper: StaticErrorCode::literal cannot be "
+                    "forwarded by a function outside STATIC_LITERAL_ROOTS",
+                ),
+                (
+                    "host_trait",
+                    f"fn{separator}probe<'scan>(value:{separator}&'scan{separator}str)"
+                    f"{separator}"
+                    "{"
+                    f"{separator}use{separator}donat_connector_abi::"
+                    f"ConnectorIo{separator}as{separator}Io;{separator}let"
+                    f"{separator}_='x';"
+                    "}",
+                    "host-trait-alias: ConnectorIo cannot be aliased outside approved "
+                    "host implementation roots",
+                ),
+            )
+        ),
+        Fixture(
+            "crates/server/src/connectors/direct_self_prefix_sibling_control.rs",
+            "use self::donat_connector_abi::{host_construction, "
+            "harmless::Thing as Alias};",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/nested_self_prefix_sibling_control.rs",
+            "use self::{donat_connector_abi::{host_construction, "
+            "harmless::Thing as Alias}};",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/self_prefix_namespace_alias.rs",
+            "use self::donat_connector_abi::host_construction as host_api;",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/self_prefix_static_alias.rs",
+            "use self::donat_connector_abi::StaticErrorCode as ErrorCode;",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/connector-processors/src/self_prefix_host_trait_alias.rs",
+            "use self::donat_connector_abi::ConnectorIo as Io;",
+            "host-trait-alias: ConnectorIo cannot be aliased outside approved "
+            "host implementation roots",
         ),
         Fixture(
             "crates/server/src/connectors/executor.rs",
