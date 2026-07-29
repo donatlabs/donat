@@ -293,6 +293,13 @@ and callsite rules.
 
 ## Exact CI producer and callsite policy
 
+This remediation creates
+`scripts/check_connector_processor_boundary.py` when the file is absent and
+owns its initial restricted-namespace, trait-implementation, allocation-leak,
+producer-path, and test-path policy. Later Task 6 extends this exact checker
+with the remaining processor dependency and source-boundary rules. Task 6
+must not create a second checker, wrapper checker, or parallel policy file.
+
 `scripts/check_connector_processor_boundary.py` enforces the following
 whole-workspace production allowlists:
 
@@ -592,8 +599,14 @@ cargo clippy -p donat-connector-abi --all-targets --no-default-features \
   -- -D warnings
 cargo fmt --all -- --check
 cargo build -p donat-server --bin donat
+cargo test -p donat-conformance --test connectors
 cargo test -p donat-conformance
 ```
+
+The invoking environment supplies `PG_URL` and `DONAT_BIN` to both
+conformance commands. The verification commands do not assign or hardcode
+either value. The focused `connectors` target runs against the freshly rebuilt
+`donat` binary before the full conformance crate.
 
 The dependency tree contains only `donat-connector-abi` and
 `donat-value-contract`. The no-OS build, object-safety assertions,
