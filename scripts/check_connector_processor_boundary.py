@@ -24,6 +24,19 @@ ABI_TEST_ROOTS = ("crates/connector-abi/tests/",)
 PROCESSOR_TEST_ROOTS = ("crates/connector-processors/tests/",)
 SERVER_TEST_ROOTS = ("crates/server/tests/",)
 
+UNICODE_VERSION_GAP_IDENTIFIER = "\U00016100"
+RUST_PATTERN_WHITESPACE_CASES = (
+    ("next_line", "\u0085"),
+    ("left_to_right_mark", "\u200e"),
+    ("right_to_left_mark", "\u200f"),
+    ("line_separator", "\u2028"),
+    ("paragraph_separator", "\u2029"),
+)
+RUST_PATTERN_WHITESPACE = frozenset(
+    "\u0009\u000a\u000b\u000c\u000d\u0020"
+    "\u0085\u200e\u200f\u2028\u2029"
+)
+
 
 @dataclass(frozen=True)
 class Fixture:
@@ -52,6 +65,7 @@ class RustToken:
     value: str
     offset: int
     identifier: bool
+    raw: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,12 +202,25 @@ def blank_rust_noncode(source: str) -> str:
     return output.decode("utf-8")
 
 
-def rust_identifier_start(character: str) -> bool:
-    return character == "_" or character.isidentifier()
+def rust_identifier_atom_character(character: str) -> bool:
+    if character in RUST_PATTERN_WHITESPACE:
+        return False
+    if ord(character) >= 0x80:
+        return True
+    return (
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character == "_"
+    )
 
 
-def rust_identifier_continue(character: str) -> bool:
-    return ("_" + character).isidentifier()
+def rust_name(token: RustToken, name: str) -> bool:
+    return token.identifier and token.value == name
+
+
+def rust_keyword(token: RustToken, keyword: str) -> bool:
+    return rust_name(token, keyword) and not token.raw
 
 
 def rust_tokens(source: str) -> list[RustToken]:
@@ -201,34 +228,36 @@ def rust_tokens(source: str) -> list[RustToken]:
     index = 0
     while index < len(source):
         character = source[index]
-        if character.isspace():
+        if index == 0 and character == "\ufeff":
             index += 1
             continue
-
-        raw_identifier = (
-            source.startswith("r#", index)
-            and index + 2 < len(source)
-            and rust_identifier_start(source[index + 2])
-        )
-        if raw_identifier:
-            end = index + 3
-            while end < len(source) and rust_identifier_continue(source[end]):
-                end += 1
-            tokens.append(RustToken(source[index + 2 : end], index, True))
-            index = end
-            continue
-
-        if rust_identifier_start(character):
-            end = index + 1
-            while end < len(source) and rust_identifier_continue(source[end]):
-                end += 1
-            tokens.append(RustToken(source[index:end], index, True))
-            index = end
+        if character in RUST_PATTERN_WHITESPACE:
+            index += 1
             continue
 
         if source.startswith("::", index):
             tokens.append(RustToken("::", index, False))
             index += 2
+            continue
+
+        if (
+            source.startswith("r#", index)
+            and index + 2 < len(source)
+            and rust_identifier_atom_character(source[index + 2])
+        ):
+            end = index + 2
+            while end < len(source) and rust_identifier_atom_character(source[end]):
+                end += 1
+            tokens.append(RustToken(source[index + 2 : end], index, True, True))
+            index = end
+            continue
+
+        if rust_identifier_atom_character(character):
+            end = index + 1
+            while end < len(source) and rust_identifier_atom_character(source[end]):
+                end += 1
+            tokens.append(RustToken(source[index:end], index, True))
+            index = end
             continue
 
         tokens.append(RustToken(character, index, False))
@@ -239,7 +268,7 @@ def rust_tokens(source: str) -> list[RustToken]:
 def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
     statements: list[RustUse] = []
     for index, token in enumerate(tokens):
-        if not token.identifier or token.value != "use":
+        if not rust_keyword(token, "use"):
             continue
         end = index + 1
         while end < len(tokens) and tokens[end].value != ";":
@@ -250,7 +279,7 @@ def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
             statement_start = cursor
             cursor -= 1
         prefix = tokens[statement_start:index]
-        public = any(item.identifier and item.value == "pub" for item in prefix)
+        public = any(rust_keyword(item, "pub") for item in prefix)
         statements.append(
             RustUse(
                 tokens[statement_start].offset,
@@ -262,13 +291,13 @@ def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
 
 
 def rust_use_mentions(statement: RustUse, name: str) -> bool:
-    return any(token.identifier and token.value == name for token in statement.tokens)
+    return any(rust_name(token, name) for token in statement.tokens)
 
 
 def rust_use_aliases(statement: RustUse, name: str) -> bool:
     tokens = statement.tokens
     for index, token in enumerate(tokens):
-        if not token.identifier or token.value != name:
+        if not rust_name(token, name):
             continue
         cursor = index + 1
         while cursor < len(tokens):
@@ -276,8 +305,7 @@ def rust_use_aliases(statement: RustUse, name: str) -> bool:
             if candidate.value in (",", "}", ";"):
                 break
             if (
-                candidate.identifier
-                and candidate.value == "as"
+                rust_keyword(candidate, "as")
                 and cursor + 1 < len(tokens)
                 and tokens[cursor + 1].identifier
             ):
@@ -289,7 +317,7 @@ def rust_use_aliases(statement: RustUse, name: str) -> bool:
 def rust_type_aliases(tokens: list[RustToken]) -> list[RustTypeAlias]:
     aliases: list[RustTypeAlias] = []
     for index, token in enumerate(tokens):
-        if not token.identifier or token.value != "type":
+        if not rust_keyword(token, "type"):
             continue
         equals = index + 1
         while equals < len(tokens) and tokens[equals].value not in ("=", ";", "{"):
@@ -306,7 +334,7 @@ def rust_type_aliases(tokens: list[RustToken]) -> list[RustTypeAlias]:
 
 
 def rust_tokens_mention(tokens: tuple[RustToken, ...], name: str) -> bool:
-    return any(token.identifier and token.value == name for token in tokens)
+    return any(rust_name(token, name) for token in tokens)
 
 
 def rust_tokens_in_range(
@@ -324,8 +352,7 @@ def rust_keyword_before(
 ) -> bool:
     return any(
         token.offset < offset
-        and token.identifier
-        and token.value == keyword
+        and rust_keyword(token, keyword)
         for token in tokens
     )
 
@@ -339,8 +366,7 @@ def rust_named_item_before(
         if token.offset >= offset:
             break
         if (
-            token.identifier
-            and token.value == keyword
+            rust_keyword(token, keyword)
             and tokens[index + 1].identifier
         ):
             return True
@@ -354,8 +380,7 @@ def rust_has_generic_literal_constructor(tokens: list[RustToken]) -> bool:
             and tokens[index + 1].identifier
             and tokens[index + 2].value == ">"
             and tokens[index + 3].value == "::"
-            and tokens[index + 4].identifier
-            and tokens[index + 4].value == "literal"
+            and rust_name(tokens[index + 4], "literal")
             and tokens[index + 5].value == "("
         ):
             return True
@@ -369,7 +394,7 @@ def rust_path_references(
 ) -> list[int]:
     references: list[int] = []
     for index, token in enumerate(tokens):
-        if not token.identifier or token.value != owner:
+        if not rust_name(token, owner):
             continue
         cursor = index + 1
         if cursor < len(tokens) and tokens[cursor].value == ">":
@@ -383,20 +408,26 @@ def rust_path_references(
         if (
             cursor + 1 < len(tokens)
             and tokens[cursor].value == "::"
-            and tokens[cursor + 1].identifier
-            and tokens[cursor + 1].value == member
+            and rust_name(tokens[cursor + 1], member)
         ):
             references.append(token.offset)
     return references
 
 
 def exported_cfg_test_module(tokens: list[RustToken]) -> int | None:
-    expected = ("#", "[", "cfg", "(", "test", ")", "]")
-    for index in range(len(tokens) - len(expected) - 2):
-        if tuple(token.value for token in tokens[index : index + len(expected)]) != expected:
+    for index in range(len(tokens) - 9):
+        if not (
+            tokens[index].value == "#"
+            and tokens[index + 1].value == "["
+            and rust_name(tokens[index + 2], "cfg")
+            and tokens[index + 3].value == "("
+            and rust_name(tokens[index + 4], "test")
+            and tokens[index + 5].value == ")"
+            and tokens[index + 6].value == "]"
+        ):
             continue
-        cursor = index + len(expected)
-        if not tokens[cursor].identifier or tokens[cursor].value != "pub":
+        cursor = index + 7
+        if not rust_keyword(tokens[cursor], "pub"):
             continue
         cursor += 1
         if cursor < len(tokens) and tokens[cursor].value == "(":
@@ -410,8 +441,7 @@ def exported_cfg_test_module(tokens: list[RustToken]) -> int | None:
                 cursor += 1
         if (
             cursor + 1 < len(tokens)
-            and tokens[cursor].identifier
-            and tokens[cursor].value == "mod"
+            and rust_keyword(tokens[cursor], "mod")
             and tokens[cursor + 1].identifier
         ):
             return tokens[index].offset
@@ -424,19 +454,24 @@ def rust_impl_trait_references(
     references: list[tuple[int, str]] = []
     host_traits = ("ConnectorIo", "ProcessorControl")
     for index, token in enumerate(tokens):
-        if not token.identifier or token.value != "impl":
+        if not rust_keyword(token, "impl"):
             continue
         cursor = index + 1
-        while cursor < len(tokens) and tokens[cursor].value not in ("for", "{", ";"):
+        while (
+            cursor < len(tokens)
+            and not rust_keyword(tokens[cursor], "for")
+            and tokens[cursor].value not in ("{", ";")
+        ):
             candidate = tokens[cursor]
-            if candidate.identifier and candidate.value in host_traits:
+            if any(rust_name(candidate, trait) for trait in host_traits):
                 lookahead = cursor + 1
                 while (
                     lookahead < len(tokens)
-                    and tokens[lookahead].value not in ("for", "{", ";")
+                    and not rust_keyword(tokens[lookahead], "for")
+                    and tokens[lookahead].value not in ("{", ";")
                 ):
                     lookahead += 1
-                if lookahead < len(tokens) and tokens[lookahead].value == "for":
+                if lookahead < len(tokens) and rust_keyword(tokens[lookahead], "for"):
                     references.append((candidate.offset, candidate.value))
                 break
             cursor += 1
@@ -445,12 +480,20 @@ def rust_impl_trait_references(
 
 def private_cfg_test_ranges(tokens: list[RustToken]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
-    expected = ("#", "[", "cfg", "(", "test", ")", "]", "mod")
-    for index in range(len(tokens) - len(expected) - 1):
-        if tuple(token.value for token in tokens[index : index + len(expected)]) != expected:
+    for index in range(len(tokens) - 9):
+        if not (
+            tokens[index].value == "#"
+            and tokens[index + 1].value == "["
+            and rust_name(tokens[index + 2], "cfg")
+            and tokens[index + 3].value == "("
+            and rust_name(tokens[index + 4], "test")
+            and tokens[index + 5].value == ")"
+            and tokens[index + 6].value == "]"
+            and rust_keyword(tokens[index + 7], "mod")
+        ):
             continue
-        name = tokens[index + len(expected)]
-        opening_index = index + len(expected) + 1
+        name = tokens[index + 8]
+        opening_index = index + 9
         if not name.identifier or tokens[opening_index].value != "{":
             continue
         depth = 0
@@ -893,19 +936,19 @@ def static_literal_indirection(
 
         if (
             any(
-                token.identifier and token.value == "macro_rules"
+                rust_keyword(token, "macro_rules")
                 for token in tokens
             )
             and rust_has_generic_literal_constructor(tokens)
             and any(
-                token.identifier and token.value == type_name
+                rust_name(token, type_name)
                 for token in tokens
             )
         ):
             macro_offset = next(
                 token.offset
                 for token in tokens
-                if token.identifier and token.value == "macro_rules"
+                if rust_keyword(token, "macro_rules")
             )
             return Finding(
                 macro_offset,
@@ -1247,6 +1290,106 @@ def scan_source(relative: str, source: str) -> list[Finding]:
 
 def fixtures() -> tuple[Fixture, ...]:
     return (
+        Fixture(
+            "crates/server/src/connectors/future_unicode_static_error.rs",
+            f"use donat_connector_abi::StaticErrorCode as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/future_unicode_static_message.rs",
+            f"use donat_connector_abi::StaticSafeMessage as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "static-literal-alias: StaticSafeMessage::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/future_unicode_host_namespace.rs",
+            f"use donat_connector_abi::host_construction as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-catalog/src/future_unicode_catalog_namespace.rs",
+            f"use donat_connector_abi::catalog_construction as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "restricted-namespace-alias: restricted construction namespaces "
+            "cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-processors/src/future_unicode_connector_io.rs",
+            f"use donat_connector_abi::ConnectorIo as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "host-trait-alias: ConnectorIo cannot be aliased outside approved "
+            "host implementation roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/future_unicode_processor_control.rs",
+            f"use donat_connector_abi::ProcessorControl as "
+            f"{UNICODE_VERSION_GAP_IDENTIFIER};",
+            "host-trait-alias: ProcessorControl cannot be aliased outside approved "
+            "host implementation roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/raw_use_field_decoy.rs",
+            "struct Decoy { pub r#use: donat_connector_abi::StaticErrorCode }",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/raw_type_binding_decoy.rs",
+            "fn decoy() { let r#type = "
+            "None::<donat_connector_abi::StaticErrorCode>; }",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/raw_use_alias.rs",
+            "use donat_connector_abi::StaticErrorCode as r#use;",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/raw_protected_literal.rs",
+            'const CODE: r#StaticErrorCode = '
+            'r#StaticErrorCode::r#literal("connector_failed");',
+            "static-literal-producer: static failure literals are restricted to "
+            "approved roots",
+        ),
+        *(
+            Fixture(
+                f"crates/server/src/connectors/pattern_whitespace_{name}.rs",
+                f"use{separator}donat_connector_abi::StaticErrorCode"
+                f"{separator}as{separator}{UNICODE_VERSION_GAP_IDENTIFIER};",
+                "static-literal-alias: StaticErrorCode::literal cannot be reached "
+                "through an alias outside STATIC_LITERAL_ROOTS",
+            )
+            for name, separator in RUST_PATTERN_WHITESPACE_CASES
+        ),
+        Fixture(
+            "crates/server/src/connectors/leading_bom_alias.rs",
+            "\ufeffuse donat_connector_abi::StaticErrorCode as Alias;",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/invalid_unicode_atom_alias.rs",
+            "use donat_connector_abi::StaticErrorCode as 💥;",
+            "static-literal-alias: StaticErrorCode::literal cannot be reached "
+            "through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/unicode_noncode_decoys.rs",
+            "// host_construction StaticErrorCode ConnectorIo \U00016100\n"
+            "/* outer catalog_construction /* nested StaticSafeMessage */ "
+            "ProcessorControl */\n"
+            'const NORMAL: &str = "host_construction StaticErrorCode";\n'
+            'const RAW: &str = r###"catalog_construction ConnectorIo"###;\n'
+            "const CHARACTER: char = '𖄀';\n"
+            "fn lifetimes<'host_construction>(value: "
+            "&'host_construction str) -> &'host_construction str { value }",
+            None,
+        ),
         Fixture(
             "crates/server/src/connectors/executor.rs",
             "host_construction::transport_response();",
