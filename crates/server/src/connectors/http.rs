@@ -4,7 +4,7 @@
 //! declared slots.  There is intentionally no API accepting a caller-supplied
 //! URL, method, header name, redirect policy, or TLS policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -80,8 +80,14 @@ impl HttpConnectorConfig {
                 "base_url must be an absolute HTTP(S) URL without userinfo, query, or fragment",
             ));
         }
+        let mut header_names = HashSet::new();
         let mut resolved_headers = HeaderMap::new();
         for header in headers {
+            if !header_names.insert(header.name.clone()) {
+                return Err(HttpConfigError::new(
+                    "configured header names must not collide",
+                ));
+            }
             resolved_headers.insert(header.name, header.value);
         }
         Ok(Self {
@@ -253,6 +259,13 @@ impl HttpOperation {
             idempotency_header: None,
         }
     }
+
+    fn header_names(&self) -> impl Iterator<Item = &HeaderName> {
+        self.headers
+            .iter()
+            .map(|header| &header.name)
+            .chain(self.idempotency_header.iter())
+    }
 }
 
 impl HttpOperationBuilder {
@@ -330,13 +343,20 @@ impl HttpOperationBuilder {
                 "declared http_5xx statuses must be 5xx",
             ));
         }
+        let mut header_names = HashSet::new();
         let headers = self
             .headers
             .into_iter()
             .map(|(name, value)| {
+                let name = HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| HttpConfigError::new("operation header name is invalid"))?;
+                if !header_names.insert(name.clone()) {
+                    return Err(HttpConfigError::new(
+                        "operation header names must not collide",
+                    ));
+                }
                 Ok(StaticHeader {
-                    name: HeaderName::from_bytes(name.as_bytes())
-                        .map_err(|_| HttpConfigError::new("operation header name is invalid"))?,
+                    name,
                     value: HeaderValue::from_str(&value)
                         .map_err(|_| HttpConfigError::new("operation header value is invalid"))?,
                 })
@@ -349,6 +369,14 @@ impl HttpOperationBuilder {
                     .map_err(|_| HttpConfigError::new("idempotency header name is invalid"))
             })
             .transpose()?;
+        if idempotency_header
+            .as_ref()
+            .is_some_and(|name| header_names.contains(name))
+        {
+            return Err(HttpConfigError::new(
+                "operation header names must not collide",
+            ));
+        }
         Ok(HttpOperation {
             _name: self.name,
             method: self.method,
@@ -403,9 +431,13 @@ impl ValidatedHttpOperation {
             .iter()
             .copied()
             .map(|status| {
-                StatusCode::from_u16(status).map_err(|_| {
+                let status = StatusCode::from_u16(status).map_err(|_| {
                     HttpConfigError::new("success statuses must be valid HTTP statuses")
-                })
+                })?;
+                if !status.is_success() {
+                    return Err(HttpConfigError::new("success statuses must be 2xx"));
+                }
+                Ok(status)
             })
             .collect::<Result<Vec<_>, _>>()?;
         builder = builder.success_statuses(statuses);
@@ -491,6 +523,40 @@ impl ValidatedHttpOperation {
         }
         Ok(())
     }
+}
+
+/// Validate one HTTP instance without resolving any environment value. This is
+/// shared by deploy-time metadata validation and registry construction so the
+/// same profile and header rules apply before a database connection or a
+/// listener can be opened.
+pub(crate) fn validate_http_instance_metadata(
+    config: &ConnectorConfig,
+    operations: &[ConnectorOperation],
+) -> Result<(), HttpConfigError> {
+    let mut configured_headers = HashSet::new();
+    for header in &config.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| HttpConfigError::new("configured header name is invalid"))?;
+        if !configured_headers.insert(name) {
+            return Err(HttpConfigError::new(
+                "configured header names must not collide",
+            ));
+        }
+    }
+
+    for operation in operations {
+        let compiled = ValidatedHttpOperation::from_metadata(operation)?;
+        if compiled
+            .operation
+            .header_names()
+            .any(|name| configured_headers.contains(name))
+        {
+            return Err(HttpConfigError::new(
+                "connector operation header names must not collide with configured headers",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_method(method: &str) -> Result<HttpMethod, HttpConfigError> {
@@ -898,6 +964,16 @@ impl HttpConnector {
         ))
     }
 
+    /// A non-reversible identity for the resolved endpoint. The raw resolved
+    /// URL is intentionally kept inside the connector and never placed in a
+    /// deployment fingerprint or process record.
+    pub(crate) fn base_url_digest(&self) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(self.config.base_url.as_str().as_bytes())
+        )
+    }
+
     pub async fn execute(
         &self,
         operation: &HttpOperation,
@@ -1060,6 +1136,11 @@ impl HttpConnector {
         }
         let mut headers = self.config.headers.clone();
         for header in &operation.headers {
+            if headers.contains_key(&header.name) {
+                return Err(invariant_failure(
+                    "connector operation header names must not collide with configured headers",
+                ));
+            }
             headers.insert(header.name.clone(), header.value.clone());
         }
         if let Some(name) = &operation.idempotency_header {
@@ -1068,6 +1149,11 @@ impl HttpConnector {
             })?;
             let value = HeaderValue::from_str(key)
                 .map_err(|_| invariant_failure("connector activity idempotency key is invalid"))?;
+            if headers.contains_key(name) {
+                return Err(invariant_failure(
+                    "connector operation header names must not collide with configured headers",
+                ));
+            }
             headers.insert(name.clone(), value);
         }
         let body = operation

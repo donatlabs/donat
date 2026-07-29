@@ -215,6 +215,19 @@ fn validate_connector_operations(
     path: &str,
     errors: &mut Vec<ConnectorConfigError>,
 ) {
+    if connector.module == "http" {
+        if let Err(error) = crate::connectors::http::validate_http_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
     for (index, operation) in connector.operations.iter().enumerate() {
         let operation_path = format!("{path}.operations[{index}]");
         if operation.name.is_empty() {

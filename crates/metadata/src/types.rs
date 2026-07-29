@@ -172,6 +172,7 @@ pub struct UndeclaredConnectorOperation {}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConnectorOperation {
+    #[serde(default)]
     pub version: String,
     pub method: String,
     pub path: String,

@@ -9,8 +9,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use donat_metadata::Metadata;
+use donat_metadata::{ConnectorConfig, ConnectorOperation, Metadata};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 use crate::state::{ConnectorStartupError, validate_connector_startup};
 
@@ -110,12 +112,67 @@ const STRIPE_DEFINITION: ConnectorDefinition = ConnectorDefinition {
 enum RegistryInstance {
     Http {
         connector: Box<http::HttpConnector>,
-        operations: BTreeMap<String, http::ValidatedHttpOperation>,
+        operations: BTreeMap<String, CompiledHttpOperation>,
     },
     /// Stripe is deliberately only a compiled identity in this slice.  Its
     /// narrow protocol implementation arrives in Task 4, not as a fallback
     /// arbitrary HTTP client.
     Stripe,
+}
+
+/// The immutable compiled contract for one deployed HTTP operation. The
+/// fingerprint is intentionally non-secret and therefore safe for a future
+/// process-definition revision to retain.
+struct CompiledHttpOperation {
+    operation: http::ValidatedHttpOperation,
+    configuration_fingerprint: String,
+}
+
+#[derive(Serialize)]
+struct HttpConfigurationFingerprint<'a> {
+    module_name: &'a str,
+    module_semantic_version: &'a str,
+    runtime_abi: u32,
+    operation_name: &'a str,
+    operation_version: &'a str,
+    endpoint_identity: &'a str,
+    credential_identity: &'a str,
+    network_policy: &'a Option<String>,
+    credential_header_declarations: &'a [donat_metadata::ConnectorHeader],
+    operation_profile: &'a donat_metadata::HttpConnectorOperation,
+    capacity: &'a donat_metadata::ConnectorCapacity,
+    base_url_sha256: &'a str,
+}
+
+fn http_configuration_fingerprint(
+    definition: ConnectorDefinition,
+    config: &ConnectorConfig,
+    operation: &ConnectorOperation,
+    base_url_digest: &str,
+) -> String {
+    let profile = operation
+        .http()
+        .expect("HTTP operation profile was validated before fingerprinting");
+    let capacity = operation
+        .capacity()
+        .expect("HTTP operation capacity was validated before fingerprinting");
+    let canonical = HttpConfigurationFingerprint {
+        module_name: definition.module_name,
+        module_semantic_version: definition.semantic_version,
+        runtime_abi: definition.runtime_abi,
+        operation_name: &operation.name,
+        operation_version: &profile.version,
+        endpoint_identity: &config.endpoint_identity,
+        credential_identity: &config.credential_identity,
+        network_policy: &config.network_policy,
+        credential_header_declarations: &config.headers,
+        operation_profile: profile,
+        capacity,
+        base_url_sha256: base_url_digest,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("validated connector fingerprint fields always serialize to JSON");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Immutable lookup table of deployment-selected connector instances.
@@ -144,13 +201,23 @@ impl ConnectorRegistry {
                             instance: instance.name.clone(),
                             message: error.to_string(),
                         })?;
+                    let base_url_digest = connector.base_url_digest();
                     let mut operations = BTreeMap::new();
                     for operation in &instance.operations {
-                        let compiled = http::ValidatedHttpOperation::from_metadata(operation)
+                        let validated = http::ValidatedHttpOperation::from_metadata(operation)
                             .map_err(|error| ConnectorRegistryError::InvalidConfiguration {
                                 instance: instance.name.clone(),
                                 message: error.to_string(),
                             })?;
+                        let compiled = CompiledHttpOperation {
+                            configuration_fingerprint: http_configuration_fingerprint(
+                                HTTP_DEFINITION,
+                                &instance.config,
+                                operation,
+                                &base_url_digest,
+                            ),
+                            operation: validated,
+                        };
                         if operations
                             .insert(operation.name.clone(), compiled)
                             .is_some()
@@ -199,6 +266,18 @@ impl ConnectorRegistry {
         }
     }
 
+    /// Return the immutable, non-secret deployment fingerprint for one
+    /// compiled operation. It contains no resolved credential/header value or
+    /// raw base URL, so a future process revision can retain it safely.
+    pub fn configuration_fingerprint(&self, instance: &str, operation: &str) -> Option<&str> {
+        match self.instances.get(instance) {
+            Some(RegistryInstance::Http { operations, .. }) => operations
+                .get(operation)
+                .map(|operation| operation.configuration_fingerprint.as_str()),
+            Some(RegistryInstance::Stripe) | None => None,
+        }
+    }
+
     /// Execute only a named operation compiled from deployed metadata. This
     /// deliberately accepts neither a raw URL/method/header nor a caller-owned
     /// HTTP client. The future process worker supplies the stable idempotency
@@ -231,7 +310,7 @@ impl ConnectorRegistry {
                     ));
                 };
                 connector
-                    .execute_validated(operation, input, idempotency_key, deadline)
+                    .execute_validated(&operation.operation, input, idempotency_key, deadline)
                     .await
             }
             RegistryInstance::Stripe => Err(ConnectorFailure::new(
@@ -269,3 +348,47 @@ impl fmt::Display for ConnectorRegistryError {
 }
 
 impl std::error::Error for ConnectorRegistryError {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ConnectorDefinition, HTTP_DEFINITION, http_configuration_fingerprint};
+
+    #[test]
+    fn http_configuration_fingerprint_changes_when_runtime_abi_changes() {
+        let operation: donat_metadata::ConnectorOperation = serde_json::from_value(json!({
+            "name": "create_shipment",
+            "version": "v1",
+            "method": "POST",
+            "path": "/v1/shipments/{input.order_id}",
+            "success_statuses": [200],
+            "idempotency": { "header": "Idempotency-Key" },
+            "capacity": {
+                "max_in_flight": 1,
+                "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+            }
+        }))
+        .expect("fingerprint operation metadata deserializes");
+        let config: donat_metadata::ConnectorConfig = serde_json::from_value(json!({
+            "endpoint_identity": "logistics_test",
+            "credential_identity": "logistics_test_credential",
+            "base_url": "https://provider.example.test"
+        }))
+        .expect("fingerprint config metadata deserializes");
+
+        let baseline =
+            http_configuration_fingerprint(HTTP_DEFINITION, &config, &operation, "base-url-digest");
+        let changed_abi = http_configuration_fingerprint(
+            ConnectorDefinition {
+                runtime_abi: HTTP_DEFINITION.runtime_abi + 1,
+                ..HTTP_DEFINITION
+            },
+            &config,
+            &operation,
+            "base-url-digest",
+        );
+
+        assert_ne!(baseline, changed_abi);
+    }
+}

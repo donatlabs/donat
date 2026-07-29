@@ -48,6 +48,12 @@ fn valid_http_connector() -> Json {
         },
         "operations": [{
             "name": "create_shipment",
+            "version": "v1",
+            "method": "POST",
+            "path": "/v1/shipments/{input.order_id}",
+            "body": { "order_id": { "input": "order_id" } },
+            "success_statuses": [200],
+            "idempotency": { "header": "Idempotency-Key" },
             "capacity": {
                 "max_in_flight": 8,
                 "rate_limit": { "permits": 20, "per": "1s", "burst": 8 },
@@ -55,6 +61,106 @@ fn valid_http_connector() -> Json {
             }
         }]
     })
+}
+
+#[tokio::test]
+async fn consistency_rejects_static_http_operation_profile_errors_without_resolving_environment_values()
+ {
+    let mut unsupported_method = valid_http_connector();
+    unsupported_method["name"] = json!("unsupported_method");
+    unsupported_method["operations"][0]["method"] = json!("TRACE");
+
+    let mut invalid_path = valid_http_connector();
+    invalid_path["name"] = json!("invalid_path");
+    invalid_path["operations"][0]["path"] = json!("https://attacker.invalid/override");
+
+    let mut invalid_header = valid_http_connector();
+    invalid_header["name"] = json!("invalid_header");
+    invalid_header["operations"][0]["headers"] =
+        json!([{ "name": "Bad Header", "value": "fixed" }]);
+
+    let mut invalid_status = valid_http_connector();
+    invalid_status["name"] = json!("invalid_status");
+    invalid_status["operations"][0]["success_statuses"] = json!([999]);
+
+    let mut missing_version = valid_http_connector();
+    missing_version["name"] = json!("missing_version");
+    missing_version["operations"][0]
+        .as_object_mut()
+        .expect("operation is a JSON object")
+        .remove("version");
+
+    let mut missing_profile = valid_http_connector();
+    missing_profile["name"] = json!("missing_profile");
+    missing_profile["operations"] = json!([{
+        "name": "create_shipment",
+        "capacity": {
+            "max_in_flight": 8,
+            "rate_limit": { "permits": 20, "per": "1s", "burst": 8 }
+        }
+    }]);
+
+    let mut invalid_rate_period = valid_http_connector();
+    invalid_rate_period["name"] = json!("invalid_rate_period");
+    invalid_rate_period["operations"][0]["capacity"]["rate_limit"]["per"] = json!("forever");
+
+    let mut invalid = json!([
+        unsupported_method,
+        invalid_path,
+        invalid_header,
+        invalid_status,
+        missing_version,
+        missing_profile,
+        invalid_rate_period,
+    ]);
+    invalid[0]["config"]["base_url"] =
+        json!({ "value_from_env": "DONAT_TEST_UNRESOLVED_BASE_URL" });
+    invalid[0]["config"]["headers"] = json!([{
+        "name": "Authorization",
+        "value_from_env": "DONAT_TEST_UNRESOLVED_CREDENTIAL"
+    }]);
+
+    let dir = write_metadata_dir(invalid);
+    let result = check_consistency("postgres://unreachable", &dir)
+        .await
+        .expect(
+            "HTTP profile errors are static metadata errors, not environment or database errors",
+        );
+    let _ = std::fs::remove_dir_all(&dir);
+    let rendered = result.join("\n");
+
+    assert!(
+        rendered.contains("method must be one of GET, POST, PUT, PATCH, or DELETE"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("path must be a static absolute path without authority"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("operation header name is invalid"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("success statuses must be 2xx"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("connector operation version is required"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("http connector operations must declare an HTTP operation profile"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("connector operation capacity is invalid"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("environment value is unavailable"),
+        "deploy-time validation must not resolve credentials: {rendered}"
+    );
 }
 
 #[test]

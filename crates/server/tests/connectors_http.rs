@@ -170,6 +170,194 @@ fn declarative_registry_rejects_a_serialization_key_outside_declared_input_bindi
     );
 }
 
+#[test]
+fn declarative_registry_rejects_case_insensitive_header_collisions_before_any_header_can_overwrite()
+{
+    let connector = |config_headers: serde_json::Value,
+                     operation_headers: serde_json::Value,
+                     idempotency_header: &str| {
+        serde_json::from_value::<donat_metadata::Metadata>(json!({
+            "version": 3,
+            "sources": [],
+            "connectors": [{
+                "name": "logistics",
+                "module": "http",
+                "config": {
+                    "endpoint_identity": "logistics_test",
+                    "credential_identity": "logistics_test_credential",
+                    "base_url": "https://provider.example.test",
+                    "headers": config_headers
+                },
+                "operations": [{
+                    "name": "create_shipment",
+                    "version": "v1",
+                    "method": "POST",
+                    "path": "/v1/shipments/{input.order_id}",
+                    "headers": operation_headers,
+                    "success_statuses": [200],
+                    "idempotency": { "header": idempotency_header },
+                    "capacity": {
+                        "max_in_flight": 8,
+                        "rate_limit": { "permits": 20, "per": "1s", "burst": 8 }
+                    }
+                }]
+            }]
+        }))
+        .expect("header names remain syntactically valid metadata")
+    };
+
+    let cases = [
+        connector(
+            json!([
+                { "name": "Authorization", "value_from_env": "TOKEN_A" },
+                { "name": "authorization", "value_from_env": "TOKEN_B" }
+            ]),
+            json!([]),
+            "Idempotency-Key",
+        ),
+        connector(
+            json!([{ "name": "Authorization", "value_from_env": "TOKEN_A" }]),
+            json!([{ "name": "authorization", "value": "fixed" }]),
+            "Idempotency-Key",
+        ),
+        connector(
+            json!([{ "name": "Authorization", "value_from_env": "TOKEN_A" }]),
+            json!([]),
+            "AUTHORIZATION",
+        ),
+        connector(
+            json!([]),
+            json!([
+                { "name": "X-Request-Mode", "value": "first" },
+                { "name": "x-request-mode", "value": "second" }
+            ]),
+            "Idempotency-Key",
+        ),
+        connector(
+            json!([]),
+            json!([{ "name": "Idempotency-Key", "value": "fixed" }]),
+            "idempotency-key",
+        ),
+    ];
+
+    for metadata in cases {
+        let error = match ConnectorRegistry::build(&metadata) {
+            Ok(_) => panic!("each colliding header declaration must reject startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("header names must not collide"),
+            "the registry must reject the configuration instead of silently overwriting a header: {error}"
+        );
+    }
+}
+
+#[test]
+fn declarative_registry_exposes_a_non_secret_operation_configuration_fingerprint() {
+    const SECRET_ENV: &str = "DONAT_CONNECTOR_FINGERPRINT_TEST_TOKEN";
+
+    let metadata = || {
+        serde_json::from_value::<donat_metadata::Metadata>(json!({
+            "version": 3,
+            "sources": [],
+            "connectors": [{
+                "name": "logistics",
+                "module": "http",
+                "config": {
+                    "endpoint_identity": "logistics_test",
+                    "credential_identity": "logistics_test_credential",
+                    "base_url": "https://provider.example.test",
+                    "headers": [{ "name": "Authorization", "value_from_env": SECRET_ENV }]
+                },
+                "operations": [{
+                    "name": "create_shipment",
+                    "version": "v1",
+                    "method": "POST",
+                    "path": "/v1/shipments/{input.order_id}",
+                    "body": {
+                        "order_id": { "input": "order_id" },
+                        "customer_id": { "input": "customer_id" }
+                    },
+                    "success_statuses": [200],
+                    "idempotency": { "header": "Idempotency-Key" },
+                    "capacity": {
+                        "max_in_flight": 8,
+                        "rate_limit": { "permits": 20, "per": "1s", "burst": 8 },
+                        "serialize_by": { "input": "order_id" }
+                    }
+                }]
+            }]
+        }))
+        .expect("fingerprint fixture metadata deserializes")
+    };
+    let fingerprint = |metadata: &donat_metadata::Metadata| {
+        ConnectorRegistry::build(metadata)
+            .expect("fingerprint fixture compiles")
+            .configuration_fingerprint("logistics", "create_shipment")
+            .expect("compiled operation exposes its immutable configuration fingerprint")
+            .to_owned()
+    };
+
+    // SAFETY: this test uses a connector-specific variable and does not read
+    // it outside registry construction; the resolved value must not affect
+    // the resulting fingerprint.
+    unsafe { std::env::set_var(SECRET_ENV, "credential-value-one") };
+    let baseline_metadata = metadata();
+    let baseline = fingerprint(&baseline_metadata);
+    assert_eq!(baseline.len(), 64, "the exposed value is a SHA-256 digest");
+    assert!(!baseline.contains("credential-value-one"));
+
+    let mut operation_version = metadata();
+    let donat_metadata::ConnectorOperationProfile::Http(operation) =
+        &mut operation_version.connectors[0].operations[0].profile
+    else {
+        panic!("HTTP operation")
+    };
+    operation.version = "v2".to_owned();
+    assert_ne!(baseline, fingerprint(&operation_version));
+
+    let mut endpoint_identity = metadata();
+    endpoint_identity.connectors[0].config.endpoint_identity = "logistics_test_next".to_owned();
+    assert_ne!(baseline, fingerprint(&endpoint_identity));
+
+    let mut credential_identity = metadata();
+    credential_identity.connectors[0].config.credential_identity =
+        "logistics_test_credential_next".to_owned();
+    assert_ne!(baseline, fingerprint(&credential_identity));
+
+    let mut capacity = metadata();
+    capacity.connectors[0].operations[0]
+        .capacity
+        .as_mut()
+        .expect("operation capacity")
+        .max_in_flight = 9;
+    assert_ne!(baseline, fingerprint(&capacity));
+
+    let mut serialization = metadata();
+    serialization.connectors[0].operations[0]
+        .capacity
+        .as_mut()
+        .expect("operation capacity")
+        .serialize_by
+        .as_mut()
+        .expect("serialization policy")
+        .input = "customer_id".to_owned();
+    assert_ne!(baseline, fingerprint(&serialization));
+
+    let mut base_url = metadata();
+    base_url.connectors[0].config.base_url = Some(donat_metadata::ConnectorBaseUrl::Literal(
+        "https://provider-next.example.test".to_owned(),
+    ));
+    assert_ne!(baseline, fingerprint(&base_url));
+
+    // SAFETY: see the first assignment above. Changing a resolved credential
+    // value must not change the non-secret configuration fingerprint.
+    unsafe { std::env::set_var(SECRET_ENV, "credential-value-two") };
+    assert_eq!(baseline, fingerprint(&baseline_metadata));
+    // SAFETY: cleanup restores process state for subsequent tests.
+    unsafe { std::env::remove_var(SECRET_ENV) };
+}
+
 fn public_connector(
     resolver: Arc<dyn HostResolver>,
     transport: Arc<dyn HttpTransport>,
