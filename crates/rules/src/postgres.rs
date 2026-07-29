@@ -832,7 +832,13 @@ fn power_of_ten_exponent_condition(exponent: &str) -> String {
 }
 
 fn checked_decimal_value(value: &str, scale: &str, conditions: Vec<String>) -> String {
-    let normalized = format!("trim_scale((({value})::numeric) / power(10::numeric, ({scale})))");
+    // PostgreSQL chooses a bounded result scale for numeric division and
+    // power(), so `2 / power(10, 4000)` and `2 * power(10, -4000)` both round
+    // to zero. Parsing an exponent-form numeric retains the exact decimal
+    // position and never interpolates source text: `scale` is an integer SQL
+    // expression derived from already-typed decimal operands.
+    let scale_factor = format!("(('1e-' || (({scale})::text))::numeric)");
+    let normalized = format!("trim_scale((({value})::numeric) * ({scale_factor}))");
     format!(
         "(CASE WHEN ({}) THEN ({normalized}) ELSE {} END)",
         all_conditions(conditions),

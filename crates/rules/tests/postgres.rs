@@ -454,6 +454,128 @@ fn high_decimal_scale_remains_valid_when_no_bounded_power_is_required() {
 }
 
 #[test]
+fn extreme_scale_decimal_ordering_matches_live_postgres() {
+    let tiny = format!("0.{}1", "0".repeat(3999));
+    let larger = format!("0.{}2", "0".repeat(1799));
+    let smaller = format!("0.{}9", "0".repeat(1899));
+    let mut client = postgres_client();
+    let direct_postgres_value = client
+        .query_one(
+            &format!("SELECT (({tiny})::numeric * 2.0::numeric) > 0.0::numeric AS value"),
+            &[],
+        )
+        .expect("Postgres should compare its exact numeric values directly")
+        .get::<_, bool>("value");
+    assert!(
+        direct_postgres_value,
+        "native Postgres numeric ordering is the differential ground truth",
+    );
+    let reconstruction_stages = client
+        .query_one(
+            &format!(
+                "SELECT \
+                    scale(trim_scale(({tiny})::numeric)) = 4000 AS literal_scale, \
+                    ((2::numeric / power(10::numeric, 4000)) > 0) AS divided, \
+                    ((2::numeric * power(10::numeric, -4000)) > 0) AS shifted, \
+                    ((2::numeric * ('1e-' || 4000::text)::numeric) > 0) AS exponent_shifted"
+            ),
+            &[],
+        )
+        .expect("Postgres should expose each exact-decimal reconstruction stage");
+    assert!(
+        reconstruction_stages.get::<_, bool>("literal_scale"),
+        "literal normalization must preserve the source scale",
+    );
+    assert!(
+        !reconstruction_stages.get::<_, bool>("divided"),
+        "numeric division rounds the reconstructed high-scale value to zero",
+    );
+    assert!(
+        !reconstruction_stages.get::<_, bool>("shifted"),
+        "numeric power also rounds the reconstructed high-scale value to zero",
+    );
+    assert!(
+        reconstruction_stages.get::<_, bool>("exponent_shifted"),
+        "numeric exponent input must preserve the high-scale value",
+    );
+    let cases = [
+        (
+            "tiny positive is greater than zero",
+            format!("{tiny} * 2.0 > 0.0"),
+            true,
+        ),
+        (
+            "zero is less than a tiny positive",
+            format!("0.0 < {tiny} * 2.0"),
+            true,
+        ),
+        (
+            "tiny negative is less than zero",
+            format!("-{tiny} * 2.0 < 0.0"),
+            true,
+        ),
+        (
+            "zero is greater than a tiny negative",
+            format!("0.0 > -{tiny} * 2.0"),
+            true,
+        ),
+        (
+            "equivalent values with different source scales compare equal",
+            "1.0 <= 1.00 && 1.0 >= 1.00".to_owned(),
+            true,
+        ),
+        (
+            "equivalent values with different source scales are not ordered",
+            "1.0 < 1.00".to_owned(),
+            false,
+        ),
+        (
+            "large unequal scales compare by decimal position",
+            format!("{larger} > {smaller}"),
+            true,
+        ),
+        (
+            "large unequal scales preserve reverse ordering",
+            format!("{larger} < {smaller}"),
+            false,
+        ),
+        (
+            "large unequal negative scales reverse magnitude ordering",
+            format!("-{larger} < -{smaller}"),
+            true,
+        ),
+    ];
+    for (case, source, expected) in cases {
+        assert!(
+            source.len() <= donat_rules::MAX_EXPRESSION_BYTES,
+            "{case} must remain inside the profile source limit",
+        );
+        let rule = compiled_rule(BTreeMap::new(), &source);
+        let expression = lower_postgres(&rule, &SqlBindings::default())
+            .expect("an exact decimal comparison should lower");
+        let postgres_value = client
+            .query_one(&format!("SELECT {expression} AS value"), &[])
+            .expect("the lowered decimal comparison should execute")
+            .get::<_, bool>("value");
+        let rust_value = evaluate_bool(&rule, &BTreeMap::new())
+            .expect("the Rust decimal comparison should evaluate");
+
+        assert_eq!(
+            postgres_value, expected,
+            "Donat-lowered Postgres mismatch for {case}; SQL: {expression}",
+        );
+        assert_eq!(
+            rust_value, expected,
+            "Rust decimal ordering mismatch for {case}",
+        );
+        assert_eq!(
+            rust_value, postgres_value,
+            "Rust/Postgres decimal ordering mismatch for {case}",
+        );
+    }
+}
+
+#[test]
 fn timestamp_value_lowering_is_utc_canonical_outside_a_utc_session() {
     let rule = compiled_value_rule(
         RuleType::Timestamp,

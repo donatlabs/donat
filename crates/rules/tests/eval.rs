@@ -368,6 +368,72 @@ fn evaluate_bool_rejects_non_bool_rule() {
 }
 
 #[test]
+fn compares_extreme_scale_decimals_by_value() {
+    let tiny = format!("0.{}1", "0".repeat(3999));
+    let larger = format!("0.{}2", "0".repeat(1799));
+    let smaller = format!("0.{}9", "0".repeat(1899));
+    let cases = [
+        (
+            "tiny positive is greater than zero",
+            format!("{tiny} * 2.0 > 0.0"),
+            true,
+        ),
+        (
+            "zero is less than a tiny positive",
+            format!("0.0 < {tiny} * 2.0"),
+            true,
+        ),
+        (
+            "tiny negative is less than zero",
+            format!("-{tiny} * 2.0 < 0.0"),
+            true,
+        ),
+        (
+            "zero is greater than a tiny negative",
+            format!("0.0 > -{tiny} * 2.0"),
+            true,
+        ),
+        (
+            "equivalent values with different source scales compare equal",
+            "1.0 <= 1.00 && 1.0 >= 1.00".to_owned(),
+            true,
+        ),
+        (
+            "equivalent values with different source scales are not ordered",
+            "1.0 < 1.00".to_owned(),
+            false,
+        ),
+        (
+            "large unequal scales compare by decimal position",
+            format!("{larger} > {smaller}"),
+            true,
+        ),
+        (
+            "large unequal scales preserve reverse ordering",
+            format!("{larger} < {smaller}"),
+            false,
+        ),
+        (
+            "large unequal negative scales reverse magnitude ordering",
+            format!("-{larger} < -{smaller}"),
+            true,
+        ),
+    ];
+
+    for (case, source, expected) in cases {
+        assert!(
+            source.len() <= donat_rules::MAX_EXPRESSION_BYTES,
+            "{case} must remain inside the profile source limit",
+        );
+        let definition = rule("policy", BTreeMap::new(), RuleType::Bool, source.as_str());
+        let actual = evaluate(definition, BTreeMap::new())
+            .expect("a bounded exact decimal comparison should evaluate");
+
+        assert_eq!(actual, expected, "decimal ordering mismatch for {case}");
+    }
+}
+
+#[test]
 fn semantic_rule_errors_preserve_the_originating_source_context_and_span() {
     let cases = [
         (

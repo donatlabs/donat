@@ -1859,24 +1859,54 @@ impl Ord for Decimal {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 
-        match (self.coefficient.cmp(&0), other.coefficient.cmp(&0)) {
-            (Ordering::Less, Ordering::Greater | Ordering::Equal) => return Ordering::Less,
-            (Ordering::Greater | Ordering::Equal, Ordering::Less) => return Ordering::Greater,
-            (Ordering::Equal, Ordering::Equal) => return Ordering::Equal,
-            _ => {}
+        let left_sign = self.coefficient.cmp(&0);
+        let right_sign = other.coefficient.cmp(&0);
+        if left_sign != right_sign || left_sign == Ordering::Equal {
+            return left_sign.cmp(&right_sign);
         }
-        let scale = self.scale.max(other.scale);
-        let mut left = self.coefficient.unsigned_abs().to_string();
-        let mut right = other.coefficient.unsigned_abs().to_string();
-        left.extend(std::iter::repeat_n('0', (scale - self.scale) as usize));
-        right.extend(std::iter::repeat_n('0', (scale - other.scale) as usize));
-        let ordering = left.len().cmp(&right.len()).then_with(|| left.cmp(&right));
-        if self.coefficient.is_negative() {
+
+        let ordering = compare_decimal_magnitudes(
+            self.coefficient.unsigned_abs(),
+            self.scale,
+            other.coefficient.unsigned_abs(),
+            other.scale,
+        );
+        if left_sign == Ordering::Less {
             ordering.reverse()
         } else {
             ordering
         }
     }
+}
+
+fn compare_decimal_magnitudes(
+    left: u128,
+    left_scale: u32,
+    right: u128,
+    right_scale: u32,
+) -> std::cmp::Ordering {
+    let left_digits = left.ilog10() + 1;
+    let right_digits = right.ilog10() + 1;
+    let left_position = i64::from(left_digits) - i64::from(left_scale);
+    let right_position = i64::from(right_digits) - i64::from(right_scale);
+    let position_ordering = left_position.cmp(&right_position);
+    if position_ordering != std::cmp::Ordering::Equal {
+        return position_ordering;
+    }
+
+    let mut left_divisor = 10_u128.pow(left_digits - 1);
+    let mut right_divisor = 10_u128.pow(right_digits - 1);
+    for _ in 0..left_digits.max(right_digits) {
+        let left_digit = left.checked_div(left_divisor).unwrap_or_default() % 10;
+        left_divisor /= 10;
+        let right_digit = right.checked_div(right_divisor).unwrap_or_default() % 10;
+        right_divisor /= 10;
+        let digit_ordering = left_digit.cmp(&right_digit);
+        if digit_ordering != std::cmp::Ordering::Equal {
+            return digit_ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 impl PartialOrd for Decimal {
