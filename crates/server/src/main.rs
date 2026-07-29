@@ -1,6 +1,7 @@
 //! HTTP entry point. The serving surface is data-plane only:
 //! `/v1/graphql` (+ws), `/v1alpha1/graphql`, `/v1/relay`, `/v1beta1/relay`,
-//! `/healthz`, `/v1/version`. There is NO runtime admin/management API
+//! `/v1/connectors/{instance}/webhooks`, `/healthz`, `/v1/version`. There is
+//! NO runtime admin/management API
 //! (no `/v1/query` run_sql, no metadata mutation): schema is applied with
 //! the `migrate` subcommand, metadata is loaded from YAML at boot.
 //!
@@ -10,6 +11,7 @@
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
 mod action;
+mod connector_webhook;
 // The binary has its own module tree for its historic entry point while the
 // integration tests use the library facade. Connector activity dispatch lands
 // in Task 3, so the binary currently uses only registry construction here.
@@ -360,7 +362,11 @@ async fn main() -> anyhow::Result<()> {
     // Liveness/version are not data APIs — always mounted.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/version", get(version));
+        .route("/v1/version", get(version))
+        // Connector ingress is a provider-facing deployment surface, not one
+        // of the optional GraphQL/REST/MCP data APIs. It remains signed and
+        // declaration-bound even when all data APIs are disabled.
+        .merge(connector_webhook::router());
     // Data APIs are mounted only when enabled (deploy-time flag); a disabled
     // surface's routes are simply absent => plain 404.
     if enabled_apis.graphql {

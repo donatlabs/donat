@@ -391,6 +391,18 @@ impl ConnectorRegistry {
         }
     }
 
+    /// Resolve the one compiled inbound verifier currently supported by the
+    /// deployment. This returns `None` for both an unknown instance and a
+    /// declared module without a webhook verifier, so the HTTP boundary never
+    /// exposes connector configuration or capability details to an ingress
+    /// caller.
+    pub fn stripe_webhook_instance(&self, name: &str) -> Option<&stripe::StripeConnector> {
+        match self.instances.get(name) {
+            Some(RegistryInstance::Stripe { connector, .. }) => Some(connector),
+            Some(RegistryInstance::Http { .. }) | None => None,
+        }
+    }
+
     /// Return the immutable, non-secret deployment fingerprint for one
     /// compiled operation. It contains no resolved credential/header value or
     /// raw base URL, so a future process revision can retain it safely.
