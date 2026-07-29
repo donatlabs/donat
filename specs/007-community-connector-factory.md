@@ -573,6 +573,13 @@ order; Rust `BTreeMap<String>` UTF-8 order is not a JCS implementation.
 Inputs satisfy [RFC 7493 I-JSON](https://www.rfc-editor.org/rfc/rfc7493.html).
 Schema validation occurs before canonicalization. A format change requires a
 new explicit canonical epoch; a v1 reader never guesses a later format.
+Raw JSON numbers are accepted only when finite binary64 parsing, the
+RFC-8785/ECMAScript serialization, and reparsing preserve the same
+mathematical numeric value. Raw `9007199254740992` is therefore accepted;
+raw `9007199254740993` rejects as `canonical_json_number_not_exact`.
+Full-width catalog integers/decimals remain tagged strings. RFC 7493's
+interoperable-integer recommendation is not a mandatory rejection of exactly
+representable `2^53`.
 
 Connector, credential, operation, trigger, and event versions are stable
 SemVer core `{major,minor,patch}` values. Phase 1 rejects prerelease/build
@@ -586,9 +593,11 @@ Safe-width schema/version integers remain JSON numbers. All other `u64` and
 `NonZeroU64` fields are minimal unsigned-decimal JSON strings.
 
 The catalog owns four exact closed projections. ADR 012's normative primitive
-table and explicitly listed composite v1 shapes define every member, enum tag,
-null, array order, and set sort key through primitive leaves; implementation
-struct serialization is not a projection:
+table, branch-complete composite v1 shapes, and bidirectional field-totality
+matrix define every normalized owner field/variant, projection member, enum
+tag, null, array order, and set sort key through primitive leaves.
+Implementation-struct serialization is not a projection and canonical
+material is not a second behavioral schema:
 
 - `SourceRecordMaterialV1` is every field of the complete validated
   `ConnectorSourceRecord` in Section 4.1. Nothing is dropped as review-only.
@@ -607,10 +616,10 @@ struct serialization is not a projection:
 - `ProvenanceMaterialV1` has top-level fields
   `canonical_schema_epoch`, `connector`, `sources`, `artifacts`, `files`,
   `licenses`, `dependencies`, `embedded_material`, `notices`,
-  `resolved_fact_origins`, `donat_policy_ids`, `classifier_epoch`, and
-  `generator_epoch`. Connector retains ID/version/semantic hash; sources are
-  sorted identities with record hashes; the remaining entries retain exact
-  immutable attribution decisions.
+  `manifest_references`, `provider_evidence`, `resolved_fact_origins`,
+  `donat_policy_ids`, `classifier_epoch`, and `generator_epoch`. Connector
+  retains ID/version/semantic hash; sources are sorted identities with record
+  hashes; the remaining entries retain exact immutable attribution decisions.
 - `ValueContractMaterialV1` has `value_language_epoch`, `roots`, and
   `named_objects`. It projects complete `ValueContractField`/`TypeRef`/
   `ValueType` tagged variants and the full named-object closure, including
@@ -621,6 +630,16 @@ Optional fields are always present as value-or-null. Every enum uses
 `{"kind":"<snake_case>","value":<payload-or-null>}`. Set-like arrays sort by
 stable ID and reject duplicates; steps, transforms, and error rules retain
 declared order. No material contains the hash it produces.
+
+Field-totality includes, without summaries: npm/provider/Donat source
+branches; provider evidence source/access date/content hash/terms/facts;
+the exact five dependency dispositions `shipped`, `build_only`,
+`type_only_replaced`, `behavior_only`, and `rejected`; credential field
+secret/redaction/size data, aggregate/token bounds, every auth-plan binding,
+allowed origins/scopes, auth processor, and credential-test operation;
+complete steps/request/response/effects/defaults/bounds; all six pagination
+branches with mandatory bounds; all four matchers, complete error actions,
+and all eight fallback actions; and complete webhook and poll branches.
 
 Resolved evidence is structurally `(value, origin)`. At each stable fact-use
 site, `ResolvedFactValueMaterialV1` stores `{use_site,value}` in semantic
@@ -680,8 +699,19 @@ Golden vectors are normative:
 
 The empty-domain vectors above are hashing-oracle inputs, not schema-valid
 materials. ADR 012 additionally pins exact independently reproducible
-nonempty full-material canonical bytes and domain hashes for all four
-materials; Task 3 must reproduce both sets.
+nonempty full-material canonical bytes and hashes:
+
+```text
+source-record 420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991
+value-contract 79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+semantic 86758001d76edf0087fbe3e734462391c4855b0862a00fa1e20b93610aa53419
+provenance 4147281e4df2d68b86e3b9909a083355991a342b36766c8ea732a6a264ea9b59
+```
+
+The suite exercises complete provider evidence, credential/OAuth behavior,
+provider-idempotent effect, bounded cursor pagination, complete errors and
+bounds/defaults, both trigger families, and value/origin splitting. Task 3
+must reproduce the bytes and hashes independently.
 
 Independent tests construct these bytes, pin complete material vectors, mutate
 one field per material, prove value/origin separation, distinguish every
@@ -707,8 +737,8 @@ A `CredentialSpec` contains:
 - fixed allowed origins to which the capability may apply;
 - declared scopes, a fixed token origin/response mapping for client
   credentials, and maximum credential/token sizes;
-- an optional statically registered auth processor ID for a narrow provider
-  signature scheme;
+- an optional statically registered auth processor ID plus
+  `implementation_revision` for a narrow provider signature scheme;
 - an optional credential-test operation ID plus stable SemVer.
 
 It contains no display widget, HTML, arbitrary expression, raw secret, runtime
@@ -897,15 +927,18 @@ semantic material.
 `PaginationPlan` is a closed enum:
 
 - `None`;
-- `Cursor`, extracting from a fixed JSON pointer or response header and
-  binding to a fixed query/header slot;
-- `OffsetLimit`;
-- `PageNumber`;
-- `LinkRelation`, accepting only a relative or same-compiled-origin `next`
-  relation;
-- `Processor`, naming a static driver for an exceptional provider.
+- `Cursor { request_binding, response_pointer, bounds }`;
+- `OffsetLimit { offset_binding, limit_binding, initial_offset, page_size,
+  bounds }`;
+- `PageNumber { page_binding, page_size_binding, initial_page, page_size,
+  bounds }`;
+- `LinkRelation { relation, selected_header, bounds }`, accepting only a
+  relative or same-compiled-origin relation; and
+- `Processor { processor: { id, implementation_revision }, bounds }`.
 
-Every non-`None` plan declares maximum pages, items, bytes, and calls. A
+Every non-`None` plan carries the same mandatory `PaginationBounds` fields:
+maximum calls, pages, items, per-response bytes, aggregate response bytes,
+and canonical output bytes. A
 provider-returned absolute continuation is rejected in Phase 1 unless it
 matches the already compiled origin exactly. A future continuation capability
 may allow an explicit compiled origin set, but it remains HTTPS-only,
@@ -951,13 +984,15 @@ Connectors classify outcomes; Process metadata alone owns retry and
 
 ### 5.6 `TriggerSpec`
 
-`TriggerSpec` has two provider-integration forms:
+Both `TriggerSpec` forms carry connector/connector version, trigger/trigger
+version, event version, and runtime ABI epoch. Their remaining fields are:
 
-- `Webhook`: fixed authenticator, server-codec, and pure normalizer IDs,
+- `Webhook`: fixed authenticator, server-codec, and pure normalizer IDs each
+  paired with `implementation_revision`,
   selected headers, raw-body maximum, timestamp window, event
   ID/type/output contract, redaction, and optional explicit
   create/delete/check subscription operation IDs;
-- `Poll`: versioned checkpoint type, static poll processor ID plus
+- `Poll`: checkpoint contract, static poll processor ID plus
   `implementation_revision`, event type,
   per-poll event limit, and operation bounds.
 
@@ -2015,6 +2050,8 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `sul_source_cannot_generate_artifacts` | policy integration | every donor marks `n8n-workflow` `TypeOnlyReplaced`; SUL bytes are absent from parser input, manifests, generated Rust, fixtures, Cargo metadata, and release artifacts |
 | `imperative_ast_emits_work_item_not_rust` | codegen snapshot | function-valued routing, `execute`, `poll`, webhook code, or an ambiguous expression produces a processor/unsupported inventory finding, never guessed behavior |
 | `canonical_projection_domains_are_exact` | catalog unit | independent bytes produce every source-record/semantic/provenance/value-contract Section 5.1 vector; one-field mutation changes the applicable domain; no material includes its result; calculation order is record, resolved manifest/value contract, semantic, provenance, generated tree |
+| `canonical_projection_field_matrix_is_total` | catalog compile/unit | bidirectional coverage fails when any normalized field/variant lacks one canonical path, any projection member lacks a normalized/constant/derived owner, or any field is mapped twice outside the resolved fact split |
+| `canonical_projection_every_field_and_branch_mutates` | catalog unit | generated mutations visit every normalized field and every source/auth/request/response/effect/pagination/error/retry/redaction/trigger/value/provenance branch; each changes its applicable direct bytes/hash and preserves the other direct domain |
 | `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes its resolved value only to semantic material and its exact provider/policy origin only to provenance material; substitution, omission, or mismatched pairing rejects |
 | `typed_value_jcs_projection_is_lossless` | catalog unit | tagged `I64(1)`, `U64(1)`, `Decimal("1")`, and `String("1")` do not collide; `u64::MAX`, exact decimal spelling, canonical base64url, inline metadata nulls, and U+10000-before-U+FFFD UTF-16 member ordering match independent bytes |
 | `operation_snapshot_is_complete_and_versioned` | catalog unit | every behavioral Section 5.3 field, stable SemVer/epoch distinction, input/output recomputed hash, resolved origin/value, transform/processor `implementation_revision`, default, bound, and stored selected-header mapping is required; provenance identities are forbidden; prerelease/build versions reject; processorless multi-step rejects |
@@ -2047,7 +2084,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `inline_binary_is_bounded` | value-contract/server/native conformance | exact Section 9 JCS/base64url vectors prove 131,072/131,073 decoded-byte acceptance/rejection and 262,144/262,145 complete-value acceptance/rejection; 17 values, paths, URLs, and object references fail before I/O |
 | `semantic_projection_never_serializes_provenance_descriptors` | catalog unit | semantic construction recursively projects credential/origin/operation/trigger behavior; compile/source-policy checks reject direct serialization of provenance-bearing `OperationSpec` or `TriggerSpec` |
 | `resolved_fact_value_and_origin_hashes_are_separate` | catalog unit | origin-only mutation preserves semantic bytes/hash; value-only mutation preserves direct origin material; final provenance changes through its committed semantic hash |
-| `raw_ijson_rejections_are_exact` | catalog raw-byte fixtures | escaped/unescaped noncharacters, lone/invalid surrogate pairs, invalid UTF-8, decoded duplicate names, and non-binary64-exact numbers reject with the closed ADR-012 codes; recursive UTF-16 ordering matches RFC 8785 |
+| `raw_ijson_rejections_are_exact` | catalog raw-byte fixtures | escaped/unescaped noncharacters, lone/invalid surrogate pairs, invalid UTF-8, decoded duplicate names, `1e400`, and raw `9007199254740993` reject with the closed ADR-012 codes; raw `9007199254740992` succeeds unchanged and recursive UTF-16 ordering matches RFC 8785 |
 | `revision_fingerprint_is_complete` | Spec 005-gated compiler/reconcile | the complete behavioral `OperationSpec`, per-step horizon, and every `CatalogIdentityEnvelopeV1` field are pinned; any one-field change to source records, contracts, snapshot, provenance, or deployment identity rejects live-retired reload |
 | `upgrade_diff_is_semantic` | codegen snapshot | upgrade reports record/integrity/license, operation/type/effect, scopes, origin, request, pagination, errors, bounds, processors, tests, and notices; no retag auto-accept |
 | `workspace_build_is_offline` | clean network-disabled CI | `cargo build --workspace --release --offline --locked` succeeds without network; expected acquisition/codegen source and artifacts are separately inventoried and allowed in this proof |

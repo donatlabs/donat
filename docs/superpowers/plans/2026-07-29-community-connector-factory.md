@@ -778,6 +778,8 @@ git commit -m "fix(connectors): enforce safe connector ABI"
 - Create: `crates/connector-catalog/tests/fixtures/canonical/invalid-surrogate-pair.json`
 - Create: `crates/connector-catalog/tests/fixtures/canonical/invalid-utf8.json`
 - Create: `crates/connector-catalog/tests/fixtures/canonical/duplicate-decoded-name.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/number-exact-binary64.json`
+- Create: `crates/connector-catalog/tests/fixtures/canonical/number-non-finite.json`
 - Create: `crates/connector-catalog/tests/fixtures/canonical/number-outside-binary64.json`
 - Create: `crates/connector-catalog/tests/fixtures/canonical/recursive-utf16-order.json`
 - Create: `crates/connector-catalog/tests/fixtures/canonical/recursive-utf16-order.expected.json`
@@ -1214,7 +1216,12 @@ pub struct ManifestProvenanceReference {
     pub artifact_hashes: NonEmptyVec<ArtifactHash>,
     pub license_id: LicenseIdentity,
     pub notice_id: NoticeId,
-    pub contract_facts: Vec<ContractFact>,
+    pub contract_facts: Vec<ResolvedContractFactBinding>,
+}
+
+pub struct ResolvedContractFactBinding {
+    pub use_site: InlineId,
+    pub fact: ContractFact,
 }
 
 pub struct VersionedCredentialReference {
@@ -1258,6 +1265,285 @@ pub enum OperationEffect {
         side_effect_steps: NonEmptyVec<ProviderIdempotentStep>,
     },
 }
+
+// The following definitions close every type named above. They are normalized
+// owners, not canonical-only substitutes.
+pub enum HashAlgorithm {
+    Sha256,
+    Sha512,
+}
+
+pub struct ArtifactHash {
+    pub artifact_id: ArtifactId,
+    pub algorithm: HashAlgorithm,
+    pub digest: String,
+    pub path: Option<SourcePath>,
+}
+
+pub enum LicenseDecision {
+    Permissive {
+        spdx_id: String,
+        selected_dual_license_branch: Option<String>,
+        license_file_path: SourcePath,
+        license_file_sha256: Hash256,
+    },
+    WrittenGrant {
+        decision_id: ReviewDecisionId,
+        grant_sha256: Hash256,
+    },
+    Rejected {
+        finding: FindingId,
+    },
+}
+
+pub struct NoticeIdentity {
+    pub id: NoticeId,
+    pub license_file_path: SourcePath,
+    pub license_file_sha256: Hash256,
+    pub required_copyright_lines: Vec<String>,
+    pub notice_bundle_destination: RepoPath,
+}
+
+pub enum DependencyDisposition {
+    Shipped { license: LicenseDecision },
+    BuildOnly { license: LicenseDecision },
+    TypeOnlyReplaced { replacement: InlineId },
+    BehaviorOnly { reason: FindingId },
+    Rejected { finding: FindingId },
+}
+
+pub struct DependencyDecision {
+    pub dependency: InlineId,
+    pub disposition: DependencyDisposition,
+}
+
+pub enum EmbeddedMaterialDisposition {
+    Shipped { license: LicenseDecision },
+    BehaviorOnly { reason: FindingId },
+    Rejected { finding: FindingId },
+}
+
+pub struct EmbeddedMaterialDecision {
+    pub material_id: InlineId,
+    pub path: SourcePath,
+    pub sha256: Hash256,
+    pub disposition: EmbeddedMaterialDisposition,
+}
+
+pub struct SafetyFindings {
+    pub findings: Vec<SafetyFinding>,
+}
+
+pub struct SafetyFinding {
+    pub finding_id: FindingId,
+    pub kind: InlineId,
+    pub location: Option<SourcePath>,
+    pub message: String,
+}
+
+pub struct RepoFileHash {
+    pub path: RepoPath,
+    pub sha256: Hash256,
+}
+
+pub struct VerifiedNpmSignature {
+    pub key_id: InlineId,
+    pub signature_sha256: Hash256,
+}
+
+pub enum EvidenceTermsDisposition {
+    Permissive {
+        license: LicenseDecision,
+        evidence_url: ExactHttpsUrl,
+    },
+    ReviewedUse {
+        decision_id: ReviewDecisionId,
+        evidence_url: ExactHttpsUrl,
+    },
+    Rejected {
+        finding: FindingId,
+    },
+}
+
+pub enum ExactFactLocation {
+    JsonPointer {
+        path: SourcePath,
+        pointer: StaticJsonPointer,
+    },
+    DocumentSection {
+        path: SourcePath,
+        section: String,
+    },
+}
+
+#[repr(transparent)]
+pub struct CanonicalProviderValue(pub TypedValue);
+
+pub enum SecretClassification {
+    Secret,
+    Sensitive,
+    NonSecret,
+}
+
+pub enum RedactionPlan {
+    Omit,
+    Fixed { replacement: String },
+    PreserveLast { characters: u8 },
+}
+
+pub enum NetworkPolicy {
+    PublicOnly,
+    PrivateAllowed { policy: InlineId },
+}
+
+pub struct CompiledBinding {
+    pub field: InlineId,
+    pub source: CompiledBindingSource,
+    pub required: bool,
+    pub default: Option<TypedValue>,
+    pub mapping: Option<InlineId>,
+}
+
+pub enum CompiledBindingSource {
+    Input,
+    Constant { value: TypedValue },
+}
+
+pub struct CompiledQueryBinding {
+    pub name: StaticQueryKey,
+    pub binding: CompiledBinding,
+}
+
+pub struct CompiledHeaderBinding {
+    pub name: StaticHeaderName,
+    pub binding: CompiledBinding,
+}
+
+pub struct CompiledCredentialAction {
+    pub credential: CredentialSpecId,
+}
+
+pub enum CompiledRequestShape {
+    None,
+    Json { bindings: Vec<InlineId> },
+    FormUrlencoded { bindings: Vec<InlineId> },
+    Multipart { bindings: Vec<InlineId> },
+    RawBytes { binding: InlineId },
+}
+
+pub struct ResponseMapping {
+    pub pointer: StaticJsonPointer,
+    pub target: InlineId,
+}
+
+pub enum CompiledResponseShape {
+    Json { mappings: Vec<ResponseMapping> },
+    RawBytes { target: InlineId },
+}
+
+pub struct StatusRange {
+    pub minimum: u16,
+    pub maximum: u16,
+}
+
+pub struct ProviderIdempotentStep {
+    pub step: CompiledStepId,
+    pub fixed_binding: FixedIdempotencyBinding,
+    pub scope: ProviderIdempotencyScope,
+    pub minimum_retention_ms: NonZeroU64,
+    pub clock_safety_margin_ms: NonZeroU64,
+}
+
+pub enum FixedIdempotencyBinding {
+    Header { name: StaticHeaderName },
+    BodyField { pointer: StaticBodyPointer },
+}
+
+pub struct CapacityDefaults {
+    pub maximum_in_flight: NonZeroU32,
+}
+
+pub struct RateDefaults {
+    pub burst: NonZeroU32,
+    pub refill_interval_ms: NonZeroU64,
+}
+
+pub struct TypedSerializationKeyDefault {
+    pub field: InlineId,
+    pub value: TypedValue,
+}
+
+pub struct ResolvedFactValue {
+    pub use_site: InlineId,
+    pub value: TypedValue,
+}
+
+pub struct PaginationBounds {
+    pub maximum_calls: NonZeroU32,
+    pub maximum_pages: NonZeroU32,
+    pub maximum_items: NonZeroU32,
+    pub maximum_response_bytes: NonZeroU32,
+    pub maximum_aggregate_response_bytes: NonZeroU32,
+    pub maximum_output_canonical_bytes: NonZeroU32,
+}
+
+pub enum PaginationPlan {
+    None,
+    Cursor {
+        request_binding: InlineId,
+        response_pointer: StaticJsonPointer,
+        bounds: PaginationBounds,
+    },
+    OffsetLimit {
+        offset_binding: InlineId,
+        limit_binding: InlineId,
+        initial_offset: u64,
+        page_size: NonZeroU32,
+        bounds: PaginationBounds,
+    },
+    PageNumber {
+        page_binding: InlineId,
+        page_size_binding: InlineId,
+        initial_page: NonZeroU64,
+        page_size: NonZeroU32,
+        bounds: PaginationBounds,
+    },
+    LinkRelation {
+        relation: String,
+        selected_header: SelectedResponseHeader,
+        bounds: PaginationBounds,
+    },
+    Processor {
+        processor: VersionedProcessorRef<ProcessorFamilyId>,
+        bounds: PaginationBounds,
+    },
+}
+
+pub enum ConnectorErrorClass {
+    Transport,
+    Timeout,
+    Http429,
+    Http5xx,
+    Authentication,
+    Validation,
+    Permanent,
+    Invariant,
+}
+
+pub enum RetryAfterPolicy {
+    Never,
+    RetryAfterHeader {
+        step: CompiledStepId,
+        capability: CapabilityId,
+        maximum_seconds: NonZeroU32,
+    },
+}
+
+pub struct SubscriptionOperationIds {
+    pub create: OperationId,
+    pub delete: OperationId,
+    pub check: Option<OperationId>,
+}
 ```
 
 The version taxonomy is closed. Connector, credential, operation, trigger,
@@ -1285,18 +1571,18 @@ views of provenance-bearing runtime descriptors:
 pub struct SourceRecordMaterialV1 {
     pub record_version: u32,
     pub record_id: SourceRecordId,
-    pub subject: SourceSubject,
-    pub reacquisition: ReacquisitionPlan,
-    pub artifact_hashes: Vec<ArtifactHash>,
-    pub license: LicenseDecision,
-    pub notice: NoticeIdentity,
+    pub subject: SourceSubjectMaterialV1,
+    pub reacquisition: ReacquisitionMaterialV1,
+    pub artifact_hashes: Vec<ArtifactHashMaterialV1>,
+    pub license: LicenseDecisionMaterialV1,
+    pub notice: NoticeMaterialV1,
     pub entrypoints: Vec<SourcePath>,
-    pub dependencies: Vec<DependencyDecision>,
-    pub embedded_material: Vec<EmbeddedMaterialDecision>,
-    pub provider_contracts: Vec<ProviderContractReference>,
-    pub compatibility: CompatibilityDecision,
-    pub admission: AdmissionState,
-    pub safety_findings: SafetyFindings,
+    pub dependencies: Vec<DependencyDecisionMaterialV1>,
+    pub embedded_material: Vec<EmbeddedDecisionMaterialV1>,
+    pub provider_contracts: Vec<ProviderContractMaterialV1>,
+    pub compatibility: CompatibilityMaterialV1,
+    pub admission: AdmissionMaterialV1,
+    pub safety_findings: SafetyFindingsMaterialV1,
     pub reviewer: ReviewIdentity,
     pub approval_date: Date,
     pub proposed_manifest: Option<RepoPath>,
@@ -1306,7 +1592,7 @@ pub struct SourceRecordMaterialV1 {
 pub struct SemanticMaterialV1 {
     pub canonical_schema_epoch: u32,
     pub value_language_epoch: u32,
-    pub connector: SemanticConnectorIdentity,
+    pub connector: SemanticConnectorMaterialV1,
     pub credentials: Vec<SemanticCredentialMaterialV1>,
     pub origins: Vec<SemanticOriginMaterialV1>,
     pub operations: Vec<SemanticOperationMaterialV1>,
@@ -1323,6 +1609,8 @@ pub struct ProvenanceMaterialV1 {
     pub dependencies: Vec<DependencyDecisionMaterialV1>,
     pub embedded_material: Vec<EmbeddedDecisionMaterialV1>,
     pub notices: Vec<NoticeMaterialV1>,
+    pub manifest_references: Vec<ManifestProvenanceMaterialV1>,
+    pub provider_evidence: Vec<ProviderEvidenceOriginMaterialV1>,
     pub resolved_fact_origins: Vec<ResolvedFactOriginMaterialV1>,
     pub donat_policy_ids: Vec<DonatPolicyId>,
     pub classifier_epoch: u32,
@@ -1330,22 +1618,28 @@ pub struct ProvenanceMaterialV1 {
 }
 pub struct ValueContractMaterialV1 {
     pub value_language_epoch: u32,
-    pub roots: CanonicalContractRoots,
-    pub named_objects: CanonicalNamedObjects,
+    pub roots: BTreeMap<String, FieldMaterialV1>,
+    pub named_objects: BTreeMap<String, NamedObjectMaterialV1>,
 }
 ```
 
-Implement every recursive projection named above, including semantic
+Every type named `*MaterialV1` above is a canonical projection type with the
+exact members/branches listed in ADR 012; none is an alias to a normalized
+runtime type. Implement every recursive projection, including source npm/
+provider/Donat branches and decisions; semantic
 credential/auth/origin/step/binding/request/response/transform/processor/
 effect/pagination/error/bounds/trigger types and provenance source/artifact/
-file/license/notice/fact-origin types, exactly as ADR 012 lists them through
-primitive leaves. `SemanticOperationMaterialV1` and
+file/license/notice/provider-evidence/manifest-reference/fact-origin types,
+exactly as ADR 012 lists them through primitive leaves.
+`SemanticOperationMaterialV1` and
 `SemanticTriggerMaterialV1` must not contain or serialize `OperationSpec`,
 `TriggerSpec`, `ManifestProvenanceReference`, or any fact origin.
 
 `SourceRecordMaterialV1` is the exact field-for-field projection of the
-complete struct declared immediately above; its compile-time equality/coverage
-test fails when either field set changes. Optional values
+complete normalized owner; the bidirectional
+`canonical_projection_field_matrix_is_total` compile/test gate fails when an
+owner field/variant is absent, a projection member lacks an owner, or a field
+is mapped twice outside the intentional fact value/origin split. Optional values
 are explicit value-or-null and enums use the one tagged
 `{kind,value}` form. Set-like collections sort by stable ID and reject
 duplicates; steps, transforms, and error rules retain declared order.
@@ -1483,10 +1777,23 @@ value-contract {"a":1,"b":[true,null,"x"]} e74426ca8fb7b23e99f1f14f4a6d281575489
 ```
 
 Also reproduce the exact four valid nonempty full-material canonical byte
-lines and hashes in ADR 012. Do not obtain expected bytes from the production
-serializer. Assert every top-level and nested material field is covered, null
-and empty vectors remain explicit, and each one-field mutation changes only
-the applicable direct domain.
+lines and hashes in ADR 012:
+
+```text
+source-record 420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991
+value-contract 79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+semantic 86758001d76edf0087fbe3e734462391c4855b0862a00fa1e20b93610aa53419
+provenance 4147281e4df2d68b86e3b9909a083355991a342b36766c8ea732a6a264ea9b59
+```
+
+Do not obtain expected bytes from the production serializer. The full suite
+must exercise provider source/evidence/terms/facts; credential fields,
+OAuth2 bindings and bounds; provider-idempotent effect; non-`None`
+pagination; all eight fallback actions and four matcher branches; every
+operation/step/pagination bound/default; webhook and poll; and the matching
+fact value/origin split. Assert every top-level and nested material field is
+covered, null and empty vectors remain explicit, and each one-field mutation
+changes only the applicable direct domain.
 
 `raw_ijson.rs` reads fixture bytes without first passing through a Unicode
 string or `serde_json::Value`:
@@ -1504,15 +1811,26 @@ assert_raw_error("invalid-utf8.json", "catalog_jcs_invalid_utf8");
 assert_raw_error("duplicate-decoded-name.json",
                  "catalog_jcs_duplicate_member");
 assert_raw_error("number-outside-binary64.json",
-                 "catalog_jcs_number_not_i_json");
+                 "canonical_json_number_not_exact");
+assert_raw_error("number-non-finite.json",
+                 "canonical_json_number_not_exact");
+assert_eq!(
+    canonicalize_raw(fixture_bytes("number-exact-binary64.json")).unwrap(),
+    b"9007199254740992",
+);
 assert_eq!(
     canonicalize_raw(fixture_bytes("recursive-utf16-order.json")).unwrap(),
     include_bytes!("fixtures/canonical/recursive-utf16-order.expected.json"),
 );
 ```
 
-The duplicate fixture is `{"a":1,"\u0061":2}`. Numeric cases include `1e400`
-and `9007199254740992`. Unicode cases include escaped and raw U+FDD0,
+The duplicate fixture is `{"a":1,"\u0061":2}`. Numeric rejection cases include
+`1e400` and raw `9007199254740993`; raw `9007199254740992` is the exact
+accepted boundary. A raw number is accepted only if finite binary64 parsing,
+RFC-8785/ECMAScript serialization, and reparsing preserve its mathematical
+numeric value. This does not turn RFC 7493's interoperable-integer
+recommendation into a mandatory rejection of exactly representable `2^53`.
+Unicode cases include escaped and raw U+FDD0,
 `\ud800`, and `\ud800\u0041`. The ordering fixture nests U+10000 and U+FFFD
 keys at two object levels and expects U+10000 first by unsigned UTF-16 units.
 Add the expected-byte fixture to the Task-3 file list. These six error codes
@@ -1527,6 +1845,9 @@ Add `source_record_variants_are_closed`,
 `contract_fact_origins_are_closed_and_non_substitutable`,
 `donat_policy_cannot_satisfy_required_provider_evidence`,
 `contract_fact_semantic_and_provenance_hashes_are_separate`,
+`canonical_projection_field_matrix_is_total`,
+`canonical_projection_every_field_mutation_is_observable`,
+`canonical_projection_every_enum_branch_is_covered`,
 `semantic_projection_uses_no_provenance_bearing_runtime_descriptor`,
 `origin_only_mutation_preserves_semantic_hash`,
 `value_only_mutation_preserves_direct_origin_material`,
@@ -3281,18 +3602,40 @@ git commit -m "feat(connectors): add admitted SerpAPI search"
 ```rust
 pub enum PaginationPlan {
     None,
-    Cursor(CursorPlan),
-    OffsetLimit(OffsetLimitPlan),
-    PageNumber(PageNumberPlan),
-    LinkRelation(LinkRelationPlan),
+    Cursor {
+        request_binding: InlineId,
+        response_pointer: StaticJsonPointer,
+        bounds: PaginationBounds,
+    },
+    OffsetLimit {
+        offset_binding: InlineId,
+        limit_binding: InlineId,
+        initial_offset: u64,
+        page_size: NonZeroU32,
+        bounds: PaginationBounds,
+    },
+    PageNumber {
+        page_binding: InlineId,
+        page_size_binding: InlineId,
+        initial_page: NonZeroU64,
+        page_size: NonZeroU32,
+        bounds: PaginationBounds,
+    },
+    LinkRelation {
+        relation: String,
+        selected_header: SelectedResponseHeader,
+        bounds: PaginationBounds,
+    },
     Processor {
-        family: ProcessorFamilyId,
-        implementation_revision: u32,
+        processor: VersionedProcessorRef<ProcessorFamilyId>,
+        bounds: PaginationBounds,
     },
 }
 ```
 
-Each non-`None` branch declares smaller-or-equal maxima within 16 calls, 16
+This is the same normalized owner declared in Task 3, not a Task-12
+replacement. Each non-`None` branch declares mandatory smaller-or-equal
+`PaginationBounds` within 16 calls, 16
 pages, 10,000 items, 1 MiB per response, 4 MiB aggregate response bodies, and
 256 KiB canonical normalized output.
 
@@ -3321,8 +3664,10 @@ cargo test -p donat-connector-catalog --test pagination_plan
 cargo test -p donat-server --test connector_pagination
 ```
 
-Expected: the catalog has no `PaginationPlan` and the server test target is
-absent.
+Expected: Task 3's normalized `PaginationPlan` owner and field-total canonical
+projection compile, but the focused validation/execution tests and server
+target are absent. Task 12 must not introduce or rename a pagination field or
+variant.
 
 - [ ] **Step 3: Compile the closed plan fail-closed**
 
