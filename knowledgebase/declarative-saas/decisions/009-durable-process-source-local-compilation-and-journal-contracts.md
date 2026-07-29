@@ -27,16 +27,29 @@ provider-event dedupe and every delivery attempt.
 
 ## Decision
 
-Use a server-orchestrated two-stage immutable candidate build. Shared recursive
-value-contract types live in `donat-ir`. `donat-schema` compiles commands to
-public pre-process descriptors whose canonical fingerprints include raw effect
-declarations but no resolved process revision. The existing connector registry
-publishes public typed operation/event descriptors. The server-owned process
-compiler consumes those descriptors and Rules, derives revisions, and exposes
-them through a schema-owned neutral effect-contract interface. Schema then
-finalizes command effects and compiles the serving schema. Each `Engine`
-snapshot retains one immutable source-qualified process catalog; no compiler
-is duplicated and schema never depends on server.
+Use a server-orchestrated two-stage immutable candidate build. The unpublished
+lower `donat-value-contract` crate is the single owner of the closed
+`ValueType`/`TypeRef` language, `TypedValue`, bounded canonical constructors,
+deterministic object order, canonical size accounting, and inline-byte
+representation. It is `no_std + alloc`, forbids unsafe code, has empty default
+features and no `std` feature, build script, or third-party runtime
+dependency, and exposes no `serde_json::Value`. `donat-ir` depends on and
+re-exports those types without a second representation; metadata/Rule
+normalization adapters may live in IR.
+
+`donat-schema` compiles commands to public pre-process descriptors whose
+canonical fingerprints include raw effect declarations but no resolved process
+revision. The existing connector registry publishes public typed
+operation/event descriptors. The server-owned process compiler consumes those
+descriptors and Rules, derives revisions, and exposes them through a
+schema-owned neutral effect-contract interface. Schema then finalizes command
+effects and compiles the serving schema. Each `Engine` snapshot retains the
+metadata process catalog plus a hash-verified `DeployedProcessCatalog`
+containing the declared active and every non-terminal live-retired revision;
+no compiler is duplicated and schema never depends on server. Persisted Rule
+dependencies retain their source definitions and named-type closure so a fresh
+binary can recompile and verify an old revision rather than interpreting it
+through current metadata.
 
 Processes are strictly source-local. Start, transition, start-effect, and
 signal-effect commands resolve only in the process's Postgres source. A
@@ -47,6 +60,16 @@ created per source. Deployment explicitly selects one real source with
 `validate --metadata-dir <dir> --source <name>`; omission is valid only for one
 unambiguous Postgres source. Reconciliation changes only that source, while
 serve reads and validates every real source without issuing DDL.
+Metadata-free `migrate --migrations-dir <dir>` remains a separate
+refinery-only mode using an explicit database URL; it performs no source
+selection or metadata reconciliation.
+
+Every process journal key, foreign key, semantic key, ingress row, and query
+is qualified by metadata `source_name`, including when two source names share
+one physical database. Each persisted connector dependency also records its
+bound source. Current and live-retired dependency closures are checked
+together, so a connector cannot rebind to another source and split capacity
+coordination while old work remains.
 
 V6 gives each completed command execution generation a durable
 `invocation_id uuid`. Exact replay preserves it; expired-key re-execution gets
@@ -58,30 +81,73 @@ outer process transition. Only the established valid `P0D01`
 into one committed `on_rejection` transition; every other database error
 aborts the outer transaction.
 
+V6 owns the `donat.check_violation(text)` helper currently installed from the
+serve candidate path. Serve replaces creation with a read-only compatibility
+check and can start under a principal that lacks schema-create privileges.
+Activity admission serializes claim decisions by locking one durable
+source/connector/operation token-bucket row, then applies exact token refill,
+max-in-flight, and serialization checks before inserting a reservation.
+
+Executable connector effects are closed to headerless `ReadOnly` and
+`ProviderIdempotent`. The latter records exactly one fixed header/body binding,
+provider scope, conservative minimum retention, and positive clock margin for
+every side-effecting compiled step. Process compilation calculates and pins a
+complete checked `maximum_send_horizon_ms` for each such step, including
+schedule/capacity/rate/serialization bounds, start-to-close, lease expiry,
+takeover delay, and every retry backoff/jitter bound. It accepts equality with
+`minimum_retention_ms - clock_safety_margin_ms` and rejects missing,
+unbounded, overflowed, or one-millisecond-over policies. The source-local
+activity journal commits each step's database-clock
+`first_provider_attempt_at` before its first send and persists both the
+compiled maximum-send deadline and provider usable-window deadline. Later
+sends reuse the fixed key and permanently refuse I/O after either bound.
+
+Commands contain no connector/provider business logic. They may commit only
+closed process start/signal intent alongside their domain statement.
+Provider-specific execution is reached only by a durable activity after its
+job, lease, and capacity intent commit. Connector pagination is bounded
+transport inside that activity; it is not a logical node, workflow branch,
+retry/timer, database write, or item stream. Process metadata has no
+If/Switch/Merge/Code/Wait nodes, loops, item/paired-item model, batching as
+workflow logic, or subworkflows.
+
 Inbound persistence is split. `process_inbound_events` is only the verified
 provider-event dedupe ledger.
 `process_inbound_deliveries` is append-only audit for every accepted,
 duplicate, unmatched, ambiguous, guard-false, unexpected-state, or
 invalid-signature attempt. Invalid signatures write audit only; verified
-deliveries write audit and dedupe atomically.
+deliveries write audit and dedupe atomically. An accepted delivery stores
+source-qualified instance and event foreign keys in that same transaction so
+instance inspection never infers history from redacted payloads.
+
+Stopping new starts is explicit metadata lifecycle, not omission.
+`lifecycle: retired` keeps the definition and dependencies resolvable while a
+materialized command effect gate rejects a new start before domain DML.
+Omitting a process with a non-terminal instance is a deployment error.
 
 ## Alternatives
 
 | Option | Why Not |
 | --- | --- |
 | Put the process compiler in `donat-schema` | It would pull connector/runtime ownership into schema or duplicate the server connector compiler. |
+| Define shared values in `donat-ir` | Connector ABI/catalog crates would either depend upward on IR or create a second value representation; the lower `no_std + alloc` owner keeps the graph acyclic. |
 | Let `donat-schema` depend on `donat-server` | Creates a crate dependency cycle and reverses the planner/runtime boundary. |
 | Hash commands after resolving process revisions | A process revision includes command fingerprints, so this creates a fingerprint cycle. |
 | Reuse one introspected catalog or worker pool for all sources | Can validate or mutate the wrong database and makes atomic process behavior require distributed transactions. |
+| Key process tables only by process name or UUID | Two metadata sources may share one physical database, so unqualified rows and predicates can collide. |
 | Key outboxes by the reusable idempotency tuple | Expired-key re-execution would collide with historical effects. |
 | Catch a command exception without a savepoint | PostgreSQL leaves the outer transaction aborted, so `on_rejection` cannot commit safely. |
 | Store one inbound row per provider event | A duplicate or invalid-signature attempt cannot be audited without overwriting dedupe history or trusting an unverified provider ID. |
+| Remove retired metadata and keep only hashes | A restarted binary cannot execute the pinned definition or recompile its Rule guards deterministically. |
+| Admit a non-idempotent provider side effect with one attempt | Worker loss can leave an ambiguous external outcome even when configured attempts equal one. |
+| Put provider calls or workflow nodes in commands/connectors | It bypasses committed durable intent and recreates an unbounded workflow runtime rather than the closed Process grammar. |
 
 ## Consequences
 
-Candidate construction gains explicit descriptor and finalization stages, and
-V6 gains more source-local audit tables. Deployment tooling must select each
-Postgres source and rolling binaries must support the pinned runtime ABI.
+Candidate construction gains explicit descriptor, finalization, and deployed
+revision-loading stages, and V6 gains more source-local audit/coordination
+tables. Metadata-aware deployment tooling must select each Postgres source and
+rolling binaries must support the pinned runtime ABI.
 
 In return, the dependency graph is cycle-free, revisions are deterministic,
 every command effect identifies one actual execution, command rejection has a

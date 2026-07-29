@@ -37,27 +37,41 @@ revision, and database migrations stay backward compatible until those
 instances finish. A wait/cancellation signal's name, correlation shape, and
 payload type are likewise retained while an active revision can receive it.
 
-An activity receives one logical activity ID at enqueue time. Its provider
-idempotency key is derived from that ID and is unchanged by retry, worker crash,
-or lease takeover. The runtime distinguishes schedule-to-start from
-start-to-close timeout using the database clock. Phase 1 has no heartbeat
-extension: long interactions are represented by a start activity followed by a
-timer or verified signal. Retry delay uses deterministic jitter derived from
-logical activity ID and attempt. All worker binaries reserve operation capacity
-and rate-limit permits through Postgres before any outbound call. An operation
-may also declare a typed same-resource serialization key using that durable
-reservation mechanism.
+An activity receives one logical activity ID at enqueue time. Executable
+connector effects are closed to headerless `ReadOnly` or
+`ProviderIdempotent`. The latter declares every side-effecting compiled step
+with one fixed header/body binding, provider scope, conservative minimum
+retention, and positive clock margin. The step key is derived from logical
+activity ID, scope, and step ID and is unchanged by retry, worker crash, or
+lease takeover. A database-clock `first_provider_attempt_at` is committed in
+the source-local activity journal before that step's first network send.
+Compilation pins a complete bounded retry/takeover send horizon and requires
+it to fit the usable retention window; a later takeover permanently refuses
+I/O instead of rotating the key.
+
+The runtime distinguishes schedule-to-start from start-to-close timeout using
+the database clock. Phase 1 has no heartbeat extension: long interactions are
+represented by a start activity followed by a timer or verified signal. Retry
+delay uses deterministic jitter derived from logical activity ID and attempt.
+All worker binaries reserve operation capacity and rate-limit permits through
+Postgres before any outbound call. An operation may also declare a typed
+same-resource serialization key using that durable reservation mechanism.
+Commands commit only domain SQL plus process start/signal intent; connector or
+provider business logic is invoked only by the durable activity after that
+intent, lease, and applicable capacity reservation commit.
 
 Connector and process failures use typed classes and ordered declared
 `on_error` routes. Domain recovery and cancellation are ordinary explicit
 commands with a typed `signal_process` effect and a declared process
 transition. The effect writes a durable outbox row in the same command CTE;
 the process worker consumes it idempotently. There is no generic runtime
-cancel, retry, replay, definition-mutation API, operator CLI, admin role, or
-permission bypass. Operators use direct database access and deployment-owned
-observability for the internal journal. The binary may additionally expose only
-read-only inspect and offline history-verification CLI subcommands; they never
-mutate history or invoke a command or connector.
+cancel, retry, replay, definition-mutation API, mutating process-management
+operator CLI, admin role, or permission bypass. Operators use deployment-owned
+observability for the internal journal. The only CLI exceptions are
+`donat process inspect --source <name> --instance <uuid>` and
+`donat process verify-history --source <name> --instance <uuid>`; both are
+read-only diagnostics and never mutate history or invoke a command or
+connector.
 
 Inbound connector webhooks are durable process ingress, not connector-route
 or conformance responsibilities. The durable process ingress implementation
@@ -70,8 +84,8 @@ provider only after the transaction commits. Until that implementation
 exists, the connector route verifies raw bytes then returns `503` for a
 verified event without acknowledgement; it adds no in-memory queue, duplicate
 cache, or standalone persistence model. The connector conformance task proves
-that temporary `503` boundary only. The process plan's **Task 11: Add timers,
-split inbound audit, and command-signal consumption** owns durable ingress,
+that temporary `503` boundary only. The process plan's **Task 12: Add timers,
+command signals, and linked inbound audit** owns durable ingress,
 audit, deduplication, correlation, and success acknowledgement. The exact
 source-local journal and transaction contract is recorded in
 [[009-durable-process-source-local-compilation-and-journal-contracts]].
@@ -87,6 +101,8 @@ source-local journal and transaction contract is recorded in
 | Add activity heartbeats immediately | adds a second lease protocol before short HTTP activities and signal/timer patterns are proven |
 | Provide a generic process-admin endpoint or CLI | violates the explicit-role/no-admin boundary and bypasses the declarative domain contract |
 | Automatically reverse prior SQL on cancellation | cannot safely reverse arbitrary committed business changes; compensation must be explicit |
+| Treat one-attempt provider mutation as safe | worker loss can leave an ambiguous provider outcome, so every executable side-effecting step still needs provider idempotency |
+| Invoke a connector from command execution | external I/O would escape the one-statement command transaction and could run before durable process intent commits |
 
 ## Consequences
 

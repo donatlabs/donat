@@ -26,6 +26,21 @@ short transaction, but it never performs row-by-row business-table mutation:
 business data changes only through the existing declarative command statement.
 No external request is made while a database transaction is open.
 
+The five state variants in Section 3 are the complete Process grammar. There
+are no `If`, `Switch`, `Merge`, `Code`, or `Wait` logical nodes, workflow
+loops, batching-as-workflow, item/paired-item model, subworkflows,
+send-and-wait, or ambient workflow item. Decisions are typed Rule guards and
+explicit transitions; waiting is only a typed signal or durable timer.
+Connector pagination is bounded transport execution inside one committed
+activity job and cannot create process states, items, branches, retries,
+timers, commands, or database writes.
+
+Commands contain only domain SQL plus closed durable `start_process` and
+`signal_process` outbox effects. Connector/provider business logic is outside
+the command planner and SQL generator. It can run only through a durable
+process activity after the activity intent, lease, and applicable capacity
+reservation are committed.
+
 ## 2. Cycle-free compilation and public contracts
 
 ### 2.1 Dependency ownership
@@ -33,18 +48,73 @@ No external request is made while a database transaction is open.
 The dependency direction is:
 
 ~~~text
-donat-server -> donat-schema -> donat-ir -> donat-metadata
-      |               |             ^
-      +---------------+-------------+
+donat-server -> donat-schema -> donat-ir
+donat-server ----------------> donat-ir
+donat-sqlgen ----------------> donat-ir
+donat-ir --------------------> donat-metadata
+donat-ir --------------------> donat-value-contract
 ~~~
 
-`donat-sqlgen` also depends on `donat-ir`. `donat-schema` never depends on
-`donat-server`.
+`donat-schema` never depends on `donat-server`.
 
-The implementation adds `crates/ir/src/value_contract.rs` for the shared,
-SQL-free normalized value contract. It exports these immutable types:
+The implementation adds the unpublished lower crate
+`crates/value-contract` (`donat-value-contract`) as the single owner of the
+shared SQL-free value language. It is `#![no_std]`, uses `extern crate alloc`,
+forbids unsafe code, has empty default features, has no `std` feature, build
+script, procedural macro, or third-party runtime dependency, and exposes no
+`serde_json::Value`. It owns `ValueType`, `TypeRef`, `TypedValue`, bounded
+canonical constructors, deterministic object ordering, canonical-size
+accounting, and the inline-byte representation. `donat-ir` depends on and
+re-exports those types; it never defines a second value representation.
+
+Commands, process metadata, declarative HTTP operations, fixed connector
+modules, and Rule artifacts all normalize through this one version-1 type
+language:
+
+~~~text
+type-ref    = primary [ "!" ]
+primary     = named | "[" type-ref "]"
+named       = identifier
+identifier  = ASCII letter or "_" followed by ASCII letters, digits, or "_"
+~~~
+
+Whitespace is forbidden inside a type reference. `!` may occur once at each
+node and means both present and non-null when that node is a named field;
+without `!`, a field may be absent and its value may be null. Thus
+`[uuid!]!` is a required non-null list of non-null UUID strings.
+
+The closed canonical scalar vocabulary and aliases are:
+
+| Canonical scalar | Accepted metadata spellings | JSON value |
+| --- | --- | --- |
+| `boolean` | `Boolean`, `bool`, `boolean` | boolean |
+| `string` | `String`, `string`, `ID` | string |
+| `int32` | `Int`, `int`, `int32` | integral number in signed 32-bit range |
+| `int64` | `int64` | integral number in signed 64-bit range |
+| `uint64` | `uint64` | integral number in unsigned 64-bit range |
+| `decimal` | `Float`, `float`, `decimal` | finite JSON number |
+| `uuid` | `uuid` | canonical UUID string |
+| `date` | `date` | `YYYY-MM-DD` string |
+| `timestamp` | `timestamp` | RFC 3339 string without an offset |
+| `timestamptz` | `timestamptz` | RFC 3339 string with an offset |
+| `json` | `json`, `jsonb` | any JSON value |
+
+A name outside that table must be declared in
+`metadata.custom_types.input_objects`, `metadata.custom_types.enums`, or
+`metadata.custom_types.scalars`. A declared custom scalar retains nominal
+identity and accepts any JSON scalar value—null, object, and array are not
+scalar values. Process and HTTP type strings cannot name a `rules.yaml` type;
+a compiled Rule artifact instead converts its already resolved `RuleType`
+into the same normalized contract. Input-object recursion is allowed only
+through a named reference; every reference must resolve, duplicate names are
+rejected, and canonical maps use UTF-8 lexical key order. Enums are nominal
+and preserve declared value order.
+
+The lower crate exports these immutable types:
 
 ~~~rust
+pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
+
 pub struct ValueContractCatalog {
     pub roots: BTreeMap<String, ValueContractField>,
     pub named_objects: BTreeMap<String, ValueObjectContract>,
@@ -52,24 +122,68 @@ pub struct ValueContractCatalog {
 
 pub struct ValueContractField {
     pub required: bool,
-    pub value: ValueContract,
+    pub type_ref: TypeRef,
 }
 
-pub struct ValueContract {
+pub struct TypeRef {
     pub nullable: bool,
-    pub shape: ValueContractShape,
+    pub value_type: ValueType,
 }
 
-pub enum ValueContractShape {
-    Scalar { name: String },
+pub enum ValueScalar {
+    Boolean,
+    String,
+    Int32,
+    Int64,
+    UInt64,
+    Decimal,
+    Uuid,
+    Date,
+    Timestamp,
+    TimestampTz,
+    Json,
+    Custom { name: String },
+}
+
+pub enum ValueType {
+    Scalar { scalar: ValueScalar },
     Enum { name: String, values: Vec<String> },
     Object { fields: BTreeMap<String, ValueContractField> },
-    List { element: Box<ValueContract> },
+    List { element: Box<TypeRef> },
     Ref { name: String },
 }
 
 pub struct ValueObjectContract {
     pub fields: BTreeMap<String, ValueContractField>,
+}
+
+pub enum CanonicalNumber {
+    I64(i64),
+    U64(u64),
+    Decimal(String),
+}
+
+pub enum TypedValue {
+    Null,
+    Boolean(bool),
+    String(String),
+    Number(CanonicalNumber),
+    List(Vec<TypedValue>),
+    Object(BTreeMap<String, TypedValue>),
+    InlineBytes(BoundedInlineBytes),
+}
+
+pub struct BoundedInlineBytes {
+    bytes: Vec<u8>,
+}
+
+impl BoundedInlineBytes {
+    pub fn try_new(
+        bytes: Vec<u8>,
+        maximum_bytes: usize,
+    ) -> Result<Self, ValueContractError>;
+
+    pub fn as_slice(&self) -> &[u8];
 }
 ~~~
 
@@ -77,8 +191,27 @@ pub struct ValueObjectContract {
 from value nullability. `Ref` may name only an entry in `named_objects`, which
 makes recursive input objects finite and self-contained. Map order is
 canonical lexical order; enum value order is declared order. Contract
-assignment and JSON validation are implemented once in this lower module and
-are reused by commands, processes, and connectors.
+assignment, bounded JSON conversion, typed-value validation, and canonical
+size accounting are implemented once in this lower crate and are reused by
+commands, processes, and connectors. Assignability is exact after alias
+normalization except that any JSON-shaped contract is assignable to `json`;
+nominal enum, object, and custom-scalar names never widen to one another.
+`InlineBytes` is owned here so the connector ABI cannot invent a parallel
+value, but Spec 005 process metadata and JSON/form connector descriptors
+cannot admit it until the separate bounded-byte prerequisite in Spec 007 is
+implemented and accepted.
+
+`donat-ir` owns only metadata/Rule adapters such as
+`compile_value_contract_catalog`, and re-exports every public value-contract
+type. It also owns the unrelated closed process-start policy used by command
+effects:
+
+~~~rust
+pub enum ProcessStartPolicy {
+    Enabled,
+    RejectRetired,
+}
+~~~
 
 ### 2.2 Command descriptors
 
@@ -93,7 +226,7 @@ pub struct CommandDescriptor {
     pub result: ValueContractCatalog,
     pub allowed_roles: BTreeSet<String>,
     pub required_session_variables:
-        BTreeMap<String, BTreeMap<String, ValueContract>>,
+        BTreeMap<String, BTreeMap<String, TypeRef>>,
     pub definition_fingerprint: String,
 }
 ~~~
@@ -133,17 +266,42 @@ pub struct ConnectorOperationDescriptor {
     pub operation_version: String,
     pub input: ValueContractCatalog,
     pub output: ValueContractCatalog,
-    pub idempotency: ConnectorIdempotencySupport,
+    pub effect: OperationEffect,
     pub capacity: ConnectorCapacityContract,
     pub endpoint_identity: String,
     pub credential_identity: String,
     pub configuration_fingerprint: String,
 }
 
-pub enum ConnectorIdempotencySupport {
-    StableKeyHeader { name: String },
-    Unsupported,
+pub enum OperationEffect {
+    ReadOnly,
+    ProviderIdempotent {
+        side_effect_steps: NonEmptyVec<ProviderIdempotentStep>,
+    },
 }
+
+pub struct ProviderIdempotentStep {
+    pub step: CompiledStepId,
+    pub fixed_binding: FixedIdempotencyBinding,
+    pub scope: ProviderIdempotencyScope,
+    pub minimum_retention_ms: NonZeroU64,
+    pub clock_safety_margin_ms: NonZeroU64,
+}
+
+pub enum FixedIdempotencyBinding {
+    Header { name: StaticHeaderName },
+    BodyField { pointer: StaticBodyPointer },
+}
+
+pub struct NonEmptyVec<T> {
+    pub first: T,
+    pub rest: Vec<T>,
+}
+
+pub struct CompiledStepId(pub String);
+pub struct StaticHeaderName(pub String);
+pub struct StaticBodyPointer(pub String);
+pub struct ProviderIdempotencyScope(pub String);
 
 pub struct ConnectorCapacityContract {
     pub max_in_flight: u32,
@@ -179,14 +337,41 @@ pub struct ConnectorDescriptorCatalog {
 }
 ~~~
 
+The four string newtypes have checked constructors: values are non-empty,
+bounded, canonical, and static; header names and JSON pointers are validated
+before descriptor publication.
+
 The capacity contract contains `max_in_flight`, the exact
 `permits`/`per`/`burst` rate policy, and the optional typed scalar
-`serialize_by` input name. The idempotency contract states whether a stable
-activity key is supported and, when applicable, the fixed header identity.
+`serialize_by` input name. `OperationEffect` is closed. `ReadOnly` has no
+binding and is admitted only when immutable provider evidence proves that no
+compiled step mutates provider state. `ProviderIdempotent` contains exactly
+one entry for every side-effecting compiled step and none for read-only
+steps. Each entry fixes the step, one header/body binding, the
+provider-documented uniqueness scope, conservative minimum retention, and a
+positive clock margin strictly smaller than that retention. Missing,
+duplicate, unproven, or unbounded fields reject executable descriptor
+publication. A non-idempotent side effect may remain inventory-only, but there
+is no executable third effect variant and `max_attempts: 1` is not an escape.
+
+For each side-effecting step, workers derive the key exactly as:
+
+~~~text
+base64url_no_pad(SHA256(
+  "donat.connector.idempotency.step.v1\0" ||
+  JCS({ "logical_activity_id": logical_activity_id,
+        "scope": scope,
+        "step": compiled_step_id })
+))
+~~~
+
+The same key is applied only to that step's fixed binding on every retry or
+takeover. Another step or scope never reuses it.
 The configuration fingerprint retains the current non-secret module,
 operation, endpoint, credential-class, capacity, protocol, environment-name,
-and resolved-HTTP-endpoint-digest material; it never retains a resolved secret
-or raw environment-derived base URL.
+resolved-HTTP-endpoint-digest, effect, binding, scope, retention, and margin
+material; it never retains a resolved secret or raw environment-derived base
+URL.
 
 Verified inbound events use a sibling
 `ConnectorInboundEventDescriptor` containing instance/module/version/ABI,
@@ -195,15 +380,80 @@ field, endpoint/credential identities, and the same non-secret configuration
 fingerprint. This descriptor is produced by the same compiled connector
 registry, not a process-owned protocol compiler.
 
-Declarative HTTP operation metadata adds an explicit
-`input: BTreeMap<String, String>` type mapping. Every
-`{input.<name>}` path slot and every `{ input: <name> }` query, header, and
-recursive body slot must name an entry in that mapping and be assignable to
-its normalized contract. Dispatch rejects missing required inputs, null for a
-non-null contract, type mismatch, and undeclared extra inputs before DNS or
-request rendering. A declared input that is used only by `serialize_by` is
-valid; every other declared input must be used by the fixed request template.
-Response field type declarations form the output contract.
+Declarative HTTP operation metadata adds the exact fields
+`input: BTreeMap<String, String>` and `effect: ConnectorOperationEffect`.
+Each input value uses the version-1 type-reference grammar above and resolves
+named types only through `metadata.custom_types`. The metadata effect uses the
+same closed `read_only` or `provider_idempotent.side_effect_steps` shape as
+the descriptor; declarative HTTP has one compiled step named `request`, while
+generated/static connector operations may declare multiple named steps.
+Existing v2 `idempotency: { header: ... }` metadata still deserializes for
+inventory/reporting compatibility, but without fixed scope, retention, and
+margin it cannot publish an executable operation descriptor or be referenced
+by a Process.
+Every `{input.<name>}` path slot and every `{ input: <name> }` query, request
+header, and recursive body slot must name an entry in that mapping and be
+assignable to its normalized contract. Path and header inputs must normalize
+to a non-null scalar other than `json`; query inputs may be scalar or a list
+of scalar values; body inputs may use any declared contract. Dispatch rejects
+missing required inputs, null for a non-null contract, type mismatch, and
+undeclared extra inputs before DNS or request rendering. A declared input used
+only by `serialize_by` is valid; every other declared input must be used by the
+fixed request template. Response field type declarations use the same grammar
+and form the output contract.
+
+The existing static request-header YAML remains valid. The exact
+backward-compatible serde types are:
+
+~~~rust
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRequestHeader {
+    pub name: String,
+    #[serde(flatten)]
+    pub value: ConnectorRequestHeaderValue,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ConnectorRequestHeaderValue {
+    Static { value: String },
+    Input { input: String },
+}
+~~~
+
+~~~yaml
+input:
+  order_id: uuid!
+  request_trace: string!
+headers:
+  - name: X-Request-Source
+    value: donat
+  - name: X-Request-Trace
+    input: request_trace
+~~~
+
+Exactly one of `value` or `input` is accepted. Header names remain
+deploy-time static; input never selects a name, credential header, method,
+authority, or URL. Serialized legacy `{ name, value }` entries round-trip
+unchanged.
+
+~~~yaml
+effect:
+  provider_idempotent:
+    side_effect_steps:
+      - step: request
+        fixed_binding:
+          header: Idempotency-Key
+        scope: logistics-account-shipment-v1
+        minimum_retention_ms: 86400000
+        clock_safety_margin_ms: 300000
+~~~
+
+The positive numeric fields use checked `u64`; configuration admission
+requires `clock_safety_margin_ms < minimum_retention_ms`. The source evidence,
+normalized effect, semantic hash, descriptor, configuration fingerprint, and
+pinned process revision all retain the exact values.
 
 Stripe does not accept a metadata-defined HTTP schema. The built-in
 `stripe` module publishes a fixed descriptor for
@@ -231,7 +481,8 @@ pub struct ProcessEffectContractCatalog {
 
 pub struct ProcessEffectContract {
     pub process_name: String,
-    pub active_revision: String,
+    pub current_revision: String,
+    pub start_policy: ProcessStartPolicy,
     pub start_input: ValueContractCatalog,
     pub signals: BTreeMap<String, ProcessSignalEffectContract>,
 }
@@ -245,11 +496,18 @@ pub struct ProcessSignalEffectContract {
 }
 ~~~
 
-For each process it contains the active revision and exact start input; for
-each command signal it contains the signal name, correlation/payload
-contracts, the revision whose signal contract was checked, and the set of
-retained revisions with an identical signal-contract fingerprint. It contains
-no runtime handle or journal access.
+`ProcessStartPolicy` is the closed `donat-ir` enum from Section 2.1;
+`donat-schema` imports it rather than defining a schema-owned copy.
+For each declared process it contains the current revision, explicit start
+policy, and exact start input. A retired declaration remains resolvable but
+finalizes to `RejectRetired`; Task-owned SQL lowering turns that policy into a
+materialized pre-DML `validation-failed` gate with path
+`$.selectionSet.<command-field>` and message
+`process '<source>.<process>' does not accept new starts`. For each command
+signal the catalog contains the signal name, correlation/payload contracts,
+the revision whose signal contract was checked, and the set of retained
+revisions with an identical signal-contract fingerprint. It contains no
+runtime handle or journal access.
 
 `crates/server/src/processes/definition.rs` owns the only process compiler and
 its immutable `CompiledProcessCatalog`. Candidate construction in
@@ -269,22 +527,260 @@ its immutable `CompiledProcessCatalog`. Candidate construction in
    changing the pre-process command fingerprint.
 7. `CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects`
    compiles the serving schema.
-8. `processes::reconcile::validate_serving_catalogs` performs read-only checks
-   that every compiled revision is deployed in its real owning source before
-   the candidate `Engine` is published.
+Stages 1-7 are pure candidate compilation. Before publication,
+`processes::reconcile::validate_serving_catalogs` is stage 8: it performs only
+catalog reads, hash-verifies and recompiles all declared active plus
+non-terminal live-retired revisions, checks deploy-time helper compatibility,
+and returns an immutable `DeployedProcessCatalog`. A failure discards the
+candidate.
 
-Each `Engine` snapshot retains the finalized command catalog and one immutable
-source-qualified `CompiledProcessCatalog` beside the schema. No compiler is
-duplicated and no dependency points from `donat-schema` to `donat-server`.
+Each published `Engine` snapshot uses these exact field names:
+
+~~~rust
+pub command_catalog: Arc<CompiledCommandCatalog>,
+pub process_catalog: Arc<CompiledProcessCatalog>,
+pub deployed_process_catalog: Arc<DeployedProcessCatalog>,
+pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+~~~
+
+`process_catalog` is the metadata candidate used to finalize effects;
+workers and history verification consume only `deployed_process_catalog`.
+No compiler is duplicated and no dependency points from `donat-schema` to
+`donat-server`.
 
 ## 3. Canonical process metadata
 
-`processes.yaml` is a top-level metadata section. The following shape is the
-normative Phase-1 grammar:
+`processes.yaml` is a top-level metadata section. These are the exact serde
+interfaces. Every struct and untagged enum is
+`#[serde(deny_unknown_fields)]`; enum spellings are `snake_case`. `lifecycle`
+defaults to `active` so existing declarations remain source compatible.
+
+~~~rust
+pub struct ProcessDefinition {
+    pub name: String,
+    pub source: String,
+    #[serde(default)]
+    pub lifecycle: ProcessLifecycle,
+    pub start: ProcessStart,
+    #[serde(default)]
+    pub input: BTreeMap<String, String>,
+    #[serde(default)]
+    pub state: BTreeMap<String, String>,
+    #[serde(default)]
+    pub initial_state: BTreeMap<String, ProcessValueBinding>,
+    pub initial: String,
+    #[serde(default)]
+    pub cancellation: Option<ProcessCancellation>,
+    pub states: BTreeMap<String, ProcessStateDefinition>,
+}
+
+pub enum ProcessLifecycle {
+    Active,
+    Retired,
+}
+
+pub struct ProcessStart {
+    pub command: String,
+    pub input: BTreeMap<String, ProcessStartBinding>,
+    pub idempotency_key: ProcessStartBinding,
+}
+
+pub enum ProcessStartBinding {
+    CommandArgument { command_argument: String },
+    CommandResult { command_result: String },
+}
+
+pub struct ProcessCancellation {
+    pub signal: String,
+    pub correlate: BTreeMap<String, ProcessCommandCorrelation>,
+    pub payload: BTreeMap<String, String>,
+    pub on_cancel: String,
+}
+
+pub struct ProcessCommandCorrelation {
+    #[serde(rename = "type")]
+    pub type_ref: String,
+    pub equals: ProcessValueBinding,
+}
+
+pub enum ProcessStateDefinition {
+    Terminal(ProcessTerminalState),
+    Activity(ProcessActivityState),
+    WaitForSignal(ProcessVerifiedSignalState),
+    WaitForCommand(ProcessCommandSignalState),
+    Timer(ProcessTimerState),
+}
+
+pub struct ProcessTerminalState {
+    pub terminal: bool,
+}
+
+pub struct ProcessActivityState {
+    pub activity: ProcessActivity,
+    pub on_success: ProcessTransition,
+    pub on_error: ProcessActivityErrorRouting,
+}
+
+pub struct ProcessActivity {
+    pub connector: String,
+    pub operation: String,
+    pub input: BTreeMap<String, ProcessValueBinding>,
+    pub timeout: ProcessActivityTimeout,
+    pub retry: ProcessRetry,
+}
+
+pub struct ProcessActivityTimeout {
+    pub schedule_to_start: String,
+    pub start_to_close: String,
+}
+
+pub struct ProcessRetry {
+    pub retry_on: Vec<ProcessRetryableErrorKind>,
+    pub max_attempts: u32,
+    pub initial_interval: String,
+    pub max_interval: String,
+    pub jitter: ProcessRetryJitter,
+}
+
+pub enum ProcessRetryJitter {
+    DeterministicFull,
+}
+
+pub enum ProcessRetryableErrorKind {
+    Transport,
+    Timeout,
+    #[serde(rename = "http_429")]
+    Http429,
+    #[serde(rename = "http_5xx")]
+    Http5xx,
+}
+
+pub struct ProcessActivityErrorRouting {
+    pub routes: Vec<ProcessActivityErrorRoute>,
+    pub fallback: ProcessActivityErrorFallback,
+}
+
+pub struct ProcessActivityErrorRoute {
+    pub kinds: Vec<ProcessActivityErrorKind>,
+    pub next: String,
+}
+
+pub struct ProcessActivityErrorFallback {
+    pub next: String,
+}
+
+pub enum ProcessActivityErrorKind {
+    Transport,
+    Timeout,
+    #[serde(rename = "http_429")]
+    Http429,
+    #[serde(rename = "http_5xx")]
+    Http5xx,
+    Authentication,
+    Validation,
+    Permanent,
+    Invariant,
+    RetryExhausted,
+}
+
+pub struct ProcessVerifiedSignalState {
+    pub wait_for_signal: ProcessVerifiedSignalWait,
+    pub on_signal: ProcessTransition,
+    #[serde(default)]
+    pub timeout: Option<ProcessTimeout>,
+}
+
+pub struct ProcessVerifiedSignalWait {
+    pub connector: String,
+    pub event: String,
+    pub provider_event_id: ProcessVerifiedEventField,
+    pub correlate: BTreeMap<String, ProcessVerifiedEventCorrelation>,
+}
+
+pub struct ProcessVerifiedEventField {
+    pub event: String,
+}
+
+pub struct ProcessVerifiedEventCorrelation {
+    pub from: ProcessVerifiedEventField,
+    pub equals: ProcessValueBinding,
+}
+
+pub struct ProcessCommandSignalState {
+    pub wait_for_command: ProcessCommandSignalWait,
+    pub on_signal: ProcessTransition,
+    #[serde(default)]
+    pub timeout: Option<ProcessTimeout>,
+}
+
+pub struct ProcessCommandSignalWait {
+    pub signal: String,
+    pub correlate: BTreeMap<String, ProcessCommandCorrelation>,
+    pub payload: BTreeMap<String, String>,
+}
+
+pub struct ProcessTimerState {
+    pub timer: ProcessTimer,
+}
+
+pub struct ProcessTimer {
+    pub after: String,
+    pub on_timeout: ProcessTransition,
+}
+
+pub struct ProcessTimeout {
+    pub after: String,
+    pub on_timeout: ProcessTransition,
+}
+
+pub struct ProcessTransition {
+    #[serde(default)]
+    pub guard: Option<ProcessRuleCall>,
+    #[serde(default)]
+    pub command: Option<ProcessCommandInvocation>,
+    #[serde(default)]
+    pub set: BTreeMap<String, ProcessValueBinding>,
+    pub next: String,
+    #[serde(default)]
+    pub on_rejection: Option<String>,
+}
+
+pub struct ProcessRuleCall {
+    pub rule: String,
+    #[serde(rename = "with", default)]
+    pub bindings: BTreeMap<String, ProcessValueBinding>,
+}
+
+pub struct ProcessCommandInvocation {
+    pub name: String,
+    pub run_as_role: String,
+    #[serde(default)]
+    pub input: BTreeMap<String, ProcessValueBinding>,
+    pub session_variables: BTreeMap<String, ProcessValueBinding>,
+}
+
+pub enum ProcessValueBinding {
+    Literal { literal: serde_json::Value },
+    Input { input: String },
+    State { state: String },
+    ActivityResult { activity_result: String },
+    VerifiedSignal { verified_signal: String },
+    CommandResult { command_result: String },
+    Rule {
+        rule: String,
+        #[serde(rename = "with", default)]
+        bindings: BTreeMap<String, ProcessValueBinding>,
+    },
+}
+~~~
+
+The exact complete YAML form is illustrated below. It includes every state
+variant and every binding spelling:
 
 ~~~yaml
 - name: checkout_order
   source: default
+  lifecycle: active
   start:
     command: create_order
     input:
@@ -303,7 +799,9 @@ normative Phase-1 grammar:
   cancellation:
     signal: cancel_checkout
     correlate:
-      order_id: uuid!
+      order_id:
+        type: uuid!
+        equals: { state: order_id }
     payload:
       reason: string!
     on_cancel: cancelled
@@ -331,7 +829,7 @@ normative Phase-1 grammar:
           jitter: deterministic_full
       on_success:
         set:
-          checkout_url: { result: url }
+          checkout_url: { activity_result: url }
         next: awaiting_payment
       on_error:
         routes:
@@ -340,39 +838,72 @@ normative Phase-1 grammar:
           - kinds: [permanent, invariant, timeout, retry_exhausted]
             next: failed
         fallback:
-          next: failed
+          next: cooldown
     awaiting_payment:
       wait_for_signal:
         connector: stripe
         event: checkout.session.completed
         provider_event_id: { event: provider_event_id }
         correlate:
-          order_id: { event: client_reference_id }
-        on_signal:
-          guard:
-            rule: payment_matches_order
+          order_id:
+            from: { event: client_reference_id }
+            equals: { state: order_id }
+      on_signal:
+        guard:
+          rule: payment_matches_order
+          with:
+            order_id: { state: order_id }
+            checkout_order_id: { verified_signal: client_reference_id }
+        command:
+          name: mark_order_paid
+          run_as_role: payment_worker
+          input:
+            order_id: { state: order_id }
+          session_variables: {}
+        set:
+          checkout_url:
+            rule: normalize_checkout_url
             with:
-              order_id: { state: order_id }
-              checkout_order_id: { event: client_reference_id }
+              url: { state: checkout_url }
+        next: awaiting_receipt
+        on_rejection: failed
+      timeout:
+        after: 30d
+        on_timeout:
           command:
-            name: mark_order_paid
-            run_as_role: payment_worker
+            name: expire_order
+            run_as_role: order_worker
             input:
               order_id: { state: order_id }
             session_variables: {}
-          next: completed
+          next: expired
           on_rejection: failed
-        timeout:
-          after: 30d
-          on_timeout:
-            command:
-              name: expire_order
-              run_as_role: order_worker
-              input:
-                order_id: { state: order_id }
-              session_variables: {}
-            next: expired
-            on_rejection: failed
+    awaiting_receipt:
+      wait_for_command:
+        signal: receipt_recorded
+        correlate:
+          order_id:
+            type: uuid!
+            equals: { state: order_id }
+        payload:
+          receipt_id: string!
+      on_signal:
+        command:
+          name: attach_receipt
+          run_as_role: payment_worker
+          input:
+            order_id: { state: order_id }
+            receipt_id: { verified_signal: receipt_id }
+          session_variables: {}
+        set:
+          checkout_url: { command_result: archived_url }
+        next: completed
+        on_rejection: failed
+    cooldown:
+      timer:
+        after: 5m
+        on_timeout:
+          next: manual_review
     completed: { terminal: true }
     manual_review: { terminal: true }
     failed: { terminal: true }
@@ -380,22 +911,64 @@ normative Phase-1 grammar:
     cancelled: { terminal: true }
 ~~~
 
-`name`, `source`, `start`, `input`, `state`, `initial_state`, `initial`,
-`cancellation`, and `states` use deny-unknown-fields metadata types.
-`cancellation` is optional, but when present it requires the exact signal,
-typed correlation, typed payload, and `on_cancel` target shown above.
 `start` is required and has exactly one command in Phase 1.
 That same-source command must contain exactly one raw `start_process` effect
 targeting this process, and its canonical input/idempotency bindings must equal
 the process `start` mapping. The compiler rejects a missing, duplicate, or
 disagreeing declaration; neither side silently overrides the other.
 
-A state has exactly one kind discriminator: `terminal`, `activity`,
-`wait_for_signal`, `wait_for_command`, or `timer`. Activity
-`on_success`/`on_error` and wait-state `on_signal`/nested `timeout` are fields
-of that kind, not additional kinds. A timer-only state is
-`timer: { after: <duration>, on_timeout: <transition> }`. Phase 1 does not
-accept a sibling `after` or `on_signal` shorthand.
+A state deserializes as exactly one of the five untagged variants. `terminal`
+must be `true`. Activity `on_success`/`on_error` and wait-state
+`on_signal`/nested `timeout` are fields of that variant, not sibling kinds.
+The compiler rejects an empty state map, duplicate state name, unknown target,
+and any state unreachable from `initial` or an error/cancellation route.
+Durations are a non-zero base-10 integer followed immediately by one of
+`ms`, `s`, `m`, `h`, or `d`; they normalize to checked `u64` milliseconds.
+
+Process runtime ABI 1 fixes
+`MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS = 5000`. A claimed lease expires at its
+`start_to_close_deadline`. A takeover may send again only within the fixed
+maximum delay after that expiry; a worker arriving later records the typed
+timeout/window failure without provider I/O. Capacity, rate, and serialization
+waiting for each attempt is bounded by that attempt's `schedule_to_start`
+deadline. `Retry-After` may postpone a retry only up to that retry's declared
+`retry_delay_upper_bound`; a larger value produces the typed timeout path
+without another provider send. A runtime that cannot enforce these refusal
+bounds cannot claim ABI-1 work.
+
+For each activity and each provider-idempotent compiled step, compilation
+calculates with checked integer arithmetic:
+
+~~~text
+retry_delay_upper_bound(i) =
+  min(max_interval, initial_interval * 2^(i - 1))
+
+maximum_send_horizon_ms =
+  max_attempts * start_to_close
+  + sum i=1..(max_attempts - 1) of (
+    MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS
+    + retry_delay_upper_bound(i)
+    + schedule_to_start
+  )
+
+usable_window_ms =
+  minimum_retention_ms - clock_safety_margin_ms
+~~~
+
+Deterministic full jitter is bounded by the corresponding
+`retry_delay_upper_bound`; capacity/rate/serialization delay is inside
+`schedule_to_start`; each `start_to_close` term bounds all compiled
+step/page/call/redirect work inside that attempt, including a repeated send of
+the same step. The connector's smaller operation deadline is validated
+against `start_to_close`, and the HTTP client performs no hidden transport
+retry.
+Compilation requires
+`maximum_send_horizon_ms <= usable_window_ms`. Equality is accepted.
+Overflow, a missing bound, or a one-millisecond excess rejects the Process as
+non-executable. Every side-effecting step is checked independently, and the
+result is pinned under that activity state in the executable dependency
+closure. `ReadOnly` needs no retention calculation, remains headerless, and
+is retry/takeover-safe under the same bounded worker policy.
 
 Every activity uses the one total ordered error form:
 
@@ -408,22 +981,36 @@ on_error:
     next: failed
 ~~~
 
-`routes` is non-empty. A kind may occur in only one route. `fallback` is
-mandatory and handles every unmatched non-retried failure, including
-`invariant` and worker-generated `retry_exhausted`. The closed connector kinds
-are `transport`, `timeout`, `http_429`, `http_5xx`, `authentication`,
-`validation`, `permanent`, and `invariant`; `retry_on` accepts only the first
-four.
+`routes` is non-empty. Each `kinds` list is non-empty, a kind may occur in only
+one route, and `fallback` is mandatory. `retry_on` accepts only
+`transport`, `timeout`, `http_429`, and `http_5xx`; an exhausted retried
+failure becomes `retry_exhausted` before ordered error routing.
 
 Every transition that invokes a command requires `name`, fixed
 `run_as_role`, exact `input`, explicit `session_variables`, `next`, and
-`on_rejection`. `session_variables` is a closed typed mapping: it contains
-every name required for that role by `CommandDescriptor` and no other name.
-Allowed bindings are literals and declared process input/state,
-prior-command result, verified signal, or Rule data available in that
-transition context. They never come from caller headers, ambient GraphQL
-session data, connector-selected data outside the verified event descriptor,
-or an event-selected role.
+`on_rejection`; a transition without `command` must omit `on_rejection`.
+`session_variables` is closed: it contains every name required for that role
+by `CommandDescriptor` and no other name.
+
+The binding context is exact:
+
+| Destination | Allowed `ProcessValueBinding` variants |
+| --- | --- |
+| `initial_state` | `literal`, `input`, `rule` over those values |
+| activity input | `literal`, `input`, `state`, `rule` over those values |
+| wait correlation `equals` | `literal`, `input`, `state`, `rule` over those values |
+| transition guard, command input, session variables | the preceding variants plus `verified_signal` only in an `on_signal` transition and `activity_result` only in activity `on_success` |
+| transition `set` | all values available before the command plus `command_result` when that same transition has a command |
+| timer/timeout transition | no `verified_signal`, `activity_result`, or `command_result` unless the enclosing activity success transition supplies it |
+
+`command_result` always names a field in the result of the command in that
+same transition; it is unavailable to that command's own input/session
+bindings and is not durable ambient state unless copied by `set`.
+`verified_signal` names a field in the selected connector event descriptor or
+the `wait_for_command.payload` contract. Rule bindings recursively obey the
+row's context. No binding can read caller headers, ambient GraphQL session
+data, an unverified payload field, a connector-selected role, arbitrary JSON
+path, SQL, or a prior transition's ephemeral result.
 
 All start input, initial state, state `set`, command input/session variables,
 activity input, signal payload/correlation, and Rule bindings are checked for
@@ -450,28 +1037,42 @@ compilation. This makes capacity coordination, webhook routing, database time,
 and journal writes source-local. The runtime starts separate worker loops and
 uses separate Postgres pools for each process-owning source.
 
-Deployment uses these exact forms:
+Deployment has two deliberately separate migrate modes:
 
 ~~~text
+donat --database-url <url> migrate --migrations-dir <dir>
 donat migrate --migrations-dir migrations --metadata-dir <dir> --source <name>
 donat validate --metadata-dir <dir> --source <name>
 ~~~
 
-`--source` selects one metadata source, requires it to be Postgres, resolves
-that source's own `configuration.connection_info.database_url`, and uses the
-global `--database-url`/`DONAT_DATABASE_URL` only as the existing explicit
-fallback when the selected source has no connection URL. A missing
-environment variable is an error; it is never silently replaced by another
-source's URL.
+In refinery-only mode, no metadata directory is supplied. An explicit global
+`--database-url`, `--metadata-database-url`, `DONAT_DATABASE_URL`, or existing
+`DONAT_GRAPHQL_DATABASE_URL` alias is required. `--source` is rejected because
+there is no metadata namespace to select. The command applies every pending
+migration and exits; it does not load metadata, introspect a catalog, compile
+Rules/commands/processes, or reconcile event triggers or process definitions.
+This preserves the existing metadata-free
+`donat migrate --migrations-dir <dir>` deployment path.
 
-Omitting `--source` is accepted only when the loaded metadata contains exactly
-one Postgres source and its URL is unambiguous. Zero or multiple Postgres
-sources is a usage error. `migrate` applies V1–V6 and reconciles event triggers
-and process definitions only in the selected source. It never changes another
-source. `validate` introspects only the selected source and reports that
-source's catalog, command, process, deployed-revision, and compatibility
-problems plus global metadata-only Rule/connector/source-binding problems.
-It does not claim that unselected database catalogs were checked.
+In metadata-aware mode, `--source` selects one metadata source, requires it to
+be Postgres, resolves that source's own
+`configuration.connection_info.database_url`, and uses the explicit global
+database URL only as the existing fallback when the selected source has no
+connection URL. A missing named environment variable is an error; it is never
+silently replaced by another source's URL. Migration runs against the selected
+URL—not against a global URL before selection—then selected-source
+consistency, event-trigger reconciliation, and process reconciliation run in
+that order.
+
+When metadata is supplied, omitting `--source` is accepted only when it
+contains exactly one Postgres source and its URL is unambiguous. Zero or
+multiple Postgres sources is a usage error. `migrate` applies V1-V6 and
+reconciles event triggers and process definitions only in the selected source.
+It never changes another source. `validate` always requires a metadata
+directory; it introspects only the selected source and reports that source's
+catalog, command, process, deployed-revision, and compatibility problems plus
+global metadata-only Rule/connector/source-binding problems. It does not claim
+that unselected database catalogs were checked.
 
 Consistency code constructs a catalog map containing only the selected source.
 It must never clone one introspected `Catalog` across metadata source names.
@@ -502,6 +1103,52 @@ JSON containing:
   fingerprints;
 - the process runtime ABI.
 
+The persisted `dependency_descriptors` JSON is executable, not only an audit
+summary. Its exact logical types are:
+
+~~~rust
+pub struct ProcessDependencyDescriptors {
+    pub commands: BTreeMap<(String, String), CommandDescriptor>,
+    pub rules: BTreeMap<String, PinnedRuleBundle>,
+    pub connector_operations:
+        BTreeMap<(String, String), PinnedConnectorOperation>,
+    pub connector_inbound_events:
+        BTreeMap<(String, String), PinnedConnectorInboundEvent>,
+}
+
+pub struct PinnedRuleBundle {
+    pub profile_version: u16,
+    pub declared_types: BTreeMap<String, donat_rules::RuleType>,
+    pub definitions: BTreeMap<String, donat_rules::RuleDefinition>,
+    pub canonical_ast_sha256: BTreeMap<String, String>,
+    pub source_sha256: BTreeMap<String, String>,
+}
+
+pub struct PinnedConnectorOperation {
+    pub source_name: String,
+    pub descriptor: ConnectorOperationDescriptor,
+    pub activity_send_horizons_ms:
+        BTreeMap<String, BTreeMap<CompiledStepId, u64>>,
+}
+
+pub struct PinnedConnectorInboundEvent {
+    pub source_name: String,
+    pub descriptor: ConnectorInboundEventDescriptor,
+}
+~~~
+
+The Rule bundle contains only the referenced definitions and their transitive
+named-type closure. Loading it calls
+`donat_rules::compile_catalog_with_declared_types` and compares both stored
+hash maps before a worker may claim the revision. A pinned connector entry
+stores its owning metadata source beside the non-secret descriptor. For every
+activity state using that operation it also stores the compiler's
+per-side-effect-step `maximum_send_horizon_ms`; the descriptor retains the
+matching fixed binding, scope, retention, and margin. A fresh binary
+recomputes every horizon before accepting the persisted revision. Current
+metadata may not bind that connector instance to another source while an
+active or non-terminal live-retired revision retains the old binding.
+
 The deploy-time reconciliation entry point is:
 
 ~~~rust
@@ -510,19 +1157,61 @@ pub async fn reconcile(
     database_url: &str,
     source_catalog: &donat_catalog::Catalog,
     compiled_processes: &CompiledSourceProcessCatalog,
-    dependency_descriptors: &ProcessDependencyDescriptors,
 ) -> anyhow::Result<()>;
 ~~~
 
 It inserts a missing immutable revision, leaves an identical deployment
-unchanged, activates the selected revision, and retires omitted prior
-revisions without deleting them. It rejects removal or an incompatible change
-of a command, Rule, connector operation, runtime ABI, or wait/cancellation
-signal contract still referenced by a non-terminal instance. A process
-revision remains loadable until no live instance can use it.
+unchanged, activates a declaration whose lifecycle is `active`, and records a
+declaration whose lifecycle is `retired` without accepting new starts.
+Replacing A with active B retires A without deleting it. Omitting the entire
+process while any non-terminal instance exists is rejected; explicit
+`lifecycle: retired` is the only way to stop new starts while retaining its
+runtime dependency closure. Once every revision is terminal, omission may
+delete no history but may leave all definition rows retired.
 
-A start request stores the active revision selected when the command statement
-executes. The start worker never substitutes a newer active revision. A signal
+Reconciliation rejects removal or an incompatible change of a command,
+runtime ABI, wait/cancellation signal contract, connector operation, or
+connector/source binding still referenced by a non-terminal instance. It also
+queries active plus non-terminal live-retired dependency rows across every
+metadata source mapped to the same physical database before accepting a
+connector rebind. A process revision remains executable until no live instance
+can use it.
+
+Serving loads persisted executable revisions through:
+
+~~~rust
+pub struct DeployedProcessCatalog {
+    pub sources: BTreeMap<String, DeployedSourceProcessCatalog>,
+}
+
+pub struct DeployedSourceProcessCatalog {
+    pub active:
+        BTreeMap<String, Arc<CompiledProcessDefinition>>,
+    pub live_retired:
+        BTreeMap<(String, String), Arc<CompiledProcessDefinition>>,
+}
+
+pub async fn validate_serving_catalogs(
+    runtimes: &HashMap<String, SourceRuntime>,
+    process_catalog: &CompiledProcessCatalog,
+    command_catalog: &CompiledCommandCatalog,
+    connectors: &ConnectorRegistry,
+) -> anyhow::Result<DeployedProcessCatalog>;
+~~~
+
+For each real source this function reads only `pg_catalog` and `donat`
+catalog/journal rows. It verifies the deploy-time helper signature, selects
+the declared current revision plus every distinct revision referenced by a
+non-terminal instance, verifies canonical definition/dependency hashes,
+recompiles the persisted Rule bundle and process definition, verifies current
+command fingerprints and connector ABI/configuration support, and rejects a
+cross-source connector binding. It issues no `CREATE`, `ALTER`, `DROP`,
+`INSERT`, `UPDATE`, `DELETE`, or reconciliation call. The returned catalog is
+published atomically with the candidate Engine.
+
+A start request stores the enabled active revision selected when the command
+statement executes. `RejectRetired` raises before command domain DML and writes
+no request. The start worker never substitutes a newer revision. A signal
 request stores the revision whose signal contract finalized the effect.
 It may match an instance on another retained revision only when reconciliation
 recorded an identical signal name/correlation/payload contract fingerprint;
@@ -550,6 +1239,7 @@ pub struct ResolvedStartProcessEffect {
     pub source: String,
     pub process_name: String,
     pub process_revision: String,
+    pub start_policy: ProcessStartPolicy,
     pub input: BTreeMap<String, CommandExecutionValue>,
     pub semantic_idempotency_key: CommandExecutionValue,
     pub command_invocation_id: CommandInvocationIdSource,
@@ -576,7 +1266,8 @@ pub enum CommandInvocationIdSource {
 `CurrentExecution` is a trusted closed reference, not metadata. SQLgen
 resolves it to the concrete UUID returned by the command invocation CTE.
 `effect_position` is the zero-based position in canonical command effect
-order. All other fields are fully source- and type-resolved by the planner.
+order. `ProcessStartPolicy` is the `donat-ir` enum from Section 2.1.
+All other fields are fully source- and type-resolved by the planner.
 
 `plan_mutation.rs` lowers finalized effects into this IR. SQLgen inserts each
 start or signal request from the same successful command CTE statement and
@@ -584,6 +1275,10 @@ only from the `first` claim path. Every outbox row copies the concrete
 `invocation_id` and is unique on
 `(command_invocation_id, effect_position)`. Replay, changed-input rejection,
 guard rejection, or any database error inserts no second outbox row.
+`RejectRetired` is checked by a materialized effect gate before the
+idempotency claim and every domain CTE; it raises the exact Section 2.4
+envelope and therefore cannot leave domain DML, a command journal row, or an
+outbox row.
 
 The command's execution-generation identity and the process's semantic start
 dedupe are different contracts. The former identifies one actual command
@@ -606,7 +1301,15 @@ MCP, or management mutation surface. UUID primary keys default to
 `gen_random_uuid()`. Every process-owned JSONB payload has
 `check (pg_column_size(<column>) <= 262144)`.
 
-The migration first alters the command journal:
+V6 also owns the deploy-time definition of
+`donat.check_violation(msg text) returns json`: it raises SQLSTATE `23514`
+with the existing permission-error JSON payload. It uses `create or replace
+function` in the migration. Serve deletes `ensure_check_violation_helper` and
+checks the installed function's schema, argument type, return type, language,
+and execute privilege through `pg_catalog` only; absence or incompatibility is
+a startup error instructing the operator to run `donat migrate`.
+
+The migration alters the command journal:
 
 ~~~text
 donat.command_invocations
@@ -620,22 +1323,22 @@ It then creates these exact process tables:
 
 ~~~text
 donat.process_definition_versions(
+  source_name text not null,
   process_name text not null,
   revision text not null,
-  source_name text not null,
   canonical_definition jsonb not null,
   dependency_descriptors jsonb not null,
   runtime_abi integer not null check (runtime_abi > 0),
   status text not null check (status in ('active','retired')),
   deployed_at timestamptz not null default now(),
   retired_at timestamptz,
-  primary key(process_name, revision)
+  primary key(source_name, process_name, revision)
 )
-unique(process_name) where status = 'active';
+unique(source_name, process_name) where status = 'active';
 
 donat.process_start_requests(
-  id uuid primary key,
   source_name text not null,
+  id uuid not null,
   process_name text not null,
   revision text not null,
   input_json jsonb not null,
@@ -647,14 +1350,17 @@ donat.process_start_requests(
   instance_id uuid,
   created_at timestamptz not null default now(),
   consumed_at timestamptz,
-  unique(command_invocation_id, effect_position),
-  foreign key(process_name, revision)
-    references donat.process_definition_versions(process_name, revision)
+  primary key(source_name, id),
+  unique(source_name, command_invocation_id, effect_position),
+  foreign key(source_name, process_name, revision)
+    references donat.process_definition_versions(
+      source_name, process_name, revision
+    )
 );
 
 donat.process_instances(
-  id uuid primary key,
   source_name text not null,
+  id uuid not null,
   process_name text not null,
   revision text not null,
   source_request_id uuid not null,
@@ -667,15 +1373,21 @@ donat.process_instances(
   version bigint not null default 0 check (version >= 0),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique(process_name, start_idempotency_key),
-  unique(source_request_id),
-  foreign key(process_name, revision)
-    references donat.process_definition_versions(process_name, revision)
+  primary key(source_name, id),
+  unique(source_name, process_name, start_idempotency_key),
+  unique(source_name, source_request_id),
+  foreign key(source_name, source_request_id)
+    references donat.process_start_requests(source_name, id),
+  foreign key(source_name, process_name, revision)
+    references donat.process_definition_versions(
+      source_name, process_name, revision
+    )
 );
 
 donat.process_events(
-  id uuid primary key,
-  instance_id uuid not null references donat.process_instances(id),
+  source_name text not null,
+  id uuid not null,
+  instance_id uuid not null,
   process_name text not null,
   revision text not null,
   kind text not null check (kind in (
@@ -689,15 +1401,20 @@ donat.process_events(
   attempts integer not null default 0 check (attempts >= 0),
   created_at timestamptz not null default now(),
   consumed_at timestamptz,
-  foreign key(process_name, revision)
-    references donat.process_definition_versions(process_name, revision)
+  primary key(source_name, id),
+  foreign key(source_name, instance_id)
+    references donat.process_instances(source_name, id),
+  foreign key(source_name, process_name, revision)
+    references donat.process_definition_versions(
+      source_name, process_name, revision
+    )
 )
-unique(process_name, revision, kind, idempotency_key)
+unique(source_name, process_name, revision, kind, idempotency_key)
   where idempotency_key is not null;
 
 donat.process_signal_requests(
-  id uuid primary key,
   source_name text not null,
+  id uuid not null,
   process_name text not null,
   process_revision text not null,
   signal_name text not null,
@@ -712,15 +1429,19 @@ donat.process_signal_requests(
   )),
   created_at timestamptz not null default now(),
   consumed_at timestamptz,
-  unique(command_invocation_id, effect_position),
-  foreign key(process_name, process_revision)
-    references donat.process_definition_versions(process_name, revision)
+  primary key(source_name, id),
+  unique(source_name, command_invocation_id, effect_position),
+  foreign key(source_name, process_name, process_revision)
+    references donat.process_definition_versions(
+      source_name, process_name, revision
+    )
 );
 
 donat.process_activity_jobs(
-  id uuid primary key,
-  instance_id uuid not null references donat.process_instances(id),
-  enqueued_from_event_id uuid not null references donat.process_events(id),
+  source_name text not null,
+  id uuid not null,
+  instance_id uuid not null,
+  enqueued_from_event_id uuid not null,
   state_name text not null,
   logical_activity_id text not null,
   connector_instance text not null,
@@ -728,7 +1449,7 @@ donat.process_activity_jobs(
   serialization_key_hash bytea,
   input_json jsonb not null,
   result_json jsonb,
-  idempotency_key text not null,
+  request_fingerprint text not null,
   status text not null check (status in (
     'scheduled','running','succeeded','failed','cancelled'
   )),
@@ -741,14 +1462,37 @@ donat.process_activity_jobs(
   last_error_json jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique(instance_id, logical_activity_id)
+  primary key(source_name, id),
+  unique(source_name, instance_id, logical_activity_id),
+  foreign key(source_name, instance_id)
+    references donat.process_instances(source_name, id),
+  foreign key(source_name, enqueued_from_event_id)
+    references donat.process_events(source_name, id)
 );
 
+donat.process_activity_provider_steps(
+  source_name text not null,
+  activity_job_id uuid not null,
+  logical_activity_id text not null,
+  compiled_step_id text not null,
+  idempotency_key text not null,
+  first_provider_attempt_at timestamptz not null,
+  maximum_send_deadline_at timestamptz not null,
+  usable_window_expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  primary key(source_name, logical_activity_id, compiled_step_id),
+  unique(source_name, activity_job_id, compiled_step_id),
+  foreign key(source_name, activity_job_id)
+    references donat.process_activity_jobs(source_name, id)
+);
+index(source_name, usable_window_expires_at);
+
 donat.process_transition_logs(
-  id uuid primary key,
-  instance_id uuid not null references donat.process_instances(id),
-  event_id uuid references donat.process_events(id),
-  activity_job_id uuid references donat.process_activity_jobs(id),
+  source_name text not null,
+  id uuid not null,
+  instance_id uuid not null,
+  event_id uuid,
+  activity_job_id uuid,
   activity_attempt integer,
   from_state text,
   to_state text,
@@ -758,15 +1502,23 @@ donat.process_transition_logs(
   before_state_hash bytea,
   after_state_hash bytea,
   redacted_context jsonb not null,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  primary key(source_name, id),
+  foreign key(source_name, instance_id)
+    references donat.process_instances(source_name, id),
+  foreign key(source_name, event_id)
+    references donat.process_events(source_name, id),
+  foreign key(source_name, activity_job_id)
+    references donat.process_activity_jobs(source_name, id)
 )
-unique(instance_id, event_id) where event_id is not null;
-unique(activity_job_id, activity_attempt, outcome)
+unique(source_name, instance_id, event_id) where event_id is not null;
+unique(source_name, activity_job_id, activity_attempt, outcome)
   where activity_job_id is not null and activity_attempt is not null;
 
 donat.process_capacity_reservations(
-  id uuid primary key,
-  activity_job_id uuid not null references donat.process_activity_jobs(id),
+  source_name text not null,
+  id uuid not null,
+  activity_job_id uuid not null,
   connector_instance text not null,
   operation text not null,
   serialization_key_hash bytea,
@@ -774,13 +1526,31 @@ donat.process_capacity_reservations(
   reserved_at timestamptz not null,
   expires_at timestamptz not null,
   released_at timestamptz,
-  unique(activity_job_id, lease_token)
+  primary key(source_name, id),
+  unique(source_name, activity_job_id, lease_token),
+  foreign key(source_name, activity_job_id)
+    references donat.process_activity_jobs(source_name, id)
 );
-index(connector_instance, operation, expires_at);
-index(connector_instance, operation, serialization_key_hash, expires_at);
+index(source_name, connector_instance, operation, expires_at);
+index(
+  source_name, connector_instance, operation,
+  serialization_key_hash, expires_at
+);
+
+donat.process_capacity_buckets(
+  source_name text not null,
+  connector_instance text not null,
+  operation text not null,
+  available_tokens numeric(38,18) not null
+    check (available_tokens >= 0),
+  last_refill_at timestamptz not null,
+  policy_fingerprint text not null,
+  primary key(source_name, connector_instance, operation)
+);
 
 donat.process_inbound_deliveries(
-  id uuid primary key,
+  source_name text not null,
+  id uuid not null,
   connector_instance text not null,
   provider_event_id text,
   payload_digest bytea not null,
@@ -791,44 +1561,78 @@ donat.process_inbound_deliveries(
     'accepted','duplicate','unmatched','ambiguous','guard_false',
     'unexpected_state','invalid_signature'
   )),
+  instance_id uuid,
+  process_event_id uuid,
   redacted_metadata jsonb not null,
-  received_at timestamptz not null default now()
+  received_at timestamptz not null default now(),
+  primary key(source_name, id),
+  foreign key(source_name, instance_id)
+    references donat.process_instances(source_name, id),
+  foreign key(source_name, process_event_id)
+    references donat.process_events(source_name, id),
+  check (
+    (outcome = 'accepted'
+      and instance_id is not null
+      and process_event_id is not null)
+    or
+    (outcome <> 'accepted'
+      and instance_id is null
+      and process_event_id is null)
+  )
 );
+index(source_name, instance_id, received_at)
+  where instance_id is not null;
 
 donat.process_inbound_events(
-  id uuid primary key,
+  source_name text not null,
+  id uuid not null,
   connector_instance text not null,
   provider_event_id text not null,
-  first_delivery_id uuid not null
-    references donat.process_inbound_deliveries(id)
-    deferrable initially deferred,
+  first_delivery_id uuid not null,
   payload_digest bytea not null,
   verified_at timestamptz not null,
-  unique(connector_instance, provider_event_id)
+  primary key(source_name, id),
+  unique(source_name, connector_instance, provider_event_id),
+  foreign key(source_name, first_delivery_id)
+    references donat.process_inbound_deliveries(source_name, id)
+    deferrable initially deferred
 );
 ~~~
 
 No process table has a foreign key to `donat.command_invocations` or
 `donat.command_invocation_claims`. Indexes cover due event/start/signal/job
 status and `available_at`, activity lease expiry, instance process/state
-correlation, definition status, inbound received time, and capacity expiry.
+correlation, definition status, source-qualified inbound received/instance
+time, and capacity expiry. Every primary, foreign, partial-unique, semantic
+dedupe, due-work, and reconciliation predicate begins with `source_name`;
+two metadata source names sharing one physical database therefore remain
+disjoint even when process names, UUIDs, and semantic keys are identical.
+`process_activity_provider_steps` has a row only for a
+provider-idempotent side-effecting compiled step. Its database-clock
+`first_provider_attempt_at`, derived stable key, compiled maximum-send
+deadline, and immutable usable-window deadline are inserted and committed
+before that step's first network send; retry and takeover observe the same
+row.
 
 ## 8. Start consumption and command transitions
 
 The start worker claims one pending request with
 `FOR UPDATE SKIP LOCKED` in the request's source pool. In one short
-transaction it loads the exact stored revision, validates the canonical input,
+transaction it resolves the exact `(source_name, process_name, revision)` from
+the Engine's immutable `deployed_process_catalog`, validates the canonical input,
 inserts or finds the instance by
-`(process_name, start_idempotency_key)`, appends the start event and transition
-log for a new instance, records duplicate outcome for an existing semantic
-instance, and marks the request consumed. A crash before commit leaves the
-request pending; a crash after commit cannot create a second instance.
+`(source_name, process_name, start_idempotency_key)`, appends the start event
+and transition log for a new instance, records duplicate outcome for an
+existing semantic instance, and marks the request consumed. It never compiles
+metadata or substitutes the current declaration. A crash before commit leaves
+the request pending; a crash after commit cannot create a second instance.
 
 Every ordinary transition locks one due event and its instance, verifies the
-pinned definition/runtime ABI, evaluates its closed guard context, compares
-the optimistic instance version, writes the transition log and next
+pinned deployed definition/runtime ABI, evaluates its closed guard context,
+compares the optimistic instance version, writes the transition log and next
 event/timer/activity, and marks the event consumed in one short outer
-transaction.
+transaction. The worker refuses a revision absent from
+`deployed_process_catalog`; it does not fall back to `process_catalog`.
 
 When a transition invokes a command, the process transition owns that outer
 Postgres transaction. The worker builds:
@@ -863,40 +1667,97 @@ Neither path accepts raw SQL or constructs a new error envelope.
 
 A state transition gives each activity one deterministic
 `logical_activity_id` from the process revision, instance, triggering event,
-and state name. Its provider idempotency key is derived once from that ID and
-is unchanged by retries, crash recovery, or lease takeover.
+and state name. That logical ID is not itself an HTTP header. For each
+side-effecting compiled step, Section 2.3 derives a distinct provider key from
+the logical ID, fixed provider scope, and step ID. The per-step key and
+database-clock first-attempt time are unchanged by retries, crash recovery,
+or lease takeover. A `ReadOnly` operation is headerless.
 
-An activity claim transaction:
+`permits` and `burst` are positive integers and `per` is a positive duration.
+They define a token bucket with refill rate `permits / per` and maximum
+`burst`; one activity start consumes exactly one token. `max_in_flight` is a
+separate positive upper bound on unexpired, unreleased reservations. A token
+is never refunded because the rate policy limits starts, while releasing or
+expiring a reservation restores only an in-flight slot.
 
-1. locks one scheduled due job with `FOR UPDATE SKIP LOCKED`;
-2. compares `schedule_to_start_deadline` with the owning source's database
-   clock;
-3. under a source-local Postgres coordination lock, checks unexpired
-   `process_capacity_reservations` against `max_in_flight`, the rolling
-   permits/per/burst policy, and the optional serialization-key hash;
-4. inserts one reservation, assigns a random lease token, increments attempt,
-   and stores start-to-close/lease deadlines;
-5. commits before calling the connector.
+An activity claim uses this exact transaction protocol:
 
-Unavailable capacity leaves the job scheduled and closes the transaction.
-The connector receives immutable typed input, stable idempotency key, and
-deadline only. It receives no pool, role, mutable process, arbitrary transport
-request, or secret-bearing logger.
+1. Select one scheduled due job in the source with
+   `FOR UPDATE SKIP LOCKED`; read `db_now = statement_timestamp()` once.
+2. If `schedule_to_start_deadline <= db_now`, append its timeout event and
+   finish without touching capacity.
+3. Insert the `(source_name, connector_instance, operation)` bucket with
+   `available_tokens = burst`, `last_refill_at = db_now`, and the pinned
+   capacity-policy fingerprint using `ON CONFLICT DO NOTHING`.
+4. Lock that one bucket row `FOR UPDATE`. Every claimant acquires locks in
+   job-then-bucket order and an activity references exactly one bucket, so no
+   transaction holds multiple bucket locks. A fingerprint mismatch is an
+   invariant failure; reconciliation may replace/reset a bucket policy only
+   after no active or live-retired revision references the prior descriptor.
+5. Mark expired unreleased reservations for this bucket released at `db_now`.
+   Count only rows with `released_at IS NULL AND expires_at > db_now`.
+   Reject capacity when that count is `>= max_in_flight`. If
+   `serialize_by` is present, also reject when one such row has the same
+   non-null `serialization_key_hash`.
+6. Refill with exact numeric arithmetic:
+   `tokens = min(burst, available_tokens + elapsed_ms * permits / per_ms)`,
+   where `elapsed_ms = max(0, db_now - last_refill_at)`. Persist `tokens` and
+   `last_refill_at = db_now`. If `tokens < 1`, leave the job scheduled and set
+   `available_at` to
+   `db_now + ceil((1 - tokens) * per_ms / permits)` milliseconds.
+7. Otherwise subtract one token, insert one reservation, assign a random lease
+   token, increment the job attempt, and store start-to-close and lease
+   deadlines in that same transaction.
+8. Commit before calling the connector. Any database error rolls back the
+   bucket, reservation, and job together and makes no provider call.
+
+Unavailable max-in-flight or serialization capacity leaves the job scheduled
+without consuming a token. Because every decision is made while holding the
+durable bucket row lock, two connections cannot both observe and consume the
+same last slot or token.
+After the claim transaction commits, the activity runtime may invoke only the
+pinned connector operation. For a provider-idempotent compiled step it opens
+a separate short transaction immediately before the first network send,
+inserts or reads
+`(source_name, logical_activity_id, compiled_step_id)` in
+`process_activity_provider_steps` using `statement_timestamp()`, derives the
+fixed step key, stores
+`maximum_send_deadline_at = first_provider_attempt_at +
+maximum_send_horizon_ms` and
+`usable_window_expires_at = first_provider_attempt_at +
+(minimum_retention_ms - clock_safety_margin_ms)`, and commits. Before every
+retry/takeover send it reads the same row using the database clock. Equality
+with both deadlines is allowed. A later instant permanently refuses network
+I/O; exceeding the provider window yields
+`connector_idempotency_window_exhausted`, while exceeding the smaller compiled
+execution horizon yields the typed timeout path. Neither path rotates the key.
+
+The connector receives immutable typed input, the logical activity identity,
+canonical request fingerprint, deadline/control capability, and only the
+per-step fixed idempotency binding when the pinned effect requires it. It
+receives no pool, role, mutable process, arbitrary transport request, retry
+policy, process transition, timer, command, or secret-bearing logger.
+Provider-specific business logic executes only here after committed intent;
+the command planner, command SQL, and command-transition savepoint never call
+a connector.
 
 Completion uses a new short transaction and updates only a job whose current
 lease token still matches. It stores the result/failure, releases the
 reservation, and appends one completion event atomically. A stale completion
 cannot advance the instance and receives an append-only attempt audit.
 
-`schedule_to_start` is measured from enqueue and makes no provider call when
-expired. `start_to_close` is measured from claim and makes a late completion
-stale. Phase 1 has no heartbeat extension.
+`schedule_to_start` is measured from each attempt's scheduled
+`available_at`—initially activity enqueue, then the bounded retry
+`available_at`—and makes no provider call when expired. `start_to_close` is
+measured from claim and makes a late completion stale. Phase 1 has no
+heartbeat extension.
 
 `max_attempts` includes the first attempt. Retry delay is
 `min(max_interval, initial_interval * 2^(attempt-1))`, with deterministic full
 jitter derived from logical activity ID and attempt. `Retry-After` may
-postpone, never accelerate. Exhaustion appends `retry_exhausted`. No retry is
-implicit or infinite.
+postpone, never accelerate, but a value beyond the declared upper bound
+terminates that retry path without another send. Exhaustion appends
+`retry_exhausted`. No retry is implicit or infinite.
 
 ## 10. Timers, command signals, and verified inbound delivery
 
@@ -912,7 +1773,7 @@ bytes before parsing and returns only its typed verified event contract.
 Inbound persistence is deliberately split:
 
 - `process_inbound_events` is only the verified provider-event dedupe ledger,
-  unique on `(connector_instance, provider_event_id)`;
+  unique on `(source_name, connector_instance, provider_event_id)`;
 - `process_inbound_deliveries` is append-only audit for every delivery attempt.
 
 A verified delivery writes its delivery audit row and inserts or observes the
@@ -924,6 +1785,15 @@ with `duplicate` while preserving the original dedupe row and transition.
 An invalid signature has no trusted provider ID requirement and writes only
 one redacted delivery row with `invalid_signature`; it never writes the dedupe
 ledger or process state.
+
+An `accepted` transaction creates the process event first and sets both
+`process_inbound_deliveries.instance_id` and `process_event_id` before commit.
+Every other outcome leaves both links null. Consequently instance inspection
+uses the indexed relational predicate
+`delivery.source_name = instance.source_name AND
+delivery.instance_id = instance.id`; it never joins on redacted payloads or
+provider text. A duplicate remains independently auditable but links to no new
+event because it creates none; the original accepted delivery remains linked.
 
 The route acknowledges a verified provider event only after the complete
 transaction commits. A post-verification database failure is not
@@ -950,12 +1820,13 @@ audit-only. Compensation is an explicit state, never reverse SQL.
 | guard false | event consumed, `guard_false` audit, state unchanged |
 | valid structured command rejection | command savepoint rolled back; exactly one `on_rejection` transition commits |
 | any other command/database error | outer transition aborts; no rejection transition commits |
-| retryable selected connector error | job rescheduled with deterministic delay and same key |
+| retryable selected connector error | job rescheduled with deterministic delay and the same fixed key for each re-sent side-effect step |
 | non-retried connector error | typed completion event follows the first matching route or fallback |
 | retry limit | `retry_exhausted` follows the declared route or fallback |
 | capacity or serialization unavailable | job remains scheduled; no provider call |
 | schedule-to-start timeout | typed timeout event; no provider call |
 | start-to-close timeout or stale completion | current lease may be retried; stale completion is audit-only |
+| provider idempotency window exhausted | permanent typed failure before network I/O; the fixed step key is not rotated |
 | duplicate start semantic key | request is duplicate; existing instance is unchanged |
 | duplicate verified provider event | new delivery audit plus existing dedupe row; no second process event |
 | invalid signature | delivery audit only |
@@ -964,8 +1835,9 @@ audit-only. Compensation is an explicit state, never reverse SQL.
 | missing pinned definition/ABI | invariant audit and claim stop; no invented transition |
 
 A terminal instance treats later signals, timers, and completions as
-audit-only. Removing a definition blocks new starts but never reinterprets or
-silently discards a live instance.
+audit-only. `lifecycle: retired` blocks new starts but keeps the complete
+declaration and executable dependency closure until every instance is
+terminal; omission while live is a deployment error.
 
 ## 12. Test-first acceptance matrix
 
@@ -974,31 +1846,50 @@ a native conformance fixture. The focused identifiers are normative:
 
 | Test ID | Level | Required proof |
 | --- | --- | --- |
+| `value_type_language_is_closed_and_canonical` | value-contract unit | aliases, scalar JSON semantics, named refs, recursion, requiredness, and assignability use one parser in the `no_std + alloc` owner |
+| `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
 | `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
 | `connector_descriptor_is_typed_and_non_secret` | server unit | HTTP/Stripe descriptors contain exact contracts and no secret values |
+| `connector_effect_model_is_closed_and_per_step` | server unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |
+| `connector_effect_retention_boundary_is_exact` | process compiler | every step accepts horizon equality, rejects one millisecond over, and uses checked arithmetic |
+| `connector_effect_multistep_coverage_is_total` | process compiler | every side-effecting step has one independent binding/scope/window and read-only steps have none |
 | `http_template_slots_require_declared_types` | metadata/server unit | path/query/header/body slots reject undeclared or incompatible input |
+| `http_request_headers_preserve_static_yaml_and_add_typed_input` | metadata serde | legacy `{name,value}` round-trips and exactly one static/input value is accepted |
 | `process_metadata_requires_start_and_cancellation_shape` | metadata unit | canonical grammar includes start and typed cancellation |
+| `process_metadata_state_and_binding_unions_are_closed` | metadata serde | every Section 3 variant round-trips; mixed/unknown/context-invalid forms reject |
 | `process_candidate_build_is_cycle_free` | state unit | descriptors, process revisions, effect finalization, and schema compile in the required order |
 | `process_rejects_cross_source_command` | process compiler | start, transition, start effect, and signal effect cannot cross source |
 | `process_connector_instance_has_one_source` | process compiler | one connector instance cannot coordinate two process sources |
 | `process_deployment_selects_one_real_source` | migrate integration | selected source alone is introspected/reconciled; omitted ambiguous source fails |
+| `metadata_free_migrate_preserves_refinery_only_mode` | CLI integration | explicit URL plus no metadata applies migrations without source selection or reconciliation |
+| `serve_with_readonly_role_issues_no_ddl` | state/Postgres | startup succeeds without schema-create privilege and SQL capture contains no DDL |
 | `process_v6_schema_is_exact` | migrate integration | every Section 7 column/key/index exists and no command-journal FK exists |
+| `process_sources_sharing_database_are_isolated` | Postgres integration | identical names, UUIDs, and semantic keys in two source namespaces do not collide |
+| `process_live_connector_rebind_is_rejected` | reconcile integration | active/live-retired source-A descriptor prevents binding that instance to source B |
+| `process_retired_revision_reloads_and_completes` | restart integration | A starts, explicit retirement rejects new start, fresh Engine loads and completes/verifies A |
 | `command_invocation_id_replays_unchanged` | SQLgen/Postgres | exact replay preserves UUID |
 | `command_invocation_id_changes_after_expiry` | SQLgen/Postgres | expired-key execution gets a new UUID |
 | `command_effect_positions_share_generation` | SQLgen/Postgres | multiple positions copy one invocation UUID and remain individually unique |
 | `process_start_request_pins_revision` | command/process integration | request under A consumed after B deploy starts A |
 | `process_start_semantic_dedupe_is_separate` | process integration | distinct invocation UUIDs with one semantic key create one instance |
 | `process_session_variables_are_closed` | compiler/runtime | missing/extra/ambient mappings reject; worker uses only compiled values |
-| `process_command_rejection_commits_on_rejection` | Postgres integration | domain DML rolls back while one rejection transition commits |
+| `process_command_later_assert_commits_on_rejection` | Postgres integration | valid write then later assert rolls back domain DML while one rejection transition commits |
+| `process_command_guard_prevents_first_write` | Postgres integration | a false guard reaches no domain CTE and follows the declared rejection behavior |
 | `process_command_database_error_aborts_outer` | Postgres integration | non-P0D01 error commits no process writes |
-| `process_activity_does_not_hold_tx` | recording connector | provider wait begins only after lease transaction commits |
-| `process_lease_takeover_is_safe` | two binaries | stable key, one transition, stale audit |
+| `process_activity_does_not_hold_tx` | recording connector/Postgres observer | provider stub accepts only after another connection sees committed job and capacity intent |
+| `process_provider_logic_is_activity_only` | planner/runtime | command planning/execution cannot invoke a connector; only a committed activity dispatch can |
+| `process_lease_takeover_is_safe` | two binaries | read-only takeover is headerless; provider mutation reuses each stable step key; one transition and stale audit |
+| `process_late_takeover_refuses_before_io` | two binaries/clock | database time after the usable window produces `connector_idempotency_window_exhausted` and zero provider calls |
 | `process_activity_capacity_is_global` | two binaries | max/rate/serialization policies hold in one source |
+| `process_capacity_bucket_serializes_two_claimers` | two Postgres connections | a barrier race cannot oversubscribe the last slot/token or serialization key |
 | `process_timer_survives_restart` | controlled DB clock | timer fires once without in-memory state |
 | `process_inbound_audit_is_split` | webhook integration | accepted plus duplicate create two deliveries, one dedupe row, one transition |
+| `process_accepted_delivery_links_instance_history` | webhook/inspect integration | accepted row links source/instance/event and appears in that instance timeline |
 | `process_invalid_signature_is_audit_only` | webhook integration | invalid signature creates delivery only and permits absent provider ID |
 | `process_signal_is_not_buffered` | command/webhook integration | early/late signal cannot advance a later wait |
 | `process_revision_runtime_abi_is_fenced` | rolling deployment | incompatible worker cannot claim pinned work |
+| `process_grammar_has_no_workflow_nodes_or_items` | metadata/runtime | the five state variants are closed; node/item/loop/subworkflow spellings reject |
+| `connector_pagination_is_bounded_transport_only` | connector/runtime | pages stay inside one activity budget and cannot create process state, branch, retry, timer, command, or DB write |
 | `process_no_management_api` | route/schema test | no process management field or route is published |
 
 Focused tests rebuild `cargo build -p donat-server --bin donat` before native
@@ -1015,12 +1906,14 @@ donat process inspect --source <name> --instance <uuid>
 donat process verify-history --source <name> --instance <uuid>
 ~~~
 
-Both are read-only. Inspect emits a redacted journal timeline.
-Verify-history reapplies stored events and stored command/activity results to
-the pinned definition and exits non-zero on a before/after-state-hash
-mismatch. Neither subcommand invokes a command or connector, changes a row or
-lease, accepts arbitrary SQL or a role, or publishes an HTTP surface. They are
-not retry, replay, repair, cancellation, or definition-mutation tools.
+Both are read-only. Inspect emits a redacted journal timeline and selects
+deliveries only by indexed `(source_name, instance_id)`. Verify-history loads
+the hash-verified revision from `deployed_process_catalog`, reapplies stored
+events and stored command/activity results, and exits non-zero on a
+before/after-state-hash mismatch. Neither subcommand invokes a command or
+connector, changes a row or lease, accepts arbitrary SQL or a role, or
+publishes an HTTP surface. They are not retry, replay, repair, cancellation,
+or definition-mutation tools.
 
 ## 14. Provenance and no-copy treatment
 
@@ -1030,7 +1923,9 @@ behavior/test-category references under
 This process contract copies no upstream source, fixture, generated artifact,
 schema, or large text. Stripe Checkout contracts are independently expressed
 by the fixed Rust descriptor already admitted under the existing Stripe
-records. No n8n-derived code, fixture, module, or reference is added.
+records. No n8n-derived code, fixture, module, or reference is added. In
+particular this design does not port logical/workflow nodes, item or
+paired-item semantics, loops, batching-as-workflow, or subworkflows.
 
 A future source-level import requires a separately admitted exact source file,
 immutable revision, hash, license/notice, destination, failing-first Donat
@@ -1040,10 +1935,10 @@ test, and reviewer before the imported artifact lands.
 
 | Area | Required owner | Prohibited shortcut |
 | --- | --- | --- |
-| normalized value contracts | `donat-ir` | separate command/process/connector type checkers |
+| normalized value contracts | `donat-value-contract`; `donat-ir` re-exports | second IR/command/process/connector value representation |
 | command descriptors/effect catalog | `donat-schema` | schema dependency on server or post-plan raw metadata lookup |
 | process compiler/runtime | `donat-server::processes` and one `Engine` snapshot catalog | separate workflow service or mutable global definition |
-| connector contracts | existing compiled connector registry | duplicated protocol compiler, dynamic module, or n8n port |
+| connector contracts | existing compiled connector registry | duplicated protocol compiler, dynamic module, workflow node/item model, or connector-owned business branching |
 | DDL/reconciliation | V6 plus source-qualified `donat migrate` | serve-time DDL or reconciliation |
 | business writes | existing explicit-role command IR/SQLgen path | hand-written process business SQL or admin role |
 | process journals | short source-local Postgres transactions | distributed transaction or external I/O under transaction |
