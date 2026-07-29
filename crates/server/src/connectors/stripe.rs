@@ -20,11 +20,12 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use super::{
     ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
+    canonical_json_sha256,
     http::{MAX_HTTP_BODY_BYTES, is_public_address},
 };
 
@@ -473,7 +474,7 @@ impl StripeConnector {
             .and_then(|value| value.to_str().ok())
             .ok_or(WebhookRejection::MissingSignature)?;
         let (timestamp, signatures) = parse_stripe_signature(signature)?;
-        if now.saturating_sub(timestamp).unsigned_abs() > WEBHOOK_TIMESTAMP_TOLERANCE as u64 {
+        if now.abs_diff(timestamp) > WEBHOOK_TIMESTAMP_TOLERANCE as u64 {
             return Err(WebhookRejection::TimestampOutOfTolerance);
         }
         let mut mac = HmacSha256::new_from_slice(self.webhook_secret.as_bytes())
@@ -809,18 +810,13 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn canonical_input_fingerprint(input: &JsonValue) -> String {
-    let bytes = serde_json::to_vec(input).expect("validated Stripe input serializes");
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 pub(crate) async fn execute_checkout_from_json(
     connector: &StripeConnector,
     input: JsonValue,
     idempotency_key: &str,
     deadline: tokio::time::Instant,
 ) -> Result<ConnectorSuccess, ConnectorFailure> {
-    let fingerprint = canonical_input_fingerprint(&input);
+    let fingerprint = canonical_json_sha256(&input);
     let input = CheckoutSessionInput::from_json(input)?;
     let session = connector
         .create_checkout_session(input, idempotency_key, deadline)
@@ -882,13 +878,14 @@ mod tests {
         response::IntoResponse,
         routing::post,
     };
+    use hmac::Mac;
     use serde_json::json;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
     use super::{
-        super::ConnectorErrorClass, CheckoutLineItem, CheckoutMode, CheckoutSessionInput,
-        StripeConnector,
+        super::{ConnectorErrorClass, canonical_json_sha256},
+        CheckoutLineItem, CheckoutMode, CheckoutSessionInput, HmacSha256, StripeConnector,
     };
 
     const WEBHOOK_SECRET: &str = "whsec_independent_test_secret";
@@ -952,6 +949,21 @@ mod tests {
             value.parse().expect("test signature syntax is valid"),
         );
         headers
+    }
+
+    fn signed_signature_headers(timestamp: i64, raw_body: &[u8]) -> HeaderMap {
+        let mut mac = HmacSha256::new_from_slice(WEBHOOK_SECRET.as_bytes())
+            .expect("test webhook secret is a valid HMAC key");
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(raw_body);
+        let signature = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        signature_headers(&format!("t={timestamp},v1={signature}"))
     }
 
     #[tokio::test]
@@ -1165,6 +1177,22 @@ mod tests {
     }
 
     #[test]
+    fn stripe_request_fingerprint_is_independent_of_json_object_key_order() {
+        let first = canonical_json_sha256(&json!({
+            "mode": "payment",
+            "line_items": [{ "price": "price_basic", "quantity": 1 }],
+            "redirects": { "success": "https://merchant.example.test/success", "cancel": "https://merchant.example.test/cancel" }
+        }));
+        let reordered = canonical_json_sha256(&json!({
+            "redirects": { "cancel": "https://merchant.example.test/cancel", "success": "https://merchant.example.test/success" },
+            "line_items": [{ "quantity": 1, "price": "price_basic" }],
+            "mode": "payment"
+        }));
+
+        assert_eq!(first, reordered);
+    }
+
+    #[test]
     fn stripe_webhook_verifies_raw_bytes_before_json_and_exposes_duplicate_identity() {
         // This fails if JSON is parsed before HMAC validation, if verification
         // uses a re-serialized body, or if an ingress caller cannot use the
@@ -1233,6 +1261,15 @@ mod tests {
             )
             .expect_err("timestamps older than the five-minute tolerance are rejected");
         assert_eq!(stale.code(), "stripe_signature_timestamp_out_of_tolerance");
+
+        let future = connector
+            .verify_completed_webhook_at(
+                &signed_signature_headers(1_700_000_301, COMPLETED_BODY),
+                COMPLETED_BODY,
+                1_700_000_000,
+            )
+            .expect_err("a valid signature from far in the future is rejected");
+        assert_eq!(future.code(), "stripe_signature_timestamp_out_of_tolerance");
 
         const UNSUPPORTED_BODY: &[u8] = br#"{"id":"evt_test_other","type":"payment_intent.succeeded","data":{"object":{"object":"payment_intent","id":"pi_test_42","client_reference_id":"00000000-0000-4000-8000-000000000042","payment_status":"paid"}}}"#;
         const UNSUPPORTED_SIGNATURE: &str =

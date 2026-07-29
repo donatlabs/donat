@@ -163,6 +163,83 @@ async fn consistency_rejects_static_http_operation_profile_errors_without_resolv
     );
 }
 
+#[tokio::test]
+async fn consistency_rejects_static_http_config_errors_without_resolving_environment_values() {
+    let mut private_network = valid_http_connector();
+    private_network["name"] = json!("private_network");
+    private_network["config"]["base_url"] =
+        json!({ "value_from_env": "DONAT_TEST_UNRESOLVED_HTTP_BASE_URL" });
+    private_network["config"]["headers"] = json!([{
+        "name": "Authorization",
+        "value_from_env": "DONAT_TEST_UNRESOLVED_HTTP_CREDENTIAL"
+    }]);
+    private_network["config"]["network_policy"] = json!("private_allowed");
+
+    let mut invalid_scheme = valid_http_connector();
+    invalid_scheme["name"] = json!("invalid_scheme");
+    invalid_scheme["config"]["base_url"] = json!("ftp://logistics.example.test");
+
+    let mut invalid_userinfo = valid_http_connector();
+    invalid_userinfo["name"] = json!("invalid_userinfo");
+    invalid_userinfo["config"]["base_url"] =
+        json!("https://username:password@logistics.example.test");
+
+    let mut invalid_query = valid_http_connector();
+    invalid_query["name"] = json!("invalid_query");
+    invalid_query["config"]["base_url"] = json!("https://logistics.example.test?next=other");
+
+    let mut invalid_fragment = valid_http_connector();
+    invalid_fragment["name"] = json!("invalid_fragment");
+    invalid_fragment["config"]["base_url"] = json!("https://logistics.example.test#other");
+
+    let mut duplicate_operation = valid_http_connector();
+    duplicate_operation["name"] = json!("duplicate_operation");
+    let repeated = duplicate_operation["operations"][0].clone();
+    duplicate_operation["operations"]
+        .as_array_mut()
+        .expect("operations is an array")
+        .push(repeated);
+
+    let dir = write_metadata_dir(json!([
+        private_network,
+        invalid_scheme,
+        invalid_userinfo,
+        invalid_query,
+        invalid_fragment,
+        duplicate_operation,
+    ]));
+    let problems = check_consistency("postgres://unreachable", &dir)
+        .await
+        .expect("static HTTP configuration errors are returned before DB or env resolution");
+    let _ = std::fs::remove_dir_all(&dir);
+    let rendered = problems.join("\n");
+
+    assert!(
+        rendered.contains("network_policy must be public_only"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("base_url must be an absolute HTTP(S) URL"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("base URL must not contain userinfo"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("base_url must not contain query or fragment"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("http connector operation is declared more than once"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("environment value is unavailable"),
+        "consistency must not resolve environment values: {rendered}"
+    );
+}
+
 #[test]
 fn connector_startup_accepts_non_secret_identities_and_named_capacity() {
     let metadata = metadata(json!([valid_http_connector()]));

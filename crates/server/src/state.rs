@@ -160,6 +160,12 @@ fn validate_connector_config(
                     "base_url is required for the http connector",
                 ));
             }
+            if let Err(error) = crate::connectors::http::validate_http_config_metadata(config) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    error.to_string(),
+                ));
+            }
         }
         "stripe" => {
             if config.secret_key.is_none() {
@@ -182,22 +188,6 @@ fn validate_connector_config(
             }
         }
         _ => {}
-    }
-
-    if let Some(ConnectorBaseUrl::Literal(base_url)) = &config.base_url {
-        match reqwest::Url::parse(base_url) {
-            Ok(url) if !url.username().is_empty() || url.password().is_some() => {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.base_url"),
-                    "base URL must not contain userinfo",
-                ));
-            }
-            Ok(_) => {}
-            Err(_) => errors.push(ConnectorConfigError::new(
-                format!("{path}.config.base_url"),
-                "base_url must be an absolute URL",
-            )),
-        }
     }
 
     for (field, variable) in connector_environment_variables(config) {

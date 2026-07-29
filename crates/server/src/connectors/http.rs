@@ -4,7 +4,7 @@
 //! declared slots.  There is intentionally no API accepting a caller-supplied
 //! URL, method, header name, redirect policy, or TLS policy.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
-    ExecutionContext,
+    ExecutionContext, canonical_json_sha256,
 };
 
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
@@ -67,19 +67,7 @@ pub struct HttpConnectorConfig {
 
 impl HttpConnectorConfig {
     pub fn new(base_url: &str, headers: Vec<ConfiguredHeader>) -> Result<Self, HttpConfigError> {
-        let base_url = Url::parse(base_url)
-            .map_err(|_| HttpConfigError::new("base_url must be an absolute HTTP(S) URL"))?;
-        if !matches!(base_url.scheme(), "http" | "https")
-            || base_url.host_str().is_none()
-            || !base_url.username().is_empty()
-            || base_url.password().is_some()
-            || base_url.query().is_some()
-            || base_url.fragment().is_some()
-        {
-            return Err(HttpConfigError::new(
-                "base_url must be an absolute HTTP(S) URL without userinfo, query, or fragment",
-            ));
-        }
+        let base_url = validate_http_base_url(base_url)?;
         let mut header_names = HashSet::new();
         let mut resolved_headers = HeaderMap::new();
         for header in headers {
@@ -128,6 +116,44 @@ impl fmt::Display for HttpConfigError {
 }
 
 impl std::error::Error for HttpConfigError {}
+
+fn validate_http_base_url(base_url: &str) -> Result<Url, HttpConfigError> {
+    let base_url = Url::parse(base_url)
+        .map_err(|_| HttpConfigError::new("base_url must be an absolute HTTP(S) URL"))?;
+    if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
+        return Err(HttpConfigError::new(
+            "base_url must be an absolute HTTP(S) URL",
+        ));
+    }
+    if !base_url.username().is_empty() || base_url.password().is_some() {
+        return Err(HttpConfigError::new("base URL must not contain userinfo"));
+    }
+    if base_url.query().is_some() || base_url.fragment().is_some() {
+        return Err(HttpConfigError::new(
+            "base_url must not contain query or fragment",
+        ));
+    }
+    Ok(base_url)
+}
+
+/// Validate every HTTP instance setting that can be checked without resolving
+/// an environment value.  `validate` and `migrate` use this before opening a
+/// database connection; startup reuses it before reading configuration env.
+pub(crate) fn validate_http_config_metadata(
+    config: &ConnectorConfig,
+) -> Result<(), HttpConfigError> {
+    if config
+        .network_policy
+        .as_deref()
+        .is_some_and(|policy| policy != "public_only")
+    {
+        return Err(HttpConfigError::new("network_policy must be public_only"));
+    }
+    if let Some(ConnectorBaseUrl::Literal(base_url)) = &config.base_url {
+        validate_http_base_url(base_url)?;
+    }
+    Ok(())
+}
 
 /// A fixed HTTP method from the deployment operation declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,10 +551,10 @@ impl ValidatedHttpOperation {
     }
 }
 
-/// Validate one HTTP instance without resolving any environment value. This is
-/// shared by deploy-time metadata validation and registry construction so the
-/// same profile and header rules apply before a database connection or a
-/// listener can be opened.
+/// Validate static HTTP headers and operations without resolving any
+/// environment value. This is shared by deploy-time metadata validation and
+/// registry construction so the same profile and header rules apply before a
+/// database connection or a listener can be opened.
 pub(crate) fn validate_http_instance_metadata(
     config: &ConnectorConfig,
     operations: &[ConnectorOperation],
@@ -544,7 +570,13 @@ pub(crate) fn validate_http_instance_metadata(
         }
     }
 
+    let mut declared_operations = HashSet::new();
     for operation in operations {
+        if !declared_operations.insert(operation.name.as_str()) {
+            return Err(HttpConfigError::new(
+                "http connector operation is declared more than once",
+            ));
+        }
         let compiled = ValidatedHttpOperation::from_metadata(operation)?;
         if compiled
             .operation
@@ -640,27 +672,6 @@ fn valid_rate_period(value: &str) -> bool {
             .strip_suffix(unit)
             .and_then(|number| number.parse::<u64>().ok())
             .is_some_and(|number| number > 0)
-}
-
-fn canonical_input_fingerprint(input: &JsonValue) -> String {
-    fn canonical(value: &JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(object) => BTreeMap::from_iter(
-                object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), canonical(value))),
-            )
-            .into_iter()
-            .collect::<JsonMap<String, JsonValue>>()
-            .into(),
-            JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonical).collect()),
-            value => value.clone(),
-        }
-    }
-
-    let canonical = serde_json::to_vec(&canonical(input))
-        .expect("canonical connector input JSON always serializes");
-    format!("{:x}", Sha256::digest(canonical))
 }
 
 /// A DNS resolver seam.  Production uses [`SystemResolver`]; tests use a
@@ -929,6 +940,7 @@ impl HttpConnector {
     }
 
     pub fn from_metadata_config(config: &ConnectorConfig) -> Result<Self, HttpConfigError> {
+        validate_http_config_metadata(config)?;
         let base_url = match config.base_url.as_ref() {
             Some(ConnectorBaseUrl::Literal(value)) => value.clone(),
             Some(ConnectorBaseUrl::FromEnv(reference)) => std::env::var(&reference.value_from_env)
@@ -949,13 +961,6 @@ impl HttpConnector {
                 ConfiguredHeader::new(&header.name, &value)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if config
-            .network_policy
-            .as_deref()
-            .is_some_and(|policy| policy != "public_only")
-        {
-            return Err(HttpConfigError::new("network_policy must be public_only"));
-        }
         let config = HttpConnectorConfig::new(&base_url, headers)?;
         Ok(Self::with_components(
             config,
@@ -980,7 +985,7 @@ impl HttpConnector {
         input: JsonValue,
         context: ExecutionContext,
     ) -> Result<ConnectorSuccess, ConnectorFailure> {
-        let fingerprint = canonical_input_fingerprint(&input);
+        let fingerprint = canonical_json_sha256(&input);
         let mut success = self
             .execute_internal(operation, input, None, context)
             .await?;
@@ -999,7 +1004,7 @@ impl HttpConnector {
         // therefore cannot smuggle raw transport controls into an operation
         // whose request shape was fixed at deployment time.
         operation.validate_dispatch_input(&input)?;
-        let fingerprint = canonical_input_fingerprint(&input);
+        let fingerprint = canonical_json_sha256(&input);
         let mut success = self
             .execute_internal(
                 &operation.operation,
@@ -1361,6 +1366,9 @@ pub(crate) fn is_public_address(address: IpAddr) -> bool {
                 || fourth == 255 && first == 255 && second == 255 && third == 255)
         }
         IpAddr::V6(address) => {
+            if is_iana_non_global_ipv6(address) && !is_iana_global_ipv6_exception(address) {
+                return false;
+            }
             if let Some(mapped) = address.to_ipv4_mapped() {
                 return is_public_address(IpAddr::V4(mapped));
             }
@@ -1377,6 +1385,127 @@ pub(crate) fn is_public_address(address: IpAddr) -> bool {
                 && !(segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // discard-only 100::/64
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Ipv6Prefix {
+    segments: [u16; 8],
+    length: u8,
+}
+
+const IANA_NON_GLOBAL_IPV6_PREFIXES: &[Ipv6Prefix] = &[
+    // IANA IPv6 Special-Purpose Address Registry, Globally Reachable False
+    // or N/A (accessed 2026-07-29).
+    Ipv6Prefix {
+        segments: [0, 0, 0, 0, 0, 0, 0, 1],
+        length: 128,
+    }, // ::1/128
+    Ipv6Prefix {
+        segments: [0, 0, 0, 0, 0, 0, 0, 0],
+        length: 128,
+    }, // ::/128
+    Ipv6Prefix {
+        segments: [0, 0, 0, 0, 0, 0xffff, 0, 0],
+        length: 96,
+    }, // ::ffff:0:0/96
+    Ipv6Prefix {
+        segments: [0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0],
+        length: 48,
+    }, // 64:ff9b:1::/48
+    Ipv6Prefix {
+        segments: [0x0100, 0, 0, 0, 0, 0, 0, 0],
+        length: 64,
+    }, // 100::/64
+    Ipv6Prefix {
+        segments: [0x0100, 0, 0, 1, 0, 0, 0, 0],
+        length: 64,
+    }, // 100:0:0:1::/64
+    Ipv6Prefix {
+        segments: [0x2001, 0, 0, 0, 0, 0, 0, 0],
+        length: 23,
+    }, // 2001::/23
+    Ipv6Prefix {
+        segments: [0x2001, 0x0db8, 0, 0, 0, 0, 0, 0],
+        length: 32,
+    }, // 2001:db8::/32
+    Ipv6Prefix {
+        segments: [0x2002, 0, 0, 0, 0, 0, 0, 0],
+        length: 16,
+    }, // 2002::/16
+    Ipv6Prefix {
+        segments: [0x3fff, 0, 0, 0, 0, 0, 0, 0],
+        length: 20,
+    }, // 3fff::/20
+    Ipv6Prefix {
+        segments: [0x5f00, 0, 0, 0, 0, 0, 0, 0],
+        length: 16,
+    }, // 5f00::/16
+    Ipv6Prefix {
+        segments: [0xfc00, 0, 0, 0, 0, 0, 0, 0],
+        length: 7,
+    }, // fc00::/7
+    Ipv6Prefix {
+        segments: [0xfe80, 0, 0, 0, 0, 0, 0, 0],
+        length: 10,
+    }, // fe80::/10
+];
+
+const IANA_GLOBAL_IPV6_EXCEPTIONS: &[Ipv6Prefix] = &[
+    // Explicit Globally Reachable True entries that fall inside 2001::/23.
+    Ipv6Prefix {
+        segments: [0x2001, 1, 0, 0, 0, 0, 0, 1],
+        length: 128,
+    }, // 2001:1::1/128
+    Ipv6Prefix {
+        segments: [0x2001, 1, 0, 0, 0, 0, 0, 2],
+        length: 128,
+    }, // 2001:1::2/128
+    Ipv6Prefix {
+        segments: [0x2001, 1, 0, 0, 0, 0, 0, 3],
+        length: 128,
+    }, // 2001:1::3/128
+    Ipv6Prefix {
+        segments: [0x2001, 3, 0, 0, 0, 0, 0, 0],
+        length: 32,
+    }, // 2001:3::/32
+    Ipv6Prefix {
+        segments: [0x2001, 4, 0x0112, 0, 0, 0, 0, 0],
+        length: 48,
+    }, // 2001:4:112::/48
+    Ipv6Prefix {
+        segments: [0x2001, 0x0020, 0, 0, 0, 0, 0, 0],
+        length: 28,
+    }, // 2001:20::/28
+    Ipv6Prefix {
+        segments: [0x2001, 0x0030, 0, 0, 0, 0, 0, 0],
+        length: 28,
+    }, // 2001:30::/28
+];
+
+fn is_iana_non_global_ipv6(address: std::net::Ipv6Addr) -> bool {
+    IANA_NON_GLOBAL_IPV6_PREFIXES
+        .iter()
+        .any(|prefix| ipv6_matches_prefix(address, *prefix))
+}
+
+fn is_iana_global_ipv6_exception(address: std::net::Ipv6Addr) -> bool {
+    IANA_GLOBAL_IPV6_EXCEPTIONS
+        .iter()
+        .any(|prefix| ipv6_matches_prefix(address, *prefix))
+}
+
+fn ipv6_matches_prefix(address: std::net::Ipv6Addr, prefix: Ipv6Prefix) -> bool {
+    let address_segments = address.segments();
+    let full_segments = usize::from(prefix.length / 16);
+    if address_segments[..full_segments] != prefix.segments[..full_segments] {
+        return false;
+    }
+    let remaining_bits = prefix.length % 16;
+    if remaining_bits == 0 {
+        return true;
+    }
+    let mask = u16::MAX << (16 - remaining_bits);
+    address_segments[full_segments] & mask == prefix.segments[full_segments] & mask
 }
 
 fn transport_failure() -> ConnectorFailure {
@@ -1567,6 +1696,55 @@ mod tests {
             result.request_fingerprint, reordered.request_fingerprint,
             "request fingerprints use canonical JSON rather than object insertion order"
         );
+    }
+
+    #[test]
+    fn public_only_rejects_iana_ipv6_special_purpose_ranges_without_blocking_global_exceptions() {
+        // IANA IPv6 Special-Purpose Address Registry, accessed 2026-07-29:
+        // every False or N/A Globally Reachable prefix is ineligible for an
+        // outbound public_only destination. The True entries prove that the
+        // broad 2001::/23 denial retains its explicit global exceptions.
+        for address in [
+            "::1",
+            "::",
+            "::ffff:8.8.8.8",
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:0::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            let address = address.parse().expect("test IPv6 literal parses");
+            assert!(
+                !is_public_address(address),
+                "IANA non-global IPv6 address {address} must be denied"
+            );
+        }
+
+        for address in [
+            "64:ff9b::1",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2620:4f:8000::1",
+        ] {
+            let address = address.parse().expect("test IPv6 literal parses");
+            assert!(
+                is_public_address(address),
+                "IANA globally reachable IPv6 address {address} must remain allowed"
+            );
+        }
     }
 
     #[tokio::test]

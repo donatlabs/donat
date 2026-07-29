@@ -11,13 +11,37 @@ use std::fmt;
 
 use donat_metadata::{ConnectorBaseUrl, ConnectorConfig, ConnectorOperation, Metadata};
 use serde::Serialize;
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
 use crate::state::{ConnectorStartupError, validate_connector_startup};
 
 pub mod http;
 pub mod stripe;
+
+/// SHA-256 of a recursively key-sorted JSON value. Connector input is a JSON
+/// object contract, so equivalent object order must never produce a different
+/// durable activity identity.
+pub(crate) fn canonical_json_sha256(input: &JsonValue) -> String {
+    fn canonical(value: &JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Object(object) => BTreeMap::from_iter(
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical(value))),
+            )
+            .into_iter()
+            .collect::<JsonMap<String, JsonValue>>()
+            .into(),
+            JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonical).collect()),
+            value => value.clone(),
+        }
+    }
+
+    let canonical = serde_json::to_vec(&canonical(input))
+        .expect("canonical connector input JSON always serializes");
+    format!("{:x}", Sha256::digest(canonical))
+}
 
 /// Every activity execution failure belongs to this closed set.  Deployment
 /// metadata and startup errors deliberately use separate error types: a
