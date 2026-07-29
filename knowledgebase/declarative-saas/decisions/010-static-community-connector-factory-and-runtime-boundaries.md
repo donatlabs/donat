@@ -267,6 +267,41 @@ migration creates an `OperationSpec`, routes through shared transport, or
 deletes the old Stripe transport; it does not start if the evidence task
 cannot pass.
 
+### Construction authority for the safe connector ABI
+
+The following ownership rules are part of this decision:
+
+```text
+donat-connector-abi owns private invariant-carrying StaticErrorCode,
+StaticSafeMessage, AuthorizedCorrelations, BoundedTransportResponse, and
+ConnectorFailure values.
+
+ConnectorFailure stores one private Box<StaticFailureText>; the private
+StaticFailureText owns the StaticErrorCode and StaticSafeMessage. This
+bounded indirection preserves the public constructor/accessors and satisfies
+strict clippy::result_large_err without an allow, expectation, crate lint
+override, or command-line suppression.
+
+catalog_construction validates normalized Donat policy and is callable only
+from crates/connector-catalog/src/.
+
+host_construction intersects server-captured selected headers with the
+catalog-derived CapabilityId allowlist and is callable only from
+crates/server/src/connectors/.
+
+Rust privacy cannot express friend crates, so Task 2 creates
+scripts/check_connector_processor_boundary.py with deterministic producer and
+test-path fixtures. Task 6 extends that exact checker with dependency and
+processor-source rules.
+```
+
+`TypedBindings` shares shape counters across all roots while depth remains per
+root. All `u16` statuses remain accepted. These refinements preserve the
+existing static native boundary: they add neither a sandbox nor a runtime
+surface. Task 3 alone consumes `catalog_construction`; Task 8 alone consumes
+`host_construction`; Task 6 extends the one checker and consumes response data
+only through its accessors and static literals.
+
 ## Alternatives
 
 | Option | Why Not |

@@ -802,6 +802,12 @@ Rules may extract `Retry-After` as integer seconds or an HTTP date and may
 retain allowlisted provider correlation IDs. Safe messages are Donat-owned
 constants. Raw provider bodies, authorization material, tokens, credential
 fields, and unreviewed provider messages never cross the failure boundary.
+Each `ErrorAction` carries ABI-owned `StaticErrorCode` and
+`StaticSafeMessage` values after strict normalized validation. Catalog
+construction is the sole runtime-string producer of those values; it derives
+each correlation header to exactly one `CapabilityId`, rejects missing,
+multiple, duplicate, or more-than-64 correlation capabilities, and includes
+the static text and derived capabilities in semantic hashing.
 Connectors classify outcomes; Process metadata alone owns retry and
 `on_error` policy.
 
@@ -988,6 +994,17 @@ semantically overbroad allowed step. The Rust toolchain, server adapters and
 host capabilities, manifest admission, processor algorithms, and narrowness
 of every compiled binding remain trusted review surfaces.
 
+The initial Task 2 checker owns deterministic positive and mutated-negative
+fixtures for restricted namespace producers, test paths, trait implementations,
+and allocation leaks. Task 6 modifies that same checker rather than creating a
+second Python checker, wrapper, or parallel policy mechanism. Processor
+production code reads `BoundedTransportResponse` only through `status()`,
+`selected_headers()`, `decoded()`, `response_bytes()`, and
+`authorized_correlations()`. It uses `StaticErrorCode::literal` and
+`StaticSafeMessage::literal` for Donat-owned failures, never refers to
+`catalog_construction` or `host_construction`, never uses an allocation-leak
+API, and neither constructs nor names `StaticFailureText`.
+
 ### 7.2 Core operation ABI
 
 A processor orchestrates compiled step IDs; it does not construct a transport
@@ -1021,6 +1038,143 @@ pub trait OperationProcessor: Send + Sync {
 ```
 
 `BoxFuture` uses only `core::future`, `core::pin`, and `alloc::boxed`.
+The ABI imports `use alloc::boxed::Box;` and owns the following public,
+invariant-carrying response and failure contract. Fields without `pub` are
+immutable and private to `donat-connector-abi`; there is no raw constructor,
+compatibility shim, mutable accessor, insertion path, or conversion shim.
+
+```rust
+use alloc::boxed::Box;
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticErrorCode(InlineId);
+
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticSafeMessage {
+    len: u16,
+    bytes: [u8; MAXIMUM_SAFE_MESSAGE_BYTES],
+}
+
+pub struct AuthorizedCorrelations {
+    values: BTreeMap<CapabilityId, BoundedString>,
+}
+
+pub struct BoundedTransportResponse {
+    status: u16,
+    selected_headers: BTreeMap<CapabilityId, BoundedString>,
+    decoded: TypedValue,
+    response_bytes: u32,
+    authorized_correlations: AuthorizedCorrelations,
+}
+
+impl BoundedTransportResponse {
+    pub fn try_new(
+        status: u16,
+        selected_headers: BTreeMap<CapabilityId, BoundedString>,
+        decoded: TypedValue,
+        response_bytes: u32,
+    ) -> Result<Self, AbiError>;
+
+    pub const fn status(&self) -> u16;
+    pub fn selected_headers(
+        &self,
+    ) -> &BTreeMap<CapabilityId, BoundedString>;
+    pub fn decoded(&self) -> &TypedValue;
+    pub const fn response_bytes(&self) -> u32;
+    pub fn authorized_correlations(&self) -> &AuthorizedCorrelations;
+}
+
+struct StaticFailureText {
+    code: StaticErrorCode,
+    safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
+    retry_after_seconds: Option<u32>,
+    correlation_ids: BTreeMap<CapabilityId, BoundedString>,
+}
+
+impl ConnectorFailure {
+    pub fn try_new(
+        class: ConnectorErrorClass,
+        code: StaticErrorCode,
+        safe_message: StaticSafeMessage,
+        retry_after_seconds: Option<u64>,
+        correlations: Option<&AuthorizedCorrelations>,
+    ) -> Result<Self, AbiError>;
+
+    pub const fn class(&self) -> ConnectorErrorClass;
+    pub fn code(&self) -> &str;
+    pub fn safe_message(&self) -> &str;
+    pub const fn retry_after_seconds(&self) -> Option<u32>;
+    pub fn correlation_ids(
+        &self,
+    ) -> &BTreeMap<CapabilityId, BoundedString>;
+}
+```
+
+`status` accepts every `u16`, including `0` and `u16::MAX`. Ordinary response
+construction produces empty authorization. `ConnectorFailure::try_new`
+performs exactly one private box allocation only after every non-allocation
+validation succeeds; `code()` and `safe_message()` dereference that box.
+Allocation failure uses standard `alloc` behavior without a new `AbiError`.
+`StaticFailureText` cannot be named or constructed outside the ABI.
+
+The ABI exposes only these mechanically restricted construction namespaces:
+
+```rust
+#[doc(hidden)]
+pub mod catalog_construction {
+    pub fn static_error_code(
+        value: &str,
+    ) -> Result<StaticErrorCode, AbiError>;
+
+    pub fn static_safe_message(
+        value: &str,
+    ) -> Result<StaticSafeMessage, AbiError>;
+}
+
+#[doc(hidden)]
+pub mod host_construction {
+    pub fn transport_response(
+        status: u16,
+        selected_headers: BTreeMap<CapabilityId, BoundedString>,
+        decoded: TypedValue,
+        response_bytes: u32,
+        allowed_correlations: &[CapabilityId],
+    ) -> Result<BoundedTransportResponse, AbiError>;
+
+    pub fn authorized_correlations(
+        selected_headers: &BTreeMap<CapabilityId, BoundedString>,
+        allowed_correlations: &[CapabilityId],
+    ) -> Result<AuthorizedCorrelations, AbiError>;
+}
+```
+
+`catalog_construction` is callable only from `crates/connector-catalog/src/`
+after strict normalized policy validation. `host_construction` is callable
+only from `crates/server/src/connectors/`, where it intersects captured
+selected headers with the catalog-derived `CapabilityId` allowlist. Rust
+privacy has no friend crates, so Task 2 creates
+`scripts/check_connector_processor_boundary.py` with deterministic producer
+and test-path fixtures; Task 6 extends that exact checker with dependency and
+processor-source rules. Neither namespace is a sandbox.
+
+`TypedBindings` uses shared counters across all roots. Its validation order is:
+
+```text
+1. reject more than 64 binding slots;
+2. traverse every root with shared node, inline-value, and decoded-byte
+   counters while restarting depth at zero per root;
+3. sum canonical_size for every root with checked arithmetic;
+4. construct TypedBindings only after all checks pass.
+```
+
+The response validator uses the same shape rules for its decoded root.
 `ProcessorContext` exposes only connector/operation identity, stable logical
 activity/idempotency identity, canonical request fingerprint, opaque
 capability IDs, and a borrowed `ProcessorControl`. The control capability
@@ -1229,6 +1383,10 @@ adversarial tests, and a process dependency revision.
 No connector stores unbounded response bodies or provider diagnostics. Item
 normalization stops before exceeding the item/byte budget and returns a typed
 failure; it never silently truncates a success.
+
+The response status domain is all `u16` values: `0..=u16::MAX` is accepted.
+Status classification remains in the compiled error map; no HTTP semantic
+subrange is an ABI construction invariant.
 
 ## 9. Binary and multipart contract
 
@@ -1583,11 +1741,11 @@ standalone slice before the next row begins:
 | Order | Files | Deliverable and RED gate |
 | ---: | --- | --- |
 | 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
-| 1 | **Create** `crates/connector-abi/` and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, bounded envelopes, and host traits over the value contract; no processor implementation |
-| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and complete credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs, typed provider-evidence versus Donat-policy facts, canonical hashes, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
+| 1 | **Create** `crates/connector-abi/`, initial `scripts/check_connector_processor_boundary.py`, and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, private safe envelopes/static failure text, restricted construction namespaces, exact-boundary/compile-fail proof, and deterministic initial checker fixtures; no processor implementation |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and complete credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs, calling `catalog_construction` only after strict normalized validation, deriving correlation capabilities, semantic hashing static text/capabilities, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
 | 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for disjoint npm/provider acquisition, record-derived reacquisition, and hostile HTTPS/archive handling; synthetic extraction/license/dependency tests |
 | 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust carrying credentials/operations/triggers/source/legal identities, `generate --check`, actual-generated-entry-to-ABI ID identity proof, and exact Task-7/Task-16 consumer compile proofs; no acquisition dependency, `build.rs`, or Cargo-time generation |
-| 4 | **Create** `crates/connector-processors/` and complete the boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
+| 4 | **Create** `crates/connector-processors/` and extend the initial boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
 | 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
 | 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
 | 7 | modify `crates/server/src/connectors/mod.rs`; **Create** `crates/server/src/connectors/catalog.rs` | immutable generated catalog and registry dispatch through processor-crate lookup with no runtime registration/discovery |
@@ -1637,6 +1795,11 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | ID | Level | Required proof |
 | --- | --- | --- |
 | `value_contract_has_one_owner` | value/IR compile | the no-std value crate owns types/canonical sizing, `donat-ir` re-exports them, and catalog/ABI compile against the same type identity without a conversion copy |
+| `safe_abi_fields_are_private` | external compile-fail | four independent external field-assignment failures prove that `status`, `selected_headers`, `decoded`, and `response_bytes` cannot be assigned; separate failures prove the response/correlation constructors and forbidden runtime conversions are unavailable |
+| `safe_abi_boundaries_are_exact` | ABI unit | all `0..=u16::MAX` statuses, response/correlation limits, static-code/static-message limits, and retry clamping accept exact boundaries and reject one over; ordinary responses carry empty authorization |
+| `typed_bindings_account_across_roots` | ABI unit | aggregate multi-root node, inline-value, decoded-byte, and checked canonical-size accounting shares counters while depth restarts per root |
+| `connector_boundary_checker_is_deterministic` | checker self-test | deterministic positive fixtures pass and every restricted namespace, producer, test-path, allocation-leak, and later processor-boundary mutation fails with its stable diagnostic |
+| `safe_abi_lints_are_strict` | ABI/CI | `cargo clippy -- -D warnings -D clippy::result_large_err` passes without an allow, expectation, crate lint override, or command-line suppression; negative scans reject lint-suppression additions |
 | `catalog_descriptor_ids_match_connector_io` | phase 2 catalog compile | normalized catalog descriptors pass their exact ABI-owned IDs directly to `ConnectorIo`, with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
 | `catalog_contracts_are_closed_and_complete` | phase 2 catalog unit | credentials/auth plans, fixed origins/steps, operations/effects/pagination/error maps/bounds, webhook/poll triggers, and provenance references round-trip together; every unknown variant/field, dynamic destination, raw provider message, missing reference, or unbounded declaration rejects |
 | `contract_fact_origins_are_non_substitutable` | phase 2 catalog unit | provider evidence resolves to its exact immutable record/fact location, Donat policy resolves to its reviewed policy ID, each hashes in its assigned semantic/provenance material, and neither origin can satisfy the other |
@@ -1693,6 +1856,13 @@ cargo check -p donat-value-contract --target thumbv7em-none-eabihf \
 cargo test -p donat-connector-abi --no-default-features
 cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
+cargo clippy -p donat-connector-abi --no-default-features -- \
+  -D warnings -D clippy::result_large_err
+python3 scripts/check_connector_processor_boundary.py
+if rg -n 'allow\\(clippy::result_large_err\\)|expect\\(clippy::result_large_err\\)|\\[lints\\]|--cap-lints|--allow' \
+  crates/connector-abi scripts/check_connector_processor_boundary.py; then
+  exit 1
+fi
 cargo test -p donat-connector-catalog
 cargo test -p donat-connector-catalog catalog_descriptor_ids_match_connector_io
 cargo test -p donat-connector-catalog --test catalog_contracts
