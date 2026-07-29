@@ -4,6 +4,19 @@ Status: proposed. A connector is a Rust module compiled into donat, not a
 microservice, a dynamically downloaded plugin, or a generic arbitrary-URL
 webhook.
 
+Supersession note (2026-07-29): Spec 007 Sections 5.3 and 7 replace two
+contracts in this earlier proposal. The blanket stable-key/idempotency-header
+rule is now the closed, evidence-backed `ReadOnly` or per-compiled-step
+`ProviderIdempotent` model; `ReadOnly` is headerless, and every side-effecting
+step fixes its own binding, scope, minimum retention, and clock margin. The
+broad `ConnectorModule::execute`/`verify_webhook` sketches in Sections 3 and 6
+are historical migration context, not the implementation authority:
+provider-specific execution uses the sealed compiled-step processor ABI, while
+the server retains all transport, codec, credential, crypto, clock, and
+control capabilities. Spec 006's static registry, fixed-origin egress, closed
+errors, redaction, no-plugin, and temporary verified-webhook `503` boundaries
+remain in force.
+
 ## 1. Goal and topology
 
 Connectors make external systems available to durable processes. The first
