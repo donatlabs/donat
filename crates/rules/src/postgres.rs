@@ -727,10 +727,14 @@ fn lower_checked_decimal_binary(left: &str, right: &str, operator: &str) -> Stri
     let left = decimal_parts(left);
     let right = decimal_parts(right);
     let scale = format!("greatest(({}), ({}))", left.scale, right.scale);
-    let left_coefficient = decimal_scaled_coefficient(&left, &scale);
-    let right_coefficient = decimal_scaled_coefficient(&right, &scale);
+    let left_exponent = decimal_scale_alignment_exponent(&left, &scale);
+    let right_exponent = decimal_scale_alignment_exponent(&right, &scale);
+    let left_coefficient = decimal_scaled_coefficient(&left, &left_exponent);
+    let right_coefficient = decimal_scaled_coefficient(&right, &right_exponent);
     let result_coefficient = format!("(({left_coefficient}) {operator} ({right_coefficient}))");
     let mut conditions = vec![
+        power_of_ten_exponent_condition(&left_exponent),
+        power_of_ten_exponent_condition(&right_exponent),
         i128_range_condition(&left_coefficient),
         i128_range_condition(&right_coefficient),
     ];
@@ -785,6 +789,7 @@ fn lower_checked_decimal_divide(left: &str, right: &str) -> String {
             i128_range_condition(&left_parts.coefficient),
             i128_range_condition(&right_parts.coefficient),
             format!("(({}) <> 0::numeric)", right_parts.coefficient),
+            power_of_ten_exponent_condition(&exponent),
             i128_range_condition(&numerator),
             i128_range_condition(&quotient),
         ],
@@ -807,11 +812,23 @@ fn lower_checked_decimal_negate(value: &str) -> String {
     )
 }
 
-fn decimal_scaled_coefficient(parts: &DecimalParts, scale: &str) -> String {
+fn decimal_scale_alignment_exponent(parts: &DecimalParts, scale: &str) -> String {
+    format!("(({}) - ({}))", scale, parts.scale)
+}
+
+fn decimal_scaled_coefficient(parts: &DecimalParts, exponent: &str) -> String {
     format!(
-        "(({}) * power(10::numeric, (({}) - ({}))))",
-        parts.coefficient, scale, parts.scale
+        "(({}) * power(10::numeric, ({})))",
+        parts.coefficient, exponent
     )
+}
+
+fn power_of_ten_exponent_condition(exponent: &str) -> String {
+    // Rust's `10_i128.checked_pow(exponent)` accepts exactly 0..=38.
+    // Keep this condition ahead of every SQL expression that consumes the
+    // corresponding power so a larger decimal scale takes the same bounded
+    // arithmetic-rejection path instead of PostgreSQL's unbounded numeric one.
+    format!("(({exponent}) BETWEEN 0 AND 38)")
 }
 
 fn checked_decimal_value(value: &str, scale: &str, conditions: Vec<String>) -> String {

@@ -349,20 +349,76 @@ fn object_value_rejects_missing_non_null_members_in_rust_and_postgres() {
 }
 
 #[test]
+fn object_value_allows_missing_nullable_members_in_rust_and_postgres() {
+    let customer = object(
+        "Customer",
+        map([("nickname", RuleType::nullable(RuleType::String))]),
+    );
+    let rule = compiled_value_rule(customer.clone(), map([("customer", customer)]), "customer");
+    let bindings = map([("customer", json!({}))]);
+    let expected = json!({ "nickname": null });
+    let rust_value = evaluate_value(&rule, &bindings)
+        .expect("an absent nullable member must remain a JSON null");
+    assert_eq!(rust_value.value, expected);
+
+    let lowered = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([("customer".to_owned(), SqlBinding::literal(json!({})))]),
+    )
+    .expect("Postgres value lowering must allow the same nullable member");
+    let mut client = postgres_client();
+    let postgres_value = client
+        .query_one(
+            &format!(
+                "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
+                lowered.sql
+            ),
+            &[],
+        )
+        .expect("the nullable object value should execute in PostgreSQL")
+        .get::<_, String>("value")
+        .parse::<Value>()
+        .expect("PostgreSQL JSON output should parse");
+
+    assert_eq!(postgres_value, expected);
+}
+
+#[test]
 fn lowerer_rejects_i128_arithmetic_overflow_like_the_rust_evaluator() {
     let decimal_maximum_at_scale_one = "17014118346046923173168730371588410572.7";
+    let tiny_decimal_at_scale_4000 = format!("0.{}1", "0".repeat(3999));
     let cases = [
-        format!("{} + 1 > {}", i128::MAX, i128::MAX),
-        format!("{decimal_maximum_at_scale_one} + 0.1 > 0.0"),
-        format!("{decimal_maximum_at_scale_one} * 10.0 > 0.0"),
+        (
+            "integer result overflow",
+            format!("{} + 1 > {}", i128::MAX, i128::MAX),
+        ),
+        (
+            "decimal result overflow",
+            format!("{decimal_maximum_at_scale_one} + 0.1 > 0.0"),
+        ),
+        (
+            "decimal intermediate overflow",
+            format!("{decimal_maximum_at_scale_one} * 10.0 > 0.0"),
+        ),
+        (
+            "decimal scale alignment overflow",
+            format!("{tiny_decimal_at_scale_4000} + 0.0 > 0.0"),
+        ),
+        (
+            "decimal division numerator scale overflow",
+            format!("0.0 / {tiny_decimal_at_scale_4000} > 0.0"),
+        ),
     ];
     let mut client = postgres_client();
 
-    for source in cases {
+    for (case, source) in cases {
         let rule = compiled_rule(BTreeMap::new(), &source);
         let rust_error = evaluate_bool(&rule, &BTreeMap::new())
             .expect_err("the bounded Rust profile must reject arithmetic overflow");
-        assert!(matches!(rust_error, RuleError::InvalidLiteral { .. }));
+        assert!(
+            matches!(rust_error, RuleError::InvalidLiteral { .. }),
+            "unexpected Rust rejection for {case}: {rust_error}",
+        );
 
         let expression = lower_postgres(&rule, &SqlBindings::default())
             .expect("a validated arithmetic rule should lower to a runtime rejection");
@@ -372,9 +428,29 @@ fn lowerer_rejects_i128_arithmetic_overflow_like_the_rust_evaluator() {
         assert_eq!(
             postgres_error.as_db_error().map(|error| error.code()),
             Some(&SqlState::DIVISION_BY_ZERO),
-            "overflow rejection must use the normal runtime arithmetic path: {postgres_error}",
+            "overflow rejection for {case} must use the normal runtime arithmetic path: {postgres_error}",
         );
     }
+}
+
+#[test]
+fn high_decimal_scale_remains_valid_when_no_bounded_power_is_required() {
+    let tiny_decimal = format!("0.{}1", "0".repeat(3999));
+    let rule = compiled_rule(BTreeMap::new(), &format!("{tiny_decimal} * 2.0 > -1.0"));
+    assert!(
+        evaluate_bool(&rule, &BTreeMap::new())
+            .expect("multiplication does not require a bounded power-of-ten alignment"),
+        "the exact positive high-scale product must remain greater than negative one",
+    );
+
+    let expression = lower_postgres(&rule, &SqlBindings::default())
+        .expect("the high-scale decimal expression should lower");
+    let postgres_value = postgres_client()
+        .query_one(&format!("SELECT {expression} AS value"), &[])
+        .expect("Postgres must not reject a scale that needs no bounded power")
+        .get::<_, bool>("value");
+
+    assert!(postgres_value);
 }
 
 #[test]
@@ -384,37 +460,49 @@ fn timestamp_value_lowering_is_utc_canonical_outside_a_utc_session() {
         map([("created_at", RuleType::Timestamp)]),
         "created_at",
     );
-    let timestamp = "2026-07-29T14:30:15.120+02:00";
-    let bindings = map([("created_at", json!(timestamp))]);
-    let expected = evaluate_value(&rule, &bindings)
-        .expect("the Rust evaluator should normalize the typed timestamp to UTC");
-    let lowered = lower_postgres_value(
-        &rule,
-        &SqlBindings::new([(
-            "created_at".to_owned(),
-            SqlBinding::literal(json!(timestamp)),
-        )]),
-    )
-    .expect("the timestamp value rule should lower");
     let mut client = postgres_client();
     client
         .batch_execute("SET TIME ZONE 'Asia/Kolkata'")
         .expect("the live differential must run outside UTC");
 
-    let actual = client
-        .query_one(
-            &format!(
-                "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
-                lowered.sql
-            ),
-            &[],
+    for (case, timestamp) in [
+        ("offset input", "2026-07-29T14:30:15.120+02:00"),
+        ("already UTC input", "2026-07-29T12:30:15.120Z"),
+    ] {
+        let bindings = map([("created_at", json!(timestamp))]);
+        let expected = json!("2026-07-29T12:30:15.12Z");
+        let rust_value = evaluate_value(&rule, &bindings)
+            .expect("the Rust evaluator should normalize the typed timestamp to UTC");
+        assert_eq!(
+            rust_value.value, expected,
+            "Rust canonical timestamp mismatch for {case}",
+        );
+        let lowered = lower_postgres_value(
+            &rule,
+            &SqlBindings::new([(
+                "created_at".to_owned(),
+                SqlBinding::literal(json!(timestamp)),
+            )]),
         )
-        .expect("the lowered timestamp value should execute in PostgreSQL")
-        .get::<_, String>("value")
-        .parse::<Value>()
-        .expect("PostgreSQL JSON output should parse");
+        .expect("the timestamp value rule should lower");
+        let postgres_value = client
+            .query_one(
+                &format!(
+                    "SELECT COALESCE(to_jsonb(({})), 'null'::jsonb)::text AS value",
+                    lowered.sql
+                ),
+                &[],
+            )
+            .expect("the lowered timestamp value should execute in PostgreSQL")
+            .get::<_, String>("value")
+            .parse::<Value>()
+            .expect("PostgreSQL JSON output should parse");
 
-    assert_eq!(actual, expected.value);
+        assert_eq!(
+            postgres_value, expected,
+            "Postgres canonical timestamp mismatch for {case}",
+        );
+    }
 }
 
 #[test]

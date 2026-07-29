@@ -1271,8 +1271,11 @@ fn canonical_timestamp_utc(value: &str) -> Option<String> {
             zone_start += 1;
         }
     }
+    let fraction = value[19..zone_start]
+        .trim_end_matches('0')
+        .trim_end_matches('.');
     if bytes.get(zone_start) == Some(&b'Z') {
-        return Some(value.to_owned());
+        return Some(format!("{}{fraction}Z", &value[..19]));
     }
     let sign = match bytes.get(zone_start) {
         Some(b'+') => 1_i32,
@@ -1316,9 +1319,6 @@ fn canonical_timestamp_utc(value: &str) -> Option<String> {
             day = 1;
         }
     }
-    let fraction = value[19..zone_start]
-        .trim_end_matches('0')
-        .trim_end_matches('.');
     Some(format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{}{fraction}Z",
         utc_minutes / 60,
@@ -1708,6 +1708,9 @@ impl RuntimeValue {
                         .get(field)
                         .ok_or_else(invariant)
                         .and_then(|value| match value {
+                            Self::Null if type_.accepts_null() => {
+                                value.canonical_json(rule_name, type_)
+                            }
                             // A missing declared object member is represented as
                             // a total-access null at decode time, but a direct
                             // whole-object result must not weaken `field!` into
