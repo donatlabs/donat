@@ -4,6 +4,7 @@
 //! `main.rs`; this exposes the same modules as a library target.
 
 pub mod action;
+pub mod connectors;
 pub mod cron;
 pub mod events;
 pub mod gql;

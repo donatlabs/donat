@@ -720,6 +720,7 @@ dependencies = [
  "graphql-parser",
  "jsonwebtoken",
  "mysql",
+ "percent-encoding",
  "refinery",
  "reqwest",
  "rusqlite",

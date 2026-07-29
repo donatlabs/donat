@@ -352,6 +352,10 @@ where
 
 pub struct AppState {
     pub engine: RwLock<EngineSnapshot>,
+    /// Fully validated, immutable deployment connector registry. It is built
+    /// before the HTTP listener is bound and has no runtime mutation surface.
+    #[allow(dead_code)] // Task 3 owns the first activity-dispatch consumer.
+    pub connectors: Arc<crate::connectors::ConnectorRegistry>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
     pub default_url: String,
@@ -2193,6 +2197,7 @@ mod snapshot_tests {
     fn state(engine: Engine) -> AppState {
         AppState {
             engine: RwLock::new(Arc::new(engine)),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "sqlite::memory:".to_string(),
             admin_secret: None,
             unauthorized_role: None,

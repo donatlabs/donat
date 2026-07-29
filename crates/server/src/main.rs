@@ -10,6 +10,11 @@
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
 mod action;
+// The binary has its own module tree for its historic entry point while the
+// integration tests use the library facade. Connector activity dispatch lands
+// in Task 3, so the binary currently uses only registry construction here.
+#[allow(dead_code)]
+mod connectors;
 mod cron;
 mod events;
 mod gql;
@@ -280,16 +285,17 @@ async fn main() -> anyhow::Result<()> {
     };
     ensure_default_source(&mut metadata);
 
-    // Connector environment values are required before this process opens a
-    // listener. The validator retains and reports variable names only; it
-    // discards resolved values so they cannot enter metadata or runtime logs.
-    state::validate_connector_startup(&metadata)?;
+    // Connector configuration is fully validated before this process opens a
+    // listener. The immutable registry retains runtime credentials privately;
+    // errors contain static metadata or variable names only, never values.
+    let connectors = Arc::new(connectors::ConnectorRegistry::build(&metadata)?);
 
     if let Some(jwt) = &jwt {
         jwt.spawn_refresher(reqwest::Client::new());
     }
     let state: SharedState = Arc::new(AppState {
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap_checked(metadata)?)),
+        connectors,
         default_url: database_url,
         admin_secret,
         unauthorized_role,

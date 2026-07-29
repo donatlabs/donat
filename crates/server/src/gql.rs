@@ -2699,6 +2699,7 @@ mod tests {
     fn shared_state(engine: Arc<Engine>) -> SharedState {
         Arc::new(AppState {
             engine: tokio::sync::RwLock::new(engine),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "postgres://unused".to_string(),
             admin_secret: None,
             unauthorized_role: None,
