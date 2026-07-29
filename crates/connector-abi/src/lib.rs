@@ -192,6 +192,46 @@
 //! fn require_default<T: Default>() {}
 //! require_default::<StaticSafeMessage>();
 //! ```
+//!
+//! Decoded values cannot be acquired in a const context:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::BoundedTransportResponse;
+//! use donat_value_contract::TypedValue;
+//!
+//! const fn decoded(response: &BoundedTransportResponse) -> &TypedValue {
+//!     response.decoded()
+//! }
+//! ```
+//!
+//! Correlation authority cannot be acquired in a const context:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::{
+//!     AuthorizedCorrelations, BoundedTransportResponse,
+//! };
+//!
+//! const fn authorized(
+//!     response: &BoundedTransportResponse,
+//! ) -> &AuthorizedCorrelations {
+//!     response.authorized_correlations()
+//! }
+//! ```
+//!
+//! Failure correlation IDs cannot be acquired in a const context:
+//!
+//! ```compile_fail
+//! use std::collections::BTreeMap;
+//! use donat_connector_abi::{
+//!     BoundedString, CapabilityId, ConnectorFailure,
+//! };
+//!
+//! const fn correlations(
+//!     failure: &ConnectorFailure,
+//! ) -> &BTreeMap<CapabilityId, BoundedString> {
+//!     failure.correlation_ids()
+//! }
+//! ```
 #![no_std]
 #![forbid(unsafe_code)]
 

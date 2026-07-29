@@ -305,7 +305,7 @@ impl BoundedTransportResponse {
         &self.selected_headers
     }
 
-    pub const fn decoded(&self) -> &TypedValue {
+    pub fn decoded(&self) -> &TypedValue {
         &self.decoded
     }
 
@@ -313,7 +313,7 @@ impl BoundedTransportResponse {
         self.response_bytes
     }
 
-    pub const fn authorized_correlations(&self) -> &AuthorizedCorrelations {
+    pub fn authorized_correlations(&self) -> &AuthorizedCorrelations {
         &self.authorized_correlations
     }
 }
@@ -381,7 +381,7 @@ impl ConnectorFailure {
         self.retry_after_seconds
     }
 
-    pub const fn correlation_ids(&self) -> &BTreeMap<CapabilityId, BoundedString> {
+    pub fn correlation_ids(&self) -> &BTreeMap<CapabilityId, BoundedString> {
         &self.correlation_ids
     }
 }

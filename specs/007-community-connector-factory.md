@@ -1859,8 +1859,23 @@ cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
 cargo clippy -p donat-connector-abi --no-default-features -- \
   -D warnings -D clippy::result_large_err
 python3 scripts/check_connector_processor_boundary.py
-if rg -n 'allow\\(clippy::result_large_err\\)|expect\\(clippy::result_large_err\\)|\\[lints\\]|--cap-lints|--allow' \
-  crates/connector-abi scripts/check_connector_processor_boundary.py; then
+lint_policy_inputs=(
+  crates/connector-abi/src
+  crates/connector-abi/Cargo.toml
+  Cargo.toml
+  .github/workflows
+)
+for cargo_config in .cargo/config.toml .cargo/config; do
+  if test -f "$cargo_config"; then
+    lint_policy_inputs+=("$cargo_config")
+  fi
+done
+if rg -n \
+  -e '(?:allow|expect|warn|force_warn)\s*\([^)]*clippy::result_large_err' \
+  -e 'result-large-err\s*=\s*(?:\{\s*level\s*=\s*)?"(?:allow|warn)"' \
+  -e '(?:-A|-W|--allow|--warn|--force-warn)(?:=|\s*)clippy::result[_-]large[_-]err' \
+  -e '--cap-lints(?:=|\s+)(?:allow|warn)' \
+  "${lint_policy_inputs[@]}"; then
   exit 1
 fi
 cargo test -p donat-connector-catalog

@@ -33,10 +33,38 @@ class Fixture:
 
 
 @dataclass(frozen=True)
+class WorkspaceFixture:
+    name: str
+    root_manifest: str
+    abi_manifest: str
+    expected_rule: str | None
+
+
+@dataclass(frozen=True)
 class Finding:
     offset: int
     rule: str
     message: str
+
+
+@dataclass(frozen=True)
+class RustToken:
+    value: str
+    offset: int
+    identifier: bool
+
+
+@dataclass(frozen=True)
+class RustUse:
+    start: int
+    tokens: tuple[RustToken, ...]
+    public: bool
+
+
+@dataclass(frozen=True)
+class RustTypeAlias:
+    start: int
+    right_hand_side: tuple[RustToken, ...]
 
 
 def scan_fixture(path: Path, source: str) -> list[str]:
@@ -157,27 +185,285 @@ def blank_rust_noncode(source: str) -> str:
 
         index += 1
 
-    return output.decode("latin1")
+    return output.decode("utf-8")
 
 
-def private_cfg_test_ranges(source: str) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    pattern = re.compile(
-        r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*"
-        r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
-        re.MULTILINE,
+def rust_identifier_start(character: str) -> bool:
+    return character == "_" or character.isidentifier()
+
+
+def rust_identifier_continue(character: str) -> bool:
+    return ("_" + character).isidentifier()
+
+
+def rust_tokens(source: str) -> list[RustToken]:
+    tokens: list[RustToken] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+
+        raw_identifier = (
+            source.startswith("r#", index)
+            and index + 2 < len(source)
+            and rust_identifier_start(source[index + 2])
+        )
+        if raw_identifier:
+            end = index + 3
+            while end < len(source) and rust_identifier_continue(source[end]):
+                end += 1
+            tokens.append(RustToken(source[index + 2 : end], index, True))
+            index = end
+            continue
+
+        if rust_identifier_start(character):
+            end = index + 1
+            while end < len(source) and rust_identifier_continue(source[end]):
+                end += 1
+            tokens.append(RustToken(source[index:end], index, True))
+            index = end
+            continue
+
+        if source.startswith("::", index):
+            tokens.append(RustToken("::", index, False))
+            index += 2
+            continue
+
+        tokens.append(RustToken(character, index, False))
+        index += 1
+    return tokens
+
+
+def rust_use_statements(tokens: list[RustToken]) -> list[RustUse]:
+    statements: list[RustUse] = []
+    for index, token in enumerate(tokens):
+        if not token.identifier or token.value != "use":
+            continue
+        end = index + 1
+        while end < len(tokens) and tokens[end].value != ";":
+            end += 1
+        statement_start = index
+        cursor = index - 1
+        while cursor >= 0 and tokens[cursor].value not in (";", "{", "}"):
+            statement_start = cursor
+            cursor -= 1
+        prefix = tokens[statement_start:index]
+        public = any(item.identifier and item.value == "pub" for item in prefix)
+        statements.append(
+            RustUse(
+                tokens[statement_start].offset,
+                tuple(tokens[index + 1 : end]),
+                public,
+            )
+        )
+    return statements
+
+
+def rust_use_mentions(statement: RustUse, name: str) -> bool:
+    return any(token.identifier and token.value == name for token in statement.tokens)
+
+
+def rust_use_aliases(statement: RustUse, name: str) -> bool:
+    tokens = statement.tokens
+    for index, token in enumerate(tokens):
+        if not token.identifier or token.value != name:
+            continue
+        cursor = index + 1
+        while cursor < len(tokens):
+            candidate = tokens[cursor]
+            if candidate.value in (",", "}", ";"):
+                break
+            if (
+                candidate.identifier
+                and candidate.value == "as"
+                and cursor + 1 < len(tokens)
+                and tokens[cursor + 1].identifier
+            ):
+                return True
+            cursor += 1
+    return False
+
+
+def rust_type_aliases(tokens: list[RustToken]) -> list[RustTypeAlias]:
+    aliases: list[RustTypeAlias] = []
+    for index, token in enumerate(tokens):
+        if not token.identifier or token.value != "type":
+            continue
+        equals = index + 1
+        while equals < len(tokens) and tokens[equals].value not in ("=", ";", "{"):
+            equals += 1
+        if equals >= len(tokens) or tokens[equals].value != "=":
+            continue
+        end = equals + 1
+        while end < len(tokens) and tokens[end].value != ";":
+            end += 1
+        aliases.append(
+            RustTypeAlias(token.offset, tuple(tokens[equals + 1 : end]))
+        )
+    return aliases
+
+
+def rust_tokens_mention(tokens: tuple[RustToken, ...], name: str) -> bool:
+    return any(token.identifier and token.value == name for token in tokens)
+
+
+def rust_tokens_in_range(
+    tokens: list[RustToken],
+    start: int,
+    end: int,
+) -> tuple[RustToken, ...]:
+    return tuple(token for token in tokens if start <= token.offset < end)
+
+
+def rust_keyword_before(
+    tokens: list[RustToken],
+    offset: int,
+    keyword: str,
+) -> bool:
+    return any(
+        token.offset < offset
+        and token.identifier
+        and token.value == keyword
+        for token in tokens
     )
-    for match in pattern.finditer(source):
-        opening = source.find("{", match.start(), match.end())
+
+
+def rust_named_item_before(
+    tokens: list[RustToken],
+    offset: int,
+    keyword: str,
+) -> bool:
+    for index, token in enumerate(tokens[:-1]):
+        if token.offset >= offset:
+            break
+        if (
+            token.identifier
+            and token.value == keyword
+            and tokens[index + 1].identifier
+        ):
+            return True
+    return False
+
+
+def rust_has_generic_literal_constructor(tokens: list[RustToken]) -> bool:
+    for index in range(len(tokens) - 5):
+        if (
+            tokens[index].value == "$"
+            and tokens[index + 1].identifier
+            and tokens[index + 2].value == ">"
+            and tokens[index + 3].value == "::"
+            and tokens[index + 4].identifier
+            and tokens[index + 4].value == "literal"
+            and tokens[index + 5].value == "("
+        ):
+            return True
+    return False
+
+
+def rust_path_references(
+    tokens: list[RustToken],
+    owner: str,
+    member: str | None,
+) -> list[int]:
+    references: list[int] = []
+    for index, token in enumerate(tokens):
+        if not token.identifier or token.value != owner:
+            continue
+        cursor = index + 1
+        if cursor < len(tokens) and tokens[cursor].value == ">":
+            cursor += 1
+        if member is None:
+            previous_is_path = index > 0 and tokens[index - 1].value == "::"
+            next_is_path = cursor < len(tokens) and tokens[cursor].value == "::"
+            if previous_is_path or next_is_path:
+                references.append(token.offset)
+            continue
+        if (
+            cursor + 1 < len(tokens)
+            and tokens[cursor].value == "::"
+            and tokens[cursor + 1].identifier
+            and tokens[cursor + 1].value == member
+        ):
+            references.append(token.offset)
+    return references
+
+
+def exported_cfg_test_module(tokens: list[RustToken]) -> int | None:
+    expected = ("#", "[", "cfg", "(", "test", ")", "]")
+    for index in range(len(tokens) - len(expected) - 2):
+        if tuple(token.value for token in tokens[index : index + len(expected)]) != expected:
+            continue
+        cursor = index + len(expected)
+        if not tokens[cursor].identifier or tokens[cursor].value != "pub":
+            continue
+        cursor += 1
+        if cursor < len(tokens) and tokens[cursor].value == "(":
+            depth = 1
+            cursor += 1
+            while cursor < len(tokens) and depth:
+                if tokens[cursor].value == "(":
+                    depth += 1
+                elif tokens[cursor].value == ")":
+                    depth -= 1
+                cursor += 1
+        if (
+            cursor + 1 < len(tokens)
+            and tokens[cursor].identifier
+            and tokens[cursor].value == "mod"
+            and tokens[cursor + 1].identifier
+        ):
+            return tokens[index].offset
+    return None
+
+
+def rust_impl_trait_references(
+    tokens: list[RustToken],
+) -> list[tuple[int, str]]:
+    references: list[tuple[int, str]] = []
+    host_traits = ("ConnectorIo", "ProcessorControl")
+    for index, token in enumerate(tokens):
+        if not token.identifier or token.value != "impl":
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor].value not in ("for", "{", ";"):
+            candidate = tokens[cursor]
+            if candidate.identifier and candidate.value in host_traits:
+                lookahead = cursor + 1
+                while (
+                    lookahead < len(tokens)
+                    and tokens[lookahead].value not in ("for", "{", ";")
+                ):
+                    lookahead += 1
+                if lookahead < len(tokens) and tokens[lookahead].value == "for":
+                    references.append((candidate.offset, candidate.value))
+                break
+            cursor += 1
+    return references
+
+
+def private_cfg_test_ranges(tokens: list[RustToken]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    expected = ("#", "[", "cfg", "(", "test", ")", "]", "mod")
+    for index in range(len(tokens) - len(expected) - 1):
+        if tuple(token.value for token in tokens[index : index + len(expected)]) != expected:
+            continue
+        name = tokens[index + len(expected)]
+        opening_index = index + len(expected) + 1
+        if not name.identifier or tokens[opening_index].value != "{":
+            continue
         depth = 0
-        cursor = opening
-        while cursor < len(source):
-            if source[cursor] == "{":
+        cursor = opening_index
+        while cursor < len(tokens):
+            if tokens[cursor].value == "{":
                 depth += 1
-            elif source[cursor] == "}":
+            elif tokens[cursor].value == "}":
                 depth -= 1
                 if depth == 0:
-                    ranges.append((match.start(), cursor + 1))
+                    ranges.append(
+                        (tokens[index].offset, tokens[cursor].offset + 1)
+                    )
                     break
             cursor += 1
     return ranges
@@ -187,24 +473,33 @@ def in_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= offset < end for start, end in ranges)
 
 
-def macro_invocation_ranges(source: str) -> list[tuple[int, int]]:
+def macro_invocation_ranges(tokens: list[RustToken]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
-    pattern = re.compile(
-        r"\b(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*"
-        r"[A-Za-z_][A-Za-z0-9_]*\s*!\s*([\(\{\[])"
-    )
     closing = {"(": ")", "{": "}", "[": "]"}
-    for match in pattern.finditer(source):
-        opening = match.start(1)
+    for index, token in enumerate(tokens):
+        if token.value != "!" or index == 0 or not tokens[index - 1].identifier:
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].value not in closing:
+            continue
+        start = index - 1
+        while (
+            start >= 2
+            and tokens[start - 1].value == "::"
+            and tokens[start - 2].identifier
+        ):
+            start -= 2
+        opening = index + 1
         stack: list[str] = []
-        for cursor in range(opening, len(source)):
-            character = source[cursor]
+        for cursor in range(opening, len(tokens)):
+            character = tokens[cursor].value
             if character in closing:
                 stack.append(closing[character])
             elif stack and character == stack[-1]:
                 stack.pop()
                 if not stack:
-                    ranges.append((match.start(), cursor + 1))
+                    ranges.append(
+                        (tokens[start].offset, tokens[cursor].offset + 1)
+                    )
                     break
     return ranges
 
@@ -256,18 +551,28 @@ def flag_tokens(value: object) -> list[str]:
 
 def flags_suppress_large_error(tokens: list[str]) -> bool:
     target = "clippy::result_large_err"
+    separate_levels = ("_A", "_W", "__allow", "__warn", "__force_warn")
+    attached_levels = ("_A", "_W")
+    assigned_levels = ("__allow=", "__warn=", "__force_warn=")
     index = 0
     while index < len(tokens):
         token = tokens[index].replace("-", "_")
-        if token in ("_A", "__allow"):
+        if token in separate_levels:
             if index + 1 < len(tokens):
                 lint = tokens[index + 1].replace("-", "_")
                 if lint == target:
                     return True
                 index += 1
-        elif token.startswith("_A") and token[2:].lstrip("=") == target:
+        elif any(
+            token.startswith(prefix)
+            and token[len(prefix) :].lstrip("=") == target
+            for prefix in attached_levels
+        ):
             return True
-        elif token.startswith("__allow=") and token.split("=", 1)[1] == target:
+        elif any(
+            token.startswith(prefix) and token[len(prefix) :] == target
+            for prefix in assigned_levels
+        ):
             return True
         elif token in ("__cap_lints",):
             if index + 1 < len(tokens) and tokens[index + 1] in ("allow", "warn"):
@@ -477,7 +782,10 @@ def lint_suppression(relative: str, source: str, code: str) -> Finding | None:
             attribute = normalized_lint_text(code[start:end])
             if (
                 "clippy::result_large_err" in attribute
-                and re.search(r"(?:allow|expect)\(", attribute)
+                and re.search(
+                    r"(?:allow|expect|warn|force_warn)\(",
+                    attribute,
+                )
             ):
                 return Finding(start, "large-error-lint-suppression", message)
         return None
@@ -512,54 +820,70 @@ def lint_suppression(relative: str, source: str, code: str) -> Finding | None:
 
 def static_literal_indirection(
     relative: str,
-    code: str,
+    tokens: list[RustToken],
 ) -> Finding | None:
     if starts_with(relative, STATIC_LITERAL_ROOTS) or starts_with(
         relative, ABI_TEST_ROOTS
     ):
         return None
 
-    macro_ranges = macro_invocation_ranges(code)
+    use_statements = rust_use_statements(tokens)
+    type_aliases = rust_type_aliases(tokens)
+    macro_ranges = macro_invocation_ranges(tokens)
     for type_name in ("StaticErrorCode", "StaticSafeMessage"):
-        reexport = re.search(
-            rf"\bpub\s+use\b[^;]*\b{type_name}\b[^;]*;",
-            code,
+        reexport = next(
+            (
+                statement
+                for statement in use_statements
+                if statement.public and rust_use_mentions(statement, type_name)
+            ),
+            None,
         )
         if reexport:
             return Finding(
-                reexport.start(),
+                reexport.start,
                 "static-literal-reexport",
                 f"{type_name}::literal cannot be re-exported outside STATIC_LITERAL_ROOTS",
             )
 
-        alias = re.search(
-            rf"\buse\b[^;]*\b{type_name}\s+as\s+"
-            r"([A-Za-z_][A-Za-z0-9_]*)[^;]*;",
-            code,
+        alias = next(
+            (
+                statement
+                for statement in use_statements
+                if rust_use_aliases(statement, type_name)
+            ),
+            None,
         )
         if alias:
             return Finding(
-                alias.start(),
+                alias.start,
                 "static-literal-alias",
                 f"{type_name}::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
             )
 
-        type_alias = re.search(
-            rf"\btype\s+([A-Za-z_][A-Za-z0-9_]*)[^=;]*=\s*"
-            rf"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*{type_name}\s*;",
-            code,
+        type_alias = next(
+            (
+                alias
+                for alias in type_aliases
+                if rust_tokens_mention(alias.right_hand_side, type_name)
+            ),
+            None,
         )
         if type_alias:
             return Finding(
-                type_alias.start(),
+                type_alias.start,
                 "static-literal-type-alias",
                 f"{type_name}::literal cannot be reached through a type alias outside STATIC_LITERAL_ROOTS",
             )
 
         for start, end in macro_ranges:
-            invocation = code[start:end]
-            if re.search(rf"\b{type_name}\b", invocation) and re.search(
-                r"\bliteral\b", invocation
+            invocation = rust_tokens_in_range(tokens, start, end)
+            if rust_tokens_mention(
+                invocation,
+                type_name,
+            ) and rust_tokens_mention(
+                invocation,
+                "literal",
             ):
                 return Finding(
                     start,
@@ -567,69 +891,86 @@ def static_literal_indirection(
                     f"{type_name}::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
                 )
 
-        token_macro = re.search(r"\bmacro_rules\s*!", code)
-        generic_token_literal = re.search(
-            r"\$\s*[A-Za-z_][A-Za-z0-9_]*\s*>\s*::\s*literal\s*\(",
-            code,
-        )
-        token_literal = (
-            generic_token_literal and re.search(rf"\b{type_name}\b", code)
-        ) or re.search(rf"\b{type_name}\b\s*::\s*literal\b", code)
-        token_macro = token_macro if token_literal else None
-        if token_macro:
+        if (
+            any(
+                token.identifier and token.value == "macro_rules"
+                for token in tokens
+            )
+            and rust_has_generic_literal_constructor(tokens)
+            and any(
+                token.identifier and token.value == type_name
+                for token in tokens
+            )
+        ):
+            macro_offset = next(
+                token.offset
+                for token in tokens
+                if token.identifier and token.value == "macro_rules"
+            )
             return Finding(
-                token_macro.start(),
+                macro_offset,
                 "static-literal-wrapper",
                 f"{type_name}::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
             )
 
-        call = re.search(
-            rf"(?:<\s*)?\b{type_name}\b(?:\s*>)?\s*::\s*literal\s*\(",
-            code,
-        )
-        if not call:
+        references = rust_path_references(tokens, type_name, "literal")
+        if not references:
             continue
-        prefix = code[: call.start()]
+        reference = references[0]
         wrappers = (
-            ("macro", re.search(r"\bmacro_rules\s*!", prefix)),
-            ("trait", re.search(r"\btrait\s+[A-Za-z_]", prefix)),
-            ("function", re.search(r"\bfn\s+[A-Za-z_]", prefix)),
+            ("macro", rust_keyword_before(tokens, reference, "macro_rules")),
+            ("trait", rust_named_item_before(tokens, reference, "trait")),
+            ("function", rust_named_item_before(tokens, reference, "fn")),
         )
         for wrapper, marker in wrappers:
             if marker:
                 return Finding(
-                    call.start(),
+                    reference,
                     "static-literal-wrapper",
                     f"{type_name}::literal cannot be forwarded by a {wrapper} outside STATIC_LITERAL_ROOTS",
                 )
         return Finding(
-            call.start(),
+            reference,
             "static-literal-producer",
             "static failure literals are restricted to approved roots",
         )
     return None
 
 
-def restricted_namespace(relative: str, code: str) -> Finding | None:
-    reexport = re.search(
-        r"\bpub\s+use\b[^;]*\b(?:host_construction|catalog_construction)\b[^;]*;",
-        code,
+def restricted_namespace(
+    relative: str,
+    tokens: list[RustToken],
+    test_ranges: list[tuple[int, int]],
+) -> Finding | None:
+    namespaces = ("host_construction", "catalog_construction")
+    use_statements = rust_use_statements(tokens)
+    reexport = next(
+        (
+            statement
+            for statement in use_statements
+            if statement.public
+            and any(rust_use_mentions(statement, name) for name in namespaces)
+        ),
+        None,
     )
     if reexport:
         return Finding(
-            reexport.start(),
+            reexport.start,
             "restricted-namespace-reexport",
             "restricted construction namespaces cannot be re-exported",
         )
 
-    alias = re.search(
-        r"\buse\b[^;]*\b(?:host_construction|catalog_construction)\s+as\s+"
-        r"[A-Za-z_][A-Za-z0-9_]*[^;]*;",
-        code,
+    alias = next(
+        (
+            statement
+            for statement in use_statements
+            if any(rust_use_aliases(statement, name) for name in namespaces)
+        ),
+        None,
     )
     if alias:
         return Finding(
-            alias.start(),
+            alias.start,
             "restricted-namespace-alias",
             "restricted construction namespaces cannot be aliased",
         )
@@ -637,6 +978,7 @@ def restricted_namespace(relative: str, code: str) -> Finding | None:
     if starts_with(relative, ABI_TEST_ROOTS):
         return None
 
+    type_aliases = rust_type_aliases(tokens)
     for namespace, roots, rule, message in (
         (
             "host_construction",
@@ -651,32 +993,40 @@ def restricted_namespace(relative: str, code: str) -> Finding | None:
             "catalog_construction is restricted to connector catalog producers",
         ),
     ):
-        reference = re.search(rf"\b{namespace}\s*::", code)
-        if not reference or starts_with(relative, roots):
-            continue
-
-        type_alias = re.search(
-            rf"\btype\s+[A-Za-z_][A-Za-z0-9_]*[^=;]*=[^;]*\b{namespace}\s*::",
-            code,
+        references = rust_path_references(tokens, namespace, None)
+        type_alias = next(
+            (
+                alias
+                for alias in type_aliases
+                if rust_tokens_mention(alias.right_hand_side, namespace)
+            ),
+            None,
         )
         if type_alias:
             return Finding(
-                type_alias.start(),
+                type_alias.start,
                 "restricted-namespace-wrapper",
                 "restricted construction namespaces cannot be named by a type alias outside approved producers",
             )
-        prefix = code[: reference.start()]
-        if (
-            re.search(r"\bfn\s+[A-Za-z_]", prefix)
-            or re.search(r"\bmacro_rules\s*!", prefix)
-            or re.search(r"\btrait\s+[A-Za-z_]", prefix)
-        ):
-            return Finding(
-                reference.start(),
-                "restricted-namespace-wrapper",
-                "restricted construction calls cannot be forwarded outside approved producers",
-            )
-        return Finding(reference.start(), rule, message)
+        for reference in references:
+            if starts_with(relative, roots):
+                continue
+            if (
+                relative.startswith("crates/connector-abi/src/")
+                and in_ranges(reference, test_ranges)
+            ):
+                continue
+            if (
+                rust_named_item_before(tokens, reference, "fn")
+                or rust_keyword_before(tokens, reference, "macro_rules")
+                or rust_named_item_before(tokens, reference, "trait")
+            ):
+                return Finding(
+                    reference,
+                    "restricted-namespace-wrapper",
+                    "restricted construction calls cannot be forwarded outside approved producers",
+                )
+            return Finding(reference, rule, message)
     return None
 
 
@@ -694,7 +1044,6 @@ def approved_host_trait_indirection(
         starts_with(
             relative,
             (
-                "crates/connector-abi/src/",
                 "crates/connector-processors/src/",
                 "crates/server/src/",
             ),
@@ -705,59 +1054,72 @@ def approved_host_trait_indirection(
 
 def host_trait_indirection(
     relative: str,
-    code: str,
+    tokens: list[RustToken],
     test_ranges: list[tuple[int, int]],
 ) -> Finding | None:
-    macro_ranges = macro_invocation_ranges(code)
+    use_statements = rust_use_statements(tokens)
+    type_aliases = rust_type_aliases(tokens)
+    macro_ranges = macro_invocation_ranges(tokens)
     for trait_name in ("ConnectorIo", "ProcessorControl"):
-        reexport = re.search(
-            rf"\bpub\s+use\b[^;]*\b{trait_name}\b[^;]*;",
-            code,
+        reexport = next(
+            (
+                statement
+                for statement in use_statements
+                if statement.public and rust_use_mentions(statement, trait_name)
+            ),
+            None,
         )
         if reexport and not (
             relative == "crates/connector-abi/src/lib.rs"
-            and not re.search(rf"\b{trait_name}\s+as\s+", reexport.group())
+            and not rust_use_aliases(reexport, trait_name)
         ):
             if not approved_host_trait_indirection(
-                relative, reexport.start(), test_ranges
+                relative, reexport.start, test_ranges
             ):
                 return Finding(
-                    reexport.start(),
+                    reexport.start,
                     "host-trait-reexport",
                     f"{trait_name} cannot be re-exported outside approved host implementation roots",
                 )
 
-        alias = re.search(
-            rf"\buse\b[^;]*\b{trait_name}\s+as\s+"
-            r"[A-Za-z_][A-Za-z0-9_]*[^;]*;",
-            code,
+        alias = next(
+            (
+                statement
+                for statement in use_statements
+                if rust_use_aliases(statement, trait_name)
+            ),
+            None,
         )
         if alias and not approved_host_trait_indirection(
-            relative, alias.start(), test_ranges
+            relative, alias.start, test_ranges
         ):
             return Finding(
-                alias.start(),
+                alias.start,
                 "host-trait-alias",
                 f"{trait_name} cannot be aliased outside approved host implementation roots",
             )
 
-        type_alias = re.search(
-            rf"\btype\s+[A-Za-z_][A-Za-z0-9_]*[^=;]*=\s*"
-            rf"(?:dyn\s+)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*{trait_name}\s*;",
-            code,
+        type_alias = next(
+            (
+                alias
+                for alias in type_aliases
+                if rust_tokens_mention(alias.right_hand_side, trait_name)
+            ),
+            None,
         )
         if type_alias and not approved_host_trait_indirection(
-            relative, type_alias.start(), test_ranges
+            relative, type_alias.start, test_ranges
         ):
             return Finding(
-                type_alias.start(),
+                type_alias.start,
                 "host-trait-type-alias",
                 f"{trait_name} cannot be reached through a type alias outside approved host implementation roots",
             )
 
         for start, end in macro_ranges:
+            invocation = rust_tokens_in_range(tokens, start, end)
             if (
-                re.search(rf"\b{trait_name}\b", code[start:end])
+                rust_tokens_mention(invocation, trait_name)
                 and not approved_host_trait_indirection(
                     relative, start, test_ranges
                 )
@@ -768,23 +1130,6 @@ def host_trait_indirection(
                     "host traits can only be implemented in approved host or test roots",
                 )
 
-        token_macro = (
-            re.search(r"\bmacro_rules\s*!", code)
-            if re.search(
-                r"\bimpl\s+\$\s*[A-Za-z_][A-Za-z0-9_]*\s+for\b",
-                code,
-            )
-            and re.search(rf"\b{trait_name}\b", code)
-            else None
-        )
-        if token_macro and not approved_host_trait_indirection(
-            relative, token_macro.start(), test_ranges
-        ):
-            return Finding(
-                token_macro.start(),
-                "host-trait-implementation",
-                "host traits can only be implemented in approved host or test roots",
-            )
     return None
 
 
@@ -797,12 +1142,9 @@ def scan_source(relative: str, source: str) -> list[Finding]:
     if not relative.endswith(".rs"):
         return []
 
-    test_ranges = private_cfg_test_ranges(code)
-    exported_test = re.search(
-        r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*"
-        r"pub(?:\s*\([^)]*\))?\s+mod\s+[A-Za-z_][A-Za-z0-9_]*",
-        code,
-    )
+    tokens = rust_tokens(code)
+    test_ranges = private_cfg_test_ranges(tokens)
+    exported_test = exported_cfg_test_module(tokens)
     if exported_test is None:
         public_item = re.compile(
             r"\bpub(?:\s*\([^)]*\))?\s+"
@@ -811,12 +1153,12 @@ def scan_source(relative: str, source: str) -> list[Finding]:
         for start, end in test_ranges:
             match = public_item.search(code, start, end)
             if match:
-                exported_test = match
+                exported_test = match.start()
                 break
-    if exported_test:
+    if exported_test is not None:
         return [
             Finding(
-                exported_test.start(),
+                exported_test,
                 "exported-test-helper",
                 "test helpers in production modules must remain private",
             )
@@ -826,11 +1168,9 @@ def scan_source(relative: str, source: str) -> list[Finding]:
         relative, ABI_TEST_ROOTS + PROCESSOR_TEST_ROOTS + SERVER_TEST_ROOTS
     )
     if is_unapproved_test and (
-        re.search(r"\b(?:host_construction|catalog_construction)\s*::", code)
-        or re.search(
-            r"\bimpl\b[^{};]*\b(?:ConnectorIo|ProcessorControl)\b[^{};]*\bfor\b",
-            code,
-        )
+        rust_path_references(tokens, "host_construction", None)
+        or rust_path_references(tokens, "catalog_construction", None)
+        or rust_impl_trait_references(tokens)
     ):
         return [
             Finding(
@@ -840,23 +1180,28 @@ def scan_source(relative: str, source: str) -> list[Finding]:
             )
         ]
 
-    static_finding = static_literal_indirection(relative, code)
+    static_finding = static_literal_indirection(relative, tokens)
     if static_finding:
         return [static_finding]
 
-    namespace_finding = restricted_namespace(relative, code)
+    namespace_finding = restricted_namespace(
+        relative,
+        tokens,
+        test_ranges,
+    )
     if namespace_finding:
         return [namespace_finding]
 
-    host_indirection = host_trait_indirection(relative, code, test_ranges)
+    host_indirection = host_trait_indirection(
+        relative,
+        tokens,
+        test_ranges,
+    )
     if host_indirection:
         return [host_indirection]
 
-    host_impl = re.search(
-        r"\bimpl\b[^{};]*\b(?:ConnectorIo|ProcessorControl)\b[^{};]*\bfor\b",
-        code,
-    )
-    if host_impl:
+    host_impls = rust_impl_trait_references(tokens)
+    for host_impl, _ in host_impls:
         approved_test = starts_with(
             relative, PROCESSOR_TEST_ROOTS + SERVER_TEST_ROOTS
         )
@@ -864,12 +1209,11 @@ def scan_source(relative: str, source: str) -> list[Finding]:
             starts_with(
                 relative,
                 (
-                    "crates/connector-abi/src/",
                     "crates/connector-processors/src/",
                     "crates/server/src/",
                 ),
             )
-            and in_ranges(host_impl.start(), test_ranges)
+            and in_ranges(host_impl, test_ranges)
         )
         if not (
             starts_with(relative, HOST_IMPL_ROOTS)
@@ -878,7 +1222,7 @@ def scan_source(relative: str, source: str) -> list[Finding]:
         ):
             return [
                 Finding(
-                    host_impl.start(),
+                    host_impl,
                     "host-trait-implementation",
                     "host traits can only be implemented in approved host or test roots",
                 )
@@ -954,6 +1298,54 @@ def fixtures() -> tuple[Fixture, ...]:
             "use donat_connector_abi::StaticSafeMessage as SafeMessage;\n"
             'const MESSAGE: SafeMessage = SafeMessage::literal("connector failed");',
             "static-literal-alias: StaticSafeMessage::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_unicode_alias.rs",
+            "use donat_connector_abi::{StaticErrorCode as 错误代码};\n"
+            'const CODE: 错误代码 = 错误代码::literal("connector_failed");',
+            "static-literal-alias: StaticErrorCode::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_raw_alias.rs",
+            "use donat_connector_abi::{StaticErrorCode as r#code};\n"
+            'const CODE: r#code = r#code::literal("connector_failed");',
+            "static-literal-alias: StaticErrorCode::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_unicode_alias.rs",
+            "use donat_connector_abi::{StaticSafeMessage as 安全消息};\n"
+            'const MESSAGE: 安全消息 = 安全消息::literal("connector failed");',
+            "static-literal-alias: StaticSafeMessage::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_raw_alias.rs",
+            "use donat_connector_abi::{StaticSafeMessage as r#message};\n"
+            'const MESSAGE: r#message = r#message::literal("connector failed");',
+            "static-literal-alias: StaticSafeMessage::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/connector-processors/src/allowed_static_error_unicode_alias.rs",
+            "use donat_connector_abi::{StaticErrorCode as 错误代码};\n"
+            'const CODE: 错误代码 = 错误代码::literal("connector_failed");',
+            None,
+        ),
+        Fixture(
+            "crates/connector-processors/src/allowed_static_error_raw_alias.rs",
+            "use donat_connector_abi::{StaticErrorCode as r#code};\n"
+            'const CODE: r#code = r#code::literal("connector_failed");',
+            None,
+        ),
+        Fixture(
+            "crates/connector-processors/src/allowed_static_message_unicode_alias.rs",
+            "use donat_connector_abi::{StaticSafeMessage as 安全消息};\n"
+            'const MESSAGE: 安全消息 = 安全消息::literal("connector failed");',
+            None,
+        ),
+        Fixture(
+            "crates/connector-processors/src/allowed_static_message_raw_alias.rs",
+            "use donat_connector_abi::{StaticSafeMessage as r#message};\n"
+            'const MESSAGE: r#message = r#message::literal("connector failed");',
+            None,
         ),
         Fixture(
             "crates/server/src/connectors/forbidden_static_error_reexport.rs",
@@ -1066,6 +1458,64 @@ def fixtures() -> tuple[Fixture, ...]:
             "static-literal-producer: static failure literals are restricted to approved roots",
         ),
         Fixture(
+            "crates/server/src/connectors/forbidden_static_error_const_function_item.rs",
+            "const CODE_LITERAL: fn(&'static str) -> StaticErrorCode = "
+            "StaticErrorCode::literal;",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_const_function_item.rs",
+            "const MESSAGE_LITERAL: fn(&'static str) -> StaticSafeMessage = "
+            "StaticSafeMessage::literal;",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_static_function_item.rs",
+            "static CODE_LITERAL: fn(&'static str) -> StaticErrorCode = "
+            "StaticErrorCode::literal;",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_static_function_item.rs",
+            "static MESSAGE_LITERAL: fn(&'static str) -> StaticSafeMessage = "
+            "StaticSafeMessage::literal;",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_local_function_item.rs",
+            "fn code(value: &'static str) -> StaticErrorCode {\n"
+            "    let literal = StaticErrorCode::literal;\n"
+            "    literal(value)\n"
+            "}",
+            "static-literal-wrapper: StaticErrorCode::literal cannot be forwarded by a function outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_local_function_item.rs",
+            "fn message(value: &'static str) -> StaticSafeMessage {\n"
+            "    let literal = StaticSafeMessage::literal;\n"
+            "    literal(value)\n"
+            "}",
+            "static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a function outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_cross_file_consumer.rs",
+            "use donat_connector_abi::StaticErrorCode;\n"
+            "use shared_consumer::consume;\n"
+            "const CODE_LITERAL: fn(&'static str) -> StaticErrorCode = "
+            "StaticErrorCode::literal;\n"
+            "fn build(value: &'static str) { consume(CODE_LITERAL, value); }",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_cross_file_consumer.rs",
+            "use donat_connector_abi::StaticSafeMessage;\n"
+            "use shared_consumer::consume;\n"
+            "const MESSAGE_LITERAL: fn(&'static str) -> StaticSafeMessage = "
+            "StaticSafeMessage::literal;\n"
+            "fn build(value: &'static str) { consume(MESSAGE_LITERAL, value); }",
+            "static-literal-producer: static failure literals are restricted to approved roots",
+        ),
+        Fixture(
             "crates/server/src/connectors/forbidden_static_error_token_macro.rs",
             "macro_rules! make_literal {\n"
             "    ($kind:ty, $value:expr) => { <$kind>::literal($value) };\n"
@@ -1169,6 +1619,40 @@ def fixtures() -> tuple[Fixture, ...]:
             "restricted-namespace-alias: restricted construction namespaces cannot be aliased",
         ),
         Fixture(
+            "crates/server/src/connectors/host_unicode_alias.rs",
+            "use donat_connector_abi::{host_construction as 主机构造};\n"
+            "主机构造::transport_response();",
+            "restricted-namespace-alias: restricted construction namespaces cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/host_raw_alias.rs",
+            "use donat_connector_abi::{host_construction as r#host};\n"
+            "r#host::transport_response();",
+            "restricted-namespace-alias: restricted construction namespaces cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-catalog/src/catalog_unicode_alias.rs",
+            "use donat_connector_abi::{catalog_construction as 目录构造};\n"
+            "目录构造::static_error_code(value);",
+            "restricted-namespace-alias: restricted construction namespaces cannot be aliased",
+        ),
+        Fixture(
+            "crates/connector-catalog/src/catalog_raw_alias.rs",
+            "use donat_connector_abi::{catalog_construction as r#catalog};\n"
+            "r#catalog::static_error_code(value);",
+            "restricted-namespace-alias: restricted construction namespaces cannot be aliased",
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_host_unicode_neighbor.rs",
+            "let 结果 = host_construction::transport_response();",
+            None,
+        ),
+        Fixture(
+            "crates/connector-catalog/src/allowed_catalog_raw_neighbor.rs",
+            "let r#result = catalog_construction::static_error_code(value);",
+            None,
+        ),
+        Fixture(
             "crates/server/src/connectors/direct.rs",
             "fn build() { host_construction::transport_response(); }",
             None,
@@ -1232,6 +1716,54 @@ def fixtures() -> tuple[Fixture, ...]:
             "crates/connector-processors/src/processor_control_alias_impl.rs",
             "use donat_connector_abi::ProcessorControl as Control;\nimpl Control for Bad {}",
             "host-trait-alias: ProcessorControl cannot be aliased outside approved host implementation roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/connector_io_unicode_alias_impl.rs",
+            "use donat_connector_abi::{ConnectorIo as 连接器输入输出};\n"
+            "impl 连接器输入输出 for Bad {}",
+            "host-trait-alias: ConnectorIo cannot be aliased outside approved host implementation roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/connector_io_raw_alias_impl.rs",
+            "use donat_connector_abi::{ConnectorIo as r#io};\n"
+            "impl r#io for Bad {}",
+            "host-trait-alias: ConnectorIo cannot be aliased outside approved host implementation roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/processor_control_unicode_alias_impl.rs",
+            "use donat_connector_abi::{ProcessorControl as 处理器控制};\n"
+            "impl 处理器控制 for Bad {}",
+            "host-trait-alias: ProcessorControl cannot be aliased outside approved host implementation roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/processor_control_raw_alias_impl.rs",
+            "use donat_connector_abi::{ProcessorControl as r#control};\n"
+            "impl r#control for Bad {}",
+            "host-trait-alias: ProcessorControl cannot be aliased outside approved host implementation roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_connector_io_unicode_alias_impl.rs",
+            "use donat_connector_abi::{ConnectorIo as 连接器输入输出};\n"
+            "impl 连接器输入输出 for HostIo {}",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_connector_io_raw_alias_impl.rs",
+            "use donat_connector_abi::{ConnectorIo as r#io};\n"
+            "impl r#io for HostIo {}",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_processor_control_unicode_alias_impl.rs",
+            "use donat_connector_abi::{ProcessorControl as 处理器控制};\n"
+            "impl 处理器控制 for HostControl {}",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_processor_control_raw_alias_impl.rs",
+            "use donat_connector_abi::{ProcessorControl as r#control};\n"
+            "impl r#control for HostControl {}",
+            None,
         ),
         Fixture(
             "crates/connector-processors/src/connector_io_reexport.rs",
@@ -1346,6 +1878,22 @@ def fixtures() -> tuple[Fixture, ...]:
         Fixture(
             "crates/connector-abi/src/private_test_impl.rs",
             "#[cfg(test)]\nmod tests { impl ConnectorIo for FakeIo {} }",
+            "host-trait-implementation: host traits can only be implemented in approved host or test roots",
+        ),
+        Fixture(
+            "crates/connector-abi/src/private_test_control_impl.rs",
+            "#[cfg(test)]\nmod tests { impl ProcessorControl for FakeControl {} }",
+            "host-trait-implementation: host traits can only be implemented in approved host or test roots",
+        ),
+        Fixture(
+            "crates/connector-abi/src/private_test_namespaces.rs",
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn exercise() {\n"
+            "        host_construction::authorized_correlations();\n"
+            "        catalog_construction::static_error_code(value);\n"
+            "    }\n"
+            "}",
             None,
         ),
         Fixture(
@@ -1404,6 +1952,16 @@ def fixtures() -> tuple[Fixture, ...]:
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
         ),
         Fixture(
+            "crates/connector-abi/src/warn_large_error.rs",
+            "#[warn(clippy::result_large_err)]\nfn bad() {}",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            "crates/connector-abi/src/force_warn_large_error.rs",
+            "#![force_warn(clippy::result_large_err)]\nfn bad() {}",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
             "crates/connector-abi/Cargo.toml",
             '[lints.clippy]\nresult-large-err = "allow"\n',
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
@@ -1426,6 +1984,41 @@ def fixtures() -> tuple[Fixture, ...]:
         Fixture(
             ".cargo/config",
             '[build]\nrustflags = "-Aclippy::result-large-err"\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/short-warn.toml",
+            '[build]\nrustflags = ["-W", "clippy::result_large_err"]\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/attached-warn.toml",
+            '[build]\nrustflags = "-Wclippy::result-large-err"\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/long-warn.toml",
+            '[build]\nrustflags = ["--warn", "clippy::result_large_err"]\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/long-warn-equals.toml",
+            '[build]\nrustflags = "--warn=clippy::result-large-err"\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/force-warn.toml",
+            '[build]\nrustflags = ["--force-warn", "clippy::result_large_err"]\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/force-warn-equals.toml",
+            '[build]\nrustflags = "--force-warn=clippy::result-large-err"\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".cargo/cap-lints-equals.toml",
+            '[build]\nrustflags = "--cap-lints=allow"\n',
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
         ),
         Fixture(
@@ -1460,6 +2053,36 @@ def fixtures() -> tuple[Fixture, ...]:
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
         ),
         Fixture(
+            ".github/workflows/run-short-warn-large-error.yml",
+            "steps:\n"
+            "  - run: cargo clippy -- -W clippy::result_large_err\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/run-attached-warn-large-error.yml",
+            "steps:\n"
+            "  - run: cargo clippy -- -Wclippy::result_large_err\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/run-long-warn-large-error.yml",
+            "steps:\n"
+            "  - run: cargo clippy -- --warn=clippy::result_large_err\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/run-force-warn-large-error.yml",
+            "steps:\n"
+            "  - run: cargo clippy -- --force-warn clippy::result_large_err\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/run-cap-lints-equals.yml",
+            "steps:\n"
+            "  - run: cargo clippy -- --cap-lints=warn -D clippy::result_large_err\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
             ".github/workflows/quoted-run-allow-large-error.yml",
             'steps:\n  - run: "cargo clippy -- -A clippy::result_large_err"\n',
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
@@ -1491,6 +2114,42 @@ def fixtures() -> tuple[Fixture, ...]:
             "          RUSTFLAGS: >-\n"
             "            --allow\n"
             "            clippy::result-large-err\n"
+            "        run: cargo clippy\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/workflow-env-short-warn-large-error.yml",
+            'env:\n  RUSTFLAGS: "-W clippy::result_large_err"\n'
+            "jobs:\n  test:\n    runs-on: ubuntu-latest\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/job-env-attached-warn-large-error.yml",
+            "jobs:\n"
+            "  test:\n"
+            '    env:\n      RUSTFLAGS: "-Wclippy::result_large_err"\n'
+            "    runs-on: ubuntu-latest\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/step-env-long-warn-large-error.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - env:\n"
+            '          RUSTFLAGS: "--warn clippy::result_large_err"\n'
+            "        run: cargo clippy\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/step-env-force-warn-large-error.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - env:\n"
+            '          RUSTFLAGS: "--force-warn=clippy::result_large_err"\n'
             "        run: cargo clippy\n",
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
         ),
@@ -1568,6 +2227,42 @@ def fixtures() -> tuple[Fixture, ...]:
     )
 
 
+def workspace_fixtures() -> tuple[WorkspaceFixture, ...]:
+    return (
+        WorkspaceFixture(
+            "inherited-allow",
+            "[workspace]\n"
+            '[workspace.lints.clippy]\nresult-large-err = "allow"\n',
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n"
+            "[lints]\nworkspace = true\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        WorkspaceFixture(
+            "inherited-warn",
+            "[workspace]\n"
+            '[workspace.lints.clippy]\nresult-large-err = "warn"\n',
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n"
+            "[lints]\nworkspace = true\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        WorkspaceFixture(
+            "inherited-deny-control",
+            "[workspace]\n"
+            '[workspace.lints.clippy]\nresult-large-err = "deny"\n',
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n"
+            "[lints]\nworkspace = true\n",
+            None,
+        ),
+        WorkspaceFixture(
+            "not-inherited-control",
+            "[workspace]\n"
+            '[workspace.lints.clippy]\nresult-large-err = "allow"\n',
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+            None,
+        ),
+    )
+
+
 def run_self_test() -> list[str]:
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as temporary:
@@ -1596,6 +2291,31 @@ def run_self_test() -> list[str]:
             if diagnostics != [expected]:
                 failures.append(
                     f"self-test: {fixture.path}: expected [{expected!r}], got {diagnostics}"
+                )
+    for fixture in workspace_fixtures():
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            abi_manifest = root / "crates/connector-abi/Cargo.toml"
+            abi_manifest.parent.mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                fixture.root_manifest,
+                encoding="utf-8",
+            )
+            abi_manifest.write_text(fixture.abi_manifest, encoding="utf-8")
+            diagnostics = scan_workspace(root)
+            if fixture.expected_rule is None:
+                if diagnostics:
+                    failures.append(
+                        f"self-test: {fixture.name}: expected no diagnostic, got {diagnostics}"
+                    )
+                continue
+            expected = (
+                "connector-boundary: crates/connector-abi/Cargo.toml: "
+                f"{fixture.expected_rule}"
+            )
+            if diagnostics != [expected]:
+                failures.append(
+                    f"self-test: {fixture.name}: expected [{expected!r}], got {diagnostics}"
                 )
     return failures
 
@@ -1629,6 +2349,39 @@ def workspace_files(root: Path) -> list[Path]:
     return sorted(set(paths), key=lambda path: path.relative_to(root).as_posix())
 
 
+def workspace_lint_inheritance(root: Path) -> list[str]:
+    root_manifest = root / "Cargo.toml"
+    abi_manifest = root / "crates/connector-abi/Cargo.toml"
+    if not root_manifest.is_file() or not abi_manifest.is_file():
+        return []
+    try:
+        workspace_document = tomllib.loads(
+            root_manifest.read_text(encoding="utf-8")
+        )
+        abi_document = tomllib.loads(abi_manifest.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError:
+        return []
+
+    if abi_document.get("lints", {}).get("workspace") is not True:
+        return []
+    clippy = (
+        workspace_document.get("workspace", {})
+        .get("lints", {})
+        .get("clippy", {})
+    )
+    for key, value in clippy.items():
+        if key.replace("-", "_") != "result_large_err":
+            continue
+        level = value.get("level") if isinstance(value, dict) else value
+        if level in ("allow", "warn"):
+            return [
+                "connector-boundary: crates/connector-abi/Cargo.toml: "
+                "large-error-lint-suppression: "
+                "clippy::result_large_err must remain denied without suppression"
+            ]
+    return []
+
+
 def scan_workspace(root: Path) -> list[str]:
     diagnostics: list[str] = []
     for path in workspace_files(root):
@@ -1636,6 +2389,7 @@ def scan_workspace(root: Path) -> list[str]:
         diagnostics.extend(
             scan_fixture(relative, path.read_text(encoding="utf-8"))
         )
+    diagnostics.extend(workspace_lint_inheritance(root))
     return sorted(diagnostics)
 
 
