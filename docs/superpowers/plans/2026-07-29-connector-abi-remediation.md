@@ -19,9 +19,9 @@ roots with shared counters. The host trait signatures and crate graph remain
 unchanged; later catalog, processor, and fixed-origin executor tasks consume
 this API without compatibility adapters.
 
-**Tech Stack:** Rust 2024, `#![no_std] + alloc`, `BTreeMap`, rustdoc
-`compile_fail` tests, Python 3 standard library, GitHub Actions, native
-Postgres conformance harness.
+**Tech Stack:** Rust 2024, `#![no_std] + alloc`,
+`alloc::boxed::Box`, `BTreeMap`, rustdoc `compile_fail` tests, Python 3
+standard library, GitHub Actions, native Postgres conformance harness.
 
 ## Global Constraints
 
@@ -58,6 +58,17 @@ Postgres conformance harness.
   `BoundedTransportResponse`, and `ConnectorFailure` carry their invariants
   through private fields. `AuthorizedCorrelations` does not implement
   `Clone`.
+- `ConnectorFailure` stores one private
+  `static_text: Box<StaticFailureText>`, where private
+  `StaticFailureText { code: StaticErrorCode, safe_message:
+  StaticSafeMessage }` has no independent constructor or accessor. The
+  public `ConnectorFailure::try_new`, `code()`, and `safe_message()`
+  signatures remain unchanged.
+- The box comes from `alloc::boxed::Box`, adds no dependency, and keeps the
+  `ConnectorFailure` error variant below Clippy's large-error threshold.
+  `#[allow(clippy::result_large_err)]`,
+  `#[expect(clippy::result_large_err)]`, crate lint overrides, command-line
+  lint suppression, and equivalent spelling variants are forbidden.
 - `StaticErrorCode` accepts exactly `1..=96` ASCII bytes matching
   `[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?`.
 - `StaticSafeMessage` accepts `1..=1,024` UTF-8 bytes and rejects every
@@ -218,6 +229,8 @@ In Sections 5.5, 7.1, 7.2, 8, 13.2, and 14, state the following normative
 contract and use these exact signatures:
 
 ```rust
+use alloc::boxed::Box;
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct StaticErrorCode(InlineId);
@@ -258,6 +271,18 @@ impl BoundedTransportResponse {
     pub fn authorized_correlations(&self) -> &AuthorizedCorrelations;
 }
 
+struct StaticFailureText {
+    code: StaticErrorCode,
+    safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
+    retry_after_seconds: Option<u32>,
+    correlation_ids: BTreeMap<CapabilityId, BoundedString>,
+}
+
 impl ConnectorFailure {
     pub fn try_new(
         class: ConnectorErrorClass,
@@ -266,13 +291,25 @@ impl ConnectorFailure {
         retry_after_seconds: Option<u64>,
         correlations: Option<&AuthorizedCorrelations>,
     ) -> Result<Self, AbiError>;
+
+    pub const fn class(&self) -> ConnectorErrorClass;
+    pub fn code(&self) -> &str;
+    pub fn safe_message(&self) -> &str;
+    pub const fn retry_after_seconds(&self) -> Option<u32>;
+    pub fn correlation_ids(
+        &self,
+    ) -> &BTreeMap<CapabilityId, BoundedString>;
 }
 ```
 
 Add the exact statement that `status` accepts every `u16`, including `0` and
 `u16::MAX`. State that the response and failure fields are immutable and
 private, ordinary response construction produces empty authorization, and no
-raw constructor or compatibility shim survives.
+raw constructor or compatibility shim survives. Import
+`alloc::boxed::Box`; state that failure construction performs exactly one
+private box allocation only after every non-allocation validation succeeds,
+that `code()`/`safe_message()` dereference the box, and that allocation
+failure uses standard `alloc` behavior without a new `AbiError`.
 
 Add the shared-counter order:
 
@@ -287,7 +324,11 @@ Add the shared-counter order:
 Add acceptance rows for external compile-fail privacy/conversion checks,
 `0..=u16::MAX`, response/correlation exact boundaries, static text exact
 boundaries, aggregate multi-root node/inline/decoded-byte accounting, and
-deterministic checker mutations.
+deterministic checker mutations. Require four independent external
+field-assignment compile failures for `status`, `selected_headers`, `decoded`,
+and `response_bytes`, plus strict
+`-D warnings -D clippy::result_large_err` evidence and negative lint-
+suppression scans.
 
 - [ ] **Step 3: Amend ADR 010 with the construction-authority decision**
 
@@ -297,6 +338,12 @@ Add a decision subsection containing these exact ownership rules:
 donat-connector-abi owns private invariant-carrying StaticErrorCode,
 StaticSafeMessage, AuthorizedCorrelations, BoundedTransportResponse, and
 ConnectorFailure values.
+
+ConnectorFailure stores one private Box<StaticFailureText>; the private
+StaticFailureText owns the StaticErrorCode and StaticSafeMessage. This
+bounded indirection preserves the public constructor/accessors and satisfies
+strict clippy::result_large_err without an allow, expectation, crate lint
+override, or command-line suppression.
 
 catalog_construction validates normalized Donat policy and is callable only
 from crates/connector-catalog/src/.
@@ -325,6 +372,11 @@ In Task 2:
 - add `StaticErrorCode`, `StaticSafeMessage`, `AuthorizedCorrelations`, both
   restricted namespace signatures, and the exact `ConnectorFailure::try_new`
   signature;
+- add private `StaticFailureText { code, safe_message }`,
+  `ConnectorFailure { class, static_text: Box<StaticFailureText>,
+  retry_after_seconds, correlation_ids }`, the one post-validation
+  `Box::new` allocation, dereferencing accessors, and strict
+  `clippy::result_large_err` evidence without lint suppression;
 - add shared `ValueCounters` semantics and the all-`u16` status domain;
 - add `scripts/check_connector_processor_boundary.py` and
   `.github/workflows/ci.yml` to Task 2's files;
@@ -389,7 +441,8 @@ status(), selected_headers(), decoded(), response_bytes(), and
 authorized_correlations(). Donat-owned failures use
 StaticErrorCode::literal and StaticSafeMessage::literal. Processor production
 code never refers to catalog_construction or host_construction and never uses
-an allocation-leak API.
+an allocation-leak API. It neither constructs nor names StaticFailureText;
+boxing remains private to ConnectorFailure::try_new in the ABI.
 ```
 
 Task 6 may create
@@ -411,6 +464,10 @@ Task 8 passes the selected catalog ErrorAction's StaticErrorCode and
 StaticSafeMessage directly to ConnectorFailure::try_new. It passes
 Some(response.authorized_correlations()) for an error response and None when
 no host-authorized correlation set exists.
+
+The server neither constructs nor inspects StaticFailureText and performs no
+failure-text box allocation; ConnectorFailure::try_new performs the one
+private allocation.
 
 No server method accepts a raw failure code, raw safe message, raw
 correlation map, or caller-supplied correlation allowlist.
@@ -440,7 +497,7 @@ if awk \
   exit 1
 fi
 rg -n \
-  'StaticErrorCode|StaticSafeMessage|AuthorizedCorrelations|catalog_construction|host_construction|every `u16`|all `u16`' \
+  'StaticErrorCode|StaticSafeMessage|StaticFailureText|Box<StaticFailureText>|result_large_err|AuthorizedCorrelations|catalog_construction|host_construction|every `u16`|all `u16`' \
   specs/007-community-connector-factory.md \
   knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md \
   docs/superpowers/plans/2026-07-29-community-connector-factory.md
@@ -488,7 +545,12 @@ Commit:
 git commit -m "docs(connectors): align safe ABI ownership"
 ```
 
-Do not begin Task 2 until this commit exists and the worktree is clean.
+After the commit, the SDD controller generates a Task 1 review package from
+the committed diff and dispatches an ordinary independent task reviewer. It
+does not dispatch Judge. A rejection returns the findings to the Task 1
+implementer; after corrections, the controller regenerates the package and
+dispatches a fresh ordinary task review. Do not begin Task 2 until the
+post-commit Task 1 review records acceptance and the worktree is clean.
 
 ---
 
@@ -526,6 +588,8 @@ pub trait ConnectorIo: Send + Sync {
 - Produces:
 
 ```rust
+use alloc::boxed::Box;
+
 impl StaticErrorCode {
     pub const fn literal(value: &'static str) -> Self;
     pub fn as_str(&self) -> &str;
@@ -543,6 +607,18 @@ impl AuthorizedCorrelations {
     ) -> impl Iterator<Item = (&CapabilityId, &BoundedString)>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
+}
+
+struct StaticFailureText {
+    code: StaticErrorCode,
+    safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
+    retry_after_seconds: Option<u32>,
+    correlation_ids: BTreeMap<CapabilityId, BoundedString>,
 }
 
 impl ConnectorFailure {
@@ -743,7 +819,24 @@ Use `catalog_construction::static_error_code` and
 `catalog_construction::static_safe_message` only for runtime catalog
 validation cases. Failure behavior uses `FAILURE_CODE` and
 `FAILURE_MESSAGE`, passes either `Some(response.authorized_correlations())`
-or `None`, and verifies that `ConnectorFailure` copied the checked map.
+or `None`, and verifies that `ConnectorFailure` copied the checked map. Add:
+
+```rust
+#[test]
+fn failure_accessors_return_the_private_static_text_values() {
+    let failure = ConnectorFailure::try_new(
+        ConnectorErrorClass::Permanent,
+        FAILURE_CODE,
+        FAILURE_MESSAGE,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(failure.code(), "connector_rate_limited");
+    assert_eq!(failure.safe_message(), "provider rate limit reached");
+}
+```
 
 - [ ] **Step 2: Add private traversal tests for boundaries hidden by canonical size**
 
@@ -803,6 +896,34 @@ fn static_safe_message_zero_fills_its_private_suffix() {
 }
 ```
 
+Import `core::mem::size_of` in that private test module and add:
+
+```rust
+#[test]
+fn connector_failure_boxes_one_complete_static_text_bundle() {
+    let failure = ConnectorFailure::try_new(
+        ConnectorErrorClass::Permanent,
+        StaticErrorCode::literal("connector_failed"),
+        StaticSafeMessage::literal("connector failed"),
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        failure.static_text.code.as_str(),
+        "connector_failed",
+    );
+    assert_eq!(
+        failure.static_text.safe_message.as_str(),
+        "connector failed",
+    );
+    assert!(
+        size_of::<ConnectorFailure>() < size_of::<StaticFailureText>()
+    );
+}
+```
+
 - [ ] **Step 3: Add external compile-fail API invariants**
 
 Add crate-level rustdoc `compile_fail` examples in
@@ -820,7 +941,7 @@ let _ = BoundedTransportResponse {
 ```
 
 ```rust
-// A checked response cannot be mutated.
+// Status mutation is independently inaccessible.
 let mut response = BoundedTransportResponse::try_new(
     200,
     BTreeMap::new(),
@@ -829,6 +950,43 @@ let mut response = BoundedTransportResponse::try_new(
 ).unwrap();
 response.status = 500;
 ```
+
+```rust
+// Selected-header mutation is independently inaccessible.
+let mut response = BoundedTransportResponse::try_new(
+    200,
+    BTreeMap::new(),
+    TypedValue::Null,
+    0,
+).unwrap();
+response.selected_headers = BTreeMap::new();
+```
+
+```rust
+// Decoded-value mutation is independently inaccessible.
+let mut response = BoundedTransportResponse::try_new(
+    200,
+    BTreeMap::new(),
+    TypedValue::Null,
+    0,
+).unwrap();
+response.decoded = TypedValue::Null;
+```
+
+```rust
+// Response-byte mutation is independently inaccessible.
+let mut response = BoundedTransportResponse::try_new(
+    200,
+    BTreeMap::new(),
+    TypedValue::Null,
+    0,
+).unwrap();
+response.response_bytes = 1;
+```
+
+Each of the four mutation examples is a separate rustdoc fence with complete
+imports and setup. Do not combine them: one private field must not make the
+compile failure for another accidentally public field pass.
 
 ```rust
 // Correlation authority cannot be constructed or inserted by a caller.
@@ -900,7 +1058,8 @@ rule:
 | --- | --- | --- |
 | `host-construction-producer` | `crates/server/src/connectors/executor.rs` | same call under `crates/connector-processors/src/bad.rs` |
 | `catalog-construction-producer` | `crates/connector-catalog/src/loader.rs` | same call under `crates/server/src/connectors/bad.rs` |
-| `static-literal-producer` | ABI source, processor source, catalog generated source | literal call under ordinary server source |
+| `static-literal-producer` | ABI source, processor source, catalog generated source | direct literal call under ordinary server source |
+| `static-literal-indirection` | exact type names and direct calls inside `STATIC_LITERAL_ROOTS` | alias, re-export, type alias, function, macro, or trait that reaches either literal constructor outside `STATIC_LITERAL_ROOTS` |
 | `restricted-namespace-reexport` | unaliased private use in an allowed producer | `pub use` of either namespace |
 | `restricted-namespace-alias` | exact namespace spelling | `use donat_connector_abi::host_construction as host_api` |
 | `restricted-namespace-wrapper` | direct call in an allowed producer | forwarding function, macro, type alias, and trait under a disallowed path |
@@ -908,6 +1067,35 @@ rule:
 | `processor-allocation-leak` | ordinary owned allocation without a leak | `::leak`, `Box::leak`, `String::leak`, and `Vec::leak` under processor production source |
 | `test-path-allowlist` | ABI namespace tests, processor fake-host tests, server integration fakes | the same test helper under any other crate test path |
 | `exported-test-helper` | private `#[cfg(test)]` helper | `pub` test helper in a production library module |
+| `large-error-lint-suppression` | strict `-D warnings -D clippy::result_large_err` | source `allow`/`expect`, Cargo lint override, or command-line lint suppression |
+
+Use these exact negative fixture paths and diagnostics for static-literal
+indirection. Each fixture lives outside `STATIC_LITERAL_ROOTS`, reaches the
+named constructor through the form in its filename, and emits exactly one
+most-specific diagnostic:
+
+| Fixture path | Exact diagnostic after the fixture-path prefix |
+| --- | --- |
+| `crates/server/src/connectors/forbidden_static_error_alias.rs` | `static-literal-alias: StaticErrorCode::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_alias.rs` | `static-literal-alias: StaticSafeMessage::literal cannot be reached through an alias outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_error_reexport.rs` | `static-literal-reexport: StaticErrorCode::literal cannot be re-exported outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_reexport.rs` | `static-literal-reexport: StaticSafeMessage::literal cannot be re-exported outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_error_type_alias.rs` | `static-literal-type-alias: StaticErrorCode::literal cannot be reached through a type alias outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_type_alias.rs` | `static-literal-type-alias: StaticSafeMessage::literal cannot be reached through a type alias outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_error_function_wrapper.rs` | `static-literal-wrapper: StaticErrorCode::literal cannot be forwarded by a function outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_function_wrapper.rs` | `static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a function outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_error_macro_wrapper.rs` | `static-literal-wrapper: StaticErrorCode::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_macro_wrapper.rs` | `static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_error_trait_wrapper.rs` | `static-literal-wrapper: StaticErrorCode::literal cannot be forwarded by a trait outside STATIC_LITERAL_ROOTS` |
+| `crates/server/src/connectors/forbidden_static_message_trait_wrapper.rs` | `static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a trait outside STATIC_LITERAL_ROOTS` |
+
+Add exact negative fixtures for
+`#[allow(clippy::result_large_err)]`,
+`#[expect(clippy::result_large_err)]`, a Cargo
+`result-large-err = "allow"` override, and a workflow command containing
+`-A clippy::result_large_err`. Every one emits
+`large-error-lint-suppression: clippy::result_large_err must remain denied without suppression`
+with its fixture path.
 
 The self-test writes each fixture beneath one
 `tempfile.TemporaryDirectory`, scans paths in sorted order, requires no
@@ -1071,13 +1259,18 @@ overflow.
 
 - [ ] **Step 9: Replace the raw failure constructor without a shim**
 
-Change `ConnectorFailure` to:
+Add `use alloc::boxed::Box;` to
+`crates/connector-abi/src/envelope.rs`. Change the private failure layout to:
 
 ```rust
-pub struct ConnectorFailure {
-    class: ConnectorErrorClass,
+struct StaticFailureText {
     code: StaticErrorCode,
     safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
     retry_after_seconds: Option<u32>,
     correlation_ids: BTreeMap<CapabilityId, BoundedString>,
 }
@@ -1085,17 +1278,54 @@ pub struct ConnectorFailure {
 
 Implement the exact new constructor signature. For `Some(authority)`, clone
 the already checked private `BTreeMap` internally; for `None`, store an empty
-map. Return code/message accessors as `&str` through the static wrappers and
-retain retry clamping:
+map. Clamp the retry value before allocation:
 
 ```rust
 let retry_after_seconds = retry_after_seconds
     .map(|seconds| seconds.min(u64::from(MAXIMUM_RETRY_AFTER_SECONDS)) as u32);
 ```
 
+Only after the correlation copy and retry clamp succeed, allocate and publish
+the complete value atomically:
+
+```rust
+let static_text = Box::new(StaticFailureText {
+    code,
+    safe_message,
+});
+
+Ok(Self {
+    class,
+    static_text,
+    retry_after_seconds,
+    correlation_ids,
+})
+```
+
+Return code/message accessors as `&str` by dereferencing the private bundle:
+
+```rust
+pub fn code(&self) -> &str {
+    self.static_text.code.as_str()
+}
+
+pub fn safe_message(&self) -> &str {
+    self.static_text.safe_message.as_str()
+}
+```
+
+`StaticFailureText` has no independent constructor or accessor. Standard
+`alloc` allocation-failure behavior applies; do not add an `AbiError`
+variant. The box replaces roughly 1,123 inline bytes with one pointer in the
+`ConnectorFailure` error layout, allowing strict
+`clippy::result_large_err` to pass for every existing
+`Result<_, ConnectorFailure>` without lint suppression.
+
 Delete the old raw `&str`, raw correlation map, and caller allowlist
 parameters. Do not retain an overload, deprecated function, conversion, or
-adapter.
+adapter. Do not add `#[allow(clippy::result_large_err)]`,
+`#[expect(clippy::result_large_err)]`, a crate lint override, a Cargo lint
+override, or a command-line `-A`/`--allow`/`--cap-lints` suppression.
 
 - [ ] **Step 10: Share typed-value counters across every binding root**
 
@@ -1230,6 +1460,26 @@ producer path, reject direct calls and forwarding functions, macros, type
 aliases, and traits. Under `crates/connector-processors/src/`, reject
 `::leak`, `Box::leak`, `String::leak`, and `Vec::leak`.
 
+Apply the same anti-indirection policy to both static literal constructors.
+Track alias imports such as
+`use donat_connector_abi::StaticErrorCode as ErrorCode`, corresponding
+`StaticSafeMessage` aliases, `pub use`, `type` aliases, and
+function/macro/trait definitions that name or invoke
+`StaticErrorCode::literal` or `StaticSafeMessage::literal`. Resolve their
+local alias at call sites and reject the call, export, or forwarding
+definition when its path is outside `STATIC_LITERAL_ROOTS`. Emit the exact
+fixture diagnostics from Step 4 and emit only the most-specific indirection
+diagnostic when a direct-call rule would otherwise duplicate it.
+
+Separately scan `crates/connector-abi/src/`,
+`crates/connector-abi/Cargo.toml`, root `Cargo.toml`, an existing
+`.cargo/config.toml`, and `.github/workflows/*.yml` for
+`clippy::result_large_err` suppression. Reject `allow`, `expect`,
+`result-large-err = "allow"`, `-A`, `--allow`, `--cap-lints`, or an
+equivalent underscore/hyphen spelling with the exact
+`large-error-lint-suppression` diagnostic from Step 4. A strict
+`-D clippy::result_large_err` occurrence is permitted.
+
 Run deterministic self-tests on every invocation before scanning the real
 workspace; `--self-test` runs only the fixtures. Sort diagnostics by path,
 rule ID, and source offset. Require exactly the expected rule and path for
@@ -1272,7 +1522,8 @@ cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
 cargo tree -p donat-connector-abi --target all \
   --edges normal,build --no-default-features --offline --locked
 cargo clippy -p donat-connector-abi --all-targets \
-  --no-default-features --offline --locked -- -D warnings
+  --no-default-features --offline --locked -- \
+  -D warnings -D clippy::result_large_err
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -1289,7 +1540,9 @@ donat-connector-abi v0.1.0
 └── donat-value-contract v0.1.0
 ```
 
-- clippy, format, and whitespace checks exit zero.
+- strict Clippy proves the private boxed layout stays below the large-error
+  threshold without a lint escape;
+- format and whitespace checks exit zero.
 
 - [ ] **Step 15: Run source-breaking and scope scans**
 
@@ -1312,15 +1565,25 @@ if rg -n \
   crates/connector-abi/src/ids.rs; then
   exit 1
 fi
+if rg -n \
+  'result[_-]large[_-]err' \
+  crates/connector-abi; then
+  exit 1
+fi
+if rg -n \
+  '(-A|--allow|--cap-lints|allow|expect).*clippy::result[_-]large[_-]err|result-large-err[[:space:]]*=[[:space:]]*"allow"' \
+  Cargo.toml crates/connector-abi/Cargo.toml .github/workflows; then
+  exit 1
+fi
 rg -n \
-  'pub struct (StaticErrorCode|StaticSafeMessage|AuthorizedCorrelations|BoundedTransportResponse|ConnectorFailure)|pub mod (catalog_construction|host_construction)' \
+  'pub struct (StaticErrorCode|StaticSafeMessage|AuthorizedCorrelations|BoundedTransportResponse|ConnectorFailure)|struct StaticFailureText|static_text: Box<StaticFailureText>|pub mod (catalog_construction|host_construction)' \
   crates/connector-abi/src
 git diff --name-only HEAD
 ```
 
 Expected: all negative scans are empty; the positive scan finds the five
-invariant-carrying types and two unique namespaces; changed paths are exactly
-the six paths listed for Task 2.
+public invariant-carrying types, private boxed static-text bundle, and two
+unique namespaces; changed paths are exactly the six paths listed for Task 2.
 
 - [ ] **Step 16: Rebuild `donat` and run native conformance**
 
@@ -1344,7 +1607,7 @@ Expected:
 
 The focused connector target must run before the full conformance crate.
 
-- [ ] **Step 17: Review the cohesive remediation diff**
+- [ ] **Step 17: Perform the implementer self-review**
 
 Review:
 
@@ -1361,6 +1624,8 @@ git diff -- \
 Check every approved-design section against the diff:
 
 - response fields are private and every read is shared-only;
+- `ConnectorFailure` owns exactly one private boxed `StaticFailureText`, its
+  accessors dereference that box, and no lint suppression hides the layout;
 - ordinary responses carry no authority;
 - host authorization is an intersection and the failure caller supplies no
   allowlist;
@@ -1375,10 +1640,9 @@ Check every approved-design section against the diff:
   processor, server runtime, admin/bypass, or logical/workflow behavior
   changed.
 
-Use the selected execution workflow's independent code-quality review over
-this complete Task 2 diff before committing. Do not invoke Judge. A material
-finding must first gain a focused regression test, then repeat Steps 14
-through 16.
+This is the implementer's self-review only. Do not dispatch an independent
+reviewer or Judge before the commit. A material self-review finding first
+gains a focused regression test, then repeats Steps 14 through 16.
 
 - [ ] **Step 18: Stage exact paths and commit the remediation**
 
@@ -1424,6 +1688,15 @@ git show --stat --oneline --decorate HEAD
 Expected: the worktree is clean and the commit contains only the six staged
 paths above.
 
+After the commit, the SDD controller generates a Task 2 review package from
+the committed diff and dispatches an ordinary independent task reviewer. It
+does not dispatch Judge. A rejection returns each material finding to the
+Task 2 implementer; the implementer adds a focused regression test, repeats
+Steps 14 through 16, commits the correction, and the controller generates a
+new package for a fresh ordinary task review. The community connector
+catalog task must not start until this post-commit Task 2 review records
+acceptance.
+
 ## Plan Self-Review Checklist
 
 - [ ] Every approved-design requirement maps to Task 1 documentation or Task
@@ -1434,8 +1707,19 @@ paths above.
   before production code changes.
 - [ ] The raw-public-field contradiction is removed; no compatibility shim is
   planned.
+- [ ] Private `StaticFailureText` is boxed exactly once after validation;
+  public failure signatures stay unchanged and strict large-error Clippy runs
+  without suppression.
+- [ ] Status, selected headers, decoded value, and response-byte mutation
+  each have an independent external compile-fail check.
 - [ ] Task 2 creates the one checker and CI call; Task 6 modifies and extends
   that checker; Task 8 alone uses host construction.
+- [ ] Static literal aliases, re-exports, type aliases, function/macro/trait
+  wrappers, and lint suppressions each have exact deterministic negative
+  fixtures.
+- [ ] Task 1 and Task 2 each receive an ordinary independent post-commit SDD
+  review; no Judge or pre-commit independent reviewer is planned, and their
+  downstream task is gated on acceptance.
 - [ ] Every created/modified path exists now or is explicitly marked
   `Create`, and no task claims another task's provider/catalog/processor/
   server-runtime ownership.
