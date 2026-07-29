@@ -1,155 +1,286 @@
 # Spec 005 — Durable declarative processes
 
 Status: proposed. Processes orchestrate long-running business work after a
-command commits. They are not microservices, serverless functions, or a
-replacement for the existing GraphQL Actions endpoint.
+command commits. They are not microservices, serverless functions, an
+administrator surface, or a replacement for the existing GraphQL Actions
+endpoint.
 
 ## 1. Goal and hard boundary
 
 A process is a metadata-defined durable state machine. A domain command writes
-a pinned process-start outbox request, and the start worker consumes that
-request into the initial process event and instance. The instance then waits
-for a connector result, an authenticated inbound signal, or a timer, and
-transitions by running a declarative command or queuing another connector
-activity.
+a pinned process start or signal request in its one Postgres CTE statement.
+Source-local workers later consume that committed request, execute explicit
+role-qualified commands, schedule timers, or lease connector activities.
 
-The runtime is part of the single donat binary and stores its durable state in
-Postgres. It reuses the established journal pattern: deploy-time DDL through
-donat migrate --metadata-dir, a runtime Tokio poller, FOR UPDATE SKIP LOCKED,
-at-least-once delivery, idempotent handlers, and per-attempt logs. The serving
-binary never creates DDL.
+The runtime remains part of the single `donat` Rust binary and stores all
+durable process state in the owning Postgres source. Crates and modules are
+compilation boundaries, not services. This feature adds no workflow service,
+plugin runtime, JavaScript/WASM escape hatch, dynamic connector, runtime DDL,
+admin role, permission bypass, generic process-management HTTP API, or
+distributed transaction.
 
-An external request is never made while a database transaction is open. A
-command transaction atomically writes only a pinned process-start outbox
-request, never a process event or activity job. The start worker consumes that
-request in a later short transaction; only a process state transition may
-enqueue an activity job, and its poller performs I/O only after that transition
-commits.
+The serving binary never creates or reconciles DDL. A command remains exactly
+one Postgres statement and assembles its response in Postgres. Background
+process journal work may use several explicit journal statements inside a
+short transaction, but it never performs row-by-row business-table mutation:
+business data changes only through the existing declarative command statement.
+No external request is made while a database transaction is open.
 
-## 2. Metadata surface
+## 2. Cycle-free compilation and public contracts
 
-`processes.yaml` is a top-level metadata section. Section 7 is its only
-normative Phase-1 grammar; no earlier shorthand is accepted by the loader.
-`start.command` causes the command's final CTE to insert an immutable
-process-start request containing the compiled active revision, later consumed
-into the pinned process event. It is valid only when the command result can be
-bound to the declared immutable process input type. A transition invoking a
-command names a `run_as_role`; it
-must be explicitly listed on that command and retain every currently effective
-table permission. There is no administrator role, implicit workflow identity,
-or permission bypass.
+### 2.1 Dependency ownership
 
-Every command transition declares `on_rejection`. Every activity declares this
-single ordered error-routing form; no list-only or `default` spelling is
-accepted:
+The dependency direction is:
 
-~~~yaml
-on_error:
-  routes:
-    - kinds: [authentication, validation]
-      next: manual_review
-  fallback:
-    next: failed
+~~~text
+donat-server -> donat-schema -> donat-ir -> donat-metadata
+      |               |             ^
+      +---------------+-------------+
 ~~~
 
-`routes` is a non-empty ordered list. `kinds` contains one or more distinct
-`ActivityFailureKind` values and no value may appear in more than one route.
-`fallback` is mandatory, has exactly one `next`, and handles every activity
-failure not selected by an earlier route. It is therefore the declared outcome
-for every non-retried connector class not named above, including `invariant`,
-and for `retry_exhausted`. The closed kinds are the eight
-`ConnectorErrorClass` values from Spec 006 (`transport`, `timeout`,
-`http_429`, `http_5xx`, `authentication`, `validation`, `permanent`, and
-`invariant`) plus the worker-only `retry_exhausted` outcome. `retry_on` may
-name only `transport`, `timeout`, `http_429`, and `http_5xx`; the worker
-retries a matching connector failure only while attempts remain. Metadata
-validation rejects an absent `fallback`, an empty/duplicate/unknown route
-kind, a duplicate route kind, a non-retryable `retry_on` entry, or an invalid
-target. A state has exactly one kind discriminator: terminal, activity,
-`wait_for_signal`, `wait_for_command`, or timer waiting. An activity's
-`on_success`/`on_error` and a wait state's nested `on_signal`/`timeout` are
-fields of that one kind, not additional state kinds. `set` may consume declared
-input, state, result, signal, or Spec 004 rule values; it cannot read a table,
-select a runtime role, or execute code.
+`donat-sqlgen` also depends on `donat-ir`. `donat-schema` never depends on
+`donat-server`.
 
-A command or process may accept a decision value only into an exactly typed data destination
-or map a declared enum at deploy time to fixed action/state targets; they
-never bind a generic output to role/permission/command/connector identifiers.
+The implementation adds `crates/ir/src/value_contract.rs` for the shared,
+SQL-free normalized value contract. It exports these immutable types:
 
-## 3. Durable data model and execution
+~~~rust
+pub struct ValueContractCatalog {
+    pub roots: BTreeMap<String, ValueContractField>,
+    pub named_objects: BTreeMap<String, ValueObjectContract>,
+}
 
-The deploy-time migration creates engine-internal tables in donat:
+pub struct ValueContractField {
+    pub required: bool,
+    pub value: ValueContract,
+}
 
-- process_events: append-only starts, signals, timer firings, and activity
-  completions; unique (process_name, idempotency_key) where a source defines
-  a key;
-- process_instances: current state, state JSON, version, status, timestamps;
-- process_activity_jobs: claimed connector invocation intent, result/error,
-  attempts, retry time, and idempotency key;
-- process_transition_logs: immutable audit record of every claimed event,
-  state transition, command result, and connector attempt.
+pub struct ValueContract {
+    pub nullable: bool,
+    pub shape: ValueContractShape,
+}
 
-All transitions use optimistic instance versioning plus FOR UPDATE SKIP LOCKED.
-Retried delivery can observe the same event more than once, so the transition
-record has a unique (instance_id, event_id). A connector job has a logical
-activity ID derived when the state transition enqueues it (the pinned process
-revision, triggering event, and declared state name), not from an attempt.
-Every attempt and lease takeover uses the one idempotency key derived from that
-logical activity ID. A second claim becomes a no-op rather than a duplicated
-business transition.
+pub enum ValueContractShape {
+    Scalar { name: String },
+    Enum { name: String, values: Vec<String> },
+    Object { fields: BTreeMap<String, ValueContractField> },
+    List { element: Box<ValueContract> },
+    Ref { name: String },
+}
 
-Timer scheduling writes a process event with available_at; no in-memory sleep
-is business state. Removing a process definition prevents new starts, but its
-immutable deployed revision remains available until every pinned instance has
-reached a terminal state; existing work is never silently discarded.
+pub struct ValueObjectContract {
+    pub fields: BTreeMap<String, ValueContractField>,
+}
+~~~
 
-## 4. Inbound signals and connector completion
+`roots` and every object field retain missing-value requiredness separately
+from value nullability. `Ref` may name only an entry in `named_objects`, which
+makes recursive input objects finite and self-contained. Map order is
+canonical lexical order; enum value order is declared order. Contract
+assignment and JSON validation are implemented once in this lower module and
+are reused by commands, processes, and connectors.
 
-An inbound connector webhook is verified by that connector module before it
-can create a process signal. The signal mapping is deploy-time metadata and
-binds only declared payload fields. An unknown instance, duplicate provider
-ID, failed signature, or guard denial records an audit outcome and does not
-advance an instance.
+### 2.2 Command descriptors
 
-Connector completion appends a process event in the same database transaction
-that marks its activity job finished. The process runner consumes that event to
-run on_success or the matching on_error route. Compensation is an ordinary
-explicit state with a command or activity; it is never an implicit reverse-SQL
-algorithm.
+`crates/schema/src/commands.rs` publishes one deterministic descriptor for
+every source-qualified command accepted by the existing command compiler:
 
-## 5. Test-first acceptance contract
+~~~rust
+pub struct CommandDescriptor {
+    pub source: String,
+    pub name: String,
+    pub arguments: ValueContractCatalog,
+    pub result: ValueContractCatalog,
+    pub allowed_roles: BTreeSet<String>,
+    pub required_session_variables:
+        BTreeMap<String, BTreeMap<String, ValueContract>>,
+    pub definition_fingerprint: String,
+}
+~~~
 
-| Behavior | First failing test | Regression proof |
-| --- | --- | --- |
-| Command starts one instance | commands/process conformance fixture | command result and pinned process-start request commit atomically; the start worker creates one initial event and instance |
-| Worker crash after claim | process integration test | restart completes exactly one transition audit record |
-| Connector retry | recording connector stub | stable idempotency key is reused and attempts are logged |
-| Duplicate Stripe webhook | webhook conformance fixture | exactly one signal transition occurs |
-| Timer fires after restart | integration test with controlled clock | process reaches timeout state without in-memory state |
-| Compensation | order cancellation fixture | declared compensation command runs, no hidden rollback |
-| Removed definition | migrate/reload integration test | pending event is auditable error, not silently dropped |
+The outer key of `required_session_variables` is an allowed explicit role; the
+inner mapping contains every session-variable name and its single compatible
+contract required by that role's effective table permissions, command
+idempotency scope, and command-effect bindings. Incompatible uses of one name
+are a deployment error.
 
-All tests build the actual donat binary and use a Postgres suite database. The
-worker must be exercised with at least two engine processes to prove the claim
-and idempotency rules.
+`definition_fingerprint` is lowercase SHA-256 over versioned canonical JSON
+containing the source, name, recursive argument/result contracts, allowed
+roles, required session-variable contracts, steps, Rule artifact hashes,
+idempotency declaration, and canonical raw effect declarations. The raw effect
+material contains process/signal names and raw binding shapes, but no resolved
+process revision. Consequently a process revision may include a command
+fingerprint without creating a fingerprint cycle when that command's effect is
+later pinned to the process revision. Descriptors contain no request value,
+resolved session value, database credential, or secret.
 
-## 6. Reference porting plan
+The existing command compiler remains the only command compiler.
+`CompiledCommand` owns its `CommandDescriptor`; process compilation never
+reconstructs command types from raw metadata.
 
-| Upstream | Immutable revision | Files/behavior used | License and treatment |
-| --- | --- | --- | --- |
-| [temporalio/sdk-rust](https://github.com/temporalio/sdk-rust/tree/d2769368df9077a311537431ff4594c9c14db4e7) | d2769368df9077a311537431ff4594c9c14db4e7 | activity idempotency, durable history, replay-oriented test thinking | MIT; behavioral reference only in Phase 1; no Temporal client, protocol, or source files are imported because Donat must not require a Temporal service |
-| Donat crates/server/src/events.rs and cron.rs | current Donat revision | deploy-time reconcile versus runtime poller, retry logging, SKIP LOCKED ownership | native implementation reference and direct extension point |
+### 2.3 Connector descriptors
 
-Any future source port from Temporal must name exact files and retain its MIT
-notice. The first implementation is deliberately a smaller independent state
-machine over the Donat journal; importing Temporal's service dependency would
-violate the one-binary architecture.
+`crates/server/src/connectors/mod.rs` publishes immutable
+`ConnectorOperationDescriptor` values:
 
+~~~rust
+pub struct ConnectorOperationDescriptor {
+    pub instance_name: String,
+    pub module_name: String,
+    pub module_semantic_version: String,
+    pub runtime_abi: u32,
+    pub operation_name: String,
+    pub operation_version: String,
+    pub input: ValueContractCatalog,
+    pub output: ValueContractCatalog,
+    pub idempotency: ConnectorIdempotencySupport,
+    pub capacity: ConnectorCapacityContract,
+    pub endpoint_identity: String,
+    pub credential_identity: String,
+    pub configuration_fingerprint: String,
+}
 
-## 7. Canonical metadata and definition revision
+pub enum ConnectorIdempotencySupport {
+    StableKeyHeader { name: String },
+    Unsupported,
+}
 
-The following is the only canonical Phase-1 shape and resolves all bindings
-explicitly:
+pub struct ConnectorCapacityContract {
+    pub max_in_flight: u32,
+    pub rate_limit: ConnectorRateLimitContract,
+    pub serialize_by: Option<String>,
+}
+
+pub struct ConnectorRateLimitContract {
+    pub permits: u32,
+    pub per_milliseconds: u64,
+    pub burst: u32,
+}
+
+pub struct ConnectorInboundEventDescriptor {
+    pub instance_name: String,
+    pub module_name: String,
+    pub module_semantic_version: String,
+    pub runtime_abi: u32,
+    pub event_name: String,
+    pub event_version: String,
+    pub output: ValueContractCatalog,
+    pub provider_event_id_field: String,
+    pub endpoint_identity: String,
+    pub credential_identity: String,
+    pub configuration_fingerprint: String,
+}
+
+pub struct ConnectorDescriptorCatalog {
+    pub operations:
+        BTreeMap<(String, String), ConnectorOperationDescriptor>,
+    pub inbound_events:
+        BTreeMap<(String, String), ConnectorInboundEventDescriptor>,
+}
+~~~
+
+The capacity contract contains `max_in_flight`, the exact
+`permits`/`per`/`burst` rate policy, and the optional typed scalar
+`serialize_by` input name. The idempotency contract states whether a stable
+activity key is supported and, when applicable, the fixed header identity.
+The configuration fingerprint retains the current non-secret module,
+operation, endpoint, credential-class, capacity, protocol, environment-name,
+and resolved-HTTP-endpoint-digest material; it never retains a resolved secret
+or raw environment-derived base URL.
+
+Verified inbound events use a sibling
+`ConnectorInboundEventDescriptor` containing instance/module/version/ABI,
+event name and version, exact verified output contract, provider-event-ID
+field, endpoint/credential identities, and the same non-secret configuration
+fingerprint. This descriptor is produced by the same compiled connector
+registry, not a process-owned protocol compiler.
+
+Declarative HTTP operation metadata adds an explicit
+`input: BTreeMap<String, String>` type mapping. Every
+`{input.<name>}` path slot and every `{ input: <name> }` query, header, and
+recursive body slot must name an entry in that mapping and be assignable to
+its normalized contract. Dispatch rejects missing required inputs, null for a
+non-null contract, type mismatch, and undeclared extra inputs before DNS or
+request rendering. A declared input that is used only by `serialize_by` is
+valid; every other declared input must be used by the fixed request template.
+Response field type declarations form the output contract.
+
+Stripe does not accept a metadata-defined HTTP schema. The built-in
+`stripe` module publishes a fixed descriptor for
+`checkout.create_session`, operation version `v1`, module semantic version
+`0.1.0`, and runtime ABI `1`. Its input is the exact object
+`{ mode: CheckoutMode!, success_url: string!, cancel_url: string!,
+client_reference_id: uuid!, line_items: [CheckoutLineItem!]! }`, where
+`CheckoutMode` is `payment | subscription | setup` and
+`CheckoutLineItem` is `{ price: string!, quantity: uint64! }`. Its output is
+`{ id: string!, url: string!, status: string!, expires_at: int64! }`.
+The fixed verified `checkout.session.completed` event exposes
+`{ provider_event_id: string!, checkout_session_id: string!,
+client_reference_id: uuid!, payment_status: string! }`.
+
+### 2.4 Process-effect catalog and candidate order
+
+`crates/schema/src/process_effects.rs` owns the server-neutral,
+source-qualified catalog:
+
+~~~rust
+pub struct ProcessEffectContractCatalog {
+    pub sources:
+        BTreeMap<String, BTreeMap<String, ProcessEffectContract>>,
+}
+
+pub struct ProcessEffectContract {
+    pub process_name: String,
+    pub active_revision: String,
+    pub start_input: ValueContractCatalog,
+    pub signals: BTreeMap<String, ProcessSignalEffectContract>,
+}
+
+pub struct ProcessSignalEffectContract {
+    pub signal_name: String,
+    pub contract_revision: String,
+    pub correlation: ValueContractCatalog,
+    pub payload: ValueContractCatalog,
+    pub compatible_revisions: BTreeSet<String>,
+}
+~~~
+
+For each process it contains the active revision and exact start input; for
+each command signal it contains the signal name, correlation/payload
+contracts, the revision whose signal contract was checked, and the set of
+retained revisions with an identical signal-contract fingerprint. It contains
+no runtime handle or journal access.
+
+`crates/server/src/processes/definition.rs` owns the only process compiler and
+its immutable `CompiledProcessCatalog`. Candidate construction in
+`crates/server/src/state.rs` performs exactly this order:
+
+1. `compile_rule_catalog` compiles Rules.
+2. `compile_command_catalog` compiles source-qualified commands and their
+   pre-process `CommandDescriptor` values without resolving process revisions.
+3. `ConnectorRegistry::descriptors` supplies the already compiled connector
+   operation and inbound-event descriptors.
+4. `processes::definition::compile_process_catalog` compiles source-qualified
+   process definitions against those command, Rule, and connector descriptors
+   and derives immutable revisions.
+5. `ProcessEffectContractCatalog::from_processes` creates the cycle-free
+   schema contract.
+6. `finalize_command_effects` validates and pins raw command effects without
+   changing the pre-process command fingerprint.
+7. `CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects`
+   compiles the serving schema.
+8. `processes::reconcile::validate_serving_catalogs` performs read-only checks
+   that every compiled revision is deployed in its real owning source before
+   the candidate `Engine` is published.
+
+Each `Engine` snapshot retains the finalized command catalog and one immutable
+source-qualified `CompiledProcessCatalog` beside the schema. No compiler is
+duplicated and no dependency points from `donat-schema` to `donat-server`.
+
+## 3. Canonical process metadata
+
+`processes.yaml` is a top-level metadata section. The following shape is the
+normative Phase-1 grammar:
 
 ~~~yaml
 - name: checkout_order
@@ -173,15 +304,22 @@ explicitly:
     signal: cancel_checkout
     correlate:
       order_id: uuid!
-    payload: { reason: string! }
+    payload:
+      reason: string!
     on_cancel: cancelled
   states:
     create_checkout:
       activity:
         connector: stripe
-        operation: create_checkout_session
+        operation: checkout.create_session
         input:
+          mode: { literal: payment }
+          success_url: { literal: "https://shop.example/success" }
+          cancel_url: { literal: "https://shop.example/cancel" }
           client_reference_id: { input: order_id }
+          line_items:
+            literal:
+              - { price: price_standard, quantity: 1 }
         timeout:
           schedule_to_start: 5m
           start_to_close: 30s
@@ -207,20 +345,21 @@ explicitly:
       wait_for_signal:
         connector: stripe
         event: checkout.session.completed
-        provider_event_id: { event: id }
+        provider_event_id: { event: provider_event_id }
         correlate:
-          order_id: { event: data.object.client_reference_id }
+          order_id: { event: client_reference_id }
         on_signal:
           guard:
             rule: payment_matches_order
             with:
               order_id: { state: order_id }
-              checkout_order_id: { event: data.object.client_reference_id }
+              checkout_order_id: { event: client_reference_id }
           command:
             name: mark_order_paid
             run_as_role: payment_worker
             input:
               order_id: { state: order_id }
+            session_variables: {}
           next: completed
           on_rejection: failed
         timeout:
@@ -231,6 +370,7 @@ explicitly:
               run_as_role: order_worker
               input:
                 order_id: { state: order_id }
+              session_variables: {}
             next: expired
             on_rejection: failed
     completed: { terminal: true }
@@ -240,273 +380,672 @@ explicitly:
     cancelled: { terminal: true }
 ~~~
 
-source is required and must be the same Postgres source used by the starting
-command. input describes immutable instance input. state describes the only
-mutable user-visible process data. initial_state binds every required state
-field from input, literals, or Spec 004 rules; it cannot read a table or
-environment variable.
+`name`, `source`, `start`, `input`, `state`, `initial_state`, `initial`,
+`cancellation`, and `states` use deny-unknown-fields metadata types.
+`cancellation` is optional, but when present it requires the exact signal,
+typed correlation, typed payload, and `on_cancel` target shown above.
+`start` is required and has exactly one command in Phase 1.
+That same-source command must contain exactly one raw `start_process` effect
+targeting this process, and its canonical input/idempotency bindings must equal
+the process `start` mapping. The compiler rejects a missing, duplicate, or
+disagreeing declaration; neither side silently overrides the other.
 
-The canonical form has exactly one start command in Phase 1. A command may
-start multiple processes through separate Spec 003 effects, but one process
-definition cannot have multiple start sources. A state has exactly one kind
-discriminator; activity transition fields do not create another kind.
-`wait_for_signal` contains one verified connector signal mapping and one
-`on_signal` transition; its optional nested `timeout` has exactly `after` and
-`on_timeout` transition keys. `wait_for_command` has the same nested
-`on_signal` and optional `timeout` form, but additionally declares its exact
-command-signal name, typed payload, and correlation. A timer-only state uses
-`timer: { after: <duration>, on_timeout: <transition> }`; `after` is never a
-sibling of `wait_for_signal`, `wait_for_command`, or another state kind. The
-optional cancellation block is similarly typed and is accepted while the
-instance is non-terminal. Only a validated Spec 003 `signal_process` effect
-may append a command signal or cancellation; this is the domain-safe mechanism
-for approval, correction, and cancellation without a generic
-process-management endpoint. Start input, every state set, activity input,
-command input, signal payload, correlation field, and rule binding is checked
-against its declared type at metadata validation time.
+A state has exactly one kind discriminator: `terminal`, `activity`,
+`wait_for_signal`, `wait_for_command`, or `timer`. Activity
+`on_success`/`on_error` and wait-state `on_signal`/nested `timeout` are fields
+of that kind, not additional kinds. A timer-only state is
+`timer: { after: <duration>, on_timeout: <transition> }`. Phase 1 does not
+accept a sibling `after` or `on_signal` shorthand.
 
-During donat migrate --metadata-dir, the engine canonicalizes each valid
-process definition and derives a revision from its canonical JSON plus the
-rules, command-definition fingerprints, connector module/operation versions,
-connector endpoint and credential identities, and non-secret connector
-configuration fingerprints it references. It inserts immutable rows
-into donat.process_definition_versions:
+Every activity uses the one total ordered error form:
 
-| Column | Meaning |
+~~~yaml
+on_error:
+  routes:
+    - kinds: [authentication, validation]
+      next: manual_review
+  fallback:
+    next: failed
+~~~
+
+`routes` is non-empty. A kind may occur in only one route. `fallback` is
+mandatory and handles every unmatched non-retried failure, including
+`invariant` and worker-generated `retry_exhausted`. The closed connector kinds
+are `transport`, `timeout`, `http_429`, `http_5xx`, `authentication`,
+`validation`, `permanent`, and `invariant`; `retry_on` accepts only the first
+four.
+
+Every transition that invokes a command requires `name`, fixed
+`run_as_role`, exact `input`, explicit `session_variables`, `next`, and
+`on_rejection`. `session_variables` is a closed typed mapping: it contains
+every name required for that role by `CommandDescriptor` and no other name.
+Allowed bindings are literals and declared process input/state,
+prior-command result, verified signal, or Rule data available in that
+transition context. They never come from caller headers, ambient GraphQL
+session data, connector-selected data outside the verified event descriptor,
+or an event-selected role.
+
+All start input, initial state, state `set`, command input/session variables,
+activity input, signal payload/correlation, and Rule bindings are checked for
+exact contract assignment at deployment. A decision value may flow only into
+an exactly typed data destination or through a deploy-time fixed enum mapping;
+it cannot select a role, permission, command, connector, source, or process.
+
+Every process-owned input, state, activity input/result, signal payload, and
+redacted error value is limited to 256 KiB after canonical serialization.
+Connector modules enforce their raw-body limits before parsing.
+
+## 4. Strict source locality and deployment commands
+
+A process source is required and must name a Postgres source. The starting
+command, every transition command, every `start_process` effect, and every
+`signal_process` effect resolve only within that exact source. A same-named
+command or process in another source is not a fallback. Cross-source
+references fail deployment before a journal row can be written.
+
+A connector instance referenced by a process activity or inbound wait is
+bound to exactly one process source in a deployment. Referencing the same
+connector instance from processes in two sources fails global candidate
+compilation. This makes capacity coordination, webhook routing, database time,
+and journal writes source-local. The runtime starts separate worker loops and
+uses separate Postgres pools for each process-owning source.
+
+Deployment uses these exact forms:
+
+~~~text
+donat migrate --migrations-dir migrations --metadata-dir <dir> --source <name>
+donat validate --metadata-dir <dir> --source <name>
+~~~
+
+`--source` selects one metadata source, requires it to be Postgres, resolves
+that source's own `configuration.connection_info.database_url`, and uses the
+global `--database-url`/`DONAT_DATABASE_URL` only as the existing explicit
+fallback when the selected source has no connection URL. A missing
+environment variable is an error; it is never silently replaced by another
+source's URL.
+
+Omitting `--source` is accepted only when the loaded metadata contains exactly
+one Postgres source and its URL is unambiguous. Zero or multiple Postgres
+sources is a usage error. `migrate` applies V1–V6 and reconciles event triggers
+and process definitions only in the selected source. It never changes another
+source. `validate` introspects only the selected source and reports that
+source's catalog, command, process, deployed-revision, and compatibility
+problems plus global metadata-only Rule/connector/source-binding problems.
+It does not claim that unselected database catalogs were checked.
+
+Consistency code constructs a catalog map containing only the selected source.
+It must never clone one introspected `Catalog` across metadata source names.
+`donat-schema::compile_command_source_catalog` and
+`processes::definition::compile_process_source_catalog` are the source-scoped
+compiler entry points used by migrate/validate; the global candidate compilers
+compose the same entry points for all real source catalogs.
+Serving startup separately resolves and introspects every real source URL,
+compiles the complete candidate using those real catalogs, and performs
+read-only deployed-revision validation. Serve performs no DDL or
+reconciliation.
+
+The native conformance harness always invokes migration as
+`donat migrate --migrations-dir <workspace>/migrations --metadata-dir <suite>
+--source default`. Multi-source deployment tests invoke the command once per
+Postgres source with that source's real URL.
+
+## 5. Immutable definitions and reconciliation
+
+The compiler derives a lowercase SHA-256 revision from versioned canonical
+JSON containing:
+
+- the source-qualified canonical process definition;
+- normalized process input/state/signal contracts;
+- referenced Rule profile version and canonical AST hashes;
+- referenced pre-process command descriptors and fingerprints;
+- referenced connector operation/inbound descriptors and configuration
+  fingerprints;
+- the process runtime ABI.
+
+The deploy-time reconciliation entry point is:
+
+~~~rust
+pub async fn reconcile(
+    source_name: &str,
+    database_url: &str,
+    source_catalog: &donat_catalog::Catalog,
+    compiled_processes: &CompiledSourceProcessCatalog,
+    dependency_descriptors: &ProcessDependencyDescriptors,
+) -> anyhow::Result<()>;
+~~~
+
+It inserts a missing immutable revision, leaves an identical deployment
+unchanged, activates the selected revision, and retires omitted prior
+revisions without deleting them. It rejects removal or an incompatible change
+of a command, Rule, connector operation, runtime ABI, or wait/cancellation
+signal contract still referenced by a non-terminal instance. A process
+revision remains loadable until no live instance can use it.
+
+A start request stores the active revision selected when the command statement
+executes. The start worker never substitutes a newer active revision. A signal
+request stores the revision whose signal contract finalized the effect.
+It may match an instance on another retained revision only when reconciliation
+recorded an identical signal name/correlation/payload contract fingerprint;
+the worker never guesses compatibility from current metadata.
+
+## 6. Execution-generation identity and resolved command effects
+
+V6 adds `invocation_id uuid` to `donat.command_invocations`. Existing rows are
+backfilled with distinct UUIDs and the column becomes non-null and unique.
+The command's first execution generates a new UUID. An unexpired exact replay
+returns the stored result and preserves that UUID. Reclaiming an expired
+idempotency tuple is a new execution generation: it writes a new UUID even
+though `(command_identity, scope_hash, key)` is reused.
+
+`crates/ir/src/lib.rs` replaces `CommandEffectKind` with these closed resolved
+values:
+
+~~~rust
+pub enum ResolvedCommandEffect {
+    StartProcess(ResolvedStartProcessEffect),
+    SignalProcess(ResolvedSignalProcessEffect),
+}
+
+pub struct ResolvedStartProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub input: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+pub struct ResolvedSignalProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub signal_name: String,
+    pub correlation: BTreeMap<String, CommandExecutionValue>,
+    pub payload: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+pub enum CommandInvocationIdSource {
+    CurrentExecution,
+}
+~~~
+
+`CurrentExecution` is a trusted closed reference, not metadata. SQLgen
+resolves it to the concrete UUID returned by the command invocation CTE.
+`effect_position` is the zero-based position in canonical command effect
+order. All other fields are fully source- and type-resolved by the planner.
+
+`plan_mutation.rs` lowers finalized effects into this IR. SQLgen inserts each
+start or signal request from the same successful command CTE statement and
+only from the `first` claim path. Every outbox row copies the concrete
+`invocation_id` and is unique on
+`(command_invocation_id, effect_position)`. Replay, changed-input rejection,
+guard rejection, or any database error inserts no second outbox row.
+
+The command's execution-generation identity and the process's semantic start
+dedupe are different contracts. The former identifies one actual command
+execution; the latter is `unique(process_name, start_idempotency_key)` on
+instances and prevents two distinct command executions from starting the same
+business process. Process audit and outbox rows have no foreign key to
+`donat.command_invocations`, so command retention cannot delete or invalidate
+process history.
+
+There is no `enqueue_start` API. `processes/start.rs` and
+`processes/inbound.rs` expose worker-side consumers only; no post-command
+Rust insert, SQL function, GraphQL resolver, or HTTP handler can start or
+signal a process directly.
+
+## 7. Exact V6 journal schema
+
+`migrations/V6__donat_processes.sql` is deploy-time-only. All tables are in
+the `donat` schema, are not tracked automatically, and have no GraphQL, REST,
+MCP, or management mutation surface. UUID primary keys default to
+`gen_random_uuid()`. Every process-owned JSONB payload has
+`check (pg_column_size(<column>) <= 262144)`.
+
+The migration first alters the command journal:
+
+~~~text
+donat.command_invocations
+  add invocation_id uuid;
+  backfill every existing row with gen_random_uuid();
+  set invocation_id not null;
+  unique(invocation_id).
+~~~
+
+It then creates these exact process tables:
+
+~~~text
+donat.process_definition_versions(
+  process_name text not null,
+  revision text not null,
+  source_name text not null,
+  canonical_definition jsonb not null,
+  dependency_descriptors jsonb not null,
+  runtime_abi integer not null check (runtime_abi > 0),
+  status text not null check (status in ('active','retired')),
+  deployed_at timestamptz not null default now(),
+  retired_at timestamptz,
+  primary key(process_name, revision)
+)
+unique(process_name) where status = 'active';
+
+donat.process_start_requests(
+  id uuid primary key,
+  source_name text not null,
+  process_name text not null,
+  revision text not null,
+  input_json jsonb not null,
+  command_invocation_id uuid not null,
+  effect_position integer not null check (effect_position >= 0),
+  idempotency_key text not null,
+  status text not null
+    check (status in ('pending','consumed','duplicate','failed')),
+  instance_id uuid,
+  created_at timestamptz not null default now(),
+  consumed_at timestamptz,
+  unique(command_invocation_id, effect_position),
+  foreign key(process_name, revision)
+    references donat.process_definition_versions(process_name, revision)
+);
+
+donat.process_instances(
+  id uuid primary key,
+  source_name text not null,
+  process_name text not null,
+  revision text not null,
+  source_request_id uuid not null,
+  start_idempotency_key text not null,
+  status text not null
+    check (status in ('running','terminal','failed','cancelled')),
+  current_state text not null,
+  input_json jsonb not null,
+  state_json jsonb not null,
+  version bigint not null default 0 check (version >= 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(process_name, start_idempotency_key),
+  unique(source_request_id),
+  foreign key(process_name, revision)
+    references donat.process_definition_versions(process_name, revision)
+);
+
+donat.process_events(
+  id uuid primary key,
+  instance_id uuid not null references donat.process_instances(id),
+  process_name text not null,
+  revision text not null,
+  kind text not null check (kind in (
+    'start','signal','timer','activity_succeeded','activity_failed',
+    'retry_exhausted','command_rejected','cancellation'
+  )),
+  payload_json jsonb not null,
+  idempotency_key text,
+  available_at timestamptz not null default now(),
+  status text not null check (status in ('pending','consumed','failed')),
+  attempts integer not null default 0 check (attempts >= 0),
+  created_at timestamptz not null default now(),
+  consumed_at timestamptz,
+  foreign key(process_name, revision)
+    references donat.process_definition_versions(process_name, revision)
+)
+unique(process_name, revision, kind, idempotency_key)
+  where idempotency_key is not null;
+
+donat.process_signal_requests(
+  id uuid primary key,
+  source_name text not null,
+  process_name text not null,
+  process_revision text not null,
+  signal_name text not null,
+  correlation_json jsonb not null,
+  payload_json jsonb not null,
+  command_invocation_id uuid not null,
+  effect_position integer not null check (effect_position >= 0),
+  idempotency_key text not null,
+  status text not null check (status in (
+    'pending','consumed','duplicate','unmatched','ambiguous',
+    'guard_false','unexpected_state','failed'
+  )),
+  created_at timestamptz not null default now(),
+  consumed_at timestamptz,
+  unique(command_invocation_id, effect_position),
+  foreign key(process_name, process_revision)
+    references donat.process_definition_versions(process_name, revision)
+);
+
+donat.process_activity_jobs(
+  id uuid primary key,
+  instance_id uuid not null references donat.process_instances(id),
+  enqueued_from_event_id uuid not null references donat.process_events(id),
+  state_name text not null,
+  logical_activity_id text not null,
+  connector_instance text not null,
+  operation text not null,
+  serialization_key_hash bytea,
+  input_json jsonb not null,
+  result_json jsonb,
+  idempotency_key text not null,
+  status text not null check (status in (
+    'scheduled','running','succeeded','failed','cancelled'
+  )),
+  attempts integer not null default 0 check (attempts >= 0),
+  available_at timestamptz not null default now(),
+  schedule_to_start_deadline timestamptz not null,
+  start_to_close_deadline timestamptz,
+  lease_token uuid,
+  lease_expires_at timestamptz,
+  last_error_json jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(instance_id, logical_activity_id)
+);
+
+donat.process_transition_logs(
+  id uuid primary key,
+  instance_id uuid not null references donat.process_instances(id),
+  event_id uuid references donat.process_events(id),
+  activity_job_id uuid references donat.process_activity_jobs(id),
+  activity_attempt integer,
+  from_state text,
+  to_state text,
+  outcome text not null,
+  definition_revision text not null,
+  command_result_json jsonb,
+  before_state_hash bytea,
+  after_state_hash bytea,
+  redacted_context jsonb not null,
+  created_at timestamptz not null default now()
+)
+unique(instance_id, event_id) where event_id is not null;
+unique(activity_job_id, activity_attempt, outcome)
+  where activity_job_id is not null and activity_attempt is not null;
+
+donat.process_capacity_reservations(
+  id uuid primary key,
+  activity_job_id uuid not null references donat.process_activity_jobs(id),
+  connector_instance text not null,
+  operation text not null,
+  serialization_key_hash bytea,
+  lease_token uuid not null,
+  reserved_at timestamptz not null,
+  expires_at timestamptz not null,
+  released_at timestamptz,
+  unique(activity_job_id, lease_token)
+);
+index(connector_instance, operation, expires_at);
+index(connector_instance, operation, serialization_key_hash, expires_at);
+
+donat.process_inbound_deliveries(
+  id uuid primary key,
+  connector_instance text not null,
+  provider_event_id text,
+  payload_digest bytea not null,
+  signature_status text not null check (signature_status in (
+    'verified','missing','invalid','expired','malformed','unsupported'
+  )),
+  outcome text not null check (outcome in (
+    'accepted','duplicate','unmatched','ambiguous','guard_false',
+    'unexpected_state','invalid_signature'
+  )),
+  redacted_metadata jsonb not null,
+  received_at timestamptz not null default now()
+);
+
+donat.process_inbound_events(
+  id uuid primary key,
+  connector_instance text not null,
+  provider_event_id text not null,
+  first_delivery_id uuid not null
+    references donat.process_inbound_deliveries(id)
+    deferrable initially deferred,
+  payload_digest bytea not null,
+  verified_at timestamptz not null,
+  unique(connector_instance, provider_event_id)
+);
+~~~
+
+No process table has a foreign key to `donat.command_invocations` or
+`donat.command_invocation_claims`. Indexes cover due event/start/signal/job
+status and `available_at`, activity lease expiry, instance process/state
+correlation, definition status, inbound received time, and capacity expiry.
+
+## 8. Start consumption and command transitions
+
+The start worker claims one pending request with
+`FOR UPDATE SKIP LOCKED` in the request's source pool. In one short
+transaction it loads the exact stored revision, validates the canonical input,
+inserts or finds the instance by
+`(process_name, start_idempotency_key)`, appends the start event and transition
+log for a new instance, records duplicate outcome for an existing semantic
+instance, and marks the request consumed. A crash before commit leaves the
+request pending; a crash after commit cannot create a second instance.
+
+Every ordinary transition locks one due event and its instance, verifies the
+pinned definition/runtime ABI, evaluates its closed guard context, compares
+the optimistic instance version, writes the transition log and next
+event/timer/activity, and marks the event consumed in one short outer
+transaction.
+
+When a transition invokes a command, the process transition owns that outer
+Postgres transaction. The worker builds:
+
+~~~rust
+Session {
+    role: transition.run_as_role.clone(),
+    vars: compiled_session_variables_only,
+    backend_request: false,
+}
+~~~
+
+The mapping is evaluated only from the compiled sources allowed in Section 3;
+no request headers or ambient GraphQL session are available.
+
+The command's one SQL statement executes inside a nested savepoint. Only a
+database error with SQLSTATE `P0D01` and a valid exact
+`donat.graphql-error.v1` envelope is a command business rejection. For that
+error, the worker rolls back to and releases the savepoint, decodes the
+existing Donat error body, appends exactly one `command_rejected` audit
+event/transition, follows `on_rejection`, and commits the outer transaction.
+The command's domain DML and its command journal/outbox CTEs remain rolled
+back. A malformed reserved envelope, permission SQLSTATE `23514`, connection
+error, constraint error, decode error, or any other database failure aborts
+the outer transaction; it cannot commit `on_rejection`.
+
+GraphQL and process execution share the same internal command planner,
+single-statement renderer, result decoder, and strict rejection decoder.
+Neither path accepts raw SQL or constructs a new error envelope.
+
+## 9. Activities, leases, retries, and capacity
+
+A state transition gives each activity one deterministic
+`logical_activity_id` from the process revision, instance, triggering event,
+and state name. Its provider idempotency key is derived once from that ID and
+is unchanged by retries, crash recovery, or lease takeover.
+
+An activity claim transaction:
+
+1. locks one scheduled due job with `FOR UPDATE SKIP LOCKED`;
+2. compares `schedule_to_start_deadline` with the owning source's database
+   clock;
+3. under a source-local Postgres coordination lock, checks unexpired
+   `process_capacity_reservations` against `max_in_flight`, the rolling
+   permits/per/burst policy, and the optional serialization-key hash;
+4. inserts one reservation, assigns a random lease token, increments attempt,
+   and stores start-to-close/lease deadlines;
+5. commits before calling the connector.
+
+Unavailable capacity leaves the job scheduled and closes the transaction.
+The connector receives immutable typed input, stable idempotency key, and
+deadline only. It receives no pool, role, mutable process, arbitrary transport
+request, or secret-bearing logger.
+
+Completion uses a new short transaction and updates only a job whose current
+lease token still matches. It stores the result/failure, releases the
+reservation, and appends one completion event atomically. A stale completion
+cannot advance the instance and receives an append-only attempt audit.
+
+`schedule_to_start` is measured from enqueue and makes no provider call when
+expired. `start_to_close` is measured from claim and makes a late completion
+stale. Phase 1 has no heartbeat extension.
+
+`max_attempts` includes the first attempt. Retry delay is
+`min(max_interval, initial_interval * 2^(attempt-1))`, with deterministic full
+jitter derived from logical activity ID and attempt. `Retry-After` may
+postpone, never accelerate. Exhaustion appends `retry_exhausted`. No retry is
+implicit or infinite.
+
+## 10. Timers, command signals, and verified inbound delivery
+
+Timers are source-local journal events due by the owning Postgres clock.
+Tokio polling is only a wake-up mechanism; no sleep or in-memory wheel is
+business state.
+
+The connector endpoint remains
+`POST /v1/connectors/{connector_instance}/webhooks`. The compiled connector
+binding selects exactly one process source. The connector verifies the raw
+bytes before parsing and returns only its typed verified event contract.
+
+Inbound persistence is deliberately split:
+
+- `process_inbound_events` is only the verified provider-event dedupe ledger,
+  unique on `(connector_instance, provider_event_id)`;
+- `process_inbound_deliveries` is append-only audit for every delivery attempt.
+
+A verified delivery writes its delivery audit row and inserts or observes the
+dedupe row in one source-local transaction. A first verified event then
+correlates at most one non-terminal compatible instance and records exactly
+one of `accepted`, `unmatched`, `ambiguous`, `guard_false`, or
+`unexpected_state`. A repeated verified event writes a distinct delivery row
+with `duplicate` while preserving the original dedupe row and transition.
+An invalid signature has no trusted provider ID requirement and writes only
+one redacted delivery row with `invalid_signature`; it never writes the dedupe
+ledger or process state.
+
+The route acknowledges a verified provider event only after the complete
+transaction commits. A post-verification database failure is not
+acknowledged, so the provider can retry. Payload digests and redacted metadata
+are retained; raw bodies and secrets are not retained by this Phase-1 schema.
+
+The command-signal worker consumes only a typed
+`process_signal_requests` outbox row. It uses the stored source, process,
+revision compatibility anchor, signal name, correlation/payload, semantic key,
+invocation UUID, and effect position. No operator endpoint can manufacture
+that row.
+
+Signals are not buffered. A verified or command signal delivered while the
+instance is not receptive records `unexpected_state` and cannot advance a
+later wait. Zero or multiple correlation matches are audit-only. A declared
+cancellation signal cancels only still-scheduled jobs and takes `on_cancel`;
+an in-flight provider request is not retracted and its later completion is
+audit-only. Compensation is an explicit state, never reverse SQL.
+
+## 11. Failure and completion semantics
+
+| Outcome | Durable result |
 | --- | --- |
-| process_name, revision | immutable primary key |
-| canonical_definition | validated canonical JSON, including resolved rule AST hashes |
-| source_name | owning Postgres source |
-| runtime_abi | minimum compatible process-runtime ABI |
-| status | active or retired |
-| deployed_at | deployment audit timestamp |
+| guard false | event consumed, `guard_false` audit, state unchanged |
+| valid structured command rejection | command savepoint rolled back; exactly one `on_rejection` transition commits |
+| any other command/database error | outer transition aborts; no rejection transition commits |
+| retryable selected connector error | job rescheduled with deterministic delay and same key |
+| non-retried connector error | typed completion event follows the first matching route or fallback |
+| retry limit | `retry_exhausted` follows the declared route or fallback |
+| capacity or serialization unavailable | job remains scheduled; no provider call |
+| schedule-to-start timeout | typed timeout event; no provider call |
+| start-to-close timeout or stale completion | current lease may be retried; stale completion is audit-only |
+| duplicate start semantic key | request is duplicate; existing instance is unchanged |
+| duplicate verified provider event | new delivery audit plus existing dedupe row; no second process event |
+| invalid signature | delivery audit only |
+| unmatched/ambiguous/unexpected signal | delivery/request audit only |
+| cancellation | declared transition; only unclaimed jobs cancelled |
+| missing pinned definition/ABI | invariant audit and claim stop; no invented transition |
 
-A new metadata definition creates a new revision; it never overwrites a
-revision used by an instance. A compiled command effect writes the active
-revision into its start request in the same CTE as the command result; the
-start worker must use that stored revision, never resolve a newer active one.
-An instance stores process_name and revision, so reload, rollback, and removal
-cannot reinterpret in-flight work. A worker may claim an event only when its
-binary supports the instance runtime ABI and every pinned module/operation
-version; deployment drains or fences incompatible workers before activation.
-Retiring a definition prevents new starts but retains its revision until no
-non-terminal instance references it. The serve command performs no definition
-reconciliation or DDL; validate reports a metadata revision that has not been
-deployed by migrate.
+A terminal instance treats later signals, timers, and completions as
+audit-only. Removing a definition blocks new starts but never reinterprets or
+silently discards a live instance.
 
-Every individual process input, state, activity input/result, signal payload,
-and redacted error JSON is bounded to 256 KiB after canonical serialization.
-Inbound raw-body limits are set by the connector module before parsing. A
-deployment must keep database migrations backward-compatible with every active
-process revision. `migrate --metadata-dir` verifies active pinned command and
-catalog references before publishing the metadata snapshot; it fails rather
-than serving an instance whose referenced command, table, or column disappeared.
+## 12. Test-first acceptance matrix
 
-## 8. Durable tables and state transitions
+Every behavior starts with a failing crate test and, where externally visible,
+a native conformance fixture. The focused identifiers are normative:
 
-The migration creates the following internal tables. They are engine catalog
-tables, are not automatically tracked, and have no GraphQL, REST, MCP, or
-runtime-management mutation surface.
-
-| Table | Essential columns and unique keys | Purpose |
+| Test ID | Level | Required proof |
 | --- | --- | --- |
-| donat.process_instances | id, process_name, revision, source_event_id, status, current_state, state_json, input_json, version, created_at, updated_at; unique(process_name, revision, source_event_id) | one durable state-machine instance |
-| donat.process_events | id, instance_id nullable, process_name, revision, kind, payload_json, idempotency_key, available_at, status, attempts, created_at; unique(process_name, revision, idempotency_key) when key is non-null | immutable start, signal, timer, and completion events |
-| donat.process_start_requests | id, process_name, revision, input_json, command_invocation_id, effect_position, idempotency_key, status, created_at; unique(command_invocation_id, effect_position) | idempotent command-to-process start hand-off pinned at command execution |
-| donat.process_signal_requests | id, process_name, signal_name, correlation_json, payload_json, command_invocation_id, effect_position, idempotency_key, status, created_at; unique(command_invocation_id, effect_position) | idempotent typed command-to-process signal hand-off |
-| donat.process_activity_jobs | id, instance_id, enqueued_from_event_id, state_name, logical_activity_id, connector_instance, operation, serialization_key nullable, input_json, idempotency_key, status, attempts, available_at, schedule_to_start_deadline, start_to_close_deadline, lease_token, lease_expires_at, last_error_json; unique(instance_id, logical_activity_id) | intent to perform one external operation |
-| donat.process_transition_logs | id, instance_id, event_id nullable, activity_job_id nullable, from_state, to_state, outcome, definition_revision, redacted_context, created_at; unique(instance_id, event_id, outcome) | append-only audit trail |
-| donat.process_inbound_events | connector_instance, provider_event_id, received_at, payload_digest, verification_outcome; unique(connector_instance, provider_event_id) | provider webhook deduplication and audit |
+| `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
+| `connector_descriptor_is_typed_and_non_secret` | server unit | HTTP/Stripe descriptors contain exact contracts and no secret values |
+| `http_template_slots_require_declared_types` | metadata/server unit | path/query/header/body slots reject undeclared or incompatible input |
+| `process_metadata_requires_start_and_cancellation_shape` | metadata unit | canonical grammar includes start and typed cancellation |
+| `process_candidate_build_is_cycle_free` | state unit | descriptors, process revisions, effect finalization, and schema compile in the required order |
+| `process_rejects_cross_source_command` | process compiler | start, transition, start effect, and signal effect cannot cross source |
+| `process_connector_instance_has_one_source` | process compiler | one connector instance cannot coordinate two process sources |
+| `process_deployment_selects_one_real_source` | migrate integration | selected source alone is introspected/reconciled; omitted ambiguous source fails |
+| `process_v6_schema_is_exact` | migrate integration | every Section 7 column/key/index exists and no command-journal FK exists |
+| `command_invocation_id_replays_unchanged` | SQLgen/Postgres | exact replay preserves UUID |
+| `command_invocation_id_changes_after_expiry` | SQLgen/Postgres | expired-key execution gets a new UUID |
+| `command_effect_positions_share_generation` | SQLgen/Postgres | multiple positions copy one invocation UUID and remain individually unique |
+| `process_start_request_pins_revision` | command/process integration | request under A consumed after B deploy starts A |
+| `process_start_semantic_dedupe_is_separate` | process integration | distinct invocation UUIDs with one semantic key create one instance |
+| `process_session_variables_are_closed` | compiler/runtime | missing/extra/ambient mappings reject; worker uses only compiled values |
+| `process_command_rejection_commits_on_rejection` | Postgres integration | domain DML rolls back while one rejection transition commits |
+| `process_command_database_error_aborts_outer` | Postgres integration | non-P0D01 error commits no process writes |
+| `process_activity_does_not_hold_tx` | recording connector | provider wait begins only after lease transaction commits |
+| `process_lease_takeover_is_safe` | two binaries | stable key, one transition, stale audit |
+| `process_activity_capacity_is_global` | two binaries | max/rate/serialization policies hold in one source |
+| `process_timer_survives_restart` | controlled DB clock | timer fires once without in-memory state |
+| `process_inbound_audit_is_split` | webhook integration | accepted plus duplicate create two deliveries, one dedupe row, one transition |
+| `process_invalid_signature_is_audit_only` | webhook integration | invalid signature creates delivery only and permits absent provider ID |
+| `process_signal_is_not_buffered` | command/webhook integration | early/late signal cannot advance a later wait |
+| `process_revision_runtime_abi_is_fenced` | rolling deployment | incompatible worker cannot claim pinned work |
+| `process_no_management_api` | route/schema test | no process management field or route is published |
 
-A worker transition uses a short database transaction: lock one due event with
-FOR UPDATE SKIP LOCKED, verify its instance revision and status, apply the
-state-machine transition with instance version equality, insert the transition
-log, enqueue a timer or activity job if required, and mark the event consumed.
-The transition transaction contains no HTTP and no wait for another worker.
-It gives every job a logical_activity_id once; retries never create a new
-logical activity or provider idempotency key.
+Focused tests rebuild `cargo build -p donat-server --bin donat` before native
+conformance. Final acceptance runs all workspace tests and the full
+conformance crate against Postgres, with process lifecycle cases using two
+independent engine processes.
 
-An activity job is claimed separately. In one short committed transaction the
-worker reserves an operation-scoped, Postgres-coordinated capacity permit,
-sets status=running, a random lease_token, start_to_close_deadline, and a lease
-that outlives that deadline by a fixed safety margin. If no permit is available,
-the job remains scheduled; the worker does not hold a transaction while waiting.
-The worker then calls the connector outside a transaction. It records a result
-only with an UPDATE whose lease_token still matches and, in that same
-transaction, inserts the single activity-completed process event. A worker that
-wakes after its lease is lost cannot transition the instance; it records a
-stale-attempt audit entry. Another worker may retry after lease expiry. This
-guarantees at-least-once execution, never exactly-once external delivery.
+## 13. Read-only operational diagnosis
 
-The migration owns internal capacity-reservation rows keyed by connector
-instance and operation, with an optional canonical serialization key. Every
-engine process consults them before an outbound call, so configured
-max-in-flight, rate limits, and same-resource serialization are global to the
-deployment, not per worker. A reservation expires with its activity lease; an
-operation is never rate-limited or serialized by an in-memory counter alone.
+The binary may expose:
 
-schedule_to_start is measured from job enqueue with the database clock. If a
-scheduled job reaches that deadline before a claim, the worker appends a typed
-timeout event without calling the provider. start_to_close is measured from a
-successful claim; ActivityContext carries that deadline and a completion after
-it is stale. Phase 1 has no activity heartbeats: a long-running interaction is
-modelled by a connector start activity plus a timer or verified signal, not by
-an indefinitely extended HTTP call.
+~~~text
+donat process inspect --source <name> --instance <uuid>
+donat process verify-history --source <name> --instance <uuid>
+~~~
 
-The initial retry policy is explicit on every activity. max_attempts includes
-the first attempt. The retry schedule is min(max_interval,
-initial_interval * 2^(attempt-1)); deterministic full jitter is derived from a
-stable hash of logical_activity_id and attempt. A provider Retry-After value
-can postpone, but never accelerate, the next attempt. Reaching the limit
-appends a typed retry_exhausted event. There is no infinite implicit retry.
+Both are read-only. Inspect emits a redacted journal timeline.
+Verify-history reapplies stored events and stored command/activity results to
+the pinned definition and exits non-zero on a before/after-state-hash
+mismatch. Neither subcommand invokes a command or connector, changes a row or
+lease, accepts arbitrary SQL or a role, or publishes an HTTP surface. They are
+not retry, replay, repair, cancellation, or definition-mutation tools.
 
-## 9. Signals, time, and authorization
+## 14. Provenance and no-copy treatment
 
-The connector endpoint is POST /v1/connectors/{connector_instance}/webhooks.
-It accepts raw bytes and headers, invokes the compiled module's verifier before
-JSON parsing, and stores the verification outcome. A valid provider event ID is
-inserted into process_inbound_events before a correlated process signal is
-created; the unique key makes duplicate delivery harmless. An invalid signature
-is recorded with redacted metadata, returns the connector-defined rejection
-status, and never reaches a process instance.
+Temporal, AWS Step Functions, Inngest, Stripe, and Airbyte remain
+behavior/test-category references under
+`knowledgebase/declarative-saas/reference-porting-register.md`.
+This process contract copies no upstream source, fixture, generated artifact,
+schema, or large text. Stripe Checkout contracts are independently expressed
+by the fixed Rust descriptor already admitted under the existing Stripe
+records. No n8n-derived code, fixture, module, or reference is added.
 
-correlate maps explicit verified event fields to declared process state fields.
-It must identify at most one non-terminal instance pinned to the active or
-retired definition revision. Zero or multiple candidates are logged as
-unmatched or ambiguous and do not transition a process. Process state values
-are never inferred from a provider event without a declared mapping.
+A future source-level import requires a separately admitted exact source file,
+immutable revision, hash, license/notice, destination, failing-first Donat
+test, and reviewer before the imported artifact lands.
 
-An ordinary domain command may also deliver a typed signal through the
-validated Spec 003 signal_process effect. It has the same exact correlation,
-payload typing, idempotency, and append-only audit rules as a verified inbound
-signal. It is the only Phase-1 recovery and cancellation path. A process that
-declares a cancellation signal must declare an on_cancel transition. Consuming
-that signal moves the instance to the declared state in one transition,
-cancels still-scheduled activity jobs, and makes later in-flight completions
-audit-only; it never attempts to retract a request already accepted by a
-provider. Compensation, if required, is an explicit state after on_cancel.
+## 15. Component ownership
 
-Because a command signal may correlate an active instance on an older
-definition revision, `migrate --metadata-dir` rejects a changed or removed
-wait/cancellation signal contract while a non-terminal pinned revision still
-declares it. A new revision may add a signal, but it may not reinterpret the
-name, correlation shape, or payload type accepted by older live instances.
-
-Phase 1 does not buffer signals. If a correlated non-terminal instance is not
-currently receptive to that exact wait/cancellation signal, the inbound event
-or command-signal request receives the immutable unexpected_state audit outcome
-and does not create a future transition. A terminal or unknown instance is
-similarly audit-only. This keeps signal order visible and deterministic; a
-later buffering/TTL feature must introduce an explicit persisted contract.
-
-Due timers and leases compare against the database clock in the owning source.
-Tests use a controllable database time abstraction rather than wall-clock
-sleep. The process worker synthesizes only the run_as_role configured on the
-transition; that role must appear in the target command's permissions and have
-the needed table permissions. It has no X-Donat-Admin-Secret-derived bypass,
-does not forward caller headers, and cannot choose a role from event data.
-
-There is no generic runtime process cancel, retry, replay, or definition
-mutation API. Operators inspect internal journal rows and metrics through
-direct database access or deployment-owned observability; no role or HTTP
-endpoint bypasses a process definition. A product exposes customer-visible
-progress through ordinary tracked business tables updated by declarative
-commands.
-
-The binary may provide two read-only operational subcommands:
-`donat process inspect --source <name> --instance <uuid>` emits a redacted
-timeline from the internal journal, and `donat process verify-history` applies
-stored events and stored command/activity results to the pinned definition and
-checks recorded before/after state hashes. Neither command invokes a connector
-or command, changes a lease or journal row, accepts arbitrary SQL, or exposes
-an HTTP surface. A mismatch is an operational invariant failure with a
-non-zero exit status, not a replay or recovery action.
-
-## 10. Failure taxonomy and completion semantics
-
-| Outcome | Event/job action | Process result |
+| Area | Required owner | Prohibited shortcut |
 | --- | --- | --- |
-| guard evaluates false | consume event and log guard_false | remains in current state; no retry |
-| command business rejection | consume event and log command_rejected | follows required explicitly declared on_rejection |
-| connector retryable error | release job to scheduled with computed retry time | state remains unchanged |
-| schedule-to-start or start-to-close timeout | append typed timeout event | follows matching on_error route or mandatory fallback |
-| connector authentication, validation, permanent, or invariant error | append typed activity-failed event | follows matching on_error route or mandatory fallback |
-| retry limit reached | append typed retry_exhausted event | follows matching on_error route or mandatory fallback |
-| capacity unavailable | retain scheduled job without a provider call | state remains unchanged |
-| serialization key busy | retain scheduled job without a provider call | state remains unchanged |
-| domain cancellation signal | consume signal, cancel unclaimed jobs | follows declared on_cancel route |
-| early or late domain/provider signal | record unexpected_state audit outcome | no buffered future transition |
-| worker crash before job result commit | lease expires | activity is retried with the same idempotency key |
-| duplicate provider signal | unique insert conflicts | recorded duplicate; no second process event |
-| stale worker completion | lease-token update affects zero rows | logged stale; no state transition |
-| retired definition with instance | load pinned revision | continues normally |
-| missing pinned revision | worker stops that event and logs invariant_failure | never invents a new transition |
-
-A terminal instance rejects all later signals and timers as audit-only events.
-A compensating state is a normal declared state. It receives the same retry,
-idempotency, role, and audit rules as every other state; compensation never
-tries to reverse arbitrary prior SQL.
-
-## 11. Expanded test-first matrix
-
-| Test ID | Harness level | Required proof |
-| --- | --- | --- |
-| process_definition_revision_is_pinned | migrate plus integration | instance started on revision A completes with A after definition B deploys |
-| process_start_request_pins_revision | command plus deployment integration | command CTE produced under A starts A even when its outbox is consumed after B deploys |
-| process_revision_runtime_abi_is_fenced | rolling-deploy integration | an incompatible binary cannot claim an instance until compatible workers drain or are available |
-| process_active_dependency_is_not_removed | migrate validation | removal or incompatible change of a pinned command/catalog reference fails deployment |
-| process_retire_blocks_new_starts | conformance | removed process cannot be newly started; existing instance remains runnable |
-| process_activity_does_not_hold_tx | integration with recording connector | database lock is released before connector server is allowed to respond |
-| process_lease_takeover_is_safe | two engine processes | expired lease causes retry; stale first completion cannot transition state |
-| process_retry_key_is_stable | connector stub | all attempts and lease takeovers use one logical activity idempotency key |
-| process_activity_timeouts_are_distinct | controlled DB clock and connector stub | schedule-to-start makes no call; start-to-close yields stale completion |
-| process_activity_capacity_is_global | two engine processes and recording connector | per-operation limit and rate limit hold across workers |
-| process_retry_jitter_is_reproducible | unit plus integration | same activity ID and attempt produces the same delayed retry |
-| process_error_routes_are_total | metadata plus activity integration | the only `on_error` grammar has routes plus fallback; every non-retried class, including invariant, and retry exhaustion take a declared path |
-| process_wait_signal_timeout_is_one_state_kind | metadata plus timer integration | a wait state accepts nested timeout; a sibling `on_signal`/`after` shape and multiple outer state kinds are rejected |
-| process_signal_signature_before_parse | HTTP endpoint test | malformed JSON with bad signature is rejected before event JSON handling |
-| process_signal_deduplicates | two identical webhook requests | one inbound row and one transition |
-| process_correlation_is_unique | integration | zero and multiple candidate instances are audit-only |
-| process_signal_is_not_buffered | command plus integration | early/late signal records unexpected_state and cannot advance a later wait state |
-| process_domain_cancel_is_declarative | command plus integration | typed command signal cancels unclaimed work and takes declared on_cancel only |
-| process_operational_history_is_read_only | CLI integration | inspect redacts payloads; verify-history detects tampered state hash without command/connector I/O |
-| process_timer_survives_restart | controlled DB clock and restart | due timer transitions exactly once |
-| process_run_as_role_is_checked | metadata plus conformance | undeclared or under-permitted role fails validation or command permission |
-| process_no_management_api | route and schema test | no process mutation/query field is published |
-
-The process integration suite runs the real donat binary against Postgres with
-two independently started engine processes. It must run after cargo build -p
-donat-server --bin donat, then the complete conformance crate.
-
-## 12. Reference extraction ledger
-
-| Reference | Immutable paths | Treatment | Donat test mapping |
-| --- | --- | --- | --- |
-| temporalio/sdk-rust at d2769368df9077a311537431ff4594c9c14db4e7 | ARCHITECTURE.md, crates/sdk-core, crates/workflow | MIT behavioral reference for replay, activity failure, and history discipline; no client or protocol port | process revision, retry, and stale-completion integration tests |
-| Donat crates/server/src/events.rs | current source | durable event capture, retry-log naming, and deployment split | event-to-process journal migration tests |
-| Donat crates/server/src/cron.rs | current source | due-time materialization and multi-instance claim precedent | timer and clock tests |
-| Donat crates/server/src/migrate.rs | current source | migrate/validate boundary | definition revision deployment tests |
-
-Temporal is intentionally not a dependency. If a future change ports an MIT
-source file, its exact file path, copyright notice, destination path, and
-upstream-to-Donat test mapping must be added to the central reference register
-before import.
-
-
-## 13. Component ownership boundaries
-
-| Area | Required ownership | Prohibited shortcut |
-| --- | --- | --- |
-| Metadata and deployment validation | crates/metadata plus migrate/validate integration | reading process YAML separately in a background task |
-| Durable runtime | crates/server process module and server state | a separate workflow service or in-memory task state |
-| Tables and helper functions | refinery migrations invoked only by donat migrate | DDL at serve boot or a runtime process-admin endpoint |
-| Command execution | existing schema/IR/sqlgen command path under explicit run_as_role | direct hand-written SQL from process state |
-| Activities and webhooks | connector registry plus process job/signal tables | holding a transaction while HTTP waits |
-| Time, concurrency, and capacity | database clock, leases, SKIP LOCKED, and Postgres-coordinated permits | Tokio sleep as durable state, an in-memory limiter, or exactly-once claims |
-| Operational diagnosis | read-only process CLI over redacted pinned journal data | a process-management HTTP endpoint, replay action, or journal mutation |
-| Proof | native conformance plus two-process Postgres integration suite | a single-worker mocked unit test |
-
-The process module is allowed to issue ordinary journal DML statements because
-it is a background runtime, but every transition and connector completion must
-be a short explicit transaction with a reviewed query. It never performs
-row-by-row business-table mutations outside a declarative command.
+| normalized value contracts | `donat-ir` | separate command/process/connector type checkers |
+| command descriptors/effect catalog | `donat-schema` | schema dependency on server or post-plan raw metadata lookup |
+| process compiler/runtime | `donat-server::processes` and one `Engine` snapshot catalog | separate workflow service or mutable global definition |
+| connector contracts | existing compiled connector registry | duplicated protocol compiler, dynamic module, or n8n port |
+| DDL/reconciliation | V6 plus source-qualified `donat migrate` | serve-time DDL or reconciliation |
+| business writes | existing explicit-role command IR/SQLgen path | hand-written process business SQL or admin role |
+| process journals | short source-local Postgres transactions | distributed transaction or external I/O under transaction |
+| ingress | connector verifier plus split source-local ledger/audit | parse-before-verify, in-memory dedupe, or one-row audit overwrite |
+| proof | crate tests, native conformance, two-binary Postgres integration | mocked single-worker proof of durability |

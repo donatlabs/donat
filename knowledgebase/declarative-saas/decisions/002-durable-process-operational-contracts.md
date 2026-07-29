@@ -61,16 +61,20 @@ mutate history or invoke a command or connector.
 
 Inbound connector webhooks are durable process ingress, not connector-route
 or conformance responsibilities. The durable process ingress implementation
-must write `process_inbound_events`, deduplicate the verified provider event
-identity, persist one redacted audit outcome, correlate at most one pinned
-process instance, and acknowledge a provider only after that transaction
-commits. Until that implementation exists, the connector route verifies raw
-bytes then returns `503` for a verified event without acknowledgement; it adds
-no in-memory queue, duplicate cache, or standalone persistence model. The
-connector conformance task proves that temporary `503` boundary only. The
-process plan's **Task 6: Process timers and verified inbound events** owns the
-durable ingress, audit, deduplication, correlation, and success-acknowledgement
-work.
+uses `process_inbound_events` only as the verified provider-event dedupe
+ledger and appends one `process_inbound_deliveries` row for every delivery
+attempt. Verified deliveries write audit plus dedupe atomically; invalid
+signatures write audit only and need no trusted provider event ID. Correlation
+selects at most one pinned process instance, and the route acknowledges a
+provider only after the transaction commits. Until that implementation
+exists, the connector route verifies raw bytes then returns `503` for a
+verified event without acknowledgement; it adds no in-memory queue, duplicate
+cache, or standalone persistence model. The connector conformance task proves
+that temporary `503` boundary only. The process plan's **Task 11: Add timers,
+split inbound audit, and command-signal consumption** owns durable ingress,
+audit, deduplication, correlation, and success acknowledgement. The exact
+source-local journal and transaction contract is recorded in
+[[009-durable-process-source-local-compilation-and-journal-contracts]].
 
 ## Alternatives
 

@@ -12,6 +12,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/006-command-claim-election-separate-from-canonical-result-journal]]
 - [[decisions/007-command-cte-gates-and-batch-rule-items]]
 - [[decisions/008-source-and-role-qualified-command-identity]]
+- [[decisions/009-durable-process-source-local-compilation-and-journal-contracts]]
 
 ## Reference governance
 
