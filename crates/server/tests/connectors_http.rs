@@ -358,6 +358,82 @@ fn declarative_registry_exposes_a_non_secret_operation_configuration_fingerprint
     unsafe { std::env::remove_var(SECRET_ENV) };
 }
 
+#[test]
+fn declarative_registry_fingerprint_distinguishes_base_url_environment_source_names_without_exposure()
+ {
+    const BASE_URL_A: &str = "DONAT_CONNECTOR_FINGERPRINT_BASE_URL_A";
+    const BASE_URL_B: &str = "DONAT_CONNECTOR_FINGERPRINT_BASE_URL_B";
+    const CREDENTIAL_ENV: &str = "DONAT_CONNECTOR_FINGERPRINT_SOURCE_TOKEN";
+    const RESOLVED_BASE_URL: &str = "https://provider.example.test";
+    const CREDENTIAL_VALUE: &str = "credential-value-must-not-be-exposed";
+
+    let metadata = |base_url_environment: &str| {
+        serde_json::from_value::<donat_metadata::Metadata>(json!({
+            "version": 3,
+            "sources": [],
+            "connectors": [{
+                "name": "logistics",
+                "module": "http",
+                "config": {
+                    "endpoint_identity": "logistics_test",
+                    "credential_identity": "logistics_test_credential",
+                    "base_url": { "value_from_env": base_url_environment },
+                    "headers": [{ "name": "Authorization", "value_from_env": CREDENTIAL_ENV }]
+                },
+                "operations": [{
+                    "name": "create_shipment",
+                    "version": "v1",
+                    "method": "POST",
+                    "path": "/v1/shipments/{input.order_id}",
+                    "success_statuses": [200],
+                    "idempotency": { "header": "Idempotency-Key" },
+                    "capacity": {
+                        "max_in_flight": 1,
+                        "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+                    }
+                }]
+            }]
+        }))
+        .expect("base URL source fingerprint fixture metadata deserializes")
+    };
+    let fingerprint = |metadata: &donat_metadata::Metadata| {
+        ConnectorRegistry::build(metadata)
+            .expect("base URL source fingerprint fixture compiles")
+            .configuration_fingerprint("logistics", "create_shipment")
+            .expect("compiled operation exposes its immutable configuration fingerprint")
+            .to_owned()
+    };
+
+    // SAFETY: these connector-specific environment variables exist only for
+    // this test. The two base URL sources deliberately resolve to the same
+    // endpoint, while the public fingerprint must not expose their values.
+    unsafe {
+        std::env::set_var(BASE_URL_A, RESOLVED_BASE_URL);
+        std::env::set_var(BASE_URL_B, RESOLVED_BASE_URL);
+        std::env::set_var(CREDENTIAL_ENV, CREDENTIAL_VALUE);
+    }
+    let source_a = fingerprint(&metadata(BASE_URL_A));
+    let source_b = fingerprint(&metadata(BASE_URL_B));
+
+    assert_ne!(
+        source_a, source_b,
+        "different deployment base URL environment names must produce different revisions"
+    );
+    for value in [BASE_URL_A, BASE_URL_B, RESOLVED_BASE_URL, CREDENTIAL_VALUE] {
+        assert!(
+            !source_a.contains(value) && !source_b.contains(value),
+            "public fingerprints expose only a digest, never source values: {value}"
+        );
+    }
+
+    // SAFETY: cleanup restores process state for subsequent tests.
+    unsafe {
+        std::env::remove_var(BASE_URL_A);
+        std::env::remove_var(BASE_URL_B);
+        std::env::remove_var(CREDENTIAL_ENV);
+    }
+}
+
 fn public_connector(
     resolver: Arc<dyn HostResolver>,
     transport: Arc<dyn HttpTransport>,

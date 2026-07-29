@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use donat_metadata::{ConnectorConfig, ConnectorOperation, Metadata};
+use donat_metadata::{ConnectorBaseUrl, ConnectorConfig, ConnectorOperation, Metadata};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -141,7 +141,18 @@ struct HttpConfigurationFingerprint<'a> {
     credential_header_declarations: &'a [donat_metadata::ConnectorHeader],
     operation_profile: &'a donat_metadata::HttpConnectorOperation,
     capacity: &'a donat_metadata::ConnectorCapacity,
+    base_url_source: HttpBaseUrlSourceIdentity<'a>,
     base_url_sha256: &'a str,
+}
+
+/// The configured origin of a base URL, deliberately excluding its resolved
+/// value. An environment-variable name is deploy-time identity, while the
+/// resolved endpoint itself is represented only by `base_url_sha256`.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HttpBaseUrlSourceIdentity<'a> {
+    Literal,
+    Environment { variable: &'a str },
 }
 
 fn http_configuration_fingerprint(
@@ -156,6 +167,16 @@ fn http_configuration_fingerprint(
     let capacity = operation
         .capacity()
         .expect("HTTP operation capacity was validated before fingerprinting");
+    let base_url_source = match config
+        .base_url
+        .as_ref()
+        .expect("HTTP base URL was validated before fingerprinting")
+    {
+        ConnectorBaseUrl::Literal(_) => HttpBaseUrlSourceIdentity::Literal,
+        ConnectorBaseUrl::FromEnv(reference) => HttpBaseUrlSourceIdentity::Environment {
+            variable: &reference.value_from_env,
+        },
+    };
     let canonical = HttpConfigurationFingerprint {
         module_name: definition.module_name,
         module_semantic_version: definition.semantic_version,
@@ -168,6 +189,7 @@ fn http_configuration_fingerprint(
         credential_header_declarations: &config.headers,
         operation_profile: profile,
         capacity,
+        base_url_source,
         base_url_sha256: base_url_digest,
     };
     let bytes = serde_json::to_vec(&canonical)
