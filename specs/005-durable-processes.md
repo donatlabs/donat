@@ -66,6 +66,9 @@ script, procedural macro, or third-party runtime dependency, and exposes no
 canonical constructors, deterministic object ordering, canonical-size
 accounting, and the inline-byte representation. `donat-ir` depends on and
 re-exports those types; it never defines a second value representation.
+Task 1 of the implementation plan is the sole implementation unit and commit
+for this shared crate. Connector work records and consumes that same commit;
+it cannot create, reimplement, or recommit a second value-contract owner.
 
 Commands, process metadata, declarative HTTP operations, fixed connector
 modules, and Rule artifacts all normalize through this one version-1 type
@@ -184,31 +187,67 @@ pub enum TypedValue {
 
 pub struct BoundedInlineBytes {
     bytes: Vec<u8>,
+    media_type: BoundedMediaType,
+    file_name: Option<BoundedFileName>,
 }
+
+struct BoundedMediaType(String);
+struct BoundedFileName(String);
 
 impl BoundedInlineBytes {
     pub fn try_new(
         bytes: Vec<u8>,
-        maximum_bytes: usize,
+        media_type: &str,
+        file_name: Option<&str>,
+        maximum_decoded_bytes: usize,
     ) -> Result<Self, ValueContractError>;
 
     pub fn as_slice(&self) -> &[u8];
+    pub fn media_type(&self) -> &str;
+    pub fn file_name(&self) -> Option<&str>;
 }
+
+pub fn canonical_size(
+    value: &TypedValue,
+) -> Result<usize, ValueContractError>;
 ~~~
 
 `roots` and every object field retain missing-value requiredness separately
 from value nullability. `Ref` may name only an entry in `named_objects`, which
 makes recursive input objects finite and self-contained. Map order is
 canonical lexical order; enum value order is declared order. Contract
-assignment, bounded JSON conversion, typed-value validation, and canonical
-size accounting are implemented once in this lower crate and are reused by
-commands, processes, and connectors. Assignability is exact after alias
-normalization except that any JSON-shaped contract is assignable to `json`;
-nominal enum, object, and custom-scalar names never widen to one another.
-`InlineBytes` is owned here so the connector ABI cannot invent a parallel
-value, but Spec 005 process metadata and JSON/form connector descriptors
-cannot admit it until the separate bounded-byte prerequisite in Spec 007 is
-implemented and accepted.
+assignment, typed-value validation, and canonical size accounting are
+implemented once in this lower crate and are reused by commands, processes,
+and connectors. External JSON conversion stays in separately gated adapters.
+Assignability is exact after alias normalization except that any JSON-shaped
+contract is assignable to `json`; nominal enum, object, and custom-scalar
+names never widen to one another.
+
+`BoundedMediaType` accepts at most 255 ASCII bytes. `BoundedFileName` accepts
+at most 255 UTF-8 bytes and is data, never a filesystem path. Construction
+of both private newtypes occurs only inside `BoundedInlineBytes::try_new`;
+there is no unchecked or exported constructor. Inline-byte construction
+requires `bytes.len() <= maximum_decoded_bytes <= 131_072`. Complete-value
+validation rejects more than 16 inline values, more than 131,072 aggregate
+decoded bytes, or more than 262,144 canonical bytes. `canonical_size`
+accounts for the exact future JCS object containing `$binary`, optional
+`file_name`, and `media_type`, without exposing a JSON encoder.
+
+The exact canonical-size vectors are:
+
+- 131,072 zero bytes with `application/octet-stream` and no file name:
+  174,817 bytes;
+- 131,073 decoded bytes: rejected before encoding;
+- that accepted binary plus an 87,303-byte `padding` string: 262,144 bytes;
+- that accepted binary plus an 87,304-byte `padding` string: 262,145 bytes
+  and rejected;
+- 17 inline-byte values: rejected.
+
+`InlineBytes` is inert at this stage. Metadata, external JSON/form encoding,
+connector descriptor admission, multipart transport, commands, and process
+journals reject it until their separate gates are implemented and accepted.
+The connector ABI therefore consumes this owner and cannot invent a parallel
+value, while Task 1 does not enable binary I/O or persistence.
 
 `donat-ir` owns only metadata/Rule adapters such as
 `compile_value_contract_catalog`, and re-exports every public value-contract
@@ -1933,6 +1972,11 @@ a native conformance fixture. The focused identifiers are normative:
 | `value_type_language_is_closed_and_canonical` | value-contract unit | aliases, scalar JSON semantics, named refs, recursion, requiredness, and assignability use one parser in the `no_std + alloc` owner |
 | `value_contract_timestamp_grammar_is_exact` | value-contract unit | local timestamp accepts only valid `T`-separated no-offset values with zero-to-six fractional digits; timestamptz requires `Z`/offset |
 | `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
+| `value_contract_has_one_owner` | workspace policy | process and connector plans name the same Task-1 crate and commit; no connector-local value implementation exists |
+| `inline_bytes_have_one_inert_owner` | value-contract/workspace | the lower crate alone owns bytes, bounded media type/file name, and canonical accounting while every external adapter remains gated |
+| `inline_binary_canonical_size_vectors_are_exact` | value-contract unit | the 174,817-byte binary and 262,144/262,145-byte complete-value vectors match the future JCS representation exactly |
+| `inline_binary_count_and_decoded_bounds_are_exact` | value-contract unit | 131,072 aggregate decoded bytes and 16 inline values are accepted boundaries; one-byte/one-value excess rejects |
+| `inline_binary_external_adapters_remain_disabled` | boundary unit | metadata, JSON/form, connector admission, multipart, commands, and process journals reject `InlineBytes` |
 | `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
 | `connector_descriptor_is_typed_and_non_secret` | server unit | HTTP/Stripe descriptors contain exact contracts and no secret values |
 | `connector_effect_model_is_closed_and_per_step` | server unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |

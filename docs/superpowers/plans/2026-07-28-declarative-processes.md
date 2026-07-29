@@ -171,16 +171,29 @@ pub enum TypedValue {
 
 pub struct BoundedInlineBytes {
     bytes: Vec<u8>,
+    media_type: BoundedMediaType,
+    file_name: Option<BoundedFileName>,
 }
+
+struct BoundedMediaType(String);
+struct BoundedFileName(String);
 
 impl BoundedInlineBytes {
     pub fn try_new(
         bytes: Vec<u8>,
-        maximum_bytes: usize,
+        media_type: &str,
+        file_name: Option<&str>,
+        maximum_decoded_bytes: usize,
     ) -> Result<Self, ValueContractError>;
 
     pub fn as_slice(&self) -> &[u8];
+    pub fn media_type(&self) -> &str;
+    pub fn file_name(&self) -> Option<&str>;
 }
+
+pub fn canonical_size(
+    value: &TypedValue,
+) -> Result<usize, ValueContractError>;
 
 impl ValueContractCatalog {
     pub fn validate(
@@ -193,9 +206,10 @@ impl ValueContractCatalog {
 
 // crates/ir/src/lib.rs and crates/ir/src/value_contract.rs
 pub use donat_value_contract::{
-    CanonicalNumber, TypeRef, TypedValue, ValueContractCatalog,
-    ValueContractError, ValueContractField, ValueObjectContract, ValueScalar,
-    ValueType, VALUE_TYPE_LANGUAGE_VERSION,
+    BoundedInlineBytes, CanonicalNumber, TypeRef, TypedValue,
+    ValueContractCatalog, ValueContractError, ValueContractField,
+    ValueObjectContract, ValueScalar, ValueType,
+    VALUE_TYPE_LANGUAGE_VERSION, canonical_size,
 };
 
 pub enum ProcessStartPolicy {
@@ -242,9 +256,29 @@ value validation and canonical-size accounting. IR contains only the
 metadata/Rule adapter and re-exports; it defines no second value type.
 `crates/schema/Cargo.toml` adds exactly `sha2 = { workspace = true }`.
 
+`BoundedMediaType` accepts at most 255 ASCII bytes. `BoundedFileName` accepts
+at most 255 UTF-8 bytes and is data, never a path. Both newtypes are private
+and can be constructed only by `BoundedInlineBytes::try_new`; there is no
+unchecked or exported constructor. Inline-byte construction requires
+`bytes.len() <= maximum_decoded_bytes <= 131_072`. Complete-value validation
+rejects more than 16 inline values, more than 131,072 aggregate decoded
+bytes, or more than 262,144 canonical bytes. `canonical_size` accounts for
+the exact future `$binary`/optional `file_name`/`media_type` JCS object without
+exposing a JSON encoder.
+
+This Task 1 is the sole implementation owner shared by Spec 005 and the
+community-connector plan. All value-crate, IR re-export, command-descriptor,
+and inert inline-byte work lands in the one commit prescribed below. The
+connector plan records and consumes that commit; it must not create,
+reimplement, or recommit a second value crate. Metadata, external JSON/form
+encoding, connector descriptor admission, multipart transport, commands, and
+process journals continue to reject `InlineBytes` until their separate gates
+land.
+
 **Tests owned by this task:**
 
 - `value_type_language_is_closed_and_canonical`
+- `value_contract_has_one_owner`
 - `value_contract_distinguishes_required_from_nullable`
 - `value_contract_resolves_recursive_object_refs`
 - `value_contract_rejects_unknown_duplicate_and_invalid_refs`
@@ -252,6 +286,10 @@ metadata/Rule adapter and re-exports; it defines no second value type.
 - `value_contract_timestamp_grammar_is_exact`
 - `value_contract_assignability_is_nominal_except_json`
 - `value_contract_no_std_boundary_is_mechanical`
+- `inline_bytes_have_one_inert_owner`
+- `inline_binary_canonical_size_vectors_are_exact`
+- `inline_binary_count_and_decoded_bounds_are_exact`
+- `inline_binary_external_adapters_remain_disabled`
 - `ir_reexports_the_only_value_contract_types`
 - `command_descriptor_exposes_exact_contract`
 - `command_descriptor_fingerprint_is_pre_process_and_deterministic`
@@ -268,7 +306,23 @@ metadata/Rule adapter and re-exports; it defines no second value type.
   second, and zero or one-through-six fractional digits; reject a space
   separator, trailing dot, offset/`Z`, invalid calendar/clock fields, and a
   seventh fractional digit. Pin `timestamptz` to the same fraction/calendar
-  limits while requiring RFC 3339 `Z` or a numeric offset.
+  limits while requiring RFC 3339 `Z` or a numeric offset. In the same
+  failing value-contract test file, assert the sole inert owner, disabled
+  external adapters, and these exact independent size/count vectors:
+
+  ~~~text
+  131,072 zero bytes, application/octet-stream, no filename -> 174,817 bytes
+  131,073 decoded bytes                              -> rejected before encoding
+  accepted binary + 87,303-byte "padding" string     -> 262,144 bytes
+  accepted binary + 87,304-byte "padding" string     -> 262,145 and rejected
+  17 inline-byte values                              -> rejected
+  ~~~
+
+  Cover the 255-ASCII-byte media-type boundary, the 255-UTF-8-byte file-name
+  boundary, rejection of non-ASCII media types, file-name-as-data semantics,
+  the 131,072 aggregate decoded-byte/16-value accepted boundaries, and both
+  one-over rejections. Assert that IR re-exports the exact constructor type
+  and `canonical_size` function rather than wrapping them.
 
 - [ ] **Step 2: Add the failing command-descriptor tests**
 
@@ -281,6 +335,8 @@ metadata/Rule adapter and re-exports; it defines no second value type.
 - [ ] **Step 3: Run RED**
 
   ~~~bash
+  cargo test -p donat-value-contract inline_binary
+  cargo test -p donat-value-contract inline_bytes_have_one_inert_owner
   cargo test -p donat-value-contract
   cargo test -p donat-ir --test value_contract_adapter
   cargo test -p donat-schema --test commands command_descriptor
@@ -288,15 +344,20 @@ metadata/Rule adapter and re-exports; it defines no second value type.
     --target thumbv7em-none-eabi
   ~~~
 
-  Expected: the lower crate, IR adapter/re-export, command descriptor, and
-  schema SHA-256 dependency do not exist.
+  Expected: the lower crate, inert inline-byte owner/vectors, IR
+  adapter/re-export, command descriptor, and schema SHA-256 dependency do not
+  exist.
 
 - [ ] **Step 4: Implement the lower crate and IR adapter**
 
   Add the crate to the workspace. Implement the closed parser, bounded
   constructors, canonical scalar/collection validation, deterministic object
-  order, canonical sizing, exact assignability, and private checked inline
-  byte construction. Keep JSON conversion in IR/server adapters; do not add
+  order, canonical sizing, and exact assignability. Implement
+  `BoundedInlineBytes` with bytes, checked media type, optional checked file
+  name, the exact decoded/count/canonical limits, getters, and independent
+  future-JCS size accounting above. Keep the value inert: do not add JSON,
+  form, multipart, metadata, command, connector-admission, or journal
+  acceptance. Keep JSON conversion in IR/server adapters; do not add
   `serde_json` to the lower crate.
 
 - [ ] **Step 5: Publish immutable command descriptors**
@@ -315,11 +376,14 @@ metadata/Rule adapter and re-exports; it defines no second value type.
   cargo test -p donat-schema --test multi_source
   cargo check -p donat-value-contract --no-default-features \
     --target thumbv7em-none-eabi
+  cargo tree -p donat-value-contract --target all \
+    --edges normal,build,no-dev --no-default-features --offline --locked
   cargo metadata --locked --format-version 1 >/tmp/donat-process-metadata.json
   ~~~
 
   Inspect the metadata closure and confirm the value crate has no forbidden
-  edge. Expected: all listed tests pass without changing command execution.
+  edge. Expected: all listed tests and exact inline-byte vectors pass without
+  enabling an external binary adapter or changing command execution.
 
 - [ ] **Step 7: Commit**
 
