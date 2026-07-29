@@ -73,17 +73,24 @@
 //! response.response_bytes = 1;
 //! ```
 //!
-//! Correlation authority cannot be constructed or extended by a caller:
+//! Correlation authority cannot be constructed by a caller:
+//!
+//! ```compile_fail
+//! use std::collections::BTreeMap;
+//! use donat_connector_abi::AuthorizedCorrelations;
+//!
+//! let _ = AuthorizedCorrelations { values: BTreeMap::new() };
+//! ```
+//!
+//! Correlation authority cannot be extended by a caller:
 //!
 //! ```compile_fail
 //! use std::collections::BTreeMap;
 //! use donat_connector_abi::{
-//!     AuthorizedCorrelations, BoundedString, BoundedTransportResponse,
-//!     CapabilityId,
+//!     BoundedString, BoundedTransportResponse, CapabilityId,
 //! };
 //! use donat_value_contract::TypedValue;
 //!
-//! let _ = AuthorizedCorrelations { values: BTreeMap::new() };
 //! let response = BoundedTransportResponse::try_new(
 //!     200,
 //!     BTreeMap::new(),
@@ -96,48 +103,93 @@
 //!     .insert(CapabilityId::literal("request-id"), value);
 //! ```
 //!
-//! Runtime allocations cannot satisfy the literal-only failure-text API:
+//! A runtime allocation cannot satisfy the literal-only error-code API:
 //!
 //! ```compile_fail
 //! use std::string::String;
-//! use donat_connector_abi::{StaticErrorCode, StaticSafeMessage};
+//! use donat_connector_abi::StaticErrorCode;
 //!
 //! let dynamic = String::from("connector_failed");
 //! let _ = StaticErrorCode::literal(dynamic.as_str());
-//! let _ = StaticSafeMessage::literal(dynamic.as_str());
 //! ```
 //!
-//! Runtime conversion traits are deliberately absent:
+//! A runtime allocation cannot satisfy the literal-only safe-message API:
 //!
 //! ```compile_fail
 //! use std::string::String;
-//! use donat_connector_abi::{StaticErrorCode, StaticSafeMessage};
+//! use donat_connector_abi::StaticSafeMessage;
+//!
+//! let dynamic = String::from("connector failed");
+//! let _ = StaticSafeMessage::literal(dynamic.as_str());
+//! ```
+//!
+//! Runtime conversion into an error code is deliberately absent:
+//!
+//! ```compile_fail
+//! use std::string::String;
+//! use donat_connector_abi::StaticErrorCode;
 //!
 //! let _ = StaticErrorCode::try_from(String::from("connector_failed"));
+//! ```
+//!
+//! Runtime conversion into a safe message is deliberately absent:
+//!
+//! ```compile_fail
+//! use std::string::String;
+//! use donat_connector_abi::StaticSafeMessage;
+//!
 //! let _ = StaticSafeMessage::try_from(String::from("connector failed"));
 //! ```
 //!
-//! Public runtime constructors are deliberately absent:
+//! A public runtime error-code parser is deliberately absent:
 //!
 //! ```compile_fail
-//! use donat_connector_abi::{StaticErrorCode, StaticSafeMessage};
+//! use donat_connector_abi::StaticErrorCode;
 //!
 //! let _ = StaticErrorCode::parse("connector_failed");
+//! ```
+//!
+//! A public runtime safe-message constructor is deliberately absent:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::StaticSafeMessage;
+//!
 //! let _ = StaticSafeMessage::try_new("connector failed");
 //! ```
 //!
-//! Invariant-carrying values do not expose convenience construction traits:
+//! Correlation authority is not cloneable:
 //!
 //! ```compile_fail
-//! use donat_connector_abi::{
-//!     AuthorizedCorrelations, StaticErrorCode, StaticSafeMessage,
-//! };
+//! use donat_connector_abi::AuthorizedCorrelations;
 //!
 //! fn require_clone<T: Clone>() {}
-//! fn require_default<T: Default>() {}
 //! require_clone::<AuthorizedCorrelations>();
+//! ```
+//!
+//! Correlation authority has no default constructor:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::AuthorizedCorrelations;
+//!
+//! fn require_default<T: Default>() {}
 //! require_default::<AuthorizedCorrelations>();
+//! ```
+//!
+//! Static error codes have no default constructor:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::StaticErrorCode;
+//!
+//! fn require_default<T: Default>() {}
 //! require_default::<StaticErrorCode>();
+//! ```
+//!
+//! Static safe messages have no default constructor:
+//!
+//! ```compile_fail
+//! use donat_connector_abi::StaticSafeMessage;
+//!
+//! fn require_default<T: Default>() {}
 //! require_default::<StaticSafeMessage>();
 //! ```
 #![no_std]

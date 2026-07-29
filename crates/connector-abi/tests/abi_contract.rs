@@ -2,7 +2,7 @@ use core::mem::{align_of, size_of};
 use std::collections::BTreeMap;
 
 use donat_connector_abi::{
-    AuthenticatorId, AuthorizedCorrelations, BindingSlotId, BoundedBytes, BoundedString,
+    AbiError, AuthenticatorId, AuthorizedCorrelations, BindingSlotId, BoundedBytes, BoundedString,
     BoundedTransportResponse, BoxFuture, CapabilityId, CodecId, CompiledStepId,
     ConnectorErrorClass, ConnectorFailure, ConnectorId, ConnectorIo, CredentialFieldId,
     CredentialSpecId, Hash256, InlineId, MAXIMUM_SAFE_STRING_BYTES, NonEmptyVec, NormalizerId,
@@ -29,6 +29,13 @@ static FAILURE_MESSAGE: StaticSafeMessage =
     StaticSafeMessage::literal("provider rate limit reached");
 
 static STEPS: [CompiledStepId; 1] = [CompiledStepId::literal("search")];
+
+fn assert_abi_error<T>(result: Result<T, AbiError>, expected: AbiError) {
+    match result {
+        Err(error) => assert_eq!(error, expected),
+        Ok(_) => panic!("expected ABI construction to reject the value"),
+    }
+}
 
 #[test]
 fn abi_ids_are_canonical_and_bounded() {
@@ -212,7 +219,10 @@ fn typed_binding_maps_enforce_entry_depth_and_canonical_bounds() {
     let accepted = TypedBindings::try_new(bindings(64)).expect("64 bindings are accepted");
     assert_eq!(accepted.len(), 64);
     assert!(accepted.get(&BindingSlotId::literal("slot-0")).is_some());
-    assert!(TypedBindings::try_new(bindings(65)).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(bindings(65)),
+        AbiError::LimitExceeded("binding slots"),
+    );
 
     let mut depth_64 = BTreeMap::new();
     depth_64.insert(BindingSlotId::literal("value"), nested_list(64));
@@ -220,7 +230,10 @@ fn typed_binding_maps_enforce_entry_depth_and_canonical_bounds() {
 
     let mut depth_65 = BTreeMap::new();
     depth_65.insert(BindingSlotId::literal("value"), nested_list(65));
-    assert!(TypedBindings::try_new(depth_65).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(depth_65),
+        AbiError::LimitExceeded("typed value nesting depth"),
+    );
 
     let mut exact_canonical = BTreeMap::new();
     exact_canonical.insert(
@@ -234,15 +247,24 @@ fn typed_binding_maps_enforce_entry_depth_and_canonical_bounds() {
         BindingSlotId::literal("value"),
         TypedValue::String("a".repeat(262_143)),
     );
-    assert!(TypedBindings::try_new(over_canonical).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(over_canonical),
+        AbiError::LimitExceeded("binding canonical bytes"),
+    );
 }
 
 #[test]
 fn typed_binding_aggregate_limits_are_shared_across_roots() {
     assert!(TypedBindings::try_new(inline_bindings(&[0; 16])).is_ok());
-    assert!(TypedBindings::try_new(inline_bindings(&[0; 17])).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(inline_bindings(&[0; 17])),
+        AbiError::LimitExceeded("inline value count"),
+    );
     assert!(TypedBindings::try_new(inline_bindings(&[65_536, 65_536])).is_ok());
-    assert!(TypedBindings::try_new(inline_bindings(&[65_536, 65_537])).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(inline_bindings(&[65_536, 65_537])),
+        AbiError::LimitExceeded("aggregate decoded inline bytes"),
+    );
 
     let mut two_deep_roots = BTreeMap::new();
     two_deep_roots.insert(BindingSlotId::literal("first"), nested_list(64));
@@ -269,7 +291,10 @@ fn typed_binding_aggregate_limits_are_shared_across_roots() {
         BindingSlotId::literal("second"),
         TypedValue::String("a".repeat(131_071)),
     );
-    assert!(TypedBindings::try_new(over_canonical).is_err());
+    assert_abi_error(
+        TypedBindings::try_new(over_canonical),
+        AbiError::LimitExceeded("binding canonical bytes"),
+    );
 }
 
 fn selected_headers(count: usize, value_bytes: usize) -> BTreeMap<CapabilityId, BoundedString> {
@@ -325,17 +350,17 @@ fn transport_responses_enforce_header_body_shape_and_output_bounds() {
     assert_eq!(accepted.response_bytes(), 1_048_576);
     assert!(accepted.authorized_correlations().is_empty());
 
-    assert!(
-        BoundedTransportResponse::try_new(200, selected_headers(65, 1), TypedValue::Null, 0,)
-            .is_err()
+    assert_abi_error(
+        BoundedTransportResponse::try_new(200, selected_headers(65, 1), TypedValue::Null, 0),
+        AbiError::LimitExceeded("selected headers"),
     );
     assert!(
         BoundedTransportResponse::try_new(200, selected_headers(1, 8_192), TypedValue::Null, 0,)
             .is_ok()
     );
-    assert!(
-        BoundedTransportResponse::try_new(200, selected_headers(1, 8_193), TypedValue::Null, 0,)
-            .is_err()
+    assert_abi_error(
+        BoundedTransportResponse::try_new(200, selected_headers(1, 8_193), TypedValue::Null, 0),
+        AbiError::LimitExceeded("selected header value bytes"),
     );
     assert!(
         BoundedTransportResponse::try_new(
@@ -346,25 +371,28 @@ fn transport_responses_enforce_header_body_shape_and_output_bounds() {
         )
         .is_ok()
     );
-    assert!(
+    assert_abi_error(
         BoundedTransportResponse::try_new(
             200,
             aggregate_header_boundary(true),
             TypedValue::Null,
             0,
-        )
-        .is_err()
+        ),
+        AbiError::LimitExceeded("aggregate retained header bytes"),
     );
     assert!(
         BoundedTransportResponse::try_new(200, BTreeMap::new(), TypedValue::Null, 1_048_576,)
             .is_ok()
     );
-    assert!(
-        BoundedTransportResponse::try_new(200, BTreeMap::new(), TypedValue::Null, 1_048_577,)
-            .is_err()
+    assert_abi_error(
+        BoundedTransportResponse::try_new(200, BTreeMap::new(), TypedValue::Null, 1_048_577),
+        AbiError::LimitExceeded("transport response bytes"),
     );
     assert!(BoundedTransportResponse::try_new(200, BTreeMap::new(), nested_list(64), 0,).is_ok());
-    assert!(BoundedTransportResponse::try_new(200, BTreeMap::new(), nested_list(65), 0,).is_err());
+    assert_abi_error(
+        BoundedTransportResponse::try_new(200, BTreeMap::new(), nested_list(65), 0),
+        AbiError::LimitExceeded("typed value nesting depth"),
+    );
     assert!(
         BoundedTransportResponse::try_new(
             200,
@@ -374,14 +402,14 @@ fn transport_responses_enforce_header_body_shape_and_output_bounds() {
         )
         .is_ok()
     );
-    assert!(
+    assert_abi_error(
         BoundedTransportResponse::try_new(
             200,
             BTreeMap::new(),
             TypedValue::String("a".repeat(262_143)),
             0,
-        )
-        .is_err()
+        ),
+        AbiError::LimitExceeded("canonical output bytes"),
     );
 }
 
@@ -430,8 +458,9 @@ fn correlation_authorization_enforces_every_boundary() {
     let too_many_allowed: Vec<_> = (0..65)
         .map(|index| CapabilityId::parse(&format!("allowed-{index}")).unwrap())
         .collect();
-    assert!(
-        host_construction::authorized_correlations(&BTreeMap::new(), &too_many_allowed).is_err()
+    assert_abi_error(
+        host_construction::authorized_correlations(&BTreeMap::new(), &too_many_allowed),
+        AbiError::LimitExceeded("correlation authorization entries"),
     );
 
     let duplicate = CapabilityId::literal("duplicate");
@@ -454,7 +483,7 @@ fn correlation_authorization_enforces_every_boundary() {
         )
         .is_ok()
     );
-    assert!(
+    assert_abi_error(
         host_construction::authorized_correlations(
             &aggregate_header_boundary(true),
             &[
@@ -463,21 +492,40 @@ fn correlation_authorization_enforces_every_boundary() {
                 CapabilityId::literal("c"),
                 CapabilityId::literal("d"),
             ],
-        )
-        .is_err()
+        ),
+        AbiError::LimitExceeded("aggregate retained header bytes"),
     );
 }
 
 #[test]
 fn catalog_failure_text_validation_is_exact() {
     assert!(catalog_construction::static_error_code("connector_failed").is_ok());
-    assert!(catalog_construction::static_error_code("Connector Failed").is_err());
+    assert_abi_error(
+        catalog_construction::static_error_code("Connector Failed"),
+        AbiError::InvalidValue("connector failure code must be a canonical ABI identifier"),
+    );
     assert!(catalog_construction::static_safe_message("a").is_ok());
-    assert!(catalog_construction::static_safe_message("").is_err());
+    assert_abi_error(
+        catalog_construction::static_safe_message(""),
+        AbiError::InvalidValue("connector failure safe message must not be empty"),
+    );
     assert!(catalog_construction::static_safe_message(&"a".repeat(1_024)).is_ok());
-    assert!(catalog_construction::static_safe_message(&"a".repeat(1_025)).is_err());
-    assert!(catalog_construction::static_safe_message("line\nbreak").is_err());
-    assert!(catalog_construction::static_safe_message("line\u{0085}break").is_err());
+    assert_abi_error(
+        catalog_construction::static_safe_message(&"a".repeat(1_025)),
+        AbiError::LimitExceeded("connector failure safe message bytes"),
+    );
+    assert_abi_error(
+        catalog_construction::static_safe_message("line\nbreak"),
+        AbiError::InvalidValue(
+            "connector failure safe message must not contain control characters",
+        ),
+    );
+    assert_abi_error(
+        catalog_construction::static_safe_message("line\u{0085}break"),
+        AbiError::InvalidValue(
+            "connector failure safe message must not contain control characters",
+        ),
+    );
 }
 
 #[test]

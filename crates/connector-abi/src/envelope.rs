@@ -619,6 +619,34 @@ mod tests {
     }
 
     #[test]
+    fn individual_typed_string_bytes_accept_262_144_and_reject_262_145() {
+        let exact = TypedValue::String("a".repeat(262_144));
+        assert!(validate_typed_value_roots(core::iter::once(&exact)).is_ok());
+
+        let over = TypedValue::String("a".repeat(262_145));
+        assert_eq!(
+            validate_typed_value_roots(core::iter::once(&over)),
+            Err(AbiError::LimitExceeded("individual typed string bytes")),
+        );
+    }
+
+    #[test]
+    fn individual_object_key_bytes_accept_262_144_and_reject_262_145() {
+        let mut exact_values = BTreeMap::new();
+        exact_values.insert("a".repeat(262_144), TypedValue::Null);
+        let exact = TypedValue::Object(exact_values);
+        assert!(validate_typed_value_roots(core::iter::once(&exact)).is_ok());
+
+        let mut over_values = BTreeMap::new();
+        over_values.insert("a".repeat(262_145), TypedValue::Null);
+        let over = TypedValue::Object(over_values);
+        assert_eq!(
+            validate_typed_value_roots(core::iter::once(&over)),
+            Err(AbiError::LimitExceeded("individual typed string bytes")),
+        );
+    }
+
+    #[test]
     fn static_safe_message_zero_fills_its_private_suffix() {
         const LITERAL: StaticSafeMessage = StaticSafeMessage::literal("connector failed");
         let runtime = StaticSafeMessage::try_catalog("connector failed").unwrap();
