@@ -226,6 +226,13 @@ canonical lexical order; enum value order is declared order. Contract
 assignment, typed-value validation, and canonical size accounting are
 implemented once in this lower crate and are reused by commands, processes,
 and connectors. External JSON conversion stays in separately gated adapters.
+The accepted connector catalog owns its separate tagged RFC 8785 projection
+for persistent hashes. It does not add Serde/JCS to this crate or reuse
+`canonical_size`: `I64`, full-width `U64`, exact `Decimal`, and every other
+`TypedValue` variant receive distinct tags, object names use UTF-16 JCS order,
+and exact integers/decimals are JSON strings. Process code consumes the
+catalog's resulting `value_contract_sha256`; it does not implement another
+projection or canonicalizer.
 Assignability is exact after alias normalization except that any JSON-shaped
 contract is assignable to `json`; nominal enum, object, and custom-scalar
 names never widen to one another. Exact catalog assignment compares the
@@ -393,7 +400,9 @@ reconstructs command types from raw metadata.
 ### 2.3 Accepted connector ABI and catalog
 
 Processes do not define connector descriptor types. The accepted
-community-connector implementation owns the complete boundary:
+community-connector implementation owns the complete boundary, including the
+persistent contracts accepted in
+[[knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities]]:
 
 - `donat-connector-abi` owns the const/static-safe `ConnectorId`,
   `OperationId`, `CompiledStepId`, `TriggerId`, processor/authenticator/codec/
@@ -440,8 +449,18 @@ conversion, serialization round-trip, or runtime reparse.
 
 An immutable process revision pins the catalog-owned `OperationSpec` or
 `TriggerSpec` plus its source-bound non-secret deployment fingerprint,
-endpoint and credential identities, runtime ABI, exact schemas/bounds/effect,
-and catalog hashes. It also pins the compiler-calculated activity horizon.
+endpoint and credential identities, and compiler-calculated activity horizon.
+`OperationSpec` is already the complete self-contained catalog snapshot: it
+includes connector/operation stable SemVer, runtime/value epochs, complete
+input/output contracts and recomputed hashes, optional versioned credential,
+resolved origin closure, ordered compiled steps and transforms, optional
+versioned processor, effect, pagination, complete error map,
+capacity/rate/typed serialization defaults, every step/operation bound, stored
+selected-header capabilities, exact provenance, and fact bindings. The
+revision persists that value without restating a smaller process-owned shape.
+Connector/credential/operation/trigger/event versions are SemVer cores without
+Phase-1 prerelease/build metadata; schema/runtime and processor-like
+implementation revisions are integer epochs.
 Resolved secret values and raw environment-derived URLs are never persisted.
 There is one executable lookup path through `ConnectorRegistry`; inventory
 records are absent from it.
@@ -473,6 +492,12 @@ verified event ID/type/output, selected headers, raw-body limit, redaction,
 and exact ABI IDs. Raw authentication precedes parsing. Durable dedupe,
 delivery audit, correlation, process transition, and acknowledgement remain
 Process Task 12 responsibilities rather than connector persistence.
+
+For operation responses, each selected header is the catalog-stored pair
+`{canonical_lowercase_header_name, CapabilityId}`. Error correlations retain
+that stored mapping or a validated step-local link. Process workers and the
+server executor consume it unchanged; they never derive a capability ID or
+accept a caller-supplied correlation allowlist.
 
 Existing v2 declarative HTTP/idempotency metadata remains loadable under the
 connector plan's compatibility rules. An incomplete legacy
@@ -1218,11 +1243,18 @@ The Rule bundle contains only the referenced definitions and their transitive
 named-type closure. Loading it calls
 `donat_rules::compile_catalog_with_declared_types` and compares both stored
 hash maps before a worker may claim the revision. A pinned connector entry
-stores its owning metadata source beside the non-secret catalog spec. For every
-activity state using that operation it also stores the compiler's
+stores its owning metadata source beside the exact complete non-secret
+catalog `OperationSpec`; it is not a projection and cannot omit a catalog
+field. The persisted value therefore pins connector/credential/operation
+versions, runtime/value/schema epochs, every value-contract/record/semantic/
+provenance hash, defaults, resolved origins, processor implementation
+revisions, selected-header capabilities, mappings, effects, pagination/error
+plan, bounds, provenance, and fact bindings. For every activity state using
+that operation it also stores the compiler's
 per-side-effect-step `maximum_send_horizon_ms`; the `OperationSpec` retains the
 matching fixed binding, scope, retention, and margin. A fresh binary
-recomputes every horizon before accepting the persisted revision. Current
+recomputes every contract hash and horizon and compares the complete snapshot
+before accepting the persisted revision. Current
 metadata may not bind that connector instance to another source while an
 active or non-terminal live-retired revision retains the old binding.
 
@@ -2052,6 +2084,7 @@ a native conformance fixture. The focused identifiers are normative:
 | `value_contract_timestamp_grammar_is_exact` | value-contract unit | local timestamp accepts only valid `T`-separated no-offset values with zero-to-six fractional digits; timestamptz requires `Z`/offset |
 | `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
 | `value_contract_has_one_owner` | workspace policy | process and connector plans name the same Task-1 crate and commit; no connector-local value implementation exists |
+| `catalog_value_projection_is_not_a_second_value_owner` | cross-plan boundary | the catalog alone adapts shared `TypedValue` to tagged JCS with UTF-16 object ordering and exact integer/decimal strings; the lower crate gains no Serde/JCS and process code implements no projection |
 | `value_contract_assignability_compares_unreachable_named_objects` | value-contract unit | exact assignment compares the full named-object table, so extra, missing, or incompatible unreachable declarations reject |
 | `inline_bytes_have_one_inert_owner` | value-contract/workspace | the lower crate alone owns bytes, bounded media type/file name, and canonical accounting while every external adapter remains gated |
 | `inline_binary_canonical_size_vectors_are_exact` | value-contract unit | an independent checked oracle proves unpadded RFC 4648 base64url, root/outer JCS order and escaping, and the 174,817/262,144/262,145-byte vectors |
@@ -2070,6 +2103,8 @@ a native conformance fixture. The focused identifiers are normative:
 | `command_descriptor_rejects_incompatible_session_variable_uses` | schema unit | incompatible permission-column uses of one role/name fail before serving |
 | `is_null_permission_session_string_is_strict_boolean` | planner unit | resolved permission-session text accepts only case-insensitive true/false and rejects all other text |
 | `process_connector_ledger_uses_catalog_specs_without_local_descriptors` | cross-plan boundary | Processes consume accepted `OperationSpec`/`TriggerSpec` and ABI IDs; no server-local string descriptor model exists |
+| `process_pins_complete_operation_snapshot` | process compiler/restart | the persisted `OperationSpec` retains every connector/operation/credential version, epoch, contract/hash, default, origin, ordered step/transform, processor revision, effect, pagination/error plan, bound, selected-header capability, provenance, and fact binding; any omitted/changed field rejects reload |
+| `process_runtime_never_derives_header_capabilities` | cross-plan source policy | executor/process source consumes only catalog-stored header/capability mappings and selected-action allowlists; no capability domain/hash derivation or caller-provided allowlist path exists |
 | `process_connector_registry_is_the_only_task_3_to_14_catalog` | cross-plan boundary | compiler, reconcile, activity, ingress, and rolling tests use one accepted static registry |
 | `process_connector_inventory_only_stripe_mutation_is_not_executable` | connector/process boundary | Stripe mutation is absent from process operation lookup until immutable evidence and executable migration commits both pass; a webhook trigger grants no operation |
 | `connector_effect_model_is_closed_and_per_step` | connector catalog unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |

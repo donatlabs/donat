@@ -15,6 +15,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/009-durable-process-source-local-compilation-and-journal-contracts]]
 - [[decisions/010-static-community-connector-factory-and-runtime-boundaries]]
 - [[decisions/011-version-independent-rust-boundary-lexer]]
+- [[decisions/012-canonical-catalog-projections-and-persisted-header-capabilities]]
 
 ## Reference governance
 

@@ -90,6 +90,7 @@ native conformance harness, Postgres conformance service.
 ## Authoritative Inputs
 
 - `knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md`
+- `knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities.md`
 - `specs/007-community-connector-factory.md`
 - `specs/005-durable-processes.md` for dependency interfaces only
 - `knowledgebase/declarative-saas/reference-porting-register.md`
@@ -793,6 +794,22 @@ git commit -m "fix(connectors): enforce safe connector ABI"
 - Produces strict `#[serde(deny_unknown_fields)]` source and normalized types:
 
 ```rust
+pub struct StableSemver {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+pub struct VersionedProcessorRef<Id> {
+    pub id: Id,
+    pub implementation_revision: u32,
+}
+
+pub struct VersionedOperationReference {
+    pub operation: OperationId,
+    pub version: StableSemver,
+}
+
 pub struct ConnectorSourceRecord {
     pub record_version: u32,
     pub record_id: SourceRecordId,
@@ -978,7 +995,12 @@ pub enum AdmissionState {
 
 pub struct ConnectorManifest {
     pub connector: ConnectorId,
-    pub version: u32,
+    pub connector_version: StableSemver,
+    pub manifest_version: u32,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
+    pub provider: ProviderId,
+    pub api_identity: ApiIdentity,
     pub credentials: Vec<CredentialSpec>,
     pub origins: NonEmptyVec<FixedOrigin>,
     pub operations: NonEmptyVec<OperationSpec>,
@@ -988,13 +1010,13 @@ pub struct ConnectorManifest {
 
 pub struct CredentialSpec {
     pub credential: CredentialSpecId,
-    pub version: u32,
+    pub version: StableSemver,
     pub fields: NonEmptyVec<CredentialFieldSpec>,
     pub auth_plan: AuthPlan,
     pub allowed_origins: NonEmptyVec<OriginId>,
     pub scopes: Vec<StaticScope>,
-    pub auth_processor: Option<AuthenticatorId>,
-    pub credential_test_operation: Option<OperationId>,
+    pub auth_processor: Option<VersionedProcessorRef<AuthenticatorId>>,
+    pub credential_test_operation: Option<VersionedOperationReference>,
     pub bounds: CredentialBounds,
 }
 
@@ -1060,7 +1082,13 @@ pub struct CompiledStepSpec {
     pub request: CompiledRequestShape,
     pub success_statuses: NonEmptyVec<StatusRange>,
     pub response: CompiledResponseShape,
+    pub selected_response_headers: Vec<SelectedResponseHeader>,
     pub bounds: StepBounds,
+}
+
+pub struct SelectedResponseHeader {
+    pub canonical_lowercase_header_name: StaticHeaderName,
+    pub capability: CapabilityId,
 }
 
 pub struct StepBounds {
@@ -1101,7 +1129,13 @@ pub struct ErrorAction {
     pub code: StaticErrorCode,
     pub safe_message: StaticSafeMessage,
     pub retry_after: RetryAfterPolicy,
-    pub correlation_headers: Vec<StaticHeaderName>,
+    pub correlations: Vec<ErrorCorrelationBinding>,
+}
+
+pub struct ErrorCorrelationBinding {
+    pub canonical_lowercase_header_name: StaticHeaderName,
+    pub capability: CapabilityId,
+    pub step: CompiledStepId,
 }
 
 pub struct CompleteErrorFallback {
@@ -1130,10 +1164,15 @@ pub enum ErrorMatcher {
 
 pub enum TriggerSpec {
     Webhook {
+        connector: ConnectorId,
+        connector_version: StableSemver,
         trigger: TriggerId,
-        authenticator: AuthenticatorId,
-        codec: CodecId,
-        normalizer: NormalizerId,
+        trigger_version: StableSemver,
+        event_version: StableSemver,
+        runtime_abi_epoch: u32,
+        authenticator: VersionedProcessorRef<AuthenticatorId>,
+        codec: VersionedProcessorRef<CodecId>,
+        normalizer: VersionedProcessorRef<NormalizerId>,
         selected_headers: Vec<StaticHeaderName>,
         raw_body_max_bytes: NonZeroU32,
         timestamp_window_ms: NonZeroU64,
@@ -1144,9 +1183,14 @@ pub enum TriggerSpec {
         subscription_operations: Option<SubscriptionOperationIds>,
     },
     Poll {
+        connector: ConnectorId,
+        connector_version: StableSemver,
         trigger: TriggerId,
+        trigger_version: StableSemver,
+        event_version: StableSemver,
+        runtime_abi_epoch: u32,
         checkpoint: ValueContractCatalog,
-        processor: ProcessorFamilyId,
+        processor: VersionedProcessorRef<ProcessorFamilyId>,
         event_type: ValueContractCatalog,
         per_poll_event_limit: NonZeroU32,
         bounds: OperationBounds,
@@ -1161,19 +1205,40 @@ pub struct ManifestProvenanceReference {
     pub contract_facts: Vec<ContractFact>,
 }
 
+pub struct VersionedCredentialReference {
+    pub credential: CredentialSpecId,
+    pub version: StableSemver,
+}
+
 pub struct OperationSpec {
     pub connector: ConnectorId,
+    pub connector_version: StableSemver,
     pub operation: OperationId,
-    pub version: u32,
-    pub credential: Option<CredentialSpecId>,
-    pub steps: NonEmptyVec<CompiledStepSpec>,
-    pub effect: OperationEffect,
+    pub operation_version: StableSemver,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
     pub input: ValueContractCatalog,
+    pub input_contract_sha256: Hash256,
     pub output: ValueContractCatalog,
+    pub output_contract_sha256: Hash256,
+    pub credential: Option<VersionedCredentialReference>,
+    pub origins: NonEmptyVec<FixedOrigin>,
+    pub steps: NonEmptyVec<CompiledStepSpec>,
+    pub pre_request_transforms:
+        Vec<VersionedProcessorRef<ProcessorFamilyId>>,
+    pub post_response_transforms:
+        Vec<VersionedProcessorRef<ProcessorFamilyId>>,
+    pub operation_processor:
+        Option<VersionedProcessorRef<ProcessorFamilyId>>,
+    pub effect: OperationEffect,
     pub pagination: PaginationPlan,
     pub error_map: ErrorMap,
+    pub capacity: CapacityDefaults,
+    pub rate: RateDefaults,
+    pub serialization_key_default: Option<TypedSerializationKeyDefault>,
     pub bounds: OperationBounds,
     pub provenance: NonEmptyVec<ManifestProvenanceReference>,
+    pub fact_bindings: Vec<ResolvedFactBinding>,
 }
 
 pub enum OperationEffect {
@@ -1183,6 +1248,136 @@ pub enum OperationEffect {
     },
 }
 ```
+
+The version taxonomy is closed. Connector, credential, operation, trigger,
+and event versions are stable SemVer cores; Phase 1 rejects prerelease/build.
+Runtime ABI, canonical/source-record schema, classifier/generator, and every
+static processor/authenticator/codec/normalizer implementation revision are
+integer epochs. A processorless declarative operation has exactly one step;
+multiple steps require `operation_processor`.
+
+Task 3 also owns the exact closed projection types from Spec 007 Section 5.1:
+
+```rust
+pub struct SourceRecordMaterialV1 {
+    pub record_version: u32,
+    pub record_id: SourceRecordId,
+    pub subject: SourceSubject,
+    pub reacquisition: ReacquisitionPlan,
+    pub artifact_hashes: Vec<ArtifactHash>,
+    pub license: LicenseDecision,
+    pub notice: NoticeIdentity,
+    pub entrypoints: Vec<SourcePath>,
+    pub dependencies: Vec<DependencyDecision>,
+    pub embedded_material: Vec<EmbeddedMaterialDecision>,
+    pub provider_contracts: Vec<ProviderContractReference>,
+    pub compatibility: CompatibilityDecision,
+    pub admission: AdmissionState,
+    pub safety_findings: SafetyFindings,
+    pub reviewer: ReviewIdentity,
+    pub approval_date: Date,
+    pub proposed_manifest: Option<RepoPath>,
+    pub proposed_destinations: NonEmptyVec<RepoPath>,
+    pub red_tests: NonEmptyVec<TestId>,
+}
+pub struct SemanticMaterialV1 {
+    pub canonical_schema_epoch: u32,
+    pub value_language_epoch: u32,
+    pub connector: SemanticConnectorIdentity,
+    pub credentials: Vec<CredentialSpec>,
+    pub origins: Vec<FixedOrigin>,
+    pub operations: Vec<OperationSpec>,
+    pub triggers: Vec<TriggerSpec>,
+    pub resolved_fact_values: Vec<ResolvedFactValue>,
+}
+pub struct ProvenanceMaterialV1 {
+    pub canonical_schema_epoch: u32,
+    pub connector: ProvenanceConnectorIdentity,
+    pub sources: Vec<SourceIdentityAndRecordHash>,
+    pub artifacts: Vec<ArtifactDecision>,
+    pub files: Vec<FileDecision>,
+    pub licenses: Vec<LicenseDecision>,
+    pub dependencies: Vec<DependencyDecision>,
+    pub embedded_material: Vec<EmbeddedMaterialDecision>,
+    pub notices: Vec<NoticeIdentity>,
+    pub resolved_fact_origins: Vec<ResolvedFactOrigin>,
+    pub donat_policy_ids: Vec<ResolvedPolicyUse>,
+    pub classifier_epoch: u32,
+    pub generator_epoch: u32,
+}
+pub struct ValueContractMaterialV1 {
+    pub value_language_epoch: u32,
+    pub roots: CanonicalContractRoots,
+    pub named_objects: CanonicalNamedObjects,
+}
+```
+
+`SourceRecordMaterialV1` is the exact field-for-field projection of the
+complete struct declared immediately above; its compile-time equality/coverage
+test fails when either field set changes. Optional values
+are explicit value-or-null and enums use the one tagged
+`{kind,value}` form. Set-like collections sort by stable ID and reject
+duplicates; steps, transforms, and error rules retain declared order.
+Object names use RFC 8785 unsigned UTF-16 ordering, not `BTreeMap<String>`
+storage order. Safe-width schema/version integers are JSON numbers; every
+other `u64`/`NonZeroU64` is a minimal decimal JSON string.
+
+The catalog adapter projects every `TypedValue` with the exact Spec 007
+Section 5.1 tag and uses strings for `I64`, `U64`, and exact decimal values.
+Inline bytes use canonical unpadded base64url. This code stays in catalog;
+`donat-value-contract` gains no Serde/JCS dependency and `canonical_size`
+remains a distinct contract.
+
+The domain functions and calculation order are exact:
+
+```rust
+pub fn record_sha256(
+    value: &SourceRecordMaterialV1,
+) -> Result<Hash256, CatalogError>;
+pub fn semantic_sha256(
+    value: &SemanticMaterialV1,
+) -> Result<Hash256, CatalogError>;
+pub fn provenance_sha256(
+    value: &ProvenanceMaterialV1,
+) -> Result<Hash256, CatalogError>;
+pub fn value_contract_sha256(
+    value: &ValueContractMaterialV1,
+) -> Result<Hash256, CatalogError>;
+```
+
+Compute record hashes, resolved manifest/value-contract hashes, semantic hash,
+provenance hash, then generated Rust/tree digest. No material contains its own
+result. Resolved evidence stays one `(value, origin)` binding: semantic
+material receives the value and provenance material the exact matching
+origin.
+
+Task 3 canonicalizes each selected header to ASCII lower case and derives its
+stored capability exactly:
+
+```text
+SHA256("donat.connector.response-header-capability.v1\0" ||
+  JCS({"connector":connector_id,
+       "header":canonical_ascii_lowercase_header,
+       "operation":operation_id,
+       "operation_version":StableSemver,
+       "step":compiled_step_id}))
+```
+
+The `CapabilityId` is `response-header.` plus lower-case digest hex: exactly
+80 ASCII bytes within the 96-byte ABI limit. Correlations retain the header,
+stored ID, and step-local link. Missing, ambiguous, duplicate, or more than 64
+resolutions reject.
+
+The independent vector uses these exact canonical bytes:
+
+```json
+{"connector":"donat.http","header":"x-request-id","operation":"get","operation_version":{"major":1,"minor":0,"patch":0},"step":"request"}
+```
+
+Its digest is
+`fc5e32fca2bee508e1689d6423697c171e5db342f1eaf082987183756c5ac3d3`
+and its exact ID is
+`response-header.fc5e32fca2bee508e1689d6423697c171e5db342f1eaf082987183756c5ac3d3`.
 
 `LicenseDecision` accepts only the six Phase-1 identifiers and one selected
 allowed branch for dual licensing. `DependencyDisposition` is exactly
@@ -1240,14 +1435,18 @@ signature/provenance state that disagrees with the recorded registry metadata,
 a provenance commit that differs from its signed statement, an unexplained
 tag commit, a changed maintainer set, and an unreviewed owner mismatch.
 
-Independently construct and assert all four Spec 007 Section 5.1
+Independently construct and assert all eight Spec 007 Section 5.1
 domain-separated SHA-256 vectors:
 
 ```text
+source-record {}                    210c9ca679adf8e51a22e107484e4dd5e27a1d894901541bf5b5abd5a71fcbd4
 semantic {}                         799ea52772e70c9b45d9af5fcd185ae47f0fdcccd5957214d5425a1941c36f19
 provenance {}                       a0b89c2c2f1c7e90d8427e2c4251234ce596f2af9105f23745237aa08b1e06f4
+value-contract {}                   6f72f51c0e8b4f09a064c507a1d879921d4753cc4378fb6fefecb27e25e3dd2f
+source-record {"a":1,"b":[true,null,"x"]} d6c4fc943d8ed980d248ffa25f2d8d16be65953603705d5afc29e5e8a045269f
 semantic {"a":1,"b":[true,null,"x"]} 2f7116c006c1fdfccdd12b1fa954cd94feffee889ceac39a0f76df616da7be34
 provenance {"a":1,"b":[true,null,"x"]} 4e31e445b6c8d06e6b93fd5cc66731b850a84853dd4ee28d6a76663138217a23
+value-contract {"a":1,"b":[true,null,"x"]} e74426ca8fb7b23e99f1f14f4a6d281575489c33312e27df9e9005f37158d4ab
 ```
 
 Add `source_record_variants_are_closed`,
@@ -1258,6 +1457,17 @@ Add `source_record_variants_are_closed`,
 `contract_fact_origins_are_closed_and_non_substitutable`,
 `donat_policy_cannot_satisfy_required_provider_evidence`,
 `contract_fact_semantic_and_provenance_hashes_are_separate`,
+`canonical_projection_domains_and_calculation_order_are_exact`,
+`canonical_projection_one_field_mutations_are_separate`,
+`typed_value_projection_tags_do_not_collide`,
+`typed_value_projection_preserves_u64_decimal_and_base64`,
+`typed_value_projection_string_and_object_do_not_collide`,
+`jcs_member_names_use_utf16_order`,
+`operation_spec_is_complete_self_contained_and_versioned`,
+`processorless_declarative_operation_has_one_step`,
+`selected_header_capability_vector_is_exact`,
+`selected_header_capability_scope_and_abi_fit_are_exact`,
+`selected_header_capability_resolution_rejects_missing_ambiguous_duplicate_and_65`,
 `provider_evidence_acceptance_is_closed_and_non_executable`,
 `dependency_and_embedded_dispositions_are_closed`,
 `notice_and_destination_fields_are_required`, and
@@ -1270,7 +1480,10 @@ Add `source_record_variants_are_closed`,
 `manifest_provenance_references_match_exact_records`. Round-trip one complete
 manifest containing a credential, fixed origin, compiled step, error map,
 operation, webhook trigger, poll trigger, bounds, and provenance references;
-reject every unknown enum tag, unknown nested field, unbounded declaration,
+the operation includes every complete snapshot field, stable SemVer/epoch
+distinction, recomputed input/output hash, ordered transforms, processor
+revision, defaults, selected-header mapping, and fact binding.
+Reject every unknown enum tag, unknown nested field, unbounded declaration,
 missing reference, dynamic destination, and raw provider message. The final
 identity test assigns normalized descriptor IDs directly to `ConnectorIo`
 parameters.
@@ -1285,15 +1498,34 @@ Expected: Cargo reports that package `donat-connector-catalog` does not exist.
 
 - [ ] **Step 3: Implement strict loading and canonical material**
 
-Use `BTreeMap`, reject duplicate keys and unknown fields before
-canonicalization, and keep semantic/provenance material separate:
+Use validated closed projection builders, reject duplicate keys and unknown
+fields before canonicalization, order object names by RFC 8785 UTF-16 code
+units rather than `BTreeMap<String>` iteration, and keep all four domains
+separate:
 
 ```rust
-pub fn semantic_sha256(value: &SemanticMaterial) -> Result<Hash256, CatalogError>;
+pub fn record_sha256(
+    value: &SourceRecordMaterialV1,
+) -> Result<Hash256, CatalogError>;
+pub fn semantic_sha256(
+    value: &SemanticMaterialV1,
+) -> Result<Hash256, CatalogError>;
 pub fn provenance_sha256(
-    value: &ProvenanceMaterial,
+    value: &ProvenanceMaterialV1,
+) -> Result<Hash256, CatalogError>;
+pub fn value_contract_sha256(
+    value: &ValueContractMaterialV1,
 ) -> Result<Hash256, CatalogError>;
 ```
+
+Implement the tagged `TypedValue` adapter in catalog and preserve exact
+full-width integer/decimal strings and unpadded base64url. Do not add Serde or
+JCS to `donat-value-contract`, and do not reuse `canonical_size`.
+
+Normalize every selected response header to its stored name/ID pair using the
+exact domain formula and Spec 007 vector. Error correlations link to that
+step-local table. Reject missing, ambiguous, duplicate, or 65th resolutions.
+No downstream runtime derivation helper is exported.
 
 Validate that every side-effecting step has exactly one evidence-backed entry
 and that read-only steps have none. Validate all three source variants before
@@ -1560,35 +1792,59 @@ and immutable generated entries:
 ```rust
 pub struct GeneratedCredentialSpec {
     pub credential: CredentialSpecId,
-    pub version: u32,
+    pub version: StableSemver,
     pub fields: &'static [GeneratedCredentialField],
     pub auth_plan: GeneratedAuthPlan,
     pub allowed_origins: &'static [OriginId],
     pub scopes: &'static [GeneratedStaticScope],
-    pub auth_processor: Option<AuthenticatorId>,
-    pub credential_test_operation: Option<OperationId>,
+    pub auth_processor: Option<GeneratedVersionedAuthenticatorReference>,
+    pub credential_test_operation:
+        Option<GeneratedVersionedOperationReference>,
     pub bounds: GeneratedCredentialBounds,
 }
 
 pub struct GeneratedOperationEntry {
+    pub connector: ConnectorId,
+    pub connector_version: StableSemver,
     pub operation: OperationId,
-    pub version: u32,
-    pub credential: Option<CredentialSpecId>,
+    pub operation_version: StableSemver,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
+    pub input: GeneratedValueContract,
+    pub input_contract_sha256: Hash256,
+    pub output: GeneratedValueContract,
+    pub output_contract_sha256: Hash256,
+    pub credential: Option<GeneratedVersionedCredentialReference>,
     pub origins: &'static [GeneratedFixedOrigin],
     pub steps: &'static [GeneratedCompiledStep],
+    pub pre_request_transforms:
+        &'static [GeneratedVersionedProcessorReference],
+    pub post_response_transforms:
+        &'static [GeneratedVersionedProcessorReference],
+    pub operation_processor:
+        Option<GeneratedVersionedProcessorReference>,
     pub effect: GeneratedOperationEffect,
-    pub input: GeneratedValueContract,
-    pub output: GeneratedValueContract,
     pub pagination: GeneratedPaginationPlan,
     pub error_map: GeneratedErrorMap,
+    pub capacity: GeneratedCapacityDefaults,
+    pub rate: GeneratedRateDefaults,
+    pub serialization_key_default:
+        Option<GeneratedTypedSerializationKeyDefault>,
     pub bounds: GeneratedOperationBounds,
     pub provenance: &'static [GeneratedProvenanceReference],
+    pub fact_bindings: &'static [GeneratedResolvedFactBinding],
 }
 
 pub struct GeneratedTriggerSpec {
+    pub connector: ConnectorId,
+    pub connector_version: StableSemver,
     pub trigger: TriggerId,
+    pub trigger_version: StableSemver,
+    pub event_version: StableSemver,
+    pub runtime_abi_epoch: u32,
     pub kind: GeneratedTriggerKind,
     pub provenance: &'static [GeneratedProvenanceReference],
+    pub fact_bindings: &'static [GeneratedResolvedFactBinding],
 }
 
 pub struct GeneratedSourceIdentity {
@@ -1606,6 +1862,12 @@ pub struct GeneratedLegalIdentity {
 
 pub struct GeneratedConnectorEntry {
     pub connector: ConnectorId,
+    pub connector_version: StableSemver,
+    pub manifest_version: u32,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
+    pub provider: ProviderId,
+    pub api_identity: GeneratedApiIdentity,
     pub credentials: &'static [GeneratedCredentialSpec],
     pub operations: &'static [GeneratedOperationEntry],
     pub triggers: &'static [GeneratedTriggerSpec],
@@ -1626,7 +1888,10 @@ conversion bridge for an identity. The generated credential/auth, fixed
 origin/step, operation/effect/error/pagination/bounds, trigger, contract-fact,
 source-record, and legal shapes are const-safe projections of the strict Task
 3 model; they do not omit a normalized field or introduce a server-owned
-descriptor.
+descriptor. `GeneratedCompiledStep` carries every complete step field and each
+`GeneratedSelectedResponseHeader {
+canonical_lowercase_header_name, capability }`. Error correlations retain
+their stored step-local header/capability link.
 
 - [ ] **Step 1: Write the failing determinism and drift tests**
 
@@ -1641,14 +1906,19 @@ fn generated_catalog_is_checked_in_and_deterministic() {
 ```
 
 Also test deleted output, extra output, changed byte, unsorted IDs, duplicate
-ID, manifest/source-record mismatch, semantic/provenance mismatch, and an
-unexpected path. Add a renderer assertion that rejects output containing
+ID, manifest/source-record mismatch, record/semantic/provenance/value-contract
+hash mismatch, and an unexpected path. Add a renderer assertion that rejects
+output containing
 identity `.parse()`, `String::`, `.to_owned()`, `.to_string()`, `.clone()`,
 `OnceLock`, or `LazyLock`, and compile the emitted credentials, operations,
 triggers, source identities, legal identities, and all ABI IDs in a const
-context. Reject a generated entry that omits any matching source-record hash,
-license/notice identity, contract-fact origin, fixed step/origin, bound, auth
-plan, error map, or trigger field.
+context. Assert exact field-for-field equality between each normalized
+`OperationSpec` and `GeneratedOperationEntry`. Reject a generated entry that
+omits any version/epoch, value contract/hash, versioned credential, matching
+source-record hash, license/notice identity, contract-fact value/origin, fixed
+step/origin, selected-header mapping, transform/processor revision,
+effect/pagination/error map, capacity/rate/serialization default, bound,
+provenance/fact binding, auth plan, or trigger field.
 
 - [ ] **Step 2: Run RED**
 
@@ -1661,9 +1931,12 @@ Expected: Cargo reports that package `donat-connector-codegen` does not exist.
 - [ ] **Step 3: Implement byte-for-byte generation**
 
 Sort by stable connector/operation ID. Render a header containing manifest,
-record, generator version, semantic hash, and provenance hash. Calculate the
-generated-tree digest exactly as Spec 007 Section 10 specifies. Never use
-`OUT_DIR`, `build.rs`, the network, or `donat-connector-acquire`.
+record, generator version, record hash, semantic hash, provenance hash, and
+every referenced value-contract hash. Calculate the generated-tree digest
+exactly as Spec 007 Section 10 specifies. Never use `OUT_DIR`, `build.rs`, the
+network, or `donat-connector-acquire`.
+Render only after Task 3 computes record hashes, resolved manifest and
+value-contract hashes, semantic hash, and provenance hash in that order.
 
 - [ ] **Step 4: Add ABI identity and exact-consumer compile proofs**
 
@@ -2117,10 +2390,13 @@ No public method accepts a raw URL, method, header name, auth value, or
 arbitrary request object.
 
 Task 8 is the only production caller of `host_construction`. It captures only
-compiled selected response headers, converts each compiled header to its
-`CapabilityId` and `BoundedString` value, obtains the correlation-capability
-allowlist derived by Task 3 from the selected `ErrorAction`, and calls
-`host_construction::transport_response`.
+compiled selected response headers, ASCII-case-insensitively matches each
+captured name to the generated step's stored
+`{canonical_lowercase_header_name, CapabilityId}` pair, stores the bounded
+value under that stored ID, obtains the selected `ErrorAction`'s stored
+correlation-capability allowlist, and calls
+`host_construction::transport_response`. It never hashes or derives a
+capability ID and accepts no caller-provided mapping or allowlist.
 
 Task 8 passes the selected catalog `ErrorAction`'s `StaticErrorCode` and
 `StaticSafeMessage` directly to `ConnectorFailure::try_new`. It passes
@@ -2153,7 +2429,10 @@ Port the existing HTTP safety assertions into these exact tests:
 - `success_and_failure_bodies_are_bounded`;
 - `error_map_covers_every_status_and_transport_failure`;
 - `retry_after_supports_seconds_and_http_date`;
-- `provider_body_and_credentials_never_enter_failure`.
+- `provider_body_and_credentials_never_enter_failure`;
+- `selected_header_names_match_case_insensitively_to_stored_capabilities`;
+- `selected_error_action_passes_only_its_stored_capability_allowlist`; and
+- `runtime_source_has_no_capability_derivation_path`.
 
 Use only local Axum stubs and injected DNS/peer observations.
 
@@ -2180,6 +2459,9 @@ IDs as `invariant` before credential resolution or network I/O, charge the
 shared call/page/item/byte budget, and check `ProcessorControl` before and
 after auth, codec, and I/O. Implement only typed JSON, query, and form bodies;
 multipart, inline binary, streaming, and continuation URLs stay rejected.
+Match response header names only against the current generated step's stored
+mapping and pass the selected action's stored allowlist. Do not import a
+hashing helper or capability-domain constant into server runtime code.
 
 - [ ] **Step 5: Implement exhaustive safe errors**
 
@@ -2198,6 +2480,11 @@ compiled-contract violation -> invariant
 
 Only allowlisted provider correlation IDs and a clamped retry delay survive.
 Safe messages are Donat-owned constants.
+
+Add a source-policy assertion over Task 8 production files that rejects
+`donat.connector.response-header-capability.v1`, capability SHA-256/hex
+construction, synthesized `response-header.` IDs, and any public/caller
+allowlist parameter. The catalog crate is the only derivation owner.
 
 - [ ] **Step 6: Run GREEN and existing connector regressions**
 
@@ -2264,7 +2551,9 @@ struct CatalogInstance {
 The server joins generated operation descriptors with the private processor
 lookup and its host implementations. It has no `RegistryInstance` enum,
 module-name `match`, public registration method, dynamic fallback, or
-catch-all executor.
+catch-all executor. Registry entries expose the exact generated
+`OperationSpec` projection unchanged; they do not copy a reduced runtime
+operation descriptor.
 
 - [ ] **Step 1: Write failing static-selection and public-surface tests**
 
@@ -3282,6 +3571,10 @@ Stripe transport. The server retains fixed `https://api.stripe.com`, form
 encoding, authorization and idempotency header materialization, credentials,
 reqwest, DNS/peer checks, JSON codec, UUID/text/time, crypto, clock, deadline,
 and control.
+The new Stripe operation must satisfy the complete Task 3 snapshot, version
+taxonomy, contract-hash recomputation, stored selected-header mapping, and
+generated field-equality gates; this task cannot use a migration-only partial
+descriptor.
 
 - [ ] **Step 1: Verify the evidence precondition**
 
@@ -3728,9 +4021,14 @@ crate, compatibility adapter, or server-local persistence table:
 6. Add poll scheduling/checkpoint persistence only after Spec 005 defines its
    missing schema, transaction, restart, locking, and database-clock
    semantics. A pure poll ABI test is not authorization to invent storage.
-7. Pin semantic/provenance/configuration hashes into process revisions and
-   retain live-retired operation versions only after Spec 005 revision
-   reconcile/reload tests exist.
+7. Pin the complete catalog-owned `OperationSpec` into process revisions:
+   every connector/credential/operation version, runtime/value/schema epoch,
+   record/semantic/provenance/value-contract/configuration hash, default,
+   resolved origin, ordered step/transform, processor implementation revision,
+   effect, pagination/error plan, bound, selected-header capability,
+   provenance, and fact binding. Retain live-retired versions only after Spec
+   005 revision reconcile/reload tests prove one-field changes and complete
+   restart verification.
 8. Add inline binary/multipart only after `donat-value-contract` implements
    the exact Spec 007 Section 9 base64url/JCS vectors and Spec 005 accepts that
    value in descriptors and journals.

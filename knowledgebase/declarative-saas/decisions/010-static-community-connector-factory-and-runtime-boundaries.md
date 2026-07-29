@@ -149,6 +149,10 @@ normalization/safety values resolve only to reviewed policy IDs. Neither
 variant can satisfy a requirement for the other. Normalized fact/policy
 values enter semantic hashing, while provider record/artifact/fact identities
 and locations plus Donat policy IDs enter provenance hashing.
+[[012-canonical-catalog-projections-and-persisted-header-capabilities]]
+defines the exact stable use-site pairing: semantic material takes the
+resolved value, provenance material takes that same use site's exact origin,
+and neither side may be reconstructed or omitted.
 
 Credentials are split into compiled `CredentialSpec` values and
 source-bound deploy-time credential instances containing only read-only
@@ -175,6 +179,14 @@ receives diff review, updates checked-in output through the generator, and
 then passes `generate --check`. Ordinary Cargo builds never acquire, inspect,
 or execute donor material.
 
+The persistent calculation order and closed materials are fixed by
+[[012-canonical-catalog-projections-and-persisted-header-capabilities]]:
+source-record hashes, resolved manifest and value-contract hashes, semantic
+hash, provenance hash, then the generated Rust/tree digest. No material
+contains its own result. JCS object names use RFC 8785 UTF-16 ordering, and
+the catalog uses the decision's tagged `TypedValue` adapter rather than raw
+JSON numbers or the lower value crate's separate `canonical_size`.
+
 The catalog crate owns the complete strict normalized model before any server
 consumer: `CredentialSpec` and its closed auth plan, fixed origins and
 compiled steps, `OperationSpec`, `ErrorMap`, pagination and finite bounds,
@@ -184,6 +196,20 @@ IDs/hashes, license/notice identities, semantic/provenance hashes, and every
 exact ABI-owned ID. Credential validation and webhook lookup borrow those
 generated catalog types directly; the server defines no replacement
 descriptor.
+
+`OperationSpec` is the complete self-contained versioned snapshot from
+[[012-canonical-catalog-projections-and-persisted-header-capabilities]], not a
+summary. It retains connector and operation SemVer, runtime/value epochs,
+recomputed input/output contract hashes, optional versioned credential,
+resolved origin closure, ordered compiled steps and transforms, optional
+versioned operation processor, effect, pagination, complete error map,
+capacity/rate/typed serialization defaults, all step/operation bounds, exact
+provenance and fact bindings, and persisted selected-header capabilities.
+Processorless declarative operations have exactly one step; multiple steps
+require the versioned static operation processor. Connector, credential,
+operation, trigger, and event versions are SemVer cores without Phase-1
+prerelease/build metadata; implementation and schema versions are integer
+epochs.
 
 Source admission is exact-version and fail-closed. Phase 1 accepts only
 `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, or `0BSD`; an
@@ -202,6 +228,13 @@ repository/tarball mapping, compatibility tier, inventory/admission state,
 notices, proposed manifest and destination paths, and closed dependency and
 embedded-material dispositions. A manifest can cite only the matching record;
 an unrelated Donat-owned record cannot supply provenance.
+
+Each record is projected in full to `SourceRecordMaterialV1` and receives the
+domain-separated `record_sha256` defined by
+[[012-canonical-catalog-projections-and-persisted-header-capabilities]].
+Generated source identities store that record hash. Set-like identities sort
+by stable ID, declared behavioral order is retained, optional values are
+explicit value-or-null, and enums use the one tagged form.
 
 An exact npm subject also retains closed verified-present,
 verified-absent, or rejected decisions for registry signatures and signed
@@ -286,7 +319,7 @@ catalog_construction validates normalized Donat policy and is callable only
 from crates/connector-catalog/src/.
 
 host_construction intersects server-captured selected headers with the
-catalog-derived CapabilityId allowlist and is callable only from
+catalog-stored CapabilityId allowlist and is callable only from
 crates/server/src/connectors/.
 
 Rust privacy cannot express friend crates, so Task 2 creates
@@ -307,6 +340,15 @@ existing static native boundary: they add neither a sandbox nor a runtime
 surface. Task 3 alone consumes `catalog_construction`; Task 8 alone consumes
 `host_construction`; Task 6 extends the one checker and consumes response data
 only through its accessors and static literals.
+
+Task 3 also canonicalizes each selected response-header name and derives and
+stores its scoped 80-byte `CapabilityId` exactly once under
+[[012-canonical-catalog-projections-and-persisted-header-capabilities]].
+Error correlations retain the stored header/capability link and reject
+missing, ambiguous, duplicate, or more-than-64 resolutions. Task 5 emits that
+mapping. Task 8 only matches captured header names, stores values under the
+persisted IDs, and passes the selected action's stored allowlist; runtime code
+has no capability derivation or caller-provided allowlist path.
 
 ## Alternatives
 

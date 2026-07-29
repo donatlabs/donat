@@ -343,6 +343,24 @@ struct ProviderContractReference {
 }
 ```
 
+`record_version` is the integer source-record schema epoch. The complete
+validated record above, including review, admission, legal, dependency,
+embedded-material, destination, and RED-test fields, projects one-for-one to
+`SourceRecordMaterialV1`. Optional fields are explicit value-or-null, enums
+use `{"kind":"<snake_case>","value":<payload-or-null>}`, set-like collections
+sort by stable ID, and duplicates reject. The material never contains its own
+hash:
+
+```text
+record_sha256 =
+  SHA256("donat.connector.source-record.v1\0" ||
+         JCS(SourceRecordMaterialV1))
+```
+
+Generated source identities retain this hash. The exact projection,
+calculation order, and vectors are defined in Section 5.1 and
+[[knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities]].
+
 `SourceRecordId`, `ProviderContractId`, `ProviderFactId`, `DonatPolicyId`,
 and `NoticeId` are transparent catalog wrappers over the ABI's exact
 const/copy `InlineId` storage and grammar. This keeps generated provenance and
@@ -543,58 +561,122 @@ non-refreshing OAuth access token. Trigger forms are exactly webhook or poll.
 No later metadata/server task defines a replacement credential, operation,
 error, trigger, origin, step, bound, or provenance descriptor.
 
-### 5.1 Canonical JSON v1 and domain-separated hashes
+### 5.1 Canonical JSON v1 and domain-separated projections
 
 Every source record, normalized manifest, and descriptor object denies unknown
-fields at every nesting level. Canonical JSON v1 is RFC 8785 JSON
-Canonicalization Scheme (JCS): UTF-8 without BOM or insignificant whitespace,
-lexicographically sorted object member names, preserved array order, JCS
-number/string escaping, no duplicate member names, and no Unicode
-normalization. Schema validation occurs before canonicalization. A format
-change requires a new explicit canonical version; a v1 reader never guesses
-how to read a later version.
+fields at every nesting level. Canonical JSON v1 is
+[RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785.html): UTF-8 without BOM
+or insignificant whitespace, recursively sorted object member names,
+preserved array order, JCS primitive serialization, no duplicate member names,
+and no Unicode normalization. Member-name order is unsigned UTF-16 code-unit
+order; Rust `BTreeMap<String>` UTF-8 order is not a JCS implementation.
+Inputs satisfy [RFC 7493 I-JSON](https://www.rfc-editor.org/rfc/rfc7493.html).
+Schema validation occurs before canonicalization. A format change requires a
+new explicit canonical epoch; a v1 reader never guesses a later format.
 
-Two lower-case SHA-256 hashes are mandatory and not interchangeable:
+Connector, credential, operation, trigger, and event versions are stable
+SemVer core `{major,minor,patch}` values. Phase 1 rejects prerelease/build
+metadata. Runtime ABI, canonical/source-record schema,
+classifier/generator, and static processor/authenticator/codec/normalizer
+implementation versions are integer epochs. Every processor-like reference is
+`{id: <ABI-owned ID>, implementation_revision: <integer epoch>}`.
+`ConnectorManifest` has separate `manifest_version` and `connector_version`.
+Safe-width schema/version integers remain JSON numbers. All other `u64` and
+`NonZeroU64` fields are minimal unsigned-decimal JSON strings.
+
+The catalog owns four exact closed projections:
+
+- `SourceRecordMaterialV1` is every field of the complete validated
+  `ConnectorSourceRecord` in Section 4.1. Nothing is dropped as review-only.
+- `SemanticMaterialV1` has top-level fields
+  `canonical_schema_epoch`, `value_language_epoch`, `connector`,
+  `credentials`, `origins`, `operations`, `triggers`, and
+  `resolved_fact_values`. The connector contains ID, version, provider ID, and
+  API identity. The other values are complete normalized objects and therefore
+  retain all schemas/hashes, steps, transforms, processor IDs/revisions,
+  static error text, selected-header capabilities, mappings, typed defaults,
+  effects, pagination, and bounds.
+- `ProvenanceMaterialV1` has top-level fields
+  `canonical_schema_epoch`, `connector`, `sources`, `artifacts`, `files`,
+  `licenses`, `dependencies`, `embedded_material`, `notices`,
+  `resolved_fact_origins`, `donat_policy_ids`, `classifier_epoch`, and
+  `generator_epoch`. Connector retains ID/version/semantic hash; sources are
+  sorted identities with record hashes; the remaining entries retain exact
+  immutable attribution decisions.
+- `ValueContractMaterialV1` has `value_language_epoch`, `roots`, and
+  `named_objects`. It projects complete `ValueContractField`/`TypeRef`/
+  `ValueType` tagged variants and the full named-object closure, including
+  unreachable declarations. Roots, named objects, and fields use JCS member
+  ordering; enum values retain declared order.
+
+Optional fields are always present as value-or-null. Every enum uses
+`{"kind":"<snake_case>","value":<payload-or-null>}`. Set-like arrays sort by
+stable ID and reject duplicates; steps, transforms, and error rules retain
+declared order. No material contains the hash it produces.
+
+Resolved evidence is structurally `(value, origin)`. At each stable fact-use
+site, semantic material receives the resolved value and provenance material
+receives that same use site's provider record/artifact/fact location or Donat
+policy ID. Neither side is reconstructed from or substituted for the other.
+
+The catalog, not `donat-value-contract`, projects `TypedValue` losslessly:
 
 ```text
-semantic_sha256 =
-  SHA256("donat.connector.semantic.v1\0" || JCS(semantic_material))
-
-provenance_sha256 =
-  SHA256("donat.connector.provenance.v1\0" || JCS(provenance_material))
+Null          {"kind":"null","value":null}
+Boolean       {"kind":"boolean","value":true|false}
+String        {"kind":"string","value":"..."}
+I64           {"kind":"i64","value":"<minimal signed decimal>"}
+U64           {"kind":"u64","value":"<minimal unsigned decimal>"}
+Decimal       {"kind":"decimal","value":"<accepted exact spelling>"}
+List          {"kind":"list","value":[...]}
+Object        {"kind":"object","value":{"key":...}}
+InlineBytes   {"kind":"inline_bytes","value":{
+                 "$binary":"<RFC 4648 base64url without padding>",
+                 "file_name":<string-or-null>,
+                 "media_type":<string-or-null>}}
 ```
 
-`semantic_material` contains connector/operation/credential/event versions,
-types, every step effect and idempotency binding/scope/minimum-retention/clock
-margin, fixed steps/origins, encodings, mappings, processors, and all bounds;
-it excludes review names, source URLs, and notice text. `provenance_material`
-contains the source-record identity, exact artifact/per-file/license hashes,
-dependency/embedded-material decisions, notice IDs, normalized-manifest
-semantic hash, and classifier/generator versions. Both hashes are stored in
-the generated catalog and configuration fingerprint. A semantic change never
-hides behind an unchanged provenance hash, and a source/license change never
-hides behind unchanged behavior.
+Object keys use RFC 8785 UTF-16 ordering. Variant tags keep `I64(1)`,
+`U64(1)`, `Decimal("1")`, and `String("1")` distinct; strings preserve
+`u64::MAX` and exact decimal spelling. This adapter does not change or reuse
+the lower crate's separate `canonical_size`.
 
-For `ContractFact::ProviderEvidence`, the normalized provider value enters
-semantic material while its source-record/artifact/fact identity and exact
-location enter provenance material. For `ContractFact::DonatPolicy`, the
-selected value enters semantic material while the policy ID enters
-provenance material. Changing either origin or value changes the applicable
-domain-separated hash. Validation and negative tests prove a Donat policy
-cannot satisfy a required provider fact and provider evidence cannot
-masquerade as Donat policy.
+Hashes and order are normative:
+
+```text
+record_sha256 =
+  SHA256("donat.connector.source-record.v1\0" ||
+         JCS(SourceRecordMaterialV1))
+semantic_sha256 =
+  SHA256("donat.connector.semantic.v1\0" || JCS(SemanticMaterialV1))
+provenance_sha256 =
+  SHA256("donat.connector.provenance.v1\0" ||
+         JCS(ProvenanceMaterialV1))
+value_contract_sha256 =
+  SHA256("donat.connector.value-contract.v1\0" ||
+         JCS(ValueContractMaterialV1))
+```
+
+Calculation is record hashes, resolved manifest/value-contract hashes,
+semantic hash, provenance hash, then generated Rust/tree digest.
 
 Golden vectors are normative:
 
-| Canonical bytes | Domain | SHA-256 |
-| --- | --- | --- |
-| `{}` | `donat.connector.semantic.v1\0` | `799ea52772e70c9b45d9af5fcd185ae47f0fdcccd5957214d5425a1941c36f19` |
-| `{}` | `donat.connector.provenance.v1\0` | `a0b89c2c2f1c7e90d8427e2c4251234ce596f2af9105f23745237aa08b1e06f4` |
-| `{"a":1,"b":[true,null,"x"]}` | `donat.connector.semantic.v1\0` | `2f7116c006c1fdfccdd12b1fa954cd94feffee889ceac39a0f76df616da7be34` |
-| `{"a":1,"b":[true,null,"x"]}` | `donat.connector.provenance.v1\0` | `4e31e445b6c8d06e6b93fd5cc66731b850a84853dd4ee28d6a76663138217a23` |
+| Canonical bytes | source-record | semantic | provenance | value-contract |
+| --- | --- | --- | --- | --- |
+| `{}` | `210c9ca679adf8e51a22e107484e4dd5e27a1d894901541bf5b5abd5a71fcbd4` | `799ea52772e70c9b45d9af5fcd185ae47f0fdcccd5957214d5425a1941c36f19` | `a0b89c2c2f1c7e90d8427e2c4251234ce596f2af9105f23745237aa08b1e06f4` | `6f72f51c0e8b4f09a064c507a1d879921d4753cc4378fb6fefecb27e25e3dd2f` |
+| `{"a":1,"b":[true,null,"x"]}` | `d6c4fc943d8ed980d248ffa25f2d8d16be65953603705d5afc29e5e8a045269f` | `2f7116c006c1fdfccdd12b1fa954cd94feffee889ceac39a0f76df616da7be34` | `4e31e445b6c8d06e6b93fd5cc66731b850a84853dd4ee28d6a76663138217a23` | `e74426ca8fb7b23e99f1f14f4a6d281575489c33312e27df9e9005f37158d4ab` |
 
-Unit tests must construct those exact byte strings independently of the
-production helper, then pin representative manifest and catalog vectors.
+Independent tests construct these bytes, pin complete material vectors, mutate
+one field per material, prove value/origin separation, distinguish every
+tagged numeric/string variant with exact bytes
+`{"kind":"i64","value":"1"}`,
+`{"kind":"u64","value":"1"}`,
+`{"kind":"decimal","value":"1"}`, and
+`{"kind":"string","value":"1"}`. They pin `u64::MAX` as
+`{"kind":"u64","value":"18446744073709551615"}`, bytes `[0xff,0x00]`
+as `_wA`, a JSON-looking string versus a tagged object as non-colliding,
+exact decimal spelling, and U+10000 before U+FFFD by UTF-16.
 
 ### 5.2 `CredentialSpec`
 
@@ -611,7 +693,7 @@ A `CredentialSpec` contains:
   credentials, and maximum credential/token sizes;
 - an optional statically registered auth processor ID for a narrow provider
   signature scheme;
-- an optional credential-test operation ID.
+- an optional credential-test operation ID plus stable SemVer.
 
 It contains no display widget, HTML, arbitrary expression, raw secret, runtime
 URL, refresh token, refresh/writeback plan, or JavaScript hook.
@@ -620,23 +702,33 @@ URL, refresh token, refresh/writeback plan, or JavaScript hook.
 
 An `OperationSpec` contains:
 
-- stable connector/operation ID, semantic version, runtime ABI, and canonical
-  input/output type hashes;
-- a closed typed input and output using the shared SQL-free value-contract
-  language;
-- one or more named compiled steps, each with a fixed method, origin ID, path,
-  query keys, header names, credential action, and encoding;
-- explicit optional/default behavior for every binding;
-- JSON, form-urlencoded, multipart, or raw-byte request shape;
-- declared success statuses and response selection/normalization;
-- one `ErrorMap`;
-- one closed `OperationEffect`;
-- one `PaginationPlan`;
-- named pure pre-request/post-response transforms;
-- an optional static `OperationProcessor` ID;
+- connector ID and stable SemVer, operation ID and stable SemVer, runtime ABI
+  epoch, and value-language epoch;
+- complete input and output `ValueContractMaterialV1` values plus independently
+  recomputed `value_contract_sha256` values;
+- an optional versioned credential reference containing credential ID and
+  stable SemVer;
+- the exact resolved fixed-origin closure and complete compiled steps in
+  declared order. Each step retains fixed method, origin, path, query/header
+  keys, credential action, encoding, binding optionality/defaults, request
+  shape, success statuses, response selection/normalization, selected response
+  header mappings, and complete `StepBounds`;
+- ordered versioned pre-request and post-response transforms plus an optional
+  versioned static operation processor. Every processor-like reference is its
+  ABI-owned ID plus integer `implementation_revision`;
+- one closed `OperationEffect`, one `PaginationPlan`, and one complete ordered
+  `ErrorMap`;
 - capacity, rate, and typed serialization-key defaults;
-- exact request, response, inline-binary, page, item, call, redirect, and
-  deadline bounds.
+- complete operation request, response, inline-binary, page, item, call,
+  redirect, aggregate, output, and deadline bounds; and
+- exact provenance references and stable fact-use-site bindings.
+
+These fields are the closed self-contained snapshot listed by
+`OperationSpec` in ADR 012; null and empty values remain explicit. A
+processorless declarative operation has exactly one compiled step. Multiple
+steps require a versioned static operation processor. Generated Rust and every
+pinned process consumer retain the full snapshot rather than reloading any
+field from a current manifest.
 
 No operation field can carry an arbitrary expression, dynamic method,
 caller-owned header key, raw URL, proxy/TLS option, ambient workflow item,
@@ -757,6 +849,29 @@ Spec 005-gated two-worker tests prove headerless read-only takeover,
 stable-step-key provider mutation takeover, and late-takeover refusal before
 I/O.
 
+Every selected response header on a compiled step is stored as
+`{canonical_lowercase_header_name, capability}`. Catalog normalization derives
+the `CapabilityId` once:
+
+```text
+digest = SHA256(
+  "donat.connector.response-header-capability.v1\0" ||
+  JCS({
+    "connector": connector_id,
+    "header": canonical_ascii_lowercase_header,
+    "operation": operation_id,
+    "operation_version": StableSemver,
+    "step": compiled_step_id
+  })
+)
+CapabilityId = "response-header." || lowercase_hex(digest)
+```
+
+The result is exactly 80 ASCII bytes and fits the ABI's 96-byte bound. The
+full connector/operation/version/step scope prevents equal header names in
+different steps or versions from colliding. Header names and IDs enter
+semantic material.
+
 ### 5.4 `PaginationPlan`
 
 `PaginationPlan` is a closed enum:
@@ -804,10 +919,13 @@ constants. Raw provider bodies, authorization material, tokens, credential
 fields, and unreviewed provider messages never cross the failure boundary.
 Each `ErrorAction` carries ABI-owned `StaticErrorCode` and
 `StaticSafeMessage` values after strict normalized validation. Catalog
-construction is the sole runtime-string producer of those values; it derives
-each correlation header to exactly one `CapabilityId`, rejects missing,
-multiple, duplicate, or more-than-64 correlation capabilities, and includes
-the static text and derived capabilities in semantic hashing.
+construction is the sole runtime-string producer of those values. Each
+correlation binding retains both canonical lower-case header name and the
+stored step-local `CapabilityId` from Section 5.3, or a validated link to that
+exact mapping. Catalog validation rejects missing, ambiguous, duplicate, or
+more-than-64 resolutions and includes the static text, names, and stored IDs
+in semantic hashing. Neither an error action nor runtime code derives another
+capability.
 Connectors classify outcomes; Process metadata alone owns retry and
 `on_error` policy.
 
@@ -919,8 +1037,11 @@ defining a second representation. This supersedes ADR 009's accepted
 superseding ADR before the value-contract slice lands.
 
 `donat-connector-catalog` explicitly owns `ConnectorSourceRecord`, the
-normalized connector IR, canonical record/manifest/descriptor hashes, and the
-checked-in generated catalog. It imports the ABI-owned connector, operation,
+normalized connector IR, the exact versioned projections and domain-separated
+record/semantic/provenance/value-contract hashes from Section 5.1, the tagged
+`TypedValue` JCS adapter, and the checked-in generated catalog. The lower value
+crate gains no Serde/JCS dependency, and this adapter does not replace
+`canonical_size`. Catalog imports the ABI-owned connector, operation,
 compiled-step, processor, authenticator, codec, normalizer, credential, and
 capability ID/envelope types directly. It never defines a catalog-local string
 copy or conversion type for them. Catalog may use serde and pure hashing but
@@ -1167,7 +1288,11 @@ pub mod host_construction {
 `catalog_construction` is callable only from `crates/connector-catalog/src/`
 after strict normalized policy validation. `host_construction` is callable
 only from `crates/server/src/connectors/`, where it intersects captured
-selected headers with the catalog-derived `CapabilityId` allowlist. Rust
+selected headers with the selected error action's catalog-stored
+`CapabilityId` allowlist. Task 8 matches canonical header names and stores
+their bounded values under the persisted step mapping; it contains no
+capability domain string, hashing, derivation, or caller-provided allowlist
+path. Rust
 privacy has no friend crates, so Task 2 creates
 `scripts/check_connector_processor_boundary.py` with deterministic producer
 and test-path fixtures; Task 6 extends that exact checker with dependency and
@@ -1462,14 +1587,16 @@ fixed-origin egress policy.
 `donat-connector-codegen` emits an immutable, checked-in Rust table under
 `crates/connector-catalog/src/generated/` containing:
 
-- connector ID/version/runtime ABI and provider ID;
+- connector ID/stable SemVer, manifest schema epoch, runtime ABI epoch,
+  value-language epoch, provider ID, and API identity;
 - `CredentialSpec`, `OperationSpec`, `PaginationPlan`, `ErrorMap`, and
   `TriggerSpec` entries;
-- processor/authenticator/codec/normalizer IDs and versions;
+- processor/authenticator/codec/normalizer IDs and implementation revisions;
 - fixed origins and network policy;
+- each selected response header's canonical name and persisted capability ID;
 - every side-effect step's provider idempotency binding, scope,
   minimum-retention evidence, and clock margin;
-- canonical semantic/provenance/input/output and configuration hashes;
+- canonical record/semantic/provenance/value-contract and configuration hashes;
 - source-record IDs, source file hashes, license class, and notice IDs;
 - compiler/classifier versions.
 
@@ -1478,6 +1605,12 @@ The top-level const-safe shape is normative:
 ```rust
 pub struct GeneratedConnectorEntry {
     pub connector: ConnectorId,
+    pub connector_version: StableSemver,
+    pub manifest_version: u32,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
+    pub provider: ProviderId,
+    pub api_identity: GeneratedApiIdentity,
     pub credentials: &'static [GeneratedCredentialSpec],
     pub operations: &'static [GeneratedOperationEntry],
     pub triggers: &'static [GeneratedTriggerSpec],
@@ -1512,15 +1645,30 @@ hashes. Compile tests pass
 `&'static GeneratedTriggerSpec` to the Task-16-shaped consumer without
 defining a server-owned descriptor.
 
+`GeneratedOperationEntry` is the exact const-safe projection of the complete
+Section 5.3 `OperationSpec`: connector/version, operation/version,
+runtime/value epochs, complete input/output contracts and hashes, optional
+versioned credential, resolved origin closure, ordered complete steps and
+transforms, optional versioned processor, effect, pagination, complete error
+map, capacity/rate/typed serialization defaults, all bounds, provenance, fact
+bindings, and selected-header name/capability mappings. Codegen has a
+field-for-field equality test against the normalized operation and cannot
+restate a smaller generated shape.
+
 Generated files are sorted by stable connector/operation ID and contain a
-header naming their manifest, source record, generator version, and both
-hashes. The generated-artifact digest is
+header naming their manifest, source record, generator version, record hash,
+semantic hash, provenance hash, and every referenced value-contract hash. The
+generated-artifact digest is
 `SHA256("donat.connector.generated-rust.v1\0" || entries)`, where `entries` is
 the concatenation, in UTF-8 repository-path byte order, of each path length as
 an eight-byte big-endian integer, path bytes, file length in the same form, and
 file bytes. `generate --check` reproduces those bytes in a fresh temporary
 directory and rejects any digest/file/path difference. Cargo never invokes the
 generator.
+
+Generation observes the Section 5.1 order: source records, resolved manifests
+and value-contract hashes, semantic hash, provenance hash, then generated tree
+digest. No generated material is fed back into an earlier projection.
 
 `ConnectorRegistry::build` continues to run before the listener opens. It
 validates deploy-time instances against this table, probes declared read-only
@@ -1545,10 +1693,14 @@ descriptors for the two-stage process compiler in ADR 009. A process revision
 pins source name, connector instance, connector and operation versions,
 runtime ABI, every step's effect/idempotency binding/scope/minimum
 retention/clock margin, the compiler-calculated maximum send horizon,
-processor/version, credential-spec/identity, endpoint identity, non-secret
-configuration fingerprint, origin policy, semantic/provenance hashes, bounds,
-and input/output hashes. This publication, live-retired execution, and worker
-claim behavior do not exist until the prerequisites in Section 13 are met.
+value-language epoch, complete input/output contracts and hashes, every
+processor-like ID/implementation revision, credential-spec version/identity,
+endpoint identity, resolved origin closure, non-secret configuration
+fingerprint, semantic/provenance/record/value-contract hashes, stored selected
+header capabilities, mappings/defaults, pagination/error plan, all bounds,
+provenance, and fact bindings. This publication, live-retired execution, and
+worker claim behavior do not exist until the prerequisites in Section 13 are
+met.
 
 Rotating a read-only secret value does not serialize it into or change the
 revision. A change to resolver identity, credential class/spec, endpoint
@@ -1751,9 +1903,9 @@ standalone slice before the next row begins:
 | ---: | --- | --- |
 | 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
 | 1 | **Create** `crates/connector-abi/`, initial `scripts/check_connector_processor_boundary.py`, and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, private safe envelopes/static failure text, restricted construction namespaces, exact-boundary/compile-fail proof, and deterministic initial checker fixtures; no processor implementation |
-| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and complete credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs, calling `catalog_construction` only after strict normalized validation, deriving correlation capabilities, semantic hashing static text/capabilities, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record; exact `SourceRecordMaterialV1`, `SemanticMaterialV1`, `ProvenanceMaterialV1`, and `ValueContractMaterialV1` projections/domains/order; tagged `TypedValue` JCS adapter; complete self-contained versioned credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs; persisted selected-header capability derivation/mapping; strict `catalog_construction`; value/origin split, per-step effect, hash-vector, UTF-16, and descriptor-to-`ConnectorIo` identity proofs |
 | 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for disjoint npm/provider acquisition, record-derived reacquisition, and hostile HTTPS/archive handling; synthetic extraction/license/dependency tests |
-| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust carrying credentials/operations/triggers/source/legal identities, `generate --check`, actual-generated-entry-to-ABI ID identity proof, and exact Task-7/Task-16 consumer compile proofs; no acquisition dependency, `build.rs`, or Cargo-time generation |
+| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust carrying the exact complete normalized credential/operation/trigger projections, stored header mappings, source/legal identities, every version/hash/default/origin/processor/provenance/fact binding, `generate --check`, field-for-field normalized/generated equality, actual-generated-entry-to-ABI ID identity proof, and exact Task-7/Task-16 consumer compile proofs; no acquisition dependency, `build.rs`, or Cargo-time generation |
 | 4 | **Create** `crates/connector-processors/` and extend the initial boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
 | 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
 | 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
@@ -1822,8 +1974,13 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `license_and_dependency_disposition_is_closed` | admission unit | only the six Section 3.1 SPDX choices and an explicit allowed dual-license selection pass; every dependency has one closed disposition |
 | `sul_source_cannot_generate_artifacts` | policy integration | every donor marks `n8n-workflow` `TypeOnlyReplaced`; SUL bytes are absent from parser input, manifests, generated Rust, fixtures, Cargo metadata, and release artifacts |
 | `imperative_ast_emits_work_item_not_rust` | codegen snapshot | function-valued routing, `execute`, `poll`, webhook code, or an ambiguous expression produces a processor/unsupported inventory finding, never guessed behavior |
-| `canonical_json_and_hash_vectors_match` | catalog unit | an implementation-independent helper produces every exact Section 5.1 vector; duplicate/unknown/noncanonical input rejects |
+| `canonical_projection_domains_are_exact` | catalog unit | independent bytes produce every source-record/semantic/provenance/value-contract Section 5.1 vector; one-field mutation changes the applicable domain; no material includes its result; calculation order is record, resolved manifest/value contract, semantic, provenance, generated tree |
+| `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes its resolved value only to semantic material and its exact provider/policy origin only to provenance material; substitution, omission, or mismatched pairing rejects |
+| `typed_value_jcs_projection_is_lossless` | catalog unit | tagged `I64(1)`, `U64(1)`, `Decimal("1")`, and `String("1")` do not collide; `u64::MAX`, exact decimal spelling, canonical base64url, inline metadata nulls, and U+10000-before-U+FFFD UTF-16 member ordering match independent bytes |
+| `operation_snapshot_is_complete_and_versioned` | catalog unit | every Section 5.3 field, stable SemVer/epoch distinction, input/output recomputed hash, resolved origin, transform/processor revision, default, bound, provenance, fact binding, and stored selected-header mapping is required; prerelease/build versions reject; processorless multi-step rejects |
+| `response_header_capabilities_are_persisted_and_scoped` | catalog/codegen unit | case folding matches the exact Section 5.3 vector; connector/operation/version/step changes separate IDs; missing/ambiguous/duplicate/more-than-64 mappings reject; every result is 80 ASCII bytes and fits the 96-byte ABI ID |
 | `generated_catalog_is_checked_in_and_deterministic` | codegen/CI | `generate --check` reproduces every path/byte/digest in two clean worktrees; deletion, drift, extra output, or manifest/source-record mismatch fails |
+| `generated_operation_projection_is_exact` | codegen/catalog compile | every generated operation equals the normalized complete projection field-for-field, including all versions, hashes, defaults, origins, processors, capabilities, provenance, and fact bindings; no partial generated shape compiles |
 | `serpapi_exact_source_compiles` | codegen insta + local HTTP | admitted `0.1.10` record produces the reviewed manifest/generated Rust and fixed prepared request; snapshots are individually reviewed |
 | `operation_effect_is_closed` | catalog/compiler | headerless `ReadOnly` and per-side-effect-step `ProviderIdempotent` binding/scope/retention/margin compile; missing/duplicate/unproven step entries and non-idempotent side effects remain inventory-only |
 | `provider_idempotency_horizon_is_bounded` | Spec 005-gated process compiler | a complete policy whose maximum send horizon equals the usable window compiles; the same policy one millisecond over rejects, and any missing/unbounded schedule/capacity/start-to-close/lease/takeover/backoff component rejects |
@@ -1836,6 +1993,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `processor_calls_only_compiled_steps` | processor/server | every auxiliary ABI is object-safe and bounded; a foreign step, URL-shaped continuation, undeclared primitive, excess budget, deadline, or cancellation fails before further I/O |
 | `webhook_authentication_precedes_codec` | processor/server/endpoint | invalid authentication never invokes the server codec; valid raw authentication creates one opaque token, then server decoding, then pure typed normalization, while the public route matrix remains exact |
 | `fixed_origin_is_unescapable` | server integration | input, processor bindings, pagination, provider body, redirects, DNS rebinding, proxy environment, and peer mismatch cannot change the compiled destination |
+| `runtime_uses_stored_header_capabilities_only` | server/source policy | Task 8 matches response header names to stored IDs and passes the selected action's stored allowlist; source contains no capability domain string, SHA-256 derivation path, or caller-provided allowlist |
 | `runtime_limits_have_exact_failures` | server/local-provider matrix | every header/URL/path/query/JSON/body/aggregate/item/page/call/output/inline-byte ceiling reaches the exact Section 8 class/code without partial output or leakage; `Retry-After` clamps at 86,400 seconds |
 | `error_map_is_closed_and_redacted` | server/local-provider matrix | every transport/status/provider-code/malformed-success case reaches one existing class and Donat-owned safe message with no secret/raw body leakage |
 | `pagination_is_bounded` | server integration | cursor/offset/page/link plans share the logical-attempt budget and stop at calls/pages/items/aggregate bytes/deadline; cross-origin `next` is rejected |
@@ -1847,7 +2005,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `durable_webhook_ack_is_source_local` | Spec 005-gated webhook integration | only the Spec 005 transaction may change valid verification from `503`; exact success status/body must be specified there before a fixture lands, after audit/dedupe/correlation commit |
 | `poll_checkpoint_persistence_matches_process_contract` | future Spec 005-gated process integration | only after the missing explicit checkpoint contract exists, restart/DB-clock/source-local transaction tests prove persistence; the processor has no static workflow data |
 | `inline_binary_is_bounded` | value-contract/server/native conformance | exact Section 9 JCS/base64url vectors prove 131,072/131,073 decoded-byte acceptance/rejection and 262,144/262,145 complete-value acceptance/rejection; 17 values, paths, URLs, and object references fail before I/O |
-| `revision_fingerprint_is_complete` | Spec 005-gated compiler/reconcile | origin, every step's binding/scope/retention/margin/horizon, operation/processor/credential versions, schemas, bounds, pagination/error plan, source records, and configuration change the pinned dependency; live-retired/reload tests pass |
+| `revision_fingerprint_is_complete` | Spec 005-gated compiler/reconcile | every complete `OperationSpec` version/hash/default/origin/processor/capability/provenance/fact binding plus per-step horizon, source records, and deployment configuration is pinned; any one-field change changes the dependency and live-retired/reload tests pass |
 | `upgrade_diff_is_semantic` | codegen snapshot | upgrade reports record/integrity/license, operation/type/effect, scopes, origin, request, pagination, errors, bounds, processors, tests, and notices; no retag auto-accept |
 | `workspace_build_is_offline` | clean network-disabled CI | `cargo build --workspace --release --offline --locked` succeeds without network; expected acquisition/codegen source and artifacts are separately inventoried and allowed in this proof |
 | `runtime_package_is_source_free` | runtime package/image CI | a separate locked offline `donat-server --bin donat` release build has a runtime-package dependency tree/SBOM; only that binary, package/image, and runtime closure are scanned and contain no acquisition/codegen/donor/SUL, Node, JS, WASM, npm, n8n, dynamic plugin, or unapproved processor runtime material |
@@ -1969,10 +2127,16 @@ The generated review report must diff:
 - provider API version and fixed origins;
 - credential fields, auth class, OAuth scopes, non-refreshing token acquisition
   behavior, and redactions;
-- operation/event IDs and versions, input/output hashes, request steps, and
-  idempotency;
-- pagination/error/trigger plans and every runtime bound;
-- processor/authenticator/codec/normalizer IDs and Rust diffs;
+- manifest schema epoch; connector/credential/operation/trigger/event stable
+  SemVer; runtime/value/canonical/source-record/classifier/generator epochs;
+- complete operation input/output contracts and hashes, resolved origins,
+  ordered request steps/transforms, stored selected-header capabilities,
+  mappings/defaults, effects/idempotency, pagination, complete error plan,
+  capacity/rate/serialization and every step/operation bound;
+- processor/authenticator/codec/normalizer IDs, implementation revisions, and
+  Rust diffs;
+- record/semantic/provenance/value-contract hashes, exact fact value/origin
+  bindings, and complete generated projection equality;
 - Donat tests, fixtures, and snapshots.
 
 Any protocol-visible or type-semantic change receives a new operation or
@@ -1980,6 +2144,10 @@ credential version. Removal is rejected while a non-terminal Process revision
 pins the dependency. Security response can retire new starts through
 deploy-time metadata, but it does not reinterpret history or silently swap the
 implementation under active work.
+
+A projection-schema change receives a new epoch/domain; it never mutates the
+meaning of a v1 hash. A pinned operation retains every field listed above, so
+the upgrade report cannot compare only IDs or current catalog summaries.
 
 Every generated diff and snapshot receives human review. Source records,
 reference register entries, and notices are updated in the same change. A
@@ -2062,6 +2230,10 @@ binary work independently reviewable.
 - `knowledgebase/declarative-saas/decisions/001-declarative-saas-runtime-and-porting-policy.md`
 - `knowledgebase/declarative-saas/decisions/002-durable-process-operational-contracts.md`
 - `knowledgebase/declarative-saas/decisions/009-durable-process-source-local-compilation-and-journal-contracts.md`
+- `knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md`
+- `knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities.md`
+- [RFC 8785 — JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785.html)
+- [RFC 7493 — The I-JSON Message Format](https://www.rfc-editor.org/rfc/rfc7493.html)
 - `crates/metadata/src/types.rs`
 - `crates/server/src/connectors/mod.rs`
 - `crates/server/src/connectors/http.rs`
