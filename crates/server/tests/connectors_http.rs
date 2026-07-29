@@ -74,6 +74,102 @@ fn registry_rejects_private_network_policy_in_deployment_metadata() {
     );
 }
 
+#[tokio::test]
+async fn declarative_registry_rejects_undeclared_job_transport_input_before_network() {
+    let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
+        "version": 3,
+        "sources": [],
+        "connectors": [{
+            "name": "logistics",
+            "module": "http",
+            "config": {
+                "endpoint_identity": "logistics_test",
+                "credential_identity": "logistics_test_credential",
+                "base_url": "https://provider.example.test"
+            },
+            "operations": [{
+                "name": "create_shipment",
+                "version": "v1",
+                "method": "POST",
+                "path": "/v1/shipments/{input.order_id}",
+                "body": { "order_id": { "input": "order_id" } },
+                "success_statuses": [200],
+                "idempotency": { "header": "Idempotency-Key" },
+                "capacity": {
+                    "max_in_flight": 8,
+                    "rate_limit": { "permits": 20, "per": "1s", "burst": 8 },
+                    "serialize_by": { "input": "order_id" }
+                }
+            }]
+        }]
+    }))
+    .expect("declarative operation metadata deserializes");
+    let registry = ConnectorRegistry::build(&metadata).expect("operation compiles at startup");
+
+    let failure = registry
+        .execute(
+            "logistics",
+            "create_shipment",
+            json!({
+                "order_id": "order-42",
+                "url": "https://attacker.invalid/override",
+                "method": "DELETE",
+                "headers": { "Authorization": "attacker" }
+            }),
+            "logical-activity-42",
+            context().deadline,
+        )
+        .await
+        .expect_err("a job may fill only the operation's named input bindings");
+
+    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
+    assert_eq!(failure.code, "connector_invariant");
+    assert!(
+        !failure.safe_message.contains("attacker.invalid"),
+        "rejection must not surface the caller-provided raw URL"
+    );
+}
+
+#[test]
+fn declarative_registry_rejects_a_serialization_key_outside_declared_input_bindings() {
+    let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
+        "version": 3,
+        "sources": [],
+        "connectors": [{
+            "name": "logistics",
+            "module": "http",
+            "config": {
+                "endpoint_identity": "logistics_test",
+                "credential_identity": "logistics_test_credential",
+                "base_url": "https://provider.example.test"
+            },
+            "operations": [{
+                "name": "create_shipment",
+                "version": "v1",
+                "method": "POST",
+                "path": "/v1/shipments/{input.order_id}",
+                "success_statuses": [200],
+                "idempotency": { "header": "Idempotency-Key" },
+                "capacity": {
+                    "max_in_flight": 8,
+                    "rate_limit": { "permits": 20, "per": "1s", "burst": 8 },
+                    "serialize_by": { "input": "not_a_declared_binding" }
+                }
+            }]
+        }]
+    }))
+    .expect("operation metadata deserializes before module validation");
+
+    let error = match ConnectorRegistry::build(&metadata) {
+        Ok(_) => panic!("serialize_by must name one declared scalar operation input"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("serialize_by"),
+        "startup identifies the invalid deploy-time serialization declaration: {error}"
+    );
+}
+
 fn public_connector(
     resolver: Arc<dyn HostResolver>,
     transport: Arc<dyn HttpTransport>,

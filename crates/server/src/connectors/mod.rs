@@ -64,6 +64,9 @@ impl ConnectorFailure {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectorSuccess {
     pub output: JsonValue,
+    /// SHA-256 of canonical JSON input, suitable for a future durable activity
+    /// journal. The raw input is not retained by the connector boundary.
+    pub request_fingerprint: String,
 }
 
 /// Activity data a connector may observe.  It intentionally omits database
@@ -105,7 +108,10 @@ const STRIPE_DEFINITION: ConnectorDefinition = ConnectorDefinition {
 };
 
 enum RegistryInstance {
-    Http(Box<http::HttpConnector>),
+    Http {
+        connector: Box<http::HttpConnector>,
+        operations: BTreeMap<String, http::ValidatedHttpOperation>,
+    },
     /// Stripe is deliberately only a compiled identity in this slice.  Its
     /// narrow protocol implementation arrives in Task 4, not as a fallback
     /// arbitrary HTTP client.
@@ -132,14 +138,37 @@ impl ConnectorRegistry {
         let mut instances = BTreeMap::new();
         for instance in &metadata.connectors {
             let registered = match instance.module.as_str() {
-                "http" => RegistryInstance::Http(Box::new(
-                    http::HttpConnector::from_metadata_config(&instance.config).map_err(
-                        |error| ConnectorRegistryError::InvalidConfiguration {
+                "http" => {
+                    let connector = http::HttpConnector::from_metadata_config(&instance.config)
+                        .map_err(|error| ConnectorRegistryError::InvalidConfiguration {
                             instance: instance.name.clone(),
                             message: error.to_string(),
-                        },
-                    )?,
-                )),
+                        })?;
+                    let mut operations = BTreeMap::new();
+                    for operation in &instance.operations {
+                        let compiled = http::ValidatedHttpOperation::from_metadata(operation)
+                            .map_err(|error| ConnectorRegistryError::InvalidConfiguration {
+                                instance: instance.name.clone(),
+                                message: error.to_string(),
+                            })?;
+                        if operations
+                            .insert(operation.name.clone(), compiled)
+                            .is_some()
+                        {
+                            return Err(ConnectorRegistryError::InvalidConfiguration {
+                                instance: instance.name.clone(),
+                                message: format!(
+                                    "connector operation `{}` is declared more than once",
+                                    operation.name
+                                ),
+                            });
+                        }
+                    }
+                    RegistryInstance::Http {
+                        connector: Box::new(connector),
+                        operations,
+                    }
+                }
                 "stripe" => RegistryInstance::Stripe,
                 // Keep this defensive branch even though Task 1's static
                 // validator rejects it first: no dynamic fallback exists.
@@ -165,8 +194,51 @@ impl ConnectorRegistry {
 
     pub fn http_instance(&self, name: &str) -> Option<&http::HttpConnector> {
         match self.instances.get(name) {
-            Some(RegistryInstance::Http(connector)) => Some(connector),
+            Some(RegistryInstance::Http { connector, .. }) => Some(connector),
             Some(RegistryInstance::Stripe) | None => None,
+        }
+    }
+
+    /// Execute only a named operation compiled from deployed metadata. This
+    /// deliberately accepts neither a raw URL/method/header nor a caller-owned
+    /// HTTP client. The future process worker supplies the stable idempotency
+    /// key after acquiring its durable capacity reservation.
+    pub async fn execute(
+        &self,
+        instance: &str,
+        operation: &str,
+        input: JsonValue,
+        idempotency_key: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConnectorSuccess, ConnectorFailure> {
+        let Some(instance) = self.instances.get(instance) else {
+            return Err(ConnectorFailure::new(
+                ConnectorErrorClass::Invariant,
+                "connector_invariant",
+                "connector instance is not declared",
+            ));
+        };
+        match instance {
+            RegistryInstance::Http {
+                connector,
+                operations,
+            } => {
+                let Some(operation) = operations.get(operation) else {
+                    return Err(ConnectorFailure::new(
+                        ConnectorErrorClass::Invariant,
+                        "connector_invariant",
+                        "connector operation is not declared",
+                    ));
+                };
+                connector
+                    .execute_validated(operation, input, idempotency_key, deadline)
+                    .await
+            }
+            RegistryInstance::Stripe => Err(ConnectorFailure::new(
+                ConnectorErrorClass::Invariant,
+                "connector_invariant",
+                "connector module has no implemented operation",
+            )),
         }
     }
 }

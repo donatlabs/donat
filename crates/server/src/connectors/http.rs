@@ -4,13 +4,13 @@
 //! declared slots.  There is intentionally no API accepting a caller-supplied
 //! URL, method, header name, redirect policy, or TLS policy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use donat_metadata::{ConnectorBaseUrl, ConnectorConfig};
+use donat_metadata::{ConnectorBaseUrl, ConnectorConfig, ConnectorOperation};
 use futures_util::{StreamExt, future::BoxFuture};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{
@@ -18,6 +18,7 @@ use reqwest::{
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
@@ -221,6 +222,7 @@ pub struct HttpOperation {
     success_statuses: BTreeSet<u16>,
     response_pointers: Vec<ResponsePointer>,
     declared_5xx: BTreeSet<u16>,
+    idempotency_header: Option<HeaderName>,
 }
 
 pub struct HttpOperationBuilder {
@@ -233,6 +235,7 @@ pub struct HttpOperationBuilder {
     success_statuses: BTreeSet<u16>,
     response_pointers: Vec<ResponsePointer>,
     declared_5xx: BTreeSet<u16>,
+    idempotency_header: Option<String>,
 }
 
 impl HttpOperation {
@@ -247,6 +250,7 @@ impl HttpOperation {
             success_statuses: BTreeSet::new(),
             response_pointers: Vec::new(),
             declared_5xx: BTreeSet::new(),
+            idempotency_header: None,
         }
     }
 }
@@ -284,6 +288,11 @@ impl HttpOperationBuilder {
 
     pub fn declared_5xx(mut self, statuses: impl IntoIterator<Item = StatusCode>) -> Self {
         self.declared_5xx = statuses.into_iter().map(|status| status.as_u16()).collect();
+        self
+    }
+
+    pub fn idempotency_header(mut self, name: &str) -> Self {
+        self.idempotency_header = Some(name.to_owned());
         self
     }
 
@@ -333,6 +342,13 @@ impl HttpOperationBuilder {
                 })
             })
             .collect::<Result<Vec<_>, HttpConfigError>>()?;
+        let idempotency_header = self
+            .idempotency_header
+            .map(|name| {
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| HttpConfigError::new("idempotency header name is invalid"))
+            })
+            .transpose()?;
         Ok(HttpOperation {
             _name: self.name,
             method: self.method,
@@ -343,8 +359,242 @@ impl HttpOperationBuilder {
             success_statuses: self.success_statuses,
             response_pointers: self.response_pointers,
             declared_5xx: self.declared_5xx,
+            idempotency_header,
         })
     }
+}
+
+/// An HTTP operation compiled from typed deploy-time metadata. It retains the
+/// static request shape and the exact set of allowed job input names.
+#[derive(Debug, Clone)]
+pub struct ValidatedHttpOperation {
+    operation: HttpOperation,
+    declared_inputs: BTreeSet<String>,
+    serialize_by: Option<String>,
+}
+
+impl ValidatedHttpOperation {
+    pub fn from_metadata(operation: &ConnectorOperation) -> Result<Self, HttpConfigError> {
+        let http = operation.http().ok_or_else(|| {
+            HttpConfigError::new("http connector operations must declare an HTTP operation profile")
+        })?;
+        if http.version.is_empty() {
+            return Err(HttpConfigError::new(
+                "connector operation version is required",
+            ));
+        }
+        let method = parse_method(&http.method)?;
+        let mut declared_inputs = path_input_names(&http.path)?;
+        let mut builder = HttpOperation::builder(&operation.name, method, &http.path);
+        for (name, binding) in &http.query {
+            validate_input_name(&binding.input)?;
+            declared_inputs.insert(binding.input.clone());
+            builder = builder.query_input(name, &binding.input);
+        }
+        for header in &http.headers {
+            builder = builder.static_header(&header.name, &header.value);
+        }
+        if let Some(body) = &http.body {
+            let template = json_template_from_metadata(body, &mut declared_inputs)?;
+            builder = builder.body(template);
+        }
+        let statuses = http
+            .success_statuses
+            .iter()
+            .copied()
+            .map(|status| {
+                StatusCode::from_u16(status).map_err(|_| {
+                    HttpConfigError::new("success statuses must be valid HTTP statuses")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder = builder.success_statuses(statuses);
+        for (name, response) in &http.response {
+            builder = builder.response_pointer(
+                name,
+                &response.json_pointer,
+                response.type_.ends_with('!'),
+            );
+        }
+        let declared_5xx = http
+            .error_classification
+            .http_5xx
+            .iter()
+            .copied()
+            .map(|status| {
+                StatusCode::from_u16(status).map_err(|_| {
+                    HttpConfigError::new("http_5xx statuses must be valid HTTP statuses")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder = builder.declared_5xx(declared_5xx);
+        if let Some(idempotency) = &http.idempotency {
+            builder = builder.idempotency_header(&idempotency.header);
+        }
+        let capacity = operation.capacity().ok_or_else(|| {
+            HttpConfigError::new("capacity is required for every connector operation")
+        })?;
+        if capacity.max_in_flight == 0
+            || capacity.rate_limit.permits == 0
+            || capacity.rate_limit.burst == 0
+            || !valid_rate_period(&capacity.rate_limit.per)
+        {
+            return Err(HttpConfigError::new(
+                "connector operation capacity is invalid",
+            ));
+        }
+        let serialize_by = capacity
+            .serialize_by
+            .as_ref()
+            .map(|binding| {
+                validate_input_name(&binding.input)?;
+                if !declared_inputs.contains(&binding.input) {
+                    return Err(HttpConfigError::new(
+                        "capacity serialize_by must name a declared operation input",
+                    ));
+                }
+                Ok(binding.input.clone())
+            })
+            .transpose()?;
+        Ok(Self {
+            operation: builder.build()?,
+            declared_inputs,
+            serialize_by,
+        })
+    }
+
+    fn validate_dispatch_input(&self, input: &JsonValue) -> Result<(), ConnectorFailure> {
+        let JsonValue::Object(input) = input else {
+            return Err(invariant_failure(
+                "connector operation input must be an object",
+            ));
+        };
+        if input
+            .keys()
+            .any(|name| !self.declared_inputs.contains(name))
+        {
+            return Err(invariant_failure(
+                "connector operation input contains an undeclared value",
+            ));
+        }
+        if self
+            .declared_inputs
+            .iter()
+            .any(|name| !input.contains_key(name))
+        {
+            return Err(invariant_failure(
+                "a declared connector input value is missing",
+            ));
+        }
+        if let Some(name) = &self.serialize_by {
+            scalar_input(&JsonValue::Object(input.clone()), name)?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_method(method: &str) -> Result<HttpMethod, HttpConfigError> {
+    match method {
+        "GET" => Ok(HttpMethod::Get),
+        "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
+        "PATCH" => Ok(HttpMethod::Patch),
+        "DELETE" => Ok(HttpMethod::Delete),
+        _ => Err(HttpConfigError::new(
+            "method must be one of GET, POST, PUT, PATCH, or DELETE",
+        )),
+    }
+}
+
+fn validate_input_name(name: &str) -> Result<(), HttpConfigError> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return Err(HttpConfigError::new("connector input binding is invalid"));
+    }
+    Ok(())
+}
+
+fn path_input_names(path: &str) -> Result<BTreeSet<String>, HttpConfigError> {
+    validate_path_template(path)?;
+    let mut inputs = BTreeSet::new();
+    let mut remaining = path;
+    while let Some(index) = remaining.find("{input.") {
+        let after = &remaining[index + "{input.".len()..];
+        let end = after
+            .find('}')
+            .expect("validated path template has a closed input binding");
+        let name = &after[..end];
+        validate_input_name(name)?;
+        inputs.insert(name.to_owned());
+        remaining = &after[end + 1..];
+    }
+    Ok(inputs)
+}
+
+fn json_template_from_metadata(
+    value: &JsonValue,
+    inputs: &mut BTreeSet<String>,
+) -> Result<JsonTemplate, HttpConfigError> {
+    match value {
+        JsonValue::Object(fields) if fields.len() == 1 && fields.contains_key("input") => {
+            let Some(JsonValue::String(name)) = fields.get("input") else {
+                return Err(HttpConfigError::new(
+                    "body input binding must name an input",
+                ));
+            };
+            validate_input_name(name)?;
+            inputs.insert(name.clone());
+            Ok(JsonTemplate::Input(name.clone()))
+        }
+        JsonValue::Object(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                json_template_from_metadata(value, inputs).map(|value| (name.clone(), value))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonTemplate::Object),
+        JsonValue::Array(values) => values
+            .iter()
+            .map(|value| json_template_from_metadata(value, inputs))
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonTemplate::Array),
+        value => Ok(JsonTemplate::Literal(value.clone())),
+    }
+}
+
+fn valid_rate_period(value: &str) -> bool {
+    let Some(unit) = value.chars().last() else {
+        return false;
+    };
+    matches!(unit, 's' | 'm' | 'h')
+        && value
+            .strip_suffix(unit)
+            .and_then(|number| number.parse::<u64>().ok())
+            .is_some_and(|number| number > 0)
+}
+
+fn canonical_input_fingerprint(input: &JsonValue) -> String {
+    fn canonical(value: &JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Object(object) => BTreeMap::from_iter(
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical(value))),
+            )
+            .into_iter()
+            .collect::<JsonMap<String, JsonValue>>()
+            .into(),
+            JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonical).collect()),
+            value => value.clone(),
+        }
+    }
+
+    let canonical = serde_json::to_vec(&canonical(input))
+        .expect("canonical connector input JSON always serializes");
+    format!("{:x}", Sha256::digest(canonical))
 }
 
 /// A DNS resolver seam.  Production uses [`SystemResolver`]; tests use a
@@ -654,6 +904,45 @@ impl HttpConnector {
         input: JsonValue,
         context: ExecutionContext,
     ) -> Result<ConnectorSuccess, ConnectorFailure> {
+        let fingerprint = canonical_input_fingerprint(&input);
+        let mut success = self
+            .execute_internal(operation, input, None, context)
+            .await?;
+        success.request_fingerprint = fingerprint;
+        Ok(success)
+    }
+
+    pub(crate) async fn execute_validated(
+        &self,
+        operation: &ValidatedHttpOperation,
+        input: JsonValue,
+        idempotency_key: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConnectorSuccess, ConnectorFailure> {
+        // Validate the job boundary before DNS or template rendering. A caller
+        // therefore cannot smuggle raw transport controls into an operation
+        // whose request shape was fixed at deployment time.
+        operation.validate_dispatch_input(&input)?;
+        let fingerprint = canonical_input_fingerprint(&input);
+        let mut success = self
+            .execute_internal(
+                &operation.operation,
+                input,
+                Some(idempotency_key),
+                ExecutionContext::with_deadline(deadline),
+            )
+            .await?;
+        success.request_fingerprint = fingerprint;
+        Ok(success)
+    }
+
+    async fn execute_internal(
+        &self,
+        operation: &HttpOperation,
+        input: JsonValue,
+        idempotency_key: Option<&str>,
+        context: ExecutionContext,
+    ) -> Result<ConnectorSuccess, ConnectorFailure> {
         if context.deadline <= tokio::time::Instant::now() {
             return Err(timeout_failure());
         }
@@ -661,7 +950,7 @@ impl HttpConnector {
         // templates.  This keeps untrusted input out of a request whose
         // declared destination is already disallowed.
         self.resolve_under_deadline(context.deadline).await?;
-        let request = self.prepare_request(operation, &input)?;
+        let request = self.prepare_request(operation, &input, idempotency_key)?;
         if request.body.len() > MAX_HTTP_BODY_BYTES {
             return Err(invariant_failure(
                 "connector request exceeds the 1 MiB limit",
@@ -746,6 +1035,7 @@ impl HttpConnector {
         &self,
         operation: &HttpOperation,
         input: &JsonValue,
+        idempotency_key: Option<&str>,
     ) -> Result<PreparedHttpRequest, ConnectorFailure> {
         let path = render_path(&operation.path_template, input)?;
         let mut url = self.config.base_url.clone();
@@ -771,6 +1061,14 @@ impl HttpConnector {
         let mut headers = self.config.headers.clone();
         for header in &operation.headers {
             headers.insert(header.name.clone(), header.value.clone());
+        }
+        if let Some(name) = &operation.idempotency_header {
+            let key = idempotency_key.ok_or_else(|| {
+                invariant_failure("connector operation requires a stable idempotency key")
+            })?;
+            let value = HeaderValue::from_str(key)
+                .map_err(|_| invariant_failure("connector activity idempotency key is invalid"))?;
+            headers.insert(name.clone(), value);
         }
         let body = operation
             .body
@@ -836,7 +1134,10 @@ impl HttpConnector {
         let value: JsonValue = serde_json::from_slice(&response.body)
             .map_err(|_| validation_failure("connector provider returned malformed JSON"))?;
         if operation.response_pointers.is_empty() {
-            return Ok(ConnectorSuccess { output: value });
+            return Ok(ConnectorSuccess {
+                output: value,
+                request_fingerprint: String::new(),
+            });
         }
         let mut output = JsonMap::new();
         for field in &operation.response_pointers {
@@ -854,6 +1155,7 @@ impl HttpConnector {
         }
         Ok(ConnectorSuccess {
             output: JsonValue::Object(output),
+            request_fingerprint: String::new(),
         })
     }
 }
@@ -1108,6 +1410,116 @@ mod tests {
             .success_statuses([StatusCode::OK])
             .build()
             .expect("static operation declaration is valid")
+    }
+
+    fn declared_operation(path: &str, body: JsonValue) -> ValidatedHttpOperation {
+        let operation: ConnectorOperation = serde_json::from_value(json!({
+            "name": "create_shipment",
+            "version": "v1",
+            "method": "POST",
+            "path": path,
+            "body": body,
+            "success_statuses": [200],
+            "idempotency": { "header": "Idempotency-Key" },
+            "capacity": {
+                "max_in_flight": 1,
+                "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+            }
+        }))
+        .expect("declarative operation metadata deserializes");
+        ValidatedHttpOperation::from_metadata(&operation)
+            .expect("declarative operation compiles before execution")
+    }
+
+    #[tokio::test]
+    async fn declared_idempotency_header_uses_the_stable_logical_activity_key_and_canonical_input_fingerprint()
+     {
+        async fn record(headers: HeaderMap) -> Json<JsonValue> {
+            Json(json!({
+                "idempotency_key": headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok()),
+            }))
+        }
+
+        let server = LocalServer::start(Router::new().fallback(post(record))).await;
+        let operation = declared_operation(
+            "/v1/orders/{input.order_id}",
+            json!({
+                "order_id": { "input": "order_id" },
+                "address": { "input": "address" }
+            }),
+        );
+
+        let connector = local_connector(&server.base_url);
+        let result = connector
+            .execute_validated(
+                &operation,
+                json!({ "order_id": "order-42", "address": "first street" }),
+                "logical-activity-42",
+                context().deadline,
+            )
+            .await
+            .expect("declared operation succeeds");
+
+        assert_eq!(
+            result.output,
+            json!({ "idempotency_key": "logical-activity-42" }),
+            "the deployed header receives the stable activity key, not a job input value"
+        );
+
+        let reordered = connector
+            .execute_validated(
+                &operation,
+                json!({ "address": "first street", "order_id": "order-42" }),
+                "logical-activity-42",
+                context().deadline,
+            )
+            .await
+            .expect("the same declared input values remain executable in a different JSON order");
+        assert_eq!(
+            result.request_fingerprint, reordered.request_fingerprint,
+            "request fingerprints use canonical JSON rather than object insertion order"
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_optional_response_binding_does_not_require_an_absent_provider_field() {
+        async fn response() -> Json<JsonValue> {
+            Json(json!({ "id": "ship_123" }))
+        }
+
+        let server = LocalServer::start(Router::new().route("/shipment", post(response))).await;
+        let operation: ConnectorOperation = serde_json::from_value(json!({
+            "name": "read_shipment",
+            "version": "v1",
+            "method": "POST",
+            "path": "/shipment",
+            "success_statuses": [200],
+            "idempotency": { "header": "Idempotency-Key" },
+            "response": {
+                "tracking_url": { "json_pointer": "/tracking_url", "type": "string" }
+            },
+            "capacity": {
+                "max_in_flight": 1,
+                "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+            }
+        }))
+        .expect("optional response declaration deserializes");
+        let operation = ValidatedHttpOperation::from_metadata(&operation)
+            .expect("optional response declaration compiles");
+
+        let result = local_connector(&server.base_url)
+            .execute_validated(
+                &operation,
+                json!({}),
+                "logical-activity-optional-response",
+                context().deadline,
+            )
+            .await
+            .expect("an optional provider field may be absent");
+
+        assert_eq!(result.output, json!({}));
     }
 
     #[tokio::test]

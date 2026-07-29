@@ -9,6 +9,13 @@ config:
       value_from_env: LOGISTICS_TOKEN
 operations:
   - name: create_shipment
+    version: v1
+    method: POST
+    path: /v1/shipments/{input.order_id}
+    body:
+      order_id: { input: order_id }
+    success_statuses: [200, 201]
+    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 20, per: 1s, burst: 8 }

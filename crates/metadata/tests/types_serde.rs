@@ -969,6 +969,13 @@ fn connectors_deserialize_secret_references_and_named_operation_capacity() {
         value_from_env: LOGISTICS_TOKEN
   operations:
     - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      body:
+        order_id: { input: order_id }
+      success_statuses: [200, 201]
+      idempotency: { header: Idempotency-Key }
       capacity:
         max_in_flight: 8
         rate_limit: { permits: 20, per: 1s, burst: 8 }
@@ -1024,6 +1031,101 @@ fn connectors_deserialize_secret_references_and_named_operation_capacity() {
     assert!(
         literal_secret.to_string().contains("secret_key"),
         "literal secrets must fail at the secret field: {literal_secret}"
+    );
+}
+
+#[test]
+fn http_connector_operations_deserialize_only_declared_dynamic_bindings() {
+    // This fails if a job can later choose a URL, method, or header name
+    // instead of filling only the named value slots deployed with the operation.
+    let connectors: Vec<ConnectorInstance> = serde_yaml::from_str(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+  operations:
+    - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      query:
+        shipment_kind: { input: shipment_kind }
+      headers:
+        - name: X-Request-Source
+          value: donat
+      body:
+        order_id: { input: order_id }
+        address: { input: address }
+      success_statuses: [200, 201]
+      response:
+        shipment_id: { json_pointer: /id, type: string! }
+      idempotency: { header: Idempotency-Key }
+      error_classification:
+        http_5xx: [500, 503]
+      capacity:
+        max_in_flight: 8
+        rate_limit: { permits: 20, per: 1s, burst: 8 }
+        serialize_by: { input: order_id }
+"#,
+    )
+    .expect("a deployed HTTP operation has only static request shape and named bindings");
+
+    let http = connectors[0].operations[0]
+        .http()
+        .expect("the HTTP module receives a typed HTTP operation");
+    assert_eq!(http.version, "v1");
+    assert_eq!(http.method, "POST");
+    assert_eq!(http.path, "/v1/shipments/{input.order_id}");
+    assert_eq!(http.query["shipment_kind"].input, "shipment_kind");
+    assert_eq!(
+        http.idempotency
+            .as_ref()
+            .expect("declared idempotency is retained")
+            .header,
+        "Idempotency-Key"
+    );
+    assert_eq!(
+        connectors[0].operations[0]
+            .capacity()
+            .expect("worker capacity remains deploy-time metadata")
+            .serialize_by
+            .as_ref()
+            .expect("same-resource serialization remains declared")
+            .input,
+        "order_id"
+    );
+}
+
+#[test]
+fn http_connector_operations_reject_raw_request_transport_fields() {
+    let error = serde_yaml::from_str::<Vec<ConnectorInstance>>(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+  operations:
+    - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      success_statuses: [200]
+      capacity:
+        max_in_flight: 1
+        rate_limit: { permits: 1, per: 1s, burst: 1 }
+      url: https://attacker.invalid/override
+"#,
+    )
+    .expect_err("operation metadata cannot introduce a raw arbitrary request URL");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "the unsafe raw transport field is rejected during metadata loading"
     );
 }
 

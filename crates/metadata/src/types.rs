@@ -126,15 +126,118 @@ pub struct ConnectorHeader {
     pub value_from_env: String,
 }
 
-/// An enabled, named connector operation. Task 1 keeps the declaration
-/// deliberately small; Task 3 adds module-specific request and response
-/// templates without making caller input capable of selecting transport data.
+/// An enabled, named connector operation. The common identity and worker-owned
+/// capacity policy are kept beside a closed module operation profile. Runtime
+/// input can fill only the explicit `{ input: name }` values inside that
+/// profile; it can never select a raw transport request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConnectorOperation {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<ConnectorCapacity>,
+    #[serde(flatten)]
+    pub profile: ConnectorOperationProfile,
+}
+
+impl ConnectorOperation {
+    pub fn capacity(&self) -> Option<&ConnectorCapacity> {
+        self.capacity.as_ref()
+    }
+
+    pub fn http(&self) -> Option<&HttpConnectorOperation> {
+        match &self.profile {
+            ConnectorOperationProfile::Http(operation) => Some(operation),
+            ConnectorOperationProfile::Undeclared(_) => None,
+        }
+    }
+}
+
+/// Closed module operation profiles. `Undeclared` preserves the metadata
+/// shape accepted before a module implements its operation contract; compiled
+/// registry admission rejects it for an HTTP connector.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ConnectorOperationProfile {
+    Http(Box<HttpConnectorOperation>),
+    Undeclared(UndeclaredConnectorOperation),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndeclaredConnectorOperation {}
+
+/// The static request/response contract of one declarative HTTP operation.
+/// There is deliberately no URL, authority, dynamic method, or dynamic header
+/// key field in this type.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConnectorOperation {
+    pub version: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query: BTreeMap<String, ConnectorInputBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ConnectorStaticHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub success_statuses: Vec<u16>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response: BTreeMap<String, ConnectorResponseBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<ConnectorIdempotency>,
+    #[serde(
+        default,
+        skip_serializing_if = "ConnectorHttpErrorClassification::is_empty"
+    )]
+    pub error_classification: ConnectorHttpErrorClassification,
+}
+
+/// A named JSON input slot in an operation template.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorInputBinding {
+    pub input: String,
+}
+
+/// A deployed static request header. Credentials remain on the instance
+/// configuration path and are resolved from named environment variables.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorStaticHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// A declared response field selected from a provider JSON response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorResponseBinding {
+    pub json_pointer: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+}
+
+/// A provider idempotency header selected by metadata. The header name is
+/// static; its value is supplied only from the stable logical activity key.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorIdempotency {
+    pub header: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorHttpErrorClassification {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_5xx: Vec<u16>,
+}
+
+impl ConnectorHttpErrorClassification {
+    pub fn is_empty(&self) -> bool {
+        self.http_5xx.is_empty()
+    }
 }
 
 /// Shared operation limits enforced by the future process worker, not a
