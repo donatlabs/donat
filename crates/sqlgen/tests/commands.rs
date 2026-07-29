@@ -575,6 +575,317 @@ fn command_assertion_rejection_does_not_reach_later_dml_trigger() {
 }
 
 #[test]
+fn command_required_update_rejection_does_not_reach_later_dml_trigger() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!(
+        "command_sqlgen_required_update_trigger_{}",
+        std::process::id()
+    );
+    let function_name = format!(
+        "command_sqlgen_required_update_trigger_fn_{}",
+        std::process::id()
+    );
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        r#"
+        CREATE TABLE "public"."{table_name}" (id uuid PRIMARY KEY, status text NOT NULL);
+        CREATE FUNCTION "public"."{function_name}"() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'required update trigger must not run' USING ERRCODE = 'P0G01';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER "before_insert" BEFORE INSERT ON "public"."{table_name}"
+        FOR EACH ROW EXECUTE FUNCTION "public"."{function_name}"();
+        "#
+    ))
+    .expect("create required-update trigger-sensitive command target");
+
+    let command = root(CommandMutation {
+        name: "required_update_trigger_command".to_owned(),
+        steps: vec![
+            CommandExecutionStep::Update {
+                name: "missing_order".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table(&table_name),
+                predicate: vec![assignment(
+                    "id",
+                    "uuid",
+                    json!("550e8400-e29b-41d4-a716-446655440000"),
+                )],
+                set: vec![assignment("status", "text", json!("approved"))],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                require_affected: true,
+                filter: None,
+                check: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+            CommandExecutionStep::Insert {
+                name: "later_order".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table(&table_name),
+                object: vec![
+                    assignment("id", "uuid", json!("550e8400-e29b-41d4-a716-446655440001")),
+                    assignment("status", "text", json!("draft")),
+                ],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                check: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "status".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_1".to_owned(),
+                column: column("status", "text"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "status".to_owned(),
+            field: "status".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    assert!(
+        sql.contains("\"_cmd_required_gate_0\" AS MATERIALIZED"),
+        "a required update must materialize its success gate: {sql}"
+    );
+    let later_step_sql = sql
+        .split("\"_cmd_step_1\" AS")
+        .nth(1)
+        .and_then(|tail| tail.split(" RETURNING *").next())
+        .expect("rendered SQL contains the later insert CTE");
+    assert!(
+        later_step_sql.contains("\"_cmd_required_gate_0\""),
+        "later DML must explicitly depend on the required update gate: {sql}"
+    );
+    let error = tx
+        .execute(&sql, &[])
+        .expect_err("a missing required update row must reject before later DML runs");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("P0D01"),
+        "a trigger error proves the later insert was reached: {error:?}"
+    );
+
+    tx.rollback()
+        .expect("remove the isolated required-update trigger-sensitive target");
+}
+
+#[test]
+fn command_required_select_rejection_does_not_reach_later_dml_trigger() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!(
+        "command_sqlgen_required_select_trigger_{}",
+        std::process::id()
+    );
+    let function_name = format!(
+        "command_sqlgen_required_select_trigger_fn_{}",
+        std::process::id()
+    );
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        r#"
+        CREATE TABLE "public"."{table_name}" (id uuid PRIMARY KEY, status text NOT NULL);
+        CREATE FUNCTION "public"."{function_name}"() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'required select trigger must not run' USING ERRCODE = 'P0G01';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER "before_insert" BEFORE INSERT ON "public"."{table_name}"
+        FOR EACH ROW EXECUTE FUNCTION "public"."{function_name}"();
+        "#
+    ))
+    .expect("create required-select trigger-sensitive command target");
+
+    let command = root(CommandMutation {
+        name: "required_select_trigger_command".to_owned(),
+        steps: vec![
+            CommandExecutionStep::SelectOne {
+                name: "missing_order".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table(&table_name),
+                by: vec![assignment(
+                    "id",
+                    "uuid",
+                    json!("550e8400-e29b-41d4-a716-446655440000"),
+                )],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                require_found: true,
+                filter: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+            CommandExecutionStep::Insert {
+                name: "later_order".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table(&table_name),
+                object: vec![
+                    assignment("id", "uuid", json!("550e8400-e29b-41d4-a716-446655440001")),
+                    assignment("status", "text", json!("draft")),
+                ],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                check: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "status".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_1".to_owned(),
+                column: column("status", "text"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "status".to_owned(),
+            field: "status".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    assert!(
+        sql.contains("\"_cmd_required_gate_0\" AS MATERIALIZED"),
+        "a required select must materialize its success gate: {sql}"
+    );
+    let later_step_sql = sql
+        .split("\"_cmd_step_1\" AS")
+        .nth(1)
+        .and_then(|tail| tail.split(" RETURNING *").next())
+        .expect("rendered SQL contains the later insert CTE");
+    assert!(
+        later_step_sql.contains("\"_cmd_required_gate_0\""),
+        "later DML must explicitly depend on the required select gate: {sql}"
+    );
+    let error = tx
+        .execute(&sql, &[])
+        .expect_err("a missing required select row must reject before later DML runs");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("P0D01"),
+        "a trigger error proves the later insert was reached: {error:?}"
+    );
+
+    tx.rollback()
+        .expect("remove the isolated required-select trigger-sensitive target");
+}
+
+#[test]
+fn command_required_delete_rejection_does_not_reach_later_dml_trigger() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!(
+        "command_sqlgen_required_delete_trigger_{}",
+        std::process::id()
+    );
+    let function_name = format!(
+        "command_sqlgen_required_delete_trigger_fn_{}",
+        std::process::id()
+    );
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        r#"
+        CREATE TABLE "public"."{table_name}" (id uuid PRIMARY KEY, status text NOT NULL);
+        CREATE FUNCTION "public"."{function_name}"() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'required delete trigger must not run' USING ERRCODE = 'P0G01';
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER "before_insert" BEFORE INSERT ON "public"."{table_name}"
+        FOR EACH ROW EXECUTE FUNCTION "public"."{function_name}"();
+        "#
+    ))
+    .expect("create required-delete trigger-sensitive command target");
+
+    let command = root(CommandMutation {
+        name: "required_delete_trigger_command".to_owned(),
+        steps: vec![
+            CommandExecutionStep::Delete {
+                name: "missing_order".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table(&table_name),
+                predicate: vec![assignment(
+                    "id",
+                    "uuid",
+                    json!("550e8400-e29b-41d4-a716-446655440000"),
+                )],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                require_affected: true,
+                filter: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+            CommandExecutionStep::Insert {
+                name: "later_order".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table(&table_name),
+                object: vec![
+                    assignment("id", "uuid", json!("550e8400-e29b-41d4-a716-446655440001")),
+                    assignment("status", "text", json!("draft")),
+                ],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                check: None,
+                error_path: "$.selectionSet.advance_order".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "status".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_1".to_owned(),
+                column: column("status", "text"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "status".to_owned(),
+            field: "status".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    assert!(
+        sql.contains("\"_cmd_required_gate_0\" AS MATERIALIZED"),
+        "a required delete must materialize its success gate: {sql}"
+    );
+    let later_step_sql = sql
+        .split("\"_cmd_step_1\" AS")
+        .nth(1)
+        .and_then(|tail| tail.split(" RETURNING *").next())
+        .expect("rendered SQL contains the later insert CTE");
+    assert!(
+        later_step_sql.contains("\"_cmd_required_gate_0\""),
+        "later DML must explicitly depend on the required delete gate: {sql}"
+    );
+    let error = tx
+        .execute(&sql, &[])
+        .expect_err("a missing required delete row must reject before later DML runs");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("P0D01"),
+        "a trigger error proves the later insert was reached: {error:?}"
+    );
+
+    tx.rollback()
+        .expect("remove the isolated required-delete trigger-sensitive target");
+}
+
+#[test]
 fn command_reclaims_expired_claim_and_replaces_expired_canonical_result() {
     let _catalog_lock = command_catalog_test_lock();
     let table_name = format!("command_sqlgen_expiry_{}", std::process::id());

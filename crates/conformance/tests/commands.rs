@@ -189,6 +189,256 @@ fn create_order_lines_table(database_url: &str) {
         .expect("create order_lines table");
 }
 
+fn multi_relation_command_metadata() -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                }
+            },
+            "tables": [{
+                "table": { "schema": "public", "name": "orders" },
+                "select_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }, {
+                "table": { "schema": "public", "name": "order_lines" },
+                "select_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }]
+        }],
+        "commands": [{
+            "name": "create_order_with_line",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "order_id", "type": "uuid!" },
+                { "name": "line_id", "type": "uuid!" },
+                { "name": "customer_id", "type": "uuid!" },
+                { "name": "quantity", "type": "Int!" }
+            ],
+            "steps": [{
+                "name": "order",
+                "insert": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "object": {
+                        "id": { "arg": "order_id" },
+                        "customer_id": { "arg": "customer_id" },
+                        "status": { "literal": "draft" },
+                        "quantity": { "arg": "quantity" }
+                    },
+                    "returning": ["id", "status"]
+                }
+            }, {
+                "name": "line",
+                "insert": {
+                    "table": { "schema": "public", "name": "order_lines" },
+                    "object": {
+                        "id": { "arg": "line_id" },
+                        "order_id": { "step": "order", "column": "id" },
+                        "quantity": { "arg": "quantity" }
+                    },
+                    "returning": ["id", "order_id", "quantity"]
+                }
+            }],
+            "result": {
+                "order_id": { "step": "order", "column": "id" },
+                "line_id": { "step": "line", "column": "id" },
+                "quantity": { "step": "line", "column": "quantity" }
+            }
+        }]
+    }))
+    .expect("multi-relation command metadata deserializes")
+}
+
+fn create_multi_relation_tables(database_url: &str) {
+    let mut client = postgres::Client::connect(database_url, NoTls)
+        .expect("connect to the multi-relation command suite database");
+    client
+        .batch_execute(
+            "CREATE TABLE public.orders (\
+                id uuid PRIMARY KEY,\
+                customer_id uuid NOT NULL,\
+                status text NOT NULL,\
+                quantity integer NOT NULL\
+             );\
+             CREATE TABLE public.order_lines (\
+                id uuid PRIMARY KEY,\
+                order_id uuid NOT NULL,\
+                quantity integer NOT NULL\
+             )",
+        )
+        .expect("create multi-relation command tables");
+}
+
+fn required_row_command_metadata() -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                }
+            },
+            "tables": [{
+                "table": { "schema": "public", "name": "orders" },
+                "select_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "update_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {}, "check": {} }
+                }],
+                "delete_permissions": [{
+                    "role": "customer",
+                    "permission": { "filter": {} }
+                }]
+            }, {
+                "table": { "schema": "public", "name": "command_later_writes" },
+                "select_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "filter": {} }
+                }],
+                "insert_permissions": [{
+                    "role": "customer",
+                    "permission": { "columns": "*", "check": {} }
+                }]
+            }]
+        }],
+        "commands": [{
+            "name": "select_order_then_write",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "order_id", "type": "uuid!" },
+                { "name": "later_id", "type": "uuid!" }
+            ],
+            "steps": [{
+                "name": "required_order",
+                "select_one": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "by": { "id": { "arg": "order_id" } },
+                    "returning": ["id"]
+                }
+            }, {
+                "name": "later_write",
+                "insert": {
+                    "table": { "schema": "public", "name": "command_later_writes" },
+                    "object": {
+                        "id": { "arg": "later_id" },
+                        "kind": { "literal": "select" }
+                    },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "later_id": { "step": "later_write", "column": "id" } }
+        }, {
+            "name": "update_order_then_write",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "order_id", "type": "uuid!" },
+                { "name": "later_id", "type": "uuid!" }
+            ],
+            "steps": [{
+                "name": "required_order",
+                "update": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": { "id": { "arg": "order_id" } },
+                    "set": { "status": { "literal": "approved" } },
+                    "returning": ["id"]
+                }
+            }, {
+                "name": "later_write",
+                "insert": {
+                    "table": { "schema": "public", "name": "command_later_writes" },
+                    "object": {
+                        "id": { "arg": "later_id" },
+                        "kind": { "literal": "update" }
+                    },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "later_id": { "step": "later_write", "column": "id" } }
+        }, {
+            "name": "delete_order_then_write",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "order_id", "type": "uuid!" },
+                { "name": "later_id", "type": "uuid!" }
+            ],
+            "steps": [{
+                "name": "required_order",
+                "delete": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": { "id": { "arg": "order_id" } },
+                    "returning": ["id"]
+                }
+            }, {
+                "name": "later_write",
+                "insert": {
+                    "table": { "schema": "public", "name": "command_later_writes" },
+                    "object": {
+                        "id": { "arg": "later_id" },
+                        "kind": { "literal": "delete" }
+                    },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "later_id": { "step": "later_write", "column": "id" } }
+        }]
+    }))
+    .expect("required-row command metadata deserializes")
+}
+
+fn create_required_row_tables(database_url: &str) {
+    let mut client = postgres::Client::connect(database_url, NoTls)
+        .expect("connect to the required-row command suite database");
+    client
+        .batch_execute(
+            r#"
+            CREATE TABLE public.orders (
+                id uuid PRIMARY KEY,
+                customer_id uuid NOT NULL,
+                status text NOT NULL,
+                quantity integer NOT NULL
+            );
+            CREATE TABLE public.command_later_writes (
+                id uuid PRIMARY KEY,
+                kind text NOT NULL
+            );
+            CREATE FUNCTION public.reject_command_later_write() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'later command step must not run' USING ERRCODE = 'P0G01';
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER before_command_later_write
+            BEFORE INSERT ON public.command_later_writes
+            FOR EACH ROW EXECUTE FUNCTION public.reject_command_later_write();
+            "#,
+        )
+        .expect("create required-row command tables and rejection trigger");
+}
+
 fn validation_database(label: &str) -> (String, String) {
     let admin_url = pg_admin_url();
     let suffix = NEXT_VALIDATION_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +551,59 @@ fn command_create_order_returns_the_declared_result_shape() {
 }
 
 #[test]
+fn command_creates_rows_in_two_relations_atomically() {
+    let suite = Suite::new("command_multi_relation_success")
+        .initial_metadata(multi_relation_command_metadata())
+        .with_migrations()
+        .start();
+    create_multi_relation_tables(suite.db_url());
+
+    suite.check_query_f(
+        "commands/multi_relation_success.yaml",
+        donat_conformance::Transport::Http,
+    );
+}
+
+#[test]
+fn command_later_relation_failure_rolls_back_the_earlier_insert() {
+    let suite = Suite::new("command_multi_relation_rollback")
+        .initial_metadata(multi_relation_command_metadata())
+        .with_migrations()
+        .start();
+    create_multi_relation_tables(suite.db_url());
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect to seed the later-relation failure");
+    client
+        .batch_execute(
+            "INSERT INTO public.order_lines (id, order_id, quantity) VALUES (\
+                '550e8400-e29b-41d4-a716-446655440211',\
+                '550e8400-e29b-41d4-a716-446655440299',\
+                7\
+             )",
+        )
+        .expect("seed the duplicate line identifier");
+
+    suite.check_query_f(
+        "commands/multi_relation_rollback.yaml",
+        donat_conformance::Transport::Http,
+    );
+}
+
+#[test]
+fn command_required_rows_gate_every_later_dml_step() {
+    let suite = Suite::new("command_required_rows_gate")
+        .initial_metadata(required_row_command_metadata())
+        .with_migrations()
+        .start();
+    create_required_row_tables(suite.db_url());
+
+    suite.check_query_f(
+        "commands/required_rows_gate_later_steps.yaml",
+        donat_conformance::Transport::Http,
+    );
+}
+
+#[test]
 fn command_guard_rejection_leaves_no_order_visible_to_the_explicit_role() {
     let suite = Suite::new("command_guard_denied")
         .initial_metadata(command_metadata())
@@ -311,6 +614,57 @@ fn command_guard_rejection_leaves_no_order_visible_to_the_explicit_role() {
     suite.check_query_f(
         "commands/guard_denied_no_write.yaml",
         donat_conformance::Transport::Http,
+    );
+
+    let rejected_request_id = "550e8400-e29b-41d4-a716-446655440011";
+    {
+        let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+            .expect("connect to inspect guard rejection rollback");
+        let domain_rows: i64 = client
+            .query_one("SELECT count(*) FROM public.orders", &[])
+            .expect("count orders after guard rejection")
+            .get(0);
+        assert_eq!(domain_rows, 0, "guard rejection must leave no domain row");
+        for catalog_table in [
+            "donat.command_invocation_claims",
+            "donat.command_invocations",
+        ] {
+            let persisted: i64 = client
+                .query_one(
+                    &format!("SELECT count(*) FROM {catalog_table} WHERE key = $1"),
+                    &[&rejected_request_id],
+                )
+                .expect("count guard-rejected command catalog entries")
+                .get(0);
+            assert_eq!(
+                persisted, 0,
+                "guard rejection must leave no entry in {catalog_table}"
+            );
+        }
+    }
+
+    let headers = vec![("X-Donat-Role".to_string(), "customer".to_string())];
+    let (status, retry) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ create_order(id: \"550e8400-e29b-41d4-a716-446655440010\", customer_id: \"550e8400-e29b-41d4-a716-446655440001\", status: \"draft\", quantity: 1, request_id: \"{rejected_request_id}\") {{ order_id status }} }}"
+            )
+        }),
+        &headers,
+    );
+    assert_eq!(status, 200, "retry after guard rejection: {retry}");
+    assert_eq!(
+        retry,
+        json!({
+            "data": {
+                "create_order": {
+                    "order_id": "550e8400-e29b-41d4-a716-446655440010",
+                    "status": "draft"
+                }
+            }
+        }),
+        "the rejected key remains eligible for its first committed execution"
     );
 }
 

@@ -1,0 +1,49 @@
+- description: A failure in the second relation rejects the whole command with the stable database error.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation RejectOrderWithDuplicateLine {
+        create_order_with_line(
+          order_id: "550e8400-e29b-41d4-a716-446655440210"
+          line_id: "550e8400-e29b-41d4-a716-446655440211"
+          customer_id: "550e8400-e29b-41d4-a716-446655440001"
+          quantity: 5
+        ) {
+          order_id
+          line_id
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $
+          code: data-exception
+        message: command database error
+
+- description: The first relation rolled back and the pre-existing second-relation row is unchanged.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      query RelationsAfterRejectedCommand {
+        orders {
+          id
+        }
+        order_lines {
+          id
+          order_id
+          quantity
+        }
+      }
+  response:
+    data:
+      orders: []
+      order_lines:
+        - id: "550e8400-e29b-41d4-a716-446655440211"
+          order_id: "550e8400-e29b-41d4-a716-446655440299"
+          quantity: 7

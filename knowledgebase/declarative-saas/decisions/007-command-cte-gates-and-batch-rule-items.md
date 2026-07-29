@@ -27,6 +27,12 @@ A historical validator path also allowed a guard binding to reference a
 completed command step. Such a value cannot be a precondition: resolving it
 would require the very CTE write that a false guard must prevent.
 
+Required `select_one`, `update`, and `delete` cardinality checks were likewise
+rendered only in the final result expression. PostgreSQL happened to evaluate
+that outer rejection before an unrelated later write in the covered plans, but
+the SQL did not encode the command-ordering dependency required by the public
+contract.
+
 ## Decision
 
 The request planner recursively discovers item values used inside a Rule's
@@ -44,6 +50,14 @@ assertions observable even when no later DML exists. A false Rule calls the
 existing `donat.raise_graphql_error` helper before a dependent DML source is
 evaluated, preserving the existing structured error envelope and one-statement
 transaction contract.
+
+Every `select_one` with `require_found: true` and every `update` or `delete`
+with `require_affected: true` emits a materialized success gate immediately
+after its step CTE. The gate raises the existing structured
+`validation-failed` error when the required row is absent. Every later command
+step and the final result gate explicitly depend on it. Replay remains
+unchanged because the success gate is conditioned on the current first-executor
+gate and is skipped for a canonical-result replay.
 
 ## Alternatives
 

@@ -1,0 +1,81 @@
+- description: A missing required select row rejects before the later insert trigger can run.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation MissingRequiredSelect {
+        select_order_then_write(
+          order_id: "550e8400-e29b-41d4-a716-446655440220"
+          later_id: "550e8400-e29b-41d4-a716-446655440221"
+        ) {
+          later_id
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.select_order_then_write
+          code: validation-failed
+        message: command select_one step 'required_order' did not find a row
+
+- description: A missing required update row rejects before the later insert trigger can run.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation MissingRequiredUpdate {
+        update_order_then_write(
+          order_id: "550e8400-e29b-41d4-a716-446655440222"
+          later_id: "550e8400-e29b-41d4-a716-446655440223"
+        ) {
+          later_id
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.update_order_then_write
+          code: validation-failed
+        message: command update step 'required_order' did not affect a row
+
+- description: A missing required delete row rejects before the later insert trigger can run.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation MissingRequiredDelete {
+        delete_order_then_write(
+          order_id: "550e8400-e29b-41d4-a716-446655440224"
+          later_id: "550e8400-e29b-41d4-a716-446655440225"
+        ) {
+          later_id
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.delete_order_then_write
+          code: validation-failed
+        message: command delete step 'required_order' did not affect a row
+
+- description: No later command write reached its trigger after any required-row rejection.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      query LaterWritesAfterRequiredRowRejections {
+        command_later_writes {
+          id
+        }
+      }
+  response:
+    data:
+      command_later_writes: []

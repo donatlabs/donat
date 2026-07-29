@@ -1070,6 +1070,12 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
             );
         } else if let Some(cte) = command_step_cte(ctx, step, &step_execution_gate) {
             ctes.push(cte);
+            if let Some((required_cte, required_gate)) =
+                command_required_step_gate_cte(index, step, &step_execution_gate)
+            {
+                ctes.push(required_cte);
+                step_execution_gate = format!("({step_execution_gate}) AND {required_gate}");
+            }
         }
     }
 
@@ -1198,6 +1204,60 @@ fn command_rule_gate_cte(cte: &str, rules: &[CommandRule], precondition: &str) -
 
 fn command_gate_exists(cte: &str) -> String {
     format!("EXISTS (SELECT 1 FROM {})", quote_ident(cte))
+}
+
+fn command_required_step_gate_cte(
+    index: usize,
+    step: &CommandExecutionStep,
+    precondition: &str,
+) -> Option<(String, String)> {
+    let (step_cte, error_path, message) = match step {
+        CommandExecutionStep::SelectOne {
+            name,
+            cte,
+            require_found: true,
+            error_path,
+            ..
+        } => (
+            cte,
+            error_path,
+            format!("command select_one step '{name}' did not find a row"),
+        ),
+        CommandExecutionStep::Update {
+            name,
+            cte,
+            require_affected: true,
+            error_path,
+            ..
+        } => (
+            cte,
+            error_path,
+            format!("command update step '{name}' did not affect a row"),
+        ),
+        CommandExecutionStep::Delete {
+            name,
+            cte,
+            require_affected: true,
+            error_path,
+            ..
+        } => (
+            cte,
+            error_path,
+            format!("command delete step '{name}' did not affect a row"),
+        ),
+        _ => return None,
+    };
+    let gate_cte = format!("_cmd_required_gate_{index}");
+    let sql = format!(
+        "{gate} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN CASE WHEN EXISTS (SELECT 1 FROM {step}) THEN TRUE ELSE (donat.raise_graphql_error('validation-failed', {path}, {message}) IS NULL) END ELSE FALSE END)",
+        gate = quote_ident(&gate_cte),
+        ok = quote_ident("ok"),
+        step = quote_ident(step_cte),
+        path = quote_lit(error_path),
+        message = quote_lit(&message),
+    );
+    let gate = command_gate_exists(&gate_cte);
+    Some((sql, gate))
 }
 
 fn command_step_cte(
