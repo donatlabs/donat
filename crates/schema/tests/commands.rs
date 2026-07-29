@@ -1,15 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, RelationKind, TableInfo};
+use donat_catalog::{Catalog, ColumnInfo, FunctionArg, FunctionInfo, RelationKind, TableInfo};
 use donat_ir::{
-    CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar,
+    CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar, TypeRef,
+    ValueScalar, ValueType,
 };
 use donat_metadata::{Metadata, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
-    compile_command_catalog, execute_multi_source_introspection, validate_command_catalog,
+    compile_command_catalog, compile_command_source_catalog, execute_multi_source_introspection,
+    validate_command_catalog,
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
@@ -956,6 +958,19 @@ fn compiles_an_immutable_catalog_per_postgres_source() {
             .and_then(|source| source.command("create_order"))
             .is_some(),
         "the validated command is retained in its source-local immutable catalog"
+    );
+}
+
+#[test]
+fn missing_command_source_catalog_is_a_validation_error() {
+    let metadata = metadata(vec![valid_command()]);
+    let error = compile_command_catalog(&metadata, &HashMap::new(), &rules(), true)
+        .expect_err("a missing source catalog must fail closed without panicking");
+
+    assert_eq!(error.path, "commands[0]");
+    assert_eq!(
+        error.message,
+        "catalog for command source 'default' is missing"
     );
 }
 
@@ -2363,4 +2378,527 @@ fn rejects_non_scalar_idempotency_scope_and_non_postgres_command_sources() {
     let error =
         compile(&sqlite_metadata, RelationKind::Table).expect_err("commands remain Postgres-only");
     assert!(error.message.contains("requires a Postgres source"));
+}
+
+fn descriptor_metadata(effect_session_variable: &str) -> Metadata {
+    let command = json!({
+        "name": "create_order",
+        "source": "default",
+        "permissions": [{ "role": "customer" }, { "role": "support" }],
+        "arguments": [
+            { "name": "id", "type": "uuid!" },
+            { "name": "customer_id", "type": "uuid!" },
+            { "name": "status", "type": "String!" },
+            { "name": "quantity", "type": "Int!" },
+            { "name": "request_id", "type": "uuid!" },
+            { "name": "tree", "type": "TreeInput!" }
+        ],
+        "guards": [{
+            "rule": "customer_is_allowed",
+            "with": { "customer_id": { "arg": "customer_id" } }
+        }],
+        "steps": [
+            {
+                "name": "order",
+                "insert": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "object": {
+                        "id": { "arg": "id" },
+                        "customer_id": { "arg": "customer_id" },
+                        "status": { "arg": "status" },
+                        "quantity": { "arg": "quantity" }
+                    },
+                    "returning": ["id", "status"]
+                }
+            },
+            {
+                "name": "lookup",
+                "select_one": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "by": { "id": { "arg": "id" } },
+                    "returning": ["status"],
+                    "require_found": false
+                }
+            }
+        ],
+        "result": {
+            "order_id": { "step": "order", "column": "id" },
+            "maybe_status": { "step": "lookup", "column": "status" }
+        },
+        "idempotency": {
+            "key": { "argument": "request_id" },
+            "scope": [
+                { "argument": "customer_id" },
+                { "session_variable": "X-Donat-Request-Scope" }
+            ],
+            "retention": "30d"
+        },
+        "effects": [{
+            "start_process": {
+                "process": "checkout_order",
+                "input": {
+                    "tree": { "arg": "tree" },
+                    "actor": { "session_variable": effect_session_variable }
+                },
+                "idempotency_key": { "argument": "request_id" }
+            }
+        }]
+    });
+    let mut metadata = metadata(vec![command]);
+    metadata.custom_types.input_objects.push(
+        serde_json::from_value(json!({
+            "name": "TreeInput",
+            "fields": [
+                { "name": "label", "type": "String!" },
+                { "name": "child", "type": "TreeInput" }
+            ]
+        }))
+        .expect("recursive input metadata"),
+    );
+
+    let table = &mut metadata.sources[0].tables[0];
+    table.select_permissions[0].permission.filter =
+        json!({ "customer_id": { "_eq": "X-Donat-Customer-Id" } });
+    table.insert_permissions[0].permission.check =
+        json!({ "customer_id": { "_eq": "X-Donat-Customer-Id" } });
+
+    let mut support_select = table.select_permissions[0].clone();
+    support_select.role = "support".to_owned();
+    support_select.permission.filter = json!({ "customer_id": { "_eq": "X-Donat-Support-Id" } });
+    table.select_permissions.push(support_select);
+
+    let mut support_insert = table.insert_permissions[0].clone();
+    support_insert.role = "support".to_owned();
+    support_insert.permission.check = json!({ "customer_id": { "_eq": "X-Donat-Support-Id" } });
+    table.insert_permissions.push(support_insert);
+    metadata
+}
+
+fn descriptor_catalog(metadata: &Metadata) -> donat_schema::CompiledSourceCommandCatalog {
+    descriptor_catalog_with_rules(metadata, &rules())
+}
+
+fn descriptor_catalog_with_rules(
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+) -> donat_schema::CompiledSourceCommandCatalog {
+    compile_command_source_catalog(
+        metadata,
+        "default",
+        &catalog(RelationKind::Table),
+        rules,
+        true,
+    )
+    .expect("source-local command catalog compiles")
+}
+
+fn predicate_descriptor_fixture(filter: Json) -> (Metadata, Catalog) {
+    let mut raw =
+        serde_json::to_value(metadata(vec![valid_command()])).expect("metadata serializes");
+    let orders = &mut raw["sources"][0]["tables"][0];
+    orders["select_permissions"][0]["permission"]["filter"] = filter;
+    orders["insert_permissions"][0]["permission"]["check"] = json!({});
+    orders["object_relationships"] = json!([{
+        "name": "customer",
+        "using": {
+            "manual_configuration": {
+                "remote_table": { "schema": "public", "name": "customers" },
+                "column_mapping": { "customer_id": "id" }
+            }
+        }
+    }]);
+    raw["sources"][0]["tables"]
+        .as_array_mut()
+        .expect("tracked tables array")
+        .push(json!({
+            "table": { "schema": "public", "name": "customers" }
+        }));
+    let metadata = serde_json::from_value(raw).expect("predicate metadata deserializes");
+
+    let mut catalog = catalog(RelationKind::Table);
+    catalog.tables.insert(
+        "public.customers".to_owned(),
+        TableInfo {
+            schema: "public".to_owned(),
+            name: "customers".to_owned(),
+            relation_kind: RelationKind::Table,
+            columns: vec![
+                column("id", "uuid"),
+                column("external_id", "int8"),
+                column("active", "bool"),
+            ],
+            primary_key: vec!["id".to_owned()],
+            foreign_keys: vec![],
+        },
+    );
+    (metadata, catalog)
+}
+
+fn required_scalar(scalar: ValueScalar) -> TypeRef {
+    TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar { scalar },
+    }
+}
+
+#[test]
+fn command_descriptor_exposes_exact_contract() {
+    let metadata = descriptor_metadata("X-Donat-Actor-Id");
+    let source = descriptor_catalog(&metadata);
+    let descriptor = source
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor();
+
+    assert_eq!(descriptor.source, "default");
+    assert_eq!(descriptor.name, "create_order");
+    assert_eq!(
+        descriptor.allowed_roles,
+        BTreeSet::from(["customer".to_owned(), "support".to_owned()])
+    );
+    assert!(descriptor.arguments.roots["tree"].required);
+    assert!(matches!(
+        descriptor.arguments.roots["tree"].type_ref.value_type,
+        ValueType::Ref { ref name } if name == "TreeInput"
+    ));
+    assert!(matches!(
+        descriptor.arguments.named_objects["TreeInput"].fields["child"]
+            .type_ref
+            .value_type,
+        ValueType::Ref { ref name } if name == "TreeInput"
+    ));
+    assert!(descriptor.result.roots["order_id"].required);
+    assert!(!descriptor.result.roots["order_id"].type_ref.nullable);
+    assert!(descriptor.result.roots["maybe_status"].type_ref.nullable);
+
+    let uuid = TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar {
+            scalar: ValueScalar::Uuid,
+        },
+    };
+    let string = TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar {
+            scalar: ValueScalar::String,
+        },
+    };
+    assert_eq!(
+        descriptor.required_session_variables["customer"],
+        BTreeMap::from([
+            ("x-donat-actor-id".to_owned(), string.clone()),
+            ("x-donat-customer-id".to_owned(), uuid.clone()),
+            ("x-donat-request-scope".to_owned(), string.clone()),
+        ])
+    );
+    assert_eq!(
+        descriptor.required_session_variables["support"],
+        BTreeMap::from([
+            ("x-donat-actor-id".to_owned(), string.clone()),
+            ("x-donat-request-scope".to_owned(), string),
+            ("x-donat-support-id".to_owned(), uuid),
+        ])
+    );
+
+    let global = compile_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]),
+        &rules(),
+        true,
+    )
+    .expect("global catalog compiles");
+    assert_eq!(
+        descriptor,
+        global
+            .source("default")
+            .unwrap()
+            .command("create_order")
+            .unwrap()
+            .descriptor(),
+        "global and source-local paths publish one identical descriptor"
+    );
+}
+
+#[test]
+fn command_descriptor_session_contracts_follow_predicate_operators_and_tables() {
+    let (metadata, catalog) = predicate_descriptor_fixture(json!({
+        "_and": [
+            { "customer_id": { "_in": "X-Donat-Customer-Ids" } },
+            { "status": { "_is_null": "X-Donat-Status-Is-Null" } },
+            { "customer": {
+                "external_id": { "_eq": "X-Donat-Relationship-External-Id" }
+            }},
+            { "_exists": {
+                "_table": { "schema": "public", "name": "customers" },
+                "_where": {
+                    "external_id": { "_eq": "X-Donat-Exists-External-Id" }
+                }
+            }}
+        ]
+    }));
+    let descriptor = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect("operator-aware permission sessions compile")
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor()
+        .clone();
+    let required = &descriptor.required_session_variables["customer"];
+
+    assert_eq!(
+        required["x-donat-customer-ids"],
+        TypeRef {
+            nullable: false,
+            value_type: ValueType::List {
+                element: Box::new(required_scalar(ValueScalar::Uuid)),
+            },
+        },
+        "_in consumes a non-null list of non-null column scalars"
+    );
+    assert_eq!(
+        required["x-donat-status-is-null"],
+        required_scalar(ValueScalar::Boolean),
+        "_is_null consumes a boolean independently of the column type"
+    );
+    assert_eq!(
+        required["x-donat-relationship-external-id"],
+        required_scalar(ValueScalar::Int64),
+        "relationship predicates use the remote column contract"
+    );
+    assert_eq!(
+        required["x-donat-exists-external-id"],
+        required_scalar(ValueScalar::Int64),
+        "_exists._where uses its declared remote table contract"
+    );
+}
+
+#[test]
+fn command_descriptor_session_contracts_follow_operator_operand_types() {
+    let (metadata, mut catalog) = predicate_descriptor_fixture(json!({
+        "_and": [
+            { "document": { "_has_key": "X-Donat-Document-Key" } },
+            { "document": { "_has_keys_any": "X-Donat-Document-Keys" } },
+            { "location": { "_st_d_within": {
+                "distance": "X-Donat-Max-Distance",
+                "from": "X-Donat-Origin"
+            }}}
+        ]
+    }));
+    catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders catalog")
+        .columns
+        .extend([column("document", "jsonb"), column("location", "geometry")]);
+    let descriptor = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect("operator-specific permission sessions compile")
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor()
+        .clone();
+    let required = &descriptor.required_session_variables["customer"];
+
+    assert_eq!(
+        required["x-donat-document-key"],
+        required_scalar(ValueScalar::String),
+        "_has_key consumes a string key, not a jsonb value"
+    );
+    assert_eq!(
+        required["x-donat-document-keys"],
+        TypeRef {
+            nullable: false,
+            value_type: ValueType::List {
+                element: Box::new(required_scalar(ValueScalar::String)),
+            },
+        },
+        "_has_keys_any consumes a list of strings"
+    );
+    assert_eq!(
+        required["x-donat-max-distance"],
+        required_scalar(ValueScalar::Decimal),
+        "_st_d_within.distance consumes a decimal"
+    );
+    assert_eq!(
+        required["x-donat-origin"],
+        required_scalar(ValueScalar::Custom {
+            name: "geometry".to_owned(),
+        }),
+        "_st_d_within.from consumes the geo column value"
+    );
+}
+
+#[test]
+fn command_descriptor_rejects_computed_permission_session_argument() {
+    let (metadata, mut catalog) = predicate_descriptor_fixture(json!({
+        "session_label": { "_eq": "literal" }
+    }));
+    let mut raw = serde_json::to_value(metadata).expect("metadata serializes");
+    raw["sources"][0]["tables"][0]["computed_fields"] = json!([{
+        "name": "session_label",
+        "definition": {
+            "function": { "schema": "public", "name": "session_label" },
+            "session_argument": "session"
+        }
+    }]);
+    let metadata: Metadata =
+        serde_json::from_value(raw).expect("computed-field metadata deserializes");
+    catalog.functions.insert(
+        "public.session_label".to_owned(),
+        FunctionInfo {
+            schema: "public".to_owned(),
+            name: "session_label".to_owned(),
+            args: vec![FunctionArg {
+                name: Some("session".to_owned()),
+                has_default: false,
+                pg_type: "jsonb".to_owned(),
+                composite_of: None,
+            }],
+            returns_table: None,
+            returns_set: false,
+            returns_scalar: Some("text".to_owned()),
+        },
+    );
+
+    let error = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect_err("whole-session computed fields cannot publish a closed name set");
+    assert_eq!(error.path, "commands[0]");
+    assert_eq!(
+        error.message,
+        "computed field 'session_label' uses session_argument and cannot publish a closed session-variable contract"
+    );
+}
+
+#[test]
+fn command_descriptor_rejects_predicate_operator_contract_conflicts() {
+    let (metadata, catalog) = predicate_descriptor_fixture(json!({
+        "_and": [
+            { "customer_id": { "_in": "X-Donat-Shared-Id" } },
+            { "customer_id": { "_eq": "X-Donat-Shared-Id" } }
+        ]
+    }));
+    let error = compile_command_source_catalog(&metadata, "default", &catalog, &rules(), true)
+        .expect_err("one session variable cannot be both uuid and list<uuid>");
+
+    assert_eq!(error.path, "commands[0]");
+    assert_eq!(
+        error.message,
+        "session variable 'x-donat-shared-id' has incompatible contracts for role 'customer'"
+    );
+}
+
+#[test]
+fn command_descriptor_fingerprint_is_pre_process_and_deterministic() {
+    let metadata = descriptor_metadata("X-Donat-Actor-Id");
+    let first = descriptor_catalog(&metadata)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    let second = descriptor_catalog(&metadata)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 64);
+    assert!(
+        first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    );
+
+    let mut changed_effect = serde_json::to_value(&metadata).expect("metadata serializes");
+    changed_effect["commands"][0]["effects"][0]["start_process"]["process"] =
+        json!("other_checkout");
+    let changed_effect: Metadata =
+        serde_json::from_value(changed_effect).expect("changed metadata deserializes");
+    let changed = descriptor_catalog(&changed_effect)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    assert_ne!(first, changed, "raw effect shape is fingerprinted");
+
+    let mut changed_guard_binding = serde_json::to_value(&metadata).expect("metadata serializes");
+    changed_guard_binding["commands"][0]["guards"][0]["with"]["customer_id"] =
+        json!({ "arg": "id" });
+    let changed_guard_binding: Metadata =
+        serde_json::from_value(changed_guard_binding).expect("changed metadata deserializes");
+    let changed_guard_binding_fingerprint = descriptor_catalog(&changed_guard_binding)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    assert_ne!(
+        first, changed_guard_binding_fingerprint,
+        "raw guard bindings are fingerprinted"
+    );
+
+    let mut changed_guard_message = serde_json::to_value(&metadata).expect("metadata serializes");
+    changed_guard_message["commands"][0]["guards"][0]["message"] = json!("customer is not allowed");
+    let changed_guard_message: Metadata =
+        serde_json::from_value(changed_guard_message).expect("changed metadata deserializes");
+    let changed_guard_message_fingerprint = descriptor_catalog(&changed_guard_message)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    assert_ne!(
+        first, changed_guard_message_fingerprint,
+        "raw guard messages are fingerprinted"
+    );
+
+    let changed_rules = compile_catalog(
+        &[
+            RuleDefinition {
+                name: "customer_is_allowed".to_owned(),
+                bindings: BTreeMap::from([("customer_id".to_owned(), RuleType::Uuid)]),
+                result: RuleType::Bool,
+                expression: "false".to_owned(),
+            },
+            RuleDefinition {
+                name: "double_quantity".to_owned(),
+                bindings: BTreeMap::from([("quantity".to_owned(), RuleType::Int)]),
+                result: RuleType::Int,
+                expression: "quantity * 2".to_owned(),
+            },
+        ],
+        &[],
+    )
+    .expect("changed rule catalog compiles");
+    let changed_rule_fingerprint = descriptor_catalog_with_rules(&metadata, &changed_rules)
+        .command("create_order")
+        .unwrap()
+        .descriptor()
+        .definition_fingerprint
+        .clone();
+    assert_ne!(
+        first, changed_rule_fingerprint,
+        "referenced Rule artifact hashes are fingerprinted"
+    );
+}
+
+#[test]
+fn command_descriptor_rejects_incompatible_session_variable_uses() {
+    let mut metadata = descriptor_metadata("X-Donat-Actor-Id");
+    let table = &mut metadata.sources[0].tables[0];
+    table.select_permissions[0].permission.filter =
+        json!({ "customer_id": { "_eq": "X-Donat-Shared-Id" } });
+    table.insert_permissions[0].permission.check =
+        json!({ "quantity": { "_eq": "X-Donat-Shared-Id" } });
+    let error = compile_command_source_catalog(
+        &metadata,
+        "default",
+        &catalog(RelationKind::Table),
+        &rules(),
+        true,
+    )
+    .expect_err("one session variable cannot be both uuid and int32 for customer");
+    assert!(error.message.contains("x-donat-shared-id"));
+    assert!(error.message.contains("customer"));
+    assert!(error.message.contains("incompatible"));
 }

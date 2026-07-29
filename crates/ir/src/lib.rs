@@ -7,7 +7,16 @@
 //! permissions) is testable without a database; everything below it (sqlgen,
 //! executor) is the only code that knows Postgres exists.
 
+mod value_contract;
+
 use serde::Serialize;
+
+pub use donat_value_contract::{
+    BoundedInlineBytes, CanonicalDecimal, CanonicalNumber, TypeRef, TypedValue,
+    VALUE_TYPE_LANGUAGE_VERSION, ValueContractCatalog, ValueContractError, ValueContractField,
+    ValueObjectContract, ValueScalar, ValueType, canonical_size,
+};
+pub use value_contract::{ProcessStartPolicy, compile_value_contract_catalog};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Table {

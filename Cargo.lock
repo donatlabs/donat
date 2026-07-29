@@ -657,6 +657,7 @@ name = "donat-ir"
 version = "0.1.0"
 dependencies = [
  "donat-metadata",
+ "donat-value-contract",
  "serde",
  "serde_json",
 ]
@@ -698,6 +699,7 @@ dependencies = [
  "graphql-parser",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -753,6 +755,13 @@ dependencies = [
  "graphql-parser",
  "insta",
  "postgres",
+ "serde_json",
+]
+
+[[package]]
+name = "donat-value-contract"
+version = "0.1.0"
+dependencies = [
  "serde_json",
 ]
 

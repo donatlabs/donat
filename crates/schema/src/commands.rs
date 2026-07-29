@@ -10,17 +10,23 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use donat_catalog::{Catalog, ColumnInfo, RelationKind, TableInfo};
+use donat_ir::{
+    TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
+    compile_value_contract_catalog,
+};
 use donat_metadata::{
     Columns, Command, CommandEffect, CommandIdempotencyKey, CommandIdempotencyScope,
     CommandStepOperation, CommandValue, Metadata, QualifiedTable, Source, SourceKind, TableEntry,
     action_visible_to_role,
 };
 use donat_rules::{RuleCatalog, RuleType};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::introspection::build_schema_json;
 use crate::naming::{command_pascal_case, table_base_name};
-use crate::plan::{MutationKind, PlanError, Planner, Session};
+use crate::plan::{MutationKind, PlanError, Planner, Session, TableCtx};
+use crate::predicate::PermissionSessionOperand;
 
 /// Immutable command definitions grouped by their Postgres source.
 #[derive(Debug, Clone)]
@@ -65,7 +71,19 @@ impl CompiledSourceCommandCatalog {
 pub struct CompiledCommand {
     source: String,
     definition: Command,
+    descriptor: CommandDescriptor,
     rules: Arc<RuleCatalog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDescriptor {
+    pub source: String,
+    pub name: String,
+    pub arguments: ValueContractCatalog,
+    pub result: ValueContractCatalog,
+    pub allowed_roles: BTreeSet<String>,
+    pub required_session_variables: BTreeMap<String, BTreeMap<String, TypeRef>>,
+    pub definition_fingerprint: String,
 }
 
 impl CompiledCommand {
@@ -79,6 +97,10 @@ impl CompiledCommand {
     /// shared reference; metadata mutations never update this snapshot.
     pub fn definition(&self) -> &Command {
         &self.definition
+    }
+
+    pub fn descriptor(&self) -> &CommandDescriptor {
+        &self.descriptor
     }
 
     /// The immutable Rule catalog compiled with this command snapshot. It is
@@ -663,6 +685,803 @@ pub fn compile_command_catalog(
     }
 }
 
+pub fn compile_command_source_catalog(
+    metadata: &Metadata,
+    source_name: &str,
+    catalog: &Catalog,
+    rules: &RuleCatalog,
+    infer_function_permissions: bool,
+) -> Result<CompiledSourceCommandCatalog, PlanError> {
+    let source = metadata
+        .sources
+        .iter()
+        .find(|source| source.name == source_name)
+        .ok_or_else(|| {
+            PlanError::validation(
+                "commands",
+                format!("command source '{source_name}' does not exist"),
+            )
+        })?;
+    if source.kind != SourceKind::Postgres {
+        return Err(PlanError::validation(
+            "commands",
+            format!("command source '{source_name}' requires a Postgres source"),
+        ));
+    }
+    let catalogs = HashMap::from([(source_name.to_owned(), catalog.clone())]);
+    let rules = Arc::new(rules.clone());
+    let context = CommandCompileContext {
+        metadata,
+        catalogs: &catalogs,
+        rules: &rules,
+        infer_function_permissions,
+    };
+    let mut commands = BTreeMap::new();
+    for (index, command) in metadata.commands.iter().enumerate() {
+        if command.source != source_name {
+            continue;
+        }
+        let path = format!("commands[{index}]");
+        if commands.contains_key(&command.name) {
+            return Err(PlanError::validation(
+                &path,
+                format!(
+                    "duplicate command name '{}' for source '{source_name}'",
+                    command.name
+                ),
+            ));
+        }
+        let compiled = compile_one_command(&context, source, catalog, command, index)?;
+        commands.insert(command.name.clone(), compiled);
+    }
+    Ok(CompiledSourceCommandCatalog { commands })
+}
+
+/// Both public compiler shapes use this primitive. The aggregate compiler
+/// cannot call `compile_command_source_catalog` directly because that API
+/// deliberately returns the first source-local error, while deployment
+/// validation must retain independent diagnostics and cross-source namespace
+/// collisions. Sharing the per-command primitive keeps descriptor bytes
+/// identical without weakening aggregate diagnostics.
+struct CommandCompileContext<'a> {
+    metadata: &'a Metadata,
+    catalogs: &'a HashMap<String, Catalog>,
+    rules: &'a Arc<RuleCatalog>,
+    infer_function_permissions: bool,
+}
+
+fn compile_one_command(
+    context: &CommandCompileContext<'_>,
+    source: &Source,
+    catalog: &Catalog,
+    command: &Command,
+    command_index: usize,
+) -> Result<CompiledCommand, PlanError> {
+    validate_command(
+        context.metadata,
+        context.catalogs,
+        source,
+        context.rules.as_ref(),
+        context.infer_function_permissions,
+        command,
+        command_index,
+    )?;
+    let descriptor = build_command_descriptor(
+        context.metadata,
+        source,
+        catalog,
+        context.rules.as_ref(),
+        command,
+        command_index,
+        context.infer_function_permissions,
+    )?;
+    Ok(CompiledCommand {
+        source: source.name.clone(),
+        definition: command.clone(),
+        descriptor,
+        rules: context.rules.clone(),
+    })
+}
+
+fn build_command_descriptor(
+    metadata: &Metadata,
+    source: &Source,
+    catalog: &Catalog,
+    rules: &RuleCatalog,
+    command: &Command,
+    command_index: usize,
+    infer_function_permissions: bool,
+) -> Result<CommandDescriptor, PlanError> {
+    let path = format!("commands[{command_index}]");
+    let argument_fields = command
+        .arguments
+        .iter()
+        .map(|argument| (argument.name.clone(), argument.type_.clone()))
+        .collect();
+    let arguments = compile_value_contract_catalog(metadata, &argument_fields)
+        .map_err(|error| PlanError::validation(&path, error.to_string()))?;
+
+    let roles = command
+        .permissions
+        .iter()
+        .map(|permission| permission.role.as_str())
+        .collect::<HashSet<_>>();
+    let declared_steps = command
+        .steps
+        .iter()
+        .map(|step| step.name.clone())
+        .collect::<HashSet<_>>();
+    let mut steps = BTreeMap::new();
+    for (index, step) in command.steps.iter().enumerate() {
+        let context = ValueContext {
+            metadata,
+            command,
+            rules,
+            steps: &steps,
+            declared_steps: &declared_steps,
+            item: None,
+        };
+        let output = validate_step(
+            source,
+            catalog,
+            &roles,
+            step,
+            &context,
+            &format!("{path}.steps[{index}]"),
+        )?;
+        steps.insert(step.name.clone(), output);
+    }
+    let context = ValueContext {
+        metadata,
+        command,
+        rules,
+        steps: &steps,
+        declared_steps: &declared_steps,
+        item: None,
+    };
+    let mut result_roots = BTreeMap::new();
+    for field in &command.result.fields {
+        let static_type = value_type(&field.value, &context, None, ValueUse::Data, &path)?;
+        result_roots.insert(
+            field.name.clone(),
+            ValueContractField {
+                required: true,
+                type_ref: contract_type_from_static(&static_type, &path)?,
+            },
+        );
+    }
+    let result = ValueContractCatalog {
+        roots: result_roots,
+        named_objects: BTreeMap::new(),
+    };
+    let allowed_roles = command
+        .permissions
+        .iter()
+        .map(|permission| permission.role.clone())
+        .collect::<BTreeSet<_>>();
+    let required_session_variables = collect_required_session_variables(
+        metadata,
+        source,
+        catalog,
+        command,
+        &path,
+        infer_function_permissions,
+    )?;
+    let definition_fingerprint = command_descriptor_fingerprint(
+        source,
+        command,
+        rules,
+        &arguments,
+        &result,
+        &allowed_roles,
+        &required_session_variables,
+    );
+    Ok(CommandDescriptor {
+        source: source.name.clone(),
+        name: command.name.clone(),
+        arguments,
+        result,
+        allowed_roles,
+        required_session_variables,
+        definition_fingerprint,
+    })
+}
+
+fn contract_type_from_static(type_: &StaticType, path: &str) -> Result<TypeRef, PlanError> {
+    let parsed = match type_ {
+        StaticType::Scalar(name) => TypeRef::parse(name).map(|mut type_ref| {
+            type_ref.nullable = false;
+            type_ref
+        }),
+        StaticType::Object { name, .. } | StaticType::ObjectRef { name } => Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::Ref { name: name.clone() },
+        }),
+        StaticType::List(element) => Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::List {
+                element: Box::new(contract_type_from_static(element, path)?),
+            },
+        }),
+        StaticType::Row(fields) => Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::Object {
+                fields: contract_fields_from_static(fields, path)?,
+            },
+        }),
+        StaticType::Rows(fields) => Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::List {
+                element: Box::new(TypeRef {
+                    nullable: false,
+                    value_type: ValueType::Object {
+                        fields: contract_fields_from_static(fields, path)?,
+                    },
+                }),
+            },
+        }),
+        StaticType::Nullable(inner) => {
+            let mut type_ref = contract_type_from_static(inner, path)?;
+            type_ref.nullable = true;
+            Ok(type_ref)
+        }
+    };
+    parsed.map_err(|error| PlanError::validation(path, error.to_string()))
+}
+
+fn contract_fields_from_static(
+    fields: &BTreeMap<String, StaticType>,
+    path: &str,
+) -> Result<BTreeMap<String, ValueContractField>, PlanError> {
+    fields
+        .iter()
+        .map(|(name, type_)| {
+            Ok((
+                name.clone(),
+                ValueContractField {
+                    required: true,
+                    type_ref: contract_type_from_static(type_, path)?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn collect_required_session_variables(
+    metadata: &Metadata,
+    source: &Source,
+    catalog: &Catalog,
+    command: &Command,
+    path: &str,
+    infer_function_permissions: bool,
+) -> Result<BTreeMap<String, BTreeMap<String, TypeRef>>, PlanError> {
+    let mut planner = Planner::for_source(metadata, source, catalog);
+    // Command effects are table-only, so function-permission inference cannot
+    // change these session contracts. Retain the caller's planner mode so the
+    // descriptor path never constructs a differently configured snapshot.
+    planner.infer_function_permissions = infer_function_permissions;
+    let mut by_role = BTreeMap::new();
+
+    for permission in &command.permissions {
+        let role = permission.role.as_str();
+        let mut required = BTreeMap::new();
+        for step in &command.steps {
+            let table = match &step.operation {
+                CommandStepOperation::SelectOne { select_one } => &select_one.table,
+                CommandStepOperation::Insert { insert } => &insert.table,
+                CommandStepOperation::InsertMany { insert_many } => &insert_many.table,
+                CommandStepOperation::Update { update } => &update.table,
+                CommandStepOperation::Delete { delete } => &delete.table,
+                CommandStepOperation::Assert { .. } => continue,
+            };
+            let (entry, info) = command_target(source, catalog, table, path)?;
+            let filter_context = TableCtx {
+                entry,
+                info,
+                perms: Vec::new(),
+                type_name: table_base_name(entry),
+            };
+            if let Some(context) = planner.table_ctx_by_name(&entry.table, role) {
+                for permission in context.perms {
+                    collect_sessions_from_predicate(
+                        &planner,
+                        &permission.filter,
+                        &filter_context,
+                        role,
+                        &mut required,
+                        path,
+                    )?;
+                }
+            }
+            match &step.operation {
+                CommandStepOperation::Insert { .. } | CommandStepOperation::InsertMany { .. } => {
+                    if let Some(permission) =
+                        planner.resolve_role_perm(&entry.insert_permissions, role, |permission| {
+                            !permission.backend_only
+                        })
+                    {
+                        collect_sessions_from_predicate(
+                            &planner,
+                            &permission.check,
+                            &filter_context,
+                            role,
+                            &mut required,
+                            path,
+                        )?;
+                        for (column, value) in &permission.set {
+                            collect_session_preset(
+                                value,
+                                info.column(column),
+                                role,
+                                &mut required,
+                                path,
+                            )?;
+                        }
+                    }
+                }
+                CommandStepOperation::Update { .. } => {
+                    if let Some(permission) =
+                        planner.resolve_role_perm(&entry.update_permissions, role, |_| true)
+                    {
+                        collect_sessions_from_predicate(
+                            &planner,
+                            &permission.filter,
+                            &filter_context,
+                            role,
+                            &mut required,
+                            path,
+                        )?;
+                        if let Some(check) = &permission.check {
+                            collect_sessions_from_predicate(
+                                &planner,
+                                check,
+                                &filter_context,
+                                role,
+                                &mut required,
+                                path,
+                            )?;
+                        }
+                        for (column, value) in &permission.set {
+                            collect_session_preset(
+                                value,
+                                info.column(column),
+                                role,
+                                &mut required,
+                                path,
+                            )?;
+                        }
+                    }
+                }
+                CommandStepOperation::Delete { .. } => {
+                    if let Some(permission) =
+                        planner.resolve_role_perm(&entry.delete_permissions, role, |_| true)
+                    {
+                        collect_sessions_from_predicate(
+                            &planner,
+                            &permission.filter,
+                            &filter_context,
+                            role,
+                            &mut required,
+                            path,
+                        )?;
+                    }
+                }
+                CommandStepOperation::SelectOne { .. } | CommandStepOperation::Assert { .. } => {}
+            }
+        }
+
+        if let Some(idempotency) = &command.idempotency {
+            for scope in &idempotency.scope {
+                if let CommandIdempotencyScope::SessionVariable { session_variable } = scope {
+                    insert_unconstrained_session_contract(&mut required, session_variable);
+                }
+            }
+        }
+        for effect in &command.effects {
+            let values = match effect {
+                CommandEffect::StartProcess { start_process } => {
+                    start_process.input.values().collect::<Vec<_>>()
+                }
+                CommandEffect::SignalProcess { signal_process } => signal_process
+                    .correlate
+                    .values()
+                    .chain(signal_process.payload.values())
+                    .collect(),
+            };
+            let mut pending = values;
+            while let Some(value) = pending.pop() {
+                match value {
+                    CommandValue::SessionVariable { session_variable } => {
+                        insert_unconstrained_session_contract(&mut required, session_variable);
+                    }
+                    CommandValue::Rule { bindings, .. } => pending.extend(bindings.values()),
+                    CommandValue::Argument { .. }
+                    | CommandValue::Item { .. }
+                    | CommandValue::Step { .. }
+                    | CommandValue::Literal { .. } => {}
+                }
+            }
+        }
+        by_role.insert(permission.role.clone(), required);
+    }
+    Ok(by_role)
+}
+
+fn collect_sessions_from_predicate(
+    planner: &Planner<'_>,
+    value: &serde_json::Value,
+    context: &TableCtx<'_>,
+    role: &str,
+    required: &mut BTreeMap<String, TypeRef>,
+    path: &str,
+) -> Result<(), PlanError> {
+    for session_use in planner.collect_permission_session_uses(value, context, path)? {
+        let contract = match session_use.operand {
+            PermissionSessionOperand::Scalar(column) => required_column_contract(&column, path)?,
+            PermissionSessionOperand::List(column) => TypeRef {
+                nullable: false,
+                value_type: ValueType::List {
+                    element: Box::new(required_column_contract(&column, path)?),
+                },
+            },
+            PermissionSessionOperand::Boolean => required_boolean_contract(),
+            PermissionSessionOperand::String => required_string_contract(),
+            PermissionSessionOperand::StringList => TypeRef {
+                nullable: false,
+                value_type: ValueType::List {
+                    element: Box::new(required_string_contract()),
+                },
+            },
+            PermissionSessionOperand::Decimal => required_decimal_contract(),
+        };
+        insert_session_contract(required, role, &session_use.name, contract, path)?;
+    }
+    Ok(())
+}
+
+fn collect_session_preset(
+    value: &serde_json::Value,
+    column: Option<&ColumnInfo>,
+    role: &str,
+    required: &mut BTreeMap<String, TypeRef>,
+    path: &str,
+) -> Result<(), PlanError> {
+    let serde_json::Value::String(name) = value else {
+        return Ok(());
+    };
+    if !session_variable_name(name) {
+        return Ok(());
+    }
+    let column = column
+        .ok_or_else(|| PlanError::validation(path, "permission preset names an unknown column"))?;
+    insert_session_contract(
+        required,
+        role,
+        name,
+        required_column_contract(column, path)?,
+        path,
+    )
+}
+
+fn required_column_contract(column: &ColumnInfo, path: &str) -> Result<TypeRef, PlanError> {
+    let scalar = match column.pg_type.as_str() {
+        "bool" => ValueScalar::Boolean,
+        "int2" | "int4" | "serial" => ValueScalar::Int32,
+        "int8" | "bigint" | "bigserial" => ValueScalar::Int64,
+        "float4" | "float8" | "numeric" | "decimal" => ValueScalar::Decimal,
+        "uuid" => ValueScalar::Uuid,
+        "date" => ValueScalar::Date,
+        "timestamp" | "timestamp without time zone" => ValueScalar::Timestamp,
+        "timestamptz" | "timestamp with time zone" => ValueScalar::TimestampTz,
+        "json" | "jsonb" => ValueScalar::Json,
+        "text" | "varchar" | "bpchar" | "name" | "citext" => ValueScalar::String,
+        name if is_graphql_name(name) => ValueScalar::Custom {
+            name: name.to_owned(),
+        },
+        name => {
+            return Err(PlanError::validation(
+                path,
+                format!("column scalar '{name}' has no closed session-variable contract"),
+            ));
+        }
+    };
+    Ok(TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar { scalar },
+    })
+}
+
+fn required_boolean_contract() -> TypeRef {
+    TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar {
+            scalar: ValueScalar::Boolean,
+        },
+    }
+}
+
+fn required_decimal_contract() -> TypeRef {
+    TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar {
+            scalar: ValueScalar::Decimal,
+        },
+    }
+}
+
+fn insert_session_contract(
+    required: &mut BTreeMap<String, TypeRef>,
+    role: &str,
+    name: &str,
+    contract: TypeRef,
+    path: &str,
+) -> Result<(), PlanError> {
+    let name = name.to_ascii_lowercase();
+    if let Some(existing) = required.get(&name)
+        && existing != &contract
+    {
+        return Err(PlanError::validation(
+            path,
+            format!("session variable '{name}' has incompatible contracts for role '{role}'"),
+        ));
+    }
+    required.insert(name, contract);
+    Ok(())
+}
+
+fn insert_unconstrained_session_contract(required: &mut BTreeMap<String, TypeRef>, name: &str) {
+    let name = name.to_ascii_lowercase();
+    required
+        .entry(name)
+        .or_insert_with(required_string_contract);
+}
+
+fn required_string_contract() -> TypeRef {
+    TypeRef {
+        nullable: false,
+        value_type: ValueType::Scalar {
+            scalar: ValueScalar::String,
+        },
+    }
+}
+
+fn session_variable_name(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.starts_with("x-donat-") || value.starts_with("x-hasura-")
+}
+
+fn command_descriptor_fingerprint(
+    source: &Source,
+    command: &Command,
+    rules: &RuleCatalog,
+    arguments: &ValueContractCatalog,
+    result: &ValueContractCatalog,
+    allowed_roles: &BTreeSet<String>,
+    required_session_variables: &BTreeMap<String, BTreeMap<String, TypeRef>>,
+) -> String {
+    let rule_hashes = referenced_rule_hashes(command, rules);
+    let required_sessions = required_session_variables
+        .iter()
+        .map(|(role, values)| {
+            (
+                role.clone(),
+                values
+                    .iter()
+                    .map(|(name, type_ref)| (name.clone(), type_tokens(type_ref)))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let canonical = serde_json::json!({
+        "format": "donat.command-descriptor.v1",
+        "source": source.name,
+        "name": command.name,
+        "arguments": contract_records(arguments),
+        "result": contract_records(result),
+        "allowed_roles": allowed_roles,
+        "required_session_variables": required_sessions,
+        "guards": command.guards,
+        "steps": command.steps,
+        "rule_artifact_hashes": rule_hashes,
+        "idempotency": command.idempotency,
+        "effects": command.effects,
+    });
+    let canonical = canonicalize_fingerprint_json(canonical);
+    let bytes = serde_json::to_vec(&canonical).expect("canonical command record serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn canonicalize_fingerprint_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(canonicalize_fingerprint_json)
+                .collect(),
+        ),
+        serde_json::Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(name, value)| (name, canonicalize_fingerprint_json(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
+    }
+}
+
+fn contract_records(catalog: &ValueContractCatalog) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    for (name, field) in &catalog.roots {
+        records.push(serde_json::json!({
+            "scope": "root",
+            "name": name,
+            "required": field.required,
+            "type": type_tokens(&field.type_ref),
+        }));
+    }
+    for (object_name, object) in &catalog.named_objects {
+        for (name, field) in &object.fields {
+            records.push(serde_json::json!({
+                "scope": "named_object",
+                "object": object_name,
+                "name": name,
+                "required": field.required,
+                "type": type_tokens(&field.type_ref),
+            }));
+        }
+    }
+    records
+}
+
+fn type_tokens(root: &TypeRef) -> Vec<String> {
+    enum Event<'a> {
+        Type(&'a TypeRef),
+        Field(&'a str, &'a ValueContractField),
+    }
+    let mut tokens = Vec::new();
+    let mut pending = vec![Event::Type(root)];
+    while let Some(event) = pending.pop() {
+        match event {
+            Event::Field(name, field) => {
+                tokens.push(String::from("field"));
+                tokens.push(name.to_owned());
+                tokens.push(
+                    if field.required {
+                        "required"
+                    } else {
+                        "optional"
+                    }
+                    .to_owned(),
+                );
+                pending.push(Event::Type(&field.type_ref));
+            }
+            Event::Type(type_ref) => {
+                tokens.push(
+                    if type_ref.nullable {
+                        "nullable"
+                    } else {
+                        "non_null"
+                    }
+                    .to_owned(),
+                );
+                match &type_ref.value_type {
+                    ValueType::Scalar { scalar } => match scalar {
+                        ValueScalar::Custom { name } => {
+                            tokens.push(String::from("custom"));
+                            tokens.push(name.clone());
+                        }
+                        scalar => {
+                            tokens.push(String::from("scalar"));
+                            tokens.push(value_scalar_token(scalar).to_owned());
+                        }
+                    },
+                    ValueType::Enum { name, values } => {
+                        tokens.push(String::from("enum"));
+                        tokens.push(name.clone());
+                        tokens.push(values.len().to_string());
+                        tokens.extend(values.iter().cloned());
+                    }
+                    ValueType::Object { fields } => {
+                        tokens.push(String::from("object"));
+                        tokens.push(fields.len().to_string());
+                        for (name, field) in fields.iter().rev() {
+                            pending.push(Event::Field(name, field));
+                        }
+                    }
+                    ValueType::List { element } => {
+                        tokens.push(String::from("list"));
+                        pending.push(Event::Type(element));
+                    }
+                    ValueType::Ref { name } => {
+                        tokens.push(String::from("ref"));
+                        tokens.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn value_scalar_token(scalar: &ValueScalar) -> &'static str {
+    match scalar {
+        ValueScalar::Boolean => "boolean",
+        ValueScalar::String => "string",
+        ValueScalar::Int32 => "int32",
+        ValueScalar::Int64 => "int64",
+        ValueScalar::UInt64 => "uint64",
+        ValueScalar::Decimal => "decimal",
+        ValueScalar::Uuid => "uuid",
+        ValueScalar::Date => "date",
+        ValueScalar::Timestamp => "timestamp",
+        ValueScalar::TimestampTz => "timestamptz",
+        ValueScalar::Json => "json",
+        ValueScalar::Custom { .. } => {
+            unreachable!("custom scalars retain their declared name as a separate token")
+        }
+    }
+}
+
+fn referenced_rule_hashes(command: &Command, rules: &RuleCatalog) -> BTreeMap<String, String> {
+    let mut names = BTreeSet::new();
+    let mut pending = Vec::new();
+    for guard in &command.guards {
+        names.insert(guard.rule.clone());
+        pending.extend(guard.bindings.values());
+    }
+    for step in &command.steps {
+        match &step.operation {
+            CommandStepOperation::SelectOne { select_one } => {
+                pending.extend(select_one.by.values());
+            }
+            CommandStepOperation::Insert { insert } => pending.extend(insert.object.values()),
+            CommandStepOperation::InsertMany { insert_many } => {
+                pending.push(&insert_many.for_each);
+                pending.extend(insert_many.object.values());
+            }
+            CommandStepOperation::Update { update } => {
+                pending.extend(update.predicate.values());
+                pending.extend(update.set.values());
+            }
+            CommandStepOperation::Delete { delete } => pending.extend(delete.predicate.values()),
+            CommandStepOperation::Assert { assert } => {
+                names.insert(assert.rule.clone());
+                pending.extend(assert.bindings.values());
+            }
+        }
+    }
+    pending.extend(command.result.fields.iter().map(|field| &field.value));
+    for effect in &command.effects {
+        match effect {
+            CommandEffect::StartProcess { start_process } => {
+                pending.extend(start_process.input.values());
+            }
+            CommandEffect::SignalProcess { signal_process } => {
+                pending.extend(signal_process.correlate.values());
+                pending.extend(signal_process.payload.values());
+            }
+        }
+    }
+    while let Some(value) = pending.pop() {
+        if let CommandValue::Rule { rule, bindings } = value {
+            names.insert(rule.clone());
+            pending.extend(bindings.values());
+        }
+    }
+    names
+        .into_iter()
+        .filter_map(|name| {
+            rules
+                .rule(&name)
+                .map(|rule| (name, rule.artifact.canonical_ast_sha256.clone()))
+        })
+        .collect()
+}
+
 /// Collect every deploy-time command diagnostic in one compiler traversal.
 ///
 /// `compile_command_catalog` retains its fail-closed `Result` API for
@@ -696,6 +1515,12 @@ fn compile_command_catalog_with_diagnostics(
     let mut names_by_source: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut diagnostics = Vec::new();
     let mut validated = Vec::new();
+    let context = CommandCompileContext {
+        metadata,
+        catalogs,
+        rules: &rules_snapshot,
+        infer_function_permissions,
+    };
     for (index, command) in metadata.commands.iter().enumerate() {
         let path = format!("commands[{index}]");
         let Some(source) = metadata
@@ -730,31 +1555,26 @@ fn compile_command_catalog_with_diagnostics(
                 ),
             ));
         }
-        if let Err(error) = validate_command(
-            metadata,
-            catalogs,
-            source,
-            rules,
-            infer_function_permissions,
-            command,
-            index,
-        ) {
-            diagnostics.push(error);
+        let Some(catalog) = catalogs.get(&source.name) else {
+            diagnostics.push(PlanError::validation(
+                &path,
+                format!("catalog for command source '{}' is missing", source.name),
+            ));
             continue;
-        }
+        };
+        let compiled = match compile_one_command(&context, source, catalog, command, index) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                diagnostics.push(error);
+                continue;
+            }
+        };
         if !duplicate_name {
             sources
                 .get_mut(&source.name)
                 .expect("Postgres command source was initialized")
                 .commands
-                .insert(
-                    command.name.clone(),
-                    CompiledCommand {
-                        source: source.name.clone(),
-                        definition: command.clone(),
-                        rules: rules_snapshot.clone(),
-                    },
-                );
+                .insert(command.name.clone(), compiled);
             validated.push(ValidatedCommand {
                 index,
                 source: &source.name,
@@ -2561,4 +3381,76 @@ fn role_or_parent_has_permission<'a>(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod descriptor_fingerprint_tests {
+    use super::*;
+
+    fn fingerprint_for_step_literal(literal: serde_json::Value) -> String {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "postgres",
+                "configuration": {
+                    "connection_info": { "database_url": "postgres://unused" }
+                }
+            }],
+            "commands": [{
+                "name": "canonical_literal",
+                "source": "default",
+                "steps": [{
+                    "name": "write",
+                    "insert": {
+                        "table": { "schema": "public", "name": "orders" },
+                        "object": {
+                            "payload": { "literal": literal }
+                        }
+                    }
+                }]
+            }]
+        }))
+        .expect("fingerprint fixture deserializes");
+        let empty_contract = ValueContractCatalog {
+            roots: BTreeMap::new(),
+            named_objects: BTreeMap::new(),
+        };
+        let rules = donat_rules::compile_catalog(&[], &[]).expect("empty rules compile");
+        command_descriptor_fingerprint(
+            &metadata.sources[0],
+            &metadata.commands[0],
+            &rules,
+            &empty_contract,
+            &empty_contract,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    fn nested_literal(reverse: bool) -> serde_json::Value {
+        let mut nested = serde_json::Map::new();
+        let mut root = serde_json::Map::new();
+        if reverse {
+            nested.insert("z".to_owned(), serde_json::json!(2));
+            nested.insert("a".to_owned(), serde_json::json!(1));
+            root.insert("second".to_owned(), serde_json::Value::Object(nested));
+            root.insert("first".to_owned(), serde_json::json!(true));
+        } else {
+            nested.insert("a".to_owned(), serde_json::json!(1));
+            nested.insert("z".to_owned(), serde_json::json!(2));
+            root.insert("first".to_owned(), serde_json::json!(true));
+            root.insert("second".to_owned(), serde_json::Value::Object(nested));
+        }
+        serde_json::Value::Object(root)
+    }
+
+    #[test]
+    fn fingerprint_sorts_nested_json_step_literal_keys_recursively() {
+        assert_eq!(
+            fingerprint_for_step_literal(nested_literal(false)),
+            fingerprint_for_step_literal(nested_literal(true)),
+            "object insertion order is not command semantics"
+        );
+    }
 }

@@ -856,6 +856,46 @@ fn is_null_parses_bool_operand() {
     ));
 }
 
+fn permission_is_null(session_value: &str) -> Result<SelectQuery, PlanError> {
+    let mut metadata = metadata();
+    metadata.sources[0].tables[2].select_permissions.push(
+        serde_json::from_value(json!({
+            "role": "null_filter",
+            "permission": {
+                "columns": ["id", "title"],
+                "filter": {
+                    "title": { "_is_null": "X-Donat-Is-Null" }
+                }
+            }
+        }))
+        .expect("permission fixture deserializes"),
+    );
+    let catalog = catalog();
+    Planner::new(&metadata, &catalog).plan_v1_select(
+        &json!({ "table": "article", "columns": ["id"] }),
+        &session("null_filter", &[("x-donat-is-null", session_value)]),
+    )
+}
+
+#[test]
+fn is_null_permission_session_string_is_strict_boolean() {
+    for (value, expected) in [("TRUE", true), ("false", false)] {
+        let query = permission_is_null(value)
+            .unwrap_or_else(|error| panic!("`{value}` must parse: {error:?}"));
+        assert!(matches!(
+            query.predicate,
+            Some(BoolExp::Compare {
+                op: CompareOp::IsNull(actual),
+                ..
+            }) if actual == expected
+        ));
+    }
+
+    let error = permission_is_null("yes").expect_err("non-boolean session text must fail closed");
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.message, "expected a boolean");
+}
+
 #[test]
 fn column_compare_root_and_relationship_paths() {
     // ["$", col] compares against the bool_exp's root table.
