@@ -228,7 +228,11 @@ implemented once in this lower crate and are reused by commands, processes,
 and connectors. External JSON conversion stays in separately gated adapters.
 Assignability is exact after alias normalization except that any JSON-shaped
 contract is assignable to `json`; nominal enum, object, and custom-scalar
-names never widen to one another.
+names never widen to one another. Exact catalog assignment compares the
+complete `named_objects` table in both directions, including declarations
+unreachable from every root. An extra, missing, or field-incompatible
+unreachable named object therefore rejects; reachability does not erase part
+of the closed contract.
 
 The declared identifier grammar has no implicit GraphQL-reserved-name rule.
 `__bad` is a valid identifier because it matches the grammar; only an explicit
@@ -342,10 +346,40 @@ contract required by that role's effective table permissions, command
 idempotency scope, and command-effect bindings. Incompatible uses of one name
 are a deployment error.
 
+Permission-filter inspection and runtime bool-exp planning use one shared,
+closed predicate-operator classifier after the existing legacy-name
+normalization and backend-capability checks. It assigns descriptor session
+contracts as follows:
+
+- scalar comparison, pattern, JSON value, and spatial predicate operands use
+  the non-null contract of the predicate's column;
+- `_in` and `_nin` use a non-null list of non-null column scalars;
+- `_is_null` uses non-null `Boolean`, and a resolved permission-session text
+  value accepts only case-insensitive `true` or `false`; all other text fails
+  validation;
+- `_has_key` uses non-null `String`, while `_has_keys_any` and
+  `_has_keys_all` use non-null lists of non-null `String`;
+- `_st_d_within` and `_st_3d_d_within` use non-null `Decimal` for `distance`
+  and the nominal predicate-column contract for `from`; and
+- relationship predicates and `_exists._where` resolve columns against the
+  referenced remote table context.
+
+Permission presets contribute a contract only when the preset value is
+directly a session-variable string; descriptor compilation does not search
+arbitrary preset JSON recursively. A predicate on a computed field whose
+definition has `session_argument` is a deployment error because that
+whole-session argument cannot publish a closed session-variable name set.
+Unknown operators, unavailable capabilities, missing remote contexts, or
+incompatible contracts for one role/name fail closed rather than falling back
+to `String` or a local-table guess.
+
 `definition_fingerprint` is lowercase SHA-256 over versioned canonical JSON
 containing the source, name, recursive argument/result contracts, allowed
-roles, required session-variable contracts, steps, Rule artifact hashes,
-idempotency declaration, and canonical raw effect declarations. The raw effect
+roles, required session-variable contracts, ordered raw guard declarations,
+steps, Rule artifact hashes, idempotency declaration, and canonical raw effect
+declarations. Canonicalization recursively sorts every JSON object key and
+preserves every list's supplied order, including raw guard order; guard rule,
+binding, and message changes therefore change the fingerprint. The raw effect
 material contains process/signal names and raw binding shapes, but no resolved
 process revision. Consequently a process revision may include a command
 fingerprint without creating a fingerprint cycle when that command's effect is
@@ -2018,11 +2052,23 @@ a native conformance fixture. The focused identifiers are normative:
 | `value_contract_timestamp_grammar_is_exact` | value-contract unit | local timestamp accepts only valid `T`-separated no-offset values with zero-to-six fractional digits; timestamptz requires `Z`/offset |
 | `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
 | `value_contract_has_one_owner` | workspace policy | process and connector plans name the same Task-1 crate and commit; no connector-local value implementation exists |
+| `value_contract_assignability_compares_unreachable_named_objects` | value-contract unit | exact assignment compares the full named-object table, so extra, missing, or incompatible unreachable declarations reject |
 | `inline_bytes_have_one_inert_owner` | value-contract/workspace | the lower crate alone owns bytes, bounded media type/file name, and canonical accounting while every external adapter remains gated |
 | `inline_binary_canonical_size_vectors_are_exact` | value-contract unit | an independent checked oracle proves unpadded RFC 4648 base64url, root/outer JCS order and escaping, and the 174,817/262,144/262,145-byte vectors |
 | `inline_binary_count_and_decoded_bounds_are_exact` | value-contract unit | 131,072 aggregate decoded bytes and 16 inline values are accepted boundaries; one-byte/one-value excess rejects |
 | `inline_binary_external_adapters_remain_disabled` | boundary unit | metadata, JSON/form, connector admission, multipart, commands, and process journals reject `InlineBytes` |
+| `adapter_normalizes_custom_types_and_recursive_refs` | IR unit | the sole metadata adapter emits normalized custom scalars, enums, input objects, and recursive references |
+| `adapter_rejects_unknown_duplicate_and_invalid_refs` | IR unit | unknown, duplicate, and malformed declarations fail before a descriptor publishes |
+| `adapter_accepts_the_declared_double_underscore_identifier_grammar` | IR unit | adapter normalization preserves the shared grammar in which `__bad` has no implicit reserved-prefix rejection |
+| `missing_command_source_catalog_is_a_validation_error` | schema unit | an absent source catalog reports the exact command validation error instead of panicking |
 | `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
+| `command_descriptor_session_contracts_follow_predicate_operators_and_tables` | schema unit | list/is-null operands and relationship/_exists recursion publish contracts from the shared operator classifier and remote table context |
+| `command_descriptor_session_contracts_follow_operator_operand_types` | schema unit | JSON key operands and spatial distance/from operands publish their exact String/List<String>/Decimal/nominal-column contracts |
+| `command_descriptor_rejects_computed_permission_session_argument` | schema unit | a whole-session computed-field argument cannot publish a closed session-variable name set and fails deployment |
+| `command_descriptor_rejects_predicate_operator_contract_conflicts` | schema unit | one role/name used by operators with incompatible operand contracts fails deployment |
+| `command_descriptor_fingerprint_is_pre_process_and_deterministic` | schema unit | recursive key sorting plus ordered raw guards/effects and Rule hashes are deterministic and exclude resolved process revisions |
+| `command_descriptor_rejects_incompatible_session_variable_uses` | schema unit | incompatible permission-column uses of one role/name fail before serving |
+| `is_null_permission_session_string_is_strict_boolean` | planner unit | resolved permission-session text accepts only case-insensitive true/false and rejects all other text |
 | `process_connector_ledger_uses_catalog_specs_without_local_descriptors` | cross-plan boundary | Processes consume accepted `OperationSpec`/`TriggerSpec` and ABI IDs; no server-local string descriptor model exists |
 | `process_connector_registry_is_the_only_task_3_to_14_catalog` | cross-plan boundary | compiler, reconcile, activity, ingress, and rolling tests use one accepted static registry |
 | `process_connector_inventory_only_stripe_mutation_is_not_executable` | connector/process boundary | Stripe mutation is absent from process operation lookup until immutable evidence and executable migration commits both pass; a webhook trigger grants no operation |

@@ -102,7 +102,9 @@ no-change acceptance is outside the numbered task count.
 - Modify: `crates/schema/Cargo.toml`
 - Modify: `crates/schema/src/commands.rs`
 - Modify: `crates/schema/src/lib.rs`
+- Modify: `crates/schema/src/predicate.rs`
 - Modify: `crates/schema/tests/commands.rs`
+- Modify: `crates/schema/tests/planner.rs`
 
 **Interfaces created here:**
 
@@ -327,15 +329,25 @@ land.
 - `canonical_decimal_spelling_is_exact`
 - `value_contract_timestamp_grammar_is_exact`
 - `value_contract_assignability_is_nominal_except_json`
+- `value_contract_assignability_compares_unreachable_named_objects`
 - `value_contract_no_std_boundary_is_mechanical`
 - `inline_bytes_have_one_inert_owner`
 - `inline_binary_canonical_size_vectors_are_exact`
 - `inline_binary_count_and_decoded_bounds_are_exact`
 - `inline_binary_external_adapters_remain_disabled`
 - `ir_reexports_the_only_value_contract_types`
+- `adapter_normalizes_custom_types_and_recursive_refs`
+- `adapter_rejects_unknown_duplicate_and_invalid_refs`
+- `adapter_accepts_the_declared_double_underscore_identifier_grammar`
+- `missing_command_source_catalog_is_a_validation_error`
 - `command_descriptor_exposes_exact_contract`
+- `command_descriptor_session_contracts_follow_predicate_operators_and_tables`
+- `command_descriptor_session_contracts_follow_operator_operand_types`
+- `command_descriptor_rejects_computed_permission_session_argument`
+- `command_descriptor_rejects_predicate_operator_contract_conflicts`
 - `command_descriptor_fingerprint_is_pre_process_and_deterministic`
 - `command_descriptor_rejects_incompatible_session_variable_uses`
+- `is_null_permission_session_string_is_strict_boolean`
 
 - [ ] **Step 1: Add the failing lower-contract and boundary tests**
 
@@ -353,9 +365,12 @@ land.
   exception. Construct decimals only through `CanonicalDecimal::try_new`;
   accept `-12.5`, `0.01`, and `10`, and reject `-12.50e+2`, `-12.50`,
   `01`, `-0`, `0.0`, `1.`, whitespace, plus, and non-finite spellings.
-  Prove its private canonical spelling is what `canonical_size` counts. In the
-  same failing value-contract test file, assert the sole inert owner,
-  disabled external adapters, and these exact independent size/count vectors:
+  Prove its private canonical spelling is what `canonical_size` counts.
+  Exact assignability must compare the complete `named_objects` table in both
+  directions, including declarations unreachable from any root: an extra,
+  missing, or field-incompatible unreachable declaration rejects. In the same
+  failing value-contract test file, assert the sole inert owner, disabled
+  external adapters, and these exact independent size/count vectors:
 
   ~~~text
   131,072 zero bytes, application/octet-stream, no filename -> 174,817 bytes
@@ -378,15 +393,41 @@ land.
   boundary, rejection of non-ASCII media types, file-name-as-data semantics,
   the 131,072 aggregate decoded-byte/16-value accepted boundaries, and both
   one-over rejections. Assert that IR re-exports the exact constructor type
-  and `canonical_size` function rather than wrapping them.
+  and `canonical_size` function rather than wrapping them. Name the adapter
+  regressions exactly as listed above so custom-type normalization, invalid
+  references, and the declared `__bad` identifier behavior remain visible.
 
-- [ ] **Step 2: Add the failing command-descriptor tests**
+- [ ] **Step 2: Add the failing command-descriptor and predicate tests**
 
-  Add the three exact schema tests. The command fixture has a recursive
-  argument, nullable result, two classic roles, role-distinct session
-  variables, Rule use, idempotency, and raw `start_process`. Assert the
-  fingerprint changes with raw effect shape but contains no resolved process
-  revision, request value, environment value, credential, or secret.
+  Add the exact command and planner regressions listed above. The command
+  fixture has a recursive argument, nullable result, two classic roles,
+  role-distinct session variables, Rule use, idempotency, ordered raw guards,
+  and raw `start_process`. Prove a missing command-source catalog returns the
+  `commands[0]` validation error instead of reaching the former panic path.
+
+  In `crates/schema/src/predicate.rs`, make runtime bool-exp planning and
+  descriptor session collection call one closed normalized predicate-operator
+  classifier. Scalar operators require the non-null column scalar; `_in` and
+  `_nin` require a non-null list of non-null column scalars; `_is_null`
+  requires `Boolean`; `_has_key` requires `String`;
+  `_has_keys_any`/`_has_keys_all` require a non-null `List<String>`;
+  `_st_d_within`/`_st_3d_d_within` require `Decimal` for `distance` and the
+  nominal source-column contract for `from`. Relationship predicates and
+  `_exists._where` switch to their remote table context. Collect only a
+  direct session-variable string used as a permission preset; do not scan
+  arbitrary preset JSON recursively. A computed-field predicate whose
+  definition has `session_argument` fails descriptor compilation because it
+  cannot publish a closed session-variable name set. Conflicting contracts
+  for one role/name fail deployment.
+
+  In `crates/schema/tests/planner.rs`, prove a resolved permission-session
+  `_is_null` value accepts only case-insensitive text `true` or `false` and
+  rejects every other text as `validation-failed`. Assert the descriptor
+  fingerprint changes with raw effect shape, ordered raw guard binding or
+  message changes, and referenced Rule hashes, but contains no resolved
+  process revision, request value, environment value, credential, or secret.
+  Fingerprint canonicalization recursively sorts every JSON object key while
+  retaining declaration/list order, including raw guard order.
 
 - [ ] **Step 3: Run RED**
 
@@ -396,6 +437,9 @@ land.
   cargo test -p donat-value-contract
   cargo test -p donat-ir --test value_contract_adapter
   cargo test -p donat-schema --test commands command_descriptor
+  cargo test -p donat-schema --test commands missing_command_source_catalog
+  cargo test -p donat-schema --test planner \
+    is_null_permission_session_string_is_strict_boolean
   cargo check -p donat-value-contract --no-default-features \
     --target thumbv7em-none-eabi
   ~~~
@@ -408,7 +452,8 @@ land.
 
   Add the crate to the workspace. Implement the closed parser, bounded
   constructors, canonical scalar/collection validation, deterministic object
-  order, canonical sizing, and exact assignability. Implement
+  order, canonical sizing, and exact assignability across both roots and the
+  complete named-object table, including unreachable declarations. Implement
   `CanonicalDecimal` with the private checked spelling above; do not expose
   `Decimal(String)` or normalize an ambiguous caller spelling implicitly.
   Implement
@@ -424,8 +469,13 @@ land.
 
   Move single-source command work into `compile_command_source_catalog`; make
   the global compiler compose it. Collect role-specific required session
-  variables from effective permissions, idempotency scope, and raw effects.
-  Hash versioned canonical JSON with raw effects but no resolved revision.
+  variables from effective permission predicates through the one shared
+  runtime/descriptor operator classifier, from direct permission presets,
+  idempotency scope, and raw effects. Reject computed-field
+  `session_argument`, unknown remote contexts, and incompatible contracts
+  rather than guessing a type or session-variable name. Hash versioned
+  canonical JSON with ordered raw guards and raw effects but no resolved
+  revision; recursively sort JSON object keys while preserving all list order.
 
 - [ ] **Step 6: Run GREEN**
 
@@ -433,6 +483,7 @@ land.
   cargo test -p donat-value-contract
   cargo test -p donat-ir
   cargo test -p donat-schema --test commands
+  cargo test -p donat-schema --test planner
   cargo test -p donat-schema --test multi_source
   cargo check -p donat-value-contract --no-default-features \
     --target thumbv7em-none-eabi
@@ -448,8 +499,12 @@ land.
 - [ ] **Step 7: Commit**
 
   ~~~bash
-  git add Cargo.toml Cargo.lock crates/value-contract crates/ir \
-    crates/schema/Cargo.toml crates/schema/src crates/schema/tests
+  git add Cargo.toml Cargo.lock crates/value-contract \
+    crates/ir/Cargo.toml crates/ir/src/lib.rs \
+    crates/ir/src/value_contract.rs crates/ir/tests/value_contract_adapter.rs \
+    crates/schema/Cargo.toml crates/schema/src/commands.rs \
+    crates/schema/src/lib.rs crates/schema/src/predicate.rs \
+    crates/schema/tests/commands.rs crates/schema/tests/planner.rs
   git commit -m "feat(processes): publish closed command contracts"
   ~~~
 

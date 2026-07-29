@@ -42,7 +42,10 @@ exception, so `__bad` remains valid. Decimal values use a private
 `CanonicalDecimal` constructor and an already minimal fixed-point spelling:
 no exponent, leading plus, noncanonical integer leading zero, negative zero,
 trailing point, or trailing fractional zero. Canonical sizing counts that
-checked spelling, not an arbitrary `String`.
+checked spelling, not an arbitrary `String`. Exact contract assignability
+compares roots and the complete named-object table in both directions,
+including declarations unreachable from any root; reachability cannot hide an
+extra, missing, or incompatible part of the closed contract.
 
 Inline bytes are sized against their exact future RFC 8785 representation:
 the byte string is RFC 4648 base64url without padding, and the root object is
@@ -52,13 +55,27 @@ Production and independent test-oracle helpers use checked arithmetic for
 base64 expansion and JCS string escaping; the lower crate does not acquire a
 JSON dependency or external adapter.
 
-`donat-schema` compiles commands to public pre-process descriptors whose
-canonical fingerprints include raw effect declarations but no resolved process
-revision. The accepted connector-factory plan owns exact ABI IDs and the
-catalog-owned `OperationSpec`, `TriggerSpec`, effects, bounds, and generated
-entries. Its server `ConnectorRegistry` is the one catalog consumed by every
-process compiler and runtime stage. The Process Task-2 ledger records the
-reviewed ABI/catalog/executor/registry/webhook commits; it does not create
+`donat-schema` compiles commands to public pre-process descriptors. Runtime
+permission planning and descriptor session-contract collection use one closed
+predicate-operator classifier. Scalar operands use the non-null column
+contract; `_in`/`_nin` use a non-null list of non-null column scalars;
+`_is_null` uses `Boolean` and accepts only resolved permission-session text
+`true`/`false` case-insensitively; JSON key operators use `String` or
+`List<String>`; and spatial distance uses `Decimal` while `from` retains the
+nominal predicate-column contract. Relationship and `_exists` recursion
+switches to the remote table context. Only direct session-variable permission
+presets are collected. A computed-field `session_argument` fails descriptor
+compilation because it cannot publish a closed name set, and incompatible
+role/name uses fail rather than widening.
+
+Descriptor fingerprints recursively sort every JSON object key while
+preserving list order. They include ordered complete raw guard declarations,
+raw effect declarations, and referenced Rule artifact hashes, but no resolved
+process revision. The accepted connector-factory plan owns exact ABI IDs and
+the catalog-owned `OperationSpec`, `TriggerSpec`, effects, bounds, and
+generated entries. Its server `ConnectorRegistry` is the one catalog consumed
+by every process compiler and runtime stage. The Process Task-2 ledger records
+the reviewed ABI/catalog/executor/registry/webhook commits; it does not create
 server-local string descriptors or a second effect model. Inventory-only
 entries are not executable, and Stripe mutation remains inventory-only unless
 its separate immutable-evidence and executable-migration gates both pass. An
