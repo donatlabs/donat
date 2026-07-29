@@ -28,13 +28,19 @@ every binding slot. The exact 100,000-node, 16-inline-value, and
 131,072-decoded-inline-byte limits apply to the complete bindings envelope,
 not independently to each root.
 
+Fourth, storing the 97-byte `StaticErrorCode` and approximately 1,026-byte
+`StaticSafeMessage` inline would make `ConnectorFailure` a large `Err` variant
+for every `Result<_, ConnectorFailure>`. The ABI's mandatory
+`cargo clippy -- -D warnings` gate would reject that layout through
+`clippy::result_large_err`.
+
 This design closes those gaps without changing the accepted connector crate
 graph, host trait signatures, error classes, value-contract ownership, or
 static-factory boundary.
 
 ## Decision
 
-The ABI owns five invariant-carrying types:
+The ABI owns five public invariant-carrying types:
 
 1. `StaticErrorCode`, a private-field wrapper over the existing checked
    `InlineId`;
@@ -42,8 +48,8 @@ The ABI owns five invariant-carrying types:
 3. `AuthorizedCorrelations`, a private bounded map with no public insertion
    path;
 4. `BoundedTransportResponse`, an immutable private-field response envelope;
-5. `ConnectorFailure`, an immutable failure containing only static
-   Donat-owned text and host/catalog-authorized correlations.
+5. `ConnectorFailure`, an immutable failure containing one private boxed
+   static-text bundle and host/catalog-authorized correlations.
 
 Ordinary checked response construction creates no correlation authority.
 The server attaches authority through the uniquely named
@@ -132,10 +138,14 @@ impl BoundedTransportResponse {
     ) -> &AuthorizedCorrelations;
 }
 
-pub struct ConnectorFailure {
-    class: ConnectorErrorClass,
+struct StaticFailureText {
     code: StaticErrorCode,
     safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
     retry_after_seconds: Option<u32>,
     correlation_ids: BTreeMap<CapabilityId, BoundedString>,
 }
@@ -178,6 +188,20 @@ Read-only collection access cannot invalidate a checked response.
 `MAXIMUM_RETRY_AFTER_SECONDS`. It never accepts a raw code, raw safe message,
 raw correlation map, or caller-supplied allowlist.
 
+`StaticFailureText` is private and has no independent constructor or accessor.
+`ConnectorFailure::try_new` validates all remaining inputs and boxes the two
+already validated static values together as
+`Box::new(StaticFailureText { code, safe_message })`. It publishes the failure
+only after the complete value exists. `code()` and `safe_message()` dereference
+`static_text`. The public constructor and accessor signatures remain
+unchanged.
+
+The box uses `alloc::boxed::Box`, so the ABI remains `no_std + alloc` with no
+new dependency. The `ConnectorFailure` `Err` layout contains one pointer
+instead of both inline fixed-capacity values. No
+`allow(clippy::result_large_err)`, `expect(clippy::result_large_err)`, crate
+lint override, or command-line lint suppression is permitted.
+
 ## Static failure text
 
 `StaticErrorCode` uses the existing `InlineId` representation and validator.
@@ -204,6 +228,12 @@ The shared const-capable validator enforces all of these conditions:
 `StaticSafeMessage::literal` and the runtime catalog constructor call the same
 validator and byte copier. There is no second message grammar. `as_str` uses
 checked UTF-8 conversion and no unsafe code.
+
+`StaticErrorCode` and `StaticSafeMessage` retain their exact public
+representations and const behavior. Boxing occurs only when
+`ConnectorFailure::try_new` combines them into the private
+`StaticFailureText`; catalog entries and processor constants remain inline,
+const-constructible values.
 
 Processor implementations use `literal` only with reviewed source literals.
 They cannot convert response strings, provider bodies, headers, credentials,
@@ -362,7 +392,9 @@ The complete flow is:
    message, optional retry delay, and either
    `Some(response.authorized_correlations())` or `None`.
 7. `ConnectorFailure` clones the authorized bounded map, clamps the retry
-   delay, and exposes only shared read access.
+   delay, boxes the code and safe message together as one private
+   `StaticFailureText`, and exposes only shared read access by dereferencing
+   that box.
 
 Provider bodies, provider messages, arbitrary headers, authorization
 material, credentials, URLs, and tokens never enter the failure. Task 8's
@@ -462,6 +494,12 @@ Every validation path fails atomically; no constructor returns a truncated
 header map, partial correlation set, partial typed value, or shortened safe
 message.
 
+Failure construction creates exactly one `Box<StaticFailureText>` after its
+static values and bounded correlations have passed validation. No caller can
+observe or recover a partially assembled static-text bundle. Allocation uses
+the standard `alloc` allocation-failure behavior and does not introduce a new
+ABI error variant.
+
 The new static constructors return:
 
 - `AbiError::InvalidValue("connector failure code must be a canonical ABI identifier")`
@@ -514,6 +552,8 @@ either restricted construction namespace and no allocation-leak API.
 Processors propagate failures from `ConnectorIo` and `ProcessorControl`.
 When a reviewed processor creates a failure, it supplies only source-static
 code/message values and either host-supplied opaque correlations or none.
+It neither constructs nor names `StaticFailureText`; boxing remains an ABI
+implementation detail.
 The `OperationProcessor` result type and `ConnectorIo::call` signature do not
 change.
 
@@ -533,6 +573,8 @@ catalog `ErrorAction` directly into `ConnectorFailure::try_new`. It never
 converts raw provider text into either type. Transport failures use
 `None` when no authorized correlations exist. Error responses use the opaque
 authorized set produced from captured headers and the selected action.
+The server does not allocate or inspect `StaticFailureText`; the ABI performs
+the single private box allocation.
 
 No server method accepts a raw failure code, raw safe message, raw correlation
 allowlist, or arbitrary correlation map.
@@ -567,6 +609,10 @@ ABI tests prove:
 - a selected-but-unallowed correlation is never authorized;
 - duplicate and oversized allowlists fail;
 - code/message literals work in `const` and `static` positions;
+- `ConnectorFailure::code()` and `safe_message()` return the two values stored
+  in the private boxed bundle;
+- `ConnectorFailure` remains below Clippy's large-error threshold without a
+  lint override or suppression;
 - empty, oversized, invalid-code, and control-bearing text fails;
 - retry delay clamps at 86,400 seconds;
 - 16 and 17 inline values split across slots are exercised;
@@ -596,7 +642,10 @@ cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
 cargo tree -p donat-connector-abi --target all \
   --edges normal,build --no-default-features --offline --locked
 cargo clippy -p donat-connector-abi --all-targets --no-default-features \
-  -- -D warnings
+  -- -D warnings -D clippy::result_large_err
+if rg -n 'result[_-]large[_-]err' crates/connector-abi; then
+  exit 1
+fi
 cargo fmt --all -- --check
 cargo build -p donat-server --bin donat
 cargo test -p donat-conformance --test connectors
@@ -611,7 +660,9 @@ either value. The focused `connectors` target runs against the freshly rebuilt
 The dependency tree contains only `donat-connector-abi` and
 `donat-value-contract`. The no-OS build, object-safety assertions,
 exact-call-signature assertions, server build, focused connector coverage,
-and full conformance remain mandatory.
+and full conformance remain mandatory. The negative source scan proves that
+the green strict-Clippy result comes from the bounded private layout rather
+than a source attribute, lint expectation, lint override, or suppression.
 
 ## Migration from `db289dc`
 
@@ -626,6 +677,11 @@ The migration is source-breaking and contains no compatibility shim:
   allowlist)` with
   `ConnectorFailure::try_new(class, StaticErrorCode, StaticSafeMessage,
   retry, Option<&AuthorizedCorrelations>)`;
+- add private `StaticFailureText { code, safe_message }` and store it as
+  `Box<StaticFailureText>` inside `ConnectorFailure`;
+- retain the exact public `ConnectorFailure::try_new`, `code()`, and
+  `safe_message()` signatures while changing only their private storage and
+  dereference path;
 - replace raw test strings with static literals or catalog-construction test
   calls;
 - replace direct failure/response field assertions with accessors;
