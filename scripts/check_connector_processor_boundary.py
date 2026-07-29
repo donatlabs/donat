@@ -187,6 +187,28 @@ def in_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= offset < end for start, end in ranges)
 
 
+def macro_invocation_ranges(source: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    pattern = re.compile(
+        r"\b(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*"
+        r"[A-Za-z_][A-Za-z0-9_]*\s*!\s*([\(\{\[])"
+    )
+    closing = {"(": ")", "{": "}", "[": "]"}
+    for match in pattern.finditer(source):
+        opening = match.start(1)
+        stack: list[str] = []
+        for cursor in range(opening, len(source)):
+            character = source[cursor]
+            if character in closing:
+                stack.append(closing[character])
+            elif stack and character == stack[-1]:
+                stack.pop()
+                if not stack:
+                    ranges.append((match.start(), cursor + 1))
+                    break
+    return ranges
+
+
 def rust_attribute_ranges(source: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     offset = 0
@@ -303,6 +325,38 @@ def yaml_without_comments(source: str) -> list[str]:
     return lines
 
 
+def yaml_scalar(
+    lines: list[str],
+    index: int,
+    indentation: int,
+    value: str,
+) -> tuple[str, int]:
+    if value.startswith(("|", ">")):
+        block: list[str] = []
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if not line.strip():
+                block.append("")
+                index += 1
+                continue
+            line_indentation = len(line) - len(line.lstrip())
+            if line_indentation <= indentation:
+                break
+            block.append(line.strip())
+            index += 1
+        return "\n".join(block), index
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            decoded = value
+        return (decoded if isinstance(decoded, str) else value), index + 1
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'"), index + 1
+    return value, index + 1
+
+
 def workflow_run_commands(source: str) -> list[str]:
     lines = yaml_without_comments(source)
     commands: list[str] = []
@@ -315,34 +369,54 @@ def workflow_run_commands(source: str) -> list[str]:
             continue
         indentation = len(match.group("indent"))
         value = match.group("value").strip()
-        if value.startswith(("|", ">")):
-            block: list[str] = []
-            index += 1
-            while index < len(lines):
-                line = lines[index]
-                if not line.strip():
-                    block.append("")
-                    index += 1
-                    continue
-                line_indentation = len(line) - len(line.lstrip())
-                if line_indentation <= indentation:
-                    break
-                block.append(line.strip())
-                index += 1
-            commands.append("\n".join(block))
-            continue
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            try:
-                decoded = ast.literal_eval(value)
-            except (SyntaxError, ValueError):
-                decoded = value
-            commands.append(decoded if isinstance(decoded, str) else value)
-        elif len(value) >= 2 and value[0] == value[-1] == "'":
-            commands.append(value[1:-1].replace("''", "'"))
-        else:
-            commands.append(value)
-        index += 1
+        scalar, index = yaml_scalar(lines, index, indentation, value)
+        commands.append(scalar)
     return commands
+
+
+def workflow_rustflags(source: str) -> list[str]:
+    lines = yaml_without_comments(source)
+    values: list[str] = []
+    env_pattern = re.compile(r"^(?P<indent>\s*)(?:-\s*)?env\s*:\s*$")
+    rustflags_pattern = re.compile(
+        r"^(?P<indent>\s*)(?:RUSTFLAGS|\"RUSTFLAGS\"|'RUSTFLAGS')"
+        r"\s*:\s*(?P<value>.*)$"
+    )
+    index = 0
+    while index < len(lines):
+        env_match = env_pattern.match(lines[index])
+        if not env_match:
+            index += 1
+            continue
+        env_indentation = len(env_match.group("indent"))
+        index += 1
+        entry_indentation: int | None = None
+        while index < len(lines):
+            line = lines[index]
+            if not line.strip():
+                index += 1
+                continue
+            line_indentation = len(line) - len(line.lstrip())
+            if line_indentation <= env_indentation:
+                break
+            if entry_indentation is None:
+                entry_indentation = line_indentation
+            if line_indentation != entry_indentation:
+                index += 1
+                continue
+            rustflags_match = rustflags_pattern.match(line)
+            if not rustflags_match:
+                index += 1
+                continue
+            value = rustflags_match.group("value").strip()
+            scalar, index = yaml_scalar(
+                lines,
+                index,
+                len(rustflags_match.group("indent")),
+                value,
+            )
+            values.append(scalar)
+    return values
 
 
 def lint_suppression(relative: str, source: str, code: str) -> Finding | None:
@@ -359,7 +433,7 @@ def lint_suppression(relative: str, source: str, code: str) -> Finding | None:
                 return Finding(start, "large-error-lint-suppression", message)
         return None
 
-    if relative.endswith(".toml"):
+    if relative.endswith(".toml") or relative == ".cargo/config":
         try:
             document = tomllib.loads(source)
         except tomllib.TOMLDecodeError:
@@ -381,6 +455,9 @@ def lint_suppression(relative: str, source: str, code: str) -> Finding | None:
     for command in workflow_run_commands(source):
         if flags_suppress_large_error(flag_tokens(command)):
             return Finding(0, "large-error-lint-suppression", message)
+    for rustflags in workflow_rustflags(source):
+        if flags_suppress_large_error(flag_tokens(rustflags)):
+            return Finding(0, "large-error-lint-suppression", message)
     return None
 
 
@@ -393,6 +470,7 @@ def static_literal_indirection(
     ):
         return None
 
+    macro_ranges = macro_invocation_ranges(code)
     for type_name in ("StaticErrorCode", "StaticSafeMessage"):
         reexport = re.search(
             rf"\bpub\s+use\b[^;]*\b{type_name}\b[^;]*;",
@@ -428,6 +506,17 @@ def static_literal_indirection(
                 "static-literal-type-alias",
                 f"{type_name}::literal cannot be reached through a type alias outside STATIC_LITERAL_ROOTS",
             )
+
+        for start, end in macro_ranges:
+            invocation = code[start:end]
+            if re.search(rf"\b{type_name}\b", invocation) and re.search(
+                r"\bliteral\b", invocation
+            ):
+                return Finding(
+                    start,
+                    "static-literal-wrapper",
+                    f"{type_name}::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
+                )
 
         token_macro = re.search(r"\bmacro_rules\s*!", code)
         generic_token_literal = re.search(
@@ -570,6 +659,7 @@ def host_trait_indirection(
     code: str,
     test_ranges: list[tuple[int, int]],
 ) -> Finding | None:
+    macro_ranges = macro_invocation_ranges(code)
     for trait_name in ("ConnectorIo", "ProcessorControl"):
         reexport = re.search(
             rf"\bpub\s+use\b[^;]*\b{trait_name}\b[^;]*;",
@@ -615,6 +705,19 @@ def host_trait_indirection(
                 "host-trait-type-alias",
                 f"{trait_name} cannot be reached through a type alias outside approved host implementation roots",
             )
+
+        for start, end in macro_ranges:
+            if (
+                re.search(rf"\b{trait_name}\b", code[start:end])
+                and not approved_host_trait_indirection(
+                    relative, start, test_ranges
+                )
+            ):
+                return Finding(
+                    start,
+                    "host-trait-implementation",
+                    "host traits can only be implemented in approved host or test roots",
+                )
 
         token_macro = (
             re.search(r"\bmacro_rules\s*!", code)
@@ -946,6 +1049,53 @@ def fixtures() -> tuple[Fixture, ...]:
             "static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
         ),
         Fixture(
+            "crates/macro-support/src/static_literal.rs",
+            "#[macro_export]\n"
+            "macro_rules! construct_static {\n"
+            "    ($kind:ty, $method:ident, $value:expr) => {\n"
+            "        <$kind>::$method($value)\n"
+            "    };\n"
+            "}",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_error_cross_file_tokens.rs",
+            "use macro_support::construct_static;\n"
+            "const CODE: donat_connector_abi::StaticErrorCode = construct_static!(\n"
+            "    donat_connector_abi::StaticErrorCode,\n"
+            "    literal,\n"
+            '    "connector_failed",\n'
+            ");",
+            "static-literal-wrapper: StaticErrorCode::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/server/src/connectors/forbidden_static_message_cross_file_tokens.rs",
+            "use macro_support::construct_static;\n"
+            "const MESSAGE: donat_connector_abi::StaticSafeMessage = construct_static!(\n"
+            "    donat_connector_abi::StaticSafeMessage,\n"
+            "    literal,\n"
+            '    "connector failed",\n'
+            ");",
+            "static-literal-wrapper: StaticSafeMessage::literal cannot be forwarded by a macro outside STATIC_LITERAL_ROOTS",
+        ),
+        Fixture(
+            "crates/connector-processors/src/allowed_static_cross_file_tokens.rs",
+            "use macro_support::construct_static;\n"
+            "const CODE: donat_connector_abi::StaticErrorCode = construct_static!(\n"
+            "    donat_connector_abi::StaticErrorCode,\n"
+            "    literal,\n"
+            '    "connector_failed",\n'
+            ");",
+            None,
+        ),
+        Fixture(
+            "crates/server/src/connectors/macro_token_decoy.rs",
+            "// construct_static!(StaticErrorCode, literal, value);\n"
+            'const TEXT: &str = "implement_host!(ConnectorIo, Bad)";\n'
+            "/* construct_static!(StaticSafeMessage, literal, value); */",
+            None,
+        ),
+        Fixture(
             "crates/server/src/connectors/comment_decoy.rs",
             "// host_construction::transport_response();\n"
             'const TEXT: &str = "StaticErrorCode::literal(\\\"bad\\\")";\n'
@@ -1069,6 +1219,34 @@ def fixtures() -> tuple[Fixture, ...]:
             "}\n"
             "implement_host!(ProcessorControl);",
             "host-trait-implementation: host traits can only be implemented in approved host or test roots",
+        ),
+        Fixture(
+            "crates/macro-support/src/host_impl.rs",
+            "#[macro_export]\n"
+            "macro_rules! implement_host {\n"
+            "    ($host_trait:ident, $host:ty) => {\n"
+            "        impl donat_connector_abi::$host_trait for $host {}\n"
+            "    };\n"
+            "}",
+            None,
+        ),
+        Fixture(
+            "crates/connector-processors/src/connector_io_cross_file_token.rs",
+            "use macro_support::implement_host;\n"
+            "implement_host!(donat_connector_abi::ConnectorIo, Bad);",
+            "host-trait-implementation: host traits can only be implemented in approved host or test roots",
+        ),
+        Fixture(
+            "crates/connector-processors/src/processor_control_cross_file_token.rs",
+            "use macro_support::implement_host;\n"
+            "implement_host!(donat_connector_abi::ProcessorControl, Bad);",
+            "host-trait-implementation: host traits can only be implemented in approved host or test roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/allowed_host_cross_file_token.rs",
+            "use macro_support::implement_host;\n"
+            "implement_host!(donat_connector_abi::ConnectorIo, ServerIo);",
+            None,
         ),
         Fixture(
             "crates/connector-processors/src/owned.rs",
@@ -1197,6 +1375,11 @@ def fixtures() -> tuple[Fixture, ...]:
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
         ),
         Fixture(
+            ".cargo/config",
+            '[build]\nrustflags = "-Aclippy::result-large-err"\n',
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
             ".cargo/quoted-decoy.toml",
             '[package]\ndescription = "rustflags = [\'-A\', \'clippy::result_large_err\']"\n',
             None,
@@ -1231,6 +1414,58 @@ def fixtures() -> tuple[Fixture, ...]:
             ".github/workflows/quoted-run-allow-large-error.yml",
             'steps:\n  - run: "cargo clippy -- -A clippy::result_large_err"\n',
             "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/workflow-env-allow-large-error.yml",
+            'env:\n  RUSTFLAGS: "-A clippy::result_large_err"\n'
+            "jobs:\n  test:\n    runs-on: ubuntu-latest\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/job-env-cap-lints.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    env:\n"
+            "      RUSTFLAGS: |-\n"
+            "        --cap-lints\n"
+            "        warn\n"
+            "    runs-on: ubuntu-latest\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/step-env-allow-large-error.yml",
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - env:\n"
+            "          RUSTFLAGS: >-\n"
+            "            --allow\n"
+            "            clippy::result-large-err\n"
+            "        run: cargo clippy\n",
+            "large-error-lint-suppression: clippy::result_large_err must remain denied without suppression",
+        ),
+        Fixture(
+            ".github/workflows/env-quoted-decoy.yml",
+            "env:\n"
+            '  DESCRIPTION: \'RUSTFLAGS: "-A clippy::result_large_err"\'\n'
+            "jobs: {}\n",
+            None,
+        ),
+        Fixture(
+            ".github/workflows/env-inline-comment-decoy.yml",
+            "env:\n"
+            '  RUSTFLAGS: "-D clippy::result_large_err" # -A clippy::result_large_err\n'
+            "jobs: {}\n",
+            None,
+        ),
+        Fixture(
+            ".github/workflows/env-multiline-decoy.yml",
+            "env:\n"
+            "  DESCRIPTION: |-\n"
+            '    RUSTFLAGS: "-A clippy::result_large_err"\n'
+            "jobs: {}\n",
+            None,
         ),
         Fixture(
             ".github/workflows/inline-comment-decoy.yml",
@@ -1295,6 +1530,7 @@ def workspace_files(root: Path) -> list[Path]:
         Path("crates/connector-abi/Cargo.toml"),
         Path("Cargo.toml"),
         Path(".cargo/config.toml"),
+        Path(".cargo/config"),
     ):
         candidate = root / relative
         if candidate.is_file():
