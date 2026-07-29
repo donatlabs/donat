@@ -249,6 +249,7 @@ metadata/Rule adapter and re-exports; it defines no second value type.
 - `value_contract_resolves_recursive_object_refs`
 - `value_contract_rejects_unknown_duplicate_and_invalid_refs`
 - `value_contract_validates_every_closed_scalar_shape`
+- `value_contract_timestamp_grammar_is_exact`
 - `value_contract_assignability_is_nominal_except_json`
 - `value_contract_no_std_boundary_is_mechanical`
 - `ir_reexports_the_only_value_contract_types`
@@ -262,7 +263,12 @@ metadata/Rule adapter and re-exports; it defines no second value type.
   scalar alias, a recursive object, a nominal enum, a custom scalar, missing
   versus null, canonical map order, and the 256-KiB size edge. Add a workspace
   policy assertion that the lower crate has no forbidden dependency/build
-  edge and that IR re-exports the same Rust types.
+  edge and that IR re-exports the same Rust types. Pin local `timestamp` to
+  valid `YYYY-MM-DDTHH:MM:SS[.ffffff]` with uppercase `T`, no offset, no leap
+  second, and zero or one-through-six fractional digits; reject a space
+  separator, trailing dot, offset/`Z`, invalid calendar/clock fields, and a
+  seventh fractional digit. Pin `timestamptz` to the same fraction/calendar
+  limits while requiring RFC 3339 `Z` or a numeric offset.
 
 - [ ] **Step 2: Add the failing command-descriptor tests**
 
@@ -414,9 +420,10 @@ pub enum ConnectorFixedIdempotencyBinding {
 }
 ~~~
 
-`idempotency: { header: ... }` remains loadable v2 inventory metadata but
-cannot publish an executable mutation descriptor because it lacks scope,
-retention, and margin. It is never converted to an invented safe default.
+`idempotency: { header: "Idempotency-Key" }` remains loadable v2 inventory
+metadata but cannot publish an executable mutation descriptor because it
+lacks scope, retention, and margin. It is never converted to an invented safe
+default.
 
 **Descriptor interfaces created here:**
 
@@ -618,11 +625,6 @@ step binding/scope/retention/margin constants; do not infer them at runtime.
 - Create: `crates/server/tests/process_definition.rs`
 - Modify: `crates/server/src/lib.rs`
 - Modify: `crates/server/src/main.rs`
-- Modify: `crates/conformance/src/lib.rs`
-- Create: `crates/conformance/tests/processes.rs`
-- Create: `crates/conformance/fixtures/processes/metadata_contract.yaml`
-- Create: `crates/conformance/fixtures/processes/source_locality.yaml`
-- Create: `crates/conformance/fixtures/processes/effect_horizon.yaml`
 
 **Interfaces consumed from Tasks 1-2:**
 
@@ -916,10 +918,12 @@ For attempt `i`, the retry upper bound is
 
 ~~~text
 maximum_send_horizon_ms =
-  max_attempts * start_to_close
+  max_attempts * (
+    start_to_close
+    + MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS
+  )
   + sum i=1..(max_attempts-1) of (
-    MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS
-    + retry_delay_upper_bound(i)
+    retry_delay_upper_bound(i)
     + schedule_to_start
   )
 ~~~
@@ -929,12 +933,16 @@ Checked compilation requires that value to be at most
 wait is bounded by each attempt's schedule-to-start deadline; `Retry-After`
 cannot exceed the corresponding retry-delay upper bound. Missing, unbounded,
 overflowed, or one-millisecond-over policies reject. Each activity state and
-provider side-effect step is pinned. Each `start_to_close` term covers all
-compiled step/page/call/redirect work within that attempt, including repeated
-sends of the same step; the operation deadline must fit inside it and the HTTP
-client has no hidden transport retry.
+provider side-effect step is pinned. Each possible attempt contributes its
+`start_to_close` term plus one terminal takeover grace, including the final
+attempt and `max_attempts = 1`. Its start-to-close deadline is non-renewing:
+takeover changes lease generation but not the configured attempt ordinal or
+deadline. Each `start_to_close` term covers all compiled
+step/page/call/redirect work within that attempt, including repeated sends of
+the same step; the operation deadline must fit inside it and the HTTP client
+has no hidden transport retry.
 
-**Tests and conformance owned by this task:**
+**Tests owned by this task:**
 
 - Metadata/compiler tests:
   `process_metadata_round_trips_every_state_variant`,
@@ -956,44 +964,26 @@ client has no hidden transport retry.
   `process_revision_contains_executable_dependency_closure`,
   `connector_effect_retention_boundary_is_exact`,
   and `connector_effect_multistep_horizon_is_independent`.
-- Conformance `process_metadata_contract_is_exact` with
-  `fixtures/processes/metadata_contract.yaml`.
-- Conformance `process_source_locality_is_rejected_at_deploy` with
-  `fixtures/processes/source_locality.yaml`.
-- Conformance `process_effect_horizon_is_bounded` with
-  `fixtures/processes/effect_horizon.yaml`.
 
-- [ ] **Step 1: Add all three failing native conformance cases**
-
-  The metadata fixture includes all five states and every binding plus
-  unknown/mixed/node/item/loop/subworkflow negatives. The source fixture
-  crosses start, transition, effects, and connector ownership separately.
-  The horizon fixture has read-only, exact-equality, one-millisecond-over,
-  overflow, missing-bound, and independent multi-step cases.
-
-- [ ] **Step 2: Add every named metadata/compiler test**
+- [ ] **Step 1: Add every failing metadata/compiler test**
 
   Keep the complete YAML in the metadata fixture. Assert full deterministic
   metadata paths/messages. Pin complete Rule source/type closure and connector
-  effect/source/horizon data; hashes alone are insufficient.
+  effect/source/horizon data; hashes alone are insufficient. The horizon test
+  covers read-only, exact equality, one millisecond over, overflow,
+  missing bounds, independent multi-step windows, `max_attempts = 1`, and the
+  final attempt's takeover grace.
 
-- [ ] **Step 3: Run RED**
+- [ ] **Step 2: Run RED**
 
   ~~~bash
   cargo test -p donat-metadata processes
   cargo test -p donat-server --test process_definition
-  cargo test -p donat-conformance --test processes \
-    process_metadata_contract_is_exact
-  cargo test -p donat-conformance --test processes \
-    process_source_locality_is_rejected_at_deploy
-  cargo test -p donat-conformance --test processes \
-    process_effect_horizon_is_bounded
   ~~~
 
-  Expected: process metadata, compiler, horizon validation, and conformance
-  support do not exist.
+  Expected: process metadata, compiler, and horizon validation do not exist.
 
-- [ ] **Step 4: Implement exact serde and source-local compilation**
+- [ ] **Step 3: Implement exact serde and source-local compilation**
 
   Add absent/inline/quoted-include loading. Validate closed binding contexts,
   graph reachability/totality, matching raw start effects, roles/session
@@ -1001,45 +991,37 @@ client has no hidden transport retry.
   routing, and one-source connector ownership. Reject workflow node/item
   spellings; do not translate them.
 
-- [ ] **Step 5: Implement checked per-step horizon pinning**
+- [ ] **Step 4: Implement checked per-step horizon pinning**
 
   Calculate the complete formula with checked integers. Treat all schedule,
-  capacity, rate, serialization, lease, takeover, retry, jitter, and
-  `Retry-After` delays exactly as bounded above. A read-only operation stays
-  headerless and needs no retention window.
+  capacity, rate, serialization, start-to-close, per-attempt terminal
+  takeover, retry, jitter, and `Retry-After` delays exactly as bounded above.
+  Do not renew a configured attempt deadline on takeover. A read-only
+  operation stays headerless and needs no retention window.
 
-- [ ] **Step 6: Expose the compiler module, not workers**
+- [ ] **Step 5: Expose the compiler module, not workers**
 
   Add `pub mod processes` to the server library and `mod processes` to the
   binary. Task 3 creates no effect-source trait, journal DML, connector call,
   worker loop, runtime route, or operator surface.
 
-- [ ] **Step 7: Run GREEN**
+- [ ] **Step 6: Run GREEN**
 
   ~~~bash
   cargo test -p donat-metadata
   cargo test -p donat-server --test process_definition
   cargo test --workspace --no-run
-  cargo build -p donat-server --bin donat
-  cargo test -p donat-conformance --test processes \
-    process_metadata_contract_is_exact
-  cargo test -p donat-conformance --test processes \
-    process_source_locality_is_rejected_at_deploy
-  cargo test -p donat-conformance --test processes \
-    process_effect_horizon_is_bounded
   ~~~
 
-  Expected: pure source-local compilation passes and no process row or worker
-  exists.
+  Expected: pure source-local compilation passes without requiring a binary
+  deployment path; no process row or worker exists.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
   ~~~bash
   git add crates/metadata crates/server/src/processes \
     crates/server/src/lib.rs crates/server/src/main.rs \
-    crates/server/tests/process_definition.rs crates/conformance/src/lib.rs \
-    crates/conformance/tests/processes.rs \
-    crates/conformance/fixtures/processes
+    crates/server/tests/process_definition.rs
   git commit -m "feat(processes): compile source-local definitions"
   ~~~
 
@@ -1108,7 +1090,15 @@ pub trait ProcessEffectContractSource {
     ) -> Option<&ProcessEffectContract>;
 }
 
-impl ProcessEffectContractSource for ProcessEffectContractCatalog { /* exact */ }
+impl ProcessEffectContractSource for ProcessEffectContractCatalog {
+    fn process_effect_contract(
+        &self,
+        source: &str,
+        process: &str,
+    ) -> Option<&ProcessEffectContract> {
+        self.sources.get(source)?.get(process)
+    }
+}
 
 pub enum FinalizedCommandEffect {
     Start(FinalizedStartProcessEffect),
@@ -1136,6 +1126,21 @@ pub struct FinalizedSignalProcessEffect {
     pub effect_position: u32,
 }
 
+pub struct FinalizedCommandCatalog {
+    pub sources:
+        BTreeMap<String, FinalizedSourceCommandCatalog>,
+}
+
+pub struct FinalizedSourceCommandCatalog {
+    pub source_name: String,
+    pub commands: BTreeMap<String, FinalizedCompiledCommand>,
+}
+
+pub struct FinalizedCompiledCommand {
+    pub command: CompiledCommand,
+    pub effects: Vec<FinalizedCommandEffect>,
+}
+
 pub fn finalize_command_effects(
     commands: CompiledCommandCatalog,
     contracts: &dyn ProcessEffectContractSource,
@@ -1153,11 +1158,9 @@ impl CompiledMultiSourceSchema {
 }
 
 // crates/server/src/processes/definition.rs
-impl ProcessEffectContractCatalog {
-    pub fn from_processes(
-        processes: &CompiledProcessCatalog,
-    ) -> Result<Self, PlanError>;
-}
+pub fn build_process_effect_contract_catalog(
+    processes: &CompiledProcessCatalog,
+) -> Result<ProcessEffectContractCatalog, PlanError>;
 
 pub struct PureEngineCandidate {
     pub command_catalog: Arc<CompiledCommandCatalog>,
@@ -1172,14 +1175,18 @@ pub struct PureEngineCandidate {
 connector descriptors, processes, neutral effects, effect finalization, and
 schema compilation. It performs no catalog/journal I/O and is not yet
 published as `Engine`; Task 6 adds read-only deployed validation first.
-Task 4 creates the trait and its only process-catalog implementation together.
+Task 4 creates the trait and catalog together. The server-owned free
+constructor is legal because it is defined beside `CompiledProcessCatalog`;
+it builds the schema-owned neutral value through its public fields and does
+not add an inherent implementation to a foreign type or a schema-to-server
+dependency.
 
 **Tests owned by this task:**
 
 - `process_effect_contract_source_is_neutral_and_object_safe`
 - `process_effect_catalog_retains_active_and_retired_policy`
 - `process_effect_signal_compatibility_is_explicit`
-- `process_candidate_build_is_cycle_free`
+- `process_effect_catalog_free_constructor_is_cycle_free`
 - `process_candidate_stages_are_pure`
 - `process_candidate_failure_keeps_old_engine`
 - `process_effect_finalization_preserves_pre_process_fingerprint`
@@ -1200,12 +1207,16 @@ Task 4 creates the trait and its only process-catalog implementation together.
   Expected: the neutral source trait, finalized catalog, pure candidate, and
   new schema entry point are absent.
 
-- [ ] **Step 3: Implement stages 1-7 and the trait**
+- [ ] **Step 3: Implement stages 1-7, exact finalized owners, and the trait**
 
-  Add all repeated interfaces. `from_processes` maps `active` to `Enabled` and
-  explicit `retired` to `RejectRetired`. Finalization validates exact
-  source/type/binding/compatible revisions without changing the pre-process
-  command fingerprint. Keep the process compiler server-owned.
+  Add all repeated interfaces.
+  `build_process_effect_contract_catalog` maps `active` to `Enabled` and
+  explicit `retired` to `RejectRetired`. `FinalizedCommandCatalog`,
+  `FinalizedSourceCommandCatalog`, and `FinalizedCompiledCommand` are owned by
+  schema exactly as declared above, so Task 8 consumes a real public type.
+  Finalization validates exact source/type/binding/compatible revisions
+  without changing the pre-process command fingerprint. Keep the process
+  compiler and free constructor server-owned.
 
 - [ ] **Step 4: Remove stale state commentary**
 
@@ -1247,7 +1258,10 @@ Task 4 creates the trait and its only process-catalog implementation together.
 - Create: `crates/server/tests/cli.rs`
 - Create: `crates/server/tests/source_selection.rs`
 - Modify: `crates/conformance/src/lib.rs`
-- Modify: `crates/conformance/tests/processes.rs`
+- Create: `crates/conformance/tests/processes.rs`
+- Create: `crates/conformance/fixtures/processes/metadata_contract.yaml`
+- Create: `crates/conformance/fixtures/processes/source_locality.yaml`
+- Create: `crates/conformance/fixtures/processes/effect_horizon.yaml`
 - Create: `crates/conformance/fixtures/processes/source_selection/`
 
 **Interfaces consumed from Tasks 1-4:**
@@ -1273,6 +1287,18 @@ pub fn compile_process_source_catalog(
 **Interfaces created here:**
 
 ~~~rust
+// crates/server/src/main.rs; existing clap attributes remain unchanged.
+struct MigrateArgs {
+    migrations_dir: PathBuf,
+    metadata_dir: Option<PathBuf>,
+    source: Option<String>,
+}
+
+struct ValidateArgs {
+    metadata_dir: Option<PathBuf>,
+    source: Option<String>,
+}
+
 pub enum DeploymentSelection {
     RefineryOnly {
         database_url: String,
@@ -1286,14 +1312,19 @@ pub enum DeploymentSelection {
     },
 }
 
-pub fn resolve_migrate_selection(
+// Args is the existing binary CLI owner.
+pub(crate) fn resolve_migrate_selection(
+    global: &Args,
     cli: &MigrateArgs,
-    env: &dyn EnvironmentLookup,
+    read_env:
+        impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> anyhow::Result<DeploymentSelection>;
 
-pub fn resolve_validate_selection(
+pub(crate) fn resolve_validate_selection(
+    global: &Args,
     cli: &ValidateArgs,
-    env: &dyn EnvironmentLookup,
+    read_env:
+        impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> anyhow::Result<MetadataSourceSelection>;
 
 pub struct MetadataSourceSelection {
@@ -1319,40 +1350,66 @@ only for one unambiguous Postgres source. Validate always requires metadata.
 - `metadata_aware_migrate_rejects_ambiguous_omission`
 - `validate_requires_metadata`
 - `validate_checks_only_selected_real_catalog`
+- Conformance `process_metadata_contract_is_exact` with
+  `fixtures/processes/metadata_contract.yaml`.
+- Conformance `process_source_locality_is_rejected_at_deploy` with
+  `fixtures/processes/source_locality.yaml`.
+- Conformance `process_effect_horizon_is_bounded` with
+  `fixtures/processes/effect_horizon.yaml`.
 - Conformance `process_deployment_selects_one_real_source`
 - Fixture directory `fixtures/processes/source_selection/`
 
-- [ ] **Step 1: Add the failing native conformance case**
+- [ ] **Step 1: Add all four failing native conformance cases**
 
-  Create two metadata Postgres sources with distinct real URLs and one
-  same-named table mismatch. Prove selecting `secondary` never connects to or
-  reports the `default` catalog. Add the ambiguous no-source CLI failure.
+  The metadata-contract fixture includes all five states and every binding
+  plus unknown/mixed/node/item/loop/subworkflow negatives. The source fixture
+  crosses start, transition, effects, and connector ownership separately.
+  The horizon fixture covers read-only, exact equality, one millisecond over,
+  overflow, missing bounds, independent multi-step windows,
+  `max_attempts = 1`, and final-attempt takeover grace. The source-selection
+  fixture has two Postgres sources with distinct real URLs and one same-named
+  table mismatch; selecting `secondary` never connects to or reports the
+  `default` catalog, and ambiguous omission fails before connection.
 
 - [ ] **Step 2: Add the failing CLI/integration tests**
 
   Run refinery-only migration against an empty temporary database with no
   metadata tree. Assert `--source` is rejected there. For metadata-aware
-  cases use recording connection factories to prove URL selection occurs
-  before introspection.
+  cases spawn the real CLI with an intentionally unreachable unselected
+  source URL and a reachable selected source URL; success proves selection
+  occurs before the first connection/introspection. Add focused
+  `main.rs` unit cases for both resolvers using deterministic `read_env`
+  closures.
 
 - [ ] **Step 3: Run RED**
 
   ~~~bash
   cargo test -p donat-server --test cli metadata_free_migrate
   cargo test -p donat-server --test source_selection
+  cargo test -p donat-server --bin donat source_selection
+  cargo test -p donat-conformance --test processes \
+    process_metadata_contract_is_exact
+  cargo test -p donat-conformance --test processes \
+    process_source_locality_is_rejected_at_deploy
+  cargo test -p donat-conformance --test processes \
+    process_effect_horizon_is_bounded
   cargo test -p donat-conformance --test processes \
     process_deployment_selects_one_real_source
   ~~~
 
-  Expected: one global URL/catalog is still reused and the exact selection
-  interfaces do not exist.
+  Expected: the binary-visible metadata validation path, exact source
+  selection, and process conformance harness do not exist.
 
-- [ ] **Step 4: Implement the two migrate modes**
+- [ ] **Step 4: Implement the two migrate modes and binary validation path**
 
-  Resolve selection before opening a connection. In metadata mode compile
-  only the selected source with the two source-scoped compiler entry points.
-  Never clone one `Catalog` across source names. Update the native harness to
-  invoke metadata suites with
+  Add `source: Option<String>` to both CLI structs and implement the two exact
+  server-binary free functions above. Production passes `std::env::var`;
+  focused unit tests pass deterministic closures, so no undefined environment
+  trait is introduced. Resolve selection before opening a connection. In
+  metadata mode compile only the selected source with the two source-scoped
+  compiler entry points and the Task-4 pure candidate stages. Never clone one
+  `Catalog` across source names. Update the native harness to invoke metadata
+  suites with
   `migrate --metadata-dir <suite> --source default`.
 
 - [ ] **Step 5: Run GREEN**
@@ -1360,13 +1417,21 @@ only for one unambiguous Postgres source. Validate always requires metadata.
   ~~~bash
   cargo test -p donat-server --test cli
   cargo test -p donat-server --test source_selection
+  cargo test -p donat-server --bin donat source_selection
   cargo build -p donat-server --bin donat
+  cargo test -p donat-conformance --test processes \
+    process_metadata_contract_is_exact
+  cargo test -p donat-conformance --test processes \
+    process_source_locality_is_rejected_at_deploy
+  cargo test -p donat-conformance --test processes \
+    process_effect_horizon_is_bounded
   cargo test -p donat-conformance --test processes \
     process_deployment_selects_one_real_source
   ~~~
 
-  Expected: refinery-only migration remains metadata-free and metadata-aware
-  operations use only the selected real source.
+  Expected: this first binary-visible process task proves the metadata,
+  source-locality, horizon, and source-selection contracts; refinery-only
+  migration remains metadata-free.
 
 - [ ] **Step 6: Commit**
 
@@ -1375,7 +1440,7 @@ only for one unambiguous Postgres source. Validate always requires metadata.
     crates/server/src/validate.rs crates/server/src/lib.rs \
     crates/server/tests crates/conformance/src/lib.rs \
     crates/conformance/tests/processes.rs \
-    crates/conformance/fixtures/processes/source_selection
+    crates/conformance/fixtures/processes
   git commit -m "fix(migrate): select exact metadata sources"
   ~~~
 
@@ -1485,6 +1550,13 @@ begins with `source_name`. `process_activity_provider_steps` is keyed by
 `(source_name, logical_activity_id, compiled_step_id)` and stores the fixed
 key, database-clock `first_provider_attempt_at`, compiled
 `maximum_send_deadline_at`, and usable-window deadline.
+`process_activity_jobs` stores non-negative
+`lease_generation bigint not null default 0`; each claim can rotate that
+generation independently of the configured `attempts` ordinal.
+`process_transition_logs` stores `activity_lease_generation` and deduplicates
+activity outcomes by
+`(source_name, activity_job_id, activity_attempt,
+activity_lease_generation, outcome)`.
 Accepted inbound deliveries have source-qualified non-null instance/event
 foreign keys; every other outcome has both null. No process table references
 the command journal.
@@ -1504,7 +1576,7 @@ compatibility read; it never calls `reconcile`.
 - `process_sources_sharing_database_are_isolated`
 - `process_reconcile_is_idempotent_and_source_local`
 - `process_live_connector_rebind_is_rejected`
-- `process_retired_revision_reloads_and_completes`
+- `process_retired_revision_reloads_and_is_available`
 - `process_persisted_rule_bundle_recompiles_exactly`
 - `serve_with_readonly_role_issues_no_ddl`
 - `serve_rejects_missing_or_incompatible_check_helper`
@@ -1516,9 +1588,11 @@ compatibility read; it never calls `reconcile`.
 - [ ] **Step 1: Add both failing native conformance suites**
 
   Add active A, replacement B, explicit retirement, omission-while-live,
-  fresh-binary reload, connector source rebind, and two source names sharing
-  one physical database. Assert exact deployment errors and that retired A
-  remains executable.
+  fresh-Engine catalog reload, connector source rebind, and two source names
+  sharing one physical database. Assert exact deployment errors and that
+  retired A hash-verifies and remains addressable in
+  `DeployedSourceProcessCatalog::live_retired`. Do not start a process worker
+  or claim/complete retired work in this task.
 
 - [ ] **Step 2: Add failing migration/reconcile/serve tests**
 
@@ -1571,7 +1645,8 @@ compatibility read; it never calls `reconcile`.
   ~~~
 
   Expected: deploy performs all writes; serving under the read-only role
-  validates and publishes executable catalogs with no DDL/DML.
+  validates and publishes active/live-retired catalogs with no DDL/DML.
+  Retired execution/completion remains Task 14's rolling-runtime proof.
 
 - [ ] **Step 7: Commit**
 
@@ -1720,6 +1795,10 @@ pub enum FinalizedCommandEffect {
     Start(FinalizedStartProcessEffect),
     Signal(FinalizedSignalProcessEffect),
 }
+pub struct FinalizedCompiledCommand {
+    pub command: CompiledCommand,
+    pub effects: Vec<FinalizedCommandEffect>,
+}
 pub struct CommandInvocationGeneration {
     pub invocation_id: uuid::Uuid,
     pub replayed: bool,
@@ -1785,7 +1864,7 @@ idempotency claim and every domain CTE.
 - `command_effect_positions_share_generation`
 - `command_effect_replay_writes_no_second_outbox`
 - `command_effect_failure_writes_no_outbox`
-- `process_start_request_pins_revision`
+- `process_start_outbox_row_pins_revision`
 - `process_signal_request_pins_contract_revision`
 - `process_retired_start_rejects_before_domain_dml`
 - `process_commands_cannot_invoke_connectors`
@@ -1795,10 +1874,12 @@ idempotency claim and every domain CTE.
 - [ ] **Step 1: Add the failing native conformance case**
 
   Cover two canonical effect positions, replay, changed input, guard false,
-  domain constraint failure, A request consumed after B deployment, signal
-  revision anchor, and explicit retirement. Assert exact body/status/path and
-  DB rows. Add a negative metadata case attempting provider execution from a
-  command and assert the field is unknown.
+  domain constraint failure, an A start outbox row inspected after B
+  deployment, signal revision anchor, and explicit retirement. Assert exact
+  body/status/path and DB rows. The atomic row must still contain revision A;
+  this task does not start a consumer or prove what it executes. Add a
+  negative metadata case attempting provider execution from a command and
+  assert the field is unknown.
 
 - [ ] **Step 2: Add failing IR/schema/SQLgen tests**
 
@@ -1838,7 +1919,8 @@ idempotency claim and every domain CTE.
   ~~~
 
   Expected: domain result, command generation, and each process outbox commit
-  atomically in one statement.
+  atomically in one statement. The pinned revision is proven at rest; Task 9
+  owns post-B consumption.
 
 - [ ] **Step 6: Commit**
 
@@ -1877,6 +1959,27 @@ pub struct DeployedSourceProcessCatalog {
     pub live_retired:
         BTreeMap<(String, String), Arc<CompiledProcessDefinition>>,
 }
+pub enum SourceRuntime {
+    Postgres {
+        url: String,
+        pool: deadpool_postgres::Pool,
+        settings: RuntimePoolSettings,
+    },
+    Sqlite {
+        path: String,
+        pool: Arc<SqlitePool>,
+        settings: RuntimePoolSettings,
+    },
+    Mysql {
+        url: String,
+        pool: mysql::Pool,
+        permits: Arc<tokio::sync::Semaphore>,
+        settings: RuntimePoolSettings,
+    },
+    Clickhouse {
+        url: String,
+    },
+}
 ~~~
 
 ~~~text
@@ -1894,11 +1997,19 @@ process_transition_logs
 ~~~rust
 pub struct ProcessRuntime {
     pub source_name: String,
-    pub pool: SourcePool,
+    pub pool: deadpool_postgres::Pool,
     pub deployed_catalog: Arc<DeployedSourceProcessCatalog>,
     pub command_catalog: Arc<CompiledCommandCatalog>,
     pub connector_registry: Arc<ConnectorRegistry>,
 }
+
+pub fn build_process_runtime(
+    source_name: &str,
+    source_runtime: &SourceRuntime,
+    deployed_catalog: Arc<DeployedSourceProcessCatalog>,
+    command_catalog: Arc<CompiledCommandCatalog>,
+    connector_registry: Arc<ConnectorRegistry>,
+) -> anyhow::Result<ProcessRuntime>;
 
 pub enum StartConsumption {
     NoWork,
@@ -1912,6 +2023,13 @@ impl ProcessRuntime {
     ) -> anyhow::Result<StartConsumption>;
 }
 ~~~
+
+`build_process_runtime` is owned by
+`crates/server/src/processes/runtime.rs`. It accepts the existing
+`crates/server/src/state.rs::SourceRuntime`, matches only
+`SourceRuntime::Postgres { pool, .. }`, and clones that concrete
+`deadpool_postgres::Pool`. It rejects every non-Postgres variant before
+spawning a worker; there is no abstract pool interface.
 
 The worker selects one pending source-local request with
 `FOR UPDATE SKIP LOCKED`. In one short transaction it resolves the exact
@@ -1934,9 +2052,13 @@ function or route.
 
 - [ ] **Step 1: Add the failing native conformance case**
 
-  Start A, deploy B before consumption, and prove the worker creates A. Use
-  two distinct command generations with one semantic key and prove one
-  instance. Inject failures before/after commit and restart the binary.
+  Deploy A without a serving worker, persist a valid pending A request through
+  the harness using the exact Task-8 row shape, then deploy B and start the
+  binary. Prove the worker resolves and creates A, never B. This deterministic
+  setup places the row-before-B barrier in Task 9 rather than relying on a
+  race with an automatically spawned consumer. Use two distinct command
+  generations with one semantic key and prove one instance. Inject failures
+  before/after commit and restart the binary.
 
 - [ ] **Step 2: Add failing runtime/Postgres tests**
 
@@ -1956,7 +2078,8 @@ function or route.
 
 - [ ] **Step 4: Implement start consumption and lifecycle wiring**
 
-  Spawn one loop per process-owning source from the published Engine snapshot.
+  Build each runtime with the exact free constructor above, then spawn one
+  loop per process-owning Postgres source from the published Engine snapshot.
   Tokio polling is wake-up only. Use the exact short transaction and return
   values above. Shutdown cleanly with the existing server cancellation path.
 
@@ -1993,6 +2116,7 @@ function or route.
 - Modify: `crates/server/src/processes/runtime.rs`
 - Modify: `crates/server/src/processes/mod.rs`
 - Modify: `crates/server/src/commands.rs`
+- Modify: `crates/server/src/gql.rs`
 - Create: `crates/server/tests/process_transition.rs`
 - Modify: `crates/conformance/tests/processes.rs`
 - Create: `crates/conformance/fixtures/processes/command_transition/`
@@ -2021,14 +2145,25 @@ pub enum TransitionConsumption {
     CommandRejected {
         instance_id: Uuid,
         event_id: Uuid,
-        error: GraphQlErrorEnvelope,
+        error: CommandBusinessRejection,
     },
 }
 
 pub enum ProcessCommandOutcome {
     Applied { result: TypedValue },
-    Rejected { error: GraphQlErrorEnvelope },
+    Rejected { error: CommandBusinessRejection },
 }
+
+// crates/server/src/commands.rs
+pub(crate) struct CommandBusinessRejection {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+pub(crate) fn decode_command_business_rejection(
+    error: &tokio_postgres::Error,
+) -> Option<CommandBusinessRejection>;
 
 impl ProcessRuntime {
     pub async fn consume_one_transition(
@@ -2050,7 +2185,14 @@ revision/runtime ABI and optimistic version, evaluates a closed Rule guard,
 and writes history/next work atomically. Command execution uses the existing
 planner, one-statement renderer, result decoder, and exact classic role. It
 runs inside `SAVEPOINT donat_process_command`. Only SQLSTATE `P0D01` with a
-valid exact `donat.graphql-error.v1` envelope becomes `Rejected`: roll back
+valid exact `donat.graphql-error.v1` envelope becomes `Rejected`.
+`decode_command_business_rejection` is extracted from the current private
+`crates/server/src/gql.rs::command_graphql_error_json` parser and becomes the
+one strict typed decoder shared by GraphQL and processes. It returns `Some`
+only for `P0D01` whose primary message is an object with exactly the four
+string fields `kind`, `code`, `path`, and `message`, with exact kind, non-empty
+code, and a path beginning with `$`. Permission `23514`, malformed reserved
+payloads, and all other SQLSTATEs return `None`. For the valid case, roll back
 and release the savepoint, append one `command_rejected`, follow
 `on_rejection`, and commit the outer transaction. Every other failure aborts
 the outer transaction. No ambient GraphQL headers/session and no connector
@@ -2064,6 +2206,7 @@ call are available.
 - `process_command_database_error_aborts_outer`
 - `process_command_malformed_reserved_envelope_aborts_outer`
 - `process_command_permission_error_aborts_outer`
+- `command_business_rejection_decoder_is_strict`
 - `process_transition_uses_deployed_revision_only`
 - `process_provider_logic_is_activity_only`
 - Conformance `process_command_transition_savepoint_is_exact`
@@ -2082,7 +2225,9 @@ call are available.
 
   Assert missing/extra/ambient session variables reject, only compiled
   mappings reach the command, and a command cannot construct/invoke a
-  connector or provider request.
+  connector or provider request. Feed the shared decoder exact `P0D01`,
+  malformed/extra-field `P0D01`, empty-code/bad-path payloads, permission
+  `23514`, and an unrelated SQLSTATE.
 
 - [ ] **Step 3: Run RED**
 
@@ -2096,9 +2241,11 @@ call are available.
 
 - [ ] **Step 4: Implement transition and command execution**
 
-  Reuse the exact command internals; do not add raw SQL, a new rejection
-  envelope, row-by-row business mutation, or post-command outbox insert.
-  Validate all typed mappings before opening the transaction.
+  Extract the exact typed decoder into `commands.rs` and make existing GraphQL
+  rendering consume it before wiring the same result to the process
+  savepoint. Reuse the exact command internals; do not add raw SQL, a second
+  rejection envelope, row-by-row business mutation, or post-command outbox
+  insert. Validate all typed mappings before opening the transaction.
 
 - [ ] **Step 5: Run GREEN**
 
@@ -2117,6 +2264,7 @@ call are available.
 
   ~~~bash
   git add crates/server/src/processes crates/server/src/commands.rs \
+    crates/server/src/gql.rs \
     crates/server/tests/process_transition.rs \
     crates/conformance/tests/processes.rs \
     crates/conformance/fixtures/processes/command_transition
@@ -2142,7 +2290,7 @@ call are available.
 - Modify: `crates/conformance/tests/processes.rs`
 - Create: `crates/conformance/fixtures/processes/activity_runtime/`
 
-**Interfaces consumed from Tasks 2, 3, 6, and 10:**
+**Interfaces consumed from Tasks 2, 3, 6, 9, and 10:**
 
 ~~~rust
 pub enum OperationEffect {
@@ -2180,6 +2328,7 @@ pub struct ClaimedActivity {
     pub state_name: String,
     pub logical_activity_id: String,
     pub lease_token: Uuid,
+    pub lease_generation: u64,
     pub attempt: u32,
     pub input: TypedValue,
     pub request_fingerprint: String,
@@ -2224,14 +2373,22 @@ impl ProcessRuntime {
 }
 ~~~
 
-Claim protocol is exact: lock one due job; read
-`statement_timestamp()` once; handle schedule timeout; create/lock one
+Claim protocol is exact: lock either one scheduled due new/retry attempt or
+one running job whose lease expired; read `statement_timestamp()` once. A
+scheduled claim handles schedule-to-start timeout first. A takeover retains
+the configured `attempt` and its original non-renewing
+`start_to_close_deadline`; if database time is later than that deadline plus
+`MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS`, it records the typed timeout/window
+failure and authorizes no provider I/O. Otherwise create/lock one
 source/connector/operation token bucket in job-then-bucket order; release
 expired reservations; enforce global max-in-flight and typed serialization;
 refill exact numeric tokens; defer without consuming when unavailable; or
-consume one token, insert reservation, assign lease, increment attempt, and
-commit. Provider observation starts only after another Postgres connection
-can see committed job/lease/reservation state.
+consume one token and insert a reservation. Every successful claim assigns a
+new lease token and increments `lease_generation`. Only a scheduled
+new/retry claim increments `attempt` and sets a new start-to-close deadline;
+a takeover never renews either. Commit before dispatch. Provider observation
+starts only after another Postgres connection can see committed
+job/lease/reservation state.
 
 For each provider-idempotent step,
 `authorize_provider_step` derives:
@@ -2249,9 +2406,20 @@ It inserts/reads the source-local provider-step row in a separate short
 transaction committed before the first network send. Equality with
 both `first_provider_attempt_at + maximum_send_horizon_ms` and
 `first_provider_attempt_at + minimum_retention_ms -
-clock_safety_margin_ms` is allowed. A later DB-clock instant refuses I/O:
-the compiled deadline takes the typed timeout path, and the provider deadline
-returns `connector_idempotency_window_exhausted`. Neither rotates the key.
+clock_safety_margin_ms` does not by itself expire that bound because
+authorization uses strict `>`; both bounds are still evaluated. Every send
+uses the same database-clock precedence:
+
+1. If `db_now > usable_window_expires_at`, return permanent
+   `connector_idempotency_window_exhausted`.
+2. Else if `db_now > maximum_send_deadline_at`, return the typed timeout.
+3. Else authorize the send.
+
+Compilation guarantees the maximum-send deadline is no later than the usable
+provider deadline. Therefore usable-window-plus-one millisecond satisfies
+both late conditions and step 1 deliberately wins; a time strictly between
+unequal deadlines takes step 2. Neither refusal rotates the key or performs
+network I/O.
 Read-only calls are headerless. The HTTP client has no hidden retry.
 Connector pagination, when used, remains inside one activity's compiled
 page/item/call/byte/deadline budget and cannot create process states,
@@ -2263,6 +2431,9 @@ branches, retries, timers, commands, or database writes.
 - `process_provider_logic_is_activity_only`
 - `process_readonly_takeover_is_headerless`
 - `process_lease_takeover_is_safe`
+- `process_provider_step_deadline_precedence_is_exact`
+- `process_single_attempt_includes_takeover_grace`
+- `process_final_attempt_includes_takeover_grace`
 - `process_late_takeover_refuses_before_io`
 - `process_activity_capacity_is_global`
 - `process_capacity_bucket_serializes_two_claimers`
@@ -2279,15 +2450,22 @@ branches, retries, timers, commands, or database writes.
   Use a Donat-owned provider stub that blocks until a separate DB connection
   observes committed intent/reservation. Cover read-only takeover, provider
   mutation takeover with stable per-step keys, multi-step independent keys,
-  exact usable-window equality, one millisecond late refusal, retry
-  exhaustion, schedule/start timeout, and bounded pagination.
+  equality at the maximum deadline while the usable deadline remains later,
+  equality when both deadlines are the same, a database time strictly between
+  unequal deadlines, usable-window-plus-one-millisecond refusal,
+  `max_attempts = 1`, final-attempt takeover grace, retry exhaustion,
+  schedule/start timeout, and bounded pagination. Assert the provider-window
+  error wins when both bounds are late and every refusal has zero provider
+  calls.
 
 - [ ] **Step 2: Add failing two-connection and two-binary tests**
 
   Put a barrier after two claimers have selected work. Prove the bucket lock
   prevents oversubscribing the final token/slot/serialization key. Control the
-  database clock and inject stale completions/worker loss. Assert no provider
-  call occurs under an open journal transaction.
+  database clock and inject stale completions/worker loss. Prove takeover
+  increments lease generation but not attempt/deadline, including the final
+  boundary and a one-attempt policy. Assert no provider call occurs under an
+  open journal transaction.
 
 - [ ] **Step 3: Run RED**
 
@@ -2305,21 +2483,25 @@ branches, retries, timers, commands, or database writes.
 
   Use exact numeric refill and source-first predicates. A token is never
   refunded; release/expiry restores only in-flight capacity. Never hold more
-  than one bucket lock. Commit before any connector or provider logic.
+  than one bucket lock. Rotate lease token/generation on takeover without
+  renewing its attempt deadline. Commit before any connector or provider
+  logic.
 
 - [ ] **Step 5: Implement step authorization and connector dispatch**
 
   Resolve only the pinned descriptor/catalog. Commit first-attempt time before
   each side-effecting step's first send, recheck database time before every
-  later send, and inject the key into only the fixed binding. Keep retry,
-  process state, commands, timers, and DB handles out of connector code.
+  later send in the exact provider-first order above, and inject the key into
+  only the fixed binding. Keep retry, process state, commands, timers, and DB
+  handles out of connector code.
 
 - [ ] **Step 6: Implement completion/retry**
 
-  Match the current lease token in a new short transaction; release the
-  reservation and append completion atomically. Stale completion is
-  append-only audit. Apply finite deterministic jitter and declared typed
-  error routing only.
+  Match the current lease token and generation in a new short transaction;
+  release the reservation and append completion atomically. Key transition
+  outcome dedupe by source, job, configured attempt, lease generation, and
+  outcome. Stale completion is append-only audit. Apply finite deterministic
+  jitter and declared typed error routing only.
 
 - [ ] **Step 7: Run GREEN**
 
@@ -2368,7 +2550,7 @@ branches, retries, timers, commands, or database writes.
 - Modify: `crates/conformance/tests/processes.rs`
 - Create: `crates/conformance/fixtures/processes/signals_and_ingress/`
 
-**Interfaces/schema consumed from Tasks 6, 8, and 9:**
+**Interfaces/schema consumed from Tasks 6 and 8-10:**
 
 ~~~text
 process_signal_requests
@@ -2425,6 +2607,14 @@ pub enum InboundPersistence {
     UnexpectedState { delivery_id: Uuid },
 }
 
+pub enum InvalidSignatureStatus {
+    Missing,
+    Invalid,
+    Expired,
+    Malformed,
+    Unsupported,
+}
+
 impl ProcessRuntime {
     pub async fn consume_one_signal(
         &self,
@@ -2442,7 +2632,7 @@ impl ProcessRuntime {
     pub async fn persist_invalid_inbound(
         &self,
         connector_instance: &str,
-        signature_status: SignatureStatus,
+        signature_status: InvalidSignatureStatus,
         payload_digest: [u8; 32],
         redacted_metadata: BTreeMap<String, TypedValue>,
     ) -> anyhow::Result<Uuid>;
@@ -2454,9 +2644,11 @@ consume only typed atomic outbox rows. Verified inbound raw bytes are
 authenticated before parsing, then audit plus dedupe/correlation commit in
 one source-local transaction. Accepted delivery creates the process event and
 sets both relational links before commit. Duplicate/other outcomes have null
-links. Invalid signature writes delivery audit only and requires no trusted
-provider ID. The route acknowledges verified input only after commit. Signals
-are never buffered for a future state.
+links. Verified persistence writes schema status `verified`; the separate
+closed `InvalidSignatureStatus` maps exactly to `missing`, `invalid`,
+`expired`, `malformed`, or `unsupported`, writes delivery audit only, and
+requires no trusted provider ID. The route acknowledges verified input only
+after commit. Signals are never buffered for a future state.
 
 **Tests and conformance owned by this task:**
 
@@ -2574,7 +2766,8 @@ process_events
 process_transition_logs
 process_activity_jobs
 process_activity_provider_steps
-process_inbound_deliveries(source_name, instance_id, process_event_id, ...)
+process_inbound_deliveries:
+  source_name, instance_id, process_event_id
 ~~~
 
 **Interfaces created here:**
@@ -2594,14 +2787,31 @@ pub struct RedactedProcessTimeline {
     pub entries: Vec<RedactedTimelineEntry>,
 }
 
+pub struct RedactedTimelineEntry {
+    pub occurred_at: DateTime<Utc>,
+    pub kind: RedactedTimelineEntryKind,
+    pub reference_id: Uuid,
+    pub outcome: String,
+    pub redacted_metadata: BTreeMap<String, serde_json::Value>,
+}
+
+pub enum RedactedTimelineEntryKind {
+    ProcessEvent,
+    Transition,
+    Activity,
+    InboundDelivery,
+}
+
 pub async fn inspect_process(
-    runtime: &SourceRuntime,
+    pool: &deadpool_postgres::Pool,
+    source_name: &str,
     deployed: &DeployedSourceProcessCatalog,
     instance_id: Uuid,
 ) -> anyhow::Result<RedactedProcessTimeline>;
 
 pub async fn verify_process_history(
-    runtime: &SourceRuntime,
+    pool: &deadpool_postgres::Pool,
+    source_name: &str,
     deployed: &DeployedSourceProcessCatalog,
     instance_id: Uuid,
 ) -> anyhow::Result<HistoryVerification>;
@@ -2627,7 +2837,10 @@ Both commands select the source's real URL, use the hash-verified deployed
 revision, join deliveries only by indexed `(source_name, instance_id)`, redact
 values, and perform no write, lock claim, command, connector, retry, replay,
 repair, cancellation, or definition mutation. No GraphQL/REST/MCP/admin
-process-management field or route is added.
+process-management field or route is added. The CLI matches the existing
+`SourceRuntime::Postgres { pool, .. }` and passes that concrete pool plus the
+explicit source name to these functions; a non-Postgres source is rejected
+before diagnosis.
 
 **Tests and conformance owned by this task:**
 
@@ -2734,9 +2947,36 @@ pub struct ProcessCluster {
     pub provider: RecordingProvider,
 }
 
+pub struct SpawnedEngine {
+    child: tokio::process::Child,
+    pub base_url: reqwest::Url,
+    pub build: EngineBuild,
+}
+
 pub struct EngineBuild {
     pub binary: PathBuf,
     pub expected_runtime_abi: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderObservation {
+    pub logical_activity_id: String,
+    pub compiled_step_id: String,
+    pub idempotency_key: Option<String>,
+    pub request_digest: [u8; 32],
+}
+
+pub struct RecordingProvider {
+    pub base_url: reqwest::Url,
+    observations:
+        Arc<tokio::sync::Mutex<Vec<ProviderObservation>>>,
+    release_after_intent: Arc<tokio::sync::Notify>,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl RecordingProvider {
+    pub async fn observations(&self) -> Vec<ProviderObservation>;
+    pub fn release_after_committed_intent(&self);
 }
 
 impl ProcessCluster {
@@ -2783,9 +3023,12 @@ rules.
 
   Add the exact test and fixture before the cluster helper. Start compatible
   old/new binaries, then an incompatible ABI binary. Cover A active, explicit
-  retirement, B current, A still live; timer restart; read-only takeover;
-  provider mutation takeover; late idempotency refusal; duplicate webhook
-  after DB failure; and same physical DB with two source namespaces.
+  retirement, B current, and fresh-binary completion of retained A. This is
+  the first and only task that turns Task 6's hash-verified retired
+  availability into an execution/completion proof. Also cover timer restart;
+  read-only takeover; provider mutation takeover; late idempotency refusal;
+  duplicate webhook after DB failure; and same physical DB with two source
+  namespaces.
 
 - [ ] **Step 2: Add the failing server integration test**
 

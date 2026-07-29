@@ -95,9 +95,18 @@ The closed canonical scalar vocabulary and aliases are:
 | `decimal` | `Float`, `float`, `decimal` | finite JSON number |
 | `uuid` | `uuid` | canonical UUID string |
 | `date` | `date` | `YYYY-MM-DD` string |
-| `timestamp` | `timestamp` | RFC 3339 string without an offset |
-| `timestamptz` | `timestamptz` | RFC 3339 string with an offset |
+| `timestamp` | `timestamp` | local ISO-8601 `YYYY-MM-DDTHH:MM:SS[.ffffff]`, with no offset |
+| `timestamptz` | `timestamptz` | RFC 3339 `YYYY-MM-DDTHH:MM:SS[.ffffff]` followed by `Z` or `±HH:MM` |
 | `json` | `json`, `jsonb` | any JSON value |
+
+A local `timestamp` has exactly four year, two month/day/hour/minute/second
+digits, uppercase `T`, a valid proleptic-Gregorian calendar date, hour
+`00..23`, minute/second `00..59`, and either no fractional part or a dot
+followed by one through six digits. It rejects a space separator, leap second,
+trailing decimal point, `Z`, numeric offset, whitespace, and more than six
+fractional digits. `timestamptz` requires uppercase `T` plus `Z` or a valid
+numeric offset and uses the same zero-through-six fractional-digit and
+no-leap-second rules. Validation does not infer a session time zone.
 
 A name outside that table must be declared in
 `metadata.custom_types.input_objects`, `metadata.custom_types.enums`, or
@@ -387,10 +396,10 @@ named types only through `metadata.custom_types`. The metadata effect uses the
 same closed `read_only` or `provider_idempotent.side_effect_steps` shape as
 the descriptor; declarative HTTP has one compiled step named `request`, while
 generated/static connector operations may declare multiple named steps.
-Existing v2 `idempotency: { header: ... }` metadata still deserializes for
-inventory/reporting compatibility, but without fixed scope, retention, and
-margin it cannot publish an executable operation descriptor or be referenced
-by a Process.
+Existing v2 `idempotency: { header: "Idempotency-Key" }` metadata still
+deserializes for inventory/reporting compatibility, but without fixed scope,
+retention, and margin it cannot publish an executable operation descriptor or
+be referenced by a Process.
 Every `{input.<name>}` path slot and every `{ input: <name> }` query, request
 header, and recursive body slot must name an entry in that mapping and be
 assignable to its normalized contract. Path and header inputs must normalize
@@ -521,8 +530,10 @@ its immutable `CompiledProcessCatalog`. Candidate construction in
 4. `processes::definition::compile_process_catalog` compiles source-qualified
    process definitions against those command, Rule, and connector descriptors
    and derives immutable revisions.
-5. `ProcessEffectContractCatalog::from_processes` creates the cycle-free
-   schema contract.
+5. The server-owned free function
+   `processes::definition::build_process_effect_contract_catalog` consumes
+   `&CompiledProcessCatalog` and returns the schema-owned
+   `ProcessEffectContractCatalog`.
 6. `finalize_command_effects` validates and pins raw command effects without
    changing the pre-process command fingerprint.
 7. `CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects`
@@ -547,6 +558,19 @@ pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
 workers and history verification consume only `deployed_process_catalog`.
 No compiler is duplicated and no dependency points from `donat-schema` to
 `donat-server`.
+
+The stage-5 function is free rather than an inherent implementation:
+
+~~~rust
+pub fn build_process_effect_contract_catalog(
+    processes: &CompiledProcessCatalog,
+) -> Result<ProcessEffectContractCatalog, PlanError>;
+~~~
+
+It is defined in `donat-server`, where `CompiledProcessCatalog` is local, and
+constructs the public schema-owned data type through its fields/checked
+schema constructors. Rust never receives an inherent implementation of a
+foreign `donat-schema` type, and schema never imports the server catalog.
 
 ## 3. Canonical process metadata
 
@@ -927,11 +951,14 @@ Durations are a non-zero base-10 integer followed immediately by one of
 
 Process runtime ABI 1 fixes
 `MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS = 5000`. A claimed lease expires at its
-`start_to_close_deadline`. A takeover may send again only within the fixed
-maximum delay after that expiry; a worker arriving later records the typed
-timeout/window failure without provider I/O. Capacity, rate, and serialization
-waiting for each attempt is bounded by that attempt's `schedule_to_start`
-deadline. `Retry-After` may postpone a retry only up to that retry's declared
+non-renewing `start_to_close_deadline`. Rotating a lease token during takeover
+does not move that deadline or increment the configured attempt ordinal. A
+takeover of that same attempt may send again only through
+`start_to_close_deadline + MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS`; a worker
+arriving later records the typed timeout/window failure without provider I/O.
+Capacity, rate, and serialization waiting for each new configured retry
+attempt is bounded by that attempt's `schedule_to_start` deadline.
+`Retry-After` may postpone a retry only up to that retry's declared
 `retry_delay_upper_bound`; a larger value produces the typed timeout path
 without another provider send. A runtime that cannot enforce these refusal
 bounds cannot claim ABI-1 work.
@@ -944,10 +971,12 @@ retry_delay_upper_bound(i) =
   min(max_interval, initial_interval * 2^(i - 1))
 
 maximum_send_horizon_ms =
-  max_attempts * start_to_close
+  max_attempts * (
+    start_to_close
+    + MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS
+  )
   + sum i=1..(max_attempts - 1) of (
-    MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS
-    + retry_delay_upper_bound(i)
+    retry_delay_upper_bound(i)
     + schedule_to_start
   )
 
@@ -957,11 +986,12 @@ usable_window_ms =
 
 Deterministic full jitter is bounded by the corresponding
 `retry_delay_upper_bound`; capacity/rate/serialization delay is inside
-`schedule_to_start`; each `start_to_close` term bounds all compiled
-step/page/call/redirect work inside that attempt, including a repeated send of
-the same step. The connector's smaller operation deadline is validated
-against `start_to_close`, and the HTTP client performs no hidden transport
-retry.
+`schedule_to_start`; each attempt term bounds all compiled
+step/page/call/redirect work plus its terminal takeover grace, including a
+repeated send of the same step. The terminal grace is included even when
+`max_attempts = 1`, so a single configured attempt is not an idempotency
+escape. The connector's smaller operation deadline is validated against
+`start_to_close`, and the HTTP client performs no hidden transport retry.
 Compilation requires
 `maximum_send_horizon_ms <= usable_window_ms`. Equality is accepted.
 Overflow, a missing bound, or a one-millisecond excess rejects the Process as
@@ -1454,6 +1484,7 @@ donat.process_activity_jobs(
     'scheduled','running','succeeded','failed','cancelled'
   )),
   attempts integer not null default 0 check (attempts >= 0),
+  lease_generation bigint not null default 0 check (lease_generation >= 0),
   available_at timestamptz not null default now(),
   schedule_to_start_deadline timestamptz not null,
   start_to_close_deadline timestamptz,
@@ -1494,6 +1525,7 @@ donat.process_transition_logs(
   event_id uuid,
   activity_job_id uuid,
   activity_attempt integer,
+  activity_lease_generation bigint,
   from_state text,
   to_state text,
   outcome text not null,
@@ -1512,8 +1544,13 @@ donat.process_transition_logs(
     references donat.process_activity_jobs(source_name, id)
 )
 unique(source_name, instance_id, event_id) where event_id is not null;
-unique(source_name, activity_job_id, activity_attempt, outcome)
-  where activity_job_id is not null and activity_attempt is not null;
+unique(
+  source_name, activity_job_id, activity_attempt,
+  activity_lease_generation, outcome
+)
+  where activity_job_id is not null
+    and activity_attempt is not null
+    and activity_lease_generation is not null;
 
 donat.process_capacity_reservations(
   source_name text not null,
@@ -1659,9 +1696,37 @@ back. A malformed reserved envelope, permission SQLSTATE `23514`, connection
 error, constraint error, decode error, or any other database failure aborts
 the outer transaction; it cannot commit `on_rejection`.
 
+`crates/server/src/commands.rs` owns the strict shared decoder extracted from
+the current private GraphQL helper:
+
+~~~rust
+pub(crate) struct CommandBusinessRejection {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+pub(crate) fn decode_command_business_rejection(
+    error: &tokio_postgres::Error,
+) -> Option<CommandBusinessRejection>;
+~~~
+
+It returns `Some` only when the driver error has SQLSTATE `P0D01` and its
+primary message is an object with exactly the four string fields `kind`,
+`code`, `path`, and `message`, `kind == "donat.graphql-error.v1"`, a non-empty
+code, and a path beginning with `$`. GraphQL rendering and the process
+savepoint consume this typed value. Permission SQLSTATE `23514`, malformed
+reserved payloads, and every non-`P0D01` error return `None`.
+
 GraphQL and process execution share the same internal command planner,
 single-statement renderer, result decoder, and strict rejection decoder.
 Neither path accepts raw SQL or constructs a new error envelope.
+
+Each Postgres `ProcessRuntime` owns a cloned
+`deadpool_postgres::Pool` extracted from the matching
+`SourceRuntime::Postgres { pool, .. }` during Engine worker construction.
+Non-Postgres variants are rejected before a worker is created; no abstract
+pool type or cross-backend process executor is introduced.
 
 ## 9. Activities, leases, retries, and capacity
 
@@ -1682,10 +1747,16 @@ expiring a reservation restores only an in-flight slot.
 
 An activity claim uses this exact transaction protocol:
 
-1. Select one scheduled due job in the source with
-   `FOR UPDATE SKIP LOCKED`; read `db_now = statement_timestamp()` once.
-2. If `schedule_to_start_deadline <= db_now`, append its timeout event and
-   finish without touching capacity.
+1. Select one scheduled due new/retry attempt or one running job with an
+   expired lease in the source using `FOR UPDATE SKIP LOCKED`; read
+   `db_now = statement_timestamp()` once. A running job retains its configured
+   `attempts` ordinal and non-renewing `start_to_close_deadline`.
+2. For a scheduled attempt, if
+   `schedule_to_start_deadline <= db_now`, append its timeout event and finish
+   without touching capacity. For a takeover, if
+   `db_now > start_to_close_deadline +
+   MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS`, append the typed timeout/window
+   failure and make no provider call.
 3. Insert the `(source_name, connector_instance, operation)` bucket with
    `available_tokens = burst`, `last_refill_at = db_now`, and the pinned
    capacity-policy fingerprint using `ON CONFLICT DO NOTHING`.
@@ -1706,8 +1777,10 @@ An activity claim uses this exact transaction protocol:
    `available_at` to
    `db_now + ceil((1 - tokens) * per_ms / permits)` milliseconds.
 7. Otherwise subtract one token, insert one reservation, assign a random lease
-   token, increment the job attempt, and store start-to-close and lease
-   deadlines in that same transaction.
+   token, and increment `lease_generation`. Increment `attempts` and set a new
+   `start_to_close_deadline` only when claiming a scheduled new/retry attempt.
+   A takeover keeps both the attempt ordinal and its original deadline.
+   Store the lease expiry in that same transaction.
 8. Commit before calling the connector. Any database error rolls back the
    bucket, reservation, and job together and makes no provider call.
 
@@ -1727,10 +1800,20 @@ maximum_send_horizon_ms` and
 `usable_window_expires_at = first_provider_attempt_at +
 (minimum_retention_ms - clock_safety_margin_ms)`, and commits. Before every
 retry/takeover send it reads the same row using the database clock. Equality
-with both deadlines is allowed. A later instant permanently refuses network
-I/O; exceeding the provider window yields
-`connector_idempotency_window_exhausted`, while exceeding the smaller compiled
-execution horizon yields the typed timeout path. Neither path rotates the key.
+does not by itself expire either bound because both comparisons are strict
+`>`; authorization still evaluates both bounds in the following order.
+Authorization uses this exact precedence:
+
+1. If `db_now > usable_window_expires_at`, permanently refuse network I/O
+   with `connector_idempotency_window_exhausted`.
+2. Otherwise, if `db_now > maximum_send_deadline_at`, refuse network I/O
+   through the typed timeout route.
+3. Otherwise authorize the send with the persisted fixed key/binding.
+
+Because compilation requires the maximum-send deadline to be no later than
+the usable provider deadline, a time after the usable deadline satisfies both
+late predicates; step 1 deliberately wins. A time strictly between unequal
+deadlines takes step 2. Neither refusal path rotates the key.
 
 The connector receives immutable typed input, the logical activity identity,
 canonical request fingerprint, deadline/control capability, and only the
@@ -1826,6 +1909,7 @@ audit-only. Compensation is an explicit state, never reverse SQL.
 | capacity or serialization unavailable | job remains scheduled; no provider call |
 | schedule-to-start timeout | typed timeout event; no provider call |
 | start-to-close timeout or stale completion | current lease may be retried; stale completion is audit-only |
+| compiled maximum-send horizon exhausted while provider window remains usable | typed timeout before network I/O |
 | provider idempotency window exhausted | permanent typed failure before network I/O; the fixed step key is not rotated |
 | duplicate start semantic key | request is duplicate; existing instance is unchanged |
 | duplicate verified provider event | new delivery audit plus existing dedupe row; no second process event |
@@ -1847,17 +1931,18 @@ a native conformance fixture. The focused identifiers are normative:
 | Test ID | Level | Required proof |
 | --- | --- | --- |
 | `value_type_language_is_closed_and_canonical` | value-contract unit | aliases, scalar JSON semantics, named refs, recursion, requiredness, and assignability use one parser in the `no_std + alloc` owner |
+| `value_contract_timestamp_grammar_is_exact` | value-contract unit | local timestamp accepts only valid `T`-separated no-offset values with zero-to-six fractional digits; timestamptz requires `Z`/offset |
 | `value_contract_no_std_boundary_is_mechanical` | workspace policy | value contract compiles for the no-OS target, has no `std`/unsafe/build-script/third-party runtime edge, and IR only re-exports it |
 | `command_descriptor_exposes_exact_contract` | schema unit | recursive argument/result contracts, roles, session variables, and deterministic pre-process fingerprint are public |
 | `connector_descriptor_is_typed_and_non_secret` | server unit | HTTP/Stripe descriptors contain exact contracts and no secret values |
 | `connector_effect_model_is_closed_and_per_step` | server unit | headerless read-only and complete fixed provider-idempotent step records publish; inventory-only side effects reject |
-| `connector_effect_retention_boundary_is_exact` | process compiler | every step accepts horizon equality, rejects one millisecond over, and uses checked arithmetic |
+| `connector_effect_retention_boundary_is_exact` | process compiler | every step accepts horizon equality, rejects one millisecond over, uses checked arithmetic, and includes final takeover grace for `max_attempts: 1` and the final attempt |
 | `connector_effect_multistep_coverage_is_total` | process compiler | every side-effecting step has one independent binding/scope/window and read-only steps have none |
 | `http_template_slots_require_declared_types` | metadata/server unit | path/query/header/body slots reject undeclared or incompatible input |
 | `http_request_headers_preserve_static_yaml_and_add_typed_input` | metadata serde | legacy `{name,value}` round-trips and exactly one static/input value is accepted |
 | `process_metadata_requires_start_and_cancellation_shape` | metadata unit | canonical grammar includes start and typed cancellation |
 | `process_metadata_state_and_binding_unions_are_closed` | metadata serde | every Section 3 variant round-trips; mixed/unknown/context-invalid forms reject |
-| `process_candidate_build_is_cycle_free` | state unit | descriptors, process revisions, effect finalization, and schema compile in the required order |
+| `process_effect_catalog_free_constructor_is_cycle_free` | state unit | server-owned free construction, descriptors, process revisions, effect finalization, and schema compile in the required order without a foreign inherent impl |
 | `process_rejects_cross_source_command` | process compiler | start, transition, start effect, and signal effect cannot cross source |
 | `process_connector_instance_has_one_source` | process compiler | one connector instance cannot coordinate two process sources |
 | `process_deployment_selects_one_real_source` | migrate integration | selected source alone is introspected/reconciled; omitted ambiguous source fails |
@@ -1866,10 +1951,12 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_v6_schema_is_exact` | migrate integration | every Section 7 column/key/index exists and no command-journal FK exists |
 | `process_sources_sharing_database_are_isolated` | Postgres integration | identical names, UUIDs, and semantic keys in two source namespaces do not collide |
 | `process_live_connector_rebind_is_rejected` | reconcile integration | active/live-retired source-A descriptor prevents binding that instance to source B |
+| `process_retired_revision_reloads_and_is_available` | restart integration | fresh Engine hash-verifies and exposes non-terminal retired A without executing it |
 | `process_retired_revision_reloads_and_completes` | restart integration | A starts, explicit retirement rejects new start, fresh Engine loads and completes/verifies A |
 | `command_invocation_id_replays_unchanged` | SQLgen/Postgres | exact replay preserves UUID |
 | `command_invocation_id_changes_after_expiry` | SQLgen/Postgres | expired-key execution gets a new UUID |
 | `command_effect_positions_share_generation` | SQLgen/Postgres | multiple positions copy one invocation UUID and remain individually unique |
+| `process_start_outbox_row_pins_revision` | command/Postgres | atomic start row written under A retains A after B deployment, without requiring a consumer |
 | `process_start_request_pins_revision` | command/process integration | request under A consumed after B deploy starts A |
 | `process_start_semantic_dedupe_is_separate` | process integration | distinct invocation UUIDs with one semantic key create one instance |
 | `process_session_variables_are_closed` | compiler/runtime | missing/extra/ambient mappings reject; worker uses only compiled values |
@@ -1879,7 +1966,8 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_activity_does_not_hold_tx` | recording connector/Postgres observer | provider stub accepts only after another connection sees committed job and capacity intent |
 | `process_provider_logic_is_activity_only` | planner/runtime | command planning/execution cannot invoke a connector; only a committed activity dispatch can |
 | `process_lease_takeover_is_safe` | two binaries | read-only takeover is headerless; provider mutation reuses each stable step key; one transition and stale audit |
-| `process_late_takeover_refuses_before_io` | two binaries/clock | database time after the usable window produces `connector_idempotency_window_exhausted` and zero provider calls |
+| `process_provider_step_deadline_precedence_is_exact` | worker/clock | maximum-deadline equality and equality of both deadlines authorize; between-deadline time is timeout; usable-window-plus-one millisecond is `connector_idempotency_window_exhausted` with zero I/O |
+| `process_late_takeover_refuses_before_io` | two binaries/clock | final-attempt and `max_attempts: 1` takeover boundaries use the non-renewing deadline and zero provider calls after the permitted grace/window |
 | `process_activity_capacity_is_global` | two binaries | max/rate/serialization policies hold in one source |
 | `process_capacity_bucket_serializes_two_claimers` | two Postgres connections | a barrier race cannot oversubscribe the last slot/token or serialization key |
 | `process_timer_survives_restart` | controlled DB clock | timer fires once without in-memory state |

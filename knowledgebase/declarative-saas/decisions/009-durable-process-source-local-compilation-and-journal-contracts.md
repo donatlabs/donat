@@ -51,6 +51,13 @@ dependencies retain their source definitions and named-type closure so a fresh
 binary can recompile and verify an old revision rather than interpreting it
 through current metadata.
 
+The neutral effect catalog is built by the server-owned free function
+`build_process_effect_contract_catalog(&CompiledProcessCatalog) ->
+Result<ProcessEffectContractCatalog, PlanError>`. It constructs the
+schema-owned value through its public fields or checked schema constructors.
+It is not an inherent implementation on the foreign schema type, and it adds
+no schema-to-server dependency.
+
 Processes are strictly source-local. Start, transition, start-effect, and
 signal-effect commands resolve only in the process's Postgres source. A
 connector instance used by processes is bound to one source, and workers,
@@ -81,6 +88,15 @@ outer process transition. Only the established valid `P0D01`
 into one committed `on_rejection` transition; every other database error
 aborts the outer transaction.
 
+`crates/server/src/commands.rs` owns the shared strict decoder
+`decode_command_business_rejection(&tokio_postgres::Error) ->
+Option<CommandBusinessRejection>`. It succeeds only for SQLSTATE `P0D01` whose
+primary message is an object with exactly four string fields: `kind`, `code`,
+`path`, and `message`; `kind` must equal `donat.graphql-error.v1`, `code` must
+be non-empty, and `path` must begin with `$`. The GraphQL renderer and process
+savepoint consume that typed result. Permission SQLSTATE `23514`, malformed
+reserved payloads, and all other errors return `None`.
+
 V6 owns the `donat.check_violation(text)` helper currently installed from the
 serve candidate path. Serve replaces creation with a read-only compatibility
 check and can start under a principal that lacks schema-create privileges.
@@ -93,14 +109,23 @@ Executable connector effects are closed to headerless `ReadOnly` and
 provider scope, conservative minimum retention, and positive clock margin for
 every side-effecting compiled step. Process compilation calculates and pins a
 complete checked `maximum_send_horizon_ms` for each such step, including
-schedule/capacity/rate/serialization bounds, start-to-close, lease expiry,
-takeover delay, and every retry backoff/jitter bound. It accepts equality with
+schedule/capacity/rate/serialization bounds, start-to-close through lease
+expiry, one terminal takeover grace for every possible attempt, and every retry
+backoff/jitter bound. The attempt's start-to-close deadline is non-renewing:
+lease takeover changes lease generation but not the configured attempt
+ordinal or deadline. The terminal grace is present even for
+`max_attempts = 1`. Compilation accepts equality with
 `minimum_retention_ms - clock_safety_margin_ms` and rejects missing,
 unbounded, overflowed, or one-millisecond-over policies. The source-local
 activity journal commits each step's database-clock
 `first_provider_attempt_at` before its first send and persists both the
 compiled maximum-send deadline and provider usable-window deadline. Later
-sends reuse the fixed key and permanently refuse I/O after either bound.
+sends reuse the fixed key. Equality does not by itself expire either bound;
+both comparisons are strict and both bounds are still evaluated. After both
+bounds, the usable-provider-window check runs first and returns
+`connector_idempotency_window_exhausted`; between unequal deadlines, only the
+compiled horizon has expired and the typed timeout route wins. Both refusals
+happen before network I/O.
 
 Commands contain no connector/provider business logic. They may commit only
 closed process start/signal intent alongside their domain statement.

@@ -46,8 +46,16 @@ activity ID, scope, and step ID and is unchanged by retry, worker crash, or
 lease takeover. A database-clock `first_provider_attempt_at` is committed in
 the source-local activity journal before that step's first network send.
 Compilation pins a complete bounded retry/takeover send horizon and requires
-it to fit the usable retention window; a later takeover permanently refuses
-I/O instead of rotating the key.
+it to fit the usable retention window. Each possible attempt contributes its
+start-to-close bound plus one terminal takeover grace, including the final
+attempt and `max_attempts = 1`. A takeover rotates lease generation but cannot
+renew that attempt's deadline or increment its configured attempt ordinal.
+Equality does not by itself expire either persisted bound; both comparisons
+are strict and both bounds are still evaluated. When database time is later
+than both, the provider usable-window check runs first and returns permanent
+`connector_idempotency_window_exhausted`; when it is only later than the
+compiled maximum-send deadline, the typed timeout route wins. Both routes
+permanently refuse network I/O instead of rotating the key.
 
 The runtime distinguishes schedule-to-start from start-to-close timeout using
 the database clock. Phase 1 has no heartbeat extension: long interactions are
