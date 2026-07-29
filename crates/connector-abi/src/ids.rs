@@ -53,6 +53,26 @@ impl InlineId {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticErrorCode(InlineId);
+
+impl StaticErrorCode {
+    pub const fn literal(value: &'static str) -> Self {
+        Self(InlineId::literal(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn parse_catalog(value: &str) -> Result<Self, AbiError> {
+        InlineId::parse(value).map(Self).map_err(|_| {
+            AbiError::InvalidValue("connector failure code must be a canonical ABI identifier")
+        })
+    }
+}
+
 const fn valid_id(value: &[u8]) -> bool {
     if value.is_empty() || value.len() > ABI_ID_CAPACITY {
         return false;

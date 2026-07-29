@@ -2,13 +2,14 @@ use core::mem::{align_of, size_of};
 use std::collections::BTreeMap;
 
 use donat_connector_abi::{
-    AuthenticatorId, BindingSlotId, BoundedBytes, BoundedString, BoundedTransportResponse,
-    BoxFuture, CapabilityId, CodecId, CompiledStepId, ConnectorErrorClass, ConnectorFailure,
-    ConnectorId, ConnectorIo, CredentialFieldId, CredentialSpecId, Hash256, InlineId, NonEmptyVec,
-    NormalizerId, OperationId, OriginId, ProcessorContext, ProcessorControl, ProcessorFamilyId,
-    TriggerId, TypedBindings,
+    AuthenticatorId, AuthorizedCorrelations, BindingSlotId, BoundedBytes, BoundedString,
+    BoundedTransportResponse, BoxFuture, CapabilityId, CodecId, CompiledStepId,
+    ConnectorErrorClass, ConnectorFailure, ConnectorId, ConnectorIo, CredentialFieldId,
+    CredentialSpecId, Hash256, InlineId, MAXIMUM_SAFE_STRING_BYTES, NonEmptyVec, NormalizerId,
+    OperationId, OriginId, ProcessorContext, ProcessorControl, ProcessorFamilyId, StaticErrorCode,
+    StaticSafeMessage, TriggerId, TypedBindings, catalog_construction, host_construction,
 };
-use donat_value_contract::TypedValue;
+use donat_value_contract::{BoundedInlineBytes, TypedValue};
 
 const SERPAPI: ConnectorId = ConnectorId::literal("serpapi");
 const OPERATION: OperationId = OperationId::literal("search.google");
@@ -23,6 +24,9 @@ const CAPABILITY: CapabilityId = CapabilityId::literal("request-id");
 const BINDING_SLOT: BindingSlotId = BindingSlotId::literal("query");
 const ORIGIN: OriginId = OriginId::literal("serpapi-public");
 const RAW_ID: InlineId = InlineId::literal("raw");
+const FAILURE_CODE: StaticErrorCode = StaticErrorCode::literal("connector_rate_limited");
+static FAILURE_MESSAGE: StaticSafeMessage =
+    StaticSafeMessage::literal("provider rate limit reached");
 
 static STEPS: [CompiledStepId; 1] = [CompiledStepId::literal("search")];
 
@@ -183,6 +187,26 @@ fn nested_list(depth: usize) -> TypedValue {
     (0..depth).fold(TypedValue::Null, |value, _| TypedValue::List(vec![value]))
 }
 
+fn inline_value(bytes: usize) -> TypedValue {
+    TypedValue::InlineBytes(
+        BoundedInlineBytes::try_new(vec![0; bytes], "application/octet-stream", None, bytes)
+            .unwrap(),
+    )
+}
+
+fn inline_bindings(sizes: &[usize]) -> BTreeMap<BindingSlotId, TypedValue> {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            (
+                BindingSlotId::parse(&format!("inline-{index}")).unwrap(),
+                inline_value(*bytes),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn typed_binding_maps_enforce_entry_depth_and_canonical_bounds() {
     let accepted = TypedBindings::try_new(bindings(64)).expect("64 bindings are accepted");
@@ -213,16 +237,81 @@ fn typed_binding_maps_enforce_entry_depth_and_canonical_bounds() {
     assert!(TypedBindings::try_new(over_canonical).is_err());
 }
 
+#[test]
+fn typed_binding_aggregate_limits_are_shared_across_roots() {
+    assert!(TypedBindings::try_new(inline_bindings(&[0; 16])).is_ok());
+    assert!(TypedBindings::try_new(inline_bindings(&[0; 17])).is_err());
+    assert!(TypedBindings::try_new(inline_bindings(&[65_536, 65_536])).is_ok());
+    assert!(TypedBindings::try_new(inline_bindings(&[65_536, 65_537])).is_err());
+
+    let mut two_deep_roots = BTreeMap::new();
+    two_deep_roots.insert(BindingSlotId::literal("first"), nested_list(64));
+    two_deep_roots.insert(BindingSlotId::literal("second"), nested_list(64));
+    assert!(TypedBindings::try_new(two_deep_roots).is_ok());
+
+    let mut exact_canonical = BTreeMap::new();
+    exact_canonical.insert(
+        BindingSlotId::literal("first"),
+        TypedValue::String("a".repeat(131_070)),
+    );
+    exact_canonical.insert(
+        BindingSlotId::literal("second"),
+        TypedValue::String("a".repeat(131_070)),
+    );
+    assert!(TypedBindings::try_new(exact_canonical).is_ok());
+
+    let mut over_canonical = BTreeMap::new();
+    over_canonical.insert(
+        BindingSlotId::literal("first"),
+        TypedValue::String("a".repeat(131_070)),
+    );
+    over_canonical.insert(
+        BindingSlotId::literal("second"),
+        TypedValue::String("a".repeat(131_071)),
+    );
+    assert!(TypedBindings::try_new(over_canonical).is_err());
+}
+
 fn selected_headers(count: usize, value_bytes: usize) -> BTreeMap<CapabilityId, BoundedString> {
     (0..count)
         .map(|index| {
             (
                 CapabilityId::parse(&format!("header-{index}")).expect("canonical capability ID"),
-                BoundedString::try_new(&"a".repeat(value_bytes), 262_144)
+                BoundedString::try_new(&"a".repeat(value_bytes), MAXIMUM_SAFE_STRING_BYTES)
                     .expect("globally bounded string"),
             )
         })
         .collect()
+}
+
+fn aggregate_header_boundary(over_by_one: bool) -> BTreeMap<CapabilityId, BoundedString> {
+    ["a", "b", "c", "d"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let value_bytes = if over_by_one && index == 0 {
+                8_192
+            } else {
+                8_191
+            };
+            (
+                CapabilityId::parse(id).unwrap(),
+                BoundedString::try_new(&"a".repeat(value_bytes), MAXIMUM_SAFE_STRING_BYTES)
+                    .unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_u16_status_is_accepted_and_public_construction_has_no_authority() {
+    for status in [0, 1, 199, 200, 599, 600, u16::MAX] {
+        let response =
+            BoundedTransportResponse::try_new(status, BTreeMap::new(), TypedValue::Null, 0)
+                .expect("the ABI does not impose HTTP status semantics");
+        assert_eq!(response.status(), status);
+        assert!(response.authorized_correlations().is_empty());
+    }
 }
 
 #[test]
@@ -230,26 +319,51 @@ fn transport_responses_enforce_header_body_shape_and_output_bounds() {
     let accepted =
         BoundedTransportResponse::try_new(200, selected_headers(64, 1), nested_list(64), 1_048_576)
             .expect("all exact ceilings are accepted");
-    assert_eq!(accepted.status, 200);
-    assert_eq!(accepted.selected_headers.len(), 64);
-    assert_eq!(accepted.response_bytes, 1_048_576);
+    assert_eq!(accepted.status(), 200);
+    assert_eq!(accepted.selected_headers().len(), 64);
+    assert_eq!(accepted.decoded(), &nested_list(64));
+    assert_eq!(accepted.response_bytes(), 1_048_576);
+    assert!(accepted.authorized_correlations().is_empty());
 
     assert!(
         BoundedTransportResponse::try_new(200, selected_headers(65, 1), TypedValue::Null, 0,)
             .is_err()
     );
     assert!(
+        BoundedTransportResponse::try_new(200, selected_headers(1, 8_192), TypedValue::Null, 0,)
+            .is_ok()
+    );
+    assert!(
         BoundedTransportResponse::try_new(200, selected_headers(1, 8_193), TypedValue::Null, 0,)
             .is_err()
     );
     assert!(
-        BoundedTransportResponse::try_new(200, selected_headers(5, 8_192), TypedValue::Null, 0,)
-            .is_err()
+        BoundedTransportResponse::try_new(
+            200,
+            aggregate_header_boundary(false),
+            TypedValue::Null,
+            0,
+        )
+        .is_ok()
+    );
+    assert!(
+        BoundedTransportResponse::try_new(
+            200,
+            aggregate_header_boundary(true),
+            TypedValue::Null,
+            0,
+        )
+        .is_err()
+    );
+    assert!(
+        BoundedTransportResponse::try_new(200, BTreeMap::new(), TypedValue::Null, 1_048_576,)
+            .is_ok()
     );
     assert!(
         BoundedTransportResponse::try_new(200, BTreeMap::new(), TypedValue::Null, 1_048_577,)
             .is_err()
     );
+    assert!(BoundedTransportResponse::try_new(200, BTreeMap::new(), nested_list(64), 0,).is_ok());
     assert!(BoundedTransportResponse::try_new(200, BTreeMap::new(), nested_list(65), 0,).is_err());
     assert!(
         BoundedTransportResponse::try_new(
@@ -272,7 +386,102 @@ fn transport_responses_enforce_header_body_shape_and_output_bounds() {
 }
 
 #[test]
-fn connector_failures_are_closed_redacted_clamped_and_allowlisted() {
+fn host_authority_is_intersection_only() {
+    let allowed_present = CapabilityId::literal("request-id");
+    let allowed_absent = CapabilityId::literal("trace-id");
+    let selected_unallowed = CapabilityId::literal("server-id");
+    let mut selected = BTreeMap::new();
+    selected.insert(
+        allowed_present,
+        BoundedString::try_new("req-123", 8_192).unwrap(),
+    );
+    selected.insert(
+        selected_unallowed,
+        BoundedString::try_new("srv-456", 8_192).unwrap(),
+    );
+
+    let response = host_construction::transport_response(
+        200,
+        selected,
+        TypedValue::Null,
+        0,
+        &[allowed_present, allowed_absent],
+    )
+    .unwrap();
+
+    let authority: &AuthorizedCorrelations = response.authorized_correlations();
+    assert_eq!(
+        authority.get(&allowed_present).map(BoundedString::as_str),
+        Some("req-123"),
+    );
+    assert!(authority.get(&allowed_absent).is_none());
+    assert!(authority.get(&selected_unallowed).is_none());
+    assert_eq!(authority.len(), 1);
+    assert_eq!(authority.iter().count(), 1);
+    assert_eq!(response.selected_headers().len(), 2);
+}
+
+#[test]
+fn correlation_authorization_enforces_every_boundary() {
+    let exact_selected = selected_headers(64, 1);
+    let exact_allowed: Vec<_> = exact_selected.keys().copied().collect();
+    assert!(host_construction::authorized_correlations(&exact_selected, &exact_allowed).is_ok());
+
+    let too_many_allowed: Vec<_> = (0..65)
+        .map(|index| CapabilityId::parse(&format!("allowed-{index}")).unwrap())
+        .collect();
+    assert!(
+        host_construction::authorized_correlations(&BTreeMap::new(), &too_many_allowed).is_err()
+    );
+
+    let duplicate = CapabilityId::literal("duplicate");
+    assert!(matches!(
+        host_construction::authorized_correlations(&BTreeMap::new(), &[duplicate, duplicate]),
+        Err(donat_connector_abi::AbiError::InvalidValue(
+            "correlation authorization contains a duplicate capability",
+        ))
+    ));
+
+    assert!(
+        host_construction::authorized_correlations(
+            &aggregate_header_boundary(false),
+            &[
+                CapabilityId::literal("a"),
+                CapabilityId::literal("b"),
+                CapabilityId::literal("c"),
+                CapabilityId::literal("d"),
+            ],
+        )
+        .is_ok()
+    );
+    assert!(
+        host_construction::authorized_correlations(
+            &aggregate_header_boundary(true),
+            &[
+                CapabilityId::literal("a"),
+                CapabilityId::literal("b"),
+                CapabilityId::literal("c"),
+                CapabilityId::literal("d"),
+            ],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn catalog_failure_text_validation_is_exact() {
+    assert!(catalog_construction::static_error_code("connector_failed").is_ok());
+    assert!(catalog_construction::static_error_code("Connector Failed").is_err());
+    assert!(catalog_construction::static_safe_message("a").is_ok());
+    assert!(catalog_construction::static_safe_message("").is_err());
+    assert!(catalog_construction::static_safe_message(&"a".repeat(1_024)).is_ok());
+    assert!(catalog_construction::static_safe_message(&"a".repeat(1_025)).is_err());
+    assert!(catalog_construction::static_safe_message("line\nbreak").is_err());
+    assert!(catalog_construction::static_safe_message("line\u{0085}break").is_err());
+}
+
+#[test]
+fn connector_failures_are_closed_redacted_clamped_and_authorized() {
     fn class_index(class: ConnectorErrorClass) -> u8 {
         match class {
             ConnectorErrorClass::Transport => 0,
@@ -299,20 +508,22 @@ fn connector_failures_are_closed_redacted_clamped_and_allowlisted() {
     assert_eq!(classes.map(class_index), [0_u8, 1, 2, 3, 4, 5, 6, 7]);
 
     let request_id = CapabilityId::literal("request-id");
-    let mut correlations = BTreeMap::new();
-    correlations.insert(
+    let mut selected = BTreeMap::new();
+    selected.insert(
         request_id,
         BoundedString::try_new("req-123", 8_192).unwrap(),
     );
+    let response =
+        host_construction::transport_response(429, selected, TypedValue::Null, 0, &[request_id])
+            .unwrap();
     let failure = ConnectorFailure::try_new(
         ConnectorErrorClass::Http429,
-        "connector_rate_limited",
-        "provider rate limit reached",
-        Some(86_401),
-        correlations,
-        &[request_id],
+        FAILURE_CODE,
+        FAILURE_MESSAGE,
+        Some(86_400),
+        Some(response.authorized_correlations()),
     )
-    .expect("safe allowlisted failure");
+    .expect("safe authorized failure");
     assert_eq!(failure.class(), ConnectorErrorClass::Http429);
     assert_eq!(failure.code(), "connector_rate_limited");
     assert_eq!(failure.safe_message(), "provider rate limit reached");
@@ -325,44 +536,31 @@ fn connector_failures_are_closed_redacted_clamped_and_allowlisted() {
         Some("req-123")
     );
 
-    let mut unlisted = BTreeMap::new();
-    unlisted.insert(
-        CapabilityId::literal("trace-id"),
-        BoundedString::try_new("trace-123", 8_192).unwrap(),
-    );
-    assert!(
-        ConnectorFailure::try_new(
-            ConnectorErrorClass::Permanent,
-            "connector_failed",
-            "connector failed",
-            None,
-            unlisted,
-            &[request_id],
-        )
-        .is_err()
-    );
-    assert!(
-        ConnectorFailure::try_new(
-            ConnectorErrorClass::Permanent,
-            &"a".repeat(97),
-            "connector failed",
-            None,
-            BTreeMap::new(),
-            &[],
-        )
-        .is_err()
-    );
-    assert!(
-        ConnectorFailure::try_new(
-            ConnectorErrorClass::Permanent,
-            "connector_failed",
-            &"a".repeat(1_025),
-            None,
-            BTreeMap::new(),
-            &[],
-        )
-        .is_err()
-    );
+    let clamped = ConnectorFailure::try_new(
+        ConnectorErrorClass::Http429,
+        FAILURE_CODE,
+        FAILURE_MESSAGE,
+        Some(86_401),
+        None,
+    )
+    .unwrap();
+    assert_eq!(clamped.retry_after_seconds(), Some(86_400));
+    assert!(clamped.correlation_ids().is_empty());
+}
+
+#[test]
+fn failure_accessors_return_the_private_static_text_values() {
+    let failure = ConnectorFailure::try_new(
+        ConnectorErrorClass::Permanent,
+        FAILURE_CODE,
+        FAILURE_MESSAGE,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(failure.code(), "connector_rate_limited");
+    assert_eq!(failure.safe_message(), "provider rate limit reached");
 }
 
 #[test]
@@ -387,36 +585,15 @@ fn host_traits_are_object_safe_send_and_sync_with_exact_call_types() {
 
 #[test]
 fn processor_context_borrows_only_neutral_bounded_capabilities() {
-    struct Control;
-
-    impl ProcessorControl for Control {
-        fn check(&self) -> Result<(), ConnectorFailure> {
-            Ok(())
-        }
+    fn inspect_context(context: ProcessorContext<'_>) {
+        let _: &ConnectorId = context.connector;
+        let _: &OperationId = context.operation;
+        let _: &BoundedString = context.logical_activity_id;
+        let _: &BoundedString = context.idempotency_identity;
+        let _: &Hash256 = context.request_fingerprint;
+        let _: &[CapabilityId] = context.capabilities;
+        let _: &dyn ProcessorControl = context.control;
     }
 
-    let connector = ConnectorId::literal("serpapi");
-    let operation = OperationId::literal("search.google");
-    let logical_activity_id = BoundedString::try_new("activity-123", 64).unwrap();
-    let idempotency_identity = BoundedString::try_new("attempt-123", 64).unwrap();
-    let request_fingerprint = Hash256::new([9; 32]);
-    let capabilities = [CapabilityId::literal("request-id")];
-    let control = Control;
-    let context = ProcessorContext {
-        connector: &connector,
-        operation: &operation,
-        logical_activity_id: &logical_activity_id,
-        idempotency_identity: &idempotency_identity,
-        request_fingerprint: &request_fingerprint,
-        capabilities: &capabilities,
-        control: &control,
-    };
-
-    assert_eq!(context.connector.as_str(), "serpapi");
-    assert_eq!(context.operation.as_str(), "search.google");
-    assert_eq!(context.logical_activity_id.as_str(), "activity-123");
-    assert_eq!(context.idempotency_identity.as_str(), "attempt-123");
-    assert_eq!(context.request_fingerprint.as_bytes(), &[9; 32]);
-    assert_eq!(context.capabilities[0].as_str(), "request-id");
-    assert!(context.control.check().is_ok());
+    let _ = inspect_context;
 }

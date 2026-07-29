@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Connector processor boundary policy
+        run: python3 scripts/check_connector_processor_boundary.py
       - name: Unit and snapshot tests
         run: cargo test --workspace --exclude donat-conformance
 

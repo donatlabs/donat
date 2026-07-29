@@ -1,10 +1,11 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use donat_value_contract::{TypedValue, canonical_size};
 
-use crate::{AbiError, BindingSlotId, CapabilityId, InlineId};
+use crate::{AbiError, BindingSlotId, CapabilityId, StaticErrorCode};
 
 pub const MAXIMUM_SAFE_STRING_BYTES: usize = 262_144;
 pub const MAXIMUM_BOUNDED_BYTES: usize = 1_048_576;
@@ -20,6 +21,83 @@ pub const MAXIMUM_RETRY_AFTER_SECONDS: u32 = 86_400;
 pub const MAXIMUM_CORRELATION_IDS: usize = 64;
 pub const MAXIMUM_FAILURE_CODE_BYTES: usize = 96;
 pub const MAXIMUM_SAFE_MESSAGE_BYTES: usize = 1_024;
+const MAXIMUM_INLINE_VALUES: usize = 16;
+const MAXIMUM_DECODED_INLINE_BYTES: usize = 131_072;
+
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticSafeMessage {
+    len: u16,
+    bytes: [u8; MAXIMUM_SAFE_MESSAGE_BYTES],
+}
+
+impl StaticSafeMessage {
+    pub const fn literal(value: &'static str) -> Self {
+        match Self::try_copy(value) {
+            Ok(message) => message,
+            Err(_) => panic!("invalid connector failure safe message literal"),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("validated connector failure messages are UTF-8")
+    }
+
+    pub(crate) fn try_catalog(value: &str) -> Result<Self, AbiError> {
+        Self::try_copy(value)
+    }
+
+    const fn try_copy(value: &str) -> Result<Self, AbiError> {
+        let source = value.as_bytes();
+        match validate_safe_message_bytes(source) {
+            Ok(()) => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut bytes = [0_u8; MAXIMUM_SAFE_MESSAGE_BYTES];
+        let mut index = 0;
+        while index < source.len() {
+            bytes[index] = source[index];
+            index += 1;
+        }
+
+        Ok(Self {
+            len: source.len() as u16,
+            bytes,
+        })
+    }
+}
+
+const fn validate_safe_message_bytes(source: &[u8]) -> Result<(), AbiError> {
+    if source.is_empty() {
+        return Err(AbiError::InvalidValue(
+            "connector failure safe message must not be empty",
+        ));
+    }
+    if source.len() > MAXIMUM_SAFE_MESSAGE_BYTES {
+        return Err(AbiError::LimitExceeded(
+            "connector failure safe message bytes",
+        ));
+    }
+
+    let mut index = 0;
+    while index < source.len() {
+        let byte = source[index];
+        let ascii_control = byte <= 0x1f || byte == 0x7f;
+        let unicode_c1_control = byte == 0xc2
+            && index + 1 < source.len()
+            && source[index + 1] >= 0x80
+            && source[index + 1] <= 0x9f;
+        if ascii_control || unicode_c1_control {
+            return Err(AbiError::InvalidValue(
+                "connector failure safe message must not contain control characters",
+            ));
+        }
+        index += 1;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BoundedString(String);
@@ -138,9 +216,9 @@ impl TypedBindings {
             return Err(AbiError::LimitExceeded("binding slots"));
         }
 
+        validate_typed_value_roots(slots.values())?;
         let mut canonical_bytes = 0_usize;
         for value in slots.values() {
-            validate_typed_value_shape(value)?;
             let value_bytes = canonical_size(value)
                 .map_err(|_| AbiError::LimitExceeded("binding canonical bytes"))?;
             canonical_bytes = canonical_bytes
@@ -170,11 +248,34 @@ impl TypedBindings {
     }
 }
 
+pub struct AuthorizedCorrelations {
+    values: BTreeMap<CapabilityId, BoundedString>,
+}
+
+impl AuthorizedCorrelations {
+    pub fn get(&self, id: &CapabilityId) -> Option<&BoundedString> {
+        self.values.get(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&CapabilityId, &BoundedString)> {
+        self.values.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
 pub struct BoundedTransportResponse {
-    pub status: u16,
-    pub selected_headers: BTreeMap<CapabilityId, BoundedString>,
-    pub decoded: TypedValue,
-    pub response_bytes: u32,
+    status: u16,
+    selected_headers: BTreeMap<CapabilityId, BoundedString>,
+    decoded: TypedValue,
+    response_bytes: u32,
+    authorized_correlations: AuthorizedCorrelations,
 }
 
 impl BoundedTransportResponse {
@@ -184,22 +285,36 @@ impl BoundedTransportResponse {
         decoded: TypedValue,
         response_bytes: u32,
     ) -> Result<Self, AbiError> {
-        validate_headers(&selected_headers, MAXIMUM_SELECTED_HEADERS)?;
-        if response_bytes > MAXIMUM_TRANSPORT_RESPONSE_BYTES {
-            return Err(AbiError::LimitExceeded("transport response bytes"));
-        }
-        validate_typed_value_shape(&decoded)?;
-        let output_bytes = canonical_size(&decoded)
-            .map_err(|_| AbiError::LimitExceeded("canonical output bytes"))?;
-        if output_bytes > MAXIMUM_CANONICAL_OUTPUT_BYTES {
-            return Err(AbiError::LimitExceeded("canonical output bytes"));
-        }
+        validate_response(&selected_headers, &decoded, response_bytes)?;
         Ok(Self {
             status,
             selected_headers,
             decoded,
             response_bytes,
+            authorized_correlations: AuthorizedCorrelations {
+                values: BTreeMap::new(),
+            },
         })
+    }
+
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn selected_headers(&self) -> &BTreeMap<CapabilityId, BoundedString> {
+        &self.selected_headers
+    }
+
+    pub const fn decoded(&self) -> &TypedValue {
+        &self.decoded
+    }
+
+    pub const fn response_bytes(&self) -> u32 {
+        self.response_bytes
+    }
+
+    pub const fn authorized_correlations(&self) -> &AuthorizedCorrelations {
+        &self.authorized_correlations
     }
 }
 
@@ -215,10 +330,14 @@ pub enum ConnectorErrorClass {
     Invariant,
 }
 
+struct StaticFailureText {
+    code: StaticErrorCode,
+    safe_message: StaticSafeMessage,
+}
+
 pub struct ConnectorFailure {
     class: ConnectorErrorClass,
-    code: BoundedString,
-    safe_message: BoundedString,
+    static_text: Box<StaticFailureText>,
     retry_after_seconds: Option<u32>,
     correlation_ids: BTreeMap<CapabilityId, BoundedString>,
 }
@@ -226,43 +345,21 @@ pub struct ConnectorFailure {
 impl ConnectorFailure {
     pub fn try_new(
         class: ConnectorErrorClass,
-        code: &str,
-        safe_message: &str,
+        code: StaticErrorCode,
+        safe_message: StaticSafeMessage,
         retry_after_seconds: Option<u64>,
-        correlation_ids: BTreeMap<CapabilityId, BoundedString>,
-        allowed_correlation_ids: &[CapabilityId],
+        correlations: Option<&AuthorizedCorrelations>,
     ) -> Result<Self, AbiError> {
-        if InlineId::parse(code).is_err() {
-            return Err(AbiError::InvalidValue(
-                "connector failure code must be a canonical ABI identifier",
-            ));
-        }
-        let code = BoundedString::try_new(code, MAXIMUM_FAILURE_CODE_BYTES)?;
-        let safe_message = BoundedString::try_new(safe_message, MAXIMUM_SAFE_MESSAGE_BYTES)?;
-        if safe_message.is_empty() {
-            return Err(AbiError::InvalidValue(
-                "connector failure safe message must not be empty",
-            ));
-        }
-        if correlation_ids.len() > MAXIMUM_CORRELATION_IDS {
-            return Err(AbiError::LimitExceeded("correlation IDs"));
-        }
-        if correlation_ids
-            .keys()
-            .any(|candidate| !allowed_correlation_ids.contains(candidate))
-        {
-            return Err(AbiError::InvalidValue(
-                "connector failure correlation ID is not allowlisted",
-            ));
-        }
-        validate_headers(&correlation_ids, MAXIMUM_CORRELATION_IDS)?;
-
+        let correlation_ids = correlations
+            .map(|authority| authority.values.clone())
+            .unwrap_or_default();
         let retry_after_seconds = retry_after_seconds
             .map(|seconds| seconds.min(u64::from(MAXIMUM_RETRY_AFTER_SECONDS)) as u32);
+        let static_text = Box::new(StaticFailureText { code, safe_message });
+
         Ok(Self {
             class,
-            code,
-            safe_message,
+            static_text,
             retry_after_seconds,
             correlation_ids,
         })
@@ -273,11 +370,11 @@ impl ConnectorFailure {
     }
 
     pub fn code(&self) -> &str {
-        self.code.as_str()
+        self.static_text.code.as_str()
     }
 
     pub fn safe_message(&self) -> &str {
-        self.safe_message.as_str()
+        self.static_text.safe_message.as_str()
     }
 
     pub const fn retry_after_seconds(&self) -> Option<u32> {
@@ -287,6 +384,66 @@ impl ConnectorFailure {
     pub const fn correlation_ids(&self) -> &BTreeMap<CapabilityId, BoundedString> {
         &self.correlation_ids
     }
+}
+
+pub(crate) fn host_transport_response(
+    status: u16,
+    selected_headers: BTreeMap<CapabilityId, BoundedString>,
+    decoded: TypedValue,
+    response_bytes: u32,
+    allowed_correlations: &[CapabilityId],
+) -> Result<BoundedTransportResponse, AbiError> {
+    validate_response(&selected_headers, &decoded, response_bytes)?;
+    let authorized_correlations = authorize_correlations(&selected_headers, allowed_correlations)?;
+    Ok(BoundedTransportResponse {
+        status,
+        selected_headers,
+        decoded,
+        response_bytes,
+        authorized_correlations,
+    })
+}
+
+pub(crate) fn authorize_correlations(
+    selected_headers: &BTreeMap<CapabilityId, BoundedString>,
+    allowed_correlations: &[CapabilityId],
+) -> Result<AuthorizedCorrelations, AbiError> {
+    validate_headers(selected_headers, MAXIMUM_SELECTED_HEADERS)?;
+    if allowed_correlations.len() > MAXIMUM_CORRELATION_IDS {
+        return Err(AbiError::LimitExceeded("correlation authorization entries"));
+    }
+
+    let mut seen = BTreeMap::new();
+    let mut values = BTreeMap::new();
+    for id in allowed_correlations {
+        if seen.insert(*id, ()).is_some() {
+            return Err(AbiError::InvalidValue(
+                "correlation authorization contains a duplicate capability",
+            ));
+        }
+        if let Some(value) = selected_headers.get(id) {
+            values.insert(*id, value.clone());
+        }
+    }
+    Ok(AuthorizedCorrelations { values })
+}
+
+fn validate_response(
+    selected_headers: &BTreeMap<CapabilityId, BoundedString>,
+    decoded: &TypedValue,
+    response_bytes: u32,
+) -> Result<(), AbiError> {
+    validate_headers(selected_headers, MAXIMUM_SELECTED_HEADERS)?;
+    if response_bytes > MAXIMUM_TRANSPORT_RESPONSE_BYTES {
+        return Err(AbiError::LimitExceeded("transport response bytes"));
+    }
+    validate_typed_value_roots(core::iter::once(decoded))?;
+    let output_bytes =
+        canonical_size(decoded).map_err(|_| AbiError::LimitExceeded("canonical output bytes"))?;
+    if output_bytes > MAXIMUM_CANONICAL_OUTPUT_BYTES {
+        return Err(AbiError::LimitExceeded("canonical output bytes"));
+    }
+    Ok(())
 }
 
 fn validate_headers(
@@ -312,15 +469,37 @@ fn validate_headers(
     Ok(())
 }
 
-fn validate_typed_value_shape(root: &TypedValue) -> Result<(), AbiError> {
-    let mut nodes = 0_usize;
+#[derive(Default)]
+struct ValueCounters {
+    nodes: usize,
+    inline_values: usize,
+    decoded_inline_bytes: usize,
+}
+
+fn validate_typed_value_roots<'a>(
+    roots: impl Iterator<Item = &'a TypedValue>,
+) -> Result<(), AbiError> {
+    let mut counters = ValueCounters::default();
+    for root in roots {
+        validate_typed_value_root(root, &mut counters)?;
+    }
+    Ok(())
+}
+
+fn validate_typed_value_root(
+    root: &TypedValue,
+    counters: &mut ValueCounters,
+) -> Result<(), AbiError> {
     let mut pending = alloc::vec![(root, 0_usize)];
     while let Some((value, depth)) = pending.pop() {
         if depth > MAXIMUM_JSON_DEPTH {
             return Err(AbiError::LimitExceeded("typed value nesting depth"));
         }
-        nodes = nodes.checked_add(1).ok_or(AbiError::SizeOverflow)?;
-        if nodes > MAXIMUM_JSON_NODES {
+        counters.nodes = counters
+            .nodes
+            .checked_add(1)
+            .ok_or(AbiError::SizeOverflow)?;
+        if counters.nodes > MAXIMUM_JSON_NODES {
             return Err(AbiError::LimitExceeded("typed value node count"));
         }
         match value {
@@ -340,11 +519,135 @@ fn validate_typed_value_shape(root: &TypedValue) -> Result<(), AbiError> {
                     pending.push((value, depth + 1));
                 }
             }
-            TypedValue::Null
-            | TypedValue::Boolean(_)
-            | TypedValue::Number(_)
-            | TypedValue::InlineBytes(_) => {}
+            TypedValue::InlineBytes(value) => {
+                counters.inline_values = counters
+                    .inline_values
+                    .checked_add(1)
+                    .ok_or(AbiError::SizeOverflow)?;
+                if counters.inline_values > MAXIMUM_INLINE_VALUES {
+                    return Err(AbiError::LimitExceeded("inline value count"));
+                }
+                counters.decoded_inline_bytes = counters
+                    .decoded_inline_bytes
+                    .checked_add(value.as_slice().len())
+                    .ok_or(AbiError::SizeOverflow)?;
+                if counters.decoded_inline_bytes > MAXIMUM_DECODED_INLINE_BYTES {
+                    return Err(AbiError::LimitExceeded("aggregate decoded inline bytes"));
+                }
+            }
+            TypedValue::Null | TypedValue::Boolean(_) | TypedValue::Number(_) => {}
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use core::mem::size_of;
+
+    use donat_value_contract::BoundedInlineBytes;
+
+    use super::*;
+
+    fn nested_list(depth: usize) -> TypedValue {
+        (0..depth).fold(TypedValue::Null, |value, _| TypedValue::List(vec![value]))
+    }
+
+    fn inline_value(bytes: usize) -> TypedValue {
+        TypedValue::InlineBytes(
+            BoundedInlineBytes::try_new(vec![0; bytes], "application/octet-stream", None, bytes)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn aggregate_node_counter_accepts_100_000_and_rejects_100_001() {
+        let exact = TypedValue::List(vec![TypedValue::Null; 99_999]);
+        assert!(validate_typed_value_roots(core::iter::once(&exact)).is_ok());
+
+        let over = TypedValue::List(vec![TypedValue::Null; 100_000]);
+        assert_eq!(
+            validate_typed_value_roots(core::iter::once(&over)),
+            Err(AbiError::LimitExceeded("typed value node count")),
+        );
+    }
+
+    #[test]
+    fn aggregate_node_counter_is_shared_while_depth_restarts() {
+        let first = TypedValue::List(vec![TypedValue::Null; 49_999]);
+        let second = TypedValue::List(vec![TypedValue::Null; 49_999]);
+        assert!(validate_typed_value_roots([&first, &second].into_iter()).is_ok());
+
+        let one_over = TypedValue::List(vec![TypedValue::Null; 50_000]);
+        assert_eq!(
+            validate_typed_value_roots([&first, &one_over].into_iter()),
+            Err(AbiError::LimitExceeded("typed value node count")),
+        );
+    }
+
+    #[test]
+    fn aggregate_traversal_restarts_depth_for_each_root() {
+        let first = nested_list(64);
+        let second = nested_list(64);
+        assert!(validate_typed_value_roots([&first, &second].into_iter()).is_ok());
+
+        let over = nested_list(65);
+        assert_eq!(
+            validate_typed_value_roots(core::iter::once(&over)),
+            Err(AbiError::LimitExceeded("typed value nesting depth")),
+        );
+    }
+
+    #[test]
+    fn aggregate_traversal_reports_exact_inline_limits() {
+        let exact_count: Vec<_> = (0..16).map(|_| inline_value(0)).collect();
+        assert!(validate_typed_value_roots(exact_count.iter()).is_ok());
+        let over_count: Vec<_> = (0..17).map(|_| inline_value(0)).collect();
+        assert_eq!(
+            validate_typed_value_roots(over_count.iter()),
+            Err(AbiError::LimitExceeded("inline value count")),
+        );
+
+        let exact_bytes = [inline_value(65_536), inline_value(65_536)];
+        assert!(validate_typed_value_roots(exact_bytes.iter()).is_ok());
+        let over_bytes = [inline_value(65_536), inline_value(65_537)];
+        assert_eq!(
+            validate_typed_value_roots(over_bytes.iter()),
+            Err(AbiError::LimitExceeded("aggregate decoded inline bytes",)),
+        );
+    }
+
+    #[test]
+    fn static_safe_message_zero_fills_its_private_suffix() {
+        const LITERAL: StaticSafeMessage = StaticSafeMessage::literal("connector failed");
+        let runtime = StaticSafeMessage::try_catalog("connector failed").unwrap();
+
+        assert!(LITERAL == runtime);
+        assert_eq!(LITERAL.as_str(), "connector failed");
+        assert!(
+            LITERAL.bytes[usize::from(LITERAL.len)..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn connector_failure_boxes_one_complete_static_text_bundle() {
+        let failure = ConnectorFailure::try_new(
+            ConnectorErrorClass::Permanent,
+            StaticErrorCode::literal("connector_failed"),
+            StaticSafeMessage::literal("connector failed"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(failure.static_text.code.as_str(), "connector_failed",);
+        assert_eq!(
+            failure.static_text.safe_message.as_str(),
+            "connector failed",
+        );
+        assert!(size_of::<ConnectorFailure>() < size_of::<StaticFailureText>());
+    }
 }
