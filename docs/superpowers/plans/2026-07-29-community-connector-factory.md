@@ -343,7 +343,7 @@ cargo test -p donat-schema --test commands
 cargo check -p donat-value-contract --no-default-features \
   --target thumbv7em-none-eabi
 cargo tree -p donat-value-contract --target all \
-  --edges normal,build,no-dev --no-default-features --offline --locked
+  --edges normal,build --no-default-features --offline --locked
 ```
 
 Expected: the exact decimal spelling and identifier grammar tests pass, the
@@ -569,7 +569,7 @@ out of every public field and signature.
 cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo tree -p donat-connector-abi --target all \
-  --edges normal,build,no-dev --no-default-features --offline --locked
+  --edges normal,build --no-default-features --offline --locked
 ```
 
 Expected: only `donat-connector-abi` and the local value-contract crate appear.
@@ -606,15 +606,22 @@ git commit -m "feat(connectors): add neutral connector ABI"
 - Create: `crates/connector-catalog/src/canonical.rs`
 - Create: `crates/connector-catalog/tests/source_record.rs`
 - Create: `crates/connector-catalog/tests/operation_spec.rs`
+- Create: `crates/connector-catalog/tests/catalog_contracts.rs`
+- Create: `crates/connector-catalog/tests/contract_facts.rs`
 - Create: `crates/connector-catalog/tests/canonical_hashes.rs`
 - Create: `crates/connector-catalog/tests/type_identity.rs`
 - Create: `crates/connector-catalog/tests/fixtures/missing-license-file-hash.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/missing-side-effect-step.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/unknown-effect.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/unknown-auth-plan.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/incomplete-error-map.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/unbounded-trigger.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/policy-as-provider-fact.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/serpapi-npm-record.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/provider-contract-record.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/donat-owned-record.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/npm-repository-mismatch.yaml`
+- Create: `crates/connector-catalog/tests/fixtures/npm-provenance-mismatch.yaml`
 - Create: `crates/connector-catalog/tests/fixtures/open-dependency-disposition.yaml`
 - Create: `crates/connector-catalog/sources/records/donat-owned-http-v1.yaml`
 - Modify: `Cargo.toml`
@@ -630,6 +637,7 @@ pub struct ConnectorSourceRecord {
     pub record_version: u32,
     pub record_id: SourceRecordId,
     pub subject: SourceSubject,
+    pub reacquisition: ReacquisitionPlan,
     pub artifact_hashes: Vec<ArtifactHash>,
     pub license: LicenseDecision,
     pub notice: NoticeIdentity,
@@ -647,14 +655,28 @@ pub struct ConnectorSourceRecord {
     pub red_tests: NonEmptyVec<TestId>,
 }
 
-pub struct SourceRecordId(String);
-pub struct ProviderContractId(String);
-pub struct ProviderFactId(String);
+#[repr(transparent)]
+pub struct SourceRecordId(InlineId);
+#[repr(transparent)]
+pub struct ProviderContractId(InlineId);
+#[repr(transparent)]
+pub struct ProviderFactId(InlineId);
+#[repr(transparent)]
+pub struct DonatPolicyId(InlineId);
+#[repr(transparent)]
+pub struct NoticeId(InlineId);
 
 pub enum SourceSubject {
     ExactNpm(ExactNpmPackage),
     ProviderArtifact(ExactProviderArtifact),
     DonatOwned(DonatOwnedSource),
+}
+
+pub enum ReacquisitionPlan {
+    ExactNpmReview,
+    ProviderRepositoryReview,
+    ProviderVersionedArtifactReview,
+    DonatOwnedNoNetwork,
 }
 
 pub struct ExactNpmPackage {
@@ -665,6 +687,12 @@ pub struct ExactNpmPackage {
     pub repository: ImmutableRepository,
     pub npm_git_head: GitCommit,
     pub package_repository: RepositoryUrl,
+    pub signature: NpmSignatureDecision,
+    pub provenance: NpmProvenanceDecision,
+    pub tag_commit: Option<GitCommit>,
+    pub provenance_commit: Option<GitCommit>,
+    pub maintainers: Vec<NpmMaintainerIdentity>,
+    pub repository_owner: RepositoryOwnerDecision,
 }
 
 pub struct NpmIntegrity {
@@ -676,6 +704,45 @@ pub struct ImmutableRepository {
     pub url: RepositoryUrl,
     pub commit: GitCommit,
     pub tree: GitTree,
+}
+
+pub enum NpmSignatureDecision {
+    Verified {
+        signatures: NonEmptyVec<VerifiedNpmSignature>,
+        registry_metadata_sha256: Hash256,
+    },
+    VerifiedAbsent {
+        registry_metadata_sha256: Hash256,
+    },
+    Rejected {
+        finding: FindingId,
+    },
+}
+
+pub enum NpmProvenanceDecision {
+    Verified {
+        statement_sha256: Hash256,
+        source_commit: GitCommit,
+    },
+    VerifiedAbsent {
+        registry_metadata_sha256: Hash256,
+    },
+    Rejected {
+        finding: FindingId,
+    },
+}
+
+pub enum RepositoryOwnerDecision {
+    Consistent {
+        package_owner: NpmOwnerIdentity,
+        repository_owner: RepositoryOwnerIdentity,
+    },
+    ReviewedMismatch {
+        decision_id: ReviewDecisionId,
+    },
+    Rejected {
+        finding: FindingId,
+    },
 }
 
 pub struct ExactProviderArtifact {
@@ -709,10 +776,20 @@ pub struct ProviderFact {
     pub normalized_value: CanonicalProviderValue,
 }
 
+pub enum ContractFact {
+    ProviderEvidence {
+        source_record_id: SourceRecordId,
+        fact_id: ProviderFactId,
+    },
+    DonatPolicy {
+        policy_id: DonatPolicyId,
+        value: TypedValue,
+    },
+}
+
 pub struct ProviderContractReference {
-    pub source_record_id: SourceRecordId,
     pub contract_id: ProviderContractId,
-    pub required_facts: NonEmptyVec<ProviderFactId>,
+    pub facts: NonEmptyVec<ContractFact>,
 }
 
 pub struct DonatOwnedSource {
@@ -739,14 +816,204 @@ pub enum AdmissionState {
     },
 }
 
+pub struct ConnectorManifest {
+    pub connector: ConnectorId,
+    pub version: u32,
+    pub credentials: Vec<CredentialSpec>,
+    pub origins: NonEmptyVec<FixedOrigin>,
+    pub operations: NonEmptyVec<OperationSpec>,
+    pub triggers: Vec<TriggerSpec>,
+    pub provenance: NonEmptyVec<ManifestProvenanceReference>,
+}
+
+pub struct CredentialSpec {
+    pub credential: CredentialSpecId,
+    pub version: u32,
+    pub fields: NonEmptyVec<CredentialFieldSpec>,
+    pub auth_plan: AuthPlan,
+    pub allowed_origins: NonEmptyVec<OriginId>,
+    pub scopes: Vec<StaticScope>,
+    pub auth_processor: Option<AuthenticatorId>,
+    pub credential_test_operation: Option<OperationId>,
+    pub bounds: CredentialBounds,
+}
+
+pub struct CredentialFieldSpec {
+    pub field: CredentialFieldId,
+    pub required: bool,
+    pub secret: SecretClassification,
+    pub maximum_bytes: NonZeroU32,
+    pub redaction: RedactionPlan,
+}
+
+pub struct CredentialBounds {
+    pub maximum_field_bytes: NonZeroU32,
+    pub maximum_aggregate_bytes: NonZeroU32,
+    pub maximum_token_bytes: NonZeroU32,
+}
+
+pub enum AuthPlan {
+    FixedHeaderApiKey {
+        field: CredentialFieldId,
+        header: StaticHeaderName,
+    },
+    FixedQueryApiKey {
+        field: CredentialFieldId,
+        query: StaticQueryKey,
+    },
+    Bearer {
+        token: CredentialFieldId,
+    },
+    HttpBasic {
+        username: CredentialFieldId,
+        password: CredentialFieldId,
+    },
+    OAuth2ClientCredentials {
+        client_id: CredentialFieldId,
+        client_secret: CredentialFieldId,
+        token_origin: OriginId,
+        token_step: CompiledStepId,
+        scopes: Vec<StaticScope>,
+        token_pointer: StaticJsonPointer,
+    },
+    PreprovisionedOAuthAccessToken {
+        token: CredentialFieldId,
+    },
+}
+
+pub struct FixedOrigin {
+    pub origin: OriginId,
+    pub scheme: HttpsOnly,
+    pub host: StaticDnsName,
+    pub port: NonZeroU16,
+    pub network_policy: NetworkPolicy,
+}
+
+pub struct CompiledStepSpec {
+    pub step: CompiledStepId,
+    pub method: StaticHttpMethod,
+    pub origin: OriginId,
+    pub path: StaticPathTemplate,
+    pub query: Vec<CompiledQueryBinding>,
+    pub headers: Vec<CompiledHeaderBinding>,
+    pub credential_action: Option<CompiledCredentialAction>,
+    pub request: CompiledRequestShape,
+    pub success_statuses: NonEmptyVec<StatusRange>,
+    pub response: CompiledResponseShape,
+    pub bounds: StepBounds,
+}
+
+pub struct StepBounds {
+    pub maximum_headers: NonZeroU32,
+    pub maximum_header_bytes: NonZeroU32,
+    pub maximum_url_bytes: NonZeroU32,
+    pub maximum_request_bytes: NonZeroU32,
+    pub maximum_response_bytes: NonZeroU32,
+    pub maximum_json_depth: NonZeroU32,
+    pub maximum_json_nodes: NonZeroU32,
+    pub maximum_inline_binary_bytes: NonZeroU32,
+    pub deadline_ms: NonZeroU64,
+}
+
+pub struct OperationBounds {
+    pub maximum_calls: NonZeroU32,
+    pub maximum_pages: NonZeroU32,
+    pub maximum_items: NonZeroU32,
+    pub maximum_aggregate_request_bytes: NonZeroU32,
+    pub maximum_aggregate_response_bytes: NonZeroU32,
+    pub maximum_output_canonical_bytes: NonZeroU32,
+    pub maximum_redirects: u8,
+    pub deadline_ms: NonZeroU64,
+}
+
+pub struct ErrorMap {
+    pub rules: Vec<ErrorRule>,
+    pub fallback: CompleteErrorFallback,
+}
+
+pub struct ErrorRule {
+    pub matcher: ErrorMatcher,
+    pub action: ErrorAction,
+}
+
+pub struct ErrorAction {
+    pub class: ConnectorErrorClass,
+    pub code: StaticErrorCode,
+    pub safe_message: StaticSafeMessage,
+    pub retry_after: RetryAfterPolicy,
+    pub correlation_headers: Vec<StaticHeaderName>,
+}
+
+pub struct CompleteErrorFallback {
+    pub transport: ErrorAction,
+    pub timeout: ErrorAction,
+    pub http_429: ErrorAction,
+    pub http_5xx: ErrorAction,
+    pub authentication: ErrorAction,
+    pub validation: ErrorAction,
+    pub permanent: ErrorAction,
+    pub invariant: ErrorAction,
+}
+
+pub enum ErrorMatcher {
+    Status(StatusRange),
+    ProviderCode {
+        pointer: StaticJsonPointer,
+        codes: NonEmptyVec<StaticProviderCode>,
+    },
+    Header {
+        name: StaticHeaderName,
+        values: NonEmptyVec<StaticHeaderValue>,
+    },
+    MalformedDeclaredSuccess,
+}
+
+pub enum TriggerSpec {
+    Webhook {
+        trigger: TriggerId,
+        authenticator: AuthenticatorId,
+        codec: CodecId,
+        normalizer: NormalizerId,
+        selected_headers: Vec<StaticHeaderName>,
+        raw_body_max_bytes: NonZeroU32,
+        timestamp_window_ms: NonZeroU64,
+        event_id: ValueContractCatalog,
+        event_type: ValueContractCatalog,
+        output: ValueContractCatalog,
+        redaction: RedactionPlan,
+        subscription_operations: Option<SubscriptionOperationIds>,
+    },
+    Poll {
+        trigger: TriggerId,
+        checkpoint: ValueContractCatalog,
+        processor: ProcessorFamilyId,
+        event_type: ValueContractCatalog,
+        per_poll_event_limit: NonZeroU32,
+        bounds: OperationBounds,
+    },
+}
+
+pub struct ManifestProvenanceReference {
+    pub source_record_id: SourceRecordId,
+    pub artifact_hashes: NonEmptyVec<ArtifactHash>,
+    pub license_id: LicenseIdentity,
+    pub notice_id: NoticeId,
+    pub contract_facts: Vec<ContractFact>,
+}
+
 pub struct OperationSpec {
     pub connector: ConnectorId,
     pub operation: OperationId,
+    pub version: u32,
+    pub credential: Option<CredentialSpecId>,
     pub steps: NonEmptyVec<CompiledStepSpec>,
     pub effect: OperationEffect,
     pub input: ValueContractCatalog,
     pub output: ValueContractCatalog,
+    pub pagination: PaginationPlan,
+    pub error_map: ErrorMap,
     pub bounds: OperationBounds,
+    pub provenance: NonEmptyVec<ManifestProvenanceReference>,
 }
 
 pub enum OperationEffect {
@@ -765,8 +1032,19 @@ copyright lines, and the planned notice-bundle destination. Exact npm loading
 decodes one canonical `sha512-...` SRI value into the structured 64-byte
 digest and requires `npm_git_head == repository.commit`, exact package
 name/version, tarball URL, package repository mapping, and tree identity.
+The exact npm variant also retains a closed verified/present,
+verified-absent, or rejected decision for registry signatures and signed
+provenance; optional distinct tag/provenance commits; the reviewed maintainer
+set; and a closed repository-owner consistency decision. A verified
+provenance commit must match `provenance_commit`, and neither a tag nor
+provenance commit may be silently substituted for `npm_git_head`.
 Every dependency and embedded artifact has one explicit closed disposition.
 Every proposed manifest/destination is a normalized repository-relative path.
+`ConnectorManifest`, every nested credential/auth, fixed-origin/step,
+operation/error/pagination/bounds, trigger, and provenance type denies unknown
+fields. Credential and trigger bounds are finite and no auth, error, or
+trigger variant accepts an arbitrary method, URL, header name, expression,
+provider message, secret, or processor path.
 
 - [ ] **Step 1: Write failing strictness, effect, and hash-vector tests**
 
@@ -795,6 +1073,13 @@ fn serpapi_npm_record_round_trips_without_information_loss() {
 }
 ```
 
+The SerpAPI-shaped fixture asserts the exact `NpmSignatureDecision`,
+`NpmProvenanceDecision::VerifiedAbsent`, optional tag/provenance commits,
+maintainer set, and repository-owner decision. Add negative assertions for a
+signature/provenance state that disagrees with the recorded registry metadata,
+a provenance commit that differs from its signed statement, an unexplained
+tag commit, a changed maintainer set, and an unreviewed owner mismatch.
+
 Independently construct and assert all four Spec 007 Section 5.1
 domain-separated SHA-256 vectors:
 
@@ -807,12 +1092,28 @@ provenance {"a":1,"b":[true,null,"x"]} 4e31e445b6c8d06e6b93fd5cc66731b850a84853d
 
 Add `source_record_variants_are_closed`,
 `npm_integrity_and_repository_mapping_are_exact`,
+`npm_signature_provenance_tag_maintainer_and_owner_state_is_exact`,
+`reacquisition_plan_matches_source_subject`,
 `provider_contract_reference_requires_matching_record_and_facts`,
+`contract_fact_origins_are_closed_and_non_substitutable`,
+`donat_policy_cannot_satisfy_required_provider_evidence`,
+`contract_fact_semantic_and_provenance_hashes_are_separate`,
 `provider_evidence_acceptance_is_closed_and_non_executable`,
 `dependency_and_embedded_dispositions_are_closed`,
 `notice_and_destination_fields_are_required`, and
-`catalog_descriptor_ids_match_connector_io`. The last test assigns normalized
-descriptor IDs directly to `ConnectorIo` parameters.
+`catalog_descriptor_ids_match_connector_io`. In
+`catalog_contracts.rs`, add
+`credential_auth_plan_is_closed_and_bounded`,
+`fixed_origin_step_and_operation_bounds_are_required`,
+`error_map_is_complete_closed_and_redacted`,
+`webhook_and_poll_trigger_specs_are_closed_and_bounded`, and
+`manifest_provenance_references_match_exact_records`. Round-trip one complete
+manifest containing a credential, fixed origin, compiled step, error map,
+operation, webhook trigger, poll trigger, bounds, and provenance references;
+reject every unknown enum tag, unknown nested field, unbounded declaration,
+missing reference, dynamic destination, and raw provider message. The final
+identity test assigns normalized descriptor IDs directly to `ConnectorIo`
+parameters.
 
 - [ ] **Step 2: Run RED**
 
@@ -838,17 +1139,29 @@ Validate that every side-effecting step has exactly one evidence-backed entry
 and that read-only steps have none. Validate all three source variants before
 canonicalization. A provider artifact has no npm fields; a Donat-owned record
 has no external package claim; an npm record cannot omit or flatten SRI and
-repository mapping. A mutable provider URL plus access date/hash is not an
-immutable source identity and is rejected. Every provider fact names its
-exact location and normalized value. Every provider-contract reference
-resolves to a distinct matching `ProviderArtifact` record, normalized
-contract, and complete fact set. `EvidenceAccepted` is valid only for a
+repository, signature, provenance, tag, maintainer, or owner mapping. A
+`ReacquisitionPlan` must match its exact source-subject variant, and
+`DonatOwnedNoNetwork` can never reach a network command. A
+mutable provider URL plus access date/hash is not an immutable source identity
+and is rejected. Every provider fact names its exact location and normalized
+value. Every `ContractFact::ProviderEvidence` resolves to a distinct matching
+`ProviderArtifact` record, normalized contract, and complete fact set; every
+`ContractFact::DonatPolicy` resolves to a matching reviewed Donat policy ID.
+The two variants are not substitutable. Provider normalized values and Donat
+policy values enter semantic material; provider record/artifact/fact
+identities and locations plus Donat policy IDs enter provenance material.
+Changing either origin or value changes the corresponding domain-separated
+hash. `EvidenceAccepted` is valid only for a
 `ProviderArtifact`; `ApprovedForPort` is valid only for a donor or Donat-owned
-operation source. The three catalog-local provenance IDs use one strict
+operation source. The five catalog-local provenance IDs use one strict
 `1..=96`-byte ASCII grammar
 `[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?` and reject unknown, empty, duplicate, or
-mismatched references. The provider-contract round-trip fixture exercises
-`EvidenceAccepted`; that state can never generate an operation entry.
+mismatched references. They are transparent wrappers over Task 2's exact
+const/copy `InlineId` storage and expose the same checked runtime parser plus
+const literal constructor, so generated source, fact, policy, and notice
+identities need no `String` or lazy initialization. The provider-contract
+round-trip fixture exercises `EvidenceAccepted`; that state can never
+generate an operation entry.
 Inventory-only records never enter the executable catalog.
 
 - [ ] **Step 4: Run GREEN and review snapshots**
@@ -859,9 +1172,11 @@ cargo insta test -p donat-connector-catalog
 cargo insta review
 ```
 
-Expected: the exact SerpAPI-shaped npm fixture round-trips, provider and
-Donat-owned variants remain distinct, every mismatch/open disposition fails,
-and reviewed snapshots contain no source description or UI metadata.
+Expected: the exact SerpAPI-shaped npm fixture round-trips,
+provider-evidence and Donat-policy origins remain distinct, the complete
+credential/operation/trigger catalog round-trips, every
+mismatch/open/unbounded disposition fails, and reviewed snapshots contain no
+source description or UI metadata.
 
 - [ ] **Step 5: Commit the neutral catalog**
 
@@ -885,6 +1200,7 @@ git commit -m "feat(connectors): add normalized connector catalog"
 - Create: `crates/connector-acquire/src/admission.rs`
 - Create: `crates/connector-acquire/src/inventory.rs`
 - Create: `crates/connector-acquire/tests/source_admission.rs`
+- Create: `crates/connector-acquire/tests/cli_contract.rs`
 - Create: `crates/connector-acquire/tests/hostile_archives.rs`
 - Create: `crates/connector-acquire/tests/imperative_inventory.rs`
 - Modify: `.gitignore`
@@ -898,38 +1214,61 @@ git commit -m "feat(connectors): add normalized connector catalog"
 - Produces development-only commands:
 
 ```text
-donat-connector-acquire acquire-review \
+donat-connector-acquire acquire-npm-review \
   --artifact-url <exact-https-url> \
+  --expected-integrity <canonical-sha512-sri> \
   --repository-url <exact-https-git-url> \
   --commit <full-commit> \
-  [--provider-repository-url <exact-https-git-url> \
-   --provider-commit <full-commit>] \
-  [--provider-evidence-url <exact-https-url>]... \
   --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --artifact-url <exact-https-url> \
+  --provider-revision <non-empty-immutable-revision> \
+  --expected-sha256 <lower-case-64-hex> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire reacquire-reviewed \
+  --record <approved.yaml> \
+  --output <absent-ignored-quarantine-directory>
+
 donat-connector-acquire check-record --record <approved.yaml>
 donat-connector-acquire verify \
   --record <approved.yaml> \
   --artifact <local-artifact> \
-  --source-tree <local-source-tree>
+  [--source-tree <local-source-tree>]
 ```
 
-`acquire-review` is the only networked command and writes an ignored
-mode-`0700` quarantine plus candidate review bundle.
+The two `acquire-*-review` commands are disjoint tagged schemas. The npm
+command requires SRI before any record exists and rejects provider-only
+flags. The provider command requires exactly one of repository
+`{repository_url, commit}` or versioned-artifact
+`{artifact_url, provider_revision, expected_sha256}` and rejects npm
+integrity/package fields. `reacquire-reviewed` accepts no locator or expected
+hash on the command line; it reads those exact identities only from a
+schema-valid `ApprovedForPort` or `EvidenceAccepted` source record and refuses
+an inventory/candidate record. These three are the only networked commands and
+write an ignored mode-`0700` quarantine plus candidate review bundle.
 `.donat/connector-quarantine/` is added to `.gitignore`. `check-record` is
 offline and checks only schema/internal consistency; it never claims byte
 verification. `verify` is offline, requires explicit local artifact and
-source-tree paths, and recomputes artifact integrity, repository tree, every
-admitted file hash, and the license hash from those bytes. Neither offline
-command writes source or generated Rust. No command executes donor scripts,
-binaries, tests, Node, or JavaScript.
+source-tree paths for npm/repository subjects, forbids `--source-tree` for a
+versioned single artifact, and recomputes artifact integrity, repository tree,
+every admitted file hash, and the license hash from those bytes. Neither
+offline command writes source or generated Rust. No command executes donor
+scripts, binaries, tests, Node, or JavaScript.
 
-Provider repository/evidence inputs are optional, repeatable review inputs.
-For a repository provider artifact, acquisition emits the checked-out tree
-and a deterministic local `provider-source.tar`; for mutable URL candidates,
-it emits a local `provider-evidence.bundle` that can prove byte identity for a
-rejection test but cannot invent an immutable provider revision. Offline
-`verify` treats either local bundle as the explicit `--artifact` and never
-reaches the network.
+An npm acquisition emits `package.tgz` and `source/`. A repository provider
+acquisition emits `provider-source.tar` and `source/`; a versioned provider
+artifact emits `provider-artifact.bin`. Mutable provider HTML with only an
+access date is not an acquisition schema and cannot become immutable evidence.
+Tests may use checked-in synthetic bytes to prove that rejection without
+network access. All networked forms use the same checked-in host policy;
+`docs.stripe.com` is not allowed by this plan.
 
 - [ ] **Step 1: Add synthetic hostile-archive RED tests**
 
@@ -947,24 +1286,40 @@ fn package_script_sentinel_is_never_executed() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Add exact disjoint-CLI RED tests**
+
+Add `npm_review_requires_expected_integrity`,
+`npm_review_rejects_provider_only_flags`,
+`provider_review_requires_one_exact_source_identity`,
+`provider_review_rejects_npm_flags`,
+`provider_versioned_artifact_requires_expected_sha256`,
+`reacquire_uses_only_reviewed_record_identity`,
+`reacquire_rejects_locator_overrides`, and
+`unallowlisted_provider_host_is_rejected`. Parse the same clap command enum
+used by `main`; do not duplicate a test-only grammar.
+
+- [ ] **Step 3: Run RED**
 
 ```bash
+cargo test -p donat-connector-acquire --test cli_contract
 cargo test -p donat-connector-acquire --test source_admission
 cargo test -p donat-connector-acquire --test hostile_archives
 ```
 
 Expected: Cargo reports that package `donat-connector-acquire` does not exist.
 
-- [ ] **Step 3: Implement the exact acquisition policy**
+- [ ] **Step 4: Implement the exact acquisition policy**
 
 Enforce HTTPS, the checked-in host allowlist, at most three same-host HTTPS
 redirects, 64 MiB compressed, 256 MiB expanded, 16 MiB per file, 10,000
-entries, and depth 32. Hash the complete artifact before entry inspection.
-Use an exclusive mode-`0700` temporary directory, exclusive file creation,
+entries, and depth 32. Hash the complete artifact before entry inspection and
+require npm/versioned-provider bytes to match expected integrity first.
+Safely extract repository bytes, then require the exact commit/tree identity;
+reacquisition matches every corresponding record value before admission. Use
+an exclusive mode-`0700` temporary directory, exclusive file creation,
 no-follow walks, normalized relative UTF-8 paths, and RAII cleanup.
 
-- [ ] **Step 4: Add admission and imperative-source findings**
+- [ ] **Step 5: Add admission and imperative-source findings**
 
 Prove the six-license allowlist, closed dependency dispositions,
 `n8n-workflow: TypeOnlyReplaced`, exact tree/file/license hashes, and
@@ -979,26 +1334,27 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 5: Prove record-only and byte-verification modes differ**
+- [ ] **Step 6: Prove record-only and byte-verification modes differ**
 
 Add tests `check_record_does_not_claim_byte_verification`,
-`verify_requires_artifact_and_source_tree`,
+`verify_requires_subject_specific_local_inputs`,
 `verify_recomputes_every_recorded_hash`, and
-`network_is_available_only_to_acquire_review`. Add
+`network_is_available_only_to_review_and_reacquire_commands`. Add
 `provider_repository_emits_offline_artifact_and_tree` and
 `mutable_provider_url_cannot_become_immutable_evidence`. A record that repeats
 expected hash strings passes `check-record` but fails `verify` against one
 changed artifact byte or source file.
 
-- [ ] **Step 6: Run GREEN**
+- [ ] **Step 7: Run GREEN**
 
 ```bash
+cargo test -p donat-connector-acquire --test cli_contract
 cargo test -p donat-connector-acquire --test source_admission
 cargo test -p donat-connector-acquire --test hostile_archives
 cargo test -p donat-connector-acquire --test imperative_inventory
 ```
 
-- [ ] **Step 7: Commit the acquisition tool**
+- [ ] **Step 8: Commit the acquisition tool**
 
 ```bash
 git add .gitignore Cargo.toml Cargo.lock crates/connector-acquire
@@ -1020,6 +1376,7 @@ git commit -m "feat(connectors): add hostile source acquisition gate"
 - Create: `crates/connector-codegen/tests/deterministic_catalog.rs`
 - Create:
   `crates/connector-codegen/tests/snapshots/deterministic_catalog__donat_owned_http.snap`
+- Create: `crates/connector-catalog/tests/generated_consumers.rs`
 - Create: `crates/connector-catalog/manifests/donat-owned-http-v1.yaml`
 - Create: `crates/connector-catalog/src/generated/mod.rs`
 - Create: `crates/connector-catalog/src/generated/donat_owned_http.rs`
@@ -1041,9 +1398,59 @@ donat-connector-codegen generate --output <temporary-directory>
 and immutable generated entries:
 
 ```rust
+pub struct GeneratedCredentialSpec {
+    pub credential: CredentialSpecId,
+    pub version: u32,
+    pub fields: &'static [GeneratedCredentialField],
+    pub auth_plan: GeneratedAuthPlan,
+    pub allowed_origins: &'static [OriginId],
+    pub scopes: &'static [GeneratedStaticScope],
+    pub auth_processor: Option<AuthenticatorId>,
+    pub credential_test_operation: Option<OperationId>,
+    pub bounds: GeneratedCredentialBounds,
+}
+
+pub struct GeneratedOperationEntry {
+    pub operation: OperationId,
+    pub version: u32,
+    pub credential: Option<CredentialSpecId>,
+    pub origins: &'static [GeneratedFixedOrigin],
+    pub steps: &'static [GeneratedCompiledStep],
+    pub effect: GeneratedOperationEffect,
+    pub input: GeneratedValueContract,
+    pub output: GeneratedValueContract,
+    pub pagination: GeneratedPaginationPlan,
+    pub error_map: GeneratedErrorMap,
+    pub bounds: GeneratedOperationBounds,
+    pub provenance: &'static [GeneratedProvenanceReference],
+}
+
+pub struct GeneratedTriggerSpec {
+    pub trigger: TriggerId,
+    pub kind: GeneratedTriggerKind,
+    pub provenance: &'static [GeneratedProvenanceReference],
+}
+
+pub struct GeneratedSourceIdentity {
+    pub record_id: SourceRecordId,
+    pub record_sha256: Hash256,
+    pub artifact_hashes: &'static [GeneratedArtifactHash],
+}
+
+pub struct GeneratedLegalIdentity {
+    pub source_record_id: SourceRecordId,
+    pub license_id: LicenseIdentity,
+    pub notice_id: NoticeId,
+    pub license_file_sha256: Hash256,
+}
+
 pub struct GeneratedConnectorEntry {
     pub connector: ConnectorId,
+    pub credentials: &'static [GeneratedCredentialSpec],
     pub operations: &'static [GeneratedOperationEntry],
+    pub triggers: &'static [GeneratedTriggerSpec],
+    pub source_records: &'static [GeneratedSourceIdentity],
+    pub legal: &'static [GeneratedLegalIdentity],
     pub semantic_sha256: Hash256,
     pub provenance_sha256: Hash256,
 }
@@ -1055,7 +1462,11 @@ Every rendered identity is emitted as an ABI const literal, for example
 `ConnectorId::literal("donat.http")` and
 `CompiledStepId::literal("request")`. Generated code contains no owned
 `String`, lazy initialization, parse call, deserialization, clone, or
-conversion bridge for an identity.
+conversion bridge for an identity. The generated credential/auth, fixed
+origin/step, operation/effect/error/pagination/bounds, trigger, contract-fact,
+source-record, and legal shapes are const-safe projections of the strict Task
+3 model; they do not omit a normalized field or introduce a server-owned
+descriptor.
 
 - [ ] **Step 1: Write the failing determinism and drift tests**
 
@@ -1073,7 +1484,11 @@ Also test deleted output, extra output, changed byte, unsorted IDs, duplicate
 ID, manifest/source-record mismatch, semantic/provenance mismatch, and an
 unexpected path. Add a renderer assertion that rejects output containing
 identity `.parse()`, `String::`, `.to_owned()`, `.to_string()`, `.clone()`,
-`OnceLock`, or `LazyLock`, and compile the emitted statics in a const context.
+`OnceLock`, or `LazyLock`, and compile the emitted credentials, operations,
+triggers, source identities, legal identities, and all ABI IDs in a const
+context. Reject a generated entry that omits any matching source-record hash,
+license/notice identity, contract-fact origin, fixed step/origin, bound, auth
+plan, error map, or trigger field.
 
 - [ ] **Step 2: Run RED**
 
@@ -1090,11 +1505,33 @@ record, generator version, semantic hash, and provenance hash. Calculate the
 generated-tree digest exactly as Spec 007 Section 10 specifies. Never use
 `OUT_DIR`, `build.rs`, the network, or `donat-connector-acquire`.
 
-- [ ] **Step 4: Add the post-codegen ABI identity proof**
+- [ ] **Step 4: Add ABI identity and exact-consumer compile proofs**
 
 Add `generated_catalog_ids_match_abi` in the catalog crate. It assigns every
 actual checked-in connector, operation, step, processor-family, credential,
-and capability ID directly to the corresponding ABI type.
+capability, trigger, authenticator, codec, normalizer, and origin ID directly
+to the corresponding ABI type.
+
+In `generated_consumers.rs`, compile these exact catalog-facing consumers:
+
+```rust
+fn task7_credential(
+    spec: &'static GeneratedCredentialSpec,
+) -> CredentialSpecId {
+    spec.credential
+}
+
+fn task16_trigger(spec: &'static GeneratedTriggerSpec) -> TriggerId {
+    spec.trigger
+}
+```
+
+Add
+`generated_credentials_compile_for_task7_without_server_descriptor` and
+`generated_triggers_compile_for_task16_without_server_descriptor`. The test
+imports both argument types from `donat_connector_catalog::generated`; it
+must not define a server-owned credential, operation, trigger, source, or
+legal descriptor.
 
 - [ ] **Step 5: Render the first manifest to a temporary directory**
 
@@ -1126,6 +1563,7 @@ Never hand-edit `donat_owned_http.rs`, `mod.rs`, or `catalog.digest`.
 cargo test -p donat-connector-codegen --test deterministic_catalog
 cargo run -p donat-connector-codegen -- generate --check
 cargo test -p donat-connector-catalog generated_catalog_ids_match_abi
+cargo test -p donat-connector-catalog --test generated_consumers
 cargo insta test -p donat-connector-codegen
 cargo insta review
 ```
@@ -1135,7 +1573,8 @@ cargo insta review
 ```bash
 git add Cargo.toml Cargo.lock crates/connector-codegen \
   crates/connector-catalog/manifests/donat-owned-http-v1.yaml \
-  crates/connector-catalog/src/generated crates/connector-catalog/src/lib.rs
+  crates/connector-catalog/src/generated crates/connector-catalog/src/lib.rs \
+  crates/connector-catalog/tests/generated_consumers.rs
 git commit -m "feat(connectors): generate checked-in static catalog"
 ```
 
@@ -1274,7 +1713,7 @@ cargo test -p donat-connector-processors --no-default-features
 cargo check -p donat-connector-processors --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo tree -p donat-connector-processors --target all \
-  --edges normal,build,no-dev --no-default-features --offline --locked
+  --edges normal,build --no-default-features --offline --locked
 cargo test -p donat-connector-abi --no-default-features
 cargo test -p donat-value-contract --no-default-features
 ```
@@ -1382,6 +1821,7 @@ Add exact tests:
 - `environment_reference_is_validated_before_listen`;
 - `credential_is_resolved_again_for_every_use`;
 - `capability_is_scoped_to_compiled_step_and_field`;
+- `credential_validation_consumes_generated_spec_without_server_descriptor`;
 - `credential_failure_never_contains_secret_value`;
 - `credential_capability_has_no_debug_clone_or_serialize_surface`.
 
@@ -1416,12 +1856,14 @@ absent.
 - [ ] **Step 3: Implement strict metadata selection**
 
 Add the strict optional credential object to existing `ConnectorConfig`.
-Validate `module` against the generated catalog, `CredentialSpecId` against
-that module, every credential field against the selected spec, every enabled
-operation against the module, and every environment variable name before the
-listener opens. Store only module/instance identity, endpoint identity,
-credential identity, enabled operations, and secret references in the
-immutable registry.
+Validate `module` against `GeneratedConnectorEntry`, select the exact
+`&'static GeneratedCredentialSpec` emitted in Task 5, validate every
+credential field against that value, validate every enabled
+`GeneratedOperationEntry` against the same module, and validate every
+environment variable name before the listener opens. Do not copy the
+generated credential or operation into a server-owned descriptor. Store only
+module/instance identity, endpoint identity, credential identity, enabled
+operations, and secret references in the immutable registry.
 
 - [ ] **Step 4: Implement read-only resolution and opaque consumption**
 
@@ -1719,11 +2161,13 @@ cargo insta review
 Delete `ConnectorModule`, `ConnectorDefinition`, `RegistryInstance`,
 `built_in_module_names`, and the `"http"`/`"stripe"` module match only after
 equivalent static entries are present. Until Task 15 migrates Stripe, its
-generated Donat-owned compatibility entry contains configuration and trigger
-identity but no executable `OperationSpec`; a private fixed server function
-pointer reaches the existing adapter for its direct Rust behavior oracle.
-There is no string dispatch or process/public exposure. Preserve every current
-inbound webhook result and the exact empty-body 404.
+generated Donat-owned compatibility entry contains configuration only: it has
+neither an executable `GeneratedOperationEntry` nor a
+`GeneratedTriggerSpec`. A private fixed server function pointer reaches the
+existing adapter for its direct Rust behavior oracle. Task 16 is the sole
+owner of the first generated Stripe webhook trigger descriptor. There is no
+string dispatch or process/public exposure. Preserve every current inbound
+webhook result and the exact empty-body 404.
 
 - [ ] **Step 7: Run GREEN and scoped public-surface proof**
 
@@ -1824,8 +2268,8 @@ This official SerpApi repository is an immutable `ProviderArtifact` used
 behavior-only; no provider wrapper code or fixture is copied or translated.
 The record pins exact fact locations and normalized facts:
 
-- `serpapi/core.py:34-77`: Google-capable search, `GET`, JSON default, and
-  typed result construction;
+- `serpapi/core.py:34-77`: Google-capable provider path `/search`, `GET`,
+  JSON default, and typed result construction;
 - `serpapi/http.py:11-69`: fixed `https://serpapi.com`, API-key query binding,
   and generic HTTP-error propagation;
 - `tests/example_search_google_test.py:6-14`: a successful Google query has
@@ -1844,6 +2288,10 @@ Donat-owned restrictions under Task 8; `requests.raise_for_status()` is not
 misrepresented as an exact-200 check. No other provider-specific response or
 error assumption is admitted.
 
+The donor `nodes/SerpApi/SerpApi.node.ts` fact is the sole authority for the
+literal `/search.json` path used by the normalized operation. The provider
+`/search` fact proves compatible method/base-origin behavior only.
+
 `serpapi-search-provider-v1.yaml` uses the strict `ProviderArtifact` subject
 and owns these immutable provider facts. `serpapi-0.1.10.yaml` uses
 `ExactNpm` and references that provider-contract record; one source record
@@ -1856,21 +2304,27 @@ This is the explicit networked review step:
 ```bash
 quarantine=.donat/connector-quarantine/serpapi-0.1.10
 test ! -e "$quarantine"
-cargo run -p donat-connector-acquire -- acquire-review \
+npm_review_dir="$quarantine/npm"
+provider_review_dir="$quarantine/provider"
+cargo run -p donat-connector-acquire -- acquire-npm-review \
   --artifact-url \
   https://registry.npmjs.org/n8n-nodes-serpapi/-/n8n-nodes-serpapi-0.1.10.tgz \
   --expected-integrity \
   sha512-E9tAU4c9mhNWr07s6RGeqzyrlQO8y42YvtMjPWuLf+tIEM8muU/RIgtp+ojhaoNVCP+jfrwmsSC75OIuoMVS9A== \
   --repository-url https://github.com/serpapi/n8n-nodes-serpapi.git \
   --commit e48b778878c043f30277b932c4c129804efee66d \
-  --provider-repository-url https://github.com/serpapi/serpapi-python.git \
-  --provider-commit f0cc2fea09bab5884825cbb7bd74f845c8713ea6 \
-  --output "$quarantine"
+  --output "$npm_review_dir"
+cargo run -p donat-connector-acquire -- acquire-provider-review \
+  --repository-url https://github.com/serpapi/serpapi-python.git \
+  --commit f0cc2fea09bab5884825cbb7bd74f845c8713ea6 \
+  --output "$provider_review_dir"
 ```
 
 Inspect the quarantine inventory, donor source tree, tarball, provider source
-tree, both repository trees, every admitted file hash, both licenses, scripts,
-dependencies, and embedded material. Nothing under
+tree, both repository trees, every admitted file hash, registry signature and
+provenance metadata, tag/provenance commits, maintainers, repository-owner
+mapping, both licenses, scripts, dependencies, and embedded material. Nothing
+under
 `.donat/connector-quarantine/` is staged.
 
 - [ ] **Step 2: Add the Donat-owned RED admission tests**
@@ -1882,6 +2336,7 @@ Add exact tests:
 - `serpapi_license_and_notice_are_complete`;
 - `serpapi_dependency_dispositions_are_closed`;
 - `serpapi_n8n_workflow_is_type_only_replaced`;
+- `serpapi_npm_signature_provenance_and_owner_decisions_are_exact`;
 - `serpapi_provider_repository_covers_only_pinned_protocol_facts`;
 - `serpapi_success_body_and_unmapped_status_normalization_is_donat_owned`;
 - `serpapi_npm_record_references_matching_provider_contract`;
@@ -1904,16 +2359,20 @@ provider contract are absent.
 - [ ] **Step 4: Create the complete provider and donor pre-port records**
 
 Record `n8n-workflow: "*"` as `TypeOnlyReplaced`; record all other package,
-embedded, and tool dependencies with a closed disposition. Approve only
-Google search descriptor inventory, the fixed `https://serpapi.com` provider
-origin, `GET /search.json`, query encoding, JSON decoding, static API-key
-credential shape, the `/organic_results` example, and the exact
-`400`/`401`/`429` examples in the pinned provider repository. Record exact
-`[200]` success, top-level-error rejection on a `200` body, missing-as-empty,
-and generic `403`/`5xx` normalization separately as conservative Donat-owned
-behavior. Classify any imperative/function-valued source as a reviewed work
-item. Use the complete Task-3 `ExactNpm` structure, Tier A compatibility,
-proposed manifest/destinations, notice identity, repository mapping, and
+embedded, and tool dependencies with a closed disposition. Retain the exact
+reviewed `NpmSignatureDecision`, the verified absence of an npm provenance
+statement, optional tag/provenance commits, maintainer set, and
+repository-owner decision. Approve only Google search descriptor inventory,
+the donor-proven `/search.json` path, fixed `https://serpapi.com` provider
+origin, compatible provider `GET /search` behavior, query encoding, JSON
+decoding, static API-key credential shape, the `/organic_results` example,
+and the exact `400`/`401`/`429` examples. Record exact `[200]` success,
+top-level-error rejection on a `200` body, missing-as-empty, and generic
+`403`/`5xx` normalization separately as typed
+`ContractFact::DonatPolicy` values, never provider evidence. Classify any
+imperative/function-valued source as a reviewed work item. Use the complete
+Task-3 `ExactNpm` structure, Tier A compatibility, proposed
+manifest/destinations, notice identity, repository mapping, and
 `ApprovedForPort { operations: [search.google] }` state only after the exact
 RED tests from Step 2 exist. Approval authorizes the narrow port; it does not
 make anything executable without a matching generated manifest.
@@ -1946,15 +2405,15 @@ cargo run -p donat-connector-acquire -- check-record \
   crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml
 cargo run -p donat-connector-acquire -- verify \
   --record crates/connector-catalog/sources/records/serpapi-0.1.10.yaml \
-  --artifact .donat/connector-quarantine/serpapi-0.1.10/package.tgz \
-  --source-tree .donat/connector-quarantine/serpapi-0.1.10/source
+  --artifact .donat/connector-quarantine/serpapi-0.1.10/npm/package.tgz \
+  --source-tree .donat/connector-quarantine/serpapi-0.1.10/npm/source
 cargo run -p donat-connector-acquire -- verify \
   --record \
   crates/connector-catalog/sources/records/serpapi-search-provider-v1.yaml \
   --artifact \
-  .donat/connector-quarantine/serpapi-0.1.10/provider-source.tar \
+  .donat/connector-quarantine/serpapi-0.1.10/provider/provider-source.tar \
   --source-tree \
-  .donat/connector-quarantine/serpapi-0.1.10/provider-source
+  .donat/connector-quarantine/serpapi-0.1.10/provider/source
 cargo test -p donat-connector-catalog source_record
 ```
 
@@ -2093,17 +2552,20 @@ register before creating derivative files.
 
 Translate only donor fields covered by Task 10's five source hashes and
 provider facts covered by its exact immutable official-repository commit,
-tree, file hashes, and fact locations. Fixed origin, `GET /search`, JSON
-default, API-key binding, the `/organic_results` example, and
-`400`/`401`/`429` examples cite those provider fact IDs; they are not
-attributed to the n8n donor. Exact `[200]` success, top-level-error rejection
-on a `200` body, missing-as-empty, and generic `403`/`5xx` normalization cite
-separate Donat-owned fact IDs. Put the source-record ID, provider-record ID,
-both full commits/trees, package integrity, contributing source paths/hashes,
-provider and Donat-owned fact IDs, license/notice ID, RED tests, and
-destination paths in the manifest header. Reject any display name, icon, UI
-condition, workflow item, expression, function body, JavaScript, arbitrary
-engine, or arbitrary request field.
+tree, file hashes, and fact locations. Cite the donor record for the literal
+`/search.json` path: the pinned donor proves that suffix. Cite the provider
+record only for compatible `GET` semantics, fixed
+`https://serpapi.com`, its provider-owned `/search` location, API-key binding,
+JSON behavior, the `/organic_results` example, and `400`/`401`/`429`
+examples; never attribute `/search.json` to the provider record. Exact
+`[200]` success, top-level-error rejection on a `200` body, missing-as-empty,
+and generic `403`/`5xx` normalization use typed
+`ContractFact::DonatPolicy` entries. Put the source-record ID,
+provider-record ID, both full commits/trees, package integrity, contributing
+source paths/hashes, typed provider-evidence and Donat-policy origins,
+license/notice ID, RED tests, and destination paths in the manifest header.
+Reject any display name, icon, UI condition, workflow item, expression,
+function body, JavaScript, arbitrary engine, or arbitrary request field.
 
 Render to a temporary directory and review before updating checked-in output:
 
@@ -2183,7 +2645,7 @@ if rg -n "n8n-workflow|IExecuteFunctions|INodeType|pairedItem|\\$node|\\$workflo
 fi
 notice_sha256=$(sha256sum THIRD_PARTY_NOTICES.md | cut -d' ' -f1)
 rg -q "sha256 = \"${notice_sha256}\"" policy/connector-legal-notices.toml
-cargo tree -p donat-server --target all --edges normal,build,no-dev \
+cargo tree -p donat-server --target all --edges normal \
   --offline --locked
 ```
 
@@ -2449,8 +2911,10 @@ clock_safety_margin_ms: 300000
 
 The header, account scope, and minimum retention require Stripe-authored
 evidence. The positive clock margin is a Donat-owned conservative policy
-recorded in the same contract with `origin: donat_policy`; it must not be
-misattributed to Stripe.
+recorded as
+`ContractFact::DonatPolicy { policy_id: stripe.clock_margin.v1, ... }`; it
+must not be misattributed to Stripe or accepted in place of any required
+Stripe-authored fact.
 
 - [ ] **Step 1: Add strict RED evidence tests**
 
@@ -2459,6 +2923,7 @@ Add exact tests:
 - `stripe_provider_contract_rejects_mutable_locator_only`;
 - `stripe_provider_contract_requires_exact_header_scope_and_retention`;
 - `stripe_provider_contract_records_positive_donat_clock_margin`;
+- `stripe_donat_policy_cannot_satisfy_provider_fact_requirement`;
 - `stripe_provider_contract_hashes_complete_evidence_bytes`;
 - `stripe_provider_contract_is_offline_reverifiable`;
 - `stripe_operation_spec_requires_accepted_provider_contract`;
@@ -2491,44 +2956,58 @@ Stripe low-level errors page:
 
 The two documentation URLs are mutable candidate locators. Their current
 bytes are deliberately not assigned a reproducible-hash or admission claim.
+They are outside Task 4's checked-in network host policy and are not fetched
+by this plan. The rejection fixture uses independently authored synthetic
+bytes and those locator strings to prove that mutable HTML plus access date
+cannot satisfy an immutable source identity.
 An accepted record must add a Stripe-owned immutable revision or immutable
-provider artifact, complete-byte SHA-256, exact fact locations, retrieval
-date, terms/redistribution disposition, and reviewer. Do not check copied
-Stripe HTML into the repository unless its redistribution terms have been
-reviewed and recorded.
+provider repository on an allowed host, complete-byte SHA-256, exact fact
+locations, retrieval date, terms/redistribution disposition, and reviewer.
+Task 14 accepts only the repository form so clean-worktree reacquisition has
+one exact output layout. Do not check copied Stripe HTML into the repository.
 
-- [ ] **Step 3: Quarantine network acquisition and verify offline**
+- [ ] **Step 3: Acquire allowed immutable inputs; reject mutable pages offline**
 
-Network access is allowed only for the explicit acquisition command:
+Acquire the already pinned OpenAPI repository through the provider-only
+schema:
+
+```bash
+stripe_openapi_dir=.donat/connector-quarantine/stripe-openapi-6dfda253
+test ! -e "$stripe_openapi_dir"
+cargo run -p donat-connector-acquire -- acquire-provider-review \
+  --repository-url https://github.com/stripe/openapi.git \
+  --commit 6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69 \
+  --output "$stripe_openapi_dir"
+```
+
+The command never contacts `docs.stripe.com`. Test the two mutable locator
+strings only with
+`stripe-mutable-evidence-rejected.yaml` and synthetic local bytes. Inspect the
+OpenAPI bytes for the exact header/scope/retention facts; endpoint shape alone
+is insufficient. If no allowed-host immutable Stripe repository proves all
+three provider facts, keep the negative test green and stop.
+
+If review does find a qualifying immutable repository, write its exact
+identity, tree, file hashes, fact locations, and terms into the proposed
+`EvidenceAccepted` record. Reacquire solely from that record into the
+standard repository-provider layout:
 
 ```bash
 stripe_review_dir=.donat/connector-quarantine/stripe-idempotency-v1
 test ! -e "$stripe_review_dir"
-cargo run -p donat-connector-acquire -- acquire-review \
-  --provider-evidence-url \
-  'https://docs.stripe.com/api/idempotent_requests?lang=curl' \
-  --provider-evidence-url \
-  'https://docs.stripe.com/error-low-level?locale=en-GB' \
-  --repository-url https://github.com/stripe/openapi.git \
-  --commit 6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69 \
+cargo run -p donat-connector-acquire -- reacquire-reviewed \
+  --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
   --output "$stripe_review_dir"
-```
-
-That command acquires the named mutable candidates for rejection testing. If
-review finds a qualifying immutable Stripe artifact, replace those two
-candidate locators with the exact immutable identities and expected hashes
-from the proposed record. The reviewed bytes then pass the offline command:
-
-```bash
 cargo run -p donat-connector-acquire -- verify \
   --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
-  --artifact "$stripe_review_dir/provider-evidence.bundle" \
-  --source-tree "$stripe_review_dir/openapi"
+  --artifact "$stripe_review_dir/provider-source.tar" \
+  --source-tree "$stripe_review_dir/source"
 ```
 
 `verify` must fail on any byte, fact location, source identity, selected
 terms, or disposition mismatch. `check-record` is syntax-only and cannot
-admit the contract.
+admit the contract. The exact `reacquire-reviewed --record ... --output ...`
+command is recorded in the accepted source record and port-register entry.
 
 - [ ] **Step 4: Run the acceptance gate**
 
@@ -2538,8 +3017,8 @@ cargo run -p donat-connector-acquire -- check-record \
   --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml
 cargo run -p donat-connector-acquire -- verify \
   --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
-  --artifact "$stripe_review_dir/provider-evidence.bundle" \
-  --source-tree "$stripe_review_dir/openapi"
+  --artifact "$stripe_review_dir/provider-source.tar" \
+  --source-tree "$stripe_review_dir/source"
 ```
 
 Expected on acceptance: all facts and complete evidence bytes verify and the
@@ -2616,13 +3095,18 @@ accepted_stripe_evidence_commit=$(git log -1 --format=%H -- \
 test -n "$accepted_stripe_evidence_commit"
 git merge-base --is-ancestor "$accepted_stripe_evidence_commit" HEAD
 stripe_review_dir=.donat/connector-quarantine/stripe-idempotency-v1
-test -f "$stripe_review_dir/provider-evidence.bundle"
-test -d "$stripe_review_dir/openapi"
+if ! test -d "$stripe_review_dir"; then
+  cargo run -p donat-connector-acquire -- reacquire-reviewed \
+    --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
+    --output "$stripe_review_dir"
+fi
+test -f "$stripe_review_dir/provider-source.tar"
+test -d "$stripe_review_dir/source"
 cargo test -p donat-connector-catalog --test stripe_provider_evidence
 cargo run -p donat-connector-acquire -- verify \
   --record crates/connector-catalog/sources/records/stripe-idempotency-v1.yaml \
-  --artifact "$stripe_review_dir/provider-evidence.bundle" \
-  --source-tree "$stripe_review_dir/openapi"
+  --artifact "$stripe_review_dir/provider-source.tar" \
+  --source-tree "$stripe_review_dir/source"
 ```
 
 - [ ] **Step 2: Add RED migration and unchanged-oracle tests**
@@ -2780,6 +3264,7 @@ Add exact tests:
 - `authenticated_raw_body_is_opaque_to_processors`;
 - `normalizer_receives_only_typed_decoded_value`;
 - `webhook_manifest_requires_matching_donat_owned_record`;
+- `webhook_lookup_consumes_generated_trigger_without_server_descriptor`;
 - `webhook_registry_returns_only_declared_static_trigger`;
 - `unknown_or_no_verifier_is_empty_404_before_body_read`;
 - `oversized_declared_webhook_is_empty_413`;
@@ -2807,7 +3292,9 @@ sealed processor implementations. Keep bounded body collection, selected
 header copying, environment credential resolution, HMAC primitive,
 receipt-time clock, timestamp-window enforcement primitive, JSON parsing, and
 HTTP status construction server-owned. Register exact authenticator, codec,
-and normalizer IDs in the static trigger descriptor.
+and normalizer IDs in the Task-5 `GeneratedTriggerSpec`. The registry borrows
+that exact generated value; it does not define or populate a server-owned
+trigger descriptor.
 
 - [ ] **Step 4: Generalize lookup and preserve the route**
 
@@ -2962,7 +3449,7 @@ directory, runs:
 ```bash
 cargo build -p donat-server --bin donat --release --offline --locked
 cargo tree -p donat-server --target all \
-  --edges normal,build,no-dev --offline --locked
+  --edges normal --offline --locked
 ```
 
 It copies only `target/release/donat`, the exact-hash

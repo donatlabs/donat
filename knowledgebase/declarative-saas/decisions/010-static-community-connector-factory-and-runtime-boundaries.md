@@ -141,6 +141,15 @@ method, header name, credential, retry, process transition, database write,
 or raw HTTP request. Provider side effects without complete immutable
 idempotency evidence remain inventory-only.
 
+Catalog contract facts have a closed origin:
+`ProviderEvidence { source_record_id, fact_id }` or
+`DonatPolicy { policy_id, value }`. Provider facts resolve only to exact
+locations in an immutable provider-artifact record; Donat-owned
+normalization/safety values resolve only to reviewed policy IDs. Neither
+variant can satisfy a requirement for the other. Normalized fact/policy
+values enter semantic hashing, while provider record/artifact/fact identities
+and locations plus Donat policy IDs enter provenance hashing.
+
 Credentials are split into compiled `CredentialSpec` values and
 source-bound deploy-time credential instances containing only read-only
 `SecretRef` fields. The Phase 1 environment resolver probes availability at
@@ -166,6 +175,16 @@ receives diff review, updates checked-in output through the generator, and
 then passes `generate --check`. Ordinary Cargo builds never acquire, inspect,
 or execute donor material.
 
+The catalog crate owns the complete strict normalized model before any server
+consumer: `CredentialSpec` and its closed auth plan, fixed origins and
+compiled steps, `OperationSpec`, `ErrorMap`, pagination and finite bounds,
+`TriggerSpec`, and typed provenance references. The const-safe generated
+table carries credentials, operations, triggers, matching source-record
+IDs/hashes, license/notice identities, semantic/provenance hashes, and every
+exact ABI-owned ID. Credential validation and webhook lookup borrow those
+generated catalog types directly; the server defines no replacement
+descriptor.
+
 Source admission is exact-version and fail-closed. Phase 1 accepts only
 `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, or `0BSD`; an
 allowed dual-license branch must be selected explicitly. Before a derivative
@@ -183,6 +202,25 @@ repository/tarball mapping, compatibility tier, inventory/admission state,
 notices, proposed manifest and destination paths, and closed dependency and
 embedded-material dispositions. A manifest can cite only the matching record;
 an unrelated Donat-owned record cannot supply provenance.
+
+An exact npm subject also retains closed verified-present,
+verified-absent, or rejected decisions for registry signatures and signed
+provenance, optional distinct tag/provenance commits, the reviewed maintainer
+set, and a repository-owner consistency/mismatch/rejection decision. These
+are retained provenance facts, not a cryptographic Donat admission root.
+Every mismatch fails closed.
+
+Acquisition uses disjoint networked schemas. Exact npm review requires
+artifact URL, expected SHA-512 SRI, repository URL, and full commit.
+Provider-only review requires exactly one immutable repository identity or
+one versioned artifact plus expected SHA-256. Record-derived reacquisition
+accepts no locator/hash override and makes accepted evidence reproducible in
+a clean worktree; its closed reacquisition plan must match the source-subject
+variant, while Donat-owned records are explicitly no-network. All forms share
+the checked-in `registry.npmjs.org`/`github.com`/`codeload.github.com`
+allowlist;
+`docs.stripe.com` remains discovery-only and is represented by synthetic
+rejection bytes unless a separate source-policy review admits that host.
 
 The `n8n-workflow` peer dependency is always `TypeOnlyReplaced`: its bytes are
 not compiler input, linked code, generated material, fixtures, or shipped
@@ -211,6 +249,13 @@ webhook acknowledgement, polling checkpoint persistence, and revision
 retirement are deferred until their exact Spec 005 source-local prerequisites
 and tests are green. The temporary verified-webhook response remains an empty
 `503` after successful verification.
+
+For the first SerpAPI slice, the pinned donor record is the authority for
+`/search.json`. The immutable official provider repository uses `/search`
+and supports only compatible method, base-origin, API-key, JSON, result, and
+error facts; the `.json` suffix is never attributed to that provider record.
+Exact-200, top-level-error rejection, missing-as-empty, and generic status
+normalization remain typed Donat policy.
 
 Stripe work is split into three independently committed tasks. A
 processor-only proof may exercise a narrow processor against fake

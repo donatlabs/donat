@@ -242,40 +242,126 @@ authored Donat data, even when the donor source itself is eligible.
 
 Repository review is the admission authority. There is no cryptographic
 signature, signer key, trust root, or self-referential commit claim in Phase 1.
+Recorded npm registry signatures/provenance are retained source facts, not a
+replacement admission authority or Donat trust root.
 Every exact donor version has one versioned pre-port record whose deserializer
 denies unknown fields. Conceptually:
 
 ```rust
 struct ConnectorSourceRecord {
     record_version: u32,
-    source_id: String,
-    source_kind: SourceKind, // NpmPackage | ProviderSchema | DonatOwned
-    package: Option<ExactNpmPackage>,
-    repository: ImmutableRepository,
+    record_id: SourceRecordId,
+    subject: SourceSubject,
+    reacquisition: ReacquisitionPlan,
     artifact_hashes: Vec<ArtifactHash>,
     license: LicenseDecision,
+    notice: NoticeIdentity,
     entrypoints: Vec<SourcePath>,
     dependencies: Vec<DependencyDecision>,
     embedded_material: Vec<EmbeddedMaterialDecision>,
-    provider_contract: ProviderContractEvidence,
+    provider_contracts: Vec<ProviderContractReference>,
+    compatibility: CompatibilityDecision,
+    admission: AdmissionState,
     safety_findings: SafetyFindings,
-    approved_operations: Vec<OperationId>,
-    compatibility_tier: CompatibilityTier,
     reviewer: ReviewIdentity,
     approval_date: Date,
-    proposed_manifest_path: RepoPath,
-    proposed_destinations: Vec<RepoPath>,
-    red_tests: Vec<TestId>,
+    proposed_manifest: Option<RepoPath>,
+    proposed_destinations: NonEmptyVec<RepoPath>,
+    red_tests: NonEmptyVec<TestId>,
+}
+
+enum SourceSubject {
+    ExactNpm(ExactNpmPackage),
+    ProviderArtifact(ExactProviderArtifact),
+    DonatOwned(DonatOwnedSource),
+}
+
+enum ReacquisitionPlan {
+    ExactNpmReview,
+    ProviderRepositoryReview,
+    ProviderVersionedArtifactReview,
+    DonatOwnedNoNetwork,
+}
+
+struct ExactNpmPackage {
+    name: String,
+    version: ExactSemver,
+    tarball_url: ExactHttpsUrl,
+    integrity: NpmIntegrity,
+    repository: ImmutableRepository,
+    npm_git_head: GitCommit,
+    package_repository: RepositoryUrl,
+    signature: NpmSignatureDecision,
+    provenance: NpmProvenanceDecision,
+    tag_commit: Option<GitCommit>,
+    provenance_commit: Option<GitCommit>,
+    maintainers: Vec<NpmMaintainerIdentity>,
+    repository_owner: RepositoryOwnerDecision,
+}
+
+enum NpmSignatureDecision {
+    Verified {
+        signatures: NonEmptyVec<VerifiedNpmSignature>,
+        registry_metadata_sha256: Hash256,
+    },
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    Rejected { finding: FindingId },
+}
+
+enum NpmProvenanceDecision {
+    Verified {
+        statement_sha256: Hash256,
+        source_commit: GitCommit,
+    },
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    Rejected { finding: FindingId },
+}
+
+enum RepositoryOwnerDecision {
+    Consistent {
+        package_owner: NpmOwnerIdentity,
+        repository_owner: RepositoryOwnerIdentity,
+    },
+    ReviewedMismatch { decision_id: ReviewDecisionId },
+    Rejected { finding: FindingId },
+}
+
+enum ContractFact {
+    ProviderEvidence {
+        source_record_id: SourceRecordId,
+        fact_id: ProviderFactId,
+    },
+    DonatPolicy {
+        policy_id: DonatPolicyId,
+        value: TypedValue,
+    },
+}
+
+struct ProviderContractReference {
+    contract_id: ProviderContractId,
+    facts: NonEmptyVec<ContractFact>,
 }
 ```
 
-The npm form records exact package name/version, tarball URL, SHA-512
-integrity, npm signature and provenance when present, repository URL, full
-commit, tag commit when different, source-tree hash, the provenance/`gitHead`
-to-tarball mapping, package entrypoints, all dependency and peer-dependency
-licenses, license file hash, maintainers, and repository-owner consistency.
+`SourceRecordId`, `ProviderContractId`, `ProviderFactId`, `DonatPolicyId`,
+and `NoticeId` are transparent catalog wrappers over the ABI's exact
+const/copy `InlineId` storage and grammar. This keeps generated provenance and
+legal identities const-safe without making them connector execution IDs.
+`ReacquisitionPlan` must match its source-subject variant, and
+`DonatOwnedNoNetwork` is rejected by every networked command.
 
-The provider-schema form records the repository or immutable download URL,
+The npm form records exact package name/version, tarball URL, SHA-512
+integrity, a closed verified-present/verified-absent/rejected npm signature
+decision, a separate closed signed-provenance decision, repository URL, full
+`npm_git_head`, optional distinct tag and provenance commits, source-tree
+hash, the provenance/`gitHead`-to-tarball mapping, package entrypoints, all
+dependency and peer-dependency licenses, license file hash, the reviewed
+maintainer set, and a closed repository-owner consistency/mismatch/rejection
+decision. A present signed-provenance source commit must equal
+`provenance_commit`; no tag or provenance commit silently replaces
+`npm_git_head`.
+
+The provider-artifact form records the repository or immutable download URL,
 full revision, exact schema paths, byte hashes, declared license, mandatory
 notice, provider API version, and terms evidence. Mutable HTML documentation
 can be a dated behavior reference but cannot be compiler input.
@@ -285,8 +371,15 @@ safety record rejects dynamic code, `eval`, process or shell execution,
 filesystem/environment access, arbitrary destinations, proxy or TLS controls,
 long-lived sockets, local services, unadmitted SDK dependencies, unbounded
 loops, and unbounded binary behavior. A mismatch in package version, tarball
-integrity, provenance, git tree, entrypoint, license, dependency, or embedded
-material fails closed.
+integrity, signature/provenance disposition, provenance commit, tag decision,
+maintainers, repository-owner decision, git tree, entrypoint, license,
+dependency, or embedded material fails closed.
+
+Provider-authored facts and Donat-owned safety/normalization choices use the
+closed `ContractFact` origin above. A provider-evidence fact must resolve to
+the named immutable `ProviderArtifact` record and exact fact location. A
+Donat policy must resolve to its reviewed policy ID and cannot satisfy a
+required provider fact.
 
 Admission and port evidence are distinct:
 
@@ -303,6 +396,38 @@ Admission and port evidence are distinct:
 ### 4.2 Hostile acquisition and extraction
 
 The network-capable acquisition tool treats every remote artifact as hostile.
+Its command grammar separates npm and provider-only identities:
+
+```text
+donat-connector-acquire acquire-npm-review \
+  --artifact-url <exact-https-url> \
+  --expected-integrity <canonical-sha512-sri> \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --artifact-url <exact-https-url> \
+  --provider-revision <non-empty-immutable-revision> \
+  --expected-sha256 <lower-case-64-hex> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire reacquire-reviewed \
+  --record <approved.yaml> \
+  --output <absent-ignored-quarantine-directory>
+```
+
+The npm form requires its expected SRI before a pre-port record exists and
+rejects provider-only flags. The provider form accepts exactly one of the
+repository pair or versioned-artifact triple and rejects npm fields.
+`reacquire-reviewed` accepts no command-line locator/hash override and derives
+the exact identity from a schema-valid approved record. Tests parse the
+production command enum and prove these grammars are disjoint.
 Its Phase 1 policy is exact:
 
 - acquisition uses HTTPS only;
@@ -314,8 +439,10 @@ Its Phase 1 policy is exact:
   the original host, and credentials/cookies are never forwarded;
 - the streaming compressed artifact limit is 64 MiB;
 - the complete tarball is written into an exclusive temporary directory with
-  mode `0700`, hashed, and compared with the source record before any archive
-  entry is inspected or extracted;
+  mode `0700` and hashed before entry inspection. Npm/versioned-artifact
+  bytes must match the command's expected integrity first; repository bytes
+  are safely extracted and then must match the exact commit/tree identity.
+  Reacquisition must match every corresponding record value before admission;
 - extraction permits at most 256 MiB expanded total, 16 MiB per regular file,
   10,000 entries, and path depth 32;
 - every entry path must be normalized relative UTF-8. Absolute paths, empty
@@ -331,6 +458,14 @@ Its Phase 1 policy is exact:
   startup cleanup pass removes abandoned tool-owned directories after a crash;
 - package scripts, executables, donor tests, npm hooks, Node, and JavaScript
   are never executed.
+
+The same allowlist applies to all three networked commands.
+`docs.stripe.com` is not admitted. Mutable Stripe documentation is represented
+only by independently authored synthetic rejection bytes unless a separate
+checked-in source-policy review adds that host. A repository-provider review
+emits deterministic `provider-source.tar` plus `source/`; the exact
+`reacquire-reviewed --record ... --output ...` command is recorded with an
+accepted provider contract so a clean worktree can reproduce those bytes.
 
 Synthetic adversarial tests cover absolute and `..` traversal, links and every
 special type, sparse/unknown entries, duplicate/case-collision paths,
@@ -398,6 +533,16 @@ The compiler emits immutable runtime descriptors. Source descriptions and UI
 hints are discarded; stable field IDs, types, constraints, and protocol
 mappings remain.
 
+`donat-connector-catalog` owns one strict `ConnectorManifest` containing
+closed `CredentialSpec`/auth plans, fixed origins, compiled steps,
+`OperationSpec`/effects/pagination/error maps/bounds, `TriggerSpec` values,
+and typed provenance references. Every nesting level denies unknown fields.
+Credential auth plans are exactly fixed-header API key, fixed-query API key,
+bearer, HTTP Basic, OAuth2 client credentials, or a pre-provisioned
+non-refreshing OAuth access token. Trigger forms are exactly webhook or poll.
+No later metadata/server task defines a replacement credential, operation,
+error, trigger, origin, step, bound, or provenance descriptor.
+
 ### 5.1 Canonical JSON v1 and domain-separated hashes
 
 Every source record, normalized manifest, and descriptor object denies unknown
@@ -429,6 +574,15 @@ semantic hash, and classifier/generator versions. Both hashes are stored in
 the generated catalog and configuration fingerprint. A semantic change never
 hides behind an unchanged provenance hash, and a source/license change never
 hides behind unchanged behavior.
+
+For `ContractFact::ProviderEvidence`, the normalized provider value enters
+semantic material while its source-record/artifact/fact identity and exact
+location enter provenance material. For `ContractFact::DonatPolicy`, the
+selected value enters semantic material while the policy ID enters
+provenance material. Changing either origin or value changes the applicable
+domain-separated hash. Validation and negative tests prove a Donat policy
+cannot satisfy a required provider fact and provider evidence cannot
+masquerade as Donat policy.
 
 Golden vectors are normative:
 
@@ -527,6 +681,11 @@ provider/Donat clock uncertainty and is positive and strictly smaller than
 `minimum_retention_ms`. These fields enter the source record, normalized IR,
 semantic hash, public operation descriptor, configuration fingerprint, and
 pinned process revision.
+
+Binding, scope, and retention cite
+`ContractFact::ProviderEvidence`; the safety margin cites
+`ContractFact::DonatPolicy`. Validation rejects either fact origin in the
+other slot.
 
 Every side-effecting compiled step has exactly one such entry; read-only steps
 have none. Duplicate, missing, or unproven entries reject executable
@@ -1147,6 +1306,45 @@ fixed-origin egress policy.
 - source-record IDs, source file hashes, license class, and notice IDs;
 - compiler/classifier versions.
 
+The top-level const-safe shape is normative:
+
+```rust
+pub struct GeneratedConnectorEntry {
+    pub connector: ConnectorId,
+    pub credentials: &'static [GeneratedCredentialSpec],
+    pub operations: &'static [GeneratedOperationEntry],
+    pub triggers: &'static [GeneratedTriggerSpec],
+    pub source_records: &'static [GeneratedSourceIdentity],
+    pub legal: &'static [GeneratedLegalIdentity],
+    pub semantic_sha256: Hash256,
+    pub provenance_sha256: Hash256,
+}
+
+pub struct GeneratedSourceIdentity {
+    pub record_id: SourceRecordId,
+    pub record_sha256: Hash256,
+    pub artifact_hashes: &'static [GeneratedArtifactHash],
+}
+
+pub struct GeneratedLegalIdentity {
+    pub source_record_id: SourceRecordId,
+    pub license_id: LicenseIdentity,
+    pub notice_id: NoticeId,
+    pub license_file_sha256: Hash256,
+}
+```
+
+The generated credential, operation, and trigger entries carry every strict
+Section 5 field, including auth plan, fixed origins/steps, error map, bounds,
+contract-fact origins, and provenance references. Every connector,
+credential, field, operation, step, trigger, processor, authenticator, codec,
+normalizer, capability, and origin identity is the exact ABI-owned const/copy
+type. Generated source/legal identities retain the matching record and legal
+hashes. Compile tests pass
+`&'static GeneratedCredentialSpec` to the Task-7-shaped consumer and
+`&'static GeneratedTriggerSpec` to the Task-16-shaped consumer without
+defining a server-owned descriptor.
+
 Generated files are sorted by stable connector/operation ID and contain a
 header naming their manifest, source record, generator version, and both
 hashes. The generated-artifact digest is
@@ -1252,6 +1450,14 @@ bounds:
   items: 100
   output_canonical_bytes: 262144
 ```
+
+The pinned donor record is the authority for the literal `/search.json`
+path. The immutable official provider repository uses `/search`; its facts
+support compatible `GET` semantics, fixed `https://serpapi.com`, API-key
+binding, JSON behavior, and provider-owned result/error examples, but they do
+not prove the `.json` suffix. Exact `[200]` success, top-level-error rejection,
+missing-as-empty, and generic status normalization are typed
+`ContractFact::DonatPolicy` values rather than provider facts.
 
 Neither the caller nor a processor can add a query key, change `engine`,
 select an origin, or request a raw response. The first compiler test compares
@@ -1378,9 +1584,9 @@ standalone slice before the next row begins:
 | ---: | --- | --- |
 | 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
 | 1 | **Create** `crates/connector-abi/` and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, bounded envelopes, and host traits over the value contract; no processor implementation |
-| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and neutral normalized IR importing exact ABI IDs, canonical hashes, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
-| 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for hostile HTTPS/archive acquisition; synthetic extraction/license/dependency tests |
-| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust, `generate --check`, and actual-generated-entry-to-ABI ID identity proof; no acquisition dependency, `build.rs`, or Cargo-time generation |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and complete credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs, typed provider-evidence versus Donat-policy facts, canonical hashes, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
+| 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for disjoint npm/provider acquisition, record-derived reacquisition, and hostile HTTPS/archive handling; synthetic extraction/license/dependency tests |
+| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust carrying credentials/operations/triggers/source/legal identities, `generate --check`, actual-generated-entry-to-ABI ID identity proof, and exact Task-7/Task-16 consumer compile proofs; no acquisition dependency, `build.rs`, or Cargo-time generation |
 | 4 | **Create** `crates/connector-processors/` and complete the boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
 | 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
 | 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
@@ -1432,7 +1638,12 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | --- | --- | --- |
 | `value_contract_has_one_owner` | value/IR compile | the no-std value crate owns types/canonical sizing, `donat-ir` re-exports them, and catalog/ABI compile against the same type identity without a conversion copy |
 | `catalog_descriptor_ids_match_connector_io` | phase 2 catalog compile | normalized catalog descriptors pass their exact ABI-owned IDs directly to `ConnectorIo`, with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
-| `generated_catalog_ids_match_abi` | phase 3b post-codegen catalog compile | after deterministic codegen creates the actual checked-in entries, every generated connector/operation/step/processor-family/credential/capability ID assigns directly to its ABI-owned type |
+| `catalog_contracts_are_closed_and_complete` | phase 2 catalog unit | credentials/auth plans, fixed origins/steps, operations/effects/pagination/error maps/bounds, webhook/poll triggers, and provenance references round-trip together; every unknown variant/field, dynamic destination, raw provider message, missing reference, or unbounded declaration rejects |
+| `contract_fact_origins_are_non_substitutable` | phase 2 catalog unit | provider evidence resolves to its exact immutable record/fact location, Donat policy resolves to its reviewed policy ID, each hashes in its assigned semantic/provenance material, and neither origin can satisfy the other |
+| `npm_provenance_state_is_exact` | catalog/acquisition unit | signature and signed-provenance present/absent/rejected decisions, optional tag/provenance commits, maintainers, and repository-owner decisions round-trip and every mismatch fails |
+| `acquisition_command_schemas_are_disjoint` | acquisition CLI unit | npm acquisition requires expected SRI, provider acquisition requires exactly one provider identity form, cross-form flags reject, unallowlisted Stripe documentation rejects, and record-derived reacquisition permits no locator override |
+| `generated_catalog_ids_match_abi` | phase 3b post-codegen catalog compile | after deterministic codegen creates the actual checked-in entries, every generated connector/operation/step/processor-family/credential/capability/trigger/authenticator/codec/normalizer/origin ID assigns directly to its ABI-owned type |
+| `generated_consumers_use_catalog_types` | phase 3b compile | Task-7-shaped credential validation accepts `&'static GeneratedCredentialSpec` and Task-16-shaped webhook lookup accepts `&'static GeneratedTriggerSpec` without any server-owned descriptor |
 | `processor_lookup_ids_match_abi` | phase 4 processor compile | private static-table lookup accepts the exact generated ABI-owned processor-family IDs without a conversion copy |
 | `source_record_requires_exact_artifacts` | catalog/acquisition unit | catalog-owned records reject missing or mismatched exact version, integrity, repository/tree/license/file hash, provenance mapping, entrypoint, closed dependency/embedded-material decision, reviewer, destination, RED test, or notice; unknown fields fail at every nesting level |
 | `hostile_archive_is_never_trusted` | acquisition integration | HTTPS/host/three-redirect policy, hash-before-extract, every archive size/count/depth ceiling, normalized-path collisions, links/special/sparse/unknown entries, no-follow replacement, cleanup, and an unexecuted package-script sentinel are pinned |
@@ -1484,8 +1695,11 @@ cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo test -p donat-connector-catalog
 cargo test -p donat-connector-catalog catalog_descriptor_ids_match_connector_io
+cargo test -p donat-connector-catalog --test catalog_contracts
+cargo test -p donat-connector-catalog --test contract_facts
 
 # Acquisition and codegen are independent siblings over that catalog.
+cargo test -p donat-connector-acquire --test cli_contract
 cargo test -p donat-connector-acquire --test source_admission
 cargo test -p donat-connector-acquire --test hostile_archives
 cargo test -p donat-connector-codegen --test deterministic_catalog
@@ -1493,13 +1707,14 @@ cargo test -p donat-connector-codegen --test serpapi_compile
 cargo insta test -p donat-connector-codegen
 cargo insta review
 cargo test -p donat-connector-catalog generated_catalog_ids_match_abi
+cargo test -p donat-connector-catalog --test generated_consumers
 
 # The later local-only processor implementation is checked on a no-OS target
 # before any real processor is admitted.
 cargo check -p donat-connector-processors --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo tree -p donat-connector-processors --target all \
-  --edges normal,build,no-dev --no-default-features --offline --locked
+  --edges normal,build --no-default-features --offline --locked
 
 cargo test -p donat-connector-processors --no-default-features
 cargo test -p donat-connector-processors processor_lookup_ids_match_abi
@@ -1524,7 +1739,7 @@ podman run --rm --network=none <pinned-build-image> \
 # Runtime absence is a separate package proof, never a workspace-artifact
 # absence assertion.
 cargo build -p donat-server --bin donat --release --offline --locked
-cargo tree -p donat-server --target all --edges normal,no-dev \
+cargo tree -p donat-server --target all --edges normal \
   --offline --locked
 
 # Required regression proof after each engine-behavior slice is green.
