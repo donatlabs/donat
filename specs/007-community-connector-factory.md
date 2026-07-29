@@ -891,14 +891,17 @@ an opaque processor handle; the server cannot implement/register an alternate
 processor or provide a dynamic fallback. CI rejects implementation blocks
 outside this crate.
 
-A compile-only `catalog_abi_id_types_are_identical` test assigns IDs from
-normalized catalog descriptors and checked-in generated entries directly to
-the ABI-owned parameter types of `ConnectorIo` and processor lookup. The
-assignments use the exact same Rust types: no `String`, `&str`, parse,
-serialization round-trip, `From`/`Into`, wrapper copy, or other conversion is
-permitted. The catalog slice first proves descriptor/generated-entry and
-`ConnectorIo` identity; the later processor slice extends the same assertion
-to private-table lookup.
+Three compile-only checkpoints assign the exact same ABI-owned Rust ID types
+without `String`, `&str`, parse, serialization round-trip, `From`/`Into`,
+wrapper copy, or other conversion:
+
+1. phase 2 `catalog_descriptor_ids_match_connector_io` assigns normalized
+   descriptor IDs directly to `ConnectorIo` parameters;
+2. phase 3b `generated_catalog_ids_match_abi`, run only after codegen creates
+   the actual checked-in generated entries, assigns every generated ID to its
+   ABI type; and
+3. phase 4 `processor_lookup_ids_match_abi` assigns generated processor-family
+   IDs directly to private-table lookup.
 
 ### 7.3 Auxiliary object-safe ABIs
 
@@ -1375,10 +1378,10 @@ standalone slice before the next row begins:
 | ---: | --- | --- |
 | 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
 | 1 | **Create** `crates/connector-abi/` and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, bounded envelopes, and host traits over the value contract; no processor implementation |
-| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and neutral normalized IR importing exact ABI IDs, canonical hashes, per-step effect validation, and descriptor/generated-entry-to-`ConnectorIo` type-identity assertion |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record and neutral normalized IR importing exact ABI IDs, canonical hashes, per-step effect validation, and normalized-descriptor-to-`ConnectorIo` ID identity proof |
 | 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for hostile HTTPS/archive acquisition; synthetic extraction/license/dependency tests |
-| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust and `generate --check`; no acquisition dependency, `build.rs`, or Cargo-time generation |
-| 4 | **Create** `crates/connector-processors/` and complete the boundary checker | local-only no-OS processor implementation closure, sealed private registry, processor-lookup extension of the ABI ID identity assertion, opaque host capabilities, and independent Cloudinary-shaped proof |
+| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust, `generate --check`, and actual-generated-entry-to-ABI ID identity proof; no acquisition dependency, `build.rs`, or Cargo-time generation |
+| 4 | **Create** `crates/connector-processors/` and complete the boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
 | 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
 | 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
 | 7 | modify `crates/server/src/connectors/mod.rs`; **Create** `crates/server/src/connectors/catalog.rs` | immutable generated catalog and registry dispatch through processor-crate lookup with no runtime registration/discovery |
@@ -1428,7 +1431,9 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | ID | Level | Required proof |
 | --- | --- | --- |
 | `value_contract_has_one_owner` | value/IR compile | the no-std value crate owns types/canonical sizing, `donat-ir` re-exports them, and catalog/ABI compile against the same type identity without a conversion copy |
-| `catalog_abi_id_types_are_identical` | ABI/catalog/processor compile | normalized descriptors, checked-in generated entries, `ConnectorIo`, and private processor lookup accept the exact ABI-owned ID types with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
+| `catalog_descriptor_ids_match_connector_io` | phase 2 catalog compile | normalized catalog descriptors pass their exact ABI-owned IDs directly to `ConnectorIo`, with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
+| `generated_catalog_ids_match_abi` | phase 3b post-codegen catalog compile | after deterministic codegen creates the actual checked-in entries, every generated connector/operation/step/processor-family/credential/capability ID assigns directly to its ABI-owned type |
+| `processor_lookup_ids_match_abi` | phase 4 processor compile | private static-table lookup accepts the exact generated ABI-owned processor-family IDs without a conversion copy |
 | `source_record_requires_exact_artifacts` | catalog/acquisition unit | catalog-owned records reject missing or mismatched exact version, integrity, repository/tree/license/file hash, provenance mapping, entrypoint, closed dependency/embedded-material decision, reviewer, destination, RED test, or notice; unknown fields fail at every nesting level |
 | `hostile_archive_is_never_trusted` | acquisition integration | HTTPS/host/three-redirect policy, hash-before-extract, every archive size/count/depth ceiling, normalized-path collisions, links/special/sparse/unknown entries, no-follow replacement, cleanup, and an unexecuted package-script sentinel are pinned |
 | `license_and_dependency_disposition_is_closed` | admission unit | only the six Section 3.1 SPDX choices and an explicit allowed dual-license selection pass; every dependency has one closed disposition |
@@ -1478,7 +1483,7 @@ cargo test -p donat-connector-abi --no-default-features
 cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
   --no-default-features --offline --locked
 cargo test -p donat-connector-catalog
-cargo test -p donat-connector-catalog catalog_abi_id_types_are_identical
+cargo test -p donat-connector-catalog catalog_descriptor_ids_match_connector_io
 
 # Acquisition and codegen are independent siblings over that catalog.
 cargo test -p donat-connector-acquire --test source_admission
@@ -1487,6 +1492,7 @@ cargo test -p donat-connector-codegen --test deterministic_catalog
 cargo test -p donat-connector-codegen --test serpapi_compile
 cargo insta test -p donat-connector-codegen
 cargo insta review
+cargo test -p donat-connector-catalog generated_catalog_ids_match_abi
 
 # The later local-only processor implementation is checked on a no-OS target
 # before any real processor is admitted.
@@ -1496,7 +1502,7 @@ cargo tree -p donat-connector-processors --target all \
   --edges normal,build,no-dev --no-default-features --offline --locked
 
 cargo test -p donat-connector-processors --no-default-features
-cargo test -p donat-connector-processors catalog_abi_id_types_are_identical
+cargo test -p donat-connector-processors processor_lookup_ids_match_abi
 
 # Metadata, credential, egress, pagination, error, and adapter slices.
 cargo test -p donat-metadata connectors
