@@ -56,8 +56,11 @@ register does not waive upstream obligations.
 - Destination: independent Rust implementation in
   `crates/server/src/connectors/stripe.rs` and Donat-owned tests in
   `crates/server/tests/connectors_stripe.rs` plus crate-local unit tests.
-- Initial RED test: `stripe_checkout_posts_form_and_returns_typed_session` in
-  `crates/server/src/connectors/stripe.rs`.
+- Initial RED evidence: the Donat-owned `connectors_stripe` integration target
+  failed before the module existed with `no StripeConnector in
+  connectors::stripe`. The later crate-local test
+  `stripe_checkout_posts_form_and_returns_typed_session` covers the resulting
+  form contract.
 
 ### STRIPE-MOCK-CHECKOUT-PHASE-1 — behavior-only mock-server audit
 
@@ -75,8 +78,11 @@ register does not waive upstream obligations.
 - Destination: independent Rust implementation in
   `crates/server/src/connectors/stripe.rs` and Donat-owned tests in
   `crates/server/tests/connectors_stripe.rs` plus crate-local unit tests.
-- Initial RED test: `stripe_checkout_posts_form_and_returns_typed_session` in
-  `crates/server/src/connectors/stripe.rs`.
+- Initial RED evidence: the Donat-owned `connectors_stripe` integration target
+  failed before the module existed with `no StripeConnector in
+  connectors::stripe`. The later crate-local test
+  `stripe_checkout_posts_form_and_returns_typed_session` covers the resulting
+  form contract.
 
 No source-level port is made by these records, so `THIRD_PARTY_NOTICES.md` is
 not created or changed for this slice.
