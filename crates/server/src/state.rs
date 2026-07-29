@@ -228,6 +228,19 @@ fn validate_connector_operations(
         return;
     }
 
+    if connector.module == "stripe" {
+        if let Err(error) = crate::connectors::stripe::validate_stripe_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
     for (index, operation) in connector.operations.iter().enumerate() {
         let operation_path = format!("{path}.operations[{index}]");
         if operation.name.is_empty() {

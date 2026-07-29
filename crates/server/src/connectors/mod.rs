@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::state::{ConnectorStartupError, validate_connector_startup};
 
 pub mod http;
+pub mod stripe;
 
 /// Every activity execution failure belongs to this closed set.  Deployment
 /// metadata and startup errors deliberately use separate error types: a
@@ -114,10 +115,10 @@ enum RegistryInstance {
         connector: Box<http::HttpConnector>,
         operations: BTreeMap<String, CompiledHttpOperation>,
     },
-    /// Stripe is deliberately only a compiled identity in this slice.  Its
-    /// narrow protocol implementation arrives in Task 4, not as a fallback
-    /// arbitrary HTTP client.
-    Stripe,
+    Stripe {
+        connector: Box<stripe::StripeConnector>,
+        operations: BTreeMap<String, CompiledStripeOperation>,
+    },
 }
 
 /// The immutable compiled contract for one deployed HTTP operation. The
@@ -125,6 +126,13 @@ enum RegistryInstance {
 /// process-definition revision to retain.
 struct CompiledHttpOperation {
     operation: http::ValidatedHttpOperation,
+    configuration_fingerprint: String,
+}
+
+/// A selected Stripe Checkout operation. The operation name is still checked
+/// at dispatch even after startup validation so a future job cannot reach an
+/// unenabled provider capability.
+struct CompiledStripeOperation {
     configuration_fingerprint: String,
 }
 
@@ -197,6 +205,60 @@ fn http_configuration_fingerprint(
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[derive(Serialize)]
+struct StripeConfigurationFingerprint<'a> {
+    module_name: &'a str,
+    module_semantic_version: &'a str,
+    runtime_abi: u32,
+    operation_name: &'a str,
+    operation_version: &'a str,
+    endpoint_identity: &'a str,
+    credential_identity: &'a str,
+    api_version: &'a str,
+    secret_key_environment: &'a str,
+    webhook_secret_environment: &'a str,
+    capacity: &'a donat_metadata::ConnectorCapacity,
+}
+
+fn stripe_configuration_fingerprint(
+    config: &ConnectorConfig,
+    operation: &ConnectorOperation,
+) -> String {
+    let secret_key_environment = &config
+        .secret_key
+        .as_ref()
+        .expect("Stripe secret key was validated before fingerprinting")
+        .value_from_env;
+    let webhook_secret_environment = &config
+        .webhook_secret
+        .as_ref()
+        .expect("Stripe webhook secret was validated before fingerprinting")
+        .value_from_env;
+    let api_version = config
+        .api_version
+        .as_deref()
+        .expect("Stripe API version was validated before fingerprinting");
+    let capacity = operation
+        .capacity()
+        .expect("Stripe operation capacity was validated before fingerprinting");
+    let canonical = StripeConfigurationFingerprint {
+        module_name: STRIPE_DEFINITION.module_name,
+        module_semantic_version: STRIPE_DEFINITION.semantic_version,
+        runtime_abi: STRIPE_DEFINITION.runtime_abi,
+        operation_name: &operation.name,
+        operation_version: stripe::STRIPE_OPERATION_VERSION,
+        endpoint_identity: &config.endpoint_identity,
+        credential_identity: &config.credential_identity,
+        api_version,
+        secret_key_environment,
+        webhook_secret_environment,
+        capacity,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("validated Stripe fingerprint fields always serialize to JSON");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// Immutable lookup table of deployment-selected connector instances.
 pub struct ConnectorRegistry {
     instances: BTreeMap<String, RegistryInstance>,
@@ -258,7 +320,48 @@ impl ConnectorRegistry {
                         operations,
                     }
                 }
-                "stripe" => RegistryInstance::Stripe,
+                "stripe" => {
+                    stripe::validate_stripe_instance_metadata(
+                        &instance.config,
+                        &instance.operations,
+                    )
+                    .map_err(|error| {
+                        ConnectorRegistryError::InvalidConfiguration {
+                            instance: instance.name.clone(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                    let connector = stripe::StripeConnector::from_metadata_config(&instance.config)
+                        .map_err(|error| ConnectorRegistryError::InvalidConfiguration {
+                            instance: instance.name.clone(),
+                            message: error.to_string(),
+                        })?;
+                    let mut operations = BTreeMap::new();
+                    for operation in &instance.operations {
+                        let compiled = CompiledStripeOperation {
+                            configuration_fingerprint: stripe_configuration_fingerprint(
+                                &instance.config,
+                                operation,
+                            ),
+                        };
+                        if operations
+                            .insert(operation.name.clone(), compiled)
+                            .is_some()
+                        {
+                            return Err(ConnectorRegistryError::InvalidConfiguration {
+                                instance: instance.name.clone(),
+                                message: format!(
+                                    "connector operation `{}` is declared more than once",
+                                    operation.name
+                                ),
+                            });
+                        }
+                    }
+                    RegistryInstance::Stripe {
+                        connector: Box::new(connector),
+                        operations,
+                    }
+                }
                 // Keep this defensive branch even though Task 1's static
                 // validator rejects it first: no dynamic fallback exists.
                 module => {
@@ -284,7 +387,7 @@ impl ConnectorRegistry {
     pub fn http_instance(&self, name: &str) -> Option<&http::HttpConnector> {
         match self.instances.get(name) {
             Some(RegistryInstance::Http { connector, .. }) => Some(connector),
-            Some(RegistryInstance::Stripe) | None => None,
+            Some(RegistryInstance::Stripe { .. }) | None => None,
         }
     }
 
@@ -296,7 +399,10 @@ impl ConnectorRegistry {
             Some(RegistryInstance::Http { operations, .. }) => operations
                 .get(operation)
                 .map(|operation| operation.configuration_fingerprint.as_str()),
-            Some(RegistryInstance::Stripe) | None => None,
+            Some(RegistryInstance::Stripe { operations, .. }) => operations
+                .get(operation)
+                .map(|operation| operation.configuration_fingerprint.as_str()),
+            None => None,
         }
     }
 
@@ -335,11 +441,27 @@ impl ConnectorRegistry {
                     .execute_validated(&operation.operation, input, idempotency_key, deadline)
                     .await
             }
-            RegistryInstance::Stripe => Err(ConnectorFailure::new(
-                ConnectorErrorClass::Invariant,
-                "connector_invariant",
-                "connector module has no implemented operation",
-            )),
+            RegistryInstance::Stripe {
+                connector,
+                operations,
+            } => {
+                if !operations.contains_key(operation) {
+                    return Err(ConnectorFailure::new(
+                        ConnectorErrorClass::Invariant,
+                        "connector_invariant",
+                        "connector operation is not declared",
+                    ));
+                }
+                if operation != stripe::CREATE_CHECKOUT_SESSION_OPERATION {
+                    return Err(ConnectorFailure::new(
+                        ConnectorErrorClass::Invariant,
+                        "connector_invariant",
+                        "connector operation is not compiled into this binary",
+                    ));
+                }
+                stripe::execute_checkout_from_json(connector, input, idempotency_key, deadline)
+                    .await
+            }
         }
     }
 }

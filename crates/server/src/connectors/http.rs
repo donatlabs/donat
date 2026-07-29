@@ -1340,7 +1340,7 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn is_public_address(address: IpAddr) -> bool {
+pub(crate) fn is_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [first, second, third, fourth] = address.octets();

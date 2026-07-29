@@ -184,7 +184,7 @@ fn connector_startup_rejects_missing_env_without_revealing_a_value() {
             "api_version": "2025-06-30.basil"
         },
         "operations": [{
-            "name": "create_checkout_session",
+            "name": "checkout.create_session",
             "capacity": {
                 "max_in_flight": 16,
                 "rate_limit": { "permits": 80, "per": "1m", "burst": 20 }

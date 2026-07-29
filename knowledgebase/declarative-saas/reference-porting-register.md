@@ -38,6 +38,49 @@ register does not waive upstream obligations.
 | CAMUNDA-DMN-DOCS | [Camunda decision-table hit policies](https://docs.camunda.io/docs/8.8/components/modeler/dmn/decision-table-hit-policy/), accessed 2026-07-28 | first/unique decision-table semantics | documentation | behavior-only reference; no code, fixture, or text copy | rules decision-table tests |
 | INNGEST-DOCS | [Inngest concurrency](https://www.inngest.com/docs/guides/concurrency) and [throttling](https://www.inngest.com/docs/guides/throttling), accessed 2026-07-28 | deployment-wide concurrency and throttling concepts | documentation | behavior-only reference for shared operation capacity; no code, fixture, or text copy | two-worker capacity integration tests |
 
+## Verified behavior references
+
+### STRIPE-CHECKOUT-PHASE-1 — behavior-only contract audit
+
+- Upstream: [stripe/openapi](https://github.com/stripe/openapi) @
+  `6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69`
+- Source: `openapi/spec3.json`
+  (SHA-256: `e24a26de4188fd64dec4c043d5d3726277fdcb07556a493ea481c305b0a223d8`)
+- License: MIT. No OpenAPI schema, generated artifact, fixture, or source text
+  is copied into Donat.
+- Selected behavior: `POST /v1/checkout/sessions` accepts
+  `application/x-www-form-urlencoded`; this Phase-1 module independently
+  encodes only `mode`, `success_url`, `cancel_url`, `client_reference_id`, and
+  `line_items[*].price`/`line_items[*].quantity`, then extracts the Checkout
+  Session's `id`, `url`, `status`, and `expires_at` from a JSON response.
+- Destination: independent Rust implementation in
+  `crates/server/src/connectors/stripe.rs` and Donat-owned tests in
+  `crates/server/tests/connectors_stripe.rs` plus crate-local unit tests.
+- Initial RED test: `stripe_checkout_posts_form_and_returns_typed_session` in
+  `crates/server/src/connectors/stripe.rs`.
+
+### STRIPE-MOCK-CHECKOUT-PHASE-1 — behavior-only mock-server audit
+
+- Upstream: [stripe/stripe-mock](https://github.com/stripe/stripe-mock) @
+  `3f370d112ba55a8a12c09b162547ba32f26b9693`
+- Sources: `server/server.go`
+  (SHA-256: `74e227ddf08787f7b070213dbc2e95c5dece69788ba664b0058b71693caa82fc`)
+  and `server/server_test.go`
+  (SHA-256: `96a68725ac45e277e90f7094fe236689ae078cca5c4dc5948b66c38abeafe154`)
+- License: MIT. No Go source, fixture, executable, generated output, or test
+  text is copied into Donat.
+- Selected behavior: local tests independently verify form content type and a
+  stable `Idempotency-Key` request header against a Donat-owned Axum stub; no
+  Stripe account or live endpoint is used.
+- Destination: independent Rust implementation in
+  `crates/server/src/connectors/stripe.rs` and Donat-owned tests in
+  `crates/server/tests/connectors_stripe.rs` plus crate-local unit tests.
+- Initial RED test: `stripe_checkout_posts_form_and_returns_typed_session` in
+  `crates/server/src/connectors/stripe.rs`.
+
+No source-level port is made by these records, so `THIRD_PARTY_NOTICES.md` is
+not created or changed for this slice.
+
 ## Per-port record template
 
 Add one subsection for every actual imported file:
