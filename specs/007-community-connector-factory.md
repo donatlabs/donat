@@ -1005,6 +1005,15 @@ production code reads `BoundedTransportResponse` only through `status()`,
 `catalog_construction` or `host_construction`, never uses an allocation-leak
 API, and neither constructs nor names `StaticFailureText`.
 
+The checker follows ADR 011's version-independent lexical contract. It uses
+Rust's fixed `Pattern_White_Space` and ASCII punctuation boundaries, treats
+every other maximal scalar run as an identifier candidate, preserves `r#`
+state, matches grammar only on non-raw tokens, and matches protected names
+regardless of raw spelling. A recursive `use`-tree parser resolves visibility,
+nested groups, `self`, siblings, descendants, globs, and aliases into
+full-path leaves. It vendors no XID table and invokes no Rust parser or second
+checker.
+
 ### 7.2 Core operation ABI
 
 A processor orchestrates compiled step IDs; it does not construct a transport
@@ -1798,7 +1807,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `safe_abi_fields_are_private` | external compile-fail | four independent external field-assignment failures prove that `status`, `selected_headers`, `decoded`, and `response_bytes` cannot be assigned; separate failures prove the response/correlation constructors and forbidden runtime conversions are unavailable |
 | `safe_abi_boundaries_are_exact` | ABI unit | all `0..=u16::MAX` statuses, response/correlation limits, static-code/static-message limits, and retry clamping accept exact boundaries and reject one over; ordinary responses carry empty authorization |
 | `typed_bindings_account_across_roots` | ABI unit | aggregate multi-root node, inline-value, decoded-byte, and checked canonical-size accounting shares counters while depth restarts per root |
-| `connector_boundary_checker_is_deterministic` | checker self-test | deterministic positive fixtures pass and every restricted namespace, producer, test-path, allocation-leak, and later processor-boundary mutation fails with its stable diagnostic |
+| `connector_boundary_checker_is_deterministic` | checker self-test | deterministic positive fixtures pass and every restricted namespace, producer, test-path, allocation-leak, and later processor-boundary mutation fails with its stable diagnostic; post-Python-Unicode aliases for both namespaces/static types/host traits, Rust `Pattern_White_Space`, raw-keyword decoys/alias destinations, and nested/grouped sibling-before-`self` or descendant aliases prove the version-independent lexical and `use`-tree contract |
 | `safe_abi_lints_are_strict` | ABI/CI | `cargo clippy -- -D warnings -D clippy::result_large_err` passes without an allow, expectation, crate lint override, or command-line suppression; negative scans reject lint-suppression additions |
 | `catalog_descriptor_ids_match_connector_io` | phase 2 catalog compile | normalized catalog descriptors pass their exact ABI-owned IDs directly to `ConnectorIo`, with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
 | `catalog_contracts_are_closed_and_complete` | phase 2 catalog unit | credentials/auth plans, fixed origins/steps, operations/effects/pagination/error maps/bounds, webhook/poll triggers, and provenance references round-trip together; every unknown variant/field, dynamic destination, raw provider message, missing reference, or unbounded declaration rejects |

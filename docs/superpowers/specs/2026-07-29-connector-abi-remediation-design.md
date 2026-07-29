@@ -330,6 +330,14 @@ producer-path, and test-path policy. Later Task 6 extends this exact checker
 with the remaining processor dependency and source-boundary rules. Task 6
 must not create a second checker, wrapper checker, or parallel policy file.
 
+The accepted follow-up
+`docs/superpowers/specs/2026-07-29-connector-boundary-lexer-remediation-design.md`
+and ADR 011 refine how that policy recognizes Rust. The checker must not use
+Python Unicode identifier/whitespace classification or a version-pinned XID
+table. It preserves `r#` state, over-approximates identifier atoms from Rust's
+fixed whitespace/punctuation boundaries, and recursively resolves grouped
+`use` trees so every compiler-valid alias remains visible.
+
 `scripts/check_connector_processor_boundary.py` enforces the following
 whole-workspace production allowlists:
 
@@ -629,7 +637,10 @@ counter boundaries dominated by the canonical-byte ceiling.
 The processor-boundary checker has positive fixtures for every allowed
 production/test path and negative fixtures for every forbidden namespace,
 alias, re-export, wrapper, trait implementation, and leak call. The checker
-runs in CI and emits stable path-specific diagnostics.
+runs in CI and emits stable path-specific diagnostics. Its fixtures include
+post-Python-Unicode aliases for both namespaces, static types, and host traits;
+raw-keyword decoys; raw alias destinations; and nested/grouped `self` and
+descendant aliases with preceding siblings.
 
 ### Verification gates
 

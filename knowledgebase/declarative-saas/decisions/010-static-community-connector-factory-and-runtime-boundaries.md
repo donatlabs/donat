@@ -295,6 +295,12 @@ test-path fixtures. Task 6 extends that exact checker with dependency and
 processor-source rules.
 ```
 
+[[011-version-independent-rust-boundary-lexer]] governs the checker's Rust
+lexical policy. It uses a delimiter-based identifier over-approximation,
+preserves raw-identifier state, and recursively resolves grouped `use` trees;
+it does not couple construction authority to Python's Unicode database or a
+version-pinned XID table.
+
 `TypedBindings` shares shape counters across all roots while depth remains per
 root. All `u16` statuses remain accepted. These refinements preserve the
 existing static native boundary: they add neither a sandbox nor a runtime

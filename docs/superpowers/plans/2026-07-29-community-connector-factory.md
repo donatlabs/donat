@@ -664,7 +664,12 @@ assignments for `status`, `selected_headers`, `decoded`, and `response_bytes`,
 plus compile-fail response/correlation privacy and runtime conversion checks.
 Exercise `0..=u16::MAX`, response/correlation exact boundaries, static-text
 exact boundaries, aggregate multi-root node/inline/decoded-byte accounting,
-and deterministic checker mutations.
+and deterministic checker mutations. Checker mutations include a
+Rust-accepted identifier newer than Python 3.12's Unicode database for both
+restricted namespaces, both static types, and both host traits; all Rust
+`Pattern_White_Space` separators; legal `r#use`/`r#type` decoys; raw-keyword
+alias destinations; and nested/grouped sibling-before-`self` plus descendant
+aliases.
 
 - [ ] **Step 2: Run RED**
 
@@ -685,7 +690,11 @@ out of every public field and signature. Keep all response/failure fields
 private and immutable; no raw constructor or compatibility shim survives.
 `catalog_construction` is restricted to `crates/connector-catalog/src/` and
 `host_construction` to `crates/server/src/connectors/`; initial checker
-fixtures prove their producer and test-path allowlists.
+fixtures prove their producer and test-path allowlists. Implement ADR 011's
+delimiter-based identifier candidates without Python Unicode classification,
+preserve `r#` state so only non-raw tokens act as grammar, and recursively
+flatten supported `use` trees into full-path leaves before alias/re-export
+policy. Do not vendor XID tables, invoke `rustc`, or create a second checker.
 
 - [ ] **Step 4: Run no-OS and closure checks**
 
