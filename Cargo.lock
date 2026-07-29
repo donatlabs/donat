@@ -638,6 +638,7 @@ dependencies = [
  "donat-backend",
  "donat-metadata",
  "graphql-parser",
+ "hmac 0.12.1",
  "jsonwebtoken",
  "mysql",
  "postgres",
@@ -646,6 +647,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tokio",
  "tungstenite 0.24.0",
 ]

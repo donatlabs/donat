@@ -2446,6 +2446,31 @@ impl Running {
         self.post_inner(path, body, headers, false)
     }
 
+    /// Issue a raw-byte HTTP request against the spawned engine and preserve
+    /// the exact response bytes. This is intentionally a harness helper for
+    /// provider ingress tests; it does not add a new engine API surface.
+    pub fn post_bytes(
+        &self,
+        path: &str,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> (u16, Vec<u8>) {
+        self.ensure_engine();
+        let headers = merge_request_headers(&self.request_headers, headers.to_vec());
+        let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
+        let mut request = self.http.post(format!("{base}{path}")).body(body.to_vec());
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().expect("raw HTTP request failed");
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .expect("read raw HTTP response body")
+            .to_vec();
+        (status, body)
+    }
+
     fn post_inner(
         &self,
         path: &str,
@@ -3335,6 +3360,7 @@ mod tests {
             "agg_relay_introspection",
             "auth_env",
             "commands",
+            "connectors",
             "cron_triggers",
             "enabled_apis",
             "event_triggers",

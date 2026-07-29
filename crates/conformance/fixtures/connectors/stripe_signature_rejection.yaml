@@ -1,0 +1,6 @@
+request:
+  path: /v1/connectors/payments/webhooks
+  body: '{"id":"evt_connector_rejected","type":"checkout.session.completed","secret_sentinel":"whsec-body-must-not-escape"}'
+response:
+  status: 400
+  body: ""
