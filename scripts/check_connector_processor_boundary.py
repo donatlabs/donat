@@ -345,6 +345,49 @@ def rust_tokens_in_range(
     return tuple(token for token in tokens if start <= token.offset < end)
 
 
+def rust_exported_item_in_range(
+    tokens: list[RustToken],
+    start: int,
+    end: int,
+) -> int | None:
+    item_keywords = (
+        "const",
+        "enum",
+        "fn",
+        "mod",
+        "static",
+        "struct",
+        "trait",
+        "type",
+        "use",
+    )
+    range_tokens = rust_tokens_in_range(tokens, start, end)
+    for index, token in enumerate(range_tokens):
+        if not rust_keyword(token, "pub"):
+            continue
+        cursor = index + 1
+        if cursor < len(range_tokens) and range_tokens[cursor].value == "(":
+            depth = 1
+            cursor += 1
+            while cursor < len(range_tokens) and depth:
+                if range_tokens[cursor].value == "(":
+                    depth += 1
+                elif range_tokens[cursor].value == ")":
+                    depth -= 1
+                cursor += 1
+            if depth:
+                continue
+        if (
+            cursor < len(range_tokens)
+            and any(
+                rust_keyword(range_tokens[cursor], keyword)
+                for keyword in item_keywords
+            )
+        ):
+            return token.offset
+    return None
+
+
 def rust_keyword_before(
     tokens: list[RustToken],
     offset: int,
@@ -1189,14 +1232,9 @@ def scan_source(relative: str, source: str) -> list[Finding]:
     test_ranges = private_cfg_test_ranges(tokens)
     exported_test = exported_cfg_test_module(tokens)
     if exported_test is None:
-        public_item = re.compile(
-            r"\bpub(?:\s*\([^)]*\))?\s+"
-            r"(?:const|enum|fn|mod|static|struct|trait|type|use)\b"
-        )
         for start, end in test_ranges:
-            match = public_item.search(code, start, end)
-            if match:
-                exported_test = match.start()
+            exported_test = rust_exported_item_in_range(tokens, start, end)
+            if exported_test is not None:
                 break
     if exported_test is not None:
         return [
@@ -1355,6 +1393,31 @@ def fixtures() -> tuple[Fixture, ...]:
             'r#StaticErrorCode::r#literal("connector_failed");',
             "static-literal-producer: static failure literals are restricted to "
             "approved roots",
+        ),
+        Fixture(
+            "crates/server/src/connectors/raw_private_test_macro_decoy.rs",
+            "#[cfg(test)]\nmod tests { accept_tokens!(r#pub fn); }",
+            None,
+        ),
+        *(
+            Fixture(
+                f"crates/connector-abi/src/exported_test_{name}.rs",
+                "#[cfg(test)]\nmod tests { " + item + " }",
+                "exported-test-helper: test helpers in production modules must "
+                "remain private",
+            )
+            for name, item in (
+                ("const", "pub const ITEM: u8 = 0;"),
+                ("enum", "pub enum Item { Value }"),
+                ("fn", "pub fn item() {}"),
+                ("mod", "pub mod item {}"),
+                ("static", "pub static ITEM: u8 = 0;"),
+                ("struct", "pub struct Item;"),
+                ("trait", "pub trait Item {}"),
+                ("type", "pub type Item = ();"),
+                ("use", "pub use crate::Item;"),
+                ("restricted", "pub(crate) fn item() {}"),
+            )
         ),
         *(
             Fixture(
