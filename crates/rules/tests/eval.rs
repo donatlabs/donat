@@ -1260,6 +1260,90 @@ fn assert_sha256_hex(value: &str, label: &str) {
 }
 
 #[test]
+fn orders_matching_timestamp_operands_and_preserves_equality() {
+    let earlier = json!("2026-07-30T12:00:00Z");
+    let later = json!("2026-07-30T12:00:00.1Z");
+    let same_in_offset = json!("2026-07-30T14:00:00+02:00");
+
+    for (source, expected) in [
+        ("left < right", true),
+        ("left <= right", true),
+        ("right > left", true),
+        ("right >= left", true),
+        ("right < left", false),
+        ("left == same", true),
+        ("left != right", true),
+    ] {
+        let result = evaluate(
+            rule(
+                "policy",
+                map([
+                    ("left", RuleType::Timestamp),
+                    ("right", RuleType::Timestamp),
+                    ("same", RuleType::Timestamp),
+                ]),
+                RuleType::Bool,
+                source,
+            ),
+            map([
+                ("left", earlier.clone()),
+                ("right", later.clone()),
+                ("same", same_in_offset.clone()),
+            ]),
+        )
+        .expect("matching non-null timestamps must compare");
+        assert_eq!(result, expected, "timestamp comparison `{source}`");
+    }
+}
+
+#[test]
+fn timestamp_ordering_rejects_mixed_and_nullable_operands() {
+    for (bindings, source, expected_error) in [
+        (
+            map([("left", RuleType::Timestamp), ("right", RuleType::Int)]),
+            "left < right",
+            "mixed numeric operand",
+        ),
+        (
+            map([("left", RuleType::Timestamp), ("right", RuleType::Date)]),
+            "left <= right",
+            "mismatched temporal operand",
+        ),
+        (
+            map([
+                ("left", RuleType::nullable(RuleType::Timestamp)),
+                ("right", RuleType::Timestamp),
+            ]),
+            "left > right",
+            "nullable timestamp operand",
+        ),
+        (
+            map([("left", RuleType::Timestamp)]),
+            "left >= null",
+            "null timestamp operand",
+        ),
+    ] {
+        let error = compile_catalog(
+            &[rule(
+                "invalid_timestamp_order",
+                bindings,
+                RuleType::Bool,
+                source,
+            )],
+            &[],
+        )
+        .expect_err(expected_error);
+        assert!(
+            matches!(
+                error,
+                RuleError::TypeMismatch { .. } | RuleError::NullableOperation { .. }
+            ),
+            "{expected_error}: {error}"
+        );
+    }
+}
+
+#[test]
 fn catalog_rejects_duplicate_names_bad_default_rows_and_invalid_test_cases() {
     let duplicate_rules = compile_catalog(
         &[

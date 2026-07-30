@@ -800,6 +800,52 @@ fn timestamp_value_lowering_is_utc_canonical_outside_a_utc_session() {
 }
 
 #[test]
+fn timestamp_ordering_matches_rust_with_typed_postgres_operands() {
+    let mut client = postgres_client();
+    let bindings = map([
+        ("earlier", RuleType::Timestamp),
+        ("later", RuleType::Timestamp),
+    ]);
+    let values = map([
+        ("earlier", json!("2026-07-30T12:00:00Z")),
+        ("later", json!("2026-07-30T12:00:00.1Z")),
+    ]);
+
+    for source in [
+        "earlier < later",
+        "earlier <= later",
+        "later > earlier",
+        "later >= earlier",
+    ] {
+        let rule = compiled_rule(bindings.clone(), source);
+        let sql_bindings = SqlBindings::new(
+            values
+                .clone()
+                .into_iter()
+                .map(|(name, value)| (name, SqlBinding::literal(value))),
+        );
+        let expression =
+            lower_postgres(&rule, &sql_bindings).expect("typed timestamp ordering must lower");
+        assert!(
+            expression.contains("::timestamptz") && !expression.contains("::text"),
+            "timestamp ordering must retain typed timestamptz operands: {expression}"
+        );
+        let postgres_value = client
+            .query_one(&format!("SELECT {expression} AS value"), &[])
+            .expect("the lowered timestamp comparison must execute")
+            .get::<_, bool>("value");
+        let rust_value =
+            evaluate_bool(&rule, &values).expect("the Rust timestamp comparison must evaluate");
+
+        assert!(postgres_value, "Postgres timestamp ordering `{source}`");
+        assert_eq!(
+            rust_value, postgres_value,
+            "Rust/Postgres timestamp ordering mismatch for `{source}`"
+        );
+    }
+}
+
+#[test]
 fn lower_postgres_rejects_non_bool_rule() {
     let rule = compiled_value_rule(RuleType::String, map([("name", RuleType::String)]), "name");
     let error = lower_postgres(

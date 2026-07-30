@@ -824,12 +824,12 @@ fn check_binary(
         | BinaryOp::GreaterThanOrEqual => {
             let left = required_concrete(rule_name, left)?;
             let right = required_concrete(rule_name, right)?;
-            if left == right && is_numeric(left) {
+            if left == right && supports_ordering(left) {
                 Ok(CheckedType::Concrete(RuleType::Bool))
             } else {
                 Err(type_mismatch(
                     rule_name,
-                    "matching int or decimal operands",
+                    "matching int, decimal, or timestamp operands",
                     format!("{} and {}", left.display_name(), right.display_name()),
                 ))
             }
@@ -892,6 +892,10 @@ fn supports_whole_value_equality(type_: &RuleType) -> bool {
         type_,
         RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. }
     )
+}
+
+fn supports_ordering(type_: &RuleType) -> bool {
+    is_numeric(type_) || matches!(type_, RuleType::Timestamp)
 }
 
 fn merge_branch_types(
@@ -1579,11 +1583,49 @@ fn compare_values(
     match (left, right) {
         (RuntimeValue::Int(left), RuntimeValue::Int(right)) => Ok(left.cmp(right)),
         (RuntimeValue::Decimal(left), RuntimeValue::Decimal(right)) => Ok(left.cmp(right)),
+        (RuntimeValue::Timestamp(left), RuntimeValue::Timestamp(right)) => {
+            compare_canonical_timestamps(left, right).ok_or_else(|| RuleError::InternalInvariant {
+                rule: rule_name.to_owned(),
+            })
+        }
         _ => Err(type_mismatch(
             rule_name,
-            "matching numeric operands",
+            "matching numeric or timestamp operands",
             format!("{} and {}", left.type_name(), right.type_name()),
         )),
+    }
+}
+
+fn compare_canonical_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let left_prefix = left.as_bytes().get(..19)?;
+    let right_prefix = right.as_bytes().get(..19)?;
+    match left_prefix.cmp(right_prefix) {
+        std::cmp::Ordering::Equal => {}
+        ordering => return Some(ordering),
+    }
+
+    let left = canonical_timestamp_fraction(left)?;
+    let right = canonical_timestamp_fraction(right)?;
+    for index in 0..left.len().max(right.len()) {
+        match left
+            .get(index)
+            .copied()
+            .unwrap_or(b'0')
+            .cmp(&right.get(index).copied().unwrap_or(b'0'))
+        {
+            std::cmp::Ordering::Equal => {}
+            ordering => return Some(ordering),
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
+fn canonical_timestamp_fraction(value: &str) -> Option<&[u8]> {
+    let bytes = value.as_bytes();
+    match bytes.get(19) {
+        Some(b'Z') if bytes.len() == 20 => Some(&[]),
+        Some(b'.') if bytes.last() == Some(&b'Z') => bytes.get(20..bytes.len() - 1),
+        _ => None,
     }
 }
 
