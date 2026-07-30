@@ -1,0 +1,100 @@
+name: submit_quote
+source: default
+permissions:
+  - role: b2b_buyer
+arguments:
+  - name: organization_id
+    type: uuid!
+  - name: cart_id
+    type: bigint!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: membership
+    select_one:
+      table: public.organization_membership
+      by:
+        organization_id: { arg: organization_id }
+        user_id: { session_variable: x-donat-user-id }
+      returning: [organization_id, user_id]
+  - name: organization
+    select_one:
+      table: public.organization
+      by:
+        id: { step: membership, column: organization_id }
+      returning: [id, available_credit_minor, currency]
+  - name: cart
+    select_one:
+      table: public.cart
+      by:
+        id: { arg: cart_id }
+        customer_id: { session_variable: x-donat-user-id }
+        status: { literal: cart_open }
+      returning: [id, customer_id]
+  - name: priced_lines
+    select_many:
+      table: public.cart_pricing
+      by:
+        cart_id: { step: cart, column: id }
+        customer_id: { session_variable: x-donat-user-id }
+      order_by: [variant_id]
+      returning: [variant_id, sku, title, quantity, unit_price_minor, currency, line_total_minor]
+      require_non_empty: true
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        total_minor: { sum: { column: line_total_minor } }
+        currency: { min: { column: currency } }
+        currency_count: { count_distinct: { column: currency } }
+  - name: currency_is_uniform
+    assert:
+      rule: is_single_currency
+      with:
+        currency_count: { step: totals, column: currency_count }
+  - name: quote
+    insert:
+      table: public.quote
+      object:
+        organization_id: { step: organization, column: id }
+        customer_id: { step: cart, column: customer_id }
+        cart_id: { step: cart, column: id }
+        status: { literal: submitted }
+        total_minor: { step: totals, column: total_minor }
+        currency: { step: totals, column: currency }
+        available_credit_minor: { step: organization, column: available_credit_minor }
+      returning: [id, organization_id, status, total_minor, currency, available_credit_minor]
+  - name: quote_lines
+    insert_many:
+      table: public.quote_line
+      for_each: { step: priced_lines }
+      object:
+        quote_id: { step: quote, column: id }
+        variant_id: { item: variant_id }
+        sku: { item: sku }
+        title: { item: title }
+        quantity: { item: quantity }
+        unit_price_minor: { item: unit_price_minor }
+        currency: { item: currency }
+        line_total_minor: { item: line_total_minor }
+      returning: [id, quote_id, variant_id, quantity, unit_price_minor, currency, line_total_minor]
+  - name: approval
+    insert:
+      table: public.purchase_approval
+      object:
+        quote_id: { step: quote, column: id }
+        status: { literal: submitted }
+      returning: [id, quote_id, status]
+result:
+  quote_id: { step: quote, column: id }
+  approval_id: { step: approval, column: id }
+  total_minor: { step: quote, column: total_minor }
+  currency: { step: quote, column: currency }
+  available_credit_minor: { step: quote, column: available_credit_minor }
+  quoted_lines: { step: quote_lines }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: organization_id }
+    - { session_variable: x-donat-user-id }
+  retention: 30d

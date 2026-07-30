@@ -1,0 +1,176 @@
+name: b2b_order_approval
+source: default
+permissions:
+  - role: b2b_buyer
+input:
+  - { name: organization_id, type: uuid! }
+  - { name: cart_id, type: bigint! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: quote_id, type: uuid! }
+  - { name: approval_id, type: uuid! }
+  - { name: approval_status, type: ApprovalState! }
+  - { name: credit_consumed, type: bool! }
+start_at: submit_quote
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { input: organization_id }
+states:
+  - id: submit_quote
+    command:
+      name: submit_quote
+      run_as: caller
+      arguments:
+        organization_id: { input: organization_id }
+        cart_id: { input: cart_id }
+        request_id: { input: request_id }
+      next: route_approval
+
+  - id: route_approval
+    when:
+      decision_table: b2b_approval_route
+      input:
+        amount_minor: { state: submit_quote, field: total_minor }
+        available_credit_minor: { state: submit_quote, field: available_credit_minor }
+      cases:
+        - matches:
+            decision: approved
+            route: automatic
+          next: consume_automatic_credit
+        - matches:
+            decision: escalated
+            route: finance_review
+          next: await_approver
+      default: reject_unroutable_quote
+
+  - id: consume_automatic_credit
+    command:
+      name: consume_credit
+      run_as: b2b_finance
+      arguments:
+        approval_id: { state: submit_quote, field: approval_id }
+        request_id: { run: id }
+      next: automatically_approved
+
+  - id: await_approver
+    wait:
+      signal: approval_decision
+      role: b2b_approver
+      correlate:
+        approval_id: { state: submit_quote, field: approval_id }
+      deadline: 2d
+      next: route_approver_decision
+      on_timeout: await_finance
+
+  - id: route_approver_decision
+    when:
+      cases:
+        - rule: approval_was_approved
+          with:
+            decision: { event: decision }
+          next: manually_approved
+        - rule: approval_was_rejected
+          with:
+            decision: { event: decision }
+          next: manually_rejected
+      default: reject_unroutable_quote
+
+  - id: await_finance
+    wait:
+      signal: approval_decision
+      role: b2b_finance
+      correlate:
+        approval_id: { state: submit_quote, field: approval_id }
+      deadline: 2d
+      next: route_finance_decision
+      on_timeout: reject_after_finance_deadline
+
+  - id: route_finance_decision
+    when:
+      cases:
+        - rule: approval_was_approved
+          with:
+            decision: { event: decision }
+          next: finance_approved
+        - rule: approval_was_rejected
+          with:
+            decision: { event: decision }
+          next: finance_rejected
+      default: reject_unroutable_quote
+
+  - id: reject_after_finance_deadline
+    command:
+      name: reject_purchase
+      run_as: b2b_finance
+      arguments:
+        approval_id: { state: submit_quote, field: approval_id }
+        reason: { literal: finance_deadline_exceeded }
+        request_id: { run: id }
+      next: deadline_rejected
+
+  - id: reject_unroutable_quote
+    command:
+      name: reject_purchase
+      run_as: b2b_finance
+      arguments:
+        approval_id: { state: submit_quote, field: approval_id }
+        reason: { literal: no_approval_route }
+        request_id: { run: id }
+      next: route_rejected
+
+  - id: automatically_approved
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: consume_automatic_credit, field: approval_id }
+        approval_status: { state: consume_automatic_credit, field: approval_status }
+        credit_consumed: { literal: true }
+
+  - id: manually_approved
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: submit_quote, field: approval_id }
+        approval_status: { literal: approved }
+        credit_consumed: { literal: true }
+
+  - id: finance_approved
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: submit_quote, field: approval_id }
+        approval_status: { literal: approved }
+        credit_consumed: { literal: true }
+
+  - id: manually_rejected
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: submit_quote, field: approval_id }
+        approval_status: { literal: rejected }
+        credit_consumed: { literal: false }
+
+  - id: finance_rejected
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: submit_quote, field: approval_id }
+        approval_status: { literal: rejected }
+        credit_consumed: { literal: false }
+
+  - id: deadline_rejected
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: reject_after_finance_deadline, field: approval_id }
+        approval_status: { state: reject_after_finance_deadline, field: approval_status }
+        credit_consumed: { literal: false }
+
+  - id: route_rejected
+    output:
+      values:
+        quote_id: { state: submit_quote, field: quote_id }
+        approval_id: { state: reject_unroutable_quote, field: approval_id }
+        approval_status: { state: reject_unroutable_quote, field: approval_status }
+        credit_consumed: { literal: false }

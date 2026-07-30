@@ -1,0 +1,44 @@
+name: cancel_subscription
+source: default
+permissions:
+  - role: customer
+  - role: subscription_worker
+arguments:
+  - name: subscription_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: subscription
+    select_one:
+      table: public.subscription
+      by:
+        id: { arg: subscription_id }
+      returning: [id, customer_id, status]
+      require_found: true
+  - name: cancellation_is_allowed
+    assert:
+      rule: can_transition_subscription
+      with:
+        current: { step: subscription, column: status }
+        next: { literal: cancelled }
+  - name: cancel_subscription
+    update:
+      table: public.subscription
+      where:
+        id: { step: subscription, column: id }
+      set:
+        status: { literal: cancelled }
+        cancellation_reason: { arg: reason }
+      returning: [id, status, cancellation_reason]
+result:
+  subscription_id: { step: cancel_subscription, column: id }
+  subscription_status: { step: cancel_subscription, column: status }
+  cancellation_reason: { step: cancel_subscription, column: cancellation_reason }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: subscription_id }
+  retention: 365d

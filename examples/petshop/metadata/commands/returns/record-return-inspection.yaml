@@ -1,0 +1,113 @@
+name: record_return_inspection
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: lines
+    type: "[ReturnInspectionLine!]!"
+  - name: inspection
+    type: InspectionDecision!
+  - name: refund_amount_minor
+    type: bigint!
+  - name: inspection_id
+    type: uuid!
+  - name: note
+    type: string
+steps:
+  - name: return_context
+    select_one:
+      table: { schema: public, name: return_refund_context }
+      by: { return_id: { arg: return_id } }
+      returning: [return_id, order_id, payment_id, currency, status, replacement_requested, eligible_refund_minor]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_return
+      with:
+        current: { step: return_context, column: status }
+        next: { literal: inspected }
+  - name: inspection_matches_receipt
+    assert:
+      rule: return_inspection_matches_receipt
+      with:
+        lines: { arg: lines }
+  - name: inspected_items
+    update_many:
+      table: { schema: public, name: return_item }
+      for_each: { arg: lines }
+      by:
+        id: { item: return_item_id }
+        return_request_id: { step: return_context, column: return_id }
+      set: { inspected_quantity: { item: inspected_quantity } }
+      check:
+        rule: return_inspected_quantity_is_bounded
+        with:
+          received_quantity: { current_column: received_quantity }
+          inspected_quantity: { item: inspected_quantity }
+      returning: [id, return_request_id, order_line_id, received_quantity, inspected_quantity]
+      require_each: true
+  - name: refund_amount_is_bounded
+    assert:
+      rule: return_refund_amount_is_bounded
+      with:
+        inspection: { arg: inspection }
+        eligible_refund_minor: { step: return_context, column: eligible_refund_minor }
+        requested_amount_minor: { arg: refund_amount_minor }
+  - name: inspection_record
+    insert:
+      table: { schema: public, name: return_inspection }
+      object:
+        return_request_id: { step: return_context, column: return_id }
+        inspection_id: { arg: inspection_id }
+        decision: { arg: inspection }
+        refund_amount_minor: { arg: refund_amount_minor }
+        note: { arg: note }
+      returning: [id, return_request_id, inspection_id, decision, refund_amount_minor, note]
+  # This closed conditional insert creates a provider-refund candidate only
+  # for the accepted branch. Exchange and rejection never receive one.
+  - name: approved_refund
+    insert_when:
+      when: { argument_equals: { argument: inspection, value: accepted } }
+      table: { schema: public, name: refund }
+      object:
+        payment_id: { step: return_context, column: payment_id }
+        amount_minor: { arg: refund_amount_minor }
+        status: { literal: approved }
+      returning: [id, payment_id, amount_minor, status]
+  - name: inspection_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_context, column: return_id }
+        event_type: { literal: inspected }
+        actor_role: { literal: fulfilment }
+        request_id: { arg: inspection_id }
+        inspection_id: { step: inspection_record, column: id }
+      returning: [id, return_request_id, event_type, request_id, inspection_id]
+  - name: inspected_return
+    update:
+      table: { schema: public, name: return_request }
+      where: { id: { step: return_context, column: return_id }, status: { literal: received } }
+      set: { status: { literal: inspected } }
+      returning: [id, order_id, status, replacement_requested]
+      require_affected: true
+result:
+  return_id: { step: inspected_return, column: id }
+  order_id: { step: inspected_return, column: order_id }
+  status: { step: inspected_return, column: status }
+  replacement_requested: { step: inspected_return, column: replacement_requested }
+  inspection: { step: inspection_record }
+  items: { step: inspected_items }
+  refund: { step: approved_refund }
+  refund_id: { step: approved_refund, column: id }
+  refund_amount_minor: { arg: refund_amount_minor }
+  payment_id: { step: return_context, column: payment_id }
+  currency: { step: return_context, column: currency }
+  audit: { step: inspection_audit }
+idempotency:
+  key: { argument: inspection_id }
+  scope:
+    - { argument: return_id }
+  retention: 365d

@@ -1,0 +1,89 @@
+name: record_renewal_outcome
+source: default
+permissions:
+  - role: subscription_worker
+arguments:
+  - name: renewal_id
+    type: uuid!
+  - name: attempt
+    type: int!
+  - name: outcome
+    type: PaymentOutcome!
+  - name: provider_event_id
+    type: string!
+  - name: provider_reference
+    type: string
+  - name: payload
+    type: json!
+  - name: occurred_at
+    type: timestamptz!
+steps:
+  - name: renewal
+    select_one:
+      table: public.subscription_renewal
+      by:
+        id: { arg: renewal_id }
+      returning: [id, subscription_id, status]
+      require_found: true
+  - name: subscription
+    select_one:
+      table: public.subscription
+      by:
+        id: { step: renewal, column: subscription_id }
+      returning: [id, status]
+      require_found: true
+  # This is the durable business audit for every attempt, including retries.
+  # The payment command remains the only writer of payment status and its
+  # provider-event journal on the authorized or terminal-declined path.
+  - name: dunning_attempt
+    insert:
+      table: public.subscription_dunning_attempt
+      object:
+        renewal_id: { step: renewal, column: id }
+        attempt: { arg: attempt }
+        outcome: { arg: outcome }
+        provider_event_id: { arg: provider_event_id }
+        provider_reference: { arg: provider_reference }
+        payload: { arg: payload }
+        occurred_at: { arg: occurred_at }
+      returning: [id, renewal_id, attempt, outcome, provider_event_id, occurred_at]
+  - name: mark_dunning
+    update:
+      table: public.subscription_renewal
+      where:
+        id: { step: renewal, column: id }
+      set:
+        status: { literal: dunning }
+      returning: [id, status]
+  - name: confirm_renewal
+    update_when:
+      when: { argument_equals: { argument: outcome, value: authorized } }
+      table: public.subscription_renewal
+      where:
+        id: { step: renewal, column: id }
+      set:
+        status: { literal: confirmed }
+        confirmed_at: { arg: occurred_at }
+      returning: [id, status, confirmed_at]
+      require_affected: false
+  - name: reactivate_subscription
+    update_when:
+      when: { argument_equals: { argument: outcome, value: authorized } }
+      table: public.subscription
+      where:
+        id: { step: subscription, column: id }
+      set:
+        status: { literal: active }
+      returning: [id, status]
+      require_affected: false
+result:
+  renewal_id: { step: renewal, column: id }
+  subscription_id: { step: subscription, column: id }
+  dunning_attempt: { step: dunning_attempt }
+  renewal: { step: confirm_renewal }
+  subscription: { step: reactivate_subscription }
+idempotency:
+  key: { argument: provider_event_id }
+  scope:
+    - { argument: renewal_id }
+  retention: 365d

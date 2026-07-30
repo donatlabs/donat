@@ -1,0 +1,102 @@
+name: approve_purchase
+source: default
+permissions:
+  - role: b2b_approver
+  - role: b2b_finance
+arguments:
+  - name: approval_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: approval
+    select_one:
+      table: public.purchase_approval
+      by:
+        id: { arg: approval_id }
+      returning: [id, quote_id, status]
+  - name: quote
+    select_one:
+      table: public.quote
+      by:
+        id: { step: approval, column: quote_id }
+      returning: [id, organization_id, total_minor, currency]
+  - name: organization_credit_row
+    select_many:
+      table: public.organization
+      by:
+        id: { step: quote, column: organization_id }
+      order_by: [id]
+      returning: [id]
+      require_non_empty: true
+  - name: approval_is_allowed
+    assert:
+      rule: can_transition_approval
+      with:
+        current: { step: approval, column: status }
+        next: { literal: approved }
+  - name: consume_available_credit
+    update_many:
+      table: public.organization
+      for_each: { step: organization_credit_row }
+      by:
+        id: { item: id }
+      set:
+        available_credit_minor:
+          rule: subtract_int
+          with:
+            left: { current_column: available_credit_minor }
+            right: { step: quote, column: total_minor }
+        consumed_credit_minor:
+          rule: add_minor
+          with:
+            left: { current_column: consumed_credit_minor }
+            right: { step: quote, column: total_minor }
+      check:
+        rule: can_consume_credit
+        with:
+          available_credit_minor: { current_column: available_credit_minor }
+          requested_minor: { step: quote, column: total_minor }
+      returning: [id, available_credit_minor, consumed_credit_minor]
+      require_each: true
+  - name: credit_usage
+    insert:
+      table: public.credit_usage
+      object:
+        organization_id: { step: quote, column: organization_id }
+        quote_id: { step: quote, column: id }
+        approval_id: { step: approval, column: id }
+        amount_minor: { step: quote, column: total_minor }
+        currency: { step: quote, column: currency }
+      returning: [id, approval_id, amount_minor, currency]
+  - name: approve
+    update:
+      table: public.purchase_approval
+      where:
+        id: { step: approval, column: id }
+        status: { literal: submitted }
+      set:
+        status: { literal: approved }
+        approved_by_user_id: { session_variable: x-donat-user-id }
+      returning: [id, quote_id, status]
+      require_affected: true
+result:
+  approval_id: { step: approve, column: id }
+  quote_id: { step: approve, column: quote_id }
+  approval_status: { step: approve, column: status }
+  credit_usage_id: { step: credit_usage, column: id }
+  credit_updates: { step: consume_available_credit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: approval_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: b2b_order_approval
+      signal: approval_decision
+      correlate:
+        approval_id: { step: approve, column: id }
+      payload:
+        decision: { literal: approved }
+      idempotency_key: { argument: request_id }

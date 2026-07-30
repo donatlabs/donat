@@ -1,0 +1,261 @@
+name: return_refund
+source: default
+permissions:
+  - role: customer
+    owner_session_variable: x-donat-user-id
+input:
+  - { name: order_id, type: uuid! }
+  - { name: lines, type: "[ReturnRequestLine!]!" }
+  - { name: reason, type: string! }
+  - { name: replacement_requested, type: bool! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: return_id, type: uuid! }
+  - { name: status, type: String! }
+  - { name: approval, type: json }
+  - { name: return_label, type: json }
+  - { name: receipt, type: json }
+  - { name: inspection, type: json }
+  - { name: refund, type: json }
+  - { name: exchange, type: json }
+  - { name: audit, type: "[json!]!" }
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+start_at: request_return
+states:
+  - id: request_return
+    command:
+      name: request_return
+      run_as: caller
+      arguments:
+        order_id: { input: order_id }
+        lines: { input: lines }
+        reason: { input: reason }
+        replacement_requested: { input: replacement_requested }
+        request_id: { input: request_id }
+      next: await_support_decision
+
+  # Support invokes approve_return or reject_return directly. The command's
+  # committed audit result is the signal; the flow never chooses a support role.
+  - id: await_support_decision
+    wait:
+      signal: return_decision_recorded
+      persist_before_match: true
+      correlate:
+        return_id: { state: request_return, field: return_id }
+      deadline: 14d
+      next: route_support_decision
+      on_timeout: approval_timed_out
+
+  - id: route_support_decision
+    when:
+      cases:
+        - rule: return_decision_was_approved
+          with:
+            decision: { event: decision }
+          next: request_return_label
+      default: rejected_by_support
+
+  # mock_carrier deliberately needs a return-label operation rather than
+  # reusing outbound create_label with an incompatible shipment contract.
+  - id: request_return_label
+    request:
+      connector: mock_carrier
+      operation: create_return_label
+      input:
+        return_id: { state: request_return, field: return_id }
+        return_key: { state: request_return, field: return_id }
+        return_from: { state: request_return, field: return_from }
+        currency: { state: request_return, field: currency }
+        return_items: { state: request_return, field: items }
+      idempotency_key:
+        stable: { run: id, state: request_return_label }
+      timeout: 10s
+      retry:
+        maximum_attempts: 4
+        backoff: 250ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: await_warehouse_receipt
+      on_error: return_label_unavailable
+
+  - id: await_warehouse_receipt
+    wait:
+      signal: return_receipt_recorded
+      persist_before_match: true
+      correlate:
+        return_id: { state: request_return, field: return_id }
+      deadline: 30d
+      next: await_inspection
+      on_timeout: return_not_received
+
+  - id: await_inspection
+    wait:
+      signal: return_inspection_recorded
+      persist_before_match: true
+      correlate:
+        return_id: { state: request_return, field: return_id }
+      deadline: 7d
+      next: route_disposition
+      on_timeout: inspection_overdue
+
+  - id: route_disposition
+    when:
+      decision_table: return_disposition_route
+      input:
+        inspection: { event: inspection }
+        replacement_requested: { state: request_return, field: replacement_requested }
+      cases:
+        - matches: { disposition: refund }
+          next: request_refund
+        - matches: { disposition: exchange }
+          next: create_exchange
+      default: reject_after_inspection
+
+  - id: request_refund
+    request:
+      connector: mock_payment
+      operation: refund
+      input:
+        payment_id: { event: payment_id }
+        refund_id: { event: refund_id }
+        amount_minor: { event: refund_amount_minor }
+        currency: { event: currency }
+        reason: { input: reason }
+      idempotency_key:
+        stable: { run: id, state: request_refund, item_key: { event: refund_id } }
+      timeout: 2s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: record_refund
+      on_error: refund_provider_unavailable
+
+  - id: record_refund
+    command:
+      name: complete_refund
+      run_as: payment_worker
+      arguments:
+        payment_id: { event: payment_id }
+        refund_id: { event: refund_id }
+        provider_refund_id: { state: request_refund, field: provider_refund_id }
+        provider_event_id: { state: request_refund, field: provider_event_id }
+        amount_minor: { event: refund_amount_minor }
+        payload: { state: request_refund, field: normalized_payload }
+      next: refunded
+
+  - id: create_exchange
+    command:
+      name: create_exchange
+      run_as: fulfilment
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        exchange_id: { activity_key: exchange }
+        request_id: { activity_key: create_exchange }
+      next: exchanged
+
+  - id: reject_after_inspection
+    command:
+      name: reject_return
+      run_as: support
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        reason: { literal: return_inspection_rejected }
+        decision_id: { activity_key: reject_after_inspection }
+      next: rejected_after_inspection
+
+  - id: refunded
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { literal: refunded }
+        approval: { event: approval }
+        return_label: { state: request_return_label }
+        receipt: { event: receipt }
+        inspection: { event: inspection }
+        refund: { state: record_refund }
+        exchange: { literal: null }
+        audit:
+          - { state: request_return, field: audit }
+          - { event: approval_audit }
+          - { event: receipt_audit }
+          - { event: inspection_audit }
+          - { state: record_refund }
+
+  - id: exchanged
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { literal: exchanged }
+        approval: { event: approval }
+        return_label: { state: request_return_label }
+        receipt: { event: receipt }
+        inspection: { event: inspection }
+        refund: { literal: null }
+        exchange: { state: create_exchange, field: exchange }
+        audit:
+          - { state: request_return, field: audit }
+          - { event: approval_audit }
+          - { event: receipt_audit }
+          - { event: inspection_audit }
+          - { state: create_exchange, field: audit }
+
+  - id: rejected_by_support
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { literal: rejected }
+        approval: { event: approval }
+        return_label: { literal: null }
+        receipt: { literal: null }
+        inspection: { literal: null }
+        refund: { literal: null }
+        exchange: { literal: null }
+        audit:
+          - { state: request_return, field: audit }
+          - { event: approval_audit }
+
+  - id: rejected_after_inspection
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { literal: rejected }
+        approval: { event: approval }
+        return_label: { state: request_return_label }
+        receipt: { event: receipt }
+        inspection: { event: inspection }
+        refund: { literal: null }
+        exchange: { literal: null }
+        audit:
+          - { state: request_return, field: audit }
+          - { event: approval_audit }
+          - { event: receipt_audit }
+          - { event: inspection_audit }
+          - { state: reject_after_inspection, field: audit }
+
+  - id: approval_timed_out
+    fail:
+      code: return_approval_timed_out
+      message: Support did not decide the return request before its deadline
+
+  - id: return_label_unavailable
+    fail:
+      code: return_label_unavailable
+      message: The return label provider could not create a label
+
+  - id: return_not_received
+    fail:
+      code: return_not_received
+      message: The approved return was not received before its deadline
+
+  - id: inspection_overdue
+    fail:
+      code: return_inspection_overdue
+      message: The received return was not inspected before its deadline
+
+  - id: refund_provider_unavailable
+    fail:
+      code: refund_provider_unavailable
+      message: The payment provider could not complete the refund

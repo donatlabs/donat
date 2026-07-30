@@ -1,0 +1,337 @@
+name: subscription_renewal
+source: default
+permissions:
+  - role: subscription_worker
+# The scheduler dispatches one flow input per eligible subscription and cron
+# occurrence. Their pair is both the flow's semantic key and the key supplied
+# to `create_subscription_order`; a duplicate cron delivery converges safely.
+input:
+  - { name: subscription_id, type: uuid! }
+  - { name: cron_occurrence, type: timestamptz! }
+idempotency:
+  key: { input: cron_occurrence }
+  scope:
+    - { input: subscription_id }
+output:
+  - { name: subscription_id, type: uuid! }
+  - { name: renewal_id, type: uuid! }
+  - { name: order_id, type: uuid! }
+  - { name: payment_id, type: uuid! }
+  - { name: status, type: String! }
+start_at: create_renewal_order
+states:
+  - id: create_renewal_order
+    command:
+      name: create_subscription_order
+      run_as: subscription_worker
+      arguments:
+        subscription_id: { input: subscription_id }
+        cron_occurrence: { input: cron_occurrence }
+      next: authorize_initial
+
+  - id: authorize_initial
+    request:
+      connector: mock_payment
+      operation: authorize
+      input:
+        order_id: { state: create_renewal_order, field: order_id }
+        payment_id: { state: create_renewal_order, field: payment_id }
+        amount_minor: { state: create_renewal_order, field: amount_minor }
+        currency: { state: create_renewal_order, field: currency }
+        request_id: { activity_key: authorize_initial }
+      idempotency_key:
+        stable: { run: id, state: authorize_initial }
+      timeout: 2s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: await_initial_outcome
+      on_error: provider_request_failed
+
+  - id: await_initial_outcome
+    wait:
+      connector: mock_payment
+      event: payment_outcome
+      verification: required
+      persist_before_match: true
+      correlate:
+        payment_id: { state: create_renewal_order, field: payment_id }
+      deadline: 15m
+      next: route_initial_outcome
+      on_timeout: provider_request_failed
+
+  - id: route_initial_outcome
+    when:
+      cases:
+        - rule: payment_was_authorized
+          with:
+            outcome: { event: outcome }
+          next: record_initial_authorization
+      default: record_initial_decline
+
+  - id: record_initial_authorization
+    command:
+      name: record_payment_outcome
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: create_renewal_order, field: payment_id }
+        provider_event_id: { event: provider_event_id }
+        outcome: { event: outcome }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+      next: record_initial_renewal
+
+  - id: record_initial_renewal
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 0 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: renewed
+
+  - id: record_initial_decline
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 0 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: wait_first_dunning_delay
+
+  # The decision table has three rows. These are the only two non-terminal
+  # retry timers; `terminal_pause` below represents its final row. No state
+  # transitions point back to an earlier state.
+  - id: wait_first_dunning_delay
+    wait:
+      timer:
+        decision_table: dunning_schedule
+        with: { attempt: { literal: 1 } }
+        output: delay_seconds
+      next: authorize_first_retry
+
+  - id: authorize_first_retry
+    request:
+      connector: mock_payment
+      operation: authorize
+      input:
+        order_id: { state: create_renewal_order, field: order_id }
+        payment_id: { state: create_renewal_order, field: payment_id }
+        amount_minor: { state: create_renewal_order, field: amount_minor }
+        currency: { state: create_renewal_order, field: currency }
+        request_id: { activity_key: authorize_first_retry }
+      idempotency_key:
+        stable: { run: id, state: authorize_first_retry }
+      timeout: 2s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: await_first_retry_outcome
+      on_error: provider_request_failed
+
+  - id: await_first_retry_outcome
+    wait:
+      connector: mock_payment
+      event: payment_outcome
+      verification: required
+      persist_before_match: true
+      correlate:
+        payment_id: { state: create_renewal_order, field: payment_id }
+      deadline: 15m
+      next: route_first_retry_outcome
+      on_timeout: provider_request_failed
+
+  - id: route_first_retry_outcome
+    when:
+      cases:
+        - rule: payment_was_authorized
+          with:
+            outcome: { event: outcome }
+          next: record_first_retry_authorization
+      default: record_first_retry_decline
+
+  - id: record_first_retry_authorization
+    command:
+      name: record_payment_outcome
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: create_renewal_order, field: payment_id }
+        provider_event_id: { event: provider_event_id }
+        outcome: { event: outcome }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+      next: record_first_retry_renewal
+
+  - id: record_first_retry_renewal
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 1 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: renewed
+
+  - id: record_first_retry_decline
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 1 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: wait_second_dunning_delay
+
+  - id: wait_second_dunning_delay
+    wait:
+      timer:
+        decision_table: dunning_schedule
+        with: { attempt: { literal: 2 } }
+        output: delay_seconds
+      next: authorize_second_retry
+
+  - id: authorize_second_retry
+    request:
+      connector: mock_payment
+      operation: authorize
+      input:
+        order_id: { state: create_renewal_order, field: order_id }
+        payment_id: { state: create_renewal_order, field: payment_id }
+        amount_minor: { state: create_renewal_order, field: amount_minor }
+        currency: { state: create_renewal_order, field: currency }
+        request_id: { activity_key: authorize_second_retry }
+      idempotency_key:
+        stable: { run: id, state: authorize_second_retry }
+      timeout: 2s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: await_second_retry_outcome
+      on_error: provider_request_failed
+
+  - id: await_second_retry_outcome
+    wait:
+      connector: mock_payment
+      event: payment_outcome
+      verification: required
+      persist_before_match: true
+      correlate:
+        payment_id: { state: create_renewal_order, field: payment_id }
+      deadline: 15m
+      next: route_second_retry_outcome
+      on_timeout: provider_request_failed
+
+  - id: route_second_retry_outcome
+    when:
+      cases:
+        - rule: payment_was_authorized
+          with:
+            outcome: { event: outcome }
+          next: record_second_retry_authorization
+      default: record_terminal_decline
+
+  - id: record_second_retry_authorization
+    command:
+      name: record_payment_outcome
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: create_renewal_order, field: payment_id }
+        provider_event_id: { event: provider_event_id }
+        outcome: { event: outcome }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+      next: record_second_retry_renewal
+
+  - id: record_second_retry_renewal
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 2 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: renewed
+
+  - id: record_terminal_decline
+    command:
+      name: record_payment_outcome
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: create_renewal_order, field: payment_id }
+        provider_event_id: { event: provider_event_id }
+        outcome: { event: outcome }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+      next: record_terminal_renewal
+
+  - id: record_terminal_renewal
+    command:
+      name: record_renewal_outcome
+      run_as: subscription_worker
+      arguments:
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        attempt: { literal: 2 }
+        outcome: { event: outcome }
+        provider_event_id: { event: provider_event_id }
+        provider_reference: { event: provider_reference }
+        payload: { event: normalized_payload }
+        occurred_at: { workflow_time: now }
+      next: terminal_pause
+
+  - id: terminal_pause
+    command:
+      name: pause_subscription
+      run_as: subscription_worker
+      arguments:
+        subscription_id: { input: subscription_id }
+        reason: { literal: dunning_schedule_exhausted }
+        request_id: { activity_key: terminal_pause }
+      next: paused
+
+  - id: renewed
+    output:
+      values:
+        subscription_id: { input: subscription_id }
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        order_id: { state: create_renewal_order, field: order_id }
+        payment_id: { state: create_renewal_order, field: payment_id }
+        status: { literal: renewed }
+
+  - id: paused
+    output:
+      values:
+        subscription_id: { input: subscription_id }
+        renewal_id: { state: create_renewal_order, field: renewal_id }
+        order_id: { state: create_renewal_order, field: order_id }
+        payment_id: { state: create_renewal_order, field: payment_id }
+        status: { literal: paused }
+
+  - id: provider_request_failed
+    fail:
+      code: subscription_payment_provider_unavailable
+      message: Payment provider could not process the subscription renewal

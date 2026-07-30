@@ -31,6 +31,18 @@ types:
     enum: [clear, review_required, approved, rejected]
   - name: ReconciliationState
     enum: [pending, matched, review_required, resolved]
+  - name: ReturnApprovalLine
+    object:
+      return_item_id: uuid!
+      approved_quantity: int!
+  - name: ReturnReceiptLine
+    object:
+      return_item_id: uuid!
+      received_quantity: int!
+  - name: ReturnInspectionLine
+    object:
+      return_item_id: uuid!
+      inspected_quantity: int!
 
 rules:
   - name: can_reserve_stock
@@ -109,6 +121,42 @@ rules:
     parameters: { current: ReturnState!, next: ReturnState! }
     result: bool!
     expression: "(current == ReturnState::requested && (next == ReturnState::approved || next == ReturnState::rejected)) || (current == ReturnState::approved && next == ReturnState::received) || (current == ReturnState::received && next == ReturnState::inspected) || (current == ReturnState::inspected && (next == ReturnState::refunded || next == ReturnState::exchanged || next == ReturnState::rejected))"
+  - name: return_approval_matches_request
+    parameters: { lines: "[ReturnApprovalLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_approved_quantity_is_bounded
+    parameters: { requested_quantity: int!, approved_quantity: int! }
+    result: bool!
+    expression: "requested_quantity > 0 && approved_quantity > 0 && approved_quantity <= requested_quantity"
+  - name: return_receipt_matches_approval
+    parameters: { lines: "[ReturnReceiptLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_received_quantity_is_bounded
+    parameters: { approved_quantity: int!, received_quantity: int! }
+    result: bool!
+    expression: "approved_quantity > 0 && received_quantity > 0 && received_quantity <= approved_quantity"
+  - name: return_inspection_matches_receipt
+    parameters: { lines: "[ReturnInspectionLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_inspected_quantity_is_bounded
+    parameters: { received_quantity: int!, inspected_quantity: int! }
+    result: bool!
+    expression: "received_quantity > 0 && inspected_quantity > 0 && inspected_quantity <= received_quantity"
+  - name: return_refund_amount_is_bounded
+    parameters: { inspection: InspectionDecision!, requested_amount_minor: int!, eligible_refund_minor: int! }
+    result: bool!
+    expression: "(inspection == InspectionDecision::accepted && eligible_refund_minor > 0 && requested_amount_minor > 0 && requested_amount_minor <= eligible_refund_minor) || (inspection != InspectionDecision::accepted && requested_amount_minor == 0)"
+  - name: return_is_exchange_eligible
+    parameters: { replacement_requested: bool! }
+    result: bool!
+    expression: "replacement_requested"
+  - name: return_decision_was_approved
+    parameters: { decision: ApprovalDecision! }
+    result: bool!
+    expression: "decision == ApprovalDecision::approved"
   - name: can_transition_subscription
     parameters: { current: SubscriptionState!, next: SubscriptionState! }
     result: bool!
@@ -117,6 +165,18 @@ rules:
     parameters: { current: ApprovalState!, next: ApprovalState! }
     result: bool!
     expression: "current == ApprovalState::submitted && (next == ApprovalState::approved || next == ApprovalState::rejected || next == ApprovalState::escalated)"
+  - name: approval_was_approved
+    parameters: { decision: ApprovalDecision! }
+    result: bool!
+    expression: "decision == ApprovalDecision::approved"
+  - name: approval_was_rejected
+    parameters: { decision: ApprovalDecision! }
+    result: bool!
+    expression: "decision == ApprovalDecision::rejected"
+  - name: can_consume_credit
+    parameters: { available_credit_minor: int!, requested_minor: int! }
+    result: bool!
+    expression: "available_credit_minor >= 0 && requested_minor > 0 && requested_minor <= available_credit_minor"
   - name: can_transition_payout
     parameters: { current: PayoutState!, next: PayoutState! }
     result: bool!

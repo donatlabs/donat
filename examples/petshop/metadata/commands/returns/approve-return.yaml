@@ -1,0 +1,75 @@
+name: approve_return
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: lines
+    type: "[ReturnApprovalLine!]!"
+  - name: decision_id
+    type: uuid!
+  - name: note
+    type: string
+steps:
+  - name: return_request
+    select_one:
+      table: { schema: public, name: return_request }
+      by: { id: { arg: return_id } }
+      returning: [id, order_id, status, replacement_requested]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_return
+      with:
+        current: { step: return_request, column: status }
+        next: { literal: approved }
+  - name: approval_matches_request
+    assert:
+      rule: return_approval_matches_request
+      with:
+        lines: { arg: lines }
+  - name: approved_items
+    update_many:
+      table: { schema: public, name: return_item }
+      for_each: { arg: lines }
+      by:
+        id: { item: return_item_id }
+        return_request_id: { step: return_request, column: id }
+      set: { approved_quantity: { item: approved_quantity } }
+      check:
+        rule: return_approved_quantity_is_bounded
+        with:
+          requested_quantity: { current_column: requested_quantity }
+          approved_quantity: { item: approved_quantity }
+      returning: [id, return_request_id, order_line_id, requested_quantity, approved_quantity]
+      require_each: true
+  - name: approval_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_request, column: id }
+        event_type: { literal: approved }
+        actor_role: { literal: support }
+        request_id: { arg: decision_id }
+        note: { arg: note }
+      returning: [id, return_request_id, event_type, request_id, note]
+  - name: approved_return
+    update:
+      table: { schema: public, name: return_request }
+      where: { id: { step: return_request, column: id }, status: { literal: requested } }
+      set: { status: { literal: approved } }
+      returning: [id, order_id, status, replacement_requested]
+      require_affected: true
+result:
+  return_id: { step: approved_return, column: id }
+  order_id: { step: approved_return, column: order_id }
+  status: { step: approved_return, column: status }
+  replacement_requested: { step: approved_return, column: replacement_requested }
+  items: { step: approved_items }
+  audit: { step: approval_audit }
+idempotency:
+  key: { argument: decision_id }
+  scope:
+    - { argument: return_id }
+  retention: 365d

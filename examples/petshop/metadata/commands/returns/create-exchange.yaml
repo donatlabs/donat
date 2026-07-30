@@ -1,0 +1,78 @@
+name: create_exchange
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: exchange_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: return_request
+    select_one:
+      table: { schema: public, name: return_request }
+      by: { id: { arg: return_id }, status: { literal: inspected } }
+      returning: [id, order_id, status, replacement_requested]
+      require_found: true
+  - name: exchange_is_eligible
+    assert:
+      rule: return_is_exchange_eligible
+      with:
+        replacement_requested: { step: return_request, column: replacement_requested }
+  - name: return_items
+    select_many:
+      table: { schema: public, name: return_item }
+      by: { return_request_id: { step: return_request, column: id } }
+      order_by: [id]
+      returning: [id, order_line_id, approved_quantity, received_quantity, inspected_quantity]
+      require_non_empty: true
+  - name: exchange
+    insert:
+      table: { schema: public, name: exchange }
+      object:
+        id: { arg: exchange_id }
+        return_request_id: { step: return_request, column: id }
+        order_id: { step: return_request, column: order_id }
+        status: { literal: requested }
+      returning: [id, return_request_id, order_id, status]
+  - name: exchange_items
+    insert_many:
+      table: { schema: public, name: exchange_item }
+      for_each: { step: return_items }
+      object:
+        exchange_id: { step: exchange, column: id }
+        return_item_id: { item: id }
+        order_line_id: { item: order_line_id }
+        quantity: { item: inspected_quantity }
+      returning: [exchange_id, return_item_id, order_line_id, quantity]
+  - name: exchange_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_request, column: id }
+        event_type: { literal: exchanged }
+        actor_role: { literal: fulfilment }
+        request_id: { arg: request_id }
+        exchange_id: { step: exchange, column: id }
+      returning: [id, return_request_id, event_type, request_id, exchange_id]
+  - name: exchanged_return
+    update:
+      table: { schema: public, name: return_request }
+      where: { id: { step: return_request, column: id }, status: { literal: inspected } }
+      set: { status: { literal: exchanged } }
+      returning: [id, order_id, status]
+      require_affected: true
+result:
+  return_id: { step: exchanged_return, column: id }
+  order_id: { step: exchanged_return, column: order_id }
+  status: { step: exchanged_return, column: status }
+  exchange: { step: exchange }
+  items: { step: exchange_items }
+  audit: { step: exchange_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: return_id }
+  retention: 365d
