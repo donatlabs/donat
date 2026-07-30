@@ -1,0 +1,12 @@
+record_version: 1
+record_id: source.bad.provenance
+subject:
+  kind: exact_npm
+  value:
+    name: bad
+    version: 1.0.0
+    provenance:
+      kind: verified
+      value:
+        source_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    provenance_commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

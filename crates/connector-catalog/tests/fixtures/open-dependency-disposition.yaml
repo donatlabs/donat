@@ -1,0 +1,4 @@
+record_version: 1
+record_id: source.bad.dependency
+dependencies:
+  - dependency: unknown

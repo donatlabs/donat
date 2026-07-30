@@ -1,0 +1,9 @@
+contract_fact:
+  kind: donat_policy
+  value:
+    policy_id: policy.idempotency.header
+    value:
+      kind: string
+      value: Idempotency-Key
+required_origin:
+  kind: provider_evidence

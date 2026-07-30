@@ -1,0 +1,89 @@
+record_version: 1
+record_id: source.serpapi.npm.0_1_10
+subject:
+  kind: exact_npm
+  value:
+    name: serpapi
+    version: 0.1.10
+    tarball_url: https://registry.npmjs.org/serpapi/-/serpapi-0.1.10.tgz
+    integrity:
+      algorithm: sha512
+      digest: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    repository:
+      url: https://github.com/serpapi/serpapi-javascript
+      commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      tree: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    npm_git_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    package_repository: https://github.com/serpapi/serpapi-javascript
+    signature:
+      kind: verified
+      value:
+        signatures:
+          - key_id: npm.key.1
+            signature_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        registry_metadata_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    provenance:
+      kind: verified_absent
+      value:
+        registry_metadata_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    tag_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    provenance_commit: null
+    maintainers:
+      - maintainer.one
+      - maintainer.two
+    repository_owner:
+      kind: consistent
+      value:
+        package_owner: owner.serpapi
+        repository_owner: owner.serpapi
+reacquisition:
+  kind: exact_npm_review
+  value: null
+artifact_hashes:
+  - artifact_id: artifact.npm
+    algorithm:
+      kind: sha512
+      value: null
+    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    path: package.json
+license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+notice:
+  id: notice.serpapi
+  license_file_path: LICENSE
+  license_file_sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  required_copyright_lines:
+    - Copyright SerpAPI
+  notice_bundle_destination: THIRD_PARTY_NOTICES.md
+entrypoints:
+  - package.json
+dependencies:
+  - dependency: n8n-workflow
+    disposition:
+      kind: type_only_replaced
+      value:
+        replacement: donat.value.contract
+embedded_material: []
+provider_contracts: []
+compatibility:
+  kind: tier_a
+  value: null
+admission:
+  kind: inventory_only
+  value:
+    findings:
+      - finding.awaiting.port
+safety_findings:
+  findings: []
+reviewer: reviewer.demo
+approval_date: 2026-07-29
+proposed_manifest: connector-catalog/manifests/serpapi.yaml
+proposed_destinations:
+  - connector-catalog/sources/records/serpapi.yaml
+red_tests:
+  - serpapi_exact_source_compiles

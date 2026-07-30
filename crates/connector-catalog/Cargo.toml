@@ -1,0 +1,19 @@
+[package]
+name = "donat-connector-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Strict source records and normalized static connector catalog"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+base64 = { workspace = true }
+donat-connector-abi = { path = "../connector-abi" }
+donat-value-contract = { path = "../value-contract" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }

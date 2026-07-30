@@ -1,0 +1,3 @@
+effect:
+  kind: eventually_consistent_write
+  value: null

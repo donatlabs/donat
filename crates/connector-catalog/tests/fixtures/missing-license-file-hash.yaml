@@ -1,0 +1,7 @@
+record_version: 1
+record_id: source.incomplete
+license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    license_file_path: LICENSE

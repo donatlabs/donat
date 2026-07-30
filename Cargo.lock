@@ -660,6 +660,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-connector-catalog"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "donat-connector-abi",
+ "donat-value-contract",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "donat-ir"
 version = "0.1.0"
 dependencies = [

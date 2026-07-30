@@ -1,0 +1,10 @@
+record_version: 1
+record_id: source.bad.repository
+subject:
+  kind: exact_npm
+  value:
+    name: bad
+    version: 1.0.0
+    npm_git_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    repository:
+      commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

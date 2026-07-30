@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-pub const VALUE_TYPE_LANGUAGE_VERSION: u16 = 1;
+pub const VALUE_TYPE_LANGUAGE_VERSION: u32 = 1;
 const MAXIMUM_DECODED_INLINE_BYTES: usize = 131_072;
 const MAXIMUM_INLINE_VALUES: usize = 16;
 const MAXIMUM_CANONICAL_BYTES: usize = 262_144;

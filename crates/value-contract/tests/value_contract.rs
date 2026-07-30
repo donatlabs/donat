@@ -7,6 +7,8 @@ use donat_value_contract::{
     canonical_size,
 };
 
+const _: u32 = donat_value_contract::VALUE_TYPE_LANGUAGE_VERSION;
+
 fn parsed(source: &str) -> TypeRef {
     TypeRef::parse(source).unwrap_or_else(|error| panic!("`{source}` must parse: {error}"))
 }
