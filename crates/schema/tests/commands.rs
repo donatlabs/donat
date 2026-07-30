@@ -6,7 +6,7 @@ use donat_ir::{
     CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar, TypeRef,
     ValueScalar, ValueType,
 };
-use donat_metadata::{Metadata, ScalarType, SourceKind};
+use donat_metadata::{Columns, CommandStepOperation, Metadata, ScalarType, SourceKind};
 use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
@@ -165,6 +165,73 @@ fn valid_command() -> Json {
         "result": {
             "order_id": { "step": "order", "column": "id" },
             "status": { "step": "order", "column": "status" }
+        }
+    })
+}
+
+fn relational_batch_command() -> Json {
+    json!({
+        "name": "reserve_orders",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [
+            { "name": "customer_id", "type": "uuid!" }
+        ],
+        "steps": [
+            {
+                "name": "selected",
+                "select_many": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "by": {
+                        "customer_id": { "arg": "customer_id" }
+                    },
+                    "order_by": ["id"],
+                    "returning": ["id", "customer_id", "status", "quantity"],
+                    "require_non_empty": true
+                }
+            },
+            {
+                "name": "totals",
+                "aggregate": {
+                    "from": { "step": "selected" },
+                    "values": {
+                        "line_count": { "count": {} },
+                        "quantity_sum": { "sum": { "column": "quantity" } },
+                        "first_status": { "min": { "column": "status" } }
+                    }
+                }
+            },
+            {
+                "name": "updated",
+                "update_many": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "for_each": { "step": "selected" },
+                    "by": {
+                        "id": { "item": "id" }
+                    },
+                    "set": {
+                        "quantity": {
+                            "rule": "double_quantity",
+                            "with": {
+                                "quantity": { "item": "quantity" }
+                            }
+                        }
+                    },
+                    "check": {
+                        "rule": "customer_is_allowed",
+                        "with": {
+                            "customer_id": { "current_column": "customer_id" }
+                        }
+                    },
+                    "returning": ["id", "quantity"],
+                    "require_each": true
+                }
+            }
+        ],
+        "result": {
+            "selected": { "step": "selected" },
+            "totals": { "step": "totals" },
+            "updated": { "step": "updated" }
         }
     })
 }
@@ -366,6 +433,319 @@ fn assert_rejected(command: Json, expected: &str) {
         error.message.contains(expected),
         "expected {expected:?} in {:?}",
         error.message
+    );
+}
+
+#[test]
+fn relational_batch_rejects_unauthorized_read_and_update_targets() {
+    let mut missing_read = metadata(vec![relational_batch_command()]);
+    missing_read.sources[0].tables[0].select_permissions.clear();
+    let error = compile(&missing_read, RelationKind::Table)
+        .expect_err("select_many must require the explicit role's read permission");
+    assert!(error.message.contains("lacks select permission"));
+
+    let mut missing_update = metadata(vec![relational_batch_command()]);
+    missing_update.sources[0].tables[0]
+        .update_permissions
+        .clear();
+    let error = compile(&missing_update, RelationKind::Table)
+        .expect_err("update_many must require the explicit role's update permission");
+    assert!(error.message.contains("lacks update permission"));
+
+    let mut hidden_returning = metadata(vec![relational_batch_command()]);
+    hidden_returning.sources[0].tables[0].select_permissions[0]
+        .permission
+        .columns = Columns::List(vec![
+        "id".to_owned(),
+        "customer_id".to_owned(),
+        "quantity".to_owned(),
+    ]);
+    let error = compile(&hidden_returning, RelationKind::Table)
+        .expect_err("an undeclared read column must not enter a command result type");
+    assert!(
+        error
+            .message
+            .contains("lacks select permission for column 'status'")
+    );
+}
+
+#[test]
+fn relational_batch_rejects_invalid_equality_and_order_columns() {
+    let mut empty_equality = metadata(vec![relational_batch_command()]);
+    let CommandStepOperation::SelectMany { select_many } =
+        &mut empty_equality.commands[0].steps[0].operation
+    else {
+        panic!("relational fixture starts with select_many");
+    };
+    select_many.by.clear();
+    let error = compile(&empty_equality, RelationKind::Table)
+        .expect_err("catalog validation must retain the non-empty equality invariant");
+    assert!(error.message.contains("at least one equality"));
+
+    let mut empty_order = metadata(vec![relational_batch_command()]);
+    let CommandStepOperation::SelectMany { select_many } =
+        &mut empty_order.commands[0].steps[0].operation
+    else {
+        panic!("relational fixture starts with select_many");
+    };
+    select_many.order_by.clear();
+    let error = compile(&empty_order, RelationKind::Table)
+        .expect_err("a row set without a declared total order must be rejected");
+    assert!(error.message.contains("total order"));
+
+    let mut duplicate_order = metadata(vec![relational_batch_command()]);
+    let CommandStepOperation::SelectMany { select_many } =
+        &mut duplicate_order.commands[0].steps[0].operation
+    else {
+        panic!("relational fixture starts with select_many");
+    };
+    select_many.order_by.push("id".to_owned());
+    let error = compile(&duplicate_order, RelationKind::Table)
+        .expect_err("a repeated order column cannot define the row-set identity");
+    assert!(error.message.contains("duplicate order"));
+
+    let mut unknown_order = relational_batch_command();
+    unknown_order["steps"][0]["select_many"]["order_by"] = json!(["missing"]);
+    assert_rejected(unknown_order, "unknown order column 'missing'");
+}
+
+#[test]
+fn relational_batch_rejects_invalid_aggregate_sources_and_types() {
+    let mut scalar_source = valid_command();
+    scalar_source["steps"]
+        .as_array_mut()
+        .expect("steps array")
+        .push(json!({
+            "name": "totals",
+            "aggregate": {
+                "from": { "step": "order" },
+                "values": { "count": { "count": {} } }
+            }
+        }));
+    scalar_source["result"] = json!({ "totals": { "step": "totals" } });
+    assert_rejected(
+        scalar_source,
+        "aggregate input must be a prior select_many row set",
+    );
+
+    let mut forward_source = relational_batch_command();
+    forward_source["steps"][1]["aggregate"]["from"] = json!({ "step": "updated" });
+    assert_rejected(
+        forward_source,
+        "step reference 'updated' must reference an earlier step",
+    );
+
+    let mut non_numeric_sum = relational_batch_command();
+    non_numeric_sum["steps"][1]["aggregate"]["values"]["quantity_sum"] =
+        json!({ "sum": { "column": "status" } });
+    assert_rejected(non_numeric_sum, "sum requires a numeric column");
+
+    let unsupported_min = relational_batch_command();
+    let mut json_catalog = catalog(RelationKind::Table);
+    json_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "status")
+        .expect("status column")
+        .pg_type = "jsonb".to_owned();
+    let error = compile_with_catalog(&metadata(vec![unsupported_min]), json_catalog)
+        .expect_err("min/max must reject database types without a closed ordering");
+    assert!(error.message.contains("min requires an orderable column"));
+}
+
+#[test]
+fn relational_batch_rejects_invalid_update_many_input_and_assignments() {
+    let mut wrong_input = relational_batch_command();
+    wrong_input["steps"][2]["update_many"]["for_each"] = json!({ "step": "totals" });
+    assert_rejected(
+        wrong_input,
+        "update_many input must be a prior select_many row set",
+    );
+
+    let mut composite_catalog = catalog(RelationKind::Table);
+    composite_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .primary_key = vec!["id".to_owned(), "customer_id".to_owned()];
+    let error = compile_with_catalog(
+        &metadata(vec![relational_batch_command()]),
+        composite_catalog.clone(),
+    )
+    .expect_err("every update target primary-key column must be mapped");
+    assert!(error.message.contains("every primary-key column"));
+
+    let mut duplicate_input = relational_batch_command();
+    duplicate_input["steps"][2]["update_many"]["by"]["customer_id"] = json!({ "item": "id" });
+    let error = compile_with_catalog(&metadata(vec![duplicate_input]), composite_catalog)
+        .expect_err("one input field cannot stand in for two primary-key components");
+    assert!(error.message.contains("duplicate input key"));
+
+    let mut mismatched_current = relational_batch_command();
+    mismatched_current["steps"][2]["update_many"]["set"]["quantity"] =
+        json!({ "current_column": "status" });
+    assert_rejected(mismatched_current, "is not assignable to column 'quantity'");
+
+    let mut mismatched_rule = relational_batch_command();
+    mismatched_rule["steps"][2]["update_many"]["set"]["status"] = json!({
+        "rule": "double_quantity",
+        "with": { "quantity": { "item": "quantity" } }
+    });
+    mismatched_rule["steps"][2]["update_many"]["set"]
+        .as_object_mut()
+        .expect("set object")
+        .remove("quantity");
+    assert_rejected(mismatched_rule, "is not assignable to column 'status'");
+
+    let mut current_outside_update_many = valid_command();
+    current_outside_update_many["steps"][0]["insert"]["object"]["quantity"] =
+        json!({ "current_column": "quantity" });
+    assert_rejected(
+        current_outside_update_many,
+        "current_column values are allowed only inside update_many",
+    );
+}
+
+#[test]
+fn relational_batch_rejects_view_and_non_postgres_update_targets() {
+    let error = compile(
+        &metadata(vec![relational_batch_command()]),
+        RelationKind::View,
+    )
+    .expect_err("select_many may read a view but update_many may not target it");
+    assert!(error.message.contains("update_many target"));
+    assert!(error.message.contains("ordinary table"));
+
+    let mut sqlite = metadata(vec![relational_batch_command()]);
+    sqlite.sources[0].kind = SourceKind::Sqlite;
+    let error = compile(&sqlite, RelationKind::Table)
+        .expect_err("relational update batches remain Postgres-only");
+    assert!(error.message.contains("requires a Postgres source"));
+}
+
+#[test]
+fn relational_batch_rejects_a_row_set_projected_as_one_scalar() {
+    let mut command = relational_batch_command();
+    command["result"]["selected"] = json!({ "step": "selected", "column": "id" });
+    assert_rejected(
+        command,
+        "row-set result must reference the declared row object",
+    );
+}
+
+#[test]
+fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
+    let metadata = metadata(vec![relational_batch_command()]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let mutation = r#"
+        mutation {
+          reserve_orders(customer_id: "00000000-0000-0000-0000-000000000001") {
+            selected { id status }
+            totals { line_count quantity_sum first_status }
+            updated { id quantity }
+          }
+        }
+    "#;
+    let plan = plan_runtime(&metadata, &catalogs, commands.clone(), "customer", mutation)
+        .expect("a valid relational batch plans into closed execution IR");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &command.steps[0],
+        CommandExecutionStep::SelectMany {
+            equality,
+            order_by,
+            returning,
+            require_non_empty: true,
+            ..
+        } if equality.len() == 1 && order_by.len() == 1 && returning.len() == 4
+    ));
+    assert!(matches!(
+        &command.steps[1],
+        CommandExecutionStep::Aggregate { values, .. } if values.len() == 3
+    ));
+    assert!(matches!(
+        &command.steps[2],
+        CommandExecutionStep::UpdateMany {
+            primary_key,
+            assignments,
+            check: Some(_),
+            returning,
+            require_each: true,
+            ..
+        } if primary_key.len() == 1 && assignments.len() == 1 && returning.len() == 2
+    ));
+    let serialized = serde_json::to_value(command).expect("relational command IR serializes");
+    assert!(
+        !serialized.to_string().contains("select_many"),
+        "runtime IR carries resolved variants rather than raw command metadata: {serialized:#}"
+    );
+
+    let introspection = introspect_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          {
+            result: __type(name: "ReserveOrdersResult") {
+              fields {
+                name
+                type { kind name ofType { kind name ofType { kind name } } }
+              }
+            }
+            selected: __type(name: "ReserveOrdersSelectedRow") {
+              fields { name }
+            }
+            totals: __type(name: "ReserveOrdersTotalsRow") {
+              fields { name }
+            }
+          }
+        "#,
+    );
+    let result_fields = introspection["result"]["fields"]
+        .as_array()
+        .expect("result fields");
+    for name in ["selected", "updated"] {
+        let field = result_fields
+            .iter()
+            .find(|field| field["name"] == name)
+            .expect("row-set result field");
+        assert_eq!(field["type"]["kind"], "NON_NULL");
+        assert_eq!(field["type"]["ofType"]["kind"], "LIST");
+        assert_eq!(field["type"]["ofType"]["ofType"]["kind"], "NON_NULL");
+    }
+    let totals = result_fields
+        .iter()
+        .find(|field| field["name"] == "totals")
+        .expect("aggregate result field");
+    assert_eq!(totals["type"]["kind"], "NON_NULL");
+    assert_eq!(totals["type"]["ofType"]["name"], "ReserveOrdersTotalsRow");
+    assert_eq!(
+        introspection["selected"]["fields"],
+        json!([
+            { "name": "id" },
+            { "name": "customer_id" },
+            { "name": "status" },
+            { "name": "quantity" }
+        ]),
+        "only select_many.returning columns enter the generated row object"
+    );
+    assert_eq!(
+        introspection["totals"]["fields"],
+        json!([
+            { "name": "first_status" },
+            { "name": "line_count" },
+            { "name": "quantity_sum" }
+        ])
     );
 }
 

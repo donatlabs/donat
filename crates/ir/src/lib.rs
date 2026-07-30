@@ -481,6 +481,24 @@ pub enum CommandExecutionStep {
         filter: Option<BoolExp>,
         error_path: String,
     },
+    SelectMany {
+        name: String,
+        cte: String,
+        table: Table,
+        equality: Vec<CommandAssignment>,
+        order_by: Vec<CommandColumn>,
+        returning: Vec<CommandColumn>,
+        require_non_empty: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    Aggregate {
+        name: String,
+        cte: String,
+        input_cte: String,
+        values: Vec<CommandAggregateIr>,
+        error_path: String,
+    },
     Insert {
         name: String,
         cte: String,
@@ -514,6 +532,20 @@ pub enum CommandExecutionStep {
         check: Option<BoolExp>,
         error_path: String,
     },
+    UpdateMany {
+        name: String,
+        cte: String,
+        table: Table,
+        input_cte: String,
+        primary_key: Vec<CommandAssignment>,
+        assignments: Vec<CommandAssignment>,
+        check: Option<CommandRule>,
+        returning: Vec<CommandColumn>,
+        require_each: bool,
+        filter: Option<BoolExp>,
+        permission_check: Option<BoolExp>,
+        error_path: String,
+    },
     Delete {
         name: String,
         cte: String,
@@ -530,6 +562,42 @@ pub enum CommandExecutionStep {
     },
 }
 
+/// One named, catalog-typed aggregation over a prior command row set.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandAggregateIr {
+    Count {
+        output: CommandColumn,
+    },
+    Sum {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    Min {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    Max {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    CountDistinct {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+}
+
+impl CommandAggregateIr {
+    pub fn output(&self) -> &CommandColumn {
+        match self {
+            Self::Count { output }
+            | Self::Sum { output, .. }
+            | Self::Min { output, .. }
+            | Self::Max { output, .. }
+            | Self::CountDistinct { output, .. } => output,
+        }
+    }
+}
+
 /// One concrete target-column assignment in a command operation.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandAssignment {
@@ -541,10 +609,29 @@ pub struct CommandAssignment {
 /// an argument name, metadata literal, Rule name, or session-variable name.
 #[derive(Debug, Clone, Serialize)]
 pub enum CommandExecutionValue {
-    Scalar { value: Scalar, pg_type: String },
-    StepColumn { cte: String, column: CommandColumn },
-    Item { field: String, pg_type: String },
-    Rule { sql: String, pg_type: String },
+    Scalar {
+        value: Scalar,
+        pg_type: String,
+    },
+    StepColumn {
+        cte: String,
+        column: CommandColumn,
+    },
+    StepRows {
+        cte: String,
+        columns: Vec<CommandColumn>,
+    },
+    Item {
+        field: String,
+        pg_type: String,
+    },
+    CurrentColumn {
+        column: CommandColumn,
+    },
+    Rule {
+        sql: String,
+        pg_type: String,
+    },
 }
 
 /// A Rule expression lowered from the immutable Rules catalog with closed SQL

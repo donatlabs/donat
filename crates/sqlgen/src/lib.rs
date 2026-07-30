@@ -1119,13 +1119,28 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 "({step_execution_gate}) AND {assert_gate}",
                 assert_gate = command_gate_exists(&assert_cte),
             );
-        } else if let Some(cte) = command_step_cte(ctx, step, &step_execution_gate) {
+        } else {
+            for (gate_cte, gate) in
+                command_pre_step_gate_ctes(ctx, index, step, &step_execution_gate)
+            {
+                ctes.push(gate_cte);
+                step_execution_gate = format!("({step_execution_gate}) AND {gate}");
+            }
+            let Some(cte) = command_step_cte(ctx, step, &step_execution_gate) else {
+                continue;
+            };
             ctes.push(cte);
             if let Some((required_cte, required_gate)) =
                 command_required_step_gate_cte(index, step, &step_execution_gate)
             {
                 ctes.push(required_cte);
                 step_execution_gate = format!("({step_execution_gate}) AND {required_gate}");
+            }
+            for (gate_cte, gate) in
+                command_post_step_gate_ctes(ctx, index, step, &step_execution_gate)
+            {
+                ctes.push(gate_cte);
+                step_execution_gate = format!("({step_execution_gate}) AND {gate}");
             }
         }
     }
@@ -1259,6 +1274,250 @@ fn command_gate_exists(cte: &str) -> String {
     format!("EXISTS (SELECT 1 FROM {})", quote_ident(cte))
 }
 
+fn command_business_gate_cte(
+    cte: &str,
+    precondition: &str,
+    rejection: &str,
+    error_path: &str,
+    message: &str,
+) -> (String, String) {
+    let sql = format!(
+        "{gate} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN CASE WHEN ({rejection}) THEN (donat.raise_graphql_error('validation-failed', {path}, {message}) IS NULL) ELSE TRUE END ELSE FALSE END)",
+        gate = quote_ident(cte),
+        ok = quote_ident("ok"),
+        path = quote_lit(error_path),
+        message = quote_lit(message),
+    );
+    (sql, command_gate_exists(cte))
+}
+
+fn command_permission_gate_cte(
+    cte: &str,
+    precondition: &str,
+    rejection: &str,
+    error_path: &str,
+) -> (String, String) {
+    let payload = serde_json::json!({
+        "path": error_path,
+        "message": "check constraint of an insert/update permission has failed",
+    })
+    .to_string();
+    let sql = format!(
+        "{gate} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN CASE WHEN ({rejection}) THEN (donat.check_violation({payload}) IS NULL) ELSE TRUE END ELSE FALSE END)",
+        gate = quote_ident(cte),
+        ok = quote_ident("ok"),
+        payload = quote_lit(&payload),
+    );
+    (sql, command_gate_exists(cte))
+}
+
+fn command_pre_step_gate_ctes(
+    ctx: &mut Ctx,
+    index: usize,
+    step: &CommandExecutionStep,
+    precondition: &str,
+) -> Vec<(String, String)> {
+    let CommandExecutionStep::UpdateMany {
+        name,
+        table,
+        input_cte,
+        primary_key,
+        check,
+        filter,
+        error_path,
+        ..
+    } = step
+    else {
+        return Vec::new();
+    };
+
+    let input_alias = "_cmd_input";
+    let target_alias = "_cmd_target";
+    let input_keys = primary_key
+        .iter()
+        .map(|assignment| {
+            command_value_sql_scoped(ctx, &assignment.value, input_alias, target_alias)
+        })
+        .collect::<Vec<_>>();
+    let unique_rows = if input_keys.is_empty() {
+        "0".to_owned()
+    } else {
+        format!(
+            "(SELECT count(*) FROM (SELECT {keys} FROM {input} AS {input_alias} GROUP BY {keys}) AS {unique_alias})",
+            keys = input_keys.join(", "),
+            input = quote_ident(input_cte),
+            input_alias = quote_ident(input_alias),
+            unique_alias = quote_ident("_cmd_unique_input"),
+        )
+    };
+    let input_count = format!("(SELECT count(*) FROM {})", quote_ident(input_cte));
+    let duplicate_gate = command_business_gate_cte(
+        &format!("_cmd_unique_input_gate_{index}"),
+        precondition,
+        &format!("{input_count} <> {unique_rows}"),
+        error_path,
+        &format!("command update_many step '{name}' contains duplicate input primary keys"),
+    );
+    let mut gates = vec![duplicate_gate];
+
+    if let Some(check) = check {
+        let prior_gate = format!(
+            "({precondition}) AND {}",
+            gates
+                .last()
+                .map(|(_, gate)| gate.as_str())
+                .expect("the duplicate-input gate was just added")
+        );
+        let mut predicates =
+            command_update_many_join_predicates(ctx, primary_key, target_alias, input_alias);
+        if let Some(filter) = filter {
+            predicates.push(ctx.bool_exp(filter, target_alias, target_alias));
+        }
+        predicates.push(format!("({}) IS NOT TRUE", check.sql));
+        let rejection = format!(
+            "EXISTS (SELECT 1 FROM {table} AS {target} JOIN {input} AS {input_alias} ON {join} WHERE {predicate})",
+            table = command_table_sql(table),
+            target = quote_ident(target_alias),
+            input = quote_ident(input_cte),
+            input_alias = quote_ident(input_alias),
+            join =
+                command_update_many_join_predicates(ctx, primary_key, target_alias, input_alias,)
+                    .join(" AND "),
+            predicate = predicates.join(" AND "),
+        );
+        gates.push(command_business_gate_cte(
+            &format!("_cmd_update_check_gate_{index}"),
+            &prior_gate,
+            &rejection,
+            &check.error_path,
+            &check.message,
+        ));
+    }
+
+    gates
+}
+
+fn command_post_step_gate_ctes(
+    ctx: &mut Ctx,
+    index: usize,
+    step: &CommandExecutionStep,
+    precondition: &str,
+) -> Vec<(String, String)> {
+    match step {
+        CommandExecutionStep::SelectMany {
+            name,
+            cte,
+            order_by,
+            require_non_empty,
+            error_path,
+            ..
+        } => {
+            let order_keys = order_by
+                .iter()
+                .enumerate()
+                .map(|(order_index, _)| {
+                    qualified("_cmd_ordered_rows", &format!("_cmd_order_{order_index}"))
+                })
+                .collect::<Vec<_>>();
+            let unique_count = format!(
+                "(SELECT count(*) FROM (SELECT {keys} FROM {step} AS {rows} GROUP BY {keys}) AS {unique_alias})",
+                keys = order_keys.join(", "),
+                step = quote_ident(cte),
+                rows = quote_ident("_cmd_ordered_rows"),
+                unique_alias = quote_ident("_cmd_unique_order"),
+            );
+            let row_count = format!("(SELECT count(*) FROM {})", quote_ident(cte));
+            let unique_gate = command_business_gate_cte(
+                &format!("_cmd_unique_order_gate_{index}"),
+                precondition,
+                &format!("{row_count} <> {unique_count}"),
+                error_path,
+                &format!("command select_many step '{name}' contains duplicate order keys"),
+            );
+            let mut gates = vec![unique_gate];
+            if *require_non_empty {
+                let prior_gate = format!(
+                    "({precondition}) AND {}",
+                    gates
+                        .last()
+                        .map(|(_, gate)| gate.as_str())
+                        .expect("the unique-order gate was just added")
+                );
+                gates.push(command_business_gate_cte(
+                    &format!("_cmd_non_empty_gate_{index}"),
+                    &prior_gate,
+                    &format!("{row_count} = 0"),
+                    error_path,
+                    &format!("command select_many step '{name}' requires at least one row"),
+                ));
+            }
+            gates
+        }
+        CommandExecutionStep::UpdateMany {
+            name,
+            cte,
+            input_cte,
+            primary_key,
+            require_each,
+            permission_check,
+            error_path,
+            ..
+        } => {
+            let mut gates = Vec::new();
+            if let Some(check) = permission_check {
+                let rejection = format!(
+                    "(SELECT count(*) FROM {step} WHERE ({check}) IS NOT TRUE) > 0",
+                    step = quote_ident(cte),
+                    check = ctx.bool_exp(check, cte, cte),
+                );
+                gates.push(command_permission_gate_cte(
+                    &format!("_cmd_update_permission_gate_{index}"),
+                    precondition,
+                    &rejection,
+                    error_path,
+                ));
+            }
+            if *require_each {
+                let prior_gate = match gates.last() {
+                    Some((_, gate)) => format!("({precondition}) AND {gate}"),
+                    None => precondition.to_owned(),
+                };
+                let input_alias = "_cmd_input";
+                let input_keys = primary_key
+                    .iter()
+                    .map(|assignment| {
+                        command_value_sql_scoped(ctx, &assignment.value, input_alias, "_cmd_target")
+                    })
+                    .collect::<Vec<_>>();
+                let unique_count = if input_keys.is_empty() {
+                    "0".to_owned()
+                } else {
+                    format!(
+                        "(SELECT count(*) FROM (SELECT {keys} FROM {input} AS {input_alias} GROUP BY {keys}) AS {unique_alias})",
+                        keys = input_keys.join(", "),
+                        input = quote_ident(input_cte),
+                        input_alias = quote_ident(input_alias),
+                        unique_alias = quote_ident("_cmd_exact_unique_input"),
+                    )
+                };
+                let input_count = format!("(SELECT count(*) FROM {})", quote_ident(input_cte));
+                let affected_count = format!("(SELECT count(*) FROM {})", quote_ident(cte));
+                gates.push(command_business_gate_cte(
+                    &format!("_cmd_affected_each_gate_{index}"),
+                    &prior_gate,
+                    &format!(
+                        "{unique_count} <> {input_count} OR {affected_count} <> {input_count}"
+                    ),
+                    error_path,
+                    &format!("command update_many step '{name}' did not affect every input row"),
+                ));
+            }
+            gates
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn command_required_step_gate_cte(
     index: usize,
     step: &CommandExecutionStep,
@@ -1341,6 +1600,73 @@ fn command_step_cte(
                 table = command_table_sql(table),
                 alias = quote_ident(alias),
                 predicate = predicates.join(" AND "),
+            ))
+        }
+        CommandExecutionStep::SelectMany {
+            cte,
+            table,
+            equality,
+            order_by,
+            returning,
+            filter,
+            ..
+        } => {
+            let alias = "_cmd_target";
+            let mut predicates = command_predicates(ctx, equality, alias);
+            if let Some(filter) = filter {
+                predicates.push(ctx.bool_exp(filter, alias, alias));
+            }
+            predicates.push(execution_gate.to_owned());
+            let selected = command_returning_columns(returning, alias);
+            let order = order_by
+                .iter()
+                .map(|column| qualified(alias, &column.name))
+                .collect::<Vec<_>>();
+            let private_order = order_by
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    format!(
+                        "{} AS {}",
+                        qualified(alias, &column.name),
+                        quote_ident(&format!("_cmd_order_{index}"))
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut projection = vec![selected];
+            projection.extend(private_order);
+            projection.push(format!(
+                "row_number() OVER (ORDER BY {})::bigint AS {}",
+                order.join(", "),
+                quote_ident("_cmd_ordinal")
+            ));
+            Some(format!(
+                "{cte} AS MATERIALIZED (SELECT {projection} FROM {table} AS {alias} WHERE {predicate} ORDER BY {order})",
+                cte = quote_ident(cte),
+                projection = projection.join(", "),
+                table = command_table_sql(table),
+                alias = quote_ident(alias),
+                predicate = predicates.join(" AND "),
+                order = order.join(", "),
+            ))
+        }
+        CommandExecutionStep::Aggregate {
+            cte,
+            input_cte,
+            values,
+            ..
+        } => {
+            let input_alias = "_cmd_input";
+            let aggregates = values
+                .iter()
+                .map(|aggregate| command_aggregate_sql(aggregate, input_alias))
+                .collect::<Vec<_>>();
+            Some(format!(
+                "{cte} AS (SELECT {aggregates} FROM {input} AS {input_alias} WHERE {execution_gate})",
+                cte = quote_ident(cte),
+                aggregates = aggregates.join(", "),
+                input = quote_ident(input_cte),
+                input_alias = quote_ident(input_alias),
             ))
         }
         CommandExecutionStep::Insert {
@@ -1471,6 +1797,70 @@ fn command_step_cte(
                 predicate = predicates.join(" AND "),
             ))
         }
+        CommandExecutionStep::UpdateMany {
+            cte,
+            table,
+            input_cte,
+            primary_key,
+            assignments,
+            check,
+            filter,
+            ..
+        } => {
+            let target_alias = "_cmd_target";
+            let input_alias = "_cmd_input";
+            let updated_alias = "_cmd_updated";
+            let sets = assignments
+                .iter()
+                .map(|assignment| {
+                    format!(
+                        "{} = {}",
+                        quote_ident(&assignment.column.name),
+                        command_value_sql_scoped(ctx, &assignment.value, input_alias, target_alias,)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut predicates =
+                command_update_many_join_predicates(ctx, primary_key, target_alias, input_alias);
+            if let Some(filter) = filter {
+                predicates.push(ctx.bool_exp(filter, target_alias, target_alias));
+            }
+            if let Some(check) = check {
+                predicates.push(format!("({}) IS TRUE", check.sql));
+            }
+            predicates.push(execution_gate.to_owned());
+
+            let updated_cte = format!("{cte}_updated");
+            let ordered_join = primary_key
+                .iter()
+                .map(|assignment| {
+                    format!(
+                        "{} = {}",
+                        qualified(updated_alias, &assignment.column.name),
+                        command_value_sql_scoped(
+                            ctx,
+                            &assignment.value,
+                            input_alias,
+                            updated_alias,
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            Some(format!(
+                "{updated_cte} AS (UPDATE {table} AS {target} SET {sets} FROM {input} AS {input_alias} WHERE {predicate} RETURNING {target}.*), {cte} AS (SELECT {input_alias}.{ordinal}, {updated_alias}.* FROM {input} AS {input_alias} JOIN {updated_cte} AS {updated_alias} ON {ordered_join} ORDER BY {input_alias}.{ordinal})",
+                updated_cte = quote_ident(&updated_cte),
+                table = command_table_sql(table),
+                target = quote_ident(target_alias),
+                sets = sets.join(", "),
+                input = quote_ident(input_cte),
+                input_alias = quote_ident(input_alias),
+                predicate = predicates.join(" AND "),
+                cte = quote_ident(cte),
+                ordinal = quote_ident("_cmd_ordinal"),
+                updated_alias = quote_ident(updated_alias),
+                ordered_join = ordered_join.join(" AND "),
+            ))
+        }
         CommandExecutionStep::Delete {
             cte,
             table,
@@ -1493,6 +1883,33 @@ fn command_step_cte(
             ))
         }
     }
+}
+
+fn command_aggregate_sql(aggregate: &CommandAggregateIr, input_alias: &str) -> String {
+    let (output, expression) = match aggregate {
+        CommandAggregateIr::Count { output } => (output, "count(*)".to_owned()),
+        CommandAggregateIr::Sum { output, input } => (
+            output,
+            format!("sum({})", qualified(input_alias, &input.name)),
+        ),
+        CommandAggregateIr::Min { output, input } => (
+            output,
+            format!("min({})", qualified(input_alias, &input.name)),
+        ),
+        CommandAggregateIr::Max { output, input } => (
+            output,
+            format!("max({})", qualified(input_alias, &input.name)),
+        ),
+        CommandAggregateIr::CountDistinct { output, input } => (
+            output,
+            format!("count(DISTINCT {})", qualified(input_alias, &input.name)),
+        ),
+    };
+    format!(
+        "({expression})::{} AS {}",
+        quote_ident(&output.pg_type),
+        quote_ident(&output.name),
+    )
 }
 
 fn command_table_sql(table: &Table) -> String {
@@ -1533,6 +1950,15 @@ fn command_predicates(
 }
 
 fn command_value_sql(ctx: &mut Ctx, value: &CommandExecutionValue) -> String {
+    command_value_sql_scoped(ctx, value, "_cmd_input", "_cmd_target")
+}
+
+fn command_value_sql_scoped(
+    ctx: &mut Ctx,
+    value: &CommandExecutionValue,
+    item_alias: &str,
+    current_alias: &str,
+) -> String {
     match value {
         CommandExecutionValue::Scalar { value, pg_type } => {
             scalar_sql(&ctx.dialect, value, pg_type)
@@ -1542,11 +1968,39 @@ fn command_value_sql(ctx: &mut Ctx, value: &CommandExecutionValue) -> String {
             quote_ident(&column.name),
             quote_ident(cte),
         ),
-        CommandExecutionValue::Item { field, .. } => qualified("_cmd_item", field),
+        CommandExecutionValue::StepRows { cte, columns } => {
+            let row = command_row_json(ctx, columns, cte);
+            let order = qualified(cte, "_cmd_ordinal");
+            format!(
+                "(SELECT {} FROM {})",
+                json_array_agg(&ctx.dialect, &row, Some(&order)),
+                quote_ident(cte),
+            )
+        }
+        CommandExecutionValue::Item { field, .. } => qualified(item_alias, field),
+        CommandExecutionValue::CurrentColumn { column } => qualified(current_alias, &column.name),
         CommandExecutionValue::Rule { sql, pg_type } => {
             format!("({sql})::{}", quote_ident(pg_type))
         }
     }
+}
+
+fn command_update_many_join_predicates(
+    ctx: &mut Ctx,
+    primary_key: &[CommandAssignment],
+    target_alias: &str,
+    input_alias: &str,
+) -> Vec<String> {
+    primary_key
+        .iter()
+        .map(|assignment| {
+            format!(
+                "{} = {}",
+                qualified(target_alias, &assignment.column.name),
+                command_value_sql_scoped(ctx, &assignment.value, input_alias, target_alias),
+            )
+        })
+        .collect()
 }
 
 fn command_value_sql_for_item(
@@ -1608,10 +2062,9 @@ fn command_result_value_sql(ctx: &mut Ctx, value: &CommandResultValue) -> String
         CommandResultValue::StepRow { cte, many, columns } => {
             let row = command_row_json(ctx, columns, cte);
             if *many {
-                // Only `insert_many` has a row result in the command IR. Its
-                // renderer exposes this private ordinal alongside the declared
-                // returning columns, so the JSON contract does not depend on
-                // PostgreSQL's unspecified `RETURNING` row order.
+                // Every row-set renderer exposes this private ordinal alongside
+                // the declared columns, so neither SELECT nor RETURNING plan
+                // order can leak into the public JSON contract.
                 let order = qualified(cte, "_cmd_ordinal");
                 format!(
                     "(SELECT {} FROM {})",

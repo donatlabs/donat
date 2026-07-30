@@ -15,9 +15,9 @@ use donat_ir::{
     compile_value_contract_catalog,
 };
 use donat_metadata::{
-    Columns, Command, CommandEffect, CommandIdempotencyKey, CommandIdempotencyScope,
-    CommandStepOperation, CommandValue, Metadata, QualifiedTable, Source, SourceKind, TableEntry,
-    action_visible_to_role,
+    Columns, Command, CommandAggregate, CommandEffect, CommandIdempotencyKey,
+    CommandIdempotencyScope, CommandStepOperation, CommandValue, Metadata, QualifiedTable, Source,
+    SourceKind, TableEntry, action_visible_to_role,
 };
 use donat_rules::{RuleCatalog, RuleType};
 use sha2::{Digest, Sha256};
@@ -620,6 +620,15 @@ struct StepOutput {
     fields: BTreeMap<String, StaticType>,
     many: bool,
     may_be_absent: bool,
+    kind: StepOutputKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepOutputKind {
+    Scalar,
+    SelectMany,
+    Aggregate,
+    UpdateMany,
 }
 
 #[derive(Clone, Copy)]
@@ -630,6 +639,7 @@ struct ValueContext<'a> {
     steps: &'a BTreeMap<String, StepOutput>,
     declared_steps: &'a HashSet<String>,
     item: Option<&'a BTreeMap<String, StaticType>>,
+    current: Option<&'a BTreeMap<String, StaticType>>,
 }
 
 #[derive(Clone, Copy)]
@@ -820,6 +830,7 @@ fn build_command_descriptor(
             steps: &steps,
             declared_steps: &declared_steps,
             item: None,
+            current: None,
         };
         let output = validate_step(
             source,
@@ -838,6 +849,7 @@ fn build_command_descriptor(
         steps: &steps,
         declared_steps: &declared_steps,
         item: None,
+        current: None,
     };
     let mut result_roots = BTreeMap::new();
     for field in &command.result.fields {
@@ -974,13 +986,22 @@ fn collect_required_session_variables(
         for step in &command.steps {
             let table = match &step.operation {
                 CommandStepOperation::SelectOne { select_one } => &select_one.table,
+                CommandStepOperation::SelectMany { select_many } => &select_many.table,
                 CommandStepOperation::Insert { insert } => &insert.table,
                 CommandStepOperation::InsertMany { insert_many } => &insert_many.table,
                 CommandStepOperation::Update { update } => &update.table,
+                CommandStepOperation::UpdateMany { update_many } => &update_many.table,
                 CommandStepOperation::Delete { delete } => &delete.table,
-                CommandStepOperation::Assert { .. } => continue,
+                CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => {
+                    continue;
+                }
             };
-            let (entry, info) = command_target(source, catalog, table, path)?;
+            let (entry, info) =
+                if matches!(&step.operation, CommandStepOperation::SelectMany { .. }) {
+                    command_read_target(source, catalog, table, path)?
+                } else {
+                    command_target(source, catalog, table, path)?
+                };
             let filter_context = TableCtx {
                 entry,
                 info,
@@ -1028,7 +1049,7 @@ fn collect_required_session_variables(
                         }
                     }
                 }
-                CommandStepOperation::Update { .. } => {
+                CommandStepOperation::Update { .. } | CommandStepOperation::UpdateMany { .. } => {
                     if let Some(permission) =
                         planner.resolve_role_perm(&entry.update_permissions, role, |_| true)
                     {
@@ -1079,7 +1100,10 @@ fn collect_required_session_variables(
                         )?;
                     }
                 }
-                CommandStepOperation::SelectOne { .. } | CommandStepOperation::Assert { .. } => {}
+                CommandStepOperation::SelectOne { .. }
+                | CommandStepOperation::SelectMany { .. }
+                | CommandStepOperation::Aggregate { .. }
+                | CommandStepOperation::Assert { .. } => {}
             }
         }
 
@@ -1111,7 +1135,8 @@ fn collect_required_session_variables(
                     CommandValue::Argument { .. }
                     | CommandValue::Item { .. }
                     | CommandValue::Step { .. }
-                    | CommandValue::Literal { .. } => {}
+                    | CommandValue::Literal { .. }
+                    | CommandValue::CurrentColumn { .. } => {}
                 }
             }
         }
@@ -1463,6 +1488,9 @@ fn referenced_rule_hashes(command: &Command, rules: &RuleCatalog) -> BTreeMap<St
             CommandStepOperation::SelectOne { select_one } => {
                 pending.extend(select_one.by.values());
             }
+            CommandStepOperation::SelectMany { select_many } => {
+                pending.extend(select_many.by.values());
+            }
             CommandStepOperation::Insert { insert } => pending.extend(insert.object.values()),
             CommandStepOperation::InsertMany { insert_many } => {
                 pending.push(&insert_many.for_each);
@@ -1472,7 +1500,17 @@ fn referenced_rule_hashes(command: &Command, rules: &RuleCatalog) -> BTreeMap<St
                 pending.extend(update.predicate.values());
                 pending.extend(update.set.values());
             }
+            CommandStepOperation::UpdateMany { update_many } => {
+                pending.push(&update_many.for_each);
+                pending.extend(update_many.by.values());
+                pending.extend(update_many.set.values());
+                if let Some(check) = &update_many.check {
+                    names.insert(check.rule.clone());
+                    pending.extend(check.bindings.values());
+                }
+            }
             CommandStepOperation::Delete { delete } => pending.extend(delete.predicate.values()),
+            CommandStepOperation::Aggregate { aggregate } => pending.push(&aggregate.from),
             CommandStepOperation::Assert { assert } => {
                 names.insert(assert.rule.clone());
                 pending.extend(assert.bindings.values());
@@ -2048,6 +2086,7 @@ fn validate_command(
             steps: &steps,
             declared_steps: &declared_steps,
             item: None,
+            current: None,
         };
         let output = validate_step(source, catalog, &roles, step, &context, &step_path)?;
         steps.insert(step.name.clone(), output);
@@ -2060,6 +2099,7 @@ fn validate_command(
         steps: &steps,
         declared_steps: &declared_steps,
         item: None,
+        current: None,
     };
     for (index, guard) in command.guards.iter().enumerate() {
         validate_guard_precondition_bindings(&guard.bindings, &format!("{path}.guards[{index}]"))?;
@@ -2098,6 +2138,7 @@ fn validate_step(
                 fields: BTreeMap::new(),
                 many: false,
                 may_be_absent: false,
+                kind: StepOutputKind::Scalar,
             })
         }
         CommandStepOperation::SelectOne { select_one } => {
@@ -2117,6 +2158,70 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !select_one.require_found,
+                kind: StepOutputKind::Scalar,
+            })
+        }
+        CommandStepOperation::SelectMany { select_many } => {
+            let (entry, info) = command_read_target(source, catalog, &select_many.table, path)?;
+            if select_many.by.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "select_many requires at least one equality binding",
+                ));
+            }
+            validate_object(&select_many.by, info, context, path)?;
+            if select_many.order_by.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "select_many requires a non-empty declared total order",
+                ));
+            }
+            let mut seen_order = HashSet::new();
+            for column in &select_many.order_by {
+                if !seen_order.insert(column) {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("duplicate order column '{column}' in select_many"),
+                    ));
+                }
+                if info.column(column).is_none() {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("unknown order column '{column}' on select_many target"),
+                    ));
+                }
+            }
+            let returning = returning_columns(&select_many.returning, info, path)?;
+            require_select_permissions(
+                &planner,
+                entry,
+                info,
+                roles,
+                select_many.by.keys().chain(select_many.order_by.iter()),
+                returning.keys(),
+                path,
+            )?;
+            Ok(StepOutput {
+                fields: returning,
+                many: true,
+                may_be_absent: false,
+                kind: StepOutputKind::SelectMany,
+            })
+        }
+        CommandStepOperation::Aggregate { aggregate } => {
+            let input = prior_select_many_output(&aggregate.from, context, "aggregate", path)?;
+            if aggregate.values.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "aggregate must declare at least one output value",
+                ));
+            }
+            let fields = validate_command_aggregates(&aggregate.values, &input.fields, path)?;
+            Ok(StepOutput {
+                fields,
+                many: false,
+                may_be_absent: false,
+                kind: StepOutputKind::Aggregate,
             })
         }
         CommandStepOperation::Insert { insert } => {
@@ -2165,6 +2270,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: false,
+                kind: StepOutputKind::Scalar,
             })
         }
         CommandStepOperation::InsertMany { insert_many } => {
@@ -2218,6 +2324,7 @@ fn validate_step(
                 fields: returning,
                 many: true,
                 may_be_absent: false,
+                kind: StepOutputKind::Scalar,
             })
         }
         CommandStepOperation::Update { update } => {
@@ -2265,6 +2372,145 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !update.require_affected,
+                kind: StepOutputKind::Scalar,
+            })
+        }
+        CommandStepOperation::UpdateMany { update_many } => {
+            let (entry, info) = command_read_target(source, catalog, &update_many.table, path)?;
+            if info.relation_kind != RelationKind::Table {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "update_many target '{}.{}' must be an ordinary table, not {:?}",
+                        info.schema, info.name, info.relation_kind
+                    ),
+                ));
+            }
+            if info.primary_key.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "update_many target '{}.{}' requires a primary key",
+                        info.schema, info.name
+                    ),
+                ));
+            }
+            let input =
+                prior_select_many_output(&update_many.for_each, context, "update_many", path)?;
+            let supplied = update_many.by.keys().collect::<BTreeSet<_>>();
+            let required = info.primary_key.iter().collect::<BTreeSet<_>>();
+            if supplied != required {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "update_many requires every primary-key column ({})",
+                        info.primary_key.join(", ")
+                    ),
+                ));
+            }
+            let mut input_keys = HashSet::new();
+            for (target, value) in &update_many.by {
+                let CommandValue::Item { item } = value else {
+                    return Err(PlanError::validation(
+                        path,
+                        "update_many primary-key assignments must use current input item fields",
+                    ));
+                };
+                if !input_keys.insert(item) {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("duplicate input key '{item}' in update_many primary-key mapping"),
+                    ));
+                }
+                let actual = input.fields.get(item).ok_or_else(|| {
+                    PlanError::validation(
+                        path,
+                        format!("update_many input does not expose item field '{item}'"),
+                    )
+                })?;
+                let target = info
+                    .column(target)
+                    .expect("complete primary-key names came from the catalog");
+                let expected = column_type(target);
+                if !assignable(actual, &expected) {
+                    return Err(PlanError::validation(
+                        path,
+                        format!(
+                            "{} is not assignable to primary-key column '{}' ({})",
+                            actual.display_name(),
+                            target.name,
+                            expected.display_name()
+                        ),
+                    ));
+                }
+            }
+            if update_many.set.is_empty() {
+                return Err(PlanError::validation(
+                    path,
+                    "update_many set must contain at least one column assignment",
+                ));
+            }
+            let current_fields = info
+                .columns
+                .iter()
+                .map(|column| (column.name.clone(), column_type(column)))
+                .collect::<BTreeMap<_, _>>();
+            let update_context = ValueContext {
+                item: Some(&input.fields),
+                current: Some(&current_fields),
+                ..*context
+            };
+            validate_object(&update_many.set, info, &update_context, path)?;
+            if let Some(check) = &update_many.check {
+                validate_rule(
+                    &check.rule,
+                    &check.bindings,
+                    &update_context,
+                    path,
+                    Some(&StaticType::Scalar("Boolean".to_owned())),
+                )?;
+            }
+            let returning = returning_columns(&update_many.returning, info, path)?;
+            for role in roles {
+                let permission = planner
+                    .resolve_role_perm(&entry.update_permissions, role, |_| true)
+                    .ok_or_else(|| {
+                        PlanError::validation(
+                            path,
+                            format!(
+                                "role '{role}' lacks update permission on table '{}.{}'",
+                                info.schema, info.name
+                            ),
+                        )
+                    })?;
+                require_columns(
+                    &permission.columns,
+                    update_many.set.keys(),
+                    role,
+                    "update",
+                    info,
+                    path,
+                )?;
+            }
+            let mut read_columns = update_many.by.keys().cloned().collect::<BTreeSet<_>>();
+            collect_current_columns_from_values(update_many.set.values(), &mut read_columns);
+            if let Some(check) = &update_many.check {
+                collect_current_columns_from_values(check.bindings.values(), &mut read_columns);
+            }
+            require_select_permissions(
+                &planner,
+                entry,
+                info,
+                roles,
+                read_columns.iter(),
+                returning.keys(),
+                path,
+            )?;
+            Ok(StepOutput {
+                fields: returning,
+                many: true,
+                may_be_absent: false,
+                kind: StepOutputKind::UpdateMany,
             })
         }
         CommandStepOperation::Delete { delete } => {
@@ -2298,6 +2544,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !delete.require_affected,
+                kind: StepOutputKind::Scalar,
             })
         }
     }
@@ -2355,6 +2602,211 @@ fn command_target<'a>(
         ));
     }
     Ok((entry, info))
+}
+
+fn command_read_target<'a>(
+    source: &'a Source,
+    catalog: &'a Catalog,
+    table: &QualifiedTable,
+    path: &str,
+) -> Result<(&'a TableEntry, &'a TableInfo), PlanError> {
+    let entry = source
+        .tables
+        .iter()
+        .find(|entry| entry.table.schema() == table.schema() && entry.table.name() == table.name())
+        .ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!(
+                    "command target '{}.{}' is not tracked",
+                    table.schema(),
+                    table.name()
+                ),
+            )
+        })?;
+    let info = catalog.table(table.schema(), table.name()).ok_or_else(|| {
+        PlanError::validation(
+            path,
+            format!(
+                "command target '{}.{}' does not exist in the catalog",
+                table.schema(),
+                table.name()
+            ),
+        )
+    })?;
+    match info.relation_kind {
+        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView => {
+            Ok((entry, info))
+        }
+        kind => Err(PlanError::validation(
+            path,
+            format!(
+                "select_many target '{}.{}' must be a table or view, not {kind:?}",
+                table.schema(),
+                table.name()
+            ),
+        )),
+    }
+}
+
+fn prior_select_many_output<'a>(
+    value: &CommandValue,
+    context: &'a ValueContext<'_>,
+    operation: &str,
+    path: &str,
+) -> Result<&'a StepOutput, PlanError> {
+    let CommandValue::Step { step, column: None } = value else {
+        return Err(PlanError::validation(
+            path,
+            format!("{operation} input must be a prior select_many row set"),
+        ));
+    };
+    let output = context.steps.get(step).ok_or_else(|| {
+        let message = if context.declared_steps.contains(step) {
+            format!("step reference '{step}' must reference an earlier step")
+        } else {
+            format!("unknown step reference '{step}'")
+        };
+        PlanError::validation(path, message)
+    })?;
+    if output.kind != StepOutputKind::SelectMany {
+        return Err(PlanError::validation(
+            path,
+            format!("{operation} input must be a prior select_many row set"),
+        ));
+    }
+    Ok(output)
+}
+
+fn validate_command_aggregates(
+    values: &BTreeMap<String, CommandAggregate>,
+    input: &BTreeMap<String, StaticType>,
+    path: &str,
+) -> Result<BTreeMap<String, StaticType>, PlanError> {
+    let mut output = BTreeMap::new();
+    for (name, aggregate) in values {
+        if !is_graphql_name(name) {
+            return Err(PlanError::validation(
+                path,
+                format!("aggregate output name '{name}' must be a valid GraphQL name"),
+            ));
+        }
+        let type_ = match aggregate {
+            CommandAggregate::Count { .. } | CommandAggregate::CountDistinct { .. } => {
+                StaticType::Scalar("int8".to_owned())
+            }
+            CommandAggregate::Sum { sum } => {
+                let input_type = aggregate_input_type(&sum.column, input, path)?;
+                let scalar = input_type
+                    .scalar_name()
+                    .ok_or_else(|| PlanError::validation(path, "sum requires a numeric column"))?;
+                let output = match scalar {
+                    "Int" => "int8",
+                    "Float" => "float8",
+                    "int2" | "int4" | "serial" => "int8",
+                    "int8" | "bigint" | "bigserial" | "numeric" | "decimal" => "numeric",
+                    "float4" => "float4",
+                    "float8" => "float8",
+                    _ => {
+                        return Err(PlanError::validation(
+                            path,
+                            format!("sum requires a numeric column, got '{scalar}'"),
+                        ));
+                    }
+                };
+                StaticType::nullable(StaticType::Scalar(output.to_owned()))
+            }
+            CommandAggregate::Min { min } | CommandAggregate::Max { max: min } => {
+                let input_type = aggregate_input_type(&min.column, input, path)?;
+                let scalar = input_type.scalar_name().ok_or_else(|| {
+                    PlanError::validation(path, "min/max requires an orderable column")
+                })?;
+                if !aggregate_orderable_scalar(scalar) {
+                    let operation = if matches!(aggregate, CommandAggregate::Min { .. }) {
+                        "min"
+                    } else {
+                        "max"
+                    };
+                    return Err(PlanError::validation(
+                        path,
+                        format!("{operation} requires an orderable column, got '{scalar}'"),
+                    ));
+                }
+                StaticType::nullable(StaticType::Scalar(scalar.to_owned()))
+            }
+        };
+        if let CommandAggregate::CountDistinct { count_distinct } = aggregate {
+            let input_type = aggregate_input_type(&count_distinct.column, input, path)?;
+            let scalar = input_type.scalar_name().ok_or_else(|| {
+                PlanError::validation(path, "count_distinct requires a scalar column")
+            })?;
+            if matches!(scalar, "json" | "jsonb") {
+                return Err(PlanError::validation(
+                    path,
+                    "count_distinct requires a comparable scalar column",
+                ));
+            }
+        }
+        output.insert(name.clone(), type_);
+    }
+    Ok(output)
+}
+
+fn aggregate_input_type<'a>(
+    column: &str,
+    input: &'a BTreeMap<String, StaticType>,
+    path: &str,
+) -> Result<&'a StaticType, PlanError> {
+    input.get(column).ok_or_else(|| {
+        PlanError::validation(
+            path,
+            format!("aggregate input row set does not declare column '{column}'"),
+        )
+    })
+}
+
+fn aggregate_orderable_scalar(scalar: &str) -> bool {
+    matches!(
+        scalar,
+        "Int"
+            | "Float"
+            | "String"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "serial"
+            | "bigint"
+            | "bigserial"
+            | "float4"
+            | "float8"
+            | "numeric"
+            | "decimal"
+            | "text"
+            | "varchar"
+            | "bpchar"
+            | "name"
+            | "citext"
+            | "uuid"
+            | "date"
+            | "timestamp"
+            | "timestamptz"
+    )
+}
+
+fn collect_current_columns_from_values<'a>(
+    values: impl IntoIterator<Item = &'a CommandValue>,
+    columns: &mut BTreeSet<String>,
+) {
+    let mut pending = values.into_iter().collect::<Vec<_>>();
+    while let Some(value) = pending.pop() {
+        match value {
+            CommandValue::CurrentColumn { current_column } => {
+                columns.insert(current_column.clone());
+            }
+            CommandValue::Rule { bindings, .. } => pending.extend(bindings.values()),
+            _ => {}
+        }
+    }
 }
 
 fn validate_primary_key_predicate(
@@ -2590,6 +3042,22 @@ fn validate_result(
             return Err(PlanError::validation(
                 path,
                 "command result fields must have unique non-empty names",
+            ));
+        }
+        if let CommandValue::Step {
+            step,
+            column: Some(_),
+        } = &field.value
+            && context.steps.get(step).is_some_and(|output| {
+                matches!(
+                    output.kind,
+                    StepOutputKind::SelectMany | StepOutputKind::UpdateMany
+                )
+            })
+        {
+            return Err(PlanError::validation(
+                path,
+                "row-set result must reference the declared row object, not one scalar column",
             ));
         }
         match &field.value {
@@ -2864,7 +3332,8 @@ fn validate_guard_precondition_bindings(
             CommandValue::Argument { .. }
             | CommandValue::Item { .. }
             | CommandValue::Literal { .. }
-            | CommandValue::SessionVariable { .. } => {}
+            | CommandValue::SessionVariable { .. }
+            | CommandValue::CurrentColumn { .. } => {}
         }
     }
     Ok(())
@@ -2883,10 +3352,27 @@ fn value_type(
         }
         CommandValue::Item { item } => {
             let fields = context.item.ok_or_else(|| {
-                PlanError::validation(path, "item values are allowed only inside insert_many")
+                PlanError::validation(
+                    path,
+                    "item values are allowed only inside a relational item scope",
+                )
             })?;
             fields.get(item).cloned().ok_or_else(|| {
-                PlanError::validation(path, format!("unknown insert_many item field '{item}'"))
+                PlanError::validation(path, format!("unknown command item field '{item}'"))
+            })
+        }
+        CommandValue::CurrentColumn { current_column } => {
+            let fields = context.current.ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    "current_column values are allowed only inside update_many set or check",
+                )
+            })?;
+            fields.get(current_column).cloned().ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    format!("unknown update_many current column '{current_column}'"),
+                )
             })
         }
         CommandValue::Step { step, column } => {
@@ -2920,7 +3406,17 @@ fn value_type(
         }
         CommandValue::Literal { literal } => literal_type(literal, expected, path),
         CommandValue::Rule { rule, bindings } => {
-            validate_rule(rule, bindings, context, path, expected)
+            let actual = validate_rule(rule, bindings, context, path, None)?;
+            if let (Some(expected), StaticType::Nullable(actual_inner)) = (expected, &actual)
+                && !matches!(expected, StaticType::Nullable(_))
+                && assignable(actual_inner, expected)
+            {
+                return Err(PlanError::validation(
+                    path,
+                    format!("rule '{rule}' must return {}", expected.display_name()),
+                ));
+            }
+            Ok(actual)
         }
         CommandValue::SessionVariable { session_variable } => {
             if !matches!(use_, ValueUse::Effect) {

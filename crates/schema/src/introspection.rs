@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
-use donat_metadata::{Columns, Command, CommandStep, CommandStepOperation, CommandValue, Metadata};
+use donat_metadata::{
+    Columns, Command, CommandAggregate, CommandStep, CommandStepOperation, CommandValue, Metadata,
+};
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
 use crate::naming::{command_pascal_case, root_names, table_base_name};
@@ -248,27 +250,36 @@ fn command_type_scalars(
 fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTable> {
     match &step.operation {
         CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+        CommandStepOperation::SelectMany { select_many } => Some(&select_many.table),
         CommandStepOperation::Insert { insert } => Some(&insert.table),
         CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
         CommandStepOperation::Update { update } => Some(&update.table),
+        CommandStepOperation::UpdateMany { update_many } => Some(&update_many.table),
         CommandStepOperation::Delete { delete } => Some(&delete.table),
-        CommandStepOperation::Assert { .. } => None,
+        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => None,
     }
 }
 
 fn command_step_returning(step: &CommandStep) -> &[String] {
     match &step.operation {
         CommandStepOperation::SelectOne { select_one } => &select_one.returning,
+        CommandStepOperation::SelectMany { select_many } => &select_many.returning,
         CommandStepOperation::Insert { insert } => &insert.returning,
         CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
         CommandStepOperation::Update { update } => &update.returning,
+        CommandStepOperation::UpdateMany { update_many } => &update_many.returning,
         CommandStepOperation::Delete { delete } => &delete.returning,
-        CommandStepOperation::Assert { .. } => &[],
+        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => &[],
     }
 }
 
 fn command_step_is_many(step: &CommandStep) -> bool {
-    matches!(step.operation, CommandStepOperation::InsertMany { .. })
+    matches!(
+        step.operation,
+        CommandStepOperation::SelectMany { .. }
+            | CommandStepOperation::InsertMany { .. }
+            | CommandStepOperation::UpdateMany { .. }
+    )
 }
 
 fn command_step_may_be_absent(step: &CommandStep) -> bool {
@@ -277,6 +288,9 @@ fn command_step_may_be_absent(step: &CommandStep) -> bool {
         CommandStepOperation::Update { update } => !update.require_affected,
         CommandStepOperation::Delete { delete } => !delete.require_affected,
         CommandStepOperation::Assert { .. }
+        | CommandStepOperation::SelectMany { .. }
+        | CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::UpdateMany { .. }
         | CommandStepOperation::Insert { .. }
         | CommandStepOperation::InsertMany { .. } => false,
     }
@@ -291,6 +305,94 @@ fn command_scalar_type(literal: &Json) -> Json {
         Json::Null | Json::Array(_) | Json::Object(_) => "String",
     };
     named("SCALAR", scalar)
+}
+
+struct CommandOutputColumn {
+    name: String,
+    pg_type: String,
+    nullable: bool,
+}
+
+fn command_step_output_columns(
+    planner: &Planner,
+    command: &Command,
+    step: &CommandStep,
+) -> Vec<CommandOutputColumn> {
+    if let CommandStepOperation::Aggregate { aggregate } = &step.operation {
+        let CommandValue::Step {
+            step: input_step,
+            column: None,
+        } = &aggregate.from
+        else {
+            unreachable!("the static compiler accepts only aggregate row-set sources");
+        };
+        let input_step = command
+            .steps
+            .iter()
+            .find(|step| step.name == *input_step)
+            .expect("the static compiler retains the aggregate input step");
+        let table = command_step_table(input_step)
+            .expect("the static compiler accepts select_many aggregate inputs");
+        let info = planner
+            .catalog_table(table)
+            .expect("the static compiler retains the aggregate input catalog relation");
+        return aggregate
+            .values
+            .iter()
+            .map(|(name, aggregate)| {
+                let (pg_type, nullable) = match aggregate {
+                    CommandAggregate::Count { .. } | CommandAggregate::CountDistinct { .. } => {
+                        ("int8".to_owned(), false)
+                    }
+                    CommandAggregate::Sum { sum } => {
+                        let input = info
+                            .column(&sum.column)
+                            .expect("the static compiler retains aggregate input columns");
+                        let output = match input.pg_type.as_str() {
+                            "int2" | "int4" | "serial" => "int8",
+                            "int8" | "bigint" | "bigserial" => "numeric",
+                            "float4" => "float4",
+                            "float8" => "float8",
+                            "numeric" | "decimal" => "numeric",
+                            _ => {
+                                unreachable!("the static compiler accepts only numeric sum columns")
+                            }
+                        };
+                        (output.to_owned(), true)
+                    }
+                    CommandAggregate::Min { min } | CommandAggregate::Max { max: min } => {
+                        let input = info
+                            .column(&min.column)
+                            .expect("the static compiler retains aggregate input columns");
+                        (input.pg_type.clone(), true)
+                    }
+                };
+                CommandOutputColumn {
+                    name: name.clone(),
+                    pg_type,
+                    nullable,
+                }
+            })
+            .collect();
+    }
+
+    let table = command_step_table(step).expect("result steps cannot reference assert");
+    let info = planner
+        .catalog_table(table)
+        .expect("the static command compiler retains catalog-backed command steps");
+    command_step_returning(step)
+        .iter()
+        .map(|name| {
+            let column = info
+                .column(name)
+                .expect("the static command compiler retains returned columns");
+            CommandOutputColumn {
+                name: name.clone(),
+                pg_type: column.pg_type.clone(),
+                nullable: column.nullable,
+            }
+        })
+        .collect()
 }
 
 fn command_result_type(
@@ -316,13 +418,11 @@ fn command_result_type(
         .iter()
         .find(|candidate| candidate.name == *step)
         .expect("the static command compiler retains only declared steps");
-    let table = command_step_table(step).expect("result steps cannot reference assert");
-    let info = planner
-        .catalog_table(table)
-        .expect("the static command compiler retains catalog-backed command steps");
+    let output_columns = command_step_output_columns(planner, command, step);
     if let Some(column) = column {
-        let column = info
-            .column(column)
+        let column = output_columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
             .expect("the static command compiler retains returned columns");
         let scalar = scalar_name(&column.pg_type).to_string();
         scalars.insert(scalar.clone());
@@ -344,16 +444,13 @@ fn command_result_type(
         command_pascal_case(&step.name)
     );
     if generated.insert(row_name.clone()) {
-        let fields = command_step_returning(step)
+        let fields = output_columns
             .iter()
-            .map(|name| {
-                let column = info
-                    .column(name)
-                    .expect("the static command compiler retains returned columns");
+            .map(|column| {
                 let scalar = scalar_name(&column.pg_type).to_string();
                 scalars.insert(scalar.clone());
                 field(
-                    name,
+                    &column.name,
                     vec![],
                     if column.nullable {
                         named("SCALAR", &scalar)

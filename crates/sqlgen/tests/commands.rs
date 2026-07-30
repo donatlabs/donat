@@ -37,6 +37,16 @@ fn assignment(name: &str, pg_type: &str, data: serde_json::Value) -> CommandAssi
     }
 }
 
+fn item_assignment(target: &str, field: &str, pg_type: &str) -> CommandAssignment {
+    CommandAssignment {
+        column: column(target, pg_type),
+        value: CommandExecutionValue::Item {
+            field: field.to_owned(),
+            pg_type: pg_type.to_owned(),
+        },
+    }
+}
+
 fn root(command: CommandMutation) -> MutationRoot {
     MutationRoot::Command {
         alias: "submitted".to_owned(),
@@ -116,6 +126,22 @@ fn install_check_violation_helper(tx: &mut Transaction<'_>) {
         "#,
     )
     .expect("permission-check helper installs for direct SQLgen execution");
+}
+
+fn install_check_violation_helper_client(client: &mut Client) {
+    client
+        .batch_execute(
+            r#"
+            CREATE SCHEMA IF NOT EXISTS donat;
+            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
+            RETURNS json AS $$
+            BEGIN
+                RAISE EXCEPTION USING message = msg, errcode = '23514';
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        )
+        .expect("permission-check helper installs for direct SQLgen execution");
 }
 
 fn install_command_catalog_client(client: &mut Client) {
@@ -205,6 +231,212 @@ fn idempotent_insert_root_with_id(
             alias: "status".to_owned(),
             field: "status".to_owned(),
         }],
+    })
+}
+
+fn relational_batch_root(
+    command_name: &str,
+    pricing_table: &str,
+    stock_table: &str,
+    cart_id: i32,
+    order_by: &[&str],
+    idempotency: bool,
+) -> MutationRoot {
+    let selected_columns = vec![
+        column("line_id", "int4"),
+        column("variant_id", "int4"),
+        column("quantity", "int4"),
+        column("unit_price_minor", "int8"),
+        column("currency", "text"),
+    ];
+    let updated_columns = vec![column("variant_id", "int4"), column("reserved", "int4")];
+    root(CommandMutation {
+        identity: command_identity(command_name),
+        name: command_name.to_owned(),
+        steps: vec![
+            CommandExecutionStep::SelectMany {
+                name: "priced_lines".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table(pricing_table),
+                equality: vec![assignment("cart_id", "int4", json!(cart_id))],
+                order_by: order_by
+                    .iter()
+                    .map(|name| column(name, "int4"))
+                    .collect(),
+                returning: selected_columns.clone(),
+                require_non_empty: true,
+                filter: Some(BoolExp::Compare {
+                    column: "customer_id".to_owned(),
+                    pg_type: "int4".to_owned(),
+                    op: CompareOp::Eq(Scalar::Json(json!(7))),
+                }),
+                error_path: format!("$.selectionSet.{command_name}"),
+            },
+            CommandExecutionStep::Aggregate {
+                name: "totals".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                input_cte: "_cmd_step_0".to_owned(),
+                values: vec![
+                    CommandAggregateIr::Count {
+                        output: column("line_count", "int8"),
+                    },
+                    CommandAggregateIr::Sum {
+                        output: CommandColumn {
+                            nullable: true,
+                            ..column("subtotal_minor", "numeric")
+                        },
+                        input: column("unit_price_minor", "int8"),
+                    },
+                    CommandAggregateIr::Min {
+                        output: CommandColumn {
+                            nullable: true,
+                            ..column("first_price", "int8")
+                        },
+                        input: column("unit_price_minor", "int8"),
+                    },
+                    CommandAggregateIr::Max {
+                        output: CommandColumn {
+                            nullable: true,
+                            ..column("last_price", "int8")
+                        },
+                        input: column("unit_price_minor", "int8"),
+                    },
+                    CommandAggregateIr::CountDistinct {
+                        output: column("currency_count", "int8"),
+                        input: column("currency", "text"),
+                    },
+                ],
+                error_path: format!("$.selectionSet.{command_name}"),
+            },
+            CommandExecutionStep::UpdateMany {
+                name: "reserve_stock".to_owned(),
+                cte: "_cmd_step_2".to_owned(),
+                table: table(stock_table),
+                input_cte: "_cmd_step_0".to_owned(),
+                primary_key: vec![item_assignment("variant_id", "variant_id", "int4")],
+                assignments: vec![CommandAssignment {
+                    column: column("reserved", "int4"),
+                    value: CommandExecutionValue::Rule {
+                        sql: "\"_cmd_target\".\"reserved\" + \"_cmd_input\".\"quantity\""
+                            .to_owned(),
+                        pg_type: "int4".to_owned(),
+                    },
+                }],
+                check: Some(CommandRule {
+                    sql: "\"_cmd_target\".\"on_hand\" - \"_cmd_target\".\"reserved\" >= \"_cmd_input\".\"quantity\"".to_owned(),
+                    pg_type: "bool".to_owned(),
+                    error_path: format!("$.selectionSet.{command_name}"),
+                    message: "command update_many check rejected".to_owned(),
+                }),
+                returning: updated_columns.clone(),
+                require_each: true,
+                filter: Some(BoolExp::Compare {
+                    column: "tenant_id".to_owned(),
+                    pg_type: "int4".to_owned(),
+                    op: CompareOp::Eq(Scalar::Json(json!(7))),
+                }),
+                permission_check: Some(BoolExp::Compare {
+                    column: "reserved".to_owned(),
+                    pg_type: "int4".to_owned(),
+                    op: CompareOp::Gte(Scalar::Json(json!(0))),
+                }),
+                error_path: format!("$.selectionSet.{command_name}"),
+            },
+        ],
+        guards: vec![],
+        result: vec![
+            CommandResultField {
+                name: "priced_lines".to_owned(),
+                value: CommandResultValue::StepRow {
+                    cte: "_cmd_step_0".to_owned(),
+                    many: true,
+                    columns: selected_columns,
+                },
+            },
+            CommandResultField {
+                name: "totals".to_owned(),
+                value: CommandResultValue::StepRow {
+                    cte: "_cmd_step_1".to_owned(),
+                    many: false,
+                    columns: vec![
+                        column("line_count", "int8"),
+                        CommandColumn {
+                            nullable: true,
+                            ..column("subtotal_minor", "numeric")
+                        },
+                        CommandColumn {
+                            nullable: true,
+                            ..column("first_price", "int8")
+                        },
+                        CommandColumn {
+                            nullable: true,
+                            ..column("last_price", "int8")
+                        },
+                        column("currency_count", "int8"),
+                    ],
+                },
+            },
+            CommandResultField {
+                name: "reserved".to_owned(),
+                value: CommandResultValue::StepRow {
+                    cte: "_cmd_step_2".to_owned(),
+                    many: true,
+                    columns: updated_columns,
+                },
+            },
+        ],
+        idempotency: idempotency.then(|| CommandIdempotency {
+            key: Scalar::Json(json!(format!("request-{cart_id}"))),
+            scope: vec![Scalar::Json(json!("tenant-7"))],
+            input: Scalar::Json(json!({ "cart_id": cart_id })),
+            retention_seconds: Some(60),
+            error_path: format!("$.selectionSet.{command_name}"),
+        }),
+        effects: vec![],
+        selection: vec![
+            CommandResultSelection::List {
+                alias: "priced_lines".to_owned(),
+                field: "priced_lines".to_owned(),
+                selections: vec![
+                    CommandResultSelection::Scalar {
+                        alias: "variant_id".to_owned(),
+                        field: "variant_id".to_owned(),
+                    },
+                    CommandResultSelection::Scalar {
+                        alias: "quantity".to_owned(),
+                        field: "quantity".to_owned(),
+                    },
+                ],
+            },
+            CommandResultSelection::Object {
+                alias: "totals".to_owned(),
+                field: "totals".to_owned(),
+                selections: vec![
+                    CommandResultSelection::Scalar {
+                        alias: "line_count".to_owned(),
+                        field: "line_count".to_owned(),
+                    },
+                    CommandResultSelection::Scalar {
+                        alias: "subtotal_minor".to_owned(),
+                        field: "subtotal_minor".to_owned(),
+                    },
+                ],
+            },
+            CommandResultSelection::List {
+                alias: "reserved".to_owned(),
+                field: "reserved".to_owned(),
+                selections: vec![
+                    CommandResultSelection::Scalar {
+                        alias: "variant_id".to_owned(),
+                        field: "variant_id".to_owned(),
+                    },
+                    CommandResultSelection::Scalar {
+                        alias: "reserved".to_owned(),
+                        field: "reserved".to_owned(),
+                    },
+                ],
+            },
+        ],
     })
 }
 
@@ -1628,4 +1860,266 @@ fn command_renderer_snapshots_insert_many_and_assert() {
     assert!(sql.contains("\"_cmd_ordinal\""), "{sql}");
     assert!(sql.contains("line policy rejected"), "{sql}");
     insta::assert_snapshot!(sql);
+}
+
+#[test]
+fn relational_batch_renderer_snapshots_ordered_aggregate_guarded_update_and_replay() {
+    let sql = donat_sqlgen::mutation_to_sql(&relational_batch_root(
+        "reserve_cart",
+        "cart_pricing",
+        "inventory_stock",
+        42,
+        &["line_id"],
+        true,
+    ));
+
+    assert!(
+        sql.starts_with("WITH ") && !sql.contains(';'),
+        "a relational batch remains one top-level Postgres statement: {sql}"
+    );
+    assert!(
+        sql.contains("\"_cmd_step_0\" AS MATERIALIZED")
+            && sql.contains("row_number() OVER (ORDER BY")
+            && sql.contains("\"_cmd_ordinal\""),
+        "select_many must materialize and preserve its declared total order: {sql}"
+    );
+    for aggregate in ["count(*)", "sum(", "min(", "max(", "count(DISTINCT"] {
+        assert!(
+            sql.contains(aggregate),
+            "the closed aggregate renderer must include {aggregate}: {sql}"
+        );
+    }
+    assert!(
+        sql.contains("UPDATE \"public\".\"inventory_stock\" AS \"_cmd_target\"")
+            && sql.contains("FROM \"_cmd_step_0\" AS \"_cmd_input\"")
+            && sql.contains("\"_cmd_target\".\"reserved\" + \"_cmd_input\".\"quantity\""),
+        "update_many must use the fixed typed current/input aliases: {sql}"
+    );
+    assert!(
+        sql.contains("\"customer_id\"")
+            && sql.contains("\"tenant_id\"")
+            && sql.contains("donat.check_violation"),
+        "ordinary select/update permission predicates and checks remain explicit: {sql}"
+    );
+    assert!(
+        sql.contains("duplicate order keys")
+            && sql.contains("requires at least one row")
+            && sql.contains("duplicate input primary keys")
+            && sql.contains("did not affect every input row"),
+        "all relational cardinality gates must be present: {sql}"
+    );
+    assert!(
+        sql.contains("\"donat\".\"command_invocations\"")
+            && sql.contains("\"_cmd_store_replay\"")
+            && sql.contains("jsonb_agg"),
+        "idempotent replay stores and returns the canonical ordered row-set JSON: {sql}"
+    );
+    insta::assert_snapshot!(sql);
+}
+
+#[test]
+fn relational_batch_renderer_lowers_closed_step_rows_and_current_columns() {
+    let batch = relational_batch_root(
+        "capture_cart",
+        "cart_pricing",
+        "inventory_stock",
+        42,
+        &["line_id"],
+        false,
+    );
+    let MutationRoot::Command { mut command, .. } = batch else {
+        panic!("the relational helper builds a command mutation");
+    };
+    let CommandExecutionStep::UpdateMany { assignments, .. } = &mut command.steps[2] else {
+        panic!("the relational helper builds update_many as its third step");
+    };
+    assignments[0].value = CommandExecutionValue::CurrentColumn {
+        column: column("reserved", "int4"),
+    };
+    command.steps.push(CommandExecutionStep::Insert {
+        name: "audit".to_owned(),
+        cte: "_cmd_step_3".to_owned(),
+        table: table("reservation_audit"),
+        object: vec![CommandAssignment {
+            column: column("payload", "jsonb"),
+            value: CommandExecutionValue::StepRows {
+                cte: "_cmd_step_0".to_owned(),
+                columns: vec![column("variant_id", "int4"), column("quantity", "int4")],
+            },
+        }],
+        returning: vec![],
+        check: None,
+        error_path: "$.selectionSet.capture_cart".to_owned(),
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&root(command));
+
+    assert!(
+        sql.contains("SET \"reserved\" = \"_cmd_target\".\"reserved\""),
+        "current_column remains a fixed, quoted reference to the update target: {sql}"
+    );
+    assert!(
+        sql.contains("INSERT INTO \"public\".\"reservation_audit\"")
+            && sql.contains(
+                "json_build_object('variant_id', \"_cmd_step_0\".\"variant_id\", 'quantity', \"_cmd_step_0\".\"quantity\") ORDER BY \"_cmd_step_0\".\"_cmd_ordinal\""
+            ),
+        "StepRows is assembled as ordered JSON inside the same statement: {sql}"
+    );
+    assert!(
+        sql.contains("EXISTS (SELECT 1 FROM \"_cmd_affected_each_gate_2\") RETURNING *"),
+        "the later audit write retains the earlier relational materialized-gate dependency: {sql}"
+    );
+}
+
+#[test]
+fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinality_failures() {
+    let _catalog_lock = command_catalog_test_lock();
+    let suffix = std::process::id();
+    let pricing_table = format!("command_relational_pricing_{suffix}");
+    let stock_table = format!("command_relational_stock_{suffix}");
+    let command_name = format!("command_relational_runtime_{suffix}");
+    let mut client = postgres_client();
+    install_command_catalog_client(&mut client);
+    install_check_violation_helper_client(&mut client);
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"public\".\"{pricing_table}\" (\
+                cart_id int4 NOT NULL, \
+                line_id int4 NOT NULL, \
+                variant_id int4 NOT NULL, \
+                quantity int4 NOT NULL, \
+                unit_price_minor int8 NOT NULL, \
+                currency text NOT NULL, \
+                customer_id int4 NOT NULL\
+             ); \
+             CREATE TABLE \"public\".\"{stock_table}\" (\
+                variant_id int4 PRIMARY KEY, \
+                reserved int4 NOT NULL, \
+                on_hand int4 NOT NULL, \
+                tenant_id int4 NOT NULL\
+             ); \
+             INSERT INTO \"public\".\"{pricing_table}\" VALUES \
+                (1, 1, 2, 3, 100, 'USD', 7), \
+                (1, 2, 1, 2, 200, 'USD', 7), \
+                (2, 3, 1, 1, 100, 'USD', 7), \
+                (2, 4, 1, 1, 100, 'USD', 7), \
+                (3, 5, 2, 1, 100, 'USD', 7), \
+                (3, 6, 999, 1, 100, 'USD', 7), \
+                (5, 7, 1, 1, 100, 'USD', 7), \
+                (5, 7, 2, 1, 100, 'USD', 7); \
+             INSERT INTO \"public\".\"{stock_table}\" VALUES \
+                (1, 0, 10, 7), \
+                (2, 0, 10, 7)"
+        ))
+        .expect("create relational command execution fixture");
+
+    let idempotent = donat_sqlgen::mutation_to_sql(&relational_batch_root(
+        &command_name,
+        &pricing_table,
+        &stock_table,
+        1,
+        &["line_id"],
+        true,
+    ));
+    let first: Json = client
+        .query_one(&idempotent, &[])
+        .expect("the first relational batch executes")
+        .get(0);
+    assert_eq!(
+        first,
+        json!({
+            "priced_lines": [
+                { "variant_id": 2, "quantity": 3 },
+                { "variant_id": 1, "quantity": 2 }
+            ],
+            "totals": { "line_count": 2, "subtotal_minor": 300 },
+            "reserved": [
+                { "variant_id": 2, "reserved": 3 },
+                { "variant_id": 1, "reserved": 2 }
+            ]
+        }),
+        "all row-set results preserve the selected input order"
+    );
+
+    client
+        .execute(
+            &format!("UPDATE \"public\".\"{stock_table}\" SET reserved = 9"),
+            &[],
+        )
+        .expect("make a repeated domain write observable");
+    let replay: Json = client
+        .query_one(&idempotent, &[])
+        .expect("an exact retry replays the canonical relational result")
+        .get(0);
+    assert_eq!(
+        replay, first,
+        "replay returns the first canonical row sets and aggregate"
+    );
+    let replay_reserved: Vec<i32> = client
+        .query(
+            &format!("SELECT reserved FROM \"public\".\"{stock_table}\" ORDER BY variant_id"),
+            &[],
+        )
+        .expect("inspect stock after replay")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        replay_reserved,
+        vec![9, 9],
+        "replay does not execute update_many again"
+    );
+
+    client
+        .execute(
+            &format!("UPDATE \"public\".\"{stock_table}\" SET reserved = 0"),
+            &[],
+        )
+        .expect("reset stock for rejection cases");
+    for (cart_id, order_by, expected_message) in [
+        (2, &["line_id"][..], "duplicate input primary keys"),
+        (3, &["line_id"][..], "did not affect every input row"),
+        (4, &["line_id"][..], "requires at least one row"),
+        (5, &["line_id"][..], "duplicate order keys"),
+    ] {
+        let sql = donat_sqlgen::mutation_to_sql(&relational_batch_root(
+            &format!("{command_name}_{cart_id}"),
+            &pricing_table,
+            &stock_table,
+            cart_id,
+            order_by,
+            false,
+        ));
+        let error = client
+            .query_one(&sql, &[])
+            .expect_err("the relational cardinality gate must reject the statement");
+        let database_error = error
+            .as_db_error()
+            .expect("structured command rejection is a database error");
+        assert_eq!(database_error.code().code(), "P0D01");
+        assert!(
+            database_error.message().contains(expected_message),
+            "unexpected rejection for cart {cart_id}: {database_error:?}"
+        );
+        let reserved: Vec<i32> = client
+            .query(
+                &format!("SELECT reserved FROM \"public\".\"{stock_table}\" ORDER BY variant_id"),
+                &[],
+            )
+            .expect("the connection and fixture remain usable after statement rollback")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![0, 0],
+            "a rejected relational statement rolls back every partial update"
+        );
+    }
+
+    client
+        .batch_execute(&format!(
+            "DROP TABLE \"public\".\"{pricing_table}\", \"public\".\"{stock_table}\""
+        ))
+        .expect("remove relational command execution fixture");
 }
