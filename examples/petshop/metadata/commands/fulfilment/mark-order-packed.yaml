@@ -1,0 +1,30 @@
+name: mark_order_packed
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: allocation_id
+    type: uuid!
+  - name: packed_at
+    type: timestamptz!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: allocation
+    select_one:
+      table: { schema: public, name: inventory_allocation }
+      by: { allocation_id: { arg: allocation_id } }
+      returning: [allocation_id, order_id, stock_location_code, status, quantity]
+      require_found: true
+  - name: packed_allocation
+    update:
+      table: { schema: public, name: inventory_allocation }
+      where: { allocation_id: { arg: allocation_id }, status: { literal: allocated } }
+      set: { status: { literal: packed }, packed_at: { arg: packed_at } }
+      returning: [allocation_id, order_id, stock_location_code, quantity, status, packed_at]
+      require_affected: true
+result:
+  allocation: { step: packed_allocation }
+idempotency:
+  key: { argument: request_id }
+  scope: command

@@ -41,10 +41,58 @@ rules:
     parameters: { left: int!, right: int! }
     result: int!
     expression: "left + right"
+  - name: is_single_currency
+    parameters: { currency_count: int! }
+    result: bool!
+    expression: "currency_count == 1"
+  - name: subtract_int
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left - right"
+  - name: add_minor
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left + right"
+  - name: can_release_stock
+    parameters: { reserved: int!, releasing: int! }
+    result: bool!
+    expression: "reserved >= 0 && releasing > 0 && releasing <= reserved"
   - name: payment_was_authorized
     parameters: { outcome: PaymentOutcome! }
     result: bool!
     expression: "outcome == PaymentOutcome::authorized"
+  - name: normalize_payment_outcome_state
+    parameters: { outcome: PaymentOutcome! }
+    result: PaymentState!
+    expression: "outcome == PaymentOutcome::authorized ? PaymentState::authorized : outcome == PaymentOutcome::challenged ? PaymentState::pending : outcome == PaymentOutcome::captured ? PaymentState::captured : outcome == PaymentOutcome::voided ? PaymentState::voided : outcome == PaymentOutcome::refunded ? PaymentState::refunded : outcome == PaymentOutcome::chargeback ? PaymentState::chargeback : PaymentState::failed"
+  - name: can_authorize_payment_amount
+    parameters: { current_state: PaymentState!, payment_amount_minor: int!, requested_amount_minor: int! }
+    result: bool!
+    expression: "current_state == PaymentState::pending && payment_amount_minor > 0 && requested_amount_minor == payment_amount_minor"
+  - name: can_capture_payment_amount
+    parameters: { authorization_state: PaymentState!, authorized_minor: int!, captured_minor: int!, requested_amount_minor: int! }
+    result: bool!
+    expression: "authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && requested_amount_minor > 0 && captured_minor + requested_amount_minor <= authorized_minor"
+  - name: can_void_authorization
+    parameters: { payment_state: PaymentState!, authorization_state: PaymentState!, authorized_minor: int!, captured_minor: int! }
+    result: bool!
+    expression: "payment_state == PaymentState::authorized && authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && captured_minor < authorized_minor"
+  - name: can_refund_payment_amount
+    parameters: { payment_state: PaymentState!, captured_minor: int!, refunded_minor: int!, requested_amount_minor: int! }
+    result: bool!
+    expression: "(payment_state == PaymentState::captured || payment_state == PaymentState::refunded) && captured_minor > 0 && refunded_minor >= 0 && requested_amount_minor > 0 && refunded_minor + requested_amount_minor <= captured_minor"
+  - name: can_record_chargeback_amount
+    parameters: { payment_state: PaymentState!, captured_minor: int!, chargeback_minor: int!, requested_amount_minor: int! }
+    result: bool!
+    expression: "(payment_state == PaymentState::captured || payment_state == PaymentState::refunded || payment_state == PaymentState::chargeback) && captured_minor > 0 && chargeback_minor >= 0 && requested_amount_minor > 0 && chargeback_minor + requested_amount_minor <= captured_minor"
+  - name: can_reconcile_payment
+    parameters: { payment_state: PaymentState!, decision: ReconciliationDecision! }
+    result: bool!
+    expression: "(payment_state == PaymentState::pending || payment_state == PaymentState::authorized || payment_state == PaymentState::captured || payment_state == PaymentState::voided || payment_state == PaymentState::refunded || payment_state == PaymentState::failed || payment_state == PaymentState::chargeback) && (decision == ReconciliationDecision::matched || decision == ReconciliationDecision::manual_review || decision == ReconciliationDecision::resolved)"
+  - name: reconciliation_state_for_decision
+    parameters: { decision: ReconciliationDecision! }
+    result: ReconciliationState!
+    expression: "decision == ReconciliationDecision::matched ? ReconciliationState::matched : decision == ReconciliationDecision::manual_review ? ReconciliationState::review_required : ReconciliationState::resolved"
   - name: can_transition_checkout
     parameters: { current: CheckoutState!, next: CheckoutState! }
     result: bool!

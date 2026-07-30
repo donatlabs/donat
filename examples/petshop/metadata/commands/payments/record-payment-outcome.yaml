@@ -1,0 +1,59 @@
+name: record_payment_outcome
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: outcome
+    type: PaymentOutcome!
+  - name: provider_reference
+    type: string!
+  - name: payload
+    type: json!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, provider_reference]
+  - name: outcome_is_allowed
+    assert:
+      rule: can_transition_payment
+      with:
+        current: { step: payment, column: status }
+        next:
+          rule: normalize_payment_outcome_state
+          with:
+            outcome: { arg: outcome }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: payment_outcome }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, payment_id, event_type, provider_event_id]
+  - name: apply_outcome
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+      set:
+        status:
+          rule: normalize_payment_outcome_state
+          with:
+            outcome: { arg: outcome }
+        provider_reference: { arg: provider_reference }
+      returning: [id, status, provider_reference]
+result:
+  payment_id: { step: apply_outcome, column: id }
+  payment_status: { step: apply_outcome, column: status }
+  provider_event_id: { step: payment_event, column: provider_event_id }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

@@ -1,0 +1,172 @@
+name: partial_fulfilment
+source: default
+permissions:
+  - role: fulfilment
+input:
+  - { name: order_id, type: uuid! }
+  - { name: destination_region, type: string! }
+  - { name: allocation_request_id, type: uuid! }
+output:
+  - { name: status, type: String! }
+  - { name: order_id, type: uuid! }
+  - { name: allocations, type: "[AllocationGroup!]!" }
+  - { name: backorders, type: "[Backorder!]!" }
+  - { name: shipment_outcomes, type: "[ShipmentOutcome!]!" }
+  - { name: captures, type: "[PaymentCaptureOutcome!]!" }
+  - { name: unshipped_allocations, type: "[ItemFailure!]!" }
+idempotency:
+  key: { input: allocation_request_id }
+  scope:
+    - { input: order_id }
+start_at: allocate
+states:
+  - id: allocate
+    command:
+      name: allocate_inventory
+      run_as: fulfilment
+      arguments:
+        order_id: { input: order_id }
+        destination_region: { input: destination_region }
+        allocation_request_id: { input: allocation_request_id }
+      next: pack_allocations
+
+  - id: pack_allocations
+    for_each:
+      input: { state: allocate, field: allocations }
+      item_key: allocation_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: mark_order_packed
+        run_as: fulfilment
+        arguments:
+          allocation_id: { item: allocation_id }
+          packed_at: { workflow_time: now }
+          request_id: { activity_key: packed }
+      next: create_shipment_units
+
+  - id: create_shipment_units
+    for_each:
+      input: { state: pack_allocations, field: successful_items }
+      item_key: allocation_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: create_shipment
+        run_as: fulfilment
+        arguments:
+          allocation_id: { item: allocation_id }
+          shipment_key: { activity_key: shipment }
+          request_id: { activity_key: create_shipment }
+      next: request_labels
+
+  - id: request_labels
+    for_each:
+      input: { state: create_shipment_units, field: successful_items }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      request:
+        connector: mock_carrier
+        operation: create_label
+        input:
+          shipment_key: { item: shipment_key }
+          origin_location_code: { item: stock_location_code }
+          destination: { input: destination_region }
+          currency: { item: currency }
+          ordered_items: { item: items }
+        idempotency_key:
+          stable: { run: id, state: request_labels, item_key: shipment_key }
+        timeout: 10s
+        retry:
+          maximum_attempts: 4
+          backoff: 250ms
+          retry_on: [transport, timeout, http_429, http_5xx]
+      next: record_label_outcomes
+
+  - id: record_label_outcomes
+    for_each:
+      input: { state: request_labels, field: ordered_results }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_shipment_result
+        run_as: fulfilment
+        arguments:
+          shipment_id: { item: shipment_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: normalized_outcome }
+          carrier_shipment_reference: { item: carrier_shipment_reference }
+          tracking_number: { item: tracking_number }
+          failure_code: { item: failure_code }
+          failure_message: { item: safe_failure_message }
+      next: request_payment_captures
+
+  # A successful label is the sole eligibility gate. The provider capture is
+  # intentionally requested before its normalized response enters the local
+  # payment command, so no local capture exists without a provider attempt.
+  - id: request_payment_captures
+    for_each:
+      input: { state: record_label_outcomes, field: successful_items }
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      request:
+        connector: mock_payment
+        operation: capture
+        input:
+          payment_id: { state: allocate, field: payment_id }
+          amount_minor: { item: shipped_value_minor }
+          currency: { item: currency }
+        idempotency_key:
+          stable: { run: id, state: request_payment_captures, item_key: shipment_id }
+        timeout: 2s
+        retry:
+          maximum_attempts: 3
+          backoff: 100ms
+          retry_on: [transport, timeout, http_429, http_5xx]
+      next: record_payment_captures
+
+  - id: record_payment_captures
+    for_each:
+      input: { state: request_payment_captures, field: successful_items }
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      command:
+        name: capture_payment
+        run_as: payment_worker
+        arguments:
+          payment_id: { state: allocate, field: payment_id }
+          authorization_id: { state: allocate, field: authorization_id }
+          provider_capture_id: { item: provider_capture_id }
+          provider_event_id: { item: provider_event_id }
+          amount_minor: { item: shipped_value_minor }
+          payload: { item: normalized_payload }
+      next: partial_output
+
+  - id: partial_output
+    output:
+      values:
+        status: { literal: partial }
+        order_id: { input: order_id }
+        allocations: { state: allocate, field: allocations }
+        backorders: { state: allocate, field: backorders }
+        shipment_outcomes: { state: record_label_outcomes, field: ordered_results }
+        captures: { state: record_payment_captures, field: ordered_results }
+        unshipped_allocations:
+          - { state: pack_allocations, field: failed_items }
+          - { state: create_shipment_units, field: failed_items }
+          - { state: request_labels, field: failed_items }
+          - { state: record_label_outcomes, field: failed_items }
+          - { state: request_payment_captures, field: failed_items }
+          - { state: record_payment_captures, field: failed_items }
+        invariant:
+          { literal: unshipped lines remain allocated or packed and are never promoted to shipped }

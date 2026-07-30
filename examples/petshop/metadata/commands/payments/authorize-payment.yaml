@@ -1,0 +1,63 @@
+name: authorize_payment
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_authorization_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: amount_minor
+    type: bigint!
+  - name: payload
+    type: json!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, amount_minor, currency]
+  - name: authorization_is_allowed
+    assert:
+      rule: can_authorize_payment_amount
+      with:
+        current_state: { step: payment, column: status }
+        payment_amount_minor: { step: payment, column: amount_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: authorization }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: authorization
+    insert:
+      table: public.payment_authorization
+      object:
+        payment_id: { step: payment, column: id }
+        provider_authorization_id: { arg: provider_authorization_id }
+        authorized_minor: { arg: amount_minor }
+        captured_minor: { literal: 0 }
+        status: { literal: authorized }
+      returning: [id, payment_id, authorized_minor, captured_minor, status]
+  - name: mark_authorized
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+      set:
+        status: { literal: authorized }
+      returning: [id, status]
+result:
+  payment_id: { step: mark_authorized, column: id }
+  payment_status: { step: mark_authorized, column: status }
+  authorization_id: { step: authorization, column: id }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

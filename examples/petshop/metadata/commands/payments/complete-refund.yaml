@@ -1,0 +1,90 @@
+name: complete_refund
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: refund_id
+    type: bigint!
+  - name: provider_refund_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: amount_minor
+    type: bigint!
+  - name: payload
+    type: json!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, captured_minor, refunded_minor]
+  - name: payment_row
+    select_many:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      order_by: [id]
+      returning: [id]
+      require_non_empty: true
+  - name: refund
+    select_one:
+      table: public.refund
+      by:
+        id: { arg: refund_id }
+        payment_id: { step: payment, column: id }
+        status: { literal: approved }
+      returning: [id, payment_id, amount_minor, status]
+  - name: refund_is_bounded
+    assert:
+      rule: can_refund_payment_amount
+      with:
+        payment_state: { step: payment, column: status }
+        captured_minor: { step: payment, column: captured_minor }
+        refunded_minor: { step: payment, column: refunded_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: refund }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: complete_refund
+    update:
+      table: public.refund
+      where:
+        id: { step: refund, column: id }
+      set:
+        amount_minor: { arg: amount_minor }
+        provider_refund_id: { arg: provider_refund_id }
+        status: { literal: refunded }
+      returning: [id, payment_id, amount_minor, status]
+  - name: add_refunded_amount
+    update_many:
+      table: public.payment
+      for_each: { step: payment_row }
+      by:
+        id: { item: id }
+      set:
+        refunded_minor:
+          rule: add_minor
+          with:
+            left: { current_column: refunded_minor }
+            right: { arg: amount_minor }
+        status: { literal: refunded }
+      returning: [id, status, refunded_minor]
+      require_each: true
+result:
+  payment_id: { step: payment, column: id }
+  payment_update: { step: add_refunded_amount }
+  refund_id: { step: complete_refund, column: id }
+  amount_minor: { step: complete_refund, column: amount_minor }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

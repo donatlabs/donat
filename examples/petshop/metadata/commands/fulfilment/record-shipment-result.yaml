@@ -1,0 +1,64 @@
+name: record_shipment_result
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: shipment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: outcome
+    type: string!
+  - name: carrier_shipment_reference
+    type: string
+  - name: tracking_number
+    type: string
+  - name: failure_code
+    type: string
+  - name: failure_message
+    type: string
+steps:
+  - name: shipment
+    select_one:
+      table: { schema: public, name: shipment }
+      by: { id: { arg: shipment_id } }
+      returning: [id, allocation_id, order_id, shipment_key, status, shipped_value_minor, currency]
+      require_found: true
+  - name: result_event
+    insert:
+      table: { schema: public, name: shipment_result }
+      object:
+        shipment_id: { arg: shipment_id }
+        provider_event_id: { arg: provider_event_id }
+        outcome: { arg: outcome }
+        carrier_shipment_reference: { arg: carrier_shipment_reference }
+        tracking_number: { arg: tracking_number }
+        failure_code: { arg: failure_code }
+        failure_message: { arg: failure_message }
+      returning: [id, shipment_id, provider_event_id, outcome, failure_code]
+  # Only a normalized `label_created` outcome advances packed lines to shipped.
+  # Failure events remain recorded per item while their allocation stays packed.
+  - name: shipped
+    update_when:
+      when: { argument_equals: { argument: outcome, value: label_created } }
+      table: { schema: public, name: shipment }
+      where: { id: { arg: shipment_id }, status: { literal: packed } }
+      set:
+        status: { literal: shipped }
+        carrier_shipment_reference: { arg: carrier_shipment_reference }
+        tracking_number: { arg: tracking_number }
+      returning: [id, allocation_id, status, shipped_value_minor, currency]
+      require_affected: true
+result:
+  shipment: { step: shipment }
+  result: { step: result_event }
+  shipped: { step: shipped }
+  item_outcome:
+    shipment_id: { arg: shipment_id }
+    allocation_id: { step: shipment, column: allocation_id }
+    outcome: { arg: outcome }
+    shipped_value_minor: { step: shipment, column: shipped_value_minor }
+    currency: { step: shipment, column: currency }
+idempotency:
+  key: { argument: provider_event_id }
+  scope: command

@@ -1,0 +1,54 @@
+name: reconcile_payment
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: reconciliation_decision
+    type: ReconciliationDecision!
+  - name: payload
+    type: json!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, amount_minor, currency]
+  - name: decision_is_allowed
+    assert:
+      rule: can_reconcile_payment
+      with:
+        payment_state: { step: payment, column: status }
+        decision: { arg: reconciliation_decision }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: reconciliation }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: reconciliation
+    insert:
+      table: public.payment_reconciliation
+      object:
+        payment_id: { step: payment, column: id }
+        provider_event_id: { step: payment_event, column: provider_event_id }
+        decision: { arg: reconciliation_decision }
+        status:
+          rule: reconciliation_state_for_decision
+          with:
+            decision: { arg: reconciliation_decision }
+      returning: [id, payment_id, decision, status]
+result:
+  payment_id: { step: payment, column: id }
+  reconciliation_id: { step: reconciliation, column: id }
+  reconciliation_status: { step: reconciliation, column: status }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

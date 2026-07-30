@@ -1,0 +1,159 @@
+name: mock_payment
+module: http
+config:
+  endpoint_identity: petshop_mock_payment_v1
+  credential_identity: petshop_mock_payment_fixture
+  base_url: { value_from_env: PETSHOP_PAYMENT_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: PETSHOP_PAYMENT_API_TOKEN
+operations:
+  - name: authorize
+    version: v1
+    method: POST
+    path: /v1/payment-authorizations
+    body:
+      order_id: { input: order_id }
+      payment_id: { input: payment_id }
+      amount_minor: { input: amount_minor }
+      currency: { input: currency }
+      request_id: { input: request_id }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_authorization_id: { json_pointer: /authorization_id, type: string! }
+      provider_reference: { json_pointer: /provider_reference, type: string! }
+      status: { json_pointer: /status, type: PaymentOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 2s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 20, per: 1s, burst: 8 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [payment_method_token]
+      response_body: [provider_reference, raw_payload]
+
+  - name: capture
+    version: v1
+    method: POST
+    path: /v1/payment-authorizations/{input.payment_id}/captures
+    body:
+      payment_id: { input: payment_id }
+      amount_minor: { input: amount_minor }
+      currency: { input: currency }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_capture_id: { json_pointer: /capture_id, type: string! }
+      provider_reference: { json_pointer: /provider_reference, type: string! }
+      status: { json_pointer: /status, type: PaymentOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 2s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 20, per: 1s, burst: 8 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      response_body: [provider_reference, raw_payload]
+
+  - name: void
+    version: v1
+    method: POST
+    path: /v1/payment-authorizations/{input.payment_id}/voids
+    body:
+      payment_id: { input: payment_id }
+      reason: { input: reason }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_void_id: { json_pointer: /void_id, type: string! }
+      provider_reference: { json_pointer: /provider_reference, type: string! }
+      status: { json_pointer: /status, type: PaymentOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 2s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 20, per: 1s, burst: 8 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      response_body: [provider_reference, raw_payload]
+
+  - name: refund
+    version: v1
+    method: POST
+    path: /v1/payment-authorizations/{input.payment_id}/refunds
+    body:
+      payment_id: { input: payment_id }
+      refund_id: { input: refund_id }
+      amount_minor: { input: amount_minor }
+      currency: { input: currency }
+      reason: { input: reason }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_refund_id: { json_pointer: /refund_id, type: string! }
+      provider_reference: { json_pointer: /provider_reference, type: string! }
+      status: { json_pointer: /status, type: PaymentOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 2s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 20, per: 1s, burst: 8 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      response_body: [provider_reference, raw_payload]
+
+  - name: reconcile
+    version: v1
+    method: POST
+    path: /v1/payment-reconciliations
+    body:
+      payment_id: { input: payment_id }
+      provider_event_id: { input: provider_event_id }
+      provider_reference: { input: provider_reference }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_reconciliation_id: { json_pointer: /reconciliation_id, type: string! }
+      provider_reference: { json_pointer: /provider_reference, type: string! }
+      status: { json_pointer: /status, type: PaymentOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 4
+      rate_limit: { permits: 10, per: 1s, burst: 4 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [provider_reference]
+      response_body: [provider_reference, raw_payload]

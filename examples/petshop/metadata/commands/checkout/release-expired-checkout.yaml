@@ -1,0 +1,99 @@
+name: release_expired_checkout
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: deadline_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        order_status: { literal: checkout_started }
+      returning: [id, order_status]
+  - name: expiry_is_allowed
+    assert:
+      rule: can_transition_checkout
+      with:
+        current: { step: order, column: order_status }
+        next: { literal: expired }
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        order_id: { step: order, column: id }
+        status: { literal: pending }
+      returning: [id, status]
+  - name: payment_can_fail
+    assert:
+      rule: can_transition_payment
+      with:
+        current: { step: payment, column: status }
+        next: { literal: failed }
+  - name: remaining_reservations
+    select_many:
+      table: public.inventory_reservation
+      by:
+        order_id: { step: order, column: id }
+        status: { literal: reserved }
+      order_by: [id]
+      returning: [id, variant_id, quantity]
+  - name: release_stock
+    update_many:
+      table: public.inventory_stock
+      for_each: { step: remaining_reservations }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: subtract_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_release_stock
+        with:
+          reserved: { current_column: reserved }
+          releasing: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+  - name: release_reservations
+    update_many:
+      table: public.inventory_reservation
+      for_each: { step: remaining_reservations }
+      by:
+        id: { item: id }
+      set:
+        status: { literal: released }
+      returning: [id, status]
+      require_each: true
+  - name: fail_payment
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+      set:
+        status: { literal: failed }
+      returning: [id, status]
+  - name: expire_order
+    update:
+      table: public.orders
+      where:
+        id: { step: order, column: id }
+      set:
+        order_status: { literal: expired }
+      returning: [id, order_status]
+result:
+  order_id: { step: expire_order, column: id }
+  order_status: { step: expire_order, column: order_status }
+  payment_id: { step: fail_payment, column: id }
+  released_reservations: { step: release_reservations }
+idempotency:
+  key: { argument: deadline_id }
+  scope:
+    - { argument: order_id }
+  retention: 30d

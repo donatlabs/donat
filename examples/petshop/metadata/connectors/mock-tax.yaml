@@ -1,0 +1,36 @@
+name: mock_tax
+module: http
+config:
+  endpoint_identity: petshop_mock_tax_v1
+  credential_identity: petshop_mock_tax_fixture
+  base_url: { value_from_env: PETSHOP_TAX_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: PETSHOP_TAX_API_TOKEN
+operations:
+  - name: quote_order
+    version: v1
+    method: POST
+    path: /v1/tax-quotes
+    body:
+      destination: { input: destination }
+      currency: { input: currency }
+      taxable_lines:
+        input: taxable_lines
+        ordered: true
+    success_statuses: [200]
+    response:
+      tax_minor: { json_pointer: /tax_minor, type: bigint! }
+      tax_code: { json_pointer: /tax_code, type: string! }
+    effect: read_only
+    provider_idempotent: true
+    timeout: 2s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 40, per: 1s, burst: 16 }
+    redaction:
+      request_headers: [Authorization]

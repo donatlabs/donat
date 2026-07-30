@@ -1,0 +1,119 @@
+name: begin_checkout
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: cart_id
+    type: bigint!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: cart
+    select_one:
+      table: public.cart
+      by:
+        id: { arg: cart_id }
+        customer_id: { session_variable: x-donat-user-id }
+        status: { literal: cart_open }
+      returning: [id, customer_id, status]
+  - name: priced_lines
+    select_many:
+      table: public.cart_pricing
+      by:
+        cart_id: { step: cart, column: id }
+        customer_id: { session_variable: x-donat-user-id }
+      order_by: [variant_id]
+      returning: [variant_id, sku, title, quantity, unit_price_minor, currency, line_total_minor]
+      require_non_empty: true
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        total_minor: { sum: { column: line_total_minor } }
+        currency: { min: { column: currency } }
+        currency_count: { count_distinct: { column: currency } }
+  - name: currency_is_uniform
+    assert:
+      rule: is_single_currency
+      with:
+        currency_count: { step: totals, column: currency_count }
+  - name: reserve_stock
+    update_many:
+      table: public.inventory_stock
+      for_each: { step: priced_lines }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: add_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_reserve_stock
+        with:
+          on_hand: { current_column: on_hand }
+          reserved: { current_column: reserved }
+          requested: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+  - name: order
+    insert:
+      table: public.orders
+      object:
+        customer_id: { session_variable: x-donat-user-id }
+        order_status: { literal: checkout_started }
+        total_minor: { step: totals, column: total_minor }
+        currency: { step: totals, column: currency }
+      returning: [id, customer_id, order_status, total_minor, currency]
+  - name: order_lines
+    insert_many:
+      table: public.order_line
+      for_each: { step: priced_lines }
+      object:
+        order_id: { step: order, column: id }
+        variant_id: { item: variant_id }
+        quantity: { item: quantity }
+        unit_price_minor: { item: unit_price_minor }
+        currency: { item: currency }
+        line_total_minor: { item: line_total_minor }
+      returning: [id, variant_id, quantity, unit_price_minor, currency, line_total_minor]
+  - name: reservations
+    insert_many:
+      table: public.inventory_reservation
+      for_each: { step: priced_lines }
+      object:
+        order_id: { step: order, column: id }
+        variant_id: { item: variant_id }
+        quantity: { item: quantity }
+        status: { literal: reserved }
+      returning: [id, order_id, variant_id, quantity, status]
+  - name: payment
+    insert:
+      table: public.payment
+      object:
+        order_id: { step: order, column: id }
+        status: { literal: pending }
+        amount_minor: { step: totals, column: total_minor }
+        currency: { step: totals, column: currency }
+      returning: [id, order_id, status, amount_minor, currency]
+  - name: close_cart
+    update:
+      table: public.cart
+      where:
+        id: { step: cart, column: id }
+        customer_id: { session_variable: x-donat-user-id }
+      set:
+        status: { literal: checkout_started }
+      returning: [id, status]
+result:
+  order_id: { step: order, column: id }
+  payment_id: { step: payment, column: id }
+  total_minor: { step: totals, column: total_minor }
+  currency: { step: totals, column: currency }
+  allocation_candidates: { step: priced_lines }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 30d

@@ -1,0 +1,97 @@
+name: capture_payment
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: authorization_id
+    type: uuid!
+  - name: provider_capture_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: amount_minor
+    type: bigint!
+  - name: payload
+    type: json!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, currency]
+  - name: authorization
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { step: payment, column: id }
+      returning: [id, payment_id, authorized_minor, captured_minor, status]
+  - name: authorization_row
+    select_many:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { step: payment, column: id }
+      order_by: [id]
+      returning: [id]
+      require_non_empty: true
+  - name: capture_is_bounded
+    assert:
+      rule: can_capture_payment_amount
+      with:
+        authorization_state: { step: authorization, column: status }
+        authorized_minor: { step: authorization, column: authorized_minor }
+        captured_minor: { step: authorization, column: captured_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: capture }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: capture
+    insert:
+      table: public.payment_capture
+      object:
+        payment_id: { step: payment, column: id }
+        authorization_id: { step: authorization, column: id }
+        provider_capture_id: { arg: provider_capture_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: captured }
+      returning: [id, payment_id, authorization_id, amount_minor, status]
+  - name: add_captured_amount
+    update_many:
+      table: public.payment_authorization
+      for_each: { step: authorization_row }
+      by:
+        id: { item: id }
+      set:
+        captured_minor:
+          rule: add_minor
+          with:
+            left: { current_column: captured_minor }
+            right: { arg: amount_minor }
+      returning: [id, captured_minor]
+      require_each: true
+  - name: mark_captured
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+      set:
+        status: { literal: captured }
+      returning: [id, status]
+result:
+  payment_id: { step: mark_captured, column: id }
+  payment_status: { step: mark_captured, column: status }
+  capture_id: { step: capture, column: id }
+  amount_minor: { step: capture, column: amount_minor }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

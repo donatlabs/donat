@@ -1,0 +1,96 @@
+name: mock_carrier
+module: http
+config:
+  endpoint_identity: mock_carrier_v1
+  credential_identity: mock_carrier_bearer
+  base_url: { value_from_env: DONAT_MOCK_CARRIER_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: DONAT_MOCK_CARRIER_TOKEN
+operations:
+  - name: quote
+    version: v1
+    method: POST
+    path: /v1/quotes
+    timeout: 5s
+    body:
+      shipment_key: { input: shipment_key }
+      origin_location_code: { input: origin_location_code }
+      destination: { input: destination }
+      currency: { input: currency }
+      ordered_items: { input: ordered_items }
+    success_statuses: [200]
+    response:
+      quote_id: { json_pointer: /quote_id, type: string! }
+      service_code: { json_pointer: /service_code, type: string! }
+      amount_minor: { json_pointer: /amount_minor, type: int! }
+      currency: { json_pointer: /currency, type: string! }
+    idempotency: { header: Idempotency-Key }
+    retry:
+      maximum_attempts: 3
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [destination.phone, destination.email]
+      response_body: [quote_id]
+  - name: create_label
+    version: v1
+    method: POST
+    path: /v1/shipments/{input.shipment_key}/labels
+    timeout: 10s
+    body:
+      shipment_key: { input: shipment_key }
+      origin_location_code: { input: origin_location_code }
+      destination: { input: destination }
+      currency: { input: currency }
+      ordered_items: { input: ordered_items }
+    success_statuses: [200, 201]
+    response:
+      carrier_shipment_reference: { json_pointer: /shipment_id, type: string! }
+      tracking_number: { json_pointer: /tracking_number, type: string! }
+      label_url: { json_pointer: /label_url, type: string! }
+      provider_event_id: { json_pointer: /event_id, type: string! }
+      normalized_outcome: { json_pointer: /outcome, type: string! }
+    idempotency: { header: Idempotency-Key }
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [destination.phone, destination.email]
+      response_body: [label_url, carrier_shipment_reference]
+  - name: track
+    version: v1
+    method: GET
+    path: /v1/shipments/{input.shipment_key}/tracking
+    timeout: 5s
+    query:
+      carrier_shipment_reference: { input: carrier_shipment_reference }
+    success_statuses: [200]
+    response:
+      provider_event_id: { json_pointer: /event_id, type: string! }
+      outcome: { json_pointer: /outcome, type: string! }
+      delivered_at: { json_pointer: /delivered_at, type: timestamptz }
+    idempotency: { header: Idempotency-Key }
+    retry:
+      maximum_attempts: 3
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [carrier_shipment_reference]
+      response_body: [provider_event_id]
