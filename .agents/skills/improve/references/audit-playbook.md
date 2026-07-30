@@ -117,7 +117,7 @@ Every finding, from every category and every subagent, comes back in this shape:
 - **Effort**: S (hours) / M (a day-ish) / L (multi-day) — for the *fix*, including tests.
 - **Risk**: What the fix could break; LOW/MED/HIGH plus one line why.
 - **Confidence**: HIGH (read the code, certain) / MED (strong signal, needs verification) / LOW (smell, needs investigation). LOW-confidence findings may be reported but get an "investigate" plan, not a "fix" plan.
-- **Fix sketch**: 1–3 sentences. Not the plan — just enough to judge effort honestly.
+- **Fix sketch**: 1–3 sentences. Not the plan — just enough to assess effort honestly.
 ```
 
 ## Prioritization rubric

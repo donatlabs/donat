@@ -46,8 +46,8 @@ Petshop Rust handlers.
   generic HTTP connector at RequestBin, webhook.site, or an equivalent mock.
 - The mock callback secret is fixture-only and never establishes a
   provider-independent production signature standard.
-- Do not dispatch the Judge after each commit; the user explicitly replaced
-  that gate with a later whole-range code review.
+- The user requested a later whole-range code review rather than a per-commit
+  gate.
 
 ## File Map
 

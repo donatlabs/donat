@@ -13,8 +13,7 @@ it does not add a second workflow grammar or application-specific Rust.
 **TDD rule:** Every task starts with one focused failing test, records the
 expected failure, adds the smallest generic implementation, then runs the
 focused and enclosing suites. The engine binary is rebuilt before native
-conformance. Do not invoke Judge after commits; perform one whole-range review
-after the implementation is green.
+conformance. Perform one whole-range review after the implementation is green.
 
 ## Fixed inventory
 

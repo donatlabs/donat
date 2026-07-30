@@ -50,8 +50,8 @@ conformance harness.
 - There is no admin role, permission bypass, runtime metadata mutation,
   public connector execution route, logical/workflow node, UI, Node.js,
   JavaScript, WASM, dynamic plugin, or donor runtime.
-- Use ordinary independent spec/code reviewers. Do not invoke the Judge
-  agent; the user explicitly removed that per-commit workflow.
+- Use ordinary independent spec/code reviewers; the user explicitly removed
+  the per-commit workflow.
 - Invoke Cargo as `/home/dev/.cargo/bin/cargo` and use a RAM-backed target:
 
 ```bash
@@ -385,7 +385,7 @@ git commit -m "fix(connectors): make boundary tokens Unicode-version independent
 ```
 
 The controller dispatches an ordinary spec/code reviewer for this commit
-before Task 2. No Judge agent is used.
+before Task 2.
 
 ---
 
@@ -698,7 +698,7 @@ git commit -m "fix(connectors): parse grouped boundary use trees"
 ```
 
 The controller dispatches an ordinary spec/code reviewer for the complete
-Task 2 diff before verification. No Judge agent is used.
+Task 2 diff before verification.
 
 ---
 

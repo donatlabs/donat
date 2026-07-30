@@ -1,7 +1,7 @@
 # Conformance Backend Matrix Implementation Plan
 
 > Execute conformance-first. Rebuild `donat` before every conformance run and
-> dispatch the judge after every commit.
+> record focused verification after every commit.
 
 **Goal:** Make every registered datasource backend run the same applicable
 main conformance cases, with Postgres as the local default and an isolated,
@@ -79,4 +79,4 @@ parallel, mandatory CI job per backend.
 - Run complete Postgres conformance after rebuilding the engine.
 - Run every applicable conformance group on SQLite, MySQL, and ClickHouse.
 - Confirm reports contain no unclassified or unexplained skipped cases.
-- Review snapshots, workflow, and all diffs; dispatch final judge review.
+- Review snapshots, workflow, and all diffs; complete a final independent review.

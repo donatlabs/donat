@@ -46,8 +46,8 @@ HTTP Connectors.
 - Provider mutation operations declare timeout, retry classification,
   idempotency, capacity, and redaction.
 - Repository content is English.
-- Do not dispatch Judge or per-commit reviewers; the user requested one later
-  whole-range review.
+- The user requested one later whole-range review rather than per-commit
+  reviewers.
 
 ## File Map
 

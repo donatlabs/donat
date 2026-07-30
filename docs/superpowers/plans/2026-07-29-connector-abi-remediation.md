@@ -547,7 +547,7 @@ git commit -m "docs(connectors): align safe ABI ownership"
 
 After the commit, the SDD controller generates a Task 1 review package from
 the committed diff and dispatches an ordinary independent task reviewer. It
-does not dispatch Judge. A rejection returns the findings to the Task 1
+does not dispatch a special review agent. A rejection returns the findings to the Task 1
 implementer; after corrections, the controller regenerates the package and
 dispatches a fresh ordinary task review. Do not begin Task 2 until the
 post-commit Task 1 review records acceptance and the worktree is clean.
@@ -1641,7 +1641,7 @@ Check every approved-design section against the diff:
   changed.
 
 This is the implementer's self-review only. Do not dispatch an independent
-reviewer or Judge before the commit. A material self-review finding first
+reviewer before the commit. A material self-review finding first
 gains a focused regression test, then repeats Steps 14 through 16.
 
 - [ ] **Step 18: Stage exact paths and commit the remediation**
@@ -1690,7 +1690,7 @@ paths above.
 
 After the commit, the SDD controller generates a Task 2 review package from
 the committed diff and dispatches an ordinary independent task reviewer. It
-does not dispatch Judge. A rejection returns each material finding to the
+does not dispatch a special review agent. A rejection returns each material finding to the
 Task 2 implementer; the implementer adds a focused regression test, repeats
 Steps 14 through 16, commits the correction, and the controller generates a
 new package for a fresh ordinary task review. The community connector
@@ -1718,7 +1718,7 @@ acceptance.
   wrappers, and lint suppressions each have exact deterministic negative
   fixtures.
 - [ ] Task 1 and Task 2 each receive an ordinary independent post-commit SDD
-  review; no Judge or pre-commit independent reviewer is planned, and their
+  review; no pre-commit independent reviewer is planned, and their
   downstream task is gated on acceptance.
 - [ ] Every created/modified path exists now or is explicitly marked
   `Create`, and no task claims another task's provider/catalog/processor/

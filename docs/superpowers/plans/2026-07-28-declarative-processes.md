@@ -72,8 +72,8 @@ and the native conformance harness.
   inside the task that owns the implementation. Rebuild the server binary
   before each focused conformance GREEN run.
 - Review every insta diff; never accept snapshots blindly.
-- Do not invoke Judge. Request one independent review only after the complete
-  implementation range passes final verification.
+- Request one independent review only after the complete implementation range
+  passes final verification.
 
 **Specification:**
 [`specs/005-durable-processes.md`](../../../specs/005-durable-processes.md)
@@ -3232,7 +3232,7 @@ clean, serving SQL capture contains no DDL/DML, the route/schema inventory has
 no process-management surface, and the complete connector effect/horizon,
 two-binary takeover, retired-revision, and shared-database proofs passed.
 
-Request one independent review of the complete commit range. Do not invoke
-Judge. If review or acceptance finds a defect, return to the owning numbered
+Request one independent review of the complete commit range. If review or
+acceptance finds a defect, return to the owning numbered
 task, add a failing regression first, fix it in a new focused commit, rerun
 that task's GREEN commands, then repeat final acceptance.

@@ -22,7 +22,7 @@ files.
 
 Every step is conformance-first per CLAUDE.md: rebuild the engine binary
 (`cargo build -p donat-server --bin donat`) before running
-`cargo test -p donat-conformance`, and dispatch the judge after every commit.
+`cargo test -p donat-conformance`, and record focused verification after every commit.
 
 ---
 
@@ -69,7 +69,7 @@ Postgres output byte-for-byte, driven by the snapshot suite:
 ### Step 4 — full conformance gate
 - `cargo build -p donat-server --bin donat && cargo test -p donat-conformance`
   → exit 0, every suite green. This proves the refactor changed no behavior.
-- Commit. Dispatch judge.
+- Commit. Record focused verification.
 
 **STOP conditions (Phase 1b):** any snapshot changes that you cannot trace to
 a byte-difference bug in the dialect (do not accept it); any conformance
@@ -131,7 +131,7 @@ capability auto-skips counted.
 
 ### Step 5 — CI
 - Add a SQLite matrix leg (in-process, every push). Keep Postgres reference.
-- Commit. Dispatch judge.
+- Commit. Record focused verification.
 
 **STOP conditions (Phase 2):** a query shape that genuinely cannot be one
 SQLite statement (revisit R1 — emulate or mark a per-backend known-diff, do

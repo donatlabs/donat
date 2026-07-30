@@ -165,8 +165,8 @@ The top priority: one set of GraphQL cases runs against **every** backend.
 
 ## Phasing
 
-Each phase is its own spec → plan → TDD cycle (conformance-first, judge after
-every commit).
+Each phase is its own spec → plan → TDD cycle with conformance-first
+verification.
 
 - **Phase 0 (prereq):** the `dist → donat` rename lands. Code starts after
   (avoids conflicts on `server`/`sqlgen`/`catalog`). Design proceeds now.

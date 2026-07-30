@@ -37,8 +37,8 @@ conformance harness, `insta`.
 - Every engine behavior begins with a failing native conformance case and a
   focused crate-level test.
 - Snapshot changes are read before acceptance.
-- Do not dispatch the Judge after each commit; the user explicitly replaced
-  that gate with a later whole-range code review.
+- The user requested a later whole-range code review rather than a per-commit
+  gate.
 - Medusa, Saleor, and Spree are behavior inventories only in this plan; no
   upstream source or fixture bytes are copied.
 - After engine changes, rebuild

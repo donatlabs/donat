@@ -91,6 +91,6 @@ scalar, but it makes command metadata deterministic and preserves the existing
 public GraphQL and Rules contracts.
 
 The current `feat(commands): validate static command catalog` commit remains
-unaccepted. Its former judge passes do not cover this decision. Recovery work
+unaccepted. Its former review passes do not cover this decision. Recovery work
 must amend or fix that command-validation range, add the catalog typmod slice,
 and pass fresh review of the complete corrected range.

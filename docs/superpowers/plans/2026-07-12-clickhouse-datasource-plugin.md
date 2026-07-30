@@ -17,7 +17,7 @@
 - User values enter SQL only through dialect quoting helpers.
 - No admin role or permission bypass is introduced.
 - Rebuild `donat-server` before running conformance tests.
-- After every commit, run the repository judge gate and continue only after ACCEPT.
+- After every commit, record focused verification before continuing.
 
 ---
 
@@ -53,9 +53,9 @@ Run: `cargo test -p donat-backend clickhouse && cargo test -p donat-backend`
 
 Expected: all backend tests pass.
 
-- [ ] **Step 5: Commit and judge**
+- [ ] **Step 5: Commit and verify**
 
-Commit only Task 1 files, then dispatch the mandatory judge review and continue only after ACCEPT.
+Commit only Task 1 files, then record verification before continuing.
 
 ---
 
@@ -89,9 +89,9 @@ Run: `cargo test -p donat-catalog clickhouse && cargo test -p donat-catalog`
 
 Expected: all catalog tests pass.
 
-- [ ] **Step 5: Commit and judge**
+- [ ] **Step 5: Commit and verify**
 
-Commit only Task 2 files, then dispatch the mandatory judge review and continue only after ACCEPT.
+Commit only Task 2 files, then record verification before continuing.
 
 ---
 
@@ -126,9 +126,9 @@ Run: `cargo test -p donat-server --test clickhouse_runtime && cargo test -p dona
 
 Expected: ClickHouse and existing datasource runtime tests pass.
 
-- [ ] **Step 5: Commit and judge**
+- [ ] **Step 5: Commit and verify**
 
-Commit only Task 3 files, then dispatch the mandatory judge review and continue only after ACCEPT.
+Commit only Task 3 files, then record verification before continuing.
 
 ---
 
@@ -165,9 +165,9 @@ Run: `cargo test -p donat-sqlgen`, `cargo build -p donat-server --bin donat`, `c
 
 Expected: all applicable suites pass; unavailable external ClickHouse is reported as an explicit test prerequisite, never a silent pass.
 
-- [ ] **Step 5: Commit and judge**
+- [ ] **Step 5: Commit and verify**
 
-Commit Task 4 files and fixes, then dispatch the mandatory judge review and continue only after ACCEPT.
+Commit Task 4 files and fixes, then record verification before continuing.
 
 ---
 
@@ -196,6 +196,6 @@ Run: `cargo fmt --check`, `cargo test -p donat-backend`, `cargo test -p donat-ca
 
 Expected: formatting and all applicable tests pass.
 
-- [ ] **Step 4: Commit and judge**
+- [ ] **Step 4: Commit and verify**
 
-Commit documentation, dispatch the mandatory judge review, and finish only after ACCEPT.
+Commit documentation, record verification, and finish.
