@@ -183,9 +183,42 @@ fn qualified_table_accepts_bare_name_and_qualified_form() {
     assert_eq!(bare.name(), "author");
     assert_eq!(bare.to_string(), "public.author");
 
+    let dotted: QualifiedTable = serde_yaml::from_str("app.author").unwrap();
+    assert_eq!(dotted, QualifiedTable::Name("app.author".into()));
+    assert_eq!(dotted.schema(), "app");
+    assert_eq!(dotted.name(), "author");
+    assert_eq!(dotted.to_string(), "app.author");
+    assert_eq!(
+        serde_json::to_value(&dotted).unwrap(),
+        json!("app.author"),
+        "the accepted scalar form remains scalar when metadata is serialized"
+    );
+
     let qual: QualifiedTable = serde_yaml::from_str("{ schema: app, name: author }").unwrap();
     assert_eq!(qual.schema(), "app");
     assert_eq!(qual.to_string(), "app.author");
+
+    let parts: QualifiedTable = serde_yaml::from_str("[app, author]").unwrap();
+    assert_eq!(
+        parts,
+        QualifiedTable::Parts(vec!["app".into(), "author".into()])
+    );
+    assert_eq!(parts.schema(), "app");
+    assert_eq!(parts.name(), "author");
+}
+
+#[test]
+fn qualified_table_rejects_malformed_dotted_scalar_names() {
+    for invalid in [".author", "app.", "app.public.author"] {
+        let error = serde_yaml::from_str::<QualifiedTable>(invalid)
+            .expect_err("a dotted relation must contain exactly schema and name");
+        assert!(
+            error.to_string().contains(&format!(
+                "invalid qualified table name '{invalid}': expected 'name' or 'schema.name'"
+            )),
+            "{invalid}: {error}"
+        );
+    }
 }
 
 #[test]

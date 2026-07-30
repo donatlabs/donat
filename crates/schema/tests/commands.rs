@@ -1509,6 +1509,16 @@ fn compiles_an_immutable_catalog_per_postgres_source() {
 }
 
 #[test]
+fn command_compiler_resolves_dotted_scalar_relation_references() {
+    let mut command = valid_command();
+    command["steps"][0]["insert"]["table"] = json!("public.orders");
+    let metadata = metadata(vec![command]);
+
+    compile(&metadata, RelationKind::Table)
+        .expect("a scalar schema.name command target matches the tracked qualified table");
+}
+
+#[test]
 fn missing_command_source_catalog_is_a_validation_error() {
     let metadata = metadata(vec![valid_command()]);
     let error = compile_command_catalog(&metadata, &HashMap::new(), &rules(), true)

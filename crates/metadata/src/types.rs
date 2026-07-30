@@ -2132,8 +2132,8 @@ pub enum DatabaseUrl {
     FromEnv { from_env: String },
 }
 
-/// `table: foo` or `table: { schema: public, name: foo }`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+/// `table: foo`, `table: public.foo`, or `table: { schema: public, name: foo }`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(untagged)]
 pub enum QualifiedTable {
     Name(String),
@@ -2141,10 +2141,43 @@ pub enum QualifiedTable {
     Parts(Vec<String>),
 }
 
+impl<'de> Deserialize<'de> for QualifiedTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawQualifiedTable {
+            Name(String),
+            Qualified { schema: String, name: String },
+            Parts(Vec<String>),
+        }
+
+        match RawQualifiedTable::deserialize(deserializer)? {
+            RawQualifiedTable::Name(name) => {
+                if let Some((schema, table)) = name.split_once('.')
+                    && (schema.is_empty() || table.is_empty() || table.contains('.'))
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "invalid qualified table name '{name}': expected 'name' or 'schema.name'"
+                    )));
+                }
+                Ok(Self::Name(name))
+            }
+            RawQualifiedTable::Qualified { schema, name } => Ok(Self::Qualified { schema, name }),
+            RawQualifiedTable::Parts(parts) => Ok(Self::Parts(parts)),
+        }
+    }
+}
+
 impl QualifiedTable {
     pub fn schema(&self) -> &str {
         match self {
-            QualifiedTable::Name(_) => "public",
+            QualifiedTable::Name(name) => name
+                .split_once('.')
+                .map(|(schema, _)| schema)
+                .unwrap_or("public"),
             QualifiedTable::Qualified { schema, .. } => schema,
             QualifiedTable::Parts(parts) => parts.first().map(String::as_str).unwrap_or("public"),
         }
@@ -2152,7 +2185,9 @@ impl QualifiedTable {
 
     pub fn name(&self) -> &str {
         match self {
-            QualifiedTable::Name(name) => name,
+            QualifiedTable::Name(name) => {
+                name.split_once('.').map(|(_, table)| table).unwrap_or(name)
+            }
             QualifiedTable::Qualified { name, .. } => name,
             QualifiedTable::Parts(parts) => parts.last().map(String::as_str).unwrap_or(""),
         }
