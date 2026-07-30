@@ -4596,6 +4596,7 @@ fn parse_type_with_named(
                 "Boolean" | "bool" => Some("Boolean"),
                 "String" | "string" | "ID" => Some("String"),
                 "Int" | "int" => Some("Int"),
+                "bigint" => Some("int8"),
                 "Float" | "float" | "decimal" => Some("Float"),
                 "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(source),
                 _ => None,

@@ -3755,6 +3755,7 @@ fn command_argument_pg_type<'a>(
         "Boolean" | "bool" => "bool",
         "String" | "string" | "ID" => "text",
         "Int" | "int" => "int4",
+        "bigint" => "int8",
         "Float" | "float" | "decimal" => "numeric",
         "uuid" => "uuid",
         "date" => "date",
@@ -4114,6 +4115,12 @@ fn coerce_command_argument_value(
                 || value
                     .as_u64()
                     .is_some_and(|number| number <= i32::MAX as u64),
+        ),
+        "bigint" => Some(
+            value.as_i64().is_some()
+                || value
+                    .as_u64()
+                    .is_some_and(|number| number <= i64::MAX as u64),
         ),
         "Float" | "float" | "decimal" => Some(value.is_number()),
         "json" | "jsonb" => Some(true),

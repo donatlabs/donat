@@ -138,6 +138,9 @@ fn resolve_type(
                 Some(NamedType::Scalar) => ValueType::Scalar {
                     scalar: ValueScalar::Custom { name },
                 },
+                None if name == "bigint" => ValueType::Scalar {
+                    scalar: ValueScalar::Int64,
+                },
                 None => {
                     return Err(ValueContractError::InvalidTypeRef(format!(
                         "unknown named type `{name}`"
@@ -179,6 +182,7 @@ fn builtin_name(name: &str) -> bool {
             | "int"
             | "int32"
             | "int64"
+            | "bigint"
             | "uint64"
             | "Float"
             | "float"

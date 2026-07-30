@@ -1253,6 +1253,165 @@ fn command_arguments_validate_resolved_variables_against_the_declared_type() {
 }
 
 #[test]
+fn command_compiler_maps_every_active_petshop_builtin_scalar_alias() {
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .extend([
+            json!({ "name": "active_bool", "type": "bool!" }),
+            json!({ "name": "active_int", "type": "int!" }),
+            json!({ "name": "active_string", "type": "string!" }),
+            json!({ "name": "active_bigint", "type": "bigint!" }),
+            json!({ "name": "nullable_bigint", "type": "bigint" }),
+            json!({ "name": "bigint_list", "type": "[bigint!]!" }),
+            json!({ "name": "active_timestamptz", "type": "timestamptz!" }),
+            json!({ "name": "active_uuid", "type": "uuid!" }),
+        ]);
+    let metadata = metadata(vec![command]);
+    let catalog = compile_command_source_catalog(
+        &metadata,
+        "default",
+        &catalog(RelationKind::Table),
+        &rules(),
+        true,
+    )
+    .expect("every active Petshop command scalar alias compiles");
+    let arguments = &catalog
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor()
+        .arguments
+        .roots;
+
+    for (name, scalar) in [
+        ("active_bool", ValueScalar::Boolean),
+        ("active_int", ValueScalar::Int32),
+        ("active_string", ValueScalar::String),
+        ("active_bigint", ValueScalar::Int64),
+        ("active_timestamptz", ValueScalar::TimestampTz),
+        ("active_uuid", ValueScalar::Uuid),
+    ] {
+        assert_eq!(
+            arguments[name].type_ref,
+            TypeRef {
+                nullable: false,
+                value_type: ValueType::Scalar { scalar },
+            },
+            "{name} maps to its closed static scalar"
+        );
+    }
+    assert_eq!(
+        arguments["nullable_bigint"].type_ref,
+        TypeRef {
+            nullable: true,
+            value_type: ValueType::Scalar {
+                scalar: ValueScalar::Int64,
+            },
+        },
+        "omitting ! makes the bigint alias nullable without changing its scalar"
+    );
+    assert_eq!(
+        arguments["bigint_list"].type_ref,
+        TypeRef {
+            nullable: false,
+            value_type: ValueType::List {
+                element: Box::new(TypeRef {
+                    nullable: false,
+                    value_type: ValueType::Scalar {
+                        scalar: ValueScalar::Int64,
+                    },
+                }),
+            },
+        },
+        "the bigint alias remains closed under list and item nullability"
+    );
+}
+
+#[test]
+fn command_compiler_keeps_unknown_and_malformed_bigint_forms_closed() {
+    for invalid in [
+        "biginteger!",
+        "BigInt!",
+        "bigint!!",
+        "[bigint",
+        "bigint]",
+        "[bigint!]!!",
+    ] {
+        let mut command = valid_command();
+        command["arguments"]
+            .as_array_mut()
+            .expect("arguments array")
+            .push(json!({ "name": "invalid_alias", "type": invalid }));
+        let metadata = metadata(vec![command]);
+
+        let error = compile(&metadata, RelationKind::Table)
+            .expect_err("unknown and malformed aliases must remain deployment errors");
+        assert_eq!(error.code, "validation-failed", "{invalid}: {error:?}");
+        assert_eq!(
+            error.path, "commands[0].arguments[5]",
+            "{invalid}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn command_planner_resolves_bigint_arguments_as_int8_values() {
+    let mut command = valid_command();
+    command["arguments"][3]["type"] = json!("bigint!");
+    let metadata = metadata(vec![command]);
+    let mut bigint_catalog = catalog(RelationKind::Table);
+    bigint_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "quantity")
+        .expect("quantity column")
+        .pg_type = "int8".to_owned();
+    let catalogs = HashMap::from([("default".to_string(), bigint_catalog)]);
+    let commands = command_catalog(&metadata, &catalogs);
+
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 2147483648
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order_id }
+            }
+        "#,
+    )
+    .expect("an i64 value outside GraphQL Int range plans through the bigint alias");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must be a mutation plan");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    let [CommandExecutionStep::Insert { object, .. }] = command.steps.as_slice() else {
+        panic!("expected the resolved insert step");
+    };
+    let quantity = object
+        .iter()
+        .find(|assignment| assignment.column.name == "quantity")
+        .expect("quantity assignment is resolved");
+    assert!(matches!(
+        &quantity.value,
+        CommandExecutionValue::Scalar { value, pg_type }
+            if value == &Scalar::Json(json!(2147483648_i64)) && pg_type == "int8"
+    ));
+}
+
+#[test]
 fn command_schema_preserves_list_item_nullability_for_declared_input_objects() {
     let mut command = valid_command();
     command["arguments"]
