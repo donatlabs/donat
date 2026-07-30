@@ -1647,15 +1647,44 @@ exactly as ADR 012 lists them through primitive leaves.
 complete normalized owner. The machine-readable owner manifest in ADR 012 is
 the test input for the bidirectional
 `canonical_projection_field_matrix_is_total` compile/test gate. It fails when
-an owner leaf/branch is absent, a projection member lacks an owner, an owner
-entry contains wildcard/family shorthand, or a direct material maps a
-normalized leaf to two canonical paths. Optional values
-are explicit value-or-null and enums use the one tagged
-`{kind,value}` form. Set-like collections sort by stable ID and reject
-duplicates; steps, transforms, and error rules retain declared order.
-Object names use RFC 8785 unsigned UTF-16 ordering, not `BTreeMap<String>`
-storage order. Safe-width schema/version integers are JSON numbers; every
-other `u64`/`NonZeroU64` is a minimal decimal JSON string.
+an owner leaf/branch is absent, a projection member lacks an owner, an extra
+or stale owner is present, an owner entry contains wildcard/family shorthand,
+or a direct material maps a normalized leaf to two canonical paths. Build
+the normalized-owner, recursively expanded projection-member, and parsed
+manifest inventories independently and compare them as exact sets; do not
+assert a fixed manifest row count. Optional values are explicit value-or-null
+and enums use the one tagged `{kind,value}` form. Set-like collections sort
+by stable ID and reject duplicates; steps, transforms, and error rules retain
+declared order. Object names use RFC 8785 unsigned UTF-16 ordering, not
+`BTreeMap<String>` storage order. Safe-width schema/version integers are JSON
+numbers; every other `u64`/`NonZeroU64` is a minimal decimal JSON string.
+
+`ValueType::Scalar` projects the exact Spec-005 Task-1
+`donat_value_contract::ValueScalar` owner through an exhaustive builder with
+no wildcard arm:
+
+```text
+Boolean     -> {"kind":"boolean","value":null}
+String      -> {"kind":"string","value":null}
+Int32       -> {"kind":"int32","value":null}
+Int64       -> {"kind":"int64","value":null}
+UInt64      -> {"kind":"uint64","value":null}
+Decimal     -> {"kind":"decimal","value":null}
+Uuid        -> {"kind":"uuid","value":null}
+Date        -> {"kind":"date","value":null}
+Timestamp   -> {"kind":"timestamp","value":null}
+TimestampTz -> {"kind":"timestamptz","value":null}
+Json        -> {"kind":"json","value":null}
+Custom{name}
+            -> {"kind":"custom","value":{"name":"..."}}
+```
+
+Name the projection `ValueScalarMaterialV1`; do not add a catalog-local
+`Scalar` owner. The canonical decoder accepts exactly those tags and rejects
+every unowned tag as `catalog_jcs_schema_mismatch`. `TypeRef.nullable` alone
+projects nullability, so the builder has no `Null` arm. `InlineBytes` remains
+only the inert `TypedValueMaterialV1` branch below and is not admitted as a
+value-contract scalar.
 
 The catalog adapter projects every `TypedValue` with the exact Spec 007
 Section 5.1 tag and uses strings for `I64`, `U64`, and exact decimal values.
@@ -1804,6 +1833,37 @@ semantic f6bc86c9d5004885bb3156ab320fa76ad3ff7e9686320c54735dcfbd8c27e934
 provenance 326236f741dfa72628b63ae308599b94e83b1c2aa1aa00bd80025ff5381a7531
 ```
 
+Keep the full string value-contract bytes and hash unchanged. Starting from
+that exact byte line, replace only its nested
+`ValueScalarMaterialV1` object and assert every Spec-005 owner branch plus the
+independent `Custom.name` mutation:
+
+```text
+boolean      d0b19f2e9f814ddc5457fd85728dfe4ef649042a5134f12d3ac42fb4009ecc58
+string       79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+int32        d91c7215c24937b62dc176287b48ca5c5f923d034777706323f0b61157a6a2f2
+int64        d1f1966e3e49124f6cce79167814e323315c0e810143684321e7bc7ade23a972
+uint64       a64ccafb81f9b513c634d8f0e206e1aac705d5fcbd06fa8c5adacc34247f7ddb
+decimal      8f1a181165ec3d629693f106d9566d02f76eefe9317746044ee0693b7aa08f6b
+uuid         66c4b3a082f73831d439eb7c624409e9741621b4f7af14892896229f0bee524a
+date         93ed861bcc9b7f6213abcbdb87514515856c4d84eab444f13b3d678e3f3716a7
+timestamp    f1c17e281b279e50480d60a9ee6568df17f7eef1da6e18fd60131a2300df971a
+timestamptz  d79bbe1e56bc00033fcae029d1c9b5826bb805e0657bf0acac285420bf42b169
+json         0b3c1359fac4024dc5dc65e6bace2144f075ba8cc55cfb62e8003ae244b0a879
+custom.demo  5f7c7c1db65b1e54751e4189a4ae314952912d31c0cab1b0d0f7b7ca6792e6ad
+custom.changed
+             fec7767e4fc33c84ce50cc7a7b1e1c51395260f96a65aa1c8afa59b07937ea46
+```
+
+Use the exact canonical scalar objects and prefix/suffix pinned by ADR 012;
+do not obtain expected bytes from the production projection builder. Add the
+exact nullable-string byte vector from ADR 012 and assert hash
+`9630316fc75152223f33663a03f6be51d4953603a7fa9ccabf8560ca9585bd84`.
+It changes only `TypeRefMaterialV1.nullable` to `true`; its nested scalar tag
+stays `string`. Assert that neither a `null` nor an `inline_bytes` scalar tag
+can be built or decoded, while the separate `TypedValueMaterialV1` tags stay
+unchanged.
+
 Do not obtain expected bytes from the production serializer. The full suite
 must exercise provider source/evidence/terms/facts; credential fields,
 OAuth2 bindings and bounds; provider-idempotent effect; non-`None`
@@ -1869,6 +1929,9 @@ Add `source_record_variants_are_closed`,
 `canonical_projection_field_matrix_is_total`,
 `canonical_owner_manifest_has_no_wildcards_or_duplicate_paths`,
 `canonical_owner_manifest_matches_normalized_leaf_and_branch_set`,
+`value_scalar_projection_matches_spec_005_owner`,
+`value_scalar_projection_rejects_unowned_branch`,
+`value_scalar_nullable_semantics_do_not_create_scalar_tag`,
 `canonical_projection_every_field_mutation_is_observable`,
 `canonical_projection_every_enum_branch_is_covered`,
 `semantic_projection_uses_no_provenance_bearing_runtime_descriptor`,
@@ -1938,6 +2001,16 @@ pub fn value_contract_sha256(
     value: &ValueContractMaterialV1,
 ) -> Result<Hash256, CatalogError>;
 ```
+
+Implement `ValueScalarMaterialV1` directly from
+`donat_value_contract::ValueScalar` with the twelve explicit match arms
+listed above and no wildcard. Its strict canonical decoder admits exactly the
+twelve corresponding tags, requires the `Custom.name` payload, and rejects
+every additional tag. Project nullability only from `TypeRef.nullable`; do
+not synthesize a scalar for null or reuse the typed-value inline-bytes
+branch. The exhaustive match must become a compile error if the Task-1 owner
+adds a branch before this catalog projection and its epoch are deliberately
+updated.
 
 Implement the tagged `TypedValue` adapter in catalog and preserve exact
 full-width integer/decimal strings and unpadded base64url. Do not add Serde or

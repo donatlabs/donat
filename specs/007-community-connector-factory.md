@@ -634,15 +634,43 @@ material is not a second behavioral schema:
   unreachable declarations. Roots, named objects, and fields use JCS member
   ordering; enum values retain declared order.
 
+The `ValueType::Scalar` payload is `ValueScalarMaterialV1`, an exact
+projection of the Spec-005 Task-1
+`donat_value_contract::ValueScalar` owner:
+
+```text
+ValueScalar::Boolean     {"kind":"boolean","value":null}
+ValueScalar::String      {"kind":"string","value":null}
+ValueScalar::Int32       {"kind":"int32","value":null}
+ValueScalar::Int64       {"kind":"int64","value":null}
+ValueScalar::UInt64      {"kind":"uint64","value":null}
+ValueScalar::Decimal     {"kind":"decimal","value":null}
+ValueScalar::Uuid        {"kind":"uuid","value":null}
+ValueScalar::Date        {"kind":"date","value":null}
+ValueScalar::Timestamp   {"kind":"timestamp","value":null}
+ValueScalar::TimestampTz {"kind":"timestamptz","value":null}
+ValueScalar::Json        {"kind":"json","value":null}
+ValueScalar::Custom{name}
+  {"kind":"custom","value":{"name":"..."}}
+```
+
+The catalog defines no second `Scalar` owner. Nullability is represented only
+by `TypeRefMaterialV1.nullable`, so `Null` is not a scalar branch.
+`InlineBytes` remains only the inert `TypedValueMaterialV1` branch below
+until a separately approved value-language epoch adds a corresponding
+`ValueScalar`.
+
 Optional fields are always present as value-or-null. Every enum uses
 `{"kind":"<snake_case>","value":<payload-or-null>}`. Set-like arrays sort by
 stable ID and reject duplicates; steps, transforms, and error rules retain
 declared order. No material contains the hash it produces.
 
 Task 3 parses the ADR manifest and rejects wildcard/family entries, a missing
-normalized leaf/discriminant, an unowned canonical member, duplicate
-`(domain,canonical_path)`, or two direct-material mappings for one normalized
-owner. Recursive composite expansion proves exact normalized-leaf coverage.
+normalized leaf/discriminant, an extra or stale owner, an unowned canonical
+member, duplicate `(domain,canonical_path)`, or two direct-material mappings
+for one normalized owner. Recursive composite expansion proves exact
+normalized-leaf coverage by comparing independently built owner, projection,
+and manifest inventories as sets. No test pins a fixed manifest row count.
 
 Resolved evidence is structurally `(value, origin)`. At each stable fact-use
 site, `ResolvedFactValueMaterialV1` stores `{use_site,value}` exactly once at
@@ -719,6 +747,38 @@ The suite exercises complete provider evidence, credential/OAuth behavior,
 provider-idempotent effect, bounded cursor pagination, complete errors and
 bounds/defaults, both trigger families, and value/origin splitting. Task 3
 must reproduce the bytes and hashes independently.
+
+The existing string-only value-contract canonical bytes and
+`79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a`
+hash remain unchanged. Using that full vector as the exact template, Task 3
+substitutes each `ValueScalarMaterialV1` byte object above and independently
+pins these value-contract domain hashes:
+
+```text
+boolean      d0b19f2e9f814ddc5457fd85728dfe4ef649042a5134f12d3ac42fb4009ecc58
+string       79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+int32        d91c7215c24937b62dc176287b48ca5c5f923d034777706323f0b61157a6a2f2
+int64        d1f1966e3e49124f6cce79167814e323315c0e810143684321e7bc7ade23a972
+uint64       a64ccafb81f9b513c634d8f0e206e1aac705d5fcbd06fa8c5adacc34247f7ddb
+decimal      8f1a181165ec3d629693f106d9566d02f76eefe9317746044ee0693b7aa08f6b
+uuid         66c4b3a082f73831d439eb7c624409e9741621b4f7af14892896229f0bee524a
+date         93ed861bcc9b7f6213abcbdb87514515856c4d84eab444f13b3d678e3f3716a7
+timestamp    f1c17e281b279e50480d60a9ee6568df17f7eef1da6e18fd60131a2300df971a
+timestamptz  d79bbe1e56bc00033fcae029d1c9b5826bb805e0657bf0acac285420bf42b169
+json         0b3c1359fac4024dc5dc65e6bace2144f075ba8cc55cfb62e8003ae244b0a879
+custom.demo  5f7c7c1db65b1e54751e4189a4ae314952912d31c0cab1b0d0f7b7ca6792e6ad
+custom.changed
+             fec7767e4fc33c84ce50cc7a7b1e1c51395260f96a65aa1c8afa59b07937ea46
+```
+
+The two custom rows use exact scalar bytes
+`{"kind":"custom","value":{"name":"custom.demo"}}` and
+`{"kind":"custom","value":{"name":"custom.changed"}}`, proving the payload
+owner is observable independently of the branch tag. The separate
+`nullable:true` mutation retains the nested string scalar tag and hashes to
+`9630316fc75152223f33663a03f6be51d4953603a7fa9ccabf8560ca9585bd84`;
+no `null` or `inline_bytes` scalar vector exists. These requirements do not
+change any `TypedValueMaterialV1` tag.
 
 Independent tests construct these bytes, pin complete material vectors, mutate
 one field per material, prove value/origin separation, distinguish every
@@ -2058,8 +2118,9 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `sul_source_cannot_generate_artifacts` | policy integration | every donor marks `n8n-workflow` `TypeOnlyReplaced`; SUL bytes are absent from parser input, manifests, generated Rust, fixtures, Cargo metadata, and release artifacts |
 | `imperative_ast_emits_work_item_not_rust` | codegen snapshot | function-valued routing, `execute`, `poll`, webhook code, or an ambiguous expression produces a processor/unsupported inventory finding, never guessed behavior |
 | `canonical_projection_domains_are_exact` | catalog unit | independent bytes produce every source-record/semantic/provenance/value-contract Section 5.1 vector; one-field mutation changes the applicable domain; no material includes its result; calculation order is record, resolved manifest/value contract, semantic, provenance, generated tree |
-| `canonical_projection_field_matrix_is_total` | catalog compile/unit | the ADR-012 owner manifest parses without wildcard/family entries or duplicate `(domain,canonical_path)`; recursive expansion equals the normalized leaf/discriminant set, every projection member has a normalized/constant/named-derived owner, and one direct material never maps an owner twice |
-| `canonical_projection_every_field_and_branch_mutates` | catalog unit | generated mutations visit every normalized field and every source/auth/request/response/effect/pagination/error/retry/redaction/trigger/value/provenance branch; each changes its applicable direct bytes/hash and preserves the other direct domain |
+| `canonical_projection_field_matrix_is_total` | catalog compile/unit | the ADR-012 owner manifest parses without wildcard/family entries or duplicate `(domain,canonical_path)`; independent owner/projection/manifest inventories compare as exact sets without a fixed row count, recursive expansion equals the normalized leaf/discriminant set, every projection member has a normalized/constant/named-derived owner, and one direct material never maps an owner twice |
+| `value_scalar_projection_matches_spec_005_owner` | catalog unit | exhaustive construction accepts exactly the twelve Spec-005 `ValueScalar` branches and the Section-5.1 canonical bytes/hashes, observes a `Custom.name` mutation, rejects an unowned branch, proves nullable null semantics change only `TypeRefMaterialV1.nullable`, and admits neither `Null` nor `InlineBytes` as a scalar |
+| `canonical_projection_every_field_and_branch_mutates` | catalog unit | generated mutations visit every normalized field and every source/auth/request/response/effect/pagination/error/retry/redaction/trigger/value/provenance branch, including every real `ValueScalar` tag and `Custom.name`; each changes its applicable direct bytes/hash and preserves the other direct domain |
 | `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes one resolved value only at its semantic operation owner and one exact provider/policy origin only at its manifest-reference owner; duplicate `(use_site,fact)`, substitution, omission, or unequal semantic/provenance use-site sets reject |
 | `typed_value_jcs_projection_is_lossless` | catalog unit | tagged `I64(1)`, `U64(1)`, `Decimal("1")`, and `String("1")` do not collide; `u64::MAX`, exact decimal spelling, canonical base64url, inline metadata nulls, and U+10000-before-U+FFFD UTF-16 member ordering match independent bytes |
 | `operation_snapshot_is_complete_and_versioned` | catalog unit | every behavioral Section 5.3 field, stable SemVer/epoch distinction, input/output recomputed hash, resolved origin/value, transform/processor `implementation_revision`, default, bound, and stored selected-header mapping is required; provenance identities are forbidden; prerelease/build versions reject; processorless multi-step rejects |

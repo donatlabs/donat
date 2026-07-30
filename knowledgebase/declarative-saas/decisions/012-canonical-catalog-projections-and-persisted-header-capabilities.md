@@ -578,17 +578,26 @@ NamedObjectMaterialV1 = {"fields":{name:FieldMaterialV1}}
 FieldMaterialV1 = {"required":bool,"type_ref":TypeRefMaterialV1}
 TypeRefMaterialV1 = {"nullable":bool,"value_type":ValueTypeMaterialV1}
 ValueTypeMaterialV1 =
-  tagged "scalar" ScalarMaterialV1 |
+  tagged "scalar" ValueScalarMaterialV1 |
   tagged "enum" {"name":string,"values":[string...]} |
   tagged "object" {"fields":{name:FieldMaterialV1}} |
   tagged "list" {"element":TypeRefMaterialV1} |
   tagged "ref" {"name":string}
-ScalarMaterialV1 =
-  tagged "null" null | tagged "boolean" null |
-  tagged "string" null | tagged "i64" null |
-  tagged "u64" null | tagged "decimal" null |
-  tagged "inline_bytes" null | tagged "custom" {"name":string}
+ValueScalarMaterialV1 =
+  tagged "boolean" null | tagged "string" null |
+  tagged "int32" null | tagged "int64" null |
+  tagged "uint64" null | tagged "decimal" null |
+  tagged "uuid" null | tagged "date" null |
+  tagged "timestamp" null | tagged "timestamptz" null |
+  tagged "json" null | tagged "custom" {"name":string}
 ```
+
+`ValueScalarMaterialV1` is an exact projection of the Spec-005 Task-1 owner,
+`donat_value_contract::ValueScalar`. Nullability is represented only by
+`TypeRefMaterialV1.nullable`; there is no `null` scalar tag. `InlineBytes`
+remains only an inert `TypedValueMaterialV1` branch and cannot enter a
+value-contract scalar projection until a separately approved value-language
+epoch adds a corresponding `ValueScalar`.
 
 Maps use UTF-16 member order; enum values retain declared order; the full
 named-object closure, including unreachable declarations, is present.
@@ -1186,21 +1195,25 @@ ValueType::Enum|value-contract|ValueTypeMaterialV1{kind=enum}.kind|normalized|sc
 ValueType::Object|value-contract|ValueTypeMaterialV1{kind=object}.kind|normalized|scalar|required|object
 ValueType::List|value-contract|ValueTypeMaterialV1{kind=list}.kind|normalized|scalar|required|list
 ValueType::Ref|value-contract|ValueTypeMaterialV1{kind=ref}.kind|normalized|scalar|required|ref
-ValueType::Scalar.scalar|value-contract|ValueTypeMaterialV1{kind=scalar}.value|normalized|scalar|required|ScalarMaterialV1
+ValueType::Scalar.scalar|value-contract|ValueTypeMaterialV1{kind=scalar}.value|normalized|scalar|required|ValueScalarMaterialV1
 ValueType::Enum.name|value-contract|ValueTypeMaterialV1{kind=enum}.value.name|normalized|scalar|required|string
 ValueType::Enum.values|value-contract|ValueTypeMaterialV1{kind=enum}.value.values|normalized|declared|empty_array|Vec<string>
 ValueType::Object.fields|value-contract|ValueTypeMaterialV1{kind=object}.value.fields|normalized|utf16_member_name|empty_object|Map<string,FieldMaterialV1>
 ValueType::List.element|value-contract|ValueTypeMaterialV1{kind=list}.value.element|normalized|scalar|required|TypeRefMaterialV1
 ValueType::Ref.name|value-contract|ValueTypeMaterialV1{kind=ref}.value.name|normalized|scalar|required|string
-Scalar::Null|value-contract|ScalarMaterialV1{kind=null}.kind|normalized|scalar|required|null
-Scalar::Boolean|value-contract|ScalarMaterialV1{kind=boolean}.kind|normalized|scalar|required|boolean
-Scalar::String|value-contract|ScalarMaterialV1{kind=string}.kind|normalized|scalar|required|string
-Scalar::I64|value-contract|ScalarMaterialV1{kind=i64}.kind|normalized|scalar|required|i64
-Scalar::U64|value-contract|ScalarMaterialV1{kind=u64}.kind|normalized|scalar|required|u64
-Scalar::Decimal|value-contract|ScalarMaterialV1{kind=decimal}.kind|normalized|scalar|required|decimal
-Scalar::InlineBytes|value-contract|ScalarMaterialV1{kind=inline_bytes}.kind|normalized|scalar|required|inline_bytes
-Scalar::Custom|value-contract|ScalarMaterialV1{kind=custom}.kind|normalized|scalar|required|custom
-Scalar::Custom.name|value-contract|ScalarMaterialV1{kind=custom}.value.name|normalized|scalar|required|string
+ValueScalar::Boolean|value-contract|ValueScalarMaterialV1{kind=boolean}.kind|normalized|scalar|required|boolean
+ValueScalar::String|value-contract|ValueScalarMaterialV1{kind=string}.kind|normalized|scalar|required|string
+ValueScalar::Int32|value-contract|ValueScalarMaterialV1{kind=int32}.kind|normalized|scalar|required|int32
+ValueScalar::Int64|value-contract|ValueScalarMaterialV1{kind=int64}.kind|normalized|scalar|required|int64
+ValueScalar::UInt64|value-contract|ValueScalarMaterialV1{kind=uint64}.kind|normalized|scalar|required|uint64
+ValueScalar::Decimal|value-contract|ValueScalarMaterialV1{kind=decimal}.kind|normalized|scalar|required|decimal
+ValueScalar::Uuid|value-contract|ValueScalarMaterialV1{kind=uuid}.kind|normalized|scalar|required|uuid
+ValueScalar::Date|value-contract|ValueScalarMaterialV1{kind=date}.kind|normalized|scalar|required|date
+ValueScalar::Timestamp|value-contract|ValueScalarMaterialV1{kind=timestamp}.kind|normalized|scalar|required|timestamp
+ValueScalar::TimestampTz|value-contract|ValueScalarMaterialV1{kind=timestamptz}.kind|normalized|scalar|required|timestamptz
+ValueScalar::Json|value-contract|ValueScalarMaterialV1{kind=json}.kind|normalized|scalar|required|json
+ValueScalar::Custom|value-contract|ValueScalarMaterialV1{kind=custom}.kind|normalized|scalar|required|custom
+ValueScalar::Custom.name|value-contract|ValueScalarMaterialV1{kind=custom}.value.name|normalized|scalar|required|string
 TypedValue::Null|value-contract|TypedValueMaterialV1{kind=null}.kind|normalized|scalar|required|null
 TypedValue::Boolean|value-contract|TypedValueMaterialV1{kind=boolean}.kind|normalized|scalar|required|boolean
 TypedValue::String|value-contract|TypedValueMaterialV1{kind=string}.kind|normalized|scalar|required|string
@@ -1333,12 +1346,15 @@ derived::fact_origin.location|provenance|ResolvedFactOriginMaterialV1{kind=provi
 derived::donat_policy_ids|provenance|ProvenanceMaterialV1.donat_policy_ids|derived:contract_fact_policy_set|lexical|empty_array|Vec<DonatPolicyId>
 ```
 
-Task 3 parses this block into an immutable owner table. The test rejects a
-row with `*`, a family placeholder, an unknown domain, a duplicate
-`(domain,canonical_path)`, a duplicate normalized mapping within one direct
-material, a missing normalized leaf or enum discriminant, or an unowned
-canonical member. It recursively expands named composite types and proves
-the expanded normalized model has exactly the same leaf/discriminant set.
+Task 3 parses this block into an immutable owner table. Its invariant is an
+exact-set comparison among independently enumerated normalized owners,
+canonical members, and manifest mappings; it never pins a historical row
+count. The test rejects a row with `*`, a family placeholder, an unknown
+domain, a duplicate `(domain,canonical_path)`, a duplicate normalized mapping
+within one direct material, a missing normalized leaf or enum discriminant,
+an extra or stale owner, or an unowned canonical member. It recursively
+expands named composite types and proves the expanded normalized model has
+exactly the same leaf/discriminant set.
 
 The resolved fact split is exact: one normalized binding produces one value
 at `SemanticOperationMaterialV1.resolved_fact_values[]` and one origin at
@@ -1493,6 +1509,47 @@ provenance:
 {"artifacts":[{"algorithm":{"kind":"sha256","value":null},"artifact_id":"artifact.openapi","digest":"1111111111111111111111111111111111111111111111111111111111111111","path":"openapi.json","source_record_id":"source.demo.provider.v1"}],"canonical_schema_epoch":1,"classifier_epoch":1,"connector":{"id":"demo","semantic_sha256":"f6bc86c9d5004885bb3156ab320fa76ad3ff7e9686320c54735dcfbd8c27e934","version":{"major":1,"minor":0,"patch":0}},"dependencies":[],"donat_policy_ids":[],"embedded_material":[],"files":[],"generator_epoch":1,"licenses":[{"kind":"permissive","value":{"license_file_path":"LICENSE","license_file_sha256":"2222222222222222222222222222222222222222222222222222222222222222","selected_dual_license_branch":null,"spdx_id":"MIT"}}],"manifest_references":[{"artifact_hashes":[{"algorithm":{"kind":"sha256","value":null},"artifact_id":"artifact.openapi","digest":"1111111111111111111111111111111111111111111111111111111111111111","path":"openapi.json"}],"contract_fact_origins":[{"origin":{"kind":"provider_evidence","value":{"artifact_content_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fact_id":"fact.idempotency","location":{"kind":"json_pointer","value":{"path":"openapi.json","pointer":"/paths/~1widgets/post"}},"source_record_id":"source.demo.provider.v1"}},"use_site":"effect.request.binding"}],"license_id":"license.demo","notice_id":"notice.demo","source_record_id":"source.demo.provider.v1"}],"notices":[{"id":"notice.demo","license_file_path":"LICENSE","license_file_sha256":"2222222222222222222222222222222222222222222222222222222222222222","notice_bundle_destination":"THIRD_PARTY_NOTICES.md","required_copyright_lines":["Copyright Demo"]}],"provider_evidence":[{"evidence":[{"accessed_on":"2026-07-29","content_sha256":"1111111111111111111111111111111111111111111111111111111111111111","facts":[{"fact_id":"fact.idempotency","location":{"kind":"json_pointer","value":{"path":"openapi.json","pointer":"/paths/~1widgets/post"}}}],"source":{"kind":"repository_file","value":{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":"openapi.json","repository":"https://github.com/example/demo"}},"terms":{"kind":"permissive","value":{"evidence_url":"https://example.test/terms/v1","license":{"kind":"permissive","value":{"license_file_path":"LICENSE","license_file_sha256":"2222222222222222222222222222222222222222222222222222222222222222","selected_dual_license_branch":null,"spdx_id":"MIT"}}}}}],"provider":"demo","source_record_id":"source.demo.provider.v1"}],"sources":[{"record_id":"source.demo.provider.v1","record_sha256":"420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991"}]}
 SHA-256: 326236f741dfa72628b63ae308599b94e83b1c2aa1aa00bd80025ff5381a7531
 ```
+
+The string-only value-contract bytes and hash above remain unchanged. The
+following mutations exhaust the Spec-005 `ValueScalar` owner. For each row,
+the exact canonical `ValueContractMaterialV1` bytes are the ASCII
+concatenation of this prefix, the row's scalar bytes, and this suffix:
+
+```text
+prefix: {"named_objects":{},"roots":{"query":{"required":true,"type_ref":{"nullable":false,"value_type":{"kind":"scalar","value":
+suffix: }}}},"value_language_epoch":1}
+```
+
+The hash is
+`SHA256("donat.connector.value-contract.v1\0" || canonical_bytes)`:
+
+| Spec-005 owner / mutation | Exact scalar bytes | SHA-256 |
+| --- | --- | --- |
+| `ValueScalar::Boolean` | `{"kind":"boolean","value":null}` | `d0b19f2e9f814ddc5457fd85728dfe4ef649042a5134f12d3ac42fb4009ecc58` |
+| `ValueScalar::String` | `{"kind":"string","value":null}` | `79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a` |
+| `ValueScalar::Int32` | `{"kind":"int32","value":null}` | `d91c7215c24937b62dc176287b48ca5c5f923d034777706323f0b61157a6a2f2` |
+| `ValueScalar::Int64` | `{"kind":"int64","value":null}` | `d1f1966e3e49124f6cce79167814e323315c0e810143684321e7bc7ade23a972` |
+| `ValueScalar::UInt64` | `{"kind":"uint64","value":null}` | `a64ccafb81f9b513c634d8f0e206e1aac705d5fcbd06fa8c5adacc34247f7ddb` |
+| `ValueScalar::Decimal` | `{"kind":"decimal","value":null}` | `8f1a181165ec3d629693f106d9566d02f76eefe9317746044ee0693b7aa08f6b` |
+| `ValueScalar::Uuid` | `{"kind":"uuid","value":null}` | `66c4b3a082f73831d439eb7c624409e9741621b4f7af14892896229f0bee524a` |
+| `ValueScalar::Date` | `{"kind":"date","value":null}` | `93ed861bcc9b7f6213abcbdb87514515856c4d84eab444f13b3d678e3f3716a7` |
+| `ValueScalar::Timestamp` | `{"kind":"timestamp","value":null}` | `f1c17e281b279e50480d60a9ee6568df17f7eef1da6e18fd60131a2300df971a` |
+| `ValueScalar::TimestampTz` | `{"kind":"timestamptz","value":null}` | `d79bbe1e56bc00033fcae029d1c9b5826bb805e0657bf0acac285420bf42b169` |
+| `ValueScalar::Json` | `{"kind":"json","value":null}` | `0b3c1359fac4024dc5dc65e6bace2144f075ba8cc55cfb62e8003ae244b0a879` |
+| `ValueScalar::Custom { name: "custom.demo" }` | `{"kind":"custom","value":{"name":"custom.demo"}}` | `5f7c7c1db65b1e54751e4189a4ae314952912d31c0cab1b0d0f7b7ca6792e6ad` |
+| `Custom.name mutation to "custom.changed"` | `{"kind":"custom","value":{"name":"custom.changed"}}` | `fec7767e4fc33c84ce50cc7a7b1e1c51395260f96a65aa1c8afa59b07937ea46` |
+
+The independent nullable vector is exactly:
+
+```text
+{"named_objects":{},"roots":{"query":{"required":true,"type_ref":{"nullable":true,"value_type":{"kind":"scalar","value":{"kind":"string","value":null}}}}},"value_language_epoch":1}
+SHA-256: 9630316fc75152223f33663a03f6be51d4953603a7fa9ccabf8560ca9585bd84
+```
+
+It changes only `TypeRefMaterialV1.nullable`; the nested scalar remains
+`ValueScalar::String`. There is no `null` or `inline_bytes` scalar vector.
+The separately tested `TypedValueMaterialV1` tags remain unchanged, including
+`null`, `i64`, `u64`, decimal, and `inline_bytes`.
 
 The source vector exercises complete provider-artifact evidence and fact
 location/value. The semantic vector exercises a complete credential and
