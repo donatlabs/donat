@@ -1,0 +1,58 @@
+description: The checked-in Petshop example exposes all seeded catalogue items to staff.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: staff
+query:
+  query: |
+    query {
+      category(order_by: {id: asc}) {
+        id
+        name
+        pets(order_by: {id: asc}) {
+          id
+          name
+          price
+          status
+        }
+      }
+    }
+response:
+  data:
+    category:
+      - id: 1
+        name: Dogs
+        pets:
+          - id: 1
+            name: Rex
+            price: 350.00
+            status: available
+          - id: 2
+            name: Bella
+            price: 420.00
+            status: available
+      - id: 2
+        name: Cats
+        pets:
+          - id: 3
+            name: Whiskers
+            price: 90.00
+            status: available
+          - id: 4
+            name: Shadow
+            price: 120.00
+            status: pending
+      - id: 3
+        name: Birds
+        pets:
+          - id: 5
+            name: Tweety
+            price: 35.00
+            status: available
+      - id: 4
+        name: Fish
+        pets:
+          - id: 6
+            name: Nemo
+            price: 15.00
+            status: sold

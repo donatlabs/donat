@@ -31,6 +31,73 @@ pub fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+/// Apply a checked-in directory of versioned SQL migrations to a suite
+/// database before its first engine request. Migration paths are selected by
+/// the test harness, never from an HTTP request.
+pub fn apply_sql_migration_dir(database_url: &str, dir: &Path) -> Result<()> {
+    let mut migrations = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading migration directory {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading migration entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading migration file type {}", path.display()))?
+            .is_file()
+        {
+            return Err(anyhow!(
+                "migration entry {} is not a regular file",
+                path.display()
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("migration file name {} is not UTF-8", path.display()))?;
+        let (version, description) = name
+            .strip_prefix('V')
+            .and_then(|name| name.split_once("__"))
+            .and_then(|(version, description)| {
+                description.strip_suffix(".sql").map(|d| (version, d))
+            })
+            .ok_or_else(|| anyhow!("invalid migration file name {name}"))?;
+        if version.is_empty()
+            || version.starts_with('0')
+            || !version.bytes().all(|byte| byte.is_ascii_digit())
+            || description.is_empty()
+            || !description
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(anyhow!("invalid migration file name {name}"));
+        }
+        let version = version
+            .parse::<u64>()
+            .with_context(|| format!("invalid migration version in {name}"))?;
+        migrations.push((version, path));
+    }
+
+    migrations.sort_by_key(|(version, _)| *version);
+    for pair in migrations.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(anyhow!("duplicate version {}", pair[0].0));
+        }
+    }
+
+    let mut client = postgres::Client::connect(database_url, postgres::NoTls)
+        .with_context(|| format!("connecting to migration database {database_url}"))?;
+    for (_, path) in migrations {
+        let sql = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading migration {}", path.display()))?;
+        client
+            .batch_execute(&sql)
+            .with_context(|| format!("applying migration {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Load a fixture YAML into JSON, resolving `!include <file>` (both the real
 /// YAML tag and the quoted-string spelling donat-cli produces) relative to
 /// the including file.
@@ -3581,6 +3648,55 @@ mod tests {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn migration_files_are_sorted_by_numeric_version() {
+        let database_name = suite_database_name("migration_files_sorted");
+        let (admin_url, database_url) =
+            create_suite_db(&database_name).expect("create migration test database");
+        let dir = tempdir("migration_files_sorted");
+        write(
+            &dir,
+            "V10__insert_marker.sql",
+            "INSERT INTO migration_order (version) VALUES (10);",
+        );
+        write(
+            &dir,
+            "V2__create_marker.sql",
+            "CREATE TABLE migration_order (version integer NOT NULL);",
+        );
+
+        apply_sql_migration_dir(&database_url, &dir).expect("migrations apply in numeric order");
+
+        let mut client = pg_client(&database_url);
+        let row = client
+            .query_one("SELECT version FROM migration_order", &[])
+            .expect("migration marker exists");
+        assert_eq!(row.get::<_, i32>(0), 10);
+
+        std::fs::remove_dir_all(dir).expect("remove migration test directory");
+        let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls)
+            .expect("connect to Postgres admin database");
+        admin
+            .batch_execute(&format!("DROP DATABASE {database_name} WITH (FORCE)"))
+            .expect("drop migration test database");
+    }
+
+    #[test]
+    fn duplicate_migration_versions_are_rejected() {
+        let dir = tempdir("duplicate_migration_versions");
+        write(&dir, "V2__first.sql", "SELECT 1;");
+        write(&dir, "V2__second.sql", "SELECT 2;");
+
+        let err = apply_sql_migration_dir("postgresql://unused", &dir)
+            .expect_err("duplicate migration versions must be rejected");
+        assert!(
+            format!("{err:#}").contains("duplicate version 2"),
+            "{err:#}"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove migration test directory");
     }
 
     #[test]
