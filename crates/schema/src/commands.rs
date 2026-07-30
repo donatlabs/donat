@@ -621,6 +621,7 @@ struct StepOutput {
     fields: BTreeMap<String, StaticType>,
     many: bool,
     may_be_absent: bool,
+    guaranteed_non_empty: bool,
     kind: StepOutputKind,
 }
 
@@ -2346,6 +2347,7 @@ fn validate_step(
                 fields: BTreeMap::new(),
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2376,6 +2378,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !select_one.require_found,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2423,22 +2426,29 @@ fn validate_step(
                 fields: returning,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: select_many.require_non_empty,
                 kind: StepOutputKind::SelectMany,
             })
         }
         CommandStepOperation::Aggregate { aggregate } => {
-            let input = prior_select_many_output(&aggregate.from, context, "aggregate", path)?;
+            let input = prior_row_set_output(&aggregate.from, context, "aggregate", path)?;
             if aggregate.values.is_empty() {
                 return Err(PlanError::validation(
                     path,
                     "aggregate must declare at least one output value",
                 ));
             }
-            let fields = validate_command_aggregates(&aggregate.values, &input.fields, path)?;
+            let fields = validate_command_aggregates(
+                &aggregate.values,
+                &input.fields,
+                input.guaranteed_non_empty,
+                path,
+            )?;
             Ok(StepOutput {
                 fields,
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: true,
                 kind: StepOutputKind::Aggregate,
             })
         }
@@ -2488,6 +2498,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2542,6 +2553,7 @@ fn validate_step(
                 fields: returning,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2590,6 +2602,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !update.require_affected,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2727,6 +2740,7 @@ fn validate_step(
                 fields: returning,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::UpdateMany,
             })
         }
@@ -2736,6 +2750,7 @@ fn validate_step(
                 fields,
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2751,6 +2766,7 @@ fn validate_step(
                 fields,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: input.guaranteed_non_empty,
                 kind: StepOutputKind::ProjectMany,
             })
         }
@@ -2773,6 +2789,7 @@ fn validate_step(
                 fields,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: true,
                 kind: StepOutputKind::FixedRows,
             })
         }
@@ -2788,6 +2805,7 @@ fn validate_step(
                 fields,
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2809,6 +2827,7 @@ fn validate_step(
                 fields,
                 many: true,
                 may_be_absent: false,
+                guaranteed_non_empty: input.guaranteed_non_empty,
                 kind: StepOutputKind::DecisionMany,
             })
         }
@@ -2825,6 +2844,7 @@ fn validate_step(
                 fields: BTreeMap::new(),
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2874,6 +2894,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !update_when.require_affected,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -2924,6 +2945,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: true,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -3009,6 +3031,7 @@ fn validate_step(
                 ]),
                 many: false,
                 may_be_absent: false,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Allocation,
             })
         }
@@ -3043,6 +3066,7 @@ fn validate_step(
                 fields: returning,
                 many: false,
                 may_be_absent: !delete.require_affected,
+                guaranteed_non_empty: false,
                 kind: StepOutputKind::Scalar,
             })
         }
@@ -3455,6 +3479,7 @@ fn validate_condition(
 fn validate_command_aggregates(
     values: &BTreeMap<String, CommandAggregate>,
     input: &BTreeMap<String, StaticType>,
+    guaranteed_non_empty: bool,
     path: &str,
 ) -> Result<BTreeMap<String, StaticType>, PlanError> {
     let mut output = BTreeMap::new();
@@ -3471,6 +3496,7 @@ fn validate_command_aggregates(
             }
             CommandAggregate::Sum { sum } => {
                 let input_type = aggregate_input_type(aggregate_selector(sum, path)?, input, path)?;
+                let input_non_null = !matches!(input_type, StaticType::Nullable(_));
                 let scalar = input_type
                     .scalar_name()
                     .ok_or_else(|| PlanError::validation(path, "sum requires a numeric column"))?;
@@ -3478,7 +3504,8 @@ fn validate_command_aggregates(
                     "Int" => "int8",
                     "Float" => "float8",
                     "int2" | "int4" | "serial" => "int8",
-                    "int8" | "bigint" | "bigserial" | "numeric" | "decimal" => "numeric",
+                    "int8" | "bigint" | "bigserial" => "int8",
+                    "numeric" | "decimal" => "numeric",
                     "float4" => "float4",
                     "float8" => "float8",
                     _ => {
@@ -3488,10 +3515,16 @@ fn validate_command_aggregates(
                         ));
                     }
                 };
-                StaticType::nullable(StaticType::Scalar(output.to_owned()))
+                let output = StaticType::Scalar(output.to_owned());
+                if guaranteed_non_empty && input_non_null {
+                    output
+                } else {
+                    StaticType::nullable(output)
+                }
             }
             CommandAggregate::Min { min } | CommandAggregate::Max { max: min } => {
                 let input_type = aggregate_input_type(aggregate_selector(min, path)?, input, path)?;
+                let input_non_null = !matches!(input_type, StaticType::Nullable(_));
                 let scalar = input_type.scalar_name().ok_or_else(|| {
                     PlanError::validation(path, "min/max requires an orderable column")
                 })?;
@@ -3506,7 +3539,12 @@ fn validate_command_aggregates(
                         format!("{operation} requires an orderable column, got '{scalar}'"),
                     ));
                 }
-                StaticType::nullable(StaticType::Scalar(scalar.to_owned()))
+                let output = StaticType::Scalar(scalar.to_owned());
+                if guaranteed_non_empty && input_non_null {
+                    output
+                } else {
+                    StaticType::nullable(output)
+                }
             }
         };
         if let CommandAggregate::CountDistinct { count_distinct } = aggregate {

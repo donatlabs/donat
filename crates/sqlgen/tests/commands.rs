@@ -549,10 +549,7 @@ fn relational_batch_root(
                         output: column("line_count", "int8"),
                     },
                     CommandAggregateIr::Sum {
-                        output: CommandColumn {
-                            nullable: true,
-                            ..column("subtotal_minor", "numeric")
-                        },
+                        output: column("subtotal_minor", "int8"),
                         input: column("unit_price_minor", "int8"),
                     },
                     CommandAggregateIr::Min {
@@ -628,18 +625,9 @@ fn relational_batch_root(
                     many: false,
                     columns: vec![
                         column("line_count", "int8"),
-                        CommandColumn {
-                            nullable: true,
-                            ..column("subtotal_minor", "numeric")
-                        },
-                        CommandColumn {
-                            nullable: true,
-                            ..column("first_price", "int8")
-                        },
-                        CommandColumn {
-                            nullable: true,
-                            ..column("last_price", "int8")
-                        },
+                        column("subtotal_minor", "int8"),
+                        column("first_price", "int8"),
+                        column("last_price", "int8"),
                         column("currency_count", "int8"),
                     ],
                 },
@@ -2256,7 +2244,7 @@ fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinalit
                 line_id int4 NOT NULL, \
                 variant_id int4 NOT NULL, \
                 quantity int4 NOT NULL, \
-                unit_price_minor int8 NOT NULL, \
+                unit_price_minor int8, \
                 currency text NOT NULL, \
                 customer_id int4 NOT NULL\
              ); \
@@ -2274,21 +2262,61 @@ fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinalit
                 (3, 5, 2, 1, 100, 'USD', 7), \
                 (3, 6, 999, 1, 100, 'USD', 7), \
                 (5, 7, 1, 1, 100, 'USD', 7), \
-                (5, 7, 2, 1, 100, 'USD', 7); \
+                (5, 7, 2, 1, 100, 'USD', 7), \
+                (6, 8, 1, 0, 9223372036854775807, 'USD', 7), \
+                (6, 9, 2, 0, 1, 'USD', 7), \
+                (7, 10, 1, 0, NULL, 'USD', 7), \
+                (7, 11, 2, 0, NULL, 'USD', 7); \
              INSERT INTO \"public\".\"{stock_table}\" VALUES \
                 (1, 0, 10, 7), \
                 (2, 0, 10, 7)"
         ))
         .expect("create relational command execution fixture");
 
-    let idempotent = donat_sqlgen::mutation_to_sql(&relational_batch_root(
+    let mut idempotent_root = relational_batch_root(
         &command_name,
         &pricing_table,
         &stock_table,
         1,
         &["line_id"],
         true,
-    ));
+    );
+    let MutationRoot::Command { command, .. } = &mut idempotent_root else {
+        unreachable!("relational helper returns a command");
+    };
+    command.steps.insert(
+        1,
+        CommandExecutionStep::ProjectMany {
+            name: "projected_prices".to_owned(),
+            cte: "_cmd_projected_prices".to_owned(),
+            input_cte: "_cmd_step_0".to_owned(),
+            maximum_rows: 256,
+            values: vec![
+                CommandNamedValue {
+                    name: "unit_price_minor".to_owned(),
+                    column: column("unit_price_minor", "int8"),
+                    value: CommandExecutionValue::Item {
+                        field: "unit_price_minor".to_owned(),
+                        pg_type: "int8".to_owned(),
+                    },
+                },
+                CommandNamedValue {
+                    name: "currency".to_owned(),
+                    column: column("currency", "text"),
+                    value: CommandExecutionValue::Item {
+                        field: "currency".to_owned(),
+                        pg_type: "text".to_owned(),
+                    },
+                },
+            ],
+            error_path: format!("$.selectionSet.{command_name}"),
+        },
+    );
+    let CommandExecutionStep::Aggregate { input_cte, .. } = &mut command.steps[2] else {
+        unreachable!("project_many precedes the aggregate");
+    };
+    *input_cte = "_cmd_projected_prices".to_owned();
+    let idempotent = donat_sqlgen::mutation_to_sql(&idempotent_root);
     let first: Json = client
         .query_one(&idempotent, &[])
         .expect("the first relational batch executes")
@@ -2344,6 +2372,90 @@ fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinalit
             &[],
         )
         .expect("reset stock for rejection cases");
+
+    for cart_id in [4, 7] {
+        let mut root = relational_batch_root(
+            &format!("{command_name}_nullable_{cart_id}"),
+            &pricing_table,
+            &stock_table,
+            cart_id,
+            &["line_id"],
+            false,
+        );
+        let MutationRoot::Command { command, .. } = &mut root else {
+            unreachable!("relational helper returns a command");
+        };
+        let CommandExecutionStep::SelectMany {
+            require_non_empty, ..
+        } = &mut command.steps[0]
+        else {
+            unreachable!("first step selects the bounded input");
+        };
+        *require_non_empty = false;
+        let CommandExecutionStep::Aggregate { values, .. } = &mut command.steps[1] else {
+            unreachable!("select_many feeds the nullable aggregate");
+        };
+        for aggregate in values {
+            match aggregate {
+                CommandAggregateIr::Sum { output, .. }
+                | CommandAggregateIr::Min { output, .. }
+                | CommandAggregateIr::Max { output, .. } => output.nullable = true,
+                CommandAggregateIr::Count { .. } | CommandAggregateIr::CountDistinct { .. } => {}
+            }
+        }
+        let totals = command
+            .result
+            .iter_mut()
+            .find(|field| field.name == "totals")
+            .expect("totals result");
+        let CommandResultValue::StepRow { columns, .. } = &mut totals.value else {
+            unreachable!("totals is one aggregate row");
+        };
+        for column in columns {
+            if matches!(
+                column.name.as_str(),
+                "subtotal_minor" | "first_price" | "last_price"
+            ) {
+                column.nullable = true;
+            }
+        }
+        let value: Json = client
+            .query_one(&donat_sqlgen::mutation_to_sql(&root), &[])
+            .expect("empty and all-null bounded sums remain nullable")
+            .get(0);
+        assert_eq!(value["totals"]["subtotal_minor"], Json::Null);
+    }
+
+    let overflow = donat_sqlgen::mutation_to_sql(&relational_batch_root(
+        &format!("{command_name}_overflow"),
+        &pricing_table,
+        &stock_table,
+        6,
+        &["line_id"],
+        false,
+    ));
+    let overflow_error = client
+        .query_one(&overflow, &[])
+        .expect_err("checked bigint accumulation must fail instead of widening");
+    assert_eq!(
+        overflow_error
+            .as_db_error()
+            .expect("overflow is a database error")
+            .code()
+            .code(),
+        "22003"
+    );
+    let reserved_after_overflow: Vec<i32> = client
+        .query(
+            &format!("SELECT reserved FROM \"public\".\"{stock_table}\" ORDER BY variant_id"),
+            &[],
+        )
+        .expect("overflow rolls the statement back and keeps the connection usable")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(reserved_after_overflow, vec![0, 0]);
+
     for (cart_id, order_by, expected_message) in [
         (2, &["line_id"][..], "duplicate input primary keys"),
         (3, &["line_id"][..], "did not affect every input row"),

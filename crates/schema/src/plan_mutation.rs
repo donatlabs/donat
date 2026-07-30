@@ -32,6 +32,7 @@ struct ResolvedCommandStep {
     returning: Vec<CommandColumn>,
     field_rows: BTreeMap<String, Vec<CommandColumn>>,
     many: bool,
+    guaranteed_non_empty: bool,
     kind: ResolvedCommandStepKind,
 }
 
@@ -49,6 +50,7 @@ struct CommandCurrentContext {
 struct ResolvedCommandRowSet {
     cte: String,
     columns: BTreeMap<String, CommandColumn>,
+    guaranteed_non_empty: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -341,8 +343,15 @@ impl<'a> Planner<'a> {
             returning: columns.to_vec(),
             field_rows: BTreeMap::new(),
             many,
+            guaranteed_non_empty: false,
             kind,
         };
+        let guaranteed_output =
+            |cte: String, columns: &[CommandColumn], many, kind, guaranteed_non_empty| {
+                let mut output = output(cte, columns, many, kind);
+                output.guaranteed_non_empty = guaranteed_non_empty;
+                output
+            };
         match &step.operation {
             CommandStepOperation::Assert { assert } => {
                 let rule = self.resolve_command_rule(
@@ -371,6 +380,7 @@ impl<'a> Planner<'a> {
                         returning: Vec::new(),
                         field_rows: BTreeMap::new(),
                         many: false,
+                        guaranteed_non_empty: false,
                         kind: ResolvedCommandStepKind::Scalar,
                     },
                 ))
@@ -443,21 +453,23 @@ impl<'a> Planner<'a> {
                 };
                 Ok((
                     resolved,
-                    output(cte, &returning, true, ResolvedCommandStepKind::SelectMany),
+                    guaranteed_output(
+                        cte,
+                        &returning,
+                        true,
+                        ResolvedCommandStepKind::SelectMany,
+                        select_many.require_non_empty,
+                    ),
                 ))
             }
             CommandStepOperation::Aggregate { aggregate } => {
-                let input = self.resolve_command_row_set(
-                    &aggregate.from,
-                    previous_steps,
-                    ResolvedCommandStepKind::SelectMany,
-                    path,
-                )?;
+                let input =
+                    self.resolve_any_command_row_set(&aggregate.from, previous_steps, path)?;
                 let values = aggregate
                     .values
                     .iter()
                     .map(|(name, aggregate)| {
-                        resolve_command_aggregate(name, aggregate, input, path)
+                        resolve_command_aggregate(name, aggregate, &input, path)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let returning = values
@@ -473,7 +485,13 @@ impl<'a> Planner<'a> {
                 };
                 Ok((
                     resolved,
-                    output(cte, &returning, false, ResolvedCommandStepKind::Aggregate),
+                    guaranteed_output(
+                        cte,
+                        &returning,
+                        false,
+                        ResolvedCommandStepKind::Aggregate,
+                        true,
+                    ),
                 ))
             }
             CommandStepOperation::Project { project } => {
@@ -527,7 +545,13 @@ impl<'a> Planner<'a> {
                         values,
                         error_path: error_path.to_owned(),
                     },
-                    output(cte, &returning, true, ResolvedCommandStepKind::ProjectMany),
+                    guaranteed_output(
+                        cte,
+                        &returning,
+                        true,
+                        ResolvedCommandStepKind::ProjectMany,
+                        input.guaranteed_non_empty,
+                    ),
                 ))
             }
             CommandStepOperation::FixedRows { fixed_rows } => {
@@ -567,7 +591,13 @@ impl<'a> Planner<'a> {
                         rows,
                         error_path: error_path.to_owned(),
                     },
-                    output(cte, &columns, true, ResolvedCommandStepKind::FixedRows),
+                    guaranteed_output(
+                        cte,
+                        &columns,
+                        true,
+                        ResolvedCommandStepKind::FixedRows,
+                        true,
+                    ),
                 ))
             }
             CommandStepOperation::Decision { decision } => {
@@ -637,7 +667,13 @@ impl<'a> Planner<'a> {
                         order_by,
                         error_path: error_path.to_owned(),
                     },
-                    output(cte, &returning, true, ResolvedCommandStepKind::DecisionMany),
+                    guaranteed_output(
+                        cte,
+                        &returning,
+                        true,
+                        ResolvedCommandStepKind::DecisionMany,
+                        row_set.guaranteed_non_empty,
+                    ),
                 ))
             }
             CommandStepOperation::AssertWhen { assert_when } => {
@@ -670,6 +706,7 @@ impl<'a> Planner<'a> {
                         returning: Vec::new(),
                         field_rows: BTreeMap::new(),
                         many: false,
+                        guaranteed_non_empty: false,
                         kind: ResolvedCommandStepKind::Scalar,
                     },
                 ))
@@ -1282,6 +1319,7 @@ impl<'a> Planner<'a> {
                         returning: Vec::new(),
                         field_rows,
                         many: false,
+                        guaranteed_non_empty: false,
                         kind: ResolvedCommandStepKind::Allocation,
                     },
                 ))
@@ -1322,41 +1360,6 @@ impl<'a> Planner<'a> {
             .collect()
     }
 
-    fn resolve_command_row_set<'b>(
-        &self,
-        value: &CommandValue,
-        previous_steps: &'b BTreeMap<String, ResolvedCommandStep>,
-        expected_kind: ResolvedCommandStepKind,
-        path: &str,
-    ) -> Result<&'b ResolvedCommandStep, PlanError> {
-        let CommandValue::Step {
-            step,
-            column: None,
-            field: None,
-            where_nonzero: None,
-        } = value
-        else {
-            return Err(PlanError::validation(
-                path,
-                "command row-set input did not resolve to a complete prior step",
-            ));
-        };
-        let resolved = previous_steps.get(step).ok_or_else(|| {
-            PlanError::validation(path, "command row-set input was not resolved before use")
-        })?;
-        if resolved.kind != expected_kind {
-            return Err(PlanError::validation(
-                path,
-                "command row-set input has an invalid resolved producer",
-            ));
-        }
-        let _closed_value = CommandExecutionValue::StepRows {
-            cte: resolved.cte.clone(),
-            columns: resolved.returning.clone(),
-        };
-        Ok(resolved)
-    }
-
     fn resolve_any_command_row_set(
         &self,
         value: &CommandValue,
@@ -1389,6 +1392,7 @@ impl<'a> Planner<'a> {
                     .cloned()
                     .map(|column| (column.name.clone(), column))
                     .collect(),
+                guaranteed_non_empty: false,
             });
         }
         if !resolved.kind.is_row_set() {
@@ -1400,6 +1404,7 @@ impl<'a> Planner<'a> {
         Ok(ResolvedCommandRowSet {
             cte: resolved.cte.clone(),
             columns: resolved.columns.clone(),
+            guaranteed_non_empty: resolved.guaranteed_non_empty,
         })
     }
 
@@ -3889,11 +3894,11 @@ fn command_result_literal_type(value: &Json) -> &'static str {
 fn resolve_command_aggregate(
     name: &str,
     aggregate: &CommandAggregate,
-    input: &ResolvedCommandStep,
+    row_set: &ResolvedCommandRowSet,
     path: &str,
 ) -> Result<CommandAggregateIr, PlanError> {
     let input_column = |name: &str| {
-        input.columns.get(name).cloned().ok_or_else(|| {
+        row_set.columns.get(name).cloned().ok_or_else(|| {
             PlanError::validation(
                 path,
                 format!("aggregate input column '{name}' was not resolved before SQLgen"),
@@ -3913,7 +3918,7 @@ fn resolve_command_aggregate(
             let input = input_column(command_aggregate_selector(sum, path)?)?;
             let pg_type = match input.pg_type.as_str() {
                 "int2" | "int4" | "serial" => "int8",
-                "int8" | "bigint" | "bigserial" => "numeric",
+                "int8" | "bigint" | "bigserial" => "int8",
                 "float4" => "float4",
                 "float8" => "float8",
                 "numeric" | "decimal" => "numeric",
@@ -3928,7 +3933,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: pg_type.to_owned(),
-                    nullable: true,
+                    nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,
             })
@@ -3939,7 +3944,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: input.pg_type.clone(),
-                    nullable: true,
+                    nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,
             })
@@ -3950,7 +3955,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: input.pg_type.clone(),
-                    nullable: true,
+                    nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,
             })

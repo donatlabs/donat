@@ -600,7 +600,7 @@ fn relational_batch_rejects_invalid_aggregate_sources_and_types() {
     scalar_source["result"] = json!({ "totals": { "step": "totals" } });
     assert_rejected(
         scalar_source,
-        "aggregate input must be a prior select_many row set",
+        "aggregate input must be a prior row-set step",
     );
 
     let mut forward_source = relational_batch_command();
@@ -960,6 +960,108 @@ fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
             { "name": "line_count" },
             { "name": "quantity_sum" }
         ])
+    );
+}
+
+#[test]
+fn bounded_aggregate_preserves_bigint_width_and_non_empty_nullability() {
+    let mut command = relational_batch_command();
+    command["steps"][0]["select_many"]["returning"] =
+        json!(["id", "customer_id", "status", "quantity", "amount_minor"]);
+    command["steps"][1]["aggregate"]["values"]["quantity_sum"] =
+        json!({ "sum": { "column": "amount_minor" } });
+    let mut catalog = catalog(RelationKind::Table);
+    catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .columns
+        .push(column("amount_minor", "int8"));
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog)]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          mutation {
+            reserve_orders(customer_id: "00000000-0000-0000-0000-000000000001") {
+              totals { quantity_sum }
+            }
+          }
+        "#,
+    )
+    .expect("a guaranteed non-empty bigint sum plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    let CommandExecutionStep::Aggregate { values, .. } = &command.steps[1] else {
+        panic!("second step must be the aggregate");
+    };
+    let sum = values
+        .iter()
+        .find(|aggregate| aggregate.output().name == "quantity_sum")
+        .expect("sum output");
+    assert_eq!(sum.output().pg_type, "int8");
+    assert!(!sum.output().nullable);
+}
+
+#[test]
+fn aggregate_accepts_cardinality_preserving_project_many_without_inventing_non_empty() {
+    let mut projected = relational_batch_command();
+    projected
+        .get_mut("steps")
+        .and_then(Json::as_array_mut)
+        .expect("relational steps")
+        .insert(
+            1,
+            json!({
+                "name": "projected",
+                "project_many": {
+                    "from": { "step": "selected" },
+                    "maximum_rows": 256,
+                    "values": {
+                        "quantity": { "item": "quantity" },
+                        "status": { "item": "status" }
+                    }
+                }
+            }),
+        );
+    projected["steps"][2]["aggregate"]["from"] = json!({ "step": "projected" });
+    compile(&metadata(vec![projected.clone()]), RelationKind::Table)
+        .expect("aggregate accepts a bounded project_many row set");
+
+    projected["steps"][0]["select_many"]["require_non_empty"] = json!(false);
+    projected
+        .get_mut("steps")
+        .and_then(Json::as_array_mut)
+        .expect("relational steps")
+        .push(json!({
+            "name": "sum_valid",
+            "assert": {
+                "rule": "amount_is_valid",
+                "with": {
+                    "amount": { "step": "totals", "column": "quantity_sum" }
+                }
+            }
+        }));
+    let metadata = metadata(vec![projected]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let error = compile_command_catalog(
+        &metadata,
+        &catalogs,
+        &bigint_binding_rules(int64_type()),
+        true,
+    )
+    .expect_err("project_many must not invent a non-empty guarantee");
+    assert_eq!(
+        error.message,
+        "nullable int8 is not assignable to rule binding 'amount' (int8)"
     );
 }
 
