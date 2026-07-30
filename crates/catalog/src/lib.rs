@@ -131,14 +131,21 @@ pub struct ForeignKey {
 }
 
 const COLUMNS_SQL: &str = r#"
-SELECT n.nspname, c.relname, a.attname, t.typname, a.atttypmod,
-       NOT a.attnotnull AS nullable,
+SELECT n.nspname, c.relname, a.attname,
+       COALESCE(base_t.typname, t.typname) AS logical_type,
+       a.atttypmod,
+       NOT (a.attnotnull OR t.typnotnull) AS nullable,
        a.atthasdef AS has_default,
-       c.relkind
+       c.relkind,
+       CASE WHEN t.typtype = 'd'
+            THEN quote_ident(tn.nspname) || '.' || quote_ident(t.typname)
+       END AS native_type
 FROM pg_attribute a
 JOIN pg_class c ON a.attrelid = c.oid
 JOIN pg_namespace n ON c.relnamespace = n.oid
 JOIN pg_type t ON a.atttypid = t.oid
+JOIN pg_namespace tn ON t.typnamespace = tn.oid
+LEFT JOIN pg_type base_t ON t.typtype = 'd' AND t.typbasetype = base_t.oid
 WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p')
   AND a.attnum > 0
   AND NOT a.attisdropped
@@ -228,7 +235,7 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
             name: row.get(2),
             pg_type: row.get(3),
             pg_typmod: row.get(4),
-            native_type: None,
+            native_type: row.get(8),
             nullable: row.get(5),
             has_default: row.get(6),
         });

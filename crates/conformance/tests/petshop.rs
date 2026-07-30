@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use donat_conformance::{apply_sql_migration_dir, Suite, Transport};
+use donat_conformance::{Suite, Transport, apply_sql_migration_dir};
 
 fn petshop_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -176,6 +176,68 @@ fn command_relations_are_tracked_in_petshop_metadata() {
         missing.is_empty(),
         "active Petshop command relations must be tracked; missing: {missing:?}"
     );
+}
+
+#[test]
+fn command_view_outputs_preserve_declared_non_nullability() {
+    let root = petshop_root();
+    let running = Suite::new("petshop_command_view_nullability").start();
+    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
+        .expect("connect to the Petshop command-view catalog database");
+
+    for view in [
+        "cart_checkout_context",
+        "cart_price_candidate",
+        "cart_pricing",
+        "order_current_authorization",
+        "order_inventory_allocation_candidate",
+        "inventory_allocation_line",
+        "order_return_context",
+        "return_refund_context",
+        "order_vendor_split_candidate",
+        "vendor_payout_candidate",
+        "customer_prescription_order_line",
+    ] {
+        let columns = client
+            .query(
+                "SELECT a.attname, t.typtype::text, t.typname, t.typnotnull
+                 FROM pg_attribute a
+                 JOIN pg_class c ON c.oid = a.attrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 JOIN pg_type t ON t.oid = a.atttypid
+                 WHERE n.nspname = 'public'
+                   AND c.relname = $1
+                   AND a.attnum > 0
+                   AND NOT a.attisdropped
+                 ORDER BY a.attnum",
+                &[&view],
+            )
+            .expect("inspect command-facing view columns");
+        assert!(
+            !columns.is_empty(),
+            "command-facing view public.{view} must exist"
+        );
+        for column in columns {
+            let column_name = column.get::<_, String>(0);
+            let type_kind = column.get::<_, String>(1);
+            let native_type = column.get::<_, String>(2);
+            let type_not_null = column.get::<_, bool>(3);
+            assert!(
+                type_not_null,
+                "public.{view}.{} is semantically non-null and must be represented by a NOT NULL domain",
+                column_name
+            );
+            assert_eq!(
+                type_kind, "d",
+                "public.{view}.{column_name} must retain a native domain type"
+            );
+            assert!(
+                native_type.starts_with("petshop_required_"),
+                "public.{view}.{column_name} has unexpected domain {native_type}"
+            );
+        }
+    }
 }
 
 #[test]

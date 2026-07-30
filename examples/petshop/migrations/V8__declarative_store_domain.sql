@@ -3,6 +3,14 @@
 -- integrity, deterministic command-facing views, and seed-independent defaults.
 
 DROP VIEW order_operations;
+DROP VIEW cart_pricing;
+
+CREATE DOMAIN petshop_required_text AS text NOT NULL;
+CREATE DOMAIN petshop_required_int4 AS integer NOT NULL;
+CREATE DOMAIN petshop_required_int8 AS bigint NOT NULL;
+CREATE DOMAIN petshop_required_uuid AS uuid NOT NULL;
+CREATE DOMAIN petshop_required_bool AS boolean NOT NULL;
+CREATE DOMAIN petshop_required_jsonb AS jsonb NOT NULL;
 
 ALTER TABLE cart DROP CONSTRAINT cart_status_check;
 DROP INDEX cart_one_open_per_customer;
@@ -106,15 +114,33 @@ ALTER TABLE shipment ADD CONSTRAINT shipment_status_check
 CREATE UNIQUE INDEX shipment_key_unique
   ON shipment(shipment_key) WHERE shipment_key IS NOT NULL;
 
+CREATE VIEW cart_pricing AS
+SELECT
+  cart.id::petshop_required_int8 AS cart_id,
+  cart.customer_id::petshop_required_text AS customer_id,
+  cart_line.variant_id::petshop_required_int8 AS variant_id,
+  product_variant.sku::petshop_required_text AS sku,
+  product.title::petshop_required_text AS title,
+  cart_line.quantity::petshop_required_int4 AS quantity,
+  product_variant.price_minor::petshop_required_int8 AS unit_price_minor,
+  product_variant.currency::petshop_required_text AS currency,
+  (product_variant.price_minor * cart_line.quantity)::petshop_required_int8 AS line_total_minor,
+  inventory_stock.available_quantity::petshop_required_int4 AS available_quantity
+FROM cart
+JOIN cart_line ON cart_line.cart_id = cart.id
+JOIN product_variant ON product_variant.id = cart_line.variant_id
+JOIN product ON product.id = product_variant.product_id
+JOIN inventory_stock ON inventory_stock.variant_id = product_variant.id;
+
 CREATE VIEW cart_checkout_context AS
 SELECT
-  cart.id AS cart_id,
-  cart.customer_id,
-  cart.status,
-  'standard'::text AS customer_tier,
-  'web'::text AS sales_channel,
-  false AS coupon_present,
-  COALESCE(address.country_code, 'US') AS destination_country_code
+  cart.id::petshop_required_int8 AS cart_id,
+  cart.customer_id::petshop_required_text AS customer_id,
+  cart.status::petshop_required_text AS status,
+  'standard'::petshop_required_text AS customer_tier,
+  'web'::petshop_required_text AS sales_channel,
+  false::petshop_required_bool AS coupon_present,
+  COALESCE(address.country_code, 'US')::petshop_required_text AS destination_country_code
 FROM cart
 LEFT JOIN LATERAL (
   SELECT customer_address.country_code
@@ -126,21 +152,21 @@ LEFT JOIN LATERAL (
 
 CREATE VIEW cart_price_candidate AS
 SELECT
-  cart_line.cart_id,
-  cart.customer_id,
-  'retail'::text AS price_list_code,
-  row_number() OVER (
+  cart_line.cart_id::petshop_required_int8 AS cart_id,
+  cart.customer_id::petshop_required_text AS customer_id,
+  'retail'::petshop_required_text AS price_list_code,
+  (row_number() OVER (
     PARTITION BY cart_line.cart_id
     ORDER BY cart_line.id, cart_line.variant_id
-  )::integer AS line_sequence,
-  product_variant.id AS variant_id,
-  product_variant.sku,
-  product.title,
-  cart_line.quantity,
-  category.slug AS taxable_category,
-  product_variant.price_minor AS unit_price_minor,
-  product_variant.price_minor * cart_line.quantity AS line_subtotal_minor,
-  product_variant.currency
+  )::integer)::petshop_required_int4 AS line_sequence,
+  product_variant.id::petshop_required_int8 AS variant_id,
+  product_variant.sku::petshop_required_text AS sku,
+  product.title::petshop_required_text AS title,
+  cart_line.quantity::petshop_required_int4 AS quantity,
+  category.slug::petshop_required_text AS taxable_category,
+  product_variant.price_minor::petshop_required_int8 AS unit_price_minor,
+  (product_variant.price_minor * cart_line.quantity)::petshop_required_int8 AS line_subtotal_minor,
+  product_variant.currency::petshop_required_text AS currency
 FROM cart_line
 JOIN cart ON cart.id = cart_line.cart_id
 JOIN product_variant ON product_variant.id = cart_line.variant_id
@@ -321,11 +347,11 @@ CREATE UNIQUE INDEX notification_delivery_provider_message_unique
 
 CREATE VIEW order_current_authorization AS
 SELECT DISTINCT ON (payment.order_id)
-  payment.order_id,
-  orders.customer_id,
-  payment.id AS payment_id,
-  payment_authorization.id AS authorization_id,
-  payment.currency
+  payment.order_id::petshop_required_uuid AS order_id,
+  orders.customer_id::petshop_required_text AS customer_id,
+  payment.id::petshop_required_uuid AS payment_id,
+  payment_authorization.id::petshop_required_uuid AS authorization_id,
+  payment.currency::petshop_required_text AS currency
 FROM payment
 JOIN orders ON orders.id = payment.order_id
 JOIN payment_authorization ON payment_authorization.payment_id = payment.id
@@ -347,19 +373,19 @@ SELECT variant_id, 'main', on_hand, reserved FROM inventory_stock;
 
 CREATE VIEW order_inventory_allocation_candidate AS
 SELECT
-  order_line.order_id,
-  order_line.id AS order_line_id,
-  row_number() OVER (
+  order_line.order_id::petshop_required_uuid AS order_id,
+  order_line.id::petshop_required_uuid AS order_line_id,
+  (row_number() OVER (
     PARTITION BY order_line.order_id
     ORDER BY order_line.id, inventory_level.location_code, inventory_level.id
-  )::integer AS line_sequence,
-  order_line.variant_id,
-  order_line.quantity AS requested_quantity,
-  inventory_level.location_code,
-  inventory_level.id AS inventory_level_id,
-  inventory_level.on_hand_quantity - inventory_level.reserved_quantity AS available_quantity,
-  order_line.unit_price_minor,
-  order_line.currency
+  )::integer)::petshop_required_int4 AS line_sequence,
+  order_line.variant_id::petshop_required_int8 AS variant_id,
+  order_line.quantity::petshop_required_int4 AS requested_quantity,
+  inventory_level.location_code::petshop_required_text AS location_code,
+  inventory_level.id::petshop_required_uuid AS inventory_level_id,
+  (inventory_level.on_hand_quantity - inventory_level.reserved_quantity)::petshop_required_int4 AS available_quantity,
+  order_line.unit_price_minor::petshop_required_int8 AS unit_price_minor,
+  order_line.currency::petshop_required_text AS currency
 FROM order_line
 JOIN inventory_level ON inventory_level.variant_id = order_line.variant_id
 WHERE inventory_level.on_hand_quantity > inventory_level.reserved_quantity;
@@ -381,17 +407,17 @@ CREATE TABLE inventory_allocation (
 
 CREATE VIEW inventory_allocation_line AS
 SELECT
-  allocation_id,
-  order_line_id,
-  row_number() OVER (
+  allocation_id::petshop_required_uuid AS allocation_id,
+  order_line_id::petshop_required_uuid AS order_line_id,
+  (row_number() OVER (
     PARTITION BY allocation_id
     ORDER BY order_line_id, inventory_level_id
-  )::integer AS line_sequence,
-  order_line.variant_id,
-  inventory_allocation.quantity,
-  inventory_allocation.unit_price_minor,
-  inventory_allocation.quantity * inventory_allocation.unit_price_minor AS line_value_minor,
-  inventory_allocation.currency
+  )::integer)::petshop_required_int4 AS line_sequence,
+  order_line.variant_id::petshop_required_int8 AS variant_id,
+  inventory_allocation.quantity::petshop_required_int4 AS quantity,
+  inventory_allocation.unit_price_minor::petshop_required_int8 AS unit_price_minor,
+  (inventory_allocation.quantity * inventory_allocation.unit_price_minor)::petshop_required_int8 AS line_value_minor,
+  inventory_allocation.currency::petshop_required_text AS currency
 FROM inventory_allocation
 JOIN order_line ON order_line.id = inventory_allocation.order_line_id;
 
@@ -433,10 +459,10 @@ CREATE TABLE shipment_result (
 
 CREATE VIEW order_return_context AS
 SELECT DISTINCT ON (orders.id)
-  orders.id AS order_id,
-  orders.customer_id,
-  payment.id AS payment_id,
-  orders.currency,
+  orders.id::petshop_required_uuid AS order_id,
+  orders.customer_id::petshop_required_text AS customer_id,
+  payment.id::petshop_required_uuid AS payment_id,
+  orders.currency::petshop_required_text AS currency,
   jsonb_build_object(
     'recipient_name', customer.name,
     'address_line_1', customer_address.line1,
@@ -445,7 +471,7 @@ SELECT DISTINCT ON (orders.id)
     'region', '',
     'postal_code', customer_address.postal_code,
     'country_code', customer_address.country_code
-  ) AS return_from
+  )::petshop_required_jsonb AS return_from
 FROM orders
 JOIN payment ON payment.order_id = orders.id
 JOIN customer ON customer.customer_id = orders.customer_id
@@ -510,13 +536,13 @@ ALTER TABLE refund
 
 CREATE VIEW return_refund_context AS
 SELECT
-  return_request.id AS return_id,
-  return_request.order_id,
-  payment.id AS payment_id,
-  payment.currency,
-  return_request.status,
-  return_request.replacement_requested,
-  GREATEST(payment.captured_minor - payment.refunded_minor, 0) AS eligible_refund_minor
+  return_request.id::petshop_required_uuid AS return_id,
+  return_request.order_id::petshop_required_uuid AS order_id,
+  payment.id::petshop_required_uuid AS payment_id,
+  payment.currency::petshop_required_text AS currency,
+  return_request.status::petshop_required_text AS status,
+  return_request.replacement_requested::petshop_required_bool AS replacement_requested,
+  GREATEST(payment.captured_minor - payment.refunded_minor, 0)::petshop_required_int8 AS eligible_refund_minor
 FROM return_request
 JOIN payment ON payment.order_id = return_request.order_id
 WHERE payment.status IN ('captured', 'paid', 'refunded');
@@ -633,16 +659,16 @@ CREATE TABLE credit_usage (
 
 CREATE VIEW order_vendor_split_candidate AS
 SELECT
-  order_line.order_id,
-  order_line.id AS order_line_id,
-  row_number() OVER (
+  order_line.order_id::petshop_required_uuid AS order_id,
+  order_line.id::petshop_required_uuid AS order_line_id,
+  (row_number() OVER (
     PARTITION BY order_line.order_id ORDER BY order_line.id, product_variant.sku
-  )::integer AS line_sequence,
-  md5('offer:' || product_variant.sku)::uuid AS offer_id,
-  md5('vendor:' || category.slug)::uuid AS vendor_id,
-  category.slug AS product_category,
-  order_line.line_subtotal_minor AS gross_minor,
-  order_line.currency
+  )::integer)::petshop_required_int4 AS line_sequence,
+  (md5('offer:' || product_variant.sku)::uuid)::petshop_required_uuid AS offer_id,
+  (md5('vendor:' || category.slug)::uuid)::petshop_required_uuid AS vendor_id,
+  category.slug::petshop_required_text AS product_category,
+  order_line.line_subtotal_minor::petshop_required_int8 AS gross_minor,
+  order_line.currency::petshop_required_text AS currency
 FROM order_line
 JOIN product_variant ON product_variant.id = order_line.variant_id
 JOIN product ON product.id = product_variant.product_id
@@ -693,14 +719,14 @@ CREATE UNIQUE INDEX vendor_payout_provider_id_unique
   ON vendor_payout(provider_payout_id) WHERE provider_payout_id IS NOT NULL;
 CREATE VIEW vendor_payout_candidate AS
 SELECT
-  '00000000-0000-0000-0000-000000000001'::uuid AS payout_cycle_id,
-  vendor_id,
-  ('00000000-0000-0000-0000-000000000001:' || vendor_id::text || ':' || currency)::text AS payout_key,
-  count(*)::integer AS vendor_order_count,
-  sum(gross_minor)::bigint AS gross_minor,
-  sum((gross_minor * commission_bps) / 10000)::bigint AS commission_minor,
-  sum(gross_minor - ((gross_minor * commission_bps) / 10000))::bigint AS net_minor,
-  currency
+  '00000000-0000-0000-0000-000000000001'::petshop_required_uuid AS payout_cycle_id,
+  vendor_id::petshop_required_uuid AS vendor_id,
+  ('00000000-0000-0000-0000-000000000001:' || vendor_id::text || ':' || currency)::petshop_required_text AS payout_key,
+  (count(*)::integer)::petshop_required_int4 AS vendor_order_count,
+  (sum(gross_minor)::bigint)::petshop_required_int8 AS gross_minor,
+  (sum((gross_minor * commission_bps) / 10000)::bigint)::petshop_required_int8 AS commission_minor,
+  (sum(gross_minor - ((gross_minor * commission_bps) / 10000))::bigint)::petshop_required_int8 AS net_minor,
+  currency::petshop_required_text AS currency
 FROM vendor_order
 WHERE status = 'accepted'
 GROUP BY vendor_id, currency;
@@ -757,8 +783,8 @@ CREATE TABLE grooming_booking_event (
 
 CREATE VIEW customer_prescription_order_line AS
 SELECT
-  order_line.id AS order_line_id,
-  orders.customer_id
+  order_line.id::petshop_required_uuid AS order_line_id,
+  orders.customer_id::petshop_required_text AS customer_id
 FROM order_line
 JOIN orders ON orders.id = order_line.order_id;
 CREATE TABLE prescription_request (

@@ -104,3 +104,96 @@ async fn introspection_retains_raw_postgres_type_modifiers() {
         .expect("test table must be dropped");
     connection_task.abort();
 }
+
+#[tokio::test]
+async fn introspection_preserves_domain_view_nullability_and_base_logical_type() {
+    let pg_url = env::var("PG_URL")
+        .unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:15432/postgres".to_string());
+    let (client, connection) = tokio_postgres::connect(&pg_url, NoTls)
+        .await
+        .expect("Postgres must be available for catalog introspection tests");
+    let connection_task = tokio::spawn(connection);
+
+    let suffix = std::process::id();
+    let required_domain = format!("catalog_required_text_{suffix}");
+    let nullable_domain = format!("catalog_nullable_text_{suffix}");
+    let source = format!("catalog_domain_source_{suffix}");
+    let view = format!("catalog_domain_view_{suffix}");
+    client
+        .batch_execute(&format!(
+            "CREATE DOMAIN public.{required_domain} AS text NOT NULL; \
+             CREATE DOMAIN public.{nullable_domain} AS text; \
+             CREATE TABLE public.{source} (\
+               id integer PRIMARY KEY, \
+               required_value text NOT NULL, \
+               optional_value text\
+             ); \
+             INSERT INTO public.{source} VALUES (1, 'present', NULL); \
+             CREATE VIEW public.{view} AS SELECT \
+               required_value::{required_domain} AS required_domain_value, \
+               optional_value::{nullable_domain} AS nullable_domain_value, \
+               optional_value::{required_domain} AS checked_required_value, \
+               required_value AS base_view_value \
+             FROM public.{source};"
+        ))
+        .await
+        .expect("domain-backed test view must be created");
+
+    let catalog = introspect(&client)
+        .await
+        .expect("domain-backed view must be introspected");
+    let view_info = catalog.table("public", &view).expect("test view exists");
+
+    let required = view_info
+        .column("required_domain_value")
+        .expect("required domain column exists");
+    assert_eq!(required.pg_type, "text");
+    assert_eq!(
+        required.native_type.as_deref(),
+        Some(format!("public.{required_domain}").as_str())
+    );
+    assert!(!required.nullable);
+
+    let nullable = view_info
+        .column("nullable_domain_value")
+        .expect("nullable domain column exists");
+    assert_eq!(nullable.pg_type, "text");
+    assert_eq!(
+        nullable.native_type.as_deref(),
+        Some(format!("public.{nullable_domain}").as_str())
+    );
+    assert!(nullable.nullable);
+
+    let base = view_info
+        .column("base_view_value")
+        .expect("base view column exists");
+    assert_eq!(base.pg_type, "text");
+    assert_eq!(base.native_type, None);
+    assert!(
+        base.nullable,
+        "plain view expressions retain PostgreSQL's conservative nullability"
+    );
+
+    let error = client
+        .query(
+            &format!("SELECT checked_required_value FROM public.{view}"),
+            &[],
+        )
+        .await
+        .expect_err("a NOT NULL domain cast must reject a null view expression");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::NOT_NULL_VIOLATION)
+    );
+
+    client
+        .batch_execute(&format!(
+            "DROP VIEW public.{view}; \
+             DROP TABLE public.{source}; \
+             DROP DOMAIN public.{nullable_domain}; \
+             DROP DOMAIN public.{required_domain};"
+        ))
+        .await
+        .expect("domain-backed test objects must be dropped");
+    connection_task.abort();
+}
