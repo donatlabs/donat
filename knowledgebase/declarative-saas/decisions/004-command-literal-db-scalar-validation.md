@@ -64,6 +64,16 @@ when the descriptor was derived from a nullable concrete column. The compiled
 command preserves the concrete SQL type needed to render that null as a typed
 SQL null; a non-nullable column is a deploy-time validation error.
 
+Pure value contexts such as `fixed_rows` and command results have no
+destination column from which to derive a type. Non-null scalar literals
+retain inference, while an otherwise uninferable nullable literal uses the
+closed form
+`{ literal: null, as: uuid }`. The annotation must resolve through the same
+command and Rules type catalog to exactly one nullable scalar; lists, objects,
+unknown names, and non-null annotations reject deployment. Request planning
+retains the resolved PostgreSQL representation. Result literals obtain that
+cast from the compiled result contract rather than reparsing the annotation.
+
 Validation stays deploy-time only. `donat validate`, candidate-engine
 construction, and `migrate --metadata-dir` report the error before serving;
 the serving path does not introspect, issue DDL, mutate metadata, or loosen a
@@ -79,6 +89,7 @@ no Rust row-by-row response assembly.
 | Reuse GraphQL scalar names as the literal validator | GraphQL `Int`, `Float`, and `String` cannot express concrete integer widths, numeric typmods, string limits, or timestamp precision. |
 | Let PostgreSQL discover invalid literals at command execution | Turns deploy-time metadata errors into request-time failures and can leave error behavior dependent on a particular runtime path. |
 | Accept unknown types as strings or generic numerics | Reintroduces the information loss that caused the rejected Task 2 range and can silently change stored data. |
+| Treat an untyped result `null` as JSONB | Makes a field's GraphQL and SQL types depend on an implementation fallback instead of metadata. |
 | Add runtime DDL or an administrative bypass to inspect types on demand | Violates the deploy-time configuration model and the explicit-role/no-admin boundary. |
 
 ## Consequences

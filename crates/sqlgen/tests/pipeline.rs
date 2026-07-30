@@ -43,6 +43,7 @@ fn fixture_catalog() -> Catalog {
                 col("secret", "text", true),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -59,6 +60,7 @@ fn fixture_catalog() -> Catalog {
                 col("published", "bool", false),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),

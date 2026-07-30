@@ -12,8 +12,10 @@ arguments:
 steps:
   - name: allocation
     select_one:
-      table: { schema: public, name: inventory_allocation }
-      by: { allocation_id: { arg: allocation_id } }
+      table: { schema: public, name: inventory_allocation_group }
+      by:
+        allocation_id: { arg: allocation_id }
+        status: { literal: packed }
       returning: [allocation_id, order_id, stock_location_code, status, quantity, currency]
       require_found: true
   - name: allocation_lines

@@ -9,7 +9,7 @@ use donat_ir::{
 use donat_metadata::{Columns, CommandStepOperation, Metadata, ScalarType, SourceKind};
 use donat_rules::{
     DecisionRow, DecisionTableDefinition, HitPolicy, RuleCatalog, RuleDefinition, RuleType,
-    compile_catalog,
+    compile_catalog, compile_catalog_with_declared_types,
 };
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
@@ -50,6 +50,7 @@ fn catalog(relation_kind: RelationKind) -> Catalog {
                     column("created_at", "timestamp"),
                 ],
                 primary_key: vec!["id".to_string()],
+                unique_keys: vec![],
                 foreign_keys: vec![],
             },
         )]),
@@ -632,6 +633,338 @@ fn relational_batch_rejects_invalid_aggregate_sources_and_types() {
 }
 
 #[test]
+fn bounded_argument_rows_compile_for_aggregate_and_update_many() {
+    let command = json!({
+        "name": "apply_order_lines",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [{ "name": "lines", "type": "[OrderInput!]!" }],
+        "steps": [
+            {
+                "name": "totals",
+                "aggregate": {
+                    "from": { "arg": "lines" },
+                    "maximum_items": 2,
+                    "values": {
+                        "item_count": { "count": true },
+                        "quantity_sum": { "sum": { "field": "quantity" } }
+                    }
+                }
+            },
+            {
+                "name": "updated",
+                "update_many": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "for_each": { "arg": "lines" },
+                    "maximum_items": 2,
+                    "by": { "status": { "item": "status" } },
+                    "set": { "quantity": { "item": "quantity" } },
+                    "returning": ["status", "quantity"],
+                    "require_each": true
+                }
+            }
+        ],
+        "result": {
+            "item_count": { "step": "totals", "column": "item_count" },
+            "updated": { "step": "updated" }
+        }
+    });
+    let metadata = metadata(vec![command]);
+    let mut orders = catalog(RelationKind::Table);
+    orders
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .primary_key = vec!["status".to_owned()];
+
+    compile_with_catalog(&metadata, orders)
+        .expect("typed argument lists with explicit bounds compile as row sets");
+}
+
+#[test]
+fn bounded_argument_rows_enforce_a_static_minimum_and_refine_aggregate_nullability() {
+    let command = json!({
+        "name": "sum_order_lines",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [{ "name": "lines", "type": "[OrderInput!]!" }],
+        "steps": [
+            {
+                "name": "totals",
+                "aggregate": {
+                    "from": { "arg": "lines" },
+                    "minimum_items": 1,
+                    "maximum_items": 2,
+                    "values": {
+                        "quantity_sum": { "sum": { "field": "quantity" } }
+                    }
+                }
+            },
+            {
+                "name": "positive_total",
+                "assert": {
+                    "rule": "amount_is_valid",
+                    "with": {
+                        "amount": { "step": "totals", "column": "quantity_sum" }
+                    }
+                }
+            }
+        ],
+        "result": {
+            "quantity_sum": { "step": "totals", "column": "quantity_sum" }
+        }
+    });
+    let declared = metadata(vec![command.clone()]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let rules = bigint_binding_rules(int64_type());
+    let commands = Arc::new(
+        compile_command_catalog(&declared, &catalogs, &rules, true)
+            .expect("a positive minimum proves a non-null aggregate"),
+    );
+
+    let error = plan_runtime(
+        &declared,
+        &catalogs,
+        commands,
+        "customer",
+        "mutation { sum_order_lines(lines: []) { quantity_sum } }",
+    )
+    .expect_err("the request planner enforces the declared lower bound");
+    assert!(
+        error
+            .message
+            .contains("argument row-set requires minimum_items 1"),
+        "{error:?}"
+    );
+
+    let mut missing_minimum = command;
+    missing_minimum["steps"][0]["aggregate"]
+        .as_object_mut()
+        .expect("aggregate object")
+        .remove("minimum_items");
+    let metadata = metadata(vec![missing_minimum]);
+    let error = compile_command_catalog(&metadata, &catalogs, &rules, true)
+        .expect_err("an ordinary possibly-empty list keeps SUM nullable");
+    assert!(
+        error
+            .message
+            .contains("nullable int8 is not assignable to rule binding 'amount' (int8)"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn bounded_argument_rows_require_object_items_and_an_exact_deploy_time_bound() {
+    let aggregate = |type_: &str, maximum_items: Option<u32>| {
+        let mut step = json!({
+            "name": "totals",
+            "aggregate": {
+                "from": { "arg": "lines" },
+                "values": { "item_count": { "count": true } }
+            }
+        });
+        if let Some(maximum_items) = maximum_items {
+            step["aggregate"]["maximum_items"] = json!(maximum_items);
+        }
+        json!({
+            "name": "bounded_aggregate",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [{ "name": "lines", "type": type_ }],
+            "steps": [step],
+            "result": { "item_count": { "step": "totals", "column": "item_count" } }
+        })
+    };
+
+    assert_rejected(
+        aggregate("[OrderInput!]!", None),
+        "aggregate argument row-set source must declare maximum_items",
+    );
+    assert_rejected(
+        aggregate("[OrderInput!]!", Some(0)),
+        "aggregate maximum_items must be between 1 and 256",
+    );
+    assert_rejected(
+        aggregate("[OrderInput!]!", Some(257)),
+        "aggregate maximum_items must be between 1 and 256",
+    );
+    assert_rejected(
+        aggregate("[Int!]!", Some(2)),
+        "aggregate argument list items must be typed objects",
+    );
+
+    let mut invalid_minimum = aggregate("[OrderInput!]!", Some(2));
+    invalid_minimum["steps"][0]["aggregate"]["minimum_items"] = json!(3);
+    assert_rejected(
+        invalid_minimum,
+        "aggregate minimum_items must be between 1 and maximum_items 2",
+    );
+
+    let update_many = |maximum_items: Option<u32>, type_: &str| {
+        let mut operation = json!({
+            "table": { "schema": "public", "name": "orders" },
+            "for_each": { "arg": "lines" },
+            "by": { "id": { "item": "id" } },
+            "set": { "quantity": { "item": "quantity" } }
+        });
+        if let Some(maximum_items) = maximum_items {
+            operation["maximum_items"] = json!(maximum_items);
+        }
+        json!({
+            "name": "bounded_update",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [{ "name": "lines", "type": type_ }],
+            "steps": [{ "name": "updated", "update_many": operation }],
+            "result": { "updated": { "step": "updated" } }
+        })
+    };
+
+    assert_rejected(
+        update_many(None, "[OrderInput!]!"),
+        "update_many argument row-set source must declare maximum_items",
+    );
+    assert_rejected(
+        update_many(Some(257), "[OrderInput!]!"),
+        "update_many maximum_items must be between 1 and 256",
+    );
+    assert_rejected(
+        update_many(Some(2), "[Int!]!"),
+        "update_many argument list items must be typed objects",
+    );
+}
+
+#[test]
+fn bounded_argument_rows_plan_as_typed_internal_ctes_and_reject_bad_runtime_items() {
+    let command = json!({
+        "name": "apply_order_lines",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [{ "name": "lines", "type": "[OrderInput!]!" }],
+        "steps": [
+            {
+                "name": "totals",
+                "aggregate": {
+                    "from": { "arg": "lines" },
+                    "maximum_items": 2,
+                    "values": {
+                        "item_count": { "count": true },
+                        "quantity_sum": { "sum": { "field": "quantity" } }
+                    }
+                }
+            },
+            {
+                "name": "updated",
+                "update_many": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "for_each": { "arg": "lines" },
+                    "maximum_items": 2,
+                    "by": { "status": { "item": "status" } },
+                    "set": { "quantity": { "item": "quantity" } },
+                    "returning": ["status", "quantity"],
+                    "require_each": true
+                }
+            }
+        ],
+        "result": {
+            "item_count": { "step": "totals", "column": "item_count" },
+            "updated": { "step": "updated" }
+        }
+    });
+    let metadata = metadata(vec![command]);
+    let mut orders = catalog(RelationKind::Table);
+    orders
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .primary_key = vec!["status".to_owned()];
+    let catalogs = HashMap::from([("default".to_owned(), orders)]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let query = r#"
+        mutation {
+          apply_order_lines(
+            lines: [
+              { status: "new", quantity: 2 },
+              { status: "held", quantity: 3 }
+            ]
+          ) {
+            item_count
+            updated { status quantity }
+          }
+        }
+    "#;
+    let plan = plan_runtime(&metadata, &catalogs, commands.clone(), "customer", query)
+        .expect("bounded typed argument rows plan");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    assert_eq!(
+        command.steps.len(),
+        4,
+        "each argument consumer owns one input CTE"
+    );
+    assert!(matches!(
+        &command.steps[0],
+        CommandExecutionStep::ArgumentRows {
+            maximum_items: 2,
+            columns,
+            ..
+        } if columns.iter().any(|column| {
+            column.name == "status" && column.pg_type == "text" && !column.nullable
+        }) && columns.iter().any(|column| {
+            column.name == "quantity" && column.pg_type == "int4" && !column.nullable
+        })
+    ));
+    assert!(matches!(
+        &command.steps[1],
+        CommandExecutionStep::Aggregate { input_cte, .. }
+            if input_cte == "_cmd_step_0_input"
+    ));
+    assert!(matches!(
+        &command.steps[2],
+        CommandExecutionStep::ArgumentRows {
+            maximum_items: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &command.steps[3],
+        CommandExecutionStep::UpdateMany { input_cte, require_each: true, .. }
+            if input_cte == "_cmd_step_1_input"
+    ));
+    for (bad_lines, expected) in [
+        (
+            "[{ status: \"one\", quantity: 1 }, { status: \"two\", quantity: 2 }, { status: \"three\", quantity: 3 }]",
+            "argument row-set exceeds maximum_items 2",
+        ),
+        (
+            "[{ status: \"missing\" }]",
+            "missing required input field: \"quantity\"",
+        ),
+        (
+            "[{ status: \"wrong\", quantity: \"many\" }]",
+            "argument does not match declared type 'Int'",
+        ),
+        (
+            "[{ status: \"extra\", quantity: 1, unknown: true }]",
+            "field 'unknown' is not declared by input object 'OrderInput'",
+        ),
+    ] {
+        let query =
+            format!("mutation {{ apply_order_lines(lines: {bad_lines}) {{ item_count }} }}");
+        let error = plan_runtime(&metadata, &catalogs, commands.clone(), "customer", &query)
+            .expect_err("malformed or over-bound argument rows are rejected before SQLgen");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    }
+}
+
+#[test]
 fn relational_batch_rejects_invalid_update_many_input_and_assignments() {
     let mut wrong_input = relational_batch_command();
     wrong_input["steps"][2]["update_many"]["for_each"] = json!({ "step": "totals" });
@@ -681,6 +1014,51 @@ fn relational_batch_rejects_invalid_update_many_input_and_assignments() {
     assert_rejected(
         current_outside_update_many,
         "current_column values require a bounded current-row or update_many target-row scope",
+    );
+}
+
+#[test]
+fn update_many_separates_item_primary_keys_from_command_scoped_equality_guards() {
+    let mut command = relational_batch_command();
+    command["steps"][2]["update_many"]["by"]["customer_id"] = json!({ "arg": "customer_id" });
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          mutation {
+            reserve_orders(customer_id: "00000000-0000-0000-0000-000000000001") {
+              updated { id quantity }
+            }
+          }
+        "#,
+    )
+    .expect("a primary key plus a command-scoped ownership guard remains bounded");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &command.steps[2],
+        CommandExecutionStep::UpdateMany {
+            primary_key,
+            guards,
+            ..
+        } if primary_key.len() == 1 && guards.len() == 1
+    ));
+
+    let mut item_scoped_guard = relational_batch_command();
+    item_scoped_guard["steps"][2]["update_many"]["by"]["customer_id"] =
+        json!({ "item": "customer_id" });
+    assert_rejected(
+        item_scoped_guard,
+        "update_many additional equality guards cannot use current input item fields",
     );
 }
 
@@ -851,6 +1229,83 @@ fn relational_batch_rejects_a_row_set_projected_as_one_scalar() {
 }
 
 #[test]
+fn projected_scalar_steps_expose_a_bounded_zero_or_one_list() {
+    let mut command = valid_command();
+    command["result"] = json!({
+        "items": {
+            "step": "order",
+            "project": {
+                "order_id": "id",
+                "status": "status"
+            },
+            "maximum_items": 1
+        }
+    });
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let mutation = r#"
+        mutation {
+          create_order(
+            id: "00000000-0000-0000-0000-000000000001"
+            customer_id: "00000000-0000-0000-0000-000000000002"
+            status: "new"
+            quantity: 1
+            request_id: "00000000-0000-0000-0000-000000000003"
+          ) {
+            items { order_id status }
+          }
+        }
+    "#;
+    let plan = plan_runtime(&metadata, &catalogs, commands.clone(), "customer", mutation)
+        .expect("a scalar step projection plans as a bounded result list");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &command.result[0].value,
+        CommandResultValue::ProjectedRows {
+            many: false,
+            maximum_items: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &command.selection[0],
+        donat_ir::CommandResultSelection::List { field, .. } if field == "items"
+    ));
+
+    let introspection = introspect_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          {
+            result: __type(name: "CreateOrderResult") {
+              fields {
+                name
+                type { kind name ofType { kind name ofType { kind name } } }
+              }
+            }
+          }
+        "#,
+    );
+    let items = introspection["result"]["fields"]
+        .as_array()
+        .expect("result fields")
+        .iter()
+        .find(|field| field["name"] == "items")
+        .expect("projected list field");
+    assert_eq!(items["type"]["kind"], "NON_NULL");
+    assert_eq!(items["type"]["ofType"]["kind"], "LIST");
+    assert_eq!(items["type"]["ofType"]["ofType"]["kind"], "NON_NULL");
+}
+
+#[test]
 fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
     let metadata = metadata(vec![relational_batch_command()]);
     let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
@@ -869,11 +1324,16 @@ fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
     let MultiSourcePlan::Mutation { roots, .. } = plan else {
         panic!("command must plan as a mutation");
     };
-    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+    let [
+        MutationRoot::Command {
+            command: planned, ..
+        },
+    ] = roots.as_slice()
+    else {
         panic!("expected one command root");
     };
     assert!(matches!(
-        &command.steps[0],
+        &planned.steps[0],
         CommandExecutionStep::SelectMany {
             equality,
             order_by,
@@ -883,11 +1343,11 @@ fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
         } if equality.len() == 1 && order_by.len() == 1 && returning.len() == 4
     ));
     assert!(matches!(
-        &command.steps[1],
+        &planned.steps[1],
         CommandExecutionStep::Aggregate { values, .. } if values.len() == 3
     ));
     assert!(matches!(
-        &command.steps[2],
+        &planned.steps[2],
         CommandExecutionStep::UpdateMany {
             primary_key,
             assignments,
@@ -897,7 +1357,7 @@ fn relational_batch_compiles_typed_ir_and_exact_graphql_result_shapes() {
             ..
         } if primary_key.len() == 1 && assignments.len() == 1 && returning.len() == 2
     ));
-    let serialized = serde_json::to_value(command).expect("relational command IR serializes");
+    let serialized = serde_json::to_value(planned).expect("relational command IR serializes");
     assert!(
         !serialized.to_string().contains("select_many"),
         "runtime IR carries resolved variants rather than raw command metadata: {serialized:#}"
@@ -1677,6 +2137,86 @@ fn command_compiler_maps_every_active_petshop_builtin_scalar_alias() {
         },
         "the bigint alias remains closed under list and item nullability"
     );
+}
+
+#[test]
+fn command_arguments_resolve_closed_types_from_the_rule_catalog() {
+    let payment_outcome = RuleType::Enum {
+        name: "PaymentOutcome".to_owned(),
+        symbols: vec!["authorized".to_owned(), "declined".to_owned()],
+    };
+    let capture_claim = RuleType::Object {
+        name: "PaymentCaptureClaimInput".to_owned(),
+        fields: BTreeMap::from([
+            ("amount_minor".to_owned(), int64_type()),
+            ("shipment_id".to_owned(), RuleType::Uuid),
+        ]),
+    };
+    let evidence = RuleType::OpaqueJson {
+        name: "BoundedProviderEvidence".to_owned(),
+        maximum_bytes: 4096,
+        maximum_depth: 8,
+        maximum_nodes: 128,
+    };
+    let declared_types = BTreeMap::from([
+        ("BoundedProviderEvidence".to_owned(), evidence),
+        ("PaymentCaptureClaimInput".to_owned(), capture_claim),
+        ("PaymentOutcome".to_owned(), payment_outcome),
+    ]);
+    let rules = compile_catalog_with_declared_types(&declared_types, &[], &[])
+        .expect("closed Rule declarations compile without executable rules");
+
+    let mut command = valid_command();
+    command["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .extend([
+            json!({ "name": "outcome", "type": "PaymentOutcome!" }),
+            json!({ "name": "claims", "type": "[PaymentCaptureClaimInput!]!" }),
+            json!({ "name": "evidence", "type": "BoundedProviderEvidence!" }),
+        ]);
+    let metadata = metadata(vec![command]);
+    let catalog = compile_command_source_catalog(
+        &metadata,
+        "default",
+        &catalog(RelationKind::Table),
+        &rules,
+        true,
+    )
+    .expect("commands consume the already compiled closed Rule type catalog");
+    let arguments = &catalog
+        .command("create_order")
+        .expect("compiled command")
+        .descriptor()
+        .arguments;
+
+    assert!(matches!(
+        arguments.roots["outcome"].type_ref.value_type,
+        ValueType::Enum { ref name, ref values }
+            if name == "PaymentOutcome" && values == &["authorized", "declined"]
+    ));
+    assert!(matches!(
+        arguments.roots["claims"].type_ref.value_type,
+        ValueType::List { ref element }
+            if matches!(
+                element.value_type,
+                ValueType::Ref { ref name } if name == "PaymentCaptureClaimInput"
+            )
+    ));
+    assert!(matches!(
+        arguments.named_objects["PaymentCaptureClaimInput"].fields["amount_minor"]
+            .type_ref
+            .value_type,
+        ValueType::Scalar {
+            scalar: ValueScalar::Int64
+        }
+    ));
+    assert!(matches!(
+        arguments.roots["evidence"].type_ref.value_type,
+        ValueType::Scalar {
+            scalar: ValueScalar::Json
+        }
+    ));
 }
 
 #[test]
@@ -2536,12 +3076,17 @@ fn rejects_unknown_columns_arguments_and_forward_step_references() {
 }
 
 #[test]
-fn rejects_mutable_result_shapes_and_unknown_returning_columns() {
-    let mut mutable_result = valid_command();
-    mutable_result["result"]["echo"] = json!({ "arg": "status" });
+fn accepts_immutable_argument_results_and_rejects_mutable_result_shapes() {
+    let mut immutable_argument = valid_command();
+    immutable_argument["result"]["echo"] = json!({ "arg": "status" });
+    compile(&metadata(vec![immutable_argument]), RelationKind::Table)
+        .expect("a command may return one of its immutable typed arguments");
+
+    let mut session_result = valid_command();
+    session_result["result"]["echo"] = json!({ "session_variable": "x-donat-user-id" });
     assert_rejected(
-        mutable_result,
-        "result fields must be step columns or literals",
+        session_result,
+        "cannot expose session or mutable row context values",
     );
 
     let mut unknown_returning = valid_command();
@@ -2550,32 +3095,243 @@ fn rejects_mutable_result_shapes_and_unknown_returning_columns() {
 }
 
 #[test]
-fn rejects_update_and_delete_without_every_primary_key_predicate() {
-    for operation in [
-        json!({
-            "name": "change",
-            "update": {
-                "table": { "schema": "public", "name": "orders" },
-                "where": {},
-                "set": { "status": { "arg": "status" } },
-                "returning": ["id"]
+fn typed_result_literals_support_explicit_nullable_nulls() {
+    let mut command = valid_command();
+    command["result"]["optional_capture_id"] = json!({
+        "literal": null,
+        "as": "uuid"
+    });
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          mutation {
+            create_order(
+              id: "00000000-0000-0000-0000-000000000001"
+              customer_id: "00000000-0000-0000-0000-000000000002"
+              status: "new"
+              quantity: 1
+              request_id: "00000000-0000-0000-0000-000000000003"
+            ) {
+              optional_capture_id
             }
-        }),
-        json!({
-            "name": "remove",
-            "delete": {
-                "table": { "schema": "public", "name": "orders" },
-                "where": {},
-                "returning": ["id"]
-            }
-        }),
+          }
+        "#,
+    )
+    .expect("an explicitly typed nullable null plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &command.result[2].value,
+        CommandResultValue::Scalar {
+            value: Scalar::Json(Json::Null),
+            pg_type,
+        } if pg_type == "uuid"
+    ));
+
+    let mut non_null = valid_command();
+    non_null["result"]["invalid"] = json!({ "literal": null, "as": "uuid!" });
+    assert_rejected(
+        non_null,
+        "null command literals require a nullable typed destination",
+    );
+
+    let mut non_scalar = valid_command();
+    non_scalar["result"]["invalid"] = json!({ "literal": null, "as": "[String!]" });
+    assert_rejected(
+        non_scalar,
+        "command result literal annotations must name one scalar type",
+    );
+}
+
+#[test]
+fn accepts_complete_primary_key_predicates_with_additional_guards() {
+    for (operation, result_step) in [
+        (
+            json!({
+                "name": "selected",
+                "select_one": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "by": {
+                        "id": { "arg": "id" },
+                        "status": { "arg": "status" }
+                    },
+                    "returning": ["id"]
+                }
+            }),
+            "selected",
+        ),
+        (
+            json!({
+                "name": "changed",
+                "update": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": {
+                        "id": { "arg": "id" },
+                        "status": { "arg": "status" }
+                    },
+                    "set": { "status": { "arg": "status" } },
+                    "returning": ["id"]
+                }
+            }),
+            "changed",
+        ),
+        (
+            json!({
+                "name": "removed",
+                "delete": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": {
+                        "id": { "arg": "id" },
+                        "status": { "arg": "status" }
+                    },
+                    "returning": ["id"]
+                }
+            }),
+            "removed",
+        ),
     ] {
         let mut command = valid_command();
         command["steps"] = json!([operation]);
-        command["result"] = json!({ "order_id": { "step": "change", "column": "id" } });
-        if command["steps"][0].get("delete").is_some() {
-            command["result"] = json!({ "order_id": { "step": "remove", "column": "id" } });
+        command["result"] = json!({ "order_id": { "step": result_step, "column": "id" } });
+        compile(&metadata(vec![command]), RelationKind::Table)
+            .expect("a complete primary key plus extra equality guards remains single-row bounded");
+    }
+}
+
+#[test]
+fn accepts_complete_unconditional_unique_keys_with_additional_guards() {
+    for unique_key in [
+        vec!["customer_id".to_string()],
+        vec!["customer_id".to_string(), "quantity".to_string()],
+    ] {
+        let identity = if unique_key.len() == 1 {
+            json!({ "customer_id": { "arg": "customer_id" } })
+        } else {
+            json!({
+                "customer_id": { "arg": "customer_id" },
+                "quantity": { "arg": "quantity" }
+            })
+        };
+        for (operation, result_step) in [
+            (
+                json!({
+                    "name": "selected",
+                    "select_one": {
+                        "table": { "schema": "public", "name": "orders" },
+                        "by": identity.clone(),
+                        "returning": ["id"]
+                    }
+                }),
+                "selected",
+            ),
+            (
+                json!({
+                    "name": "changed",
+                    "update": {
+                        "table": { "schema": "public", "name": "orders" },
+                        "where": identity.clone(),
+                        "set": { "status": { "arg": "status" } },
+                        "returning": ["id"]
+                    }
+                }),
+                "changed",
+            ),
+            (
+                json!({
+                    "name": "removed",
+                    "delete": {
+                        "table": { "schema": "public", "name": "orders" },
+                        "where": identity.clone(),
+                        "returning": ["id"]
+                    }
+                }),
+                "removed",
+            ),
+        ] {
+            let mut operation = operation;
+            let operation_name = operation
+                .as_object()
+                .and_then(|step| {
+                    ["select_one", "update", "delete"]
+                        .into_iter()
+                        .find(|name| step.contains_key(*name))
+                })
+                .expect("test operation has one single-row form");
+            let predicate_name = if operation_name == "select_one" {
+                "by"
+            } else {
+                "where"
+            };
+            operation[operation_name][predicate_name]["status"] = json!({ "arg": "status" });
+
+            let mut command = valid_command();
+            command["steps"] = json!([operation]);
+            command["result"] = json!({ "order_id": { "step": result_step, "column": "id" } });
+            let mut unique_catalog = catalog(RelationKind::Table);
+            unique_catalog
+                .tables
+                .get_mut("public.orders")
+                .expect("orders table")
+                .unique_keys = vec![unique_key.clone()];
+
+            compile_with_catalog(&metadata(vec![command]), unique_catalog).expect(
+                "a complete unconditional unique key plus guards remains single-row bounded",
+            );
         }
+    }
+}
+
+#[test]
+fn rejects_single_row_predicates_without_every_primary_key_column() {
+    for (operation, result_step) in [
+        (
+            json!({
+                "name": "selected",
+                "select_one": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "by": { "status": { "arg": "status" } },
+                    "returning": ["id"]
+                }
+            }),
+            "selected",
+        ),
+        (
+            json!({
+                "name": "changed",
+                "update": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": { "status": { "arg": "status" } },
+                    "set": { "status": { "arg": "status" } },
+                    "returning": ["id"]
+                }
+            }),
+            "changed",
+        ),
+        (
+            json!({
+                "name": "removed",
+                "delete": {
+                    "table": { "schema": "public", "name": "orders" },
+                    "where": { "status": { "arg": "status" } },
+                    "returning": ["id"]
+                }
+            }),
+            "removed",
+        ),
+    ] {
+        let mut command = valid_command();
+        command["steps"] = json!([operation]);
+        command["result"] = json!({ "order_id": { "step": result_step, "column": "id" } });
         assert_rejected(command, "requires every primary-key column");
     }
 }
@@ -2890,7 +3646,7 @@ fn rejects_multi_row_step_columns_bound_to_a_scalar_destination() {
 
 #[test]
 fn allocate_many_compiles_to_bounded_typed_ir_with_named_row_sets() {
-    let command = json!({
+    let mut command = json!({
         "name": "allocate_test",
         "source": "default",
         "permissions": [{ "role": "customer" }],
@@ -2962,6 +3718,20 @@ fn allocate_many_compiles_to_bounded_typed_ir_with_named_row_sets() {
             }
         }
     });
+    command["steps"]
+        .as_array_mut()
+        .expect("allocation steps")
+        .push(json!({
+            "name": "allocation_group_count",
+            "aggregate": {
+                "from": { "step": "allocation", "field": "groups" },
+                "values": {
+                    "item_count": { "count": true }
+                }
+            }
+        }));
+    command["result"]["allocation_group_count"] =
+        json!({ "step": "allocation_group_count", "column": "item_count" });
     let metadata = metadata(vec![command]);
     let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
     let commands = command_catalog(&metadata, &catalogs);
@@ -3016,6 +3786,11 @@ fn allocate_many_compiles_to_bounded_typed_ir_with_named_row_sets() {
             ..
         } if cte.ends_with("_groups")
     ));
+    assert!(matches!(
+        &command.steps[2],
+        CommandExecutionStep::Aggregate { input_cte, .. }
+            if input_cte.ends_with("_groups")
+    ));
 
     let introspection = introspect_runtime(
         &metadata,
@@ -3068,6 +3843,68 @@ fn rejects_wrong_scalar_and_rule_binding_types() {
     assert_rejected(
         rule_mismatch,
         "is not assignable to rule binding 'customer_id'",
+    );
+}
+
+#[test]
+fn declared_rule_enums_assign_one_way_to_text_columns() {
+    let state = RuleType::Enum {
+        name: "PaymentState".to_owned(),
+        symbols: vec!["pending".to_owned(), "captured".to_owned()],
+    };
+    let rules = compile_catalog_with_declared_types(
+        &BTreeMap::from([("PaymentState".to_owned(), state.clone())]),
+        &[
+            RuleDefinition {
+                name: "pending_state".to_owned(),
+                bindings: BTreeMap::new(),
+                result: state.clone(),
+                expression: "PaymentState::pending".to_owned(),
+            },
+            RuleDefinition {
+                name: "requires_state".to_owned(),
+                bindings: BTreeMap::from([("current".to_owned(), state)]),
+                result: RuleType::Bool,
+                expression: "true".to_owned(),
+            },
+        ],
+        &[],
+    )
+    .expect("declared enum Rules compile");
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+
+    let mut enum_to_text = valid_command();
+    enum_to_text["steps"][0]["insert"]["object"]["status"] = json!({ "rule": "pending_state" });
+    compile_command_catalog(&metadata(vec![enum_to_text]), &catalogs, &rules, true)
+        .expect("a declared Rule enum may be stored in a text-family column");
+
+    let mut undeclared_scalar = valid_command();
+    undeclared_scalar["arguments"]
+        .as_array_mut()
+        .expect("arguments array")
+        .push(json!({ "name": "external_state", "type": "ExternalState!" }));
+    undeclared_scalar["steps"][0]["insert"]["object"]["status"] =
+        json!({ "arg": "external_state" });
+    let mut undeclared_metadata = metadata(vec![undeclared_scalar]);
+    declare_custom_scalar(&mut undeclared_metadata, "ExternalState");
+    let error = compile_command_catalog(&undeclared_metadata, &catalogs, &rules, true)
+        .expect_err("an arbitrary custom scalar must not acquire enum-to-text coercion");
+    assert!(
+        error
+            .message
+            .contains("is not assignable to column 'status'")
+    );
+
+    let mut string_to_enum = valid_command();
+    string_to_enum["guards"] = json!([{
+        "rule": "requires_state",
+        "with": { "current": { "arg": "status" } }
+    }]);
+    let error = compile_command_catalog(&metadata(vec![string_to_enum]), &catalogs, &rules, true)
+        .expect_err("String must remain forbidden for nominal enum Rule bindings");
+    assert_eq!(
+        error.message,
+        "String is not assignable to rule binding 'current' (PaymentState)"
     );
 }
 
@@ -3144,6 +3981,63 @@ fn aggregate_count_and_bigint_columns_bind_only_to_bigint_rules() {
         true,
     )
     .expect("an int8 column must bind to a bigint Rule parameter");
+}
+
+#[test]
+fn int_literal_widens_to_bigint_rule_binding_without_reverse_narrowing() {
+    let mut command = valid_command();
+    command["guards"] = json!([{
+        "rule": "count_is_valid",
+        "with": { "count": { "literal": 64 } }
+    }]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+
+    compile_command_catalog(
+        &metadata(vec![command]),
+        &catalogs,
+        &bigint_binding_rules(int64_type()),
+        true,
+    )
+    .expect("a bounded Int literal must widen to a bigint Rule parameter");
+}
+
+#[test]
+fn database_time_now_binds_to_the_rules_utc_timestamp_type() {
+    let timestamp_rules = compile_catalog(
+        &[RuleDefinition {
+            name: "timestamp_is_valid".to_owned(),
+            bindings: BTreeMap::from([("database_time".to_owned(), RuleType::Timestamp)]),
+            result: RuleType::Bool,
+            expression: "database_time == database_time".to_owned(),
+        }],
+        &[],
+    )
+    .expect("timestamp rule compiles");
+    let mut command = valid_command();
+    command["steps"] = json!([
+        {
+            "name": "clock",
+            "project": {
+                "values": {
+                    "database_time": { "database_time": "now" }
+                }
+            }
+        },
+        {
+            "name": "clock_is_valid",
+            "assert": {
+                "rule": "timestamp_is_valid",
+                "with": {
+                    "database_time": { "step": "clock", "column": "database_time" }
+                }
+            }
+        }
+    ]);
+    command["result"] = json!({ "database_time": { "step": "clock", "column": "database_time" } });
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+
+    compile_command_catalog(&metadata(vec![command]), &catalogs, &timestamp_rules, true)
+        .expect("database_time now is the Rules UTC timestamp type");
 }
 
 #[test]
@@ -3377,6 +4271,146 @@ fn rejects_commands_without_explicit_command_or_table_permissions() {
 }
 
 #[test]
+fn command_only_table_permissions_authorize_commands_without_exposing_crud_roots() {
+    let mut raw =
+        serde_json::to_value(metadata(vec![valid_command()])).expect("command metadata serializes");
+    let table = &mut raw["sources"][0]["tables"][0];
+    table["command_select_permissions"] = table["select_permissions"].clone();
+    table["command_insert_permissions"] = table["insert_permissions"].clone();
+    table["command_update_permissions"] = table["update_permissions"].clone();
+    table["command_delete_permissions"] = table["delete_permissions"].clone();
+    table["select_permissions"] = json!([]);
+    table["insert_permissions"] = json!([]);
+    table["update_permissions"] = json!([]);
+    table["delete_permissions"] = json!([]);
+    let metadata: Metadata =
+        serde_json::from_value(raw).expect("command-only permissions deserialize");
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+
+    let introspection = introspect_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          {
+            query: __type(name: "query_root") { fields { name } }
+            mutation: __type(name: "mutation_root") { fields { name } }
+          }
+        "#,
+    );
+    let query_fields = introspection["query"]["fields"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        query_fields.iter().all(|field| field["name"] != "orders"),
+        "command-only select permission must not expose a table query root"
+    );
+    let mutation_fields = introspection["mutation"]["fields"]
+        .as_array()
+        .expect("mutation fields");
+    assert!(
+        mutation_fields
+            .iter()
+            .any(|field| field["name"] == "create_order"),
+        "the closed command root remains visible to its explicit role"
+    );
+    for root in ["insert_orders", "update_orders", "delete_orders"] {
+        assert!(
+            mutation_fields.iter().all(|field| field["name"] != root),
+            "command-only permissions must not expose direct CRUD root {root}"
+        );
+    }
+}
+
+#[test]
+fn command_only_permissions_fail_closed_and_preserve_their_row_filter() {
+    let mut insufficient =
+        serde_json::to_value(metadata(vec![valid_command()])).expect("metadata serializes");
+    insufficient["sources"][0]["tables"][0]["command_select_permissions"] = json!([{
+        "role": "customer",
+        "permission": { "columns": ["id"], "filter": {} }
+    }]);
+    let insufficient: Metadata =
+        serde_json::from_value(insufficient).expect("command permission deserializes");
+    let error = compile(&insufficient, RelationKind::Table)
+        .expect_err("an insufficient command permission must not fall back to broad CRUD access");
+    assert!(
+        error
+            .message
+            .contains("lacks select permission for column 'customer_id'"),
+        "{error:?}"
+    );
+
+    let mut wrong_role =
+        serde_json::to_value(metadata(vec![valid_command()])).expect("metadata serializes");
+    wrong_role["sources"][0]["tables"][0]["command_insert_permissions"] = json!([{
+        "role": "support",
+        "permission": { "columns": "*", "check": {} }
+    }]);
+    wrong_role["sources"][0]["tables"][0]["insert_permissions"] = json!([]);
+    let wrong_role: Metadata =
+        serde_json::from_value(wrong_role).expect("command permission deserializes");
+    let error = compile(&wrong_role, RelationKind::Table)
+        .expect_err("a permission for another classic role grants no command access");
+    assert!(
+        error.message.contains("lacks insert permission"),
+        "{error:?}"
+    );
+
+    let mut filtered = serde_json::to_value(metadata(vec![relational_batch_command()]))
+        .expect("metadata serializes");
+    filtered["sources"][0]["tables"][0]["command_select_permissions"] = json!([{
+        "role": "customer",
+        "permission": {
+            "columns": "*",
+            "filter": { "customer_id": { "_eq": "X-Donat-User-Id" } }
+        }
+    }]);
+    let filtered: Metadata =
+        serde_json::from_value(filtered).expect("command permission deserializes");
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&filtered, &catalogs);
+    let plan = plan_runtime_for_session(
+        &filtered,
+        &catalogs,
+        commands,
+        session_with_vars(
+            "customer",
+            [("x-donat-user-id", "00000000-0000-0000-0000-000000000001")],
+        ),
+        r#"
+          mutation {
+            reserve_orders(customer_id: "00000000-0000-0000-0000-000000000001") {
+              selected { id }
+            }
+          }
+        "#,
+    )
+    .expect("the command-specific row filter plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [
+        MutationRoot::Command {
+            command: planned, ..
+        },
+    ] = roots.as_slice()
+    else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &planned.steps[0],
+        CommandExecutionStep::SelectMany {
+            filter: Some(_),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn rejects_invalid_graphql_command_names_and_mutation_root_collisions() {
     let mut invalid_name = valid_command();
     invalid_name["name"] = json!("create-order");
@@ -3471,6 +4505,31 @@ fn rejects_effects_without_command_idempotency_and_malformed_local_bindings() {
         }
     }]);
     assert_rejected(malformed_bindings, "unknown argument 'missing'");
+}
+
+#[test]
+fn effects_accept_closed_literal_payload_fields() {
+    let mut command = valid_command();
+    command["idempotency"] = json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "argument": "customer_id" }]
+    });
+    command["effects"] = json!([{
+        "signal_process": {
+            "process": "checkout",
+            "signal": "approval_recorded",
+            "correlate": { "order_id": { "arg": "id" } },
+            "payload": {
+                "approved": { "literal": true },
+                "reason": { "literal": "manual_review" },
+                "optional_note": { "literal": null }
+            },
+            "idempotency_key": { "argument": "request_id" }
+        }
+    }]);
+
+    compile(&metadata(vec![command]), RelationKind::Table)
+        .expect("fixed JSON literals are closed effect values, not ambient capabilities");
 }
 
 #[test]
@@ -3677,6 +4736,7 @@ fn predicate_descriptor_fixture(filter: Json) -> (Metadata, Catalog) {
                 column("active", "bool"),
             ],
             primary_key: vec!["id".to_owned()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -4503,6 +5563,82 @@ fn petshop_decision_rejects_non_finite_result_literal() {
         .expect_err("non-finite numeric spellings cannot enter resolved decision data");
     assert_eq!(error.path, "commands[0].steps[0]");
     assert_eq!(error.message, "invalid literal for Int");
+}
+
+#[test]
+fn typed_command_value_literals_make_fixed_row_nullability_explicit() {
+    let command = json!({
+        "name": "typed_null_rows",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "steps": [{
+            "name": "rows",
+            "fixed_rows": {
+                "maximum_rows": 1,
+                "rows": [{
+                    "optional_reference": { "literal": null, "as": "string" }
+                }]
+            }
+        }],
+        "result": { "rows": { "step": "rows" } }
+    });
+    let declared = metadata(vec![command.clone()]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&declared, &catalogs);
+    let plan = plan_runtime(
+        &declared,
+        &catalogs,
+        commands,
+        "customer",
+        "mutation { typed_null_rows { rows { optional_reference } } }",
+    )
+    .expect("a typed nullable literal plans through fixed rows");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [
+        MutationRoot::Command {
+            command: planned, ..
+        },
+    ] = roots.as_slice()
+    else {
+        panic!("expected one command root");
+    };
+    assert!(matches!(
+        &planned.steps[0],
+        CommandExecutionStep::FixedRows { columns, .. }
+            if columns.len() == 1
+                && columns[0].name == "optional_reference"
+                && columns[0].pg_type == "text"
+                && columns[0].nullable
+    ));
+
+    let mut untyped = command;
+    untyped["steps"][0]["fixed_rows"]["rows"][0]["optional_reference"] = json!({ "literal": null });
+    assert_rejected(
+        untyped,
+        "null command literals require an explicit typed destination",
+    );
+
+    let non_null = json!({
+        "name": "invalid_typed_null",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "steps": [{
+            "name": "rows",
+            "fixed_rows": {
+                "maximum_rows": 1,
+                "rows": [{
+                    "optional_reference": { "literal": null, "as": "string!" }
+                }]
+            }
+        }],
+        "result": { "rows": { "step": "rows" } }
+    });
+    assert_rejected(
+        non_null,
+        "null command literals require a nullable typed destination",
+    );
 }
 
 #[test]

@@ -37,6 +37,19 @@ duplicate input primary keys before DML. With `require_each`, it compares the
 distinct input-key count, input count, and affected count, so duplicate keys,
 missing rows, and non-one-for-one updates cannot silently succeed.
 
+The equality map may additionally contain command-scoped ownership or state
+guards after the complete primary key. Those predicates may use arguments,
+prior scalar steps, Rules, or literals, but never a current input item field.
+Execution IR retains primary-key assignments separately from guards:
+duplicate detection, result reordering, and `require_each` cardinality use
+only the key, while the actual target match applies both. This permits `id`
+plus `return_request_id` ownership checks without allowing a second item field
+to disguise duplicate primary keys.
+
+ADR 018 extends this input boundary without adding a loop or query language:
+`aggregate` and `update_many` may also consume a typed command argument list
+when that use site declares a deploy-time `maximum_items` bound.
+
 Row sets stay in one source and one command statement; they do not become a
 cross-source value or general result transport. Returned lists preserve their
 declared total order. The forms are metadata-only in this initial slice. Serde
@@ -53,6 +66,7 @@ runtime metadata mutation, or free-SQL surface.
 | General SQL or predicate templates in command metadata | Creates a second SQL language and bypasses deploy-time relation, permission, and type validation. |
 | Client-side read, aggregate, and per-row update loop | Breaks atomicity and the one-statement/no-N+1 invariant. |
 | Permit arbitrary joins, grouping, filters, or loops | Expands a checkout primitive into an unbounded query/workflow language without a product requirement. |
+| Treat every `update_many.by` field as part of the item identity | Lets a varying non-key field hide duplicate primary keys and weakens exact-cardinality checks. |
 | Treat views as update targets | Weakens predictable relation safety because an updatable view is not the ordinary primary-key table required for bounded update matching. |
 
 ## Consequences

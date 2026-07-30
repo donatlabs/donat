@@ -471,6 +471,18 @@ pub struct CommandColumn {
 /// resolved by the planner.
 #[derive(Debug, Clone, Serialize)]
 pub enum CommandExecutionStep {
+    /// One request argument list decoded to a typed bounded relational CTE.
+    /// It is internal to the execution plan and cannot be referenced by
+    /// command metadata or exposed as a result step.
+    ArgumentRows {
+        name: String,
+        cte: String,
+        items: Scalar,
+        columns: Vec<CommandColumn>,
+        minimum_items: u32,
+        maximum_items: u32,
+        error_path: String,
+    },
     SelectOne {
         name: String,
         cte: String,
@@ -604,6 +616,7 @@ pub enum CommandExecutionStep {
         table: Table,
         input_cte: String,
         primary_key: Vec<CommandAssignment>,
+        guards: Vec<CommandAssignment>,
         assignments: Vec<CommandAssignment>,
         check: Option<CommandRule>,
         returning: Vec<CommandColumn>,
@@ -846,6 +859,8 @@ pub enum CommandResultValue {
     },
     ProjectedRows {
         cte: String,
+        /// Whether the source CTE carries `_cmd_ordinal`. The public value is
+        /// always a bounded list; a scalar source contributes zero or one row.
         many: bool,
         columns: Vec<CommandResultProjection>,
         maximum_items: u32,

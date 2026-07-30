@@ -23,7 +23,7 @@ steps:
     select_one:
       table: public.return_request
       by:
-        id: { step: completed_refund, column: return_request_id }
+        id: { arg: return_id }
         status: { literal: inspected }
       returning: [id, order_id, status]
       require_found: true

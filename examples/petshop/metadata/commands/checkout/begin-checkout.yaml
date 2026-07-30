@@ -126,11 +126,11 @@ steps:
       rows:
         - kind: { literal: promotion }
           code: { step: quote, column: promotion_code }
-          provider_reference: { literal: null }
+          provider_reference: { literal: null, as: string }
           amount_minor: { step: quote, column: discount_minor }
         - kind: { literal: shipping }
           code: { step: quote, column: shipping_service_code }
-          provider_reference: { literal: null }
+          provider_reference: { literal: null, as: string }
           amount_minor: { step: quote, column: shipping_minor }
         - kind: { literal: tax }
           code: { arg: tax_code }
@@ -138,7 +138,7 @@ steps:
           amount_minor: { arg: tax_minor }
         - kind: { literal: price_list }
           code: { step: quote, column: price_list_code }
-          provider_reference: { literal: null }
+          provider_reference: { literal: null, as: string }
           amount_minor: { literal: 0 }
   - name: order_adjustments
     insert_many:

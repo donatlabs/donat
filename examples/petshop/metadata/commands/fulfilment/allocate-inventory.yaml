@@ -30,7 +30,7 @@ steps:
       by: { order_id: { arg: order_id } }
       order_by: [line_sequence, location_code, inventory_level_id]
       returning:
-        [order_line_id, line_sequence, variant_id, requested_quantity,
+        [order_id, order_line_id, line_sequence, variant_id, requested_quantity,
          location_code, inventory_level_id, available_quantity,
          unit_price_minor, currency]
       require_non_empty: true
@@ -46,7 +46,7 @@ steps:
         region: { arg: destination_region }
         location_code: { current_column: location_code }
       returning:
-        [order_line_id, line_sequence, variant_id, location_code,
+        [order_id, order_line_id, line_sequence, variant_id, location_code,
          inventory_level_id, requested_quantity, available_quantity,
          unit_price_minor, currency, allocation_rank]
       order_by: [line_sequence, allocation_rank, location_code, inventory_level_id]

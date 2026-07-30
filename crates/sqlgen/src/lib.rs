@@ -1414,6 +1414,7 @@ fn command_pre_step_gate_ctes(
         table,
         input_cte,
         primary_key,
+        guards,
         check,
         filter,
         error_path,
@@ -1462,6 +1463,12 @@ fn command_pre_step_gate_ctes(
         );
         let mut predicates =
             command_update_many_join_predicates(ctx, primary_key, target_alias, input_alias);
+        predicates.extend(command_update_many_join_predicates(
+            ctx,
+            guards,
+            target_alias,
+            input_alias,
+        ));
         if let Some(filter) = filter {
             predicates.push(ctx.bool_exp(filter, target_alias, target_alias));
         }
@@ -1939,6 +1946,68 @@ fn command_step_cte(
 ) -> Option<String> {
     match step {
         CommandExecutionStep::Assert { .. } | CommandExecutionStep::AssertWhen { .. } => None,
+        CommandExecutionStep::ArgumentRows {
+            cte,
+            items,
+            columns,
+            minimum_items,
+            maximum_items,
+            error_path,
+            ..
+        } => {
+            let items = scalar_sql(&ctx.dialect, items, "jsonb");
+            let alias = "_cmd_argument_rows";
+            let ordinal = "_cmd_ordinal";
+            let definitions = columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "{} {}",
+                        quote_ident(&column.name),
+                        quote_ident(&column.pg_type)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let aliases = columns
+                .iter()
+                .map(|column| quote_ident(&column.name))
+                .chain(std::iter::once(quote_ident(ordinal)))
+                .collect::<Vec<_>>();
+            let projection = std::iter::once(qualified(alias, ordinal))
+                .chain(columns.iter().map(|column| qualified(alias, &column.name)))
+                .collect::<Vec<_>>();
+            let maximum_message =
+                format!("command argument row-set exceeded maximum_items {maximum_items}");
+            let minimum_message =
+                format!("command argument row-set requires minimum_items {minimum_items}");
+            let within_bound = format!(
+                "CASE WHEN jsonb_array_length({items}) < {minimum_items} THEN (donat.raise_graphql_error('validation-failed', {path}, {minimum_message}) IS NULL) WHEN jsonb_array_length({items}) <= {maximum_items} THEN ({execution_gate}) ELSE (donat.raise_graphql_error('validation-failed', {path}, {maximum_message}) IS NULL) END",
+                path = quote_lit(error_path),
+                minimum_message = quote_lit(&minimum_message),
+                maximum_message = quote_lit(&maximum_message),
+            );
+            let source = if definitions.is_empty() {
+                format!(
+                    "jsonb_array_elements({items}) WITH ORDINALITY AS {alias}({ignored}, {ordinal})",
+                    alias = quote_ident(alias),
+                    ignored = quote_ident("_cmd_ignored"),
+                    ordinal = quote_ident(ordinal),
+                )
+            } else {
+                format!(
+                    "ROWS FROM(jsonb_to_recordset({items}) AS ({definitions})) WITH ORDINALITY AS {alias}({aliases})",
+                    definitions = definitions.join(", "),
+                    alias = quote_ident(alias),
+                    aliases = aliases.join(", "),
+                )
+            };
+            Some(format!(
+                "{cte} AS MATERIALIZED (SELECT {projection} FROM {source} WHERE {within_bound} ORDER BY {ordinal})",
+                cte = quote_ident(cte),
+                projection = projection.join(", "),
+                ordinal = qualified(alias, ordinal),
+            ))
+        }
         CommandExecutionStep::SelectOne {
             cte,
             table,
@@ -2303,6 +2372,7 @@ fn command_step_cte(
             table,
             input_cte,
             primary_key,
+            guards,
             assignments,
             check,
             filter,
@@ -2323,6 +2393,12 @@ fn command_step_cte(
                 .collect::<Vec<_>>();
             let mut predicates =
                 command_update_many_join_predicates(ctx, primary_key, target_alias, input_alias);
+            predicates.extend(command_update_many_join_predicates(
+                ctx,
+                guards,
+                target_alias,
+                input_alias,
+            ));
             if let Some(filter) = filter {
                 predicates.push(ctx.bool_exp(filter, target_alias, target_alias));
             }
@@ -3066,16 +3142,16 @@ fn command_result_value_sql(ctx: &mut Ctx, value: &CommandResultValue) -> String
                 })
                 .collect::<Vec<_>>();
             let row = json_object(&ctx.dialect, &pairs);
-            let value = if *many {
-                let order = qualified(cte, "_cmd_ordinal");
-                format!(
-                    "(SELECT {} FROM {})",
-                    json_array_agg(&ctx.dialect, &row, Some(&order)),
-                    quote_ident(cte),
-                )
+            let order = if *many {
+                Some(qualified(cte, "_cmd_ordinal"))
             } else {
-                format!("(SELECT {row} FROM {} LIMIT 1)", quote_ident(cte))
+                None
             };
+            let value = format!(
+                "(SELECT {} FROM {})",
+                json_array_agg(&ctx.dialect, &row, order.as_deref()),
+                quote_ident(cte),
+            );
             format!(
                 "CASE WHEN (SELECT count(*) FROM {cte}) > {maximum_items} THEN donat.raise_graphql_error('validation-failed', '$', 'command result exceeded maximum_items')::jsonb ELSE ({value})::jsonb END",
                 cte = quote_ident(cte),

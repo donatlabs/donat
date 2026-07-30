@@ -9,7 +9,7 @@ use donat_metadata::{
     ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandResultValue,
     CommandStepOperation, CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger,
     DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable, RemoteSchema,
-    RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration,
+    RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration, TableEntry,
     action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
@@ -115,6 +115,62 @@ fn select_permission_defaults() {
     assert_eq!(perm.limit, None);
     assert!(!perm.allow_aggregations);
     assert!(perm.computed_fields.is_empty());
+}
+
+#[test]
+fn command_only_table_permissions_round_trip_separately_from_crud_permissions() {
+    let table: TableEntry = serde_json::from_value(json!({
+        "table": { "schema": "public", "name": "orders" },
+        "command_select_permissions": [{
+            "role": "customer",
+            "permission": {
+                "columns": ["id", "status"],
+                "filter": { "customer_id": { "_eq": "X-Donat-User-Id" } }
+            }
+        }],
+        "command_insert_permissions": [{
+            "role": "customer",
+            "permission": {
+                "columns": ["customer_id", "status"],
+                "check": { "customer_id": { "_eq": "X-Donat-User-Id" } }
+            }
+        }],
+        "command_update_permissions": [{
+            "role": "worker",
+            "permission": {
+                "columns": ["status"],
+                "filter": {},
+                "check": {}
+            }
+        }],
+        "command_delete_permissions": [{
+            "role": "worker",
+            "permission": { "filter": {} }
+        }]
+    }))
+    .expect("command-only table permissions deserialize");
+
+    assert!(table.select_permissions.is_empty());
+    assert!(table.insert_permissions.is_empty());
+    assert!(table.update_permissions.is_empty());
+    assert!(table.delete_permissions.is_empty());
+    assert_eq!(table.command_select_permissions.len(), 1);
+    assert_eq!(table.command_insert_permissions.len(), 1);
+    assert_eq!(table.command_update_permissions.len(), 1);
+    assert_eq!(table.command_delete_permissions.len(), 1);
+
+    let encoded = serde_json::to_value(table).expect("table permissions serialize");
+    for field in [
+        "command_select_permissions",
+        "command_insert_permissions",
+        "command_update_permissions",
+        "command_delete_permissions",
+    ] {
+        assert!(
+            encoded.get(field).is_some(),
+            "{field} must survive metadata round-trip"
+        );
+    }
 }
 
 #[test]
@@ -1004,6 +1060,47 @@ steps:
                     CommandValue::Rule { bindings, .. }
                         if matches!(bindings["left"], CommandValue::CurrentColumn { .. })
                 )
+    ));
+}
+
+#[test]
+fn bounded_argument_rows_retain_their_declared_structural_bounds() {
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: bounded_argument_rows
+source: default
+arguments:
+  - name: lines
+    type: "[LineInput!]!"
+steps:
+  - name: totals
+    aggregate:
+      from: { arg: lines }
+      maximum_items: 64
+      values:
+        item_count: { count: true }
+  - name: updated
+    update_many:
+      table: public.order_lines
+      for_each: { arg: lines }
+      maximum_items: 64
+      by:
+        id: { item: id }
+      set:
+        quantity: { item: quantity }
+"#,
+    )
+    .expect("bounded argument-row sources must deserialize");
+
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::Aggregate { aggregate }
+            if aggregate.maximum_items == Some(64)
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::UpdateMany { update_many }
+            if update_many.maximum_items == Some(64)
     ));
 }
 

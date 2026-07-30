@@ -83,6 +83,7 @@ fn catalog(schema: &str, table: &str, columns: &[&str]) -> Catalog {
                 relation_kind: donat_catalog::RelationKind::Table,
                 columns: columns.iter().map(|name| col(name)).collect(),
                 primary_key: vec!["id".to_string()],
+                unique_keys: vec![],
                 foreign_keys: vec![],
             },
         )]),
@@ -866,6 +867,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
                 },
             ],
             primary_key: vec!["id".to_string()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );

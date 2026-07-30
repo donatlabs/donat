@@ -37,6 +37,7 @@ steps:
     update_many:
       table: { schema: public, name: return_item }
       for_each: { arg: lines }
+      maximum_items: 256
       by:
         id: { item: return_item_id }
         return_request_id: { step: return_context, column: return_id }

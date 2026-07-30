@@ -58,10 +58,10 @@ steps:
       object:
         payment_id: { step: payment, column: id }
         provider_event_id: { step: payment_event, column: provider_event_id }
-        provider_amount_minor: { step: payment_event, column: provider_amount_minor }
-        provider_currency: { step: payment_event, column: provider_currency }
-        provider_status: { step: payment_event, column: provider_status }
-        provider_reference: { step: payment_event, column: provider_reference }
+        provider_amount_minor: { arg: provider_amount_minor }
+        provider_currency: { arg: provider_currency }
+        provider_status: { arg: provider_status }
+        provider_reference: { arg: provider_reference }
         decision: { arg: reconciliation_decision }
         status:
           rule: reconciliation_state_for_decision

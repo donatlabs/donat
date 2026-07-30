@@ -1,7 +1,80 @@
+use std::collections::BTreeSet;
 use std::env;
 
 use donat_catalog::{RelationKind, introspect};
 use tokio_postgres::NoTls;
+
+#[tokio::test]
+async fn introspection_retains_only_unconditional_column_unique_keys() {
+    let pg_url = env::var("PG_URL")
+        .unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:15432/postgres".to_string());
+    let (client, connection) = tokio_postgres::connect(&pg_url, NoTls)
+        .await
+        .expect("Postgres must be available for catalog introspection tests");
+    let connection_task = tokio::spawn(connection);
+
+    let table = format!("catalog_unique_keys_{}", std::process::id());
+    let included_index = format!("{table}_label_key");
+    let partial_index = format!("{table}_active_email_key");
+    let expression_index = format!("{table}_lower_code_key");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public.{table} (\
+                id bigint PRIMARY KEY, \
+                tenant_id bigint NOT NULL, \
+                external_id text NOT NULL, \
+                email text NOT NULL, \
+                code text NOT NULL, \
+                label text NOT NULL, \
+                deleted boolean NOT NULL DEFAULT false, \
+                UNIQUE (tenant_id, external_id)\
+             ); \
+             CREATE UNIQUE INDEX {included_index} \
+               ON public.{table} (label) INCLUDE (code); \
+             CREATE UNIQUE INDEX {partial_index} \
+               ON public.{table} (email) WHERE NOT deleted; \
+             CREATE UNIQUE INDEX {expression_index} \
+               ON public.{table} (lower(code));"
+        ))
+        .await
+        .expect("unique-key test table must be created");
+
+    let catalog = introspect(&client)
+        .await
+        .expect("unique keys must be introspected");
+    let table_info = catalog
+        .table("public", &table)
+        .expect("unique-key test table exists");
+    let actual = table_info
+        .unique_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([
+        vec!["label".to_string()],
+        vec!["tenant_id".to_string(), "external_id".to_string()],
+    ]);
+
+    assert_eq!(actual, expected);
+    assert!(
+        !actual.contains(&vec!["id".to_string()]),
+        "the primary key stays in TableInfo::primary_key rather than being duplicated"
+    );
+    assert!(
+        !actual.contains(&vec!["email".to_string()]),
+        "partial unique indexes cannot prove global select_one cardinality"
+    );
+    assert!(
+        !actual.contains(&vec!["code".to_string()]),
+        "expression indexes are not closed column identity keys"
+    );
+
+    client
+        .batch_execute(&format!("DROP TABLE public.{table};"))
+        .await
+        .expect("unique-key test table must be dropped");
+    connection_task.abort();
+}
 
 #[tokio::test]
 async fn introspection_retains_table_view_and_materialized_view_relation_kinds() {

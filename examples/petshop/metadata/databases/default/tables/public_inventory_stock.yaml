@@ -38,6 +38,28 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+command_select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - variant_id
+        - on_hand
+        - reserved
+      filter:
+        _and:
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+  - role: payment_worker
+    permission:
+      columns:
+        - variant_id
+        - reserved
+      filter: {}
 insert_permissions:
   - role: staff
     permission:

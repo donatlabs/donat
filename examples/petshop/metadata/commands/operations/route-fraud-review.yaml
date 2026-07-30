@@ -24,42 +24,36 @@ steps:
   # The finite fraud_route table is applied to one immutable payment candidate;
   # it cannot choose a relation, role, connector, or executable expression.
   - name: route
-    decision_many:
+    decision:
       decision_table: fraud_route
-      from: { step: payment }
       input:
         payment_outcome: { arg: payment_outcome }
         score: { arg: fraud_score }
-      returning: [id, hold, route]
-      order_by: [id]
+      returning: [hold, route]
   - name: fraud_review
-    insert_many:
+    insert:
       table: public.payment_fraud_review
-      for_each: { step: route }
       object:
-        payment_id: { item: id }
+        payment_id: { step: payment, column: id }
         provider_event_id: { arg: provider_event_id }
         fraud_score: { arg: fraud_score }
-        route: { item: route }
+        route: { step: route, column: route }
         status:
           rule: fraud_state_for_route
           with:
-            hold: { item: hold }
+            hold: { step: route, column: hold }
       returning: [id, payment_id, provider_event_id, fraud_score, route, status]
-      allow_empty: false
   # This is append-only decision evidence. Resolution writes a distinct audit
   # record rather than changing the routing rationale selected at ingress.
   - name: decision_audit
-    insert_many:
+    insert:
       table: public.payment_fraud_decision
-      for_each: { step: fraud_review }
       object:
-        fraud_review_id: { item: id }
+        fraud_review_id: { step: fraud_review, column: id }
         decision: { literal: routed }
-        decision_route: { item: route }
-        provider_event_id: { item: provider_event_id }
+        decision_route: { step: fraud_review, column: route }
+        provider_event_id: { step: fraud_review, column: provider_event_id }
       returning: [id, fraud_review_id, decision, decision_route, provider_event_id]
-      allow_empty: false
 result:
   fraud_reviews: { step: fraud_review }
   decision_audit: { step: decision_audit }

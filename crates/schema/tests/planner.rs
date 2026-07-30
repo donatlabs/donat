@@ -154,6 +154,7 @@ fn catalog() -> Catalog {
                 col("system_meta", "jsonb"),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -165,6 +166,7 @@ fn catalog() -> Catalog {
             relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![col("author_id", "int4"), col("bio", "text")],
             primary_key: vec!["author_id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "profile_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
@@ -186,6 +188,7 @@ fn catalog() -> Catalog {
                 col("published", "bool"),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),

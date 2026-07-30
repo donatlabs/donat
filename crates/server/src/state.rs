@@ -2203,6 +2203,7 @@ mod snapshot_tests {
                         has_default: false,
                     }],
                     primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
                     foreign_keys: vec![],
                 },
             )]),

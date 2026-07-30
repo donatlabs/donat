@@ -96,6 +96,7 @@ fn compile_catalog_internal(
 ) -> Result<RuleCatalog, RuleError> {
     let mut catalog = RuleCatalog::default();
     let declared_type_declarations = canonical_declarations(declared_types, declaration_order)?;
+    catalog.declared_types = declared_types.clone();
 
     for (rule_index, definition) in rules.iter().enumerate() {
         if catalog.rules.contains_key(&definition.name)
@@ -230,6 +231,12 @@ fn compile_expression_in_context_with_declared_types(
 }
 
 impl RuleCatalog {
+    /// Return a finite named type resolved and validated with this immutable
+    /// catalog.
+    pub fn declared_type(&self, name: &str) -> Option<&RuleType> {
+        self.declared_types.get(name)
+    }
+
     pub fn rule(&self, name: &str) -> Option<&CompiledRule> {
         self.rules.get(name)
     }

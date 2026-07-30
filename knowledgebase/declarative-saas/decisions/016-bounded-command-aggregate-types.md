@@ -21,8 +21,9 @@ projections without reopening the declarative grammar.
 ## Decision
 
 The command compiler tracks a `guaranteed_non_empty` fact through
-`select_many(require_non_empty)`, non-empty `fixed_rows`, and
-cardinality-preserving `project_many` and `decision_many`. It does not infer
+`select_many(require_non_empty)`, non-empty `fixed_rows`, an argument row
+source with `minimum_items` greater than zero, and cardinality-preserving
+`project_many` and `decision_many`. It does not infer
 the fact through filtering, updates, allocation, or row-set fields.
 `aggregate` accepts any prior bounded row-set producer.
 

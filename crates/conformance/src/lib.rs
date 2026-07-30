@@ -1708,6 +1708,10 @@ impl Running {
                 select_permissions: vec![],
                 update_permissions: vec![],
                 delete_permissions: vec![],
+                command_insert_permissions: vec![],
+                command_select_permissions: vec![],
+                command_update_permissions: vec![],
+                command_delete_permissions: vec![],
                 event_triggers: vec![],
             });
         }

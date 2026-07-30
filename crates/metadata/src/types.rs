@@ -585,6 +585,10 @@ pub enum CommandResultValue {
     },
     Literal {
         literal: serde_json::Value,
+        /// Optional explicit result scalar. Nullable literals (notably
+        /// `null`) cannot be inferred and therefore require this annotation.
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
     },
     Rule {
         rule: String,
@@ -787,14 +791,19 @@ pub struct UpdateCommandStep {
     pub require_affected: bool,
 }
 
-/// A bounded update over one prior row-set. The catalog-aware command
-/// validator owns primary-key, row-set source, and `current_column` scope
-/// checks; metadata parsing only retains the closed declaration.
+/// A bounded update over one prior row-set or one explicitly bounded typed
+/// argument list. The catalog-aware command validator owns primary-key,
+/// row-set source, and `current_column` scope checks; metadata parsing only
+/// retains the closed declaration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateManyCommandStep {
     pub table: QualifiedTable,
     pub for_each: CommandValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_items: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_items: Option<u32>,
     pub by: BTreeMap<String, CommandValue>,
     pub set: BTreeMap<String, CommandValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -965,13 +974,17 @@ pub struct CommandRuleBinding {
     pub bindings: BTreeMap<String, CommandValue>,
 }
 
-/// One aggregation over a prior `select_many` row-set. Its source and column
-/// semantics are validated after metadata loading, against the command graph
-/// and catalog.
+/// One aggregation over a prior bounded row-set or one explicitly bounded
+/// typed argument list. Its source and column semantics are validated after
+/// metadata loading, against the command graph and catalog.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregateCommandStep {
     pub from: CommandValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_items: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_items: Option<u32>,
     pub values: BTreeMap<String, CommandAggregate>,
 }
 
@@ -1071,6 +1084,10 @@ pub enum CommandValue {
     },
     Literal {
         literal: serde_json::Value,
+        /// Optional scalar annotation for contexts such as `fixed_rows`
+        /// where no destination column supplies a type.
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
     },
     Rule {
         rule: String,
@@ -2223,6 +2240,16 @@ pub struct TableEntry {
     pub update_permissions: Vec<PermissionEntry<UpdatePermission>>,
     #[serde(default)]
     pub delete_permissions: Vec<PermissionEntry<DeletePermission>>,
+    /// Permissions used only while executing a closed declarative Command.
+    /// They never expose ordinary GraphQL/REST/MCP CRUD roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_insert_permissions: Vec<PermissionEntry<InsertPermission>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_select_permissions: Vec<PermissionEntry<SelectPermission>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_update_permissions: Vec<PermissionEntry<UpdatePermission>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_delete_permissions: Vec<PermissionEntry<DeletePermission>>,
     /// Webhooks fired on row insert/update/delete (Donat event triggers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_triggers: Vec<EventTrigger>,

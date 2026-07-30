@@ -50,6 +50,20 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+command_select_permissions:
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - captured_minor
+        - refunded_minor
+        - chargeback_minor
+        - currency
+        - provider_reference
+      filter: {}
 insert_permissions:
   - role: customer
     permission:

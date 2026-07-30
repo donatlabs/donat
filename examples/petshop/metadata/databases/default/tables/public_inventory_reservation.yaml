@@ -22,6 +22,19 @@ select_permissions:
         - quantity
         - status
       filter: {}
+command_select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - id
+        - order_id
+        - variant_id
+        - quantity
+        - status
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
 insert_permissions:
   - role: customer
     permission:

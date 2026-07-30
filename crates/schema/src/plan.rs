@@ -1,6 +1,6 @@
 //! Query planning: one GraphQL operation -> Vec<RootField> (IR).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use donat_catalog::{Catalog, TableInfo};
@@ -555,16 +555,110 @@ impl<'a> Planner<'a> {
     /// The select permissions a (possibly inherited) role has on a table:
     /// a direct permission overrides the inherited combination.
     fn role_select_perms(&self, entry: &'a TableEntry, role: &str) -> Vec<&'a SelectPermission> {
-        if let Some(p) = entry.select_permissions.iter().find(|p| p.role == role) {
-            return vec![&p.permission];
+        self.role_select_perms_from(&entry.select_permissions, role, &mut HashSet::new())
+    }
+
+    fn role_select_perms_from<'x>(
+        &self,
+        list: &'x [donat_metadata::PermissionEntry<SelectPermission>],
+        role: &str,
+        visiting: &mut HashSet<String>,
+    ) -> Vec<&'x SelectPermission> {
+        if let Some(permission) = list.iter().find(|permission| permission.role == role) {
+            return vec![&permission.permission];
         }
-        let mut out = vec![];
-        for parent in self.expand_role(role) {
-            if let Some(p) = entry.select_permissions.iter().find(|p| p.role == parent) {
-                out.push(&p.permission);
+        if !visiting.insert(role.to_owned()) {
+            return Vec::new();
+        }
+        let mut permissions = Vec::new();
+        if let Some(inherited) = self
+            .inherited_roles
+            .iter()
+            .find(|inherited| inherited.role_name == role)
+        {
+            for parent in &inherited.role_set {
+                permissions.extend(self.role_select_perms_from(list, parent, visiting));
             }
         }
-        out
+        visiting.remove(role);
+        permissions
+    }
+
+    fn permission_declared_for_role<T>(
+        &self,
+        list: &[donat_metadata::PermissionEntry<T>],
+        role: &str,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if list.iter().any(|permission| permission.role == role) {
+            return true;
+        }
+        if !visiting.insert(role.to_owned()) {
+            return false;
+        }
+        let declared = self
+            .inherited_roles
+            .iter()
+            .find(|inherited| inherited.role_name == role)
+            .is_some_and(|inherited| {
+                inherited
+                    .role_set
+                    .iter()
+                    .any(|parent| self.permission_declared_for_role(list, parent, visiting))
+            });
+        visiting.remove(role);
+        declared
+    }
+
+    pub(crate) fn command_table_ctx_by_name(
+        &self,
+        table: &QualifiedTable,
+        role: &str,
+    ) -> Option<TableCtx<'a>> {
+        let idx = *self
+            .by_table
+            .get(&format!("{}.{}", table.schema(), table.name()))?;
+        let entry = &self.tables[idx];
+        let info = self
+            .catalog
+            .table(entry.table.schema(), entry.table.name())?;
+        let command_declared = self.permission_declared_for_role(
+            &entry.command_select_permissions,
+            role,
+            &mut HashSet::new(),
+        );
+        let perms = if command_declared {
+            self.role_select_perms_from(
+                &entry.command_select_permissions,
+                role,
+                &mut HashSet::new(),
+            )
+        } else {
+            self.role_select_perms(entry, role)
+        };
+        if perms.is_empty() {
+            return None;
+        }
+        Some(TableCtx {
+            entry,
+            info,
+            perms,
+            type_name: table_base_name(entry),
+        })
+    }
+
+    pub(crate) fn resolve_command_role_perm<'x, T: serde::Serialize>(
+        &self,
+        command_list: &'x [donat_metadata::PermissionEntry<T>],
+        ordinary_list: &'x [donat_metadata::PermissionEntry<T>],
+        role: &str,
+        applies: impl Fn(&T) -> bool,
+    ) -> Option<&'x T> {
+        if self.permission_declared_for_role(command_list, role, &mut HashSet::new()) {
+            self.resolve_role_perm(command_list, role, applies)
+        } else {
+            self.resolve_role_perm(ordinary_list, role, applies)
+        }
     }
 
     /// Resolve a non-select (mutation/function) permission for a role:

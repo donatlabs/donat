@@ -394,6 +394,7 @@ pub enum CanonicalValue {
 /// ambient runtime capability.
 #[derive(Debug, Clone, Default)]
 pub struct RuleCatalog {
+    pub(crate) declared_types: BTreeMap<String, RuleType>,
     pub(crate) rules: BTreeMap<String, CompiledRule>,
     pub(crate) decision_tables: BTreeMap<String, CompiledDecisionTable>,
 }

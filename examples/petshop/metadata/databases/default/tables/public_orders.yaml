@@ -63,6 +63,24 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+command_select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - id
+        - customer_id
+        - checkout_quote_id
+        - order_status
+        - cancellation_reason
+        - subtotal_minor
+        - discount_minor
+        - shipping_minor
+        - tax_minor
+        - total_minor
+        - currency
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
 insert_permissions:
   - role: customer
     permission:

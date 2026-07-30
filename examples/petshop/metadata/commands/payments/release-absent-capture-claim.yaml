@@ -88,7 +88,7 @@ steps:
 result:
   shipment_id: { step: release_claim, column: shipment_id }
   payment_id: { step: release_claim, column: payment_id }
-  capture_id: { literal: null }
+  capture_id: { literal: null, as: uuid }
   amount_minor: { step: release_claim, column: amount_minor }
   status: { step: payment, column: status }
   requires_reconciliation: { literal: false }

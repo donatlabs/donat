@@ -15,6 +15,17 @@ select_permissions:
         - provider_event_id
         - created_at
       filter: {}
+command_select_permissions:
+  - role: reconciliation_worker
+    permission:
+      columns:
+        - id
+        - provider_event_id
+        - provider_amount_minor
+        - provider_currency
+        - provider_status
+        - provider_reference
+      filter: {}
 insert_permissions:
   - role: payment_worker
     permission:

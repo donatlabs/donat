@@ -579,6 +579,7 @@ fn relational_batch_root(
                 table: table(stock_table),
                 input_cte: "_cmd_step_0".to_owned(),
                 primary_key: vec![item_assignment("variant_id", "variant_id", "int4")],
+                guards: vec![],
                 assignments: vec![CommandAssignment {
                     column: column("reserved", "int4"),
                     value: CommandExecutionValue::Rule {
@@ -783,6 +784,204 @@ fn command_renderer_fails_closed_for_non_list_insert_many_ir() {
         !rendered.contains("INSERT INTO \"public\".\"orders\""),
         "fail-closed rendering must contain no domain write: {rendered}"
     );
+}
+
+#[test]
+fn bounded_argument_rows_render_one_typed_postgres_cte() {
+    let _catalog_lock = command_catalog_test_lock();
+    let input = "_cmd_step_0_input";
+    let root = root(CommandMutation {
+        identity: command_identity("sum_lines"),
+        name: "sum_lines".to_owned(),
+        steps: vec![
+            CommandExecutionStep::ArgumentRows {
+                name: "totals_input".to_owned(),
+                cte: input.to_owned(),
+                items: Scalar::Json(json!([
+                    { "sku": "first", "quantity": 2 },
+                    { "sku": "second", "quantity": 3 }
+                ])),
+                columns: vec![column("sku", "text"), column("quantity", "int4")],
+                minimum_items: 1,
+                maximum_items: 2,
+                error_path: "$.selectionSet.sum_lines".to_owned(),
+            },
+            CommandExecutionStep::Aggregate {
+                name: "totals".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                input_cte: input.to_owned(),
+                values: vec![
+                    CommandAggregateIr::Count {
+                        output: column("item_count", "int8"),
+                    },
+                    CommandAggregateIr::Sum {
+                        output: column("quantity_sum", "int8"),
+                        input: column("quantity", "int4"),
+                    },
+                ],
+                error_path: "$.selectionSet.sum_lines".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "item_count".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_0".to_owned(),
+                column: column("item_count", "int8"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "item_count".to_owned(),
+            field: "item_count".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&root);
+    assert!(
+        sql.contains("jsonb_to_recordset")
+            && sql.contains("\"sku\" \"text\"")
+            && sql.contains("\"quantity\" \"int4\"")
+            && sql.contains("WITH ORDINALITY"),
+        "argument items become one typed relational source: {sql}"
+    );
+    assert!(
+        sql.contains("jsonb_array_length")
+            && sql.contains("minimum_items 1")
+            && sql.contains("maximum_items 2"),
+        "the renderer retains both declared structural bounds: {sql}"
+    );
+    assert!(
+        !sql.contains("_item_0") && !sql.contains("_item_1"),
+        "argument rows are decoded as one set, not one Rust-expanded CTE per row: {sql}"
+    );
+
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start isolated argument-row execution");
+    install_command_catalog(&mut tx);
+    let result: Json = tx
+        .query_one(&sql, &[])
+        .expect("the typed argument-row CTE executes in Postgres")
+        .get(0);
+    assert_eq!(result, json!({ "item_count": 2 }));
+    tx.rollback()
+        .expect("roll back isolated argument-row execution");
+}
+
+#[test]
+fn bounded_argument_rows_keep_update_many_exact_key_gates() {
+    let input = "_cmd_step_0_input";
+    let root = root(CommandMutation {
+        identity: command_identity("update_lines"),
+        name: "update_lines".to_owned(),
+        steps: vec![
+            CommandExecutionStep::ArgumentRows {
+                name: "updated_input".to_owned(),
+                cte: input.to_owned(),
+                items: Scalar::Json(json!([
+                    { "status": "first", "quantity": 2 },
+                    { "status": "second", "quantity": 3 }
+                ])),
+                columns: vec![column("status", "text"), column("quantity", "int4")],
+                minimum_items: 0,
+                maximum_items: 2,
+                error_path: "$.selectionSet.update_lines".to_owned(),
+            },
+            CommandExecutionStep::UpdateMany {
+                name: "updated".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table("orders"),
+                input_cte: input.to_owned(),
+                primary_key: vec![item_assignment("status", "status", "text")],
+                guards: vec![assignment("tenant_id", "int4", json!(7))],
+                assignments: vec![item_assignment("quantity", "quantity", "int4")],
+                check: None,
+                returning: vec![column("status", "text"), column("quantity", "int4")],
+                require_each: true,
+                filter: None,
+                permission_check: None,
+                error_path: "$.selectionSet.update_lines".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&root);
+    assert!(
+        sql.contains("FROM \"_cmd_step_0_input\" AS \"_cmd_input\"")
+            && sql.contains("duplicate input primary keys")
+            && sql.contains("did not affect every input row")
+            && sql.contains("\"_cmd_target\".\"tenant_id\" = (7)::\"int4\""),
+        "argument-backed update_many retains exact-key gates and command-scoped predicates: {sql}"
+    );
+}
+
+#[test]
+fn projected_scalar_steps_render_as_bounded_single_item_lists() {
+    let _catalog_lock = command_catalog_test_lock();
+    let root = root(CommandMutation {
+        identity: command_identity("project_one"),
+        name: "project_one".to_owned(),
+        steps: vec![CommandExecutionStep::Project {
+            name: "candidate".to_owned(),
+            cte: "_cmd_step_0".to_owned(),
+            values: vec![CommandNamedValue {
+                name: "status".to_owned(),
+                column: column("status", "text"),
+                value: value(json!("ready"), "text"),
+            }],
+            error_path: "$.selectionSet.project_one".to_owned(),
+        }],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "items".to_owned(),
+            value: CommandResultValue::ProjectedRows {
+                cte: "_cmd_step_0".to_owned(),
+                many: false,
+                columns: vec![CommandResultProjection {
+                    name: "status".to_owned(),
+                    source: column("status", "text"),
+                }],
+                maximum_items: 1,
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::List {
+            alias: "items".to_owned(),
+            field: "items".to_owned(),
+            selections: vec![CommandResultSelection::Scalar {
+                alias: "status".to_owned(),
+                field: "status".to_owned(),
+            }],
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&root);
+    assert!(
+        sql.contains("jsonb_agg") && !sql.contains("\"_cmd_step_0\".\"_cmd_ordinal\""),
+        "a scalar source has no ordinal but its projected result is still an array: {sql}"
+    );
+
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start isolated scalar-projection execution");
+    install_command_catalog(&mut tx);
+    let result: Json = tx
+        .query_one(&sql, &[])
+        .expect("the scalar projection executes in Postgres")
+        .get(0);
+    assert_eq!(result, json!({ "items": [{ "status": "ready" }] }));
+    tx.rollback()
+        .expect("roll back isolated scalar-projection execution");
 }
 
 #[test]

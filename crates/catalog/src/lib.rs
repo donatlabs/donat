@@ -2,8 +2,9 @@
 //!
 //! The single place that knows how to read `pg_catalog`. Produces a
 //! [`Catalog`] snapshot — tables, columns with their SQL types and
-//! nullability, primary keys and foreign keys — which the planner combines
-//! with metadata. Nothing downstream talks to `pg_catalog` directly.
+//! nullability, primary keys, unconditional unique keys, and foreign keys —
+//! which the planner combines with metadata. Nothing downstream talks to
+//! `pg_catalog` directly.
 
 use std::collections::BTreeMap;
 
@@ -61,6 +62,10 @@ pub struct TableInfo {
     pub relation_kind: RelationKind,
     pub columns: Vec<ColumnInfo>,
     pub primary_key: Vec<String>,
+    /// Ordered column sets from valid, unconditional, non-expression unique
+    /// indexes. Primary keys remain in `primary_key` and are not duplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_keys: Vec<Vec<String>>,
     pub foreign_keys: Vec<ForeignKey>,
 }
 
@@ -166,6 +171,30 @@ WHERE con.contype = 'p'
 ORDER BY n.nspname, c.relname, k.ord
 "#;
 
+const UNIQUE_KEYS_SQL: &str = r#"
+SELECT n.nspname, c.relname,
+       array_agg(a.attname ORDER BY key_column.ord)::text[] AS columns
+FROM pg_index index_info
+JOIN pg_class c ON index_info.indrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+CROSS JOIN LATERAL
+  unnest(index_info.indkey::smallint[]) WITH ORDINALITY AS key_column(attnum, ord)
+JOIN pg_attribute a
+  ON a.attrelid = c.oid AND a.attnum = key_column.attnum
+WHERE index_info.indisunique
+  AND NOT index_info.indisprimary
+  AND index_info.indisvalid
+  AND index_info.indisready
+  AND index_info.indpred IS NULL
+  AND index_info.indexprs IS NULL
+  AND key_column.ord <= index_info.indnkeyatts
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'hdb_catalog')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'
+GROUP BY n.nspname, c.relname, index_info.indexrelid
+ORDER BY n.nspname, c.relname, index_info.indexrelid
+"#;
+
 const FOREIGN_KEYS_SQL: &str = r#"
 SELECT con.conname, n.nspname, c.relname,
        fn.nspname AS fschema, fc.relname AS ftable,
@@ -229,6 +258,7 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
             relation_kind,
             columns: vec![],
             primary_key: vec![],
+            unique_keys: vec![],
             foreign_keys: vec![],
         });
         entry.columns.push(ColumnInfo {
@@ -246,6 +276,14 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
         let table: String = row.get(1);
         if let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) {
             info.primary_key.push(row.get(2));
+        }
+    }
+
+    for row in client.query(UNIQUE_KEYS_SQL, &[]).await? {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        if let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) {
+            info.unique_keys.push(row.get(2));
         }
     }
 
@@ -443,6 +481,7 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
                 relation_kind: RelationKind::Table,
                 columns,
                 primary_key,
+                unique_keys: vec![],
                 foreign_keys,
             },
         );
@@ -485,6 +524,7 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
             relation_kind: RelationKind::Table,
             columns: vec![],
             primary_key: vec![],
+            unique_keys: vec![],
             foreign_keys: vec![],
         });
         entry.columns.push(ColumnInfo {
@@ -639,6 +679,7 @@ pub fn clickhouse_catalog_from_json_each_row(
             relation_kind: RelationKind::Table,
             columns: Vec::new(),
             primary_key: Vec::new(),
+            unique_keys: Vec::new(),
             foreign_keys: Vec::new(),
         });
 

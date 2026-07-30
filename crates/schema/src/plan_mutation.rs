@@ -217,8 +217,7 @@ impl<'a> Planner<'a> {
         }
         Some((|| {
             self.validate_command_runtime_permissions(command.definition(), session, path)?;
-            let arguments =
-                self.parse_command_arguments(command.definition(), field, vars, path)?;
+            let arguments = self.parse_command_arguments(command, field, vars, path)?;
             let selection =
                 self.plan_command_selection(command.definition(), field, fragments, vars, path)?;
             self.resolve_command_execution(command, arguments, selection, session, path)
@@ -239,12 +238,18 @@ impl<'a> Planner<'a> {
         for (index, step) in definition.steps.iter().enumerate() {
             let cte = format!("_cmd_step_{index}");
             let step_path = format!("{path}.steps[{index}]");
+            let argument_rows = self
+                .resolve_command_argument_rows(command, step, &cte, &arguments, &step_path, path)?;
+            if let Some((input, _)) = &argument_rows {
+                steps.push(input.clone());
+            }
             let (resolved, output) = self.resolve_command_step(
                 command,
                 step,
                 cte,
                 &arguments,
                 &resolved_steps,
+                argument_rows.as_ref().map(|(_, rows)| rows),
                 session,
                 &step_path,
                 path,
@@ -285,6 +290,7 @@ impl<'a> Planner<'a> {
                     name: field.name.clone(),
                     value: self.resolve_command_result_value(
                         command,
+                        &field.name,
                         &field.value,
                         &arguments,
                         &resolved_steps,
@@ -321,6 +327,84 @@ impl<'a> Planner<'a> {
         })
     }
 
+    fn resolve_command_argument_rows(
+        &self,
+        command: &CompiledCommand,
+        step: &CommandStep,
+        cte: &str,
+        arguments: &BTreeMap<String, Scalar>,
+        path: &str,
+        error_path: &str,
+    ) -> Result<Option<(CommandExecutionStep, ResolvedCommandRowSet)>, PlanError> {
+        let (source, minimum_items, maximum_items) = match &step.operation {
+            CommandStepOperation::Aggregate { aggregate } => (
+                &aggregate.from,
+                aggregate.minimum_items.unwrap_or(0),
+                aggregate.maximum_items,
+            ),
+            CommandStepOperation::UpdateMany { update_many } => (
+                &update_many.for_each,
+                update_many.minimum_items.unwrap_or(0),
+                update_many.maximum_items,
+            ),
+            _ => return Ok(None),
+        };
+        let CommandValue::Argument { arg } = source else {
+            return Ok(None);
+        };
+        let maximum_items = maximum_items.ok_or_else(|| {
+            PlanError::validation(
+                path,
+                "command argument row-set bound escaped deployment validation",
+            )
+        })?;
+        let items = command_argument(arguments, arg, path)?;
+        let rows = items.as_json().as_array().ok_or_else(|| {
+            PlanError::validation(path, "command argument row-set must be a list")
+        })?;
+        if rows.len() > maximum_items as usize {
+            return Err(PlanError::validation(
+                path,
+                format!("argument row-set exceeds maximum_items {maximum_items}"),
+            ));
+        }
+        if rows.len() < minimum_items as usize {
+            return Err(PlanError::validation(
+                path,
+                format!("argument row-set requires minimum_items {minimum_items}"),
+            ));
+        }
+        if rows.iter().any(|row| !row.is_object()) {
+            return Err(PlanError::validation(
+                path,
+                "command argument row-set items must be objects",
+            ));
+        }
+        let columns = command_argument_row_columns(command, arg, path)?;
+        let input_cte = format!("{cte}_input");
+        let resolved = ResolvedCommandRowSet {
+            cte: input_cte.clone(),
+            columns: columns
+                .iter()
+                .cloned()
+                .map(|column| (column.name.clone(), column))
+                .collect(),
+            guaranteed_non_empty: minimum_items > 0,
+        };
+        Ok(Some((
+            CommandExecutionStep::ArgumentRows {
+                name: format!("{}_input", step.name),
+                cte: input_cte,
+                items,
+                columns,
+                minimum_items,
+                maximum_items,
+                error_path: error_path.to_owned(),
+            },
+            resolved,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_command_step(
         &self,
@@ -329,6 +413,7 @@ impl<'a> Planner<'a> {
         cte: String,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        argument_rows: Option<&ResolvedCommandRowSet>,
         session: &Session,
         path: &str,
         error_path: &str,
@@ -463,8 +548,12 @@ impl<'a> Planner<'a> {
                 ))
             }
             CommandStepOperation::Aggregate { aggregate } => {
-                let input =
-                    self.resolve_any_command_row_set(&aggregate.from, previous_steps, path)?;
+                let input = self.resolve_any_command_row_set(
+                    &aggregate.from,
+                    previous_steps,
+                    argument_rows,
+                    path,
+                )?;
                 let values = aggregate
                     .values
                     .iter()
@@ -519,8 +608,12 @@ impl<'a> Planner<'a> {
                 ))
             }
             CommandStepOperation::ProjectMany { project_many } => {
-                let input =
-                    self.resolve_any_command_row_set(&project_many.from, previous_steps, path)?;
+                let input = self.resolve_any_command_row_set(
+                    &project_many.from,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
                 let current = CommandCurrentContext {
                     fields: input.columns.clone(),
                     alias: "_cmd_input",
@@ -628,8 +721,12 @@ impl<'a> Planner<'a> {
                 ))
             }
             CommandStepOperation::DecisionMany { decision_many } => {
-                let row_set =
-                    self.resolve_any_command_row_set(&decision_many.from, previous_steps, path)?;
+                let row_set = self.resolve_any_command_row_set(
+                    &decision_many.from,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
                 let current = CommandCurrentContext {
                     fields: row_set.columns.clone(),
                     alias: "_cmd_input",
@@ -719,7 +816,8 @@ impl<'a> Planner<'a> {
             CommandStepOperation::Insert { insert } => {
                 let context = self.command_table_context(&insert.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(
+                    .resolve_command_role_perm(
+                        &context.entry.command_insert_permissions,
                         &context.entry.insert_permissions,
                         &session.role,
                         |permission| !permission.backend_only || session.backend_request,
@@ -769,7 +867,8 @@ impl<'a> Planner<'a> {
                     resolve_command_condition(&insert_when.when, arguments, command, path)?;
                 let context = self.command_table_context(&insert_when.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(
+                    .resolve_command_role_perm(
+                        &context.entry.command_insert_permissions,
                         &context.entry.insert_permissions,
                         &session.role,
                         |permission| !permission.backend_only || session.backend_request,
@@ -818,7 +917,8 @@ impl<'a> Planner<'a> {
             CommandStepOperation::InsertMany { insert_many } => {
                 let context = self.command_table_context(&insert_many.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(
+                    .resolve_command_role_perm(
+                        &context.entry.command_insert_permissions,
                         &context.entry.insert_permissions,
                         &session.role,
                         |permission| !permission.backend_only || session.backend_request,
@@ -841,6 +941,7 @@ impl<'a> Planner<'a> {
                         let input = self.resolve_any_command_row_set(
                             &insert_many.for_each,
                             previous_steps,
+                            None,
                             path,
                         )?;
                         (
@@ -922,7 +1023,12 @@ impl<'a> Planner<'a> {
             CommandStepOperation::Update { update } => {
                 let context = self.command_table_context(&update.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(&context.entry.update_permissions, &session.role, |_| true)
+                    .resolve_command_role_perm(
+                        &context.entry.command_update_permissions,
+                        &context.entry.update_permissions,
+                        &session.role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(path, "command update permission is missing")
                     })?;
@@ -987,7 +1093,12 @@ impl<'a> Planner<'a> {
                     resolve_command_condition(&update_when.when, arguments, command, path)?;
                 let context = self.command_table_context(&update_when.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(&context.entry.update_permissions, &session.role, |_| true)
+                    .resolve_command_role_perm(
+                        &context.entry.command_update_permissions,
+                        &context.entry.update_permissions,
+                        &session.role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(path, "command update permission is missing")
                     })?;
@@ -1049,11 +1160,20 @@ impl<'a> Planner<'a> {
                 ))
             }
             CommandStepOperation::UpdateMany { update_many } => {
-                let input =
-                    self.resolve_any_command_row_set(&update_many.for_each, previous_steps, path)?;
+                let input = self.resolve_any_command_row_set(
+                    &update_many.for_each,
+                    previous_steps,
+                    argument_rows,
+                    path,
+                )?;
                 let context = self.command_table_context(&update_many.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(&context.entry.update_permissions, &session.role, |_| true)
+                    .resolve_command_role_perm(
+                        &context.entry.command_update_permissions,
+                        &context.entry.update_permissions,
+                        &session.role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(path, "command update permission is missing")
                     })?;
@@ -1070,9 +1190,32 @@ impl<'a> Planner<'a> {
                         .collect(),
                     alias: "_cmd_target",
                 };
+                let key_bindings = update_many
+                    .by
+                    .iter()
+                    .filter(|(name, _)| context.info.primary_key.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let guard_bindings = update_many
+                    .by
+                    .iter()
+                    .filter(|(name, _)| !context.info.primary_key.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>();
                 let primary_key = self.resolve_command_assignments(
                     command,
-                    &update_many.by,
+                    &key_bindings,
+                    &update_many.table,
+                    arguments,
+                    previous_steps,
+                    Some(&item),
+                    Some(&current),
+                    session,
+                    path,
+                )?;
+                let guards = self.resolve_command_assignments(
+                    command,
+                    &guard_bindings,
                     &update_many.table,
                     arguments,
                     previous_steps,
@@ -1134,6 +1277,7 @@ impl<'a> Planner<'a> {
                     },
                     input_cte: input.cte.clone(),
                     primary_key,
+                    guards,
                     assignments,
                     check,
                     returning: returning.clone(),
@@ -1150,7 +1294,12 @@ impl<'a> Planner<'a> {
             CommandStepOperation::Delete { delete } => {
                 let context = self.command_table_context(&delete.table, session, path)?;
                 let permission = self
-                    .resolve_role_perm(&context.entry.delete_permissions, &session.role, |_| true)
+                    .resolve_command_role_perm(
+                        &context.entry.command_delete_permissions,
+                        &context.entry.delete_permissions,
+                        &session.role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(path, "command delete permission is missing")
                     })?;
@@ -1187,8 +1336,12 @@ impl<'a> Planner<'a> {
                 ))
             }
             CommandStepOperation::AllocateMany { allocate_many } => {
-                let input =
-                    self.resolve_any_command_row_set(&allocate_many.from, previous_steps, path)?;
+                let input = self.resolve_any_command_row_set(
+                    &allocate_many.from,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
                 let required = |name: &str| {
                     input.columns.get(name).cloned().ok_or_else(|| {
                         PlanError::validation(
@@ -1339,12 +1492,13 @@ impl<'a> Planner<'a> {
         session: &Session,
         path: &str,
     ) -> Result<TableCtx<'a>, PlanError> {
-        self.table_ctx_by_name(table, &session.role).ok_or_else(|| {
-            PlanError::validation(
-                path,
-                format!("role '{}' lacks select permission", session.role),
-            )
-        })
+        self.command_table_ctx_by_name(table, &session.role)
+            .ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    format!("role '{}' lacks select permission", session.role),
+                )
+            })
     }
 
     fn command_columns(
@@ -1370,8 +1524,17 @@ impl<'a> Planner<'a> {
         &self,
         value: &CommandValue,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        argument_rows: Option<&ResolvedCommandRowSet>,
         path: &str,
     ) -> Result<ResolvedCommandRowSet, PlanError> {
+        if matches!(value, CommandValue::Argument { .. }) {
+            return argument_rows.cloned().ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    "command argument row-set input was not resolved before use",
+                )
+            });
+        }
         let CommandValue::Step {
             step,
             column: None,
@@ -1654,7 +1817,7 @@ impl<'a> Planner<'a> {
                 value: command_argument(arguments, arg, path)?,
                 pg_type: target.pg_type.clone(),
             }),
-            CommandValue::Literal { literal } => Ok(CommandExecutionValue::Scalar {
+            CommandValue::Literal { literal, .. } => Ok(CommandExecutionValue::Scalar {
                 value: Scalar::Json(literal.clone()),
                 pg_type: target.pg_type.clone(),
             }),
@@ -1845,7 +2008,7 @@ impl<'a> Planner<'a> {
             CommandValue::Argument { arg } => Ok(SqlBinding::literal(
                 command_argument(arguments, arg, path)?.as_json().clone(),
             )),
-            CommandValue::Literal { literal } => Ok(SqlBinding::literal(literal.clone())),
+            CommandValue::Literal { literal, .. } => Ok(SqlBinding::literal(literal.clone())),
             CommandValue::Step {
                 step,
                 column: Some(column),
@@ -1931,6 +2094,7 @@ impl<'a> Planner<'a> {
     fn resolve_command_result_value(
         &self,
         command: &CompiledCommand,
+        result_name: &str,
         value: &MetadataCommandResultValue,
         arguments: &BTreeMap<String, Scalar>,
         steps: &BTreeMap<String, ResolvedCommandStep>,
@@ -2061,10 +2225,23 @@ impl<'a> Planner<'a> {
                 value: command_argument(arguments, arg, path)?,
                 pg_type: command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
             }),
-            MetadataCommandResultValue::Literal { literal } => Ok(CommandResultValue::Scalar {
-                value: Scalar::Json(literal.clone()),
-                pg_type: command_result_literal_type(literal).to_owned(),
-            }),
+            MetadataCommandResultValue::Literal { literal, .. } => {
+                let contract = command
+                    .descriptor()
+                    .result
+                    .roots
+                    .get(result_name)
+                    .ok_or_else(|| {
+                        PlanError::validation(
+                            path,
+                            format!("command result contract has no field '{result_name}'"),
+                        )
+                    })?;
+                Ok(CommandResultValue::Scalar {
+                    value: Scalar::Json(literal.clone()),
+                    pg_type: command_contract_pg_type(&contract.type_ref),
+                })
+            }
             MetadataCommandResultValue::Rule { rule, bindings } => {
                 let compiled = command.rules().rule(rule).ok_or_else(|| {
                     PlanError::validation(path, format!("unknown compiled rule '{rule}'"))
@@ -2379,7 +2556,7 @@ impl<'a> Planner<'a> {
                 )
             })?;
             let select = self
-                .table_ctx_by_name(table, &session.role)
+                .command_table_ctx_by_name(table, &session.role)
                 .ok_or_else(|| {
                     PlanError::validation(
                         &step_path,
@@ -2425,9 +2602,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::Insert { insert } => {
                     let permission = self
-                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
-                            !permission.backend_only || session.backend_request
-                        })
+                        .resolve_command_role_perm(
+                            &entry.command_insert_permissions,
+                            &entry.insert_permissions,
+                            &session.role,
+                            |permission| !permission.backend_only || session.backend_request,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2449,9 +2629,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::InsertMany { insert_many } => {
                     let permission = self
-                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
-                            !permission.backend_only || session.backend_request
-                        })
+                        .resolve_command_role_perm(
+                            &entry.command_insert_permissions,
+                            &entry.insert_permissions,
+                            &session.role,
+                            |permission| !permission.backend_only || session.backend_request,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2473,9 +2656,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::InsertWhen { insert_when } => {
                     let permission = self
-                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
-                            !permission.backend_only || session.backend_request
-                        })
+                        .resolve_command_role_perm(
+                            &entry.command_insert_permissions,
+                            &entry.insert_permissions,
+                            &session.role,
+                            |permission| !permission.backend_only || session.backend_request,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2497,7 +2683,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::Update { update } => {
                     let permission = self
-                        .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+                        .resolve_command_role_perm(
+                            &entry.command_update_permissions,
+                            &entry.update_permissions,
+                            &session.role,
+                            |_| true,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2525,7 +2716,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::UpdateMany { update_many } => {
                     let permission = self
-                        .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+                        .resolve_command_role_perm(
+                            &entry.command_update_permissions,
+                            &entry.update_permissions,
+                            &session.role,
+                            |_| true,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2556,7 +2752,12 @@ impl<'a> Planner<'a> {
                 }
                 CommandStepOperation::UpdateWhen { update_when } => {
                     let permission = self
-                        .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+                        .resolve_command_role_perm(
+                            &entry.command_update_permissions,
+                            &entry.update_permissions,
+                            &session.role,
+                            |_| true,
+                        )
                         .ok_or_else(|| {
                             PlanError::validation(
                                 &step_path,
@@ -2583,16 +2784,21 @@ impl<'a> Planner<'a> {
                     )?;
                 }
                 CommandStepOperation::Delete { delete } => {
-                    self.resolve_role_perm(&entry.delete_permissions, &session.role, |_| true)
-                        .ok_or_else(|| {
-                            PlanError::validation(
-                                &step_path,
-                                format!(
-                                    "role '{}' lacks delete permission on table '{}.{}'",
-                                    session.role, info.schema, info.name
-                                ),
-                            )
-                        })?;
+                    self.resolve_command_role_perm(
+                        &entry.command_delete_permissions,
+                        &entry.delete_permissions,
+                        &session.role,
+                        |_| true,
+                    )
+                    .ok_or_else(|| {
+                        PlanError::validation(
+                            &step_path,
+                            format!(
+                                "role '{}' lacks delete permission on table '{}.{}'",
+                                session.role, info.schema, info.name
+                            ),
+                        )
+                    })?;
                     require_select(
                         delete
                             .predicate
@@ -2619,14 +2825,15 @@ impl<'a> Planner<'a> {
 
     fn parse_command_arguments(
         &self,
-        command: &Command,
+        command: &CompiledCommand,
         field: &GqlField<'static, String>,
         vars: &JsonMap<String, Json>,
         path: &str,
     ) -> Result<BTreeMap<String, Scalar>, PlanError> {
+        let definition = command.definition();
         let mut arguments = BTreeMap::new();
         for (name, value) in &field.arguments {
-            let definition = command
+            let argument = definition
                 .arguments
                 .iter()
                 .find(|argument| argument.name == *name)
@@ -2634,21 +2841,22 @@ impl<'a> Planner<'a> {
             let value = value_to_json(value, vars, path)?;
             let value = coerce_command_argument_value(
                 self.metadata(),
-                &definition.type_,
+                command.rules(),
+                &argument.type_,
                 &value,
                 &format!("{path}.args.{name}"),
             )?;
             arguments.insert(name.clone(), Scalar::Json(value));
         }
-        for definition in &command.arguments {
-            if !arguments.contains_key(&definition.name) {
-                if definition.type_.ends_with('!') {
+        for argument in &definition.arguments {
+            if !arguments.contains_key(&argument.name) {
+                if argument.type_.ends_with('!') {
                     return Err(PlanError::validation(
                         path,
-                        format!("missing required field argument: \"{}\"", definition.name),
+                        format!("missing required field argument: \"{}\"", argument.name),
                     ));
                 }
-                arguments.insert(definition.name.clone(), Scalar::Json(Json::Null));
+                arguments.insert(argument.name.clone(), Scalar::Json(Json::Null));
             }
         }
         Ok(arguments)
@@ -2740,19 +2948,11 @@ impl<'a> Planner<'a> {
                             vars,
                             path,
                         )?;
-                        if command_step_is_many(step) {
-                            Ok(CommandResultSelection::List {
-                                alias,
-                                field: selected.name.clone(),
-                                selections,
-                            })
-                        } else {
-                            Ok(CommandResultSelection::Object {
-                                alias,
-                                field: selected.name.clone(),
-                                selections,
-                            })
-                        }
+                        Ok(CommandResultSelection::List {
+                            alias,
+                            field: selected.name.clone(),
+                            selections,
+                        })
                     }
                     MetadataCommandResultValue::Step {
                         step,
@@ -3729,6 +3929,80 @@ fn command_argument(
     })
 }
 
+fn command_argument_row_columns(
+    command: &CompiledCommand,
+    name: &str,
+    path: &str,
+) -> Result<Vec<CommandColumn>, PlanError> {
+    let root = command
+        .descriptor()
+        .arguments
+        .roots
+        .get(name)
+        .ok_or_else(|| PlanError::validation(path, format!("unknown command argument '{name}'")))?;
+    let ValueType::List { element } = &root.type_ref.value_type else {
+        return Err(PlanError::validation(
+            path,
+            "command argument row-set contract must be a list",
+        ));
+    };
+    let fields = match &element.value_type {
+        ValueType::Ref { name } => {
+            &command
+                .descriptor()
+                .arguments
+                .named_objects
+                .get(name)
+                .ok_or_else(|| {
+                    PlanError::validation(
+                        path,
+                        format!("command argument row-set object '{name}' is unresolved"),
+                    )
+                })?
+                .fields
+        }
+        ValueType::Object { fields } => fields,
+        _ => {
+            return Err(PlanError::validation(
+                path,
+                "command argument row-set items must be typed objects",
+            ));
+        }
+    };
+    fields
+        .iter()
+        .map(|(name, field)| {
+            Ok(CommandColumn {
+                name: name.clone(),
+                pg_type: command_contract_pg_type(&field.type_ref),
+                nullable: !field.required || field.type_ref.nullable,
+            })
+        })
+        .collect()
+}
+
+fn command_contract_pg_type(type_ref: &TypeRef) -> String {
+    match &type_ref.value_type {
+        ValueType::Scalar { scalar } => match scalar {
+            ValueScalar::Boolean => "bool".to_owned(),
+            ValueScalar::String => "text".to_owned(),
+            ValueScalar::Int32 => "int4".to_owned(),
+            ValueScalar::Int64 => "int8".to_owned(),
+            ValueScalar::UInt64 | ValueScalar::Decimal => "numeric".to_owned(),
+            ValueScalar::Uuid => "uuid".to_owned(),
+            ValueScalar::Date => "date".to_owned(),
+            ValueScalar::Timestamp => "timestamp".to_owned(),
+            ValueScalar::TimestampTz => "timestamptz".to_owned(),
+            ValueScalar::Json => "jsonb".to_owned(),
+            ValueScalar::Custom { name } => name.clone(),
+        },
+        ValueType::Enum { .. } => "text".to_owned(),
+        ValueType::Object { .. } | ValueType::List { .. } | ValueType::Ref { .. } => {
+            "jsonb".to_owned()
+        }
+    }
+}
+
 fn resolved_value_column(
     command: &CompiledCommand,
     name: &str,
@@ -3743,9 +4017,10 @@ fn resolved_value_column(
             command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
             command_argument_nullable(command.definition(), arg, path)?,
         ),
-        CommandValue::Literal { literal } => (
-            command_result_literal_type(literal).to_owned(),
-            literal.is_null(),
+        CommandValue::Literal { literal, as_ } => (
+            command_value_literal_pg_type(command, literal, as_.as_deref(), path)?,
+            as_.as_deref().is_some_and(|type_| !type_.ends_with('!'))
+                || (as_.is_none() && literal.is_null()),
         ),
         CommandValue::Step {
             step,
@@ -3916,6 +4191,46 @@ fn command_result_literal_type(value: &Json) -> &'static str {
         Json::String(_) => "text",
         Json::Null | Json::Array(_) | Json::Object(_) => "jsonb",
     }
+}
+
+fn command_value_literal_pg_type(
+    command: &CompiledCommand,
+    value: &Json,
+    annotation: Option<&str>,
+    path: &str,
+) -> Result<String, PlanError> {
+    let Some(annotation) = annotation else {
+        return Ok(command_result_literal_type(value).to_owned());
+    };
+    let name = annotation.trim_end_matches('!');
+    let builtin = match name {
+        "Boolean" | "bool" => Some("bool"),
+        "String" | "string" | "ID" => Some("text"),
+        "Int" | "int" => Some("int4"),
+        "bigint" => Some("int8"),
+        "Float" | "float" | "decimal" => Some("numeric"),
+        "uuid" => Some("uuid"),
+        "date" => Some("date"),
+        "timestamp" => Some("timestamp"),
+        "timestamptz" => Some("timestamptz"),
+        "json" | "jsonb" => Some("jsonb"),
+        _ => None,
+    };
+    if let Some(pg_type) = builtin {
+        return Ok(pg_type.to_owned());
+    }
+    if let Some(type_) = command.rules().declared_type(name) {
+        return Ok(command_rule_pg_type(type_).to_owned());
+    }
+    command
+        .literal_annotation_pg_type(name)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!("command literal annotation '{annotation}' escaped deployment validation"),
+            )
+        })
 }
 
 fn resolve_command_aggregate(
@@ -4166,6 +4481,7 @@ fn require_command_columns<'a>(
 
 fn coerce_command_argument_value(
     metadata: &donat_metadata::Metadata,
+    rules: &donat_rules::RuleCatalog,
     type_: &str,
     value: &Json,
     path: &str,
@@ -4195,13 +4511,16 @@ fn coerce_command_argument_value(
                 .map(|(index, item)| {
                     coerce_command_argument_value(
                         metadata,
+                        rules,
                         inner,
                         item,
                         &format!("{path}[{index}]"),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            item => vec![coerce_command_argument_value(metadata, inner, item, path)?],
+            item => vec![coerce_command_argument_value(
+                metadata, rules, inner, item, path,
+            )?],
         };
         return Ok(Json::Array(items));
     }
@@ -4267,6 +4586,7 @@ fn coerce_command_argument_value(
                         field.name.clone(),
                         coerce_command_argument_value(
                             metadata,
+                            rules,
                             &field.type_,
                             value,
                             &format!("{path}.{}", field.name),
@@ -4283,6 +4603,9 @@ fn coerce_command_argument_value(
             }
         }
         return Ok(Json::Object(coerced));
+    }
+    if let Some(type_definition) = rules.declared_type(type_) {
+        return coerce_rule_argument_value(type_definition, value, path);
     }
     if let Some(enum_) = metadata
         .custom_types
@@ -4325,4 +4648,107 @@ fn coerce_command_argument_value(
         path,
         format!("unknown command argument type '{type_}'"),
     ))
+}
+
+fn coerce_rule_argument_value(
+    type_: &RuleType,
+    value: &Json,
+    path: &str,
+) -> Result<Json, PlanError> {
+    if let RuleType::Nullable(inner) = type_ {
+        return if value.is_null() {
+            Ok(Json::Null)
+        } else {
+            coerce_rule_argument_value(inner, value, path)
+        };
+    }
+    if value.is_null() {
+        return Err(PlanError::validation(
+            path,
+            "null is not allowed for a non-null argument",
+        ));
+    }
+    let valid = match type_ {
+        RuleType::Bool => value.is_boolean(),
+        RuleType::String | RuleType::Uuid | RuleType::Date | RuleType::Timestamp => {
+            value.is_string()
+        }
+        RuleType::Int => {
+            value
+                .as_i64()
+                .is_some_and(|number| (i32::MIN as i64..=i32::MAX as i64).contains(&number))
+                || value
+                    .as_u64()
+                    .is_some_and(|number| number <= i32::MAX as u64)
+        }
+        RuleType::Int64 => {
+            value.as_i64().is_some()
+                || value
+                    .as_u64()
+                    .is_some_and(|number| number <= i64::MAX as u64)
+        }
+        RuleType::Decimal => value.is_number(),
+        RuleType::Enum { symbols, .. } => value
+            .as_str()
+            .is_some_and(|value| symbols.iter().any(|symbol| symbol == value)),
+        RuleType::OpaqueJson { .. } => true,
+        RuleType::List(item) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| PlanError::validation(path, "argument must be a list"))?;
+            return values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    coerce_rule_argument_value(item, value, &format!("{path}[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Json::Array);
+        }
+        RuleType::Object { name, fields } => {
+            let values = value.as_object().ok_or_else(|| {
+                PlanError::validation(path, format!("argument must be input object '{name}'"))
+            })?;
+            for field in values.keys() {
+                if !fields.contains_key(field) {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("field '{field}' is not declared by input object '{name}'"),
+                    ));
+                }
+            }
+            let mut coerced = serde_json::Map::new();
+            for (field, field_type) in fields {
+                match values.get(field) {
+                    Some(value) => {
+                        coerced.insert(
+                            field.clone(),
+                            coerce_rule_argument_value(
+                                field_type,
+                                value,
+                                &format!("{path}.{field}"),
+                            )?,
+                        );
+                    }
+                    None if !matches!(field_type, RuleType::Nullable(_)) => {
+                        return Err(PlanError::validation(
+                            path,
+                            format!("missing required input field: \"{field}\""),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            return Ok(Json::Object(coerced));
+        }
+        RuleType::Nullable(_) => unreachable!("nullable Rule types are handled above"),
+    };
+    if valid {
+        Ok(value.clone())
+    } else {
+        Err(PlanError::validation(
+            path,
+            "argument does not match its declared Rule type",
+        ))
+    }
 }

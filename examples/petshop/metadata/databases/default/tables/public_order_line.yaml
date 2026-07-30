@@ -31,6 +31,24 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+command_select_permissions:
+  - role: subscription_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - variant_id
+        - quantity
+        - unit_price_minor
+        - line_total_minor
+        - currency
+      filter: {}
+  - role: veterinary_reviewer
+    permission:
+      columns:
+        - id
+        - prescription_release_id
+      filter: {}
 insert_permissions:
   - role: customer
     permission:

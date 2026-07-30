@@ -69,6 +69,11 @@
     - name: order
       using:
         foreign_key_constraint_on: order_id
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns: [id, order_id, kind, code, provider_reference, amount_minor, currency]
+        filter: {order: {customer_id: {_eq: X-Donat-User-Id}}}
   insert_permissions:
     - role: customer
       permission:
@@ -115,16 +120,31 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: payment_capture}
+  command_select_permissions:
+    - role: payment_worker
+      permission:
+        columns: [id, payment_id, authorization_id, amount_minor, status]
+        filter: {}
   insert_permissions:
     - role: payment_worker
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: payment_void}
+  command_select_permissions:
+    - role: payment_worker
+      permission:
+        columns: [id, payment_id, authorization_id, status]
+        filter: {}
   insert_permissions:
     - role: payment_worker
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: payment_chargeback}
+  command_select_permissions:
+    - role: payment_worker
+      permission:
+        columns: [id, payment_id, amount_minor, status]
+        filter: {}
   insert_permissions:
     - role: payment_worker
       permission: {columns: "*", check: {}}
@@ -133,6 +153,11 @@
   select_permissions:
     - role: support
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: reconciliation_worker
+      permission:
+        columns: [id, payment_id, provider_event_id, decision, status]
+        filter: {}
   insert_permissions:
     - role: reconciliation_worker
       permission: {columns: "*", check: {}}
@@ -141,6 +166,13 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: payment_reconciliation_resolution}
+  command_select_permissions:
+    - role: support
+      permission:
+        columns:
+          [id, reconciliation_id, resolution_id, actor_role, actor_user_id,
+           note]
+        filter: {}
   insert_permissions:
     - role: support
       permission: {columns: "*", check: {}}
@@ -149,6 +181,12 @@
   select_permissions:
     - role: support
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: payment_worker
+      permission:
+        columns:
+          [id, payment_id, provider_event_id, fraud_score, route, status]
+        filter: {}
   insert_permissions:
     - role: payment_worker
       permission: {columns: "*", check: {}}
@@ -157,6 +195,18 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: payment_fraud_decision}
+  command_select_permissions:
+    - role: payment_worker
+      permission:
+        columns:
+          [id, fraud_review_id, decision, decision_route, provider_event_id]
+        filter: {}
+    - role: support
+      permission:
+        columns:
+          [id, fraud_review_id, decision_id, decision, actor_role,
+           actor_user_id, note]
+        filter: {}
   insert_permissions:
     - role: payment_worker
       permission: {columns: "*", check: {}}
@@ -164,6 +214,9 @@
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: notification_delivery}
+  select_permissions:
+    - role: notification_worker
+      permission: {columns: "*", filter: {}}
   insert_permissions:
     - role: notification_worker
       permission: {columns: "*", check: {}}
@@ -180,6 +233,11 @@
       permission: {columns: "*", filter: {}}
 
 - table: {schema: public, name: inventory_level}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns: [id, on_hand_quantity, reserved_quantity]
+        filter: {}
   update_permissions:
     - role: fulfilment
       permission: {columns: "*", filter: {}, check: {}}
@@ -200,22 +258,40 @@
     - role: fulfilment
       permission: {columns: "*", filter: {}, check: {}}
 
+- table: {schema: public, name: inventory_allocation_group}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+
 - table: {schema: public, name: inventory_allocation_line}
   select_permissions:
     - role: fulfilment
       permission: {columns: "*", filter: {}}
 
 - table: {schema: public, name: inventory_backorder}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns: [id, order_line_id, backordered_quantity, status]
+        filter: {}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: shipment_item}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns: [shipment_id, order_line_id, quantity, line_value_minor]
+        filter: {}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: shipment_result}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
@@ -233,6 +309,11 @@
       permission: {columns: "*", filter: {}}
     - role: fulfilment
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns: [id, order_id, customer_id, replacement_requested, reason, status]
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
   insert_permissions:
     - role: customer
       permission:
@@ -252,6 +333,19 @@
   select_permissions:
     - role: fulfilment
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns:
+          [id, return_request_id, order_line_id, requested_quantity,
+           approved_quantity, received_quantity, inspected_quantity]
+        filter: {request: {customer_id: {_eq: X-Donat-User-Id}}}
+    - role: support
+      permission:
+        columns:
+          [id, return_request_id, order_line_id, requested_quantity,
+           approved_quantity]
+        filter: {}
   insert_permissions:
     - role: customer
       permission:
@@ -268,6 +362,21 @@
     - name: request
       using:
         foreign_key_constraint_on: return_request_id
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns: [id, return_request_id, event_type, request_id, reason]
+        filter: {request: {customer_id: {_eq: X-Donat-User-Id}}}
+    - role: support
+      permission:
+        columns: [id, return_request_id, event_type, request_id, reason, note]
+        filter: {}
+    - role: fulfilment
+      permission:
+        columns:
+          [id, return_request_id, event_type, request_id, inspection_id,
+           exchange_id, occurred_at]
+        filter: {}
   insert_permissions:
     - role: customer
       permission:
@@ -279,6 +388,13 @@
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: return_inspection}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns:
+          [id, return_request_id, inspection_id, decision,
+           refund_amount_minor, note]
+        filter: {}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
@@ -289,11 +405,21 @@
       permission: {columns: "*", filter: {}}
 
 - table: {schema: public, name: exchange}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns: [id, return_request_id, order_id, status]
+        filter: {}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: exchange_item}
+  command_select_permissions:
+    - role: fulfilment
+      permission:
+        columns: [exchange_id, return_item_id, order_line_id, quantity]
+        filter: {}
   insert_permissions:
     - role: fulfilment
       permission: {columns: "*", check: {}}
@@ -327,6 +453,11 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: subscription_dunning_attempt}
+  command_select_permissions:
+    - role: subscription_worker
+      permission:
+        columns: [id, renewal_id, attempt, provider_event_id, outcome, occurred_at]
+        filter: {}
   insert_permissions:
     - role: subscription_worker
       permission: {columns: "*", check: {}}
@@ -358,6 +489,13 @@
       permission: {columns: "*", filter: {}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: b2b_buyer
+      permission:
+        columns:
+          [id, organization_id, total_minor, currency, available_credit_minor,
+           status]
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
   insert_permissions:
     - role: b2b_buyer
       permission:
@@ -365,6 +503,13 @@
         check: {customer_id: {_eq: X-Donat-User-Id}}
 
 - table: {schema: public, name: quote_line}
+  command_select_permissions:
+    - role: b2b_buyer
+      permission:
+        columns:
+          [id, quote_id, variant_id, quantity, unit_price_minor,
+           line_total_minor, currency]
+        filter: {}
   insert_permissions:
     - role: b2b_buyer
       permission: {columns: "*", check: {}}
@@ -375,6 +520,11 @@
       permission: {columns: "*", filter: {}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: b2b_buyer
+      permission:
+        columns: [id, quote_id, status]
+        filter: {}
   insert_permissions:
     - role: b2b_buyer
       permission: {columns: "*", check: {}}
@@ -385,6 +535,15 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: credit_usage}
+  command_select_permissions:
+    - role: b2b_approver
+      permission:
+        columns: [id, approval_id, amount_minor, currency]
+        filter: {}
+    - role: b2b_finance
+      permission:
+        columns: [id, approval_id, amount_minor, currency]
+        filter: {}
   insert_permissions:
     - role: b2b_approver
       permission: {columns: "*", check: {}}
@@ -399,6 +558,8 @@
 - table: {schema: public, name: vendor_order}
   select_permissions:
     - role: vendor
+      permission: {columns: "*", filter: {}}
+    - role: marketplace_worker
       permission: {columns: "*", filter: {}}
   insert_permissions:
     - role: marketplace_worker
@@ -415,6 +576,11 @@
         filter: {user_id: {_eq: X-Donat-User-Id}}
 
 - table: {schema: public, name: vendor_order_acceptance}
+  command_select_permissions:
+    - role: vendor
+      permission:
+        columns: [id, vendor_order_id, vendor_id, acceptance_id]
+        filter: {}
   insert_permissions:
     - role: vendor
       permission: {columns: "*", check: {}}
@@ -430,6 +596,13 @@
       permission: {columns: "*", filter: {}}
     - role: support
       permission: {columns: "*", filter: {}}
+  command_select_permissions:
+    - role: marketplace_worker
+      permission:
+        columns:
+          [id, payout_key, payout_cycle_id, vendor_id, net_minor, currency,
+           status]
+        filter: {}
   insert_permissions:
     - role: marketplace_worker
       permission: {columns: "*", check: {}}
@@ -440,16 +613,31 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: vendor_payout_event}
+  command_select_permissions:
+    - role: payout_worker
+      permission:
+        columns: [id, payout_id, provider_event_id, outcome]
+        filter: {}
   insert_permissions:
     - role: payout_worker
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: vendor_payout_reconciliation}
+  command_select_permissions:
+    - role: support
+      permission:
+        columns: [id, payout_id, payout_cycle_id, reconciliation_id]
+        filter: {}
   insert_permissions:
     - role: support
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: vendor_dispute}
+  command_select_permissions:
+    - role: vendor
+      permission:
+        columns: [id, dispute_id, vendor_order_id, vendor_id, status]
+        filter: {}
   insert_permissions:
     - role: vendor
       permission: {columns: "*", check: {}}
@@ -481,6 +669,19 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: grooming_booking_event}
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns: [id, booking_id, event_type, request_id, reason]
+        filter: {}
+    - role: booking_worker
+      permission:
+        columns: [id, booking_id, event_type, request_id]
+        filter: {}
+    - role: groomer
+      permission:
+        columns: [id, booking_id, event_type, request_id]
+        filter: {}
   insert_permissions:
     - role: customer
       permission: {columns: "*", check: {}}
@@ -498,6 +699,10 @@
 
 - table: {schema: public, name: prescription_request}
   select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
     - role: veterinary_reviewer
       permission: {columns: "*", filter: {}}
     - role: prescription_worker
@@ -514,11 +719,29 @@
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: prescription_review}
+  command_select_permissions:
+    - role: veterinary_reviewer
+      permission:
+        columns: [id, prescription_request_id, decision, decision_id]
+        filter: {}
   insert_permissions:
     - role: veterinary_reviewer
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: prescription_event}
+  command_select_permissions:
+    - role: customer
+      permission:
+        columns: [id, prescription_request_id, event_type, request_id]
+        filter: {}
+    - role: veterinary_reviewer
+      permission:
+        columns: [id, prescription_request_id, event_type, request_id]
+        filter: {}
+    - role: prescription_worker
+      permission:
+        columns: [id, prescription_request_id, event_type, request_id]
+        filter: {}
   insert_permissions:
     - role: customer
       permission: {columns: "*", check: {}}

@@ -12,24 +12,37 @@ arguments:
 steps:
   - name: allocation
     select_one:
-      table: { schema: public, name: inventory_allocation }
-      by: { allocation_id: { arg: allocation_id } }
+      table: { schema: public, name: inventory_allocation_group }
+      by:
+        allocation_id: { arg: allocation_id }
+        status: { literal: allocated }
       returning: [allocation_id, order_id, stock_location_code, status, quantity]
       require_found: true
-  - name: packed_allocation
-    update:
+  - name: allocation_rows
+    select_many:
       table: { schema: public, name: inventory_allocation }
-      where: { allocation_id: { arg: allocation_id }, status: { literal: allocated } }
+      by:
+        allocation_id: { arg: allocation_id }
+        status: { literal: allocated }
+      order_by: [id]
+      returning: [id, allocation_id, order_id, stock_location_code, status, quantity]
+      require_non_empty: true
+      maximum_rows: 64
+  - name: packed_allocation
+    update_many:
+      table: { schema: public, name: inventory_allocation }
+      for_each: { step: allocation_rows }
+      by: { id: { item: id } }
       set: { status: { literal: packed }, packed_at: { arg: packed_at } }
-      returning: [allocation_id, order_id, stock_location_code, quantity, status, packed_at]
-      require_affected: true
+      returning: [id, allocation_id, order_id, stock_location_code, quantity, status, packed_at]
+      require_each: true
 result:
-  allocation_id: { step: packed_allocation, column: allocation_id }
-  order_id: { step: packed_allocation, column: order_id }
-  stock_location_code: { step: packed_allocation, column: stock_location_code }
-  quantity: { step: packed_allocation, column: quantity }
-  status: { step: packed_allocation, column: status }
-  packed_at: { step: packed_allocation, column: packed_at }
+  allocation_id: { arg: allocation_id }
+  order_id: { step: allocation, column: order_id }
+  stock_location_code: { step: allocation, column: stock_location_code }
+  quantity: { step: allocation, column: quantity }
+  status: { literal: packed }
+  packed_at: { arg: packed_at }
 idempotency:
   key: { argument: request_id }
   scope: command

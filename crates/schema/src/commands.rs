@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use donat_catalog::{Catalog, ColumnInfo, RelationKind, TableInfo};
 use donat_ir::{
-    TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
+    TypeRef, ValueContractCatalog, ValueContractField, ValueObjectContract, ValueScalar, ValueType,
     compile_value_contract_catalog,
 };
 use donat_metadata::{
@@ -74,6 +74,7 @@ pub struct CompiledCommand {
     definition: Command,
     descriptor: CommandDescriptor,
     rules: Arc<RuleCatalog>,
+    literal_annotation_pg_types: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,14 @@ impl CompiledCommand {
     /// name or source expression.
     pub(crate) fn rules(&self) -> &RuleCatalog {
         self.rules.as_ref()
+    }
+
+    /// PostgreSQL representation of a metadata custom scalar or enum that
+    /// was accepted for an explicitly typed command literal.
+    pub(crate) fn literal_annotation_pg_type(&self, name: &str) -> Option<&str> {
+        self.literal_annotation_pg_types
+            .get(name)
+            .map(String::as_str)
     }
 }
 
@@ -805,6 +814,21 @@ fn compile_one_command(
         definition: command.clone(),
         descriptor,
         rules: context.rules.clone(),
+        literal_annotation_pg_types: context
+            .metadata
+            .custom_types
+            .scalars
+            .iter()
+            .map(|scalar| (scalar.name.clone(), scalar.name.clone()))
+            .chain(
+                context
+                    .metadata
+                    .custom_types
+                    .enums
+                    .iter()
+                    .map(|enum_| (enum_.name.clone(), "text".to_owned())),
+            )
+            .collect(),
     })
 }
 
@@ -818,13 +842,7 @@ fn build_command_descriptor(
     infer_function_permissions: bool,
 ) -> Result<CommandDescriptor, PlanError> {
     let path = format!("commands[{command_index}]");
-    let argument_fields = command
-        .arguments
-        .iter()
-        .map(|argument| (argument.name.clone(), argument.type_.clone()))
-        .collect();
-    let arguments = compile_value_contract_catalog(metadata, &argument_fields)
-        .map_err(|error| PlanError::validation(&path, error.to_string()))?;
+    let arguments = compile_command_argument_contract(metadata, rules, command, &path)?;
 
     let roles = command
         .permissions
@@ -913,6 +931,171 @@ fn build_command_descriptor(
         allowed_roles,
         required_session_variables,
         definition_fingerprint,
+    })
+}
+
+fn compile_command_argument_contract(
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    command: &Command,
+    path: &str,
+) -> Result<ValueContractCatalog, PlanError> {
+    let mut ordinary_fields = BTreeMap::new();
+    let mut declared_rule_fields = Vec::new();
+    for argument in &command.arguments {
+        match command_declared_rule_type(metadata, rules, &argument.type_, path)? {
+            Some(type_) => declared_rule_fields.push((argument, type_)),
+            None => {
+                ordinary_fields.insert(argument.name.clone(), argument.type_.clone());
+            }
+        }
+    }
+
+    let mut contract = compile_value_contract_catalog(metadata, &ordinary_fields)
+        .map_err(|error| PlanError::validation(path, error.to_string()))?;
+    for (argument, type_) in declared_rule_fields {
+        let type_ref = contract_type_from_rule(&type_, &mut contract.named_objects, path)?;
+        contract.roots.insert(
+            argument.name.clone(),
+            ValueContractField {
+                required: argument.type_.ends_with('!'),
+                type_ref,
+            },
+        );
+    }
+    Ok(contract)
+}
+
+fn command_declared_rule_type(
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    source: &str,
+    path: &str,
+) -> Result<Option<RuleType>, PlanError> {
+    let name = graphql_named_type_name(source);
+    let is_custom_type = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .any(|input| input.name == name)
+        || metadata
+            .custom_types
+            .enums
+            .iter()
+            .any(|enum_| enum_.name == name)
+        || metadata
+            .custom_types
+            .scalars
+            .iter()
+            .any(|scalar| scalar.name == name);
+    if is_custom_type {
+        return Ok(None);
+    }
+    let Some(declared) = rules.declared_type(name) else {
+        return Ok(None);
+    };
+
+    fn resolve(
+        source: &str,
+        name: &str,
+        declared: &RuleType,
+        path: &str,
+    ) -> Result<RuleType, PlanError> {
+        let (source, required) = source
+            .strip_suffix('!')
+            .map_or((source, false), |inner| (inner, true));
+        let type_ = if let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+        {
+            RuleType::List(Box::new(resolve(inner, name, declared, path)?))
+        } else if source == name {
+            declared.clone()
+        } else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid command argument type '{source}'"),
+            ));
+        };
+        Ok(if required {
+            type_
+        } else {
+            RuleType::nullable(type_)
+        })
+    }
+
+    resolve(source, name, declared, path).map(Some)
+}
+
+fn contract_type_from_rule(
+    type_: &RuleType,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
+    if let RuleType::Nullable(inner) = type_ {
+        let mut type_ref = contract_type_from_rule(inner, named_objects, path)?;
+        type_ref.nullable = true;
+        return Ok(type_ref);
+    }
+    let value_type = match type_ {
+        RuleType::Bool => ValueType::Scalar {
+            scalar: ValueScalar::Boolean,
+        },
+        RuleType::String => ValueType::Scalar {
+            scalar: ValueScalar::String,
+        },
+        RuleType::Int => ValueType::Scalar {
+            scalar: ValueScalar::Int32,
+        },
+        RuleType::Int64 => ValueType::Scalar {
+            scalar: ValueScalar::Int64,
+        },
+        RuleType::Decimal => ValueType::Scalar {
+            scalar: ValueScalar::Decimal,
+        },
+        RuleType::Uuid => ValueType::Scalar {
+            scalar: ValueScalar::Uuid,
+        },
+        RuleType::Date => ValueType::Scalar {
+            scalar: ValueScalar::Date,
+        },
+        RuleType::Timestamp => ValueType::Scalar {
+            scalar: ValueScalar::Timestamp,
+        },
+        RuleType::Enum { name, symbols } => ValueType::Enum {
+            name: name.clone(),
+            values: symbols.clone(),
+        },
+        RuleType::List(item) => ValueType::List {
+            element: Box::new(contract_type_from_rule(item, named_objects, path)?),
+        },
+        RuleType::Object { name, fields } => {
+            if !named_objects.contains_key(name) {
+                let fields = fields
+                    .iter()
+                    .map(|(field_name, field_type)| {
+                        Ok((
+                            field_name.clone(),
+                            ValueContractField {
+                                required: !matches!(field_type, RuleType::Nullable(_)),
+                                type_ref: contract_type_from_rule(field_type, named_objects, path)?,
+                            },
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
+                named_objects.insert(name.clone(), ValueObjectContract { fields });
+            }
+            ValueType::Ref { name: name.clone() }
+        }
+        RuleType::OpaqueJson { .. } => ValueType::Scalar {
+            scalar: ValueScalar::Json,
+        },
+        RuleType::Nullable(_) => unreachable!("nullable types are handled above"),
+    };
+    let _ = path;
+    Ok(TypeRef {
+        nullable: false,
+        value_type,
     })
 }
 
@@ -1043,7 +1226,7 @@ fn collect_required_session_variables(
                 &declared_custom_scalars,
                 path,
             )?;
-            if let Some(context) = planner.table_ctx_by_name(&entry.table, role) {
+            if let Some(context) = planner.command_table_ctx_by_name(&entry.table, role) {
                 for permission in context.perms {
                     collect_sessions_from_predicate(
                         &planner,
@@ -1058,11 +1241,12 @@ fn collect_required_session_variables(
             }
             match &step.operation {
                 CommandStepOperation::Insert { .. } | CommandStepOperation::InsertMany { .. } => {
-                    if let Some(permission) =
-                        planner.resolve_role_perm(&entry.insert_permissions, role, |permission| {
-                            !permission.backend_only
-                        })
-                    {
+                    if let Some(permission) = planner.resolve_command_role_perm(
+                        &entry.command_insert_permissions,
+                        &entry.insert_permissions,
+                        role,
+                        |permission| !permission.backend_only,
+                    ) {
                         collect_sessions_from_predicate(
                             &planner,
                             &permission.check,
@@ -1087,9 +1271,12 @@ fn collect_required_session_variables(
                 CommandStepOperation::Update { .. }
                 | CommandStepOperation::UpdateMany { .. }
                 | CommandStepOperation::UpdateWhen { .. } => {
-                    if let Some(permission) =
-                        planner.resolve_role_perm(&entry.update_permissions, role, |_| true)
-                    {
+                    if let Some(permission) = planner.resolve_command_role_perm(
+                        &entry.command_update_permissions,
+                        &entry.update_permissions,
+                        role,
+                        |_| true,
+                    ) {
                         collect_sessions_from_predicate(
                             &planner,
                             &permission.filter,
@@ -1123,9 +1310,12 @@ fn collect_required_session_variables(
                     }
                 }
                 CommandStepOperation::Delete { .. } => {
-                    if let Some(permission) =
-                        planner.resolve_role_perm(&entry.delete_permissions, role, |_| true)
-                    {
+                    if let Some(permission) = planner.resolve_command_role_perm(
+                        &entry.command_delete_permissions,
+                        &entry.delete_permissions,
+                        role,
+                        |_| true,
+                    ) {
                         collect_sessions_from_predicate(
                             &planner,
                             &permission.filter,
@@ -1138,11 +1328,12 @@ fn collect_required_session_variables(
                     }
                 }
                 CommandStepOperation::InsertWhen { .. } => {
-                    if let Some(permission) =
-                        planner.resolve_role_perm(&entry.insert_permissions, role, |permission| {
-                            !permission.backend_only
-                        })
-                    {
+                    if let Some(permission) = planner.resolve_command_role_perm(
+                        &entry.command_insert_permissions,
+                        &entry.insert_permissions,
+                        role,
+                        |permission| !permission.backend_only,
+                    ) {
                         collect_sessions_from_predicate(
                             &planner,
                             &permission.check,
@@ -2235,10 +2426,10 @@ fn validate_command(
                 format!("duplicate or empty command argument '{}'", argument.name),
             ));
         }
-        command_argument_type(metadata, argument, &argument_path)?;
+        command_argument_type(metadata, rules, argument, &argument_path)?;
     }
 
-    validate_idempotency(metadata, command, &path)?;
+    validate_idempotency(metadata, rules, command, &path)?;
 
     let declared_steps = command
         .steps
@@ -2442,7 +2633,14 @@ fn validate_step(
             })
         }
         CommandStepOperation::Aggregate { aggregate } => {
-            let input = prior_row_set_output(&aggregate.from, context, "aggregate", path)?;
+            let input = bounded_command_row_set_output(
+                &aggregate.from,
+                aggregate.minimum_items,
+                aggregate.maximum_items,
+                context,
+                "aggregate",
+                path,
+            )?;
             if aggregate.values.is_empty() {
                 return Err(PlanError::validation(
                     path,
@@ -2475,9 +2673,12 @@ fn validate_step(
             let returning = returning_columns(&insert.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.insert_permissions, role, |permission| {
-                        !permission.backend_only
-                    })
+                    .resolve_command_role_perm(
+                        &entry.command_insert_permissions,
+                        &entry.insert_permissions,
+                        role,
+                        |permission| !permission.backend_only,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -2530,9 +2731,12 @@ fn validate_step(
             let returning = returning_columns(&insert_many.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.insert_permissions, role, |permission| {
-                        !permission.backend_only
-                    })
+                    .resolve_command_role_perm(
+                        &entry.command_insert_permissions,
+                        &entry.insert_permissions,
+                        role,
+                        |permission| !permission.backend_only,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -2581,7 +2785,12 @@ fn validate_step(
             let returning = returning_columns(&update.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.update_permissions, role, |_| true)
+                    .resolve_command_role_perm(
+                        &entry.command_update_permissions,
+                        &entry.update_permissions,
+                        role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -2637,10 +2846,16 @@ fn validate_step(
                     ),
                 ));
             }
-            let input_fields = update_many_item_fields(&update_many.for_each, context, path)?;
+            let input_fields = update_many_item_fields(
+                &update_many.for_each,
+                update_many.minimum_items,
+                update_many.maximum_items,
+                context,
+                path,
+            )?;
             let supplied = update_many.by.keys().collect::<BTreeSet<_>>();
             let required = info.primary_key.iter().collect::<BTreeSet<_>>();
-            if supplied != required {
+            if !required.is_subset(&supplied) {
                 return Err(PlanError::validation(
                     path,
                     format!(
@@ -2650,7 +2865,11 @@ fn validate_step(
                 ));
             }
             let mut input_keys = HashSet::new();
-            for (target, value) in &update_many.by {
+            for target_name in &info.primary_key {
+                let value = update_many
+                    .by
+                    .get(target_name)
+                    .expect("complete primary-key names were checked above");
                 let CommandValue::Item { item } = value else {
                     return Err(PlanError::validation(
                         path,
@@ -2670,10 +2889,10 @@ fn validate_step(
                     )
                 })?;
                 let target = info
-                    .column(target)
+                    .column(target_name)
                     .expect("complete primary-key names came from the catalog");
                 let expected = column_type(target);
-                if !assignable(actual, &expected) {
+                if !assignable_to_column(actual, &expected, target, context.rules) {
                     return Err(PlanError::validation(
                         path,
                         format!(
@@ -2684,6 +2903,25 @@ fn validate_step(
                         ),
                     ));
                 }
+            }
+            for (target_name, value) in update_many
+                .by
+                .iter()
+                .filter(|(name, _)| !info.primary_key.contains(name))
+            {
+                if matches!(value, CommandValue::Item { .. }) {
+                    return Err(PlanError::validation(
+                        path,
+                        "update_many additional equality guards cannot use current input item fields",
+                    ));
+                }
+                let target = info.column(target_name).ok_or_else(|| {
+                    PlanError::validation(
+                        path,
+                        format!("unknown column '{target_name}' on command target"),
+                    )
+                })?;
+                validate_value_against_column(value, target, context, path)?;
             }
             if update_many.set.is_empty() {
                 return Err(PlanError::validation(
@@ -2715,7 +2953,12 @@ fn validate_step(
             let returning = returning_columns(&update_many.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.update_permissions, role, |_| true)
+                    .resolve_command_role_perm(
+                        &entry.command_update_permissions,
+                        &entry.update_permissions,
+                        role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -2876,7 +3119,12 @@ fn validate_step(
             let returning = returning_columns(&update_when.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.update_permissions, role, |_| true)
+                    .resolve_command_role_perm(
+                        &entry.command_update_permissions,
+                        &entry.update_permissions,
+                        role,
+                        |_| true,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -2925,9 +3173,12 @@ fn validate_step(
             let returning = returning_columns(&insert_when.returning, info, path)?;
             for role in roles {
                 let permission = planner
-                    .resolve_role_perm(&entry.insert_permissions, role, |permission| {
-                        !permission.backend_only
-                    })
+                    .resolve_command_role_perm(
+                        &entry.command_insert_permissions,
+                        &entry.insert_permissions,
+                        role,
+                        |permission| !permission.backend_only,
+                    )
                     .ok_or_else(|| {
                         PlanError::validation(
                             path,
@@ -3055,7 +3306,12 @@ fn validate_step(
             let returning = returning_columns(&delete.returning, info, path)?;
             for role in roles {
                 if planner
-                    .resolve_role_perm(&entry.delete_permissions, role, |_| true)
+                    .resolve_command_role_perm(
+                        &entry.command_delete_permissions,
+                        &entry.delete_permissions,
+                        role,
+                        |_| true,
+                    )
                     .is_none()
                 {
                     return Err(PlanError::validation(
@@ -3226,11 +3482,11 @@ fn prior_row_set_output<'a>(
     context: &'a ValueContext<'_>,
     operation: &str,
     path: &str,
-) -> Result<&'a StepOutput, PlanError> {
+) -> Result<PriorRowSetOutput<'a>, PlanError> {
     let CommandValue::Step {
         step,
         column: None,
-        field: None,
+        field,
         where_nonzero: None,
     } = value
     else {
@@ -3247,13 +3503,45 @@ fn prior_row_set_output<'a>(
         };
         PlanError::validation(path, message)
     })?;
+    if let Some(field) = field {
+        let fields = match output.fields.get(field) {
+            Some(StaticType::Rows(fields)) => fields,
+            Some(StaticType::List(item)) => match item.as_ref() {
+                StaticType::Row(fields) | StaticType::Object { fields, .. } => fields,
+                _ => {
+                    return Err(PlanError::validation(
+                        path,
+                        format!("{operation} input field '{field}' must be a row set"),
+                    ));
+                }
+            },
+            _ => {
+                return Err(PlanError::validation(
+                    path,
+                    format!("{operation} input field '{field}' must be a row set"),
+                ));
+            }
+        };
+        return Ok(PriorRowSetOutput {
+            fields,
+            guaranteed_non_empty: false,
+        });
+    }
     if !output.many {
         return Err(PlanError::validation(
             path,
             format!("{operation} input must be a prior row-set step"),
         ));
     }
-    Ok(output)
+    Ok(PriorRowSetOutput {
+        fields: &output.fields,
+        guaranteed_non_empty: output.guaranteed_non_empty,
+    })
+}
+
+struct PriorRowSetOutput<'a> {
+    fields: &'a BTreeMap<String, StaticType>,
+    guaranteed_non_empty: bool,
 }
 
 fn validate_row_bound(bound: u32, operation: &str, path: &str) -> Result<(), PlanError> {
@@ -3261,6 +3549,35 @@ fn validate_row_bound(bound: u32, operation: &str, path: &str) -> Result<(), Pla
         return Err(PlanError::validation(
             path,
             format!("{operation} maximum_rows must be between 1 and {MAX_COMMAND_ROWS}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_item_bound(bound: u32, operation: &str, path: &str) -> Result<(), PlanError> {
+    if !(1..=MAX_COMMAND_ROWS).contains(&bound) {
+        return Err(PlanError::validation(
+            path,
+            format!("{operation} maximum_items must be between 1 and {MAX_COMMAND_ROWS}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_minimum_item_bound(
+    minimum_items: Option<u32>,
+    maximum_items: u32,
+    operation: &str,
+    path: &str,
+) -> Result<(), PlanError> {
+    if let Some(minimum_items) = minimum_items
+        && !(1..=maximum_items).contains(&minimum_items)
+    {
+        return Err(PlanError::validation(
+            path,
+            format!(
+                "{operation} minimum_items must be between 1 and maximum_items {maximum_items}"
+            ),
         ));
     }
     Ok(())
@@ -3455,6 +3772,7 @@ fn validate_condition(
         CommandCondition::ArgumentEquals { argument_equals } => {
             let expected = command_argument_type_by_name(
                 context.metadata,
+                context.rules,
                 context.command,
                 &argument_equals.argument,
                 path,
@@ -3657,21 +3975,40 @@ fn validate_primary_key_predicate(
     path: &str,
 ) -> Result<(), PlanError> {
     let supplied = predicate.keys().collect::<BTreeSet<_>>();
-    let required = table.primary_key.iter().collect::<BTreeSet<_>>();
-    if supplied != required {
+    let primary_key = table.primary_key.iter().collect::<BTreeSet<_>>();
+    let primary_key_matches = !primary_key.is_empty() && primary_key.is_subset(&supplied);
+    let unique_key_matches = table
+        .unique_keys
+        .iter()
+        .any(|key| !key.is_empty() && key.iter().collect::<BTreeSet<_>>().is_subset(&supplied));
+    if !primary_key_matches && !unique_key_matches {
+        if table.unique_keys.is_empty() {
+            let identity = if table.primary_key.is_empty() {
+                "table has no primary or unconditional unique key".to_owned()
+            } else {
+                format!(
+                    "update/delete/select_one requires every primary-key column ({})",
+                    table.primary_key.join(", ")
+                )
+            };
+            return Err(PlanError::validation(path, identity));
+        }
+        let unique_keys = table
+            .unique_keys
+            .iter()
+            .filter(|key| !key.is_empty())
+            .map(|key| format!("({})", key.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" or ");
         return Err(PlanError::validation(
             path,
             format!(
-                "update/delete/select_one requires every primary-key column ({})",
-                table.primary_key.join(", ")
+                "update/delete/select_one requires the complete primary key ({}) or an unconditional unique key {unique_keys}",
+                table.primary_key.join(", "),
             ),
         ));
     }
-    for (column, value) in predicate {
-        let column_info = table.column(column).expect("primary key came from table");
-        validate_value_against_column(value, column_info, context, path)?;
-    }
-    Ok(())
+    validate_object(predicate, table, context, path)
 }
 
 fn validate_object(
@@ -3697,17 +4034,21 @@ fn validate_value_against_column(
 ) -> Result<(), PlanError> {
     let expected = column_type(column);
     let actual = match value {
-        CommandValue::Literal { literal } => {
+        CommandValue::Literal { literal, as_ } => {
             validate_command_literal(literal, column, path)?;
-            // A descriptor has already proven the metadata value satisfies the
-            // concrete database column. Preserve the established StaticType
-            // assignment check for the rest of command compilation without
-            // leaking PostgreSQL widths or modifiers into that public model.
-            expected.clone()
+            if as_.is_some() {
+                command_literal_type(literal, as_.as_deref(), context, Some(&expected), path)?
+            } else {
+                // A descriptor has already proven the metadata value satisfies the
+                // concrete database column. Preserve the established StaticType
+                // assignment check for the rest of command compilation without
+                // leaking PostgreSQL widths or modifiers into that public model.
+                expected.clone()
+            }
         }
         _ => value_type(value, context, Some(&expected), ValueUse::Data, path)?,
     };
-    if !assignable(&actual, &expected) {
+    if !assignable_to_column(&actual, &expected, column, context.rules) {
         return Err(PlanError::validation(
             path,
             format!(
@@ -3719,6 +4060,49 @@ fn validate_value_against_column(
         ));
     }
     Ok(())
+}
+
+fn assignable_to_column(
+    actual: &StaticType,
+    expected: &StaticType,
+    column: &ColumnInfo,
+    rules: &RuleCatalog,
+) -> bool {
+    if assignable(actual, expected) {
+        return true;
+    }
+    if !matches!(
+        column.pg_type.as_str(),
+        "text" | "varchar" | "bpchar" | "name" | "citext"
+    ) {
+        return false;
+    }
+
+    match (actual, expected) {
+        (StaticType::Nullable(actual), StaticType::Nullable(expected)) => {
+            assignable_declared_enum_to_text(actual, expected, rules)
+        }
+        (StaticType::Nullable(_), _) => false,
+        (actual, StaticType::Nullable(expected)) => {
+            assignable_declared_enum_to_text(actual, expected, rules)
+        }
+        (actual, expected) => assignable_declared_enum_to_text(actual, expected, rules),
+    }
+}
+
+fn assignable_declared_enum_to_text(
+    actual: &StaticType,
+    expected: &StaticType,
+    rules: &RuleCatalog,
+) -> bool {
+    let (StaticType::Scalar(actual), StaticType::Scalar(expected)) = (actual, expected) else {
+        return false;
+    };
+    expected == "String"
+        && matches!(
+            rules.declared_type(actual),
+            Some(RuleType::Enum { name, .. }) if name == actual
+        )
 }
 
 fn validate_command_literal(
@@ -3785,7 +4169,7 @@ fn require_select_permissions<'a>(
         .collect::<BTreeSet<_>>();
     for role in roles {
         let context = planner
-            .table_ctx_by_name(&entry.table, role)
+            .command_table_ctx_by_name(&entry.table, role)
             .ok_or_else(|| {
                 PlanError::validation(
                     path,
@@ -3860,35 +4244,118 @@ fn insert_many_item_fields(
 
 fn update_many_item_fields(
     for_each: &CommandValue,
+    minimum_items: Option<u32>,
+    maximum_items: Option<u32>,
     context: &ValueContext<'_>,
     path: &str,
 ) -> Result<BTreeMap<String, StaticType>, PlanError> {
     match for_each {
+        CommandValue::Argument { .. } => bounded_command_row_set_output(
+            for_each,
+            minimum_items,
+            maximum_items,
+            context,
+            "update_many",
+            path,
+        )
+        .map(|output| output.fields),
         CommandValue::Step {
             field: None,
             column: None,
             where_nonzero: None,
             ..
-        } => Ok(
-            prior_select_many_output(for_each, context, "update_many", path)?
-                .fields
-                .clone(),
-        ),
+        } => {
+            reject_step_row_set_bounds(minimum_items, maximum_items, "update_many", path)?;
+            Ok(
+                prior_select_many_output(for_each, context, "update_many", path)?
+                    .fields
+                    .clone(),
+            )
+        }
         CommandValue::Step {
             field: Some(_),
             column: None,
             ..
-        } => insert_many_item_fields(for_each, context, path).map_err(|_| {
-            PlanError::validation(
-                path,
-                "update_many input must be a prior select_many row set",
-            )
-        }),
+        } => {
+            reject_step_row_set_bounds(minimum_items, maximum_items, "update_many", path)?;
+            insert_many_item_fields(for_each, context, path).map_err(|_| {
+                PlanError::validation(
+                    path,
+                    "update_many input must be a prior select_many row set",
+                )
+            })
+        }
         _ => Err(PlanError::validation(
             path,
             "update_many input must be a prior select_many row set",
         )),
     }
+}
+
+struct BoundedCommandRowSetOutput {
+    fields: BTreeMap<String, StaticType>,
+    guaranteed_non_empty: bool,
+}
+
+fn bounded_command_row_set_output(
+    value: &CommandValue,
+    minimum_items: Option<u32>,
+    maximum_items: Option<u32>,
+    context: &ValueContext<'_>,
+    operation: &str,
+    path: &str,
+) -> Result<BoundedCommandRowSetOutput, PlanError> {
+    if matches!(value, CommandValue::Argument { .. }) {
+        let maximum_items = maximum_items.ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!("{operation} argument row-set source must declare maximum_items"),
+            )
+        })?;
+        validate_item_bound(maximum_items, operation, path)?;
+        validate_minimum_item_bound(minimum_items, maximum_items, operation, path)?;
+        let type_ = value_type(value, context, None, ValueUse::Data, path)?;
+        let StaticType::List(item) = type_ else {
+            return Err(PlanError::validation(
+                path,
+                format!("{operation} argument source must be a non-null list"),
+            ));
+        };
+        let StaticType::Object { fields, .. } = *item else {
+            return Err(PlanError::validation(
+                path,
+                format!("{operation} argument list items must be typed objects"),
+            ));
+        };
+        return Ok(BoundedCommandRowSetOutput {
+            fields,
+            guaranteed_non_empty: minimum_items.is_some(),
+        });
+    }
+
+    reject_step_row_set_bounds(minimum_items, maximum_items, operation, path)?;
+    let output = prior_row_set_output(value, context, operation, path)?;
+    Ok(BoundedCommandRowSetOutput {
+        fields: output.fields.clone(),
+        guaranteed_non_empty: output.guaranteed_non_empty,
+    })
+}
+
+fn reject_step_row_set_bounds(
+    minimum_items: Option<u32>,
+    maximum_items: Option<u32>,
+    operation: &str,
+    path: &str,
+) -> Result<(), PlanError> {
+    if minimum_items.is_some() || maximum_items.is_some() {
+        return Err(PlanError::validation(
+            path,
+            format!(
+                "{operation} minimum_items/maximum_items are only valid for an argument list source"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_result(
@@ -3914,7 +4381,7 @@ fn validate_result(
             ));
         }
         match &field.value {
-            MetadataCommandResultValue::Literal { literal }
+            MetadataCommandResultValue::Literal { literal, .. }
                 if literal.as_i64().is_some_and(|value| {
                     !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value)
                 }) || literal
@@ -3924,14 +4391,6 @@ fn validate_result(
                 return Err(PlanError::validation(
                     path,
                     "integral command result literal is outside the GraphQL Int range",
-                ));
-            }
-            MetadataCommandResultValue::Argument { .. }
-            | MetadataCommandResultValue::SessionVariable { .. }
-            | MetadataCommandResultValue::CurrentColumn { .. } => {
-                return Err(PlanError::validation(
-                    path,
-                    "command result fields must be step columns or literals",
                 ));
             }
             _ => {}
@@ -4040,16 +4499,39 @@ fn result_value_type(
                     "result projection must declare at least one field",
                 ));
             }
-            if output.many {
-                Ok(StaticType::Rows(fields))
-            } else {
-                Ok(StaticType::Row(fields))
+            Ok(StaticType::Rows(fields))
+        }
+        MetadataCommandResultValue::Argument { arg } => command_argument_type_by_name(
+            context.metadata,
+            context.rules,
+            context.command,
+            arg,
+            path,
+        ),
+        MetadataCommandResultValue::Literal { literal, as_ } => {
+            let Some(type_) = as_ else {
+                return literal_type(literal, None, path);
+            };
+            let expected = parse_command_type(context.metadata, context.rules, type_, path)?;
+            if !expected.is_scalar() {
+                return Err(PlanError::validation(
+                    path,
+                    "command result literal annotations must name one scalar type",
+                ));
             }
+            let actual = literal_type(literal, Some(&expected), path)?;
+            if !assignable(&actual, &expected) {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "{} is not assignable to annotated command result type {}",
+                        actual.display_name(),
+                        expected.display_name()
+                    ),
+                ));
+            }
+            Ok(expected)
         }
-        MetadataCommandResultValue::Argument { arg } => {
-            command_argument_type_by_name(context.metadata, context.command, arg, path)
-        }
-        MetadataCommandResultValue::Literal { literal } => literal_type(literal, None, path),
         MetadataCommandResultValue::Rule { rule, bindings } => {
             validate_rule(rule, bindings, context, path, None)
         }
@@ -4101,13 +4583,14 @@ fn validate_result_bound(bound: u32, path: &str) -> Result<(), PlanError> {
 
 fn validate_idempotency(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     command: &Command,
     path: &str,
 ) -> Result<(), PlanError> {
     let Some(idempotency) = &command.idempotency else {
         return Ok(());
     };
-    validate_idempotency_key(metadata, &idempotency.key, command, path)?;
+    validate_idempotency_key(metadata, rules, &idempotency.key, command, path)?;
     if let Some(retention) = &idempotency.retention {
         command_retention_seconds(retention)
             .map_err(|message| PlanError::validation(path, message))?;
@@ -4118,7 +4601,8 @@ fn validate_idempotency(
     for scope in scopes {
         match scope {
             CommandIdempotencyScope::Argument { argument } => {
-                let type_ = command_argument_type_by_name(metadata, command, argument, path)?;
+                let type_ =
+                    command_argument_type_by_name(metadata, rules, command, argument, path)?;
                 if !type_.is_scalar() {
                     return Err(PlanError::validation(
                         path,
@@ -4182,6 +4666,7 @@ pub(crate) fn command_retention_seconds(value: &str) -> Result<u64, String> {
 
 fn validate_idempotency_key(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     key: &CommandIdempotencyKey,
     command: &Command,
     path: &str,
@@ -4192,7 +4677,7 @@ fn validate_idempotency_key(
         .iter()
         .find(|candidate| candidate.name == *argument)
         .ok_or_else(|| PlanError::validation(path, format!("unknown argument '{argument}'")))?;
-    let type_ = command_argument_type_by_name(metadata, command, argument, path)?;
+    let type_ = command_argument_type_by_name(metadata, rules, command, argument, path)?;
     if !type_.is_scalar() {
         return Err(PlanError::validation(
             path,
@@ -4238,7 +4723,13 @@ fn validate_effects(
                         "command effect requires an idempotency key",
                     )
                 })?;
-                validate_idempotency_key(context.metadata, key, command, &effect_path)?;
+                validate_idempotency_key(
+                    context.metadata,
+                    context.rules,
+                    key,
+                    command,
+                    &effect_path,
+                )?;
                 validate_effect_bindings(&start_process.input, context, &effect_path)?;
             }
             CommandEffect::SignalProcess { signal_process } => {
@@ -4248,7 +4739,13 @@ fn validate_effects(
                         "command effect requires an idempotency key",
                     )
                 })?;
-                validate_idempotency_key(context.metadata, key, command, &effect_path)?;
+                validate_idempotency_key(
+                    context.metadata,
+                    context.rules,
+                    key,
+                    command,
+                    &effect_path,
+                )?;
                 validate_effect_bindings(&signal_process.correlate, context, &effect_path)?;
                 validate_effect_bindings(&signal_process.payload, context, &effect_path)?;
             }
@@ -4269,10 +4766,11 @@ fn validate_effect_bindings(
             | CommandValue::SessionVariable { .. } => {
                 value_type(value, context, None, ValueUse::Effect, path)?;
             }
+            CommandValue::Literal { .. } => {}
             _ => {
                 return Err(PlanError::validation(
                     path,
-                    "effect payload and correlation bindings must be local arguments, prior step values, or explicit session variables",
+                    "effect payload and correlation bindings must be local arguments, prior step values, fixed literals, or explicit session variables",
                 ));
             }
         }
@@ -4371,9 +4869,13 @@ fn value_type(
     path: &str,
 ) -> Result<StaticType, PlanError> {
     match value {
-        CommandValue::Argument { arg } => {
-            command_argument_type_by_name(context.metadata, context.command, arg, path)
-        }
+        CommandValue::Argument { arg } => command_argument_type_by_name(
+            context.metadata,
+            context.rules,
+            context.command,
+            arg,
+            path,
+        ),
         CommandValue::Item { item } => {
             let fields = context.item.ok_or_else(|| {
                 PlanError::validation(
@@ -4491,7 +4993,9 @@ fn value_type(
                 None => Ok(StaticType::Row(output.fields.clone())),
             }
         }
-        CommandValue::Literal { literal } => literal_type(literal, expected, path),
+        CommandValue::Literal { literal, as_ } => {
+            command_literal_type(literal, as_.as_deref(), context, expected, path)
+        }
         CommandValue::Rule { rule, bindings } => {
             let actual = validate_rule(rule, bindings, context, path, None)?;
             if let (Some(expected), StaticType::Nullable(actual_inner)) = (expected, &actual)
@@ -4593,6 +5097,37 @@ fn literal_type(
     Ok(inferred)
 }
 
+fn command_literal_type(
+    literal: &serde_json::Value,
+    annotation: Option<&str>,
+    context: &ValueContext<'_>,
+    expected: Option<&StaticType>,
+    path: &str,
+) -> Result<StaticType, PlanError> {
+    let Some(annotation) = annotation else {
+        return literal_type(literal, expected, path);
+    };
+    let annotated = parse_command_type(context.metadata, context.rules, annotation, path)?;
+    if !annotated.is_scalar() {
+        return Err(PlanError::validation(
+            path,
+            "command literal annotations must name one scalar type",
+        ));
+    }
+    let actual = literal_type(literal, Some(&annotated), path)?;
+    if !assignable(&actual, &annotated) {
+        return Err(PlanError::validation(
+            path,
+            format!(
+                "{} is not assignable to annotated command literal type {}",
+                actual.display_name(),
+                annotated.display_name()
+            ),
+        ));
+    }
+    Ok(annotated)
+}
+
 fn validate_string_literal(
     value: &str,
     expected: &StaticType,
@@ -4629,6 +5164,7 @@ fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
 
 fn command_argument_type_by_name(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     command: &Command,
     name: &str,
     path: &str,
@@ -4638,28 +5174,31 @@ fn command_argument_type_by_name(
         .iter()
         .find(|argument| argument.name == name)
         .ok_or_else(|| PlanError::validation(path, format!("unknown argument '{name}'")))?;
-    command_argument_type(metadata, argument, path)
+    command_argument_type(metadata, rules, argument, path)
 }
 
 fn command_argument_type(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     argument: &donat_metadata::CommandArgument,
     path: &str,
 ) -> Result<StaticType, PlanError> {
-    parse_command_type(metadata, &argument.type_, path)
+    parse_command_type(metadata, rules, &argument.type_, path)
 }
 
 fn parse_command_type(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     type_: &str,
     path: &str,
 ) -> Result<StaticType, PlanError> {
     let mut active_inputs = HashSet::new();
-    parse_command_type_with_active_inputs(metadata, type_, path, &mut active_inputs)
+    parse_command_type_with_active_inputs(metadata, rules, type_, path, &mut active_inputs)
 }
 
 fn parse_command_type_with_active_inputs(
     metadata: &Metadata,
+    rules: &RuleCatalog,
     type_: &str,
     path: &str,
     active_inputs: &mut HashSet<String>,
@@ -4683,6 +5222,7 @@ fn parse_command_type_with_active_inputs(
                         field.name.clone(),
                         parse_command_type_with_active_inputs(
                             metadata,
+                            rules,
                             &field.type_,
                             path,
                             active_inputs,
@@ -4709,6 +5249,9 @@ fn parse_command_type_with_active_inputs(
                 .any(|value| value.name == name)
         {
             return Ok(Some(StaticType::Scalar(name.to_string())));
+        }
+        if let Some(type_) = rules.declared_type(name) {
+            return Ok(Some(rule_type(type_)));
         }
         Ok(None)
     })
@@ -4789,7 +5332,7 @@ fn rule_type(type_: &RuleType) -> StaticType {
         RuleType::Decimal => StaticType::Scalar("Float".to_string()),
         RuleType::Uuid => StaticType::Scalar("uuid".to_string()),
         RuleType::Date => StaticType::Scalar("date".to_string()),
-        RuleType::Timestamp => StaticType::Scalar("timestamp".to_string()),
+        RuleType::Timestamp => StaticType::Scalar("timestamptz".to_string()),
         RuleType::Enum { name, .. } => StaticType::Scalar(name.clone()),
         RuleType::List(item) => StaticType::List(Box::new(rule_type(item))),
         RuleType::Object { name, fields } => StaticType::Object {
@@ -4812,6 +5355,11 @@ fn assignable(actual: &StaticType, expected: &StaticType) -> bool {
         (StaticType::Nullable(_), _) => false,
         (actual, StaticType::Nullable(expected)) => assignable(actual, expected),
         (StaticType::List(actual), StaticType::List(expected)) => assignable(actual, expected),
+        (StaticType::Scalar(actual), StaticType::Scalar(expected))
+            if actual == "Int" && expected == "int8" =>
+        {
+            true
+        }
         _ => actual == expected,
     }
 }
