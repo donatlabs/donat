@@ -1,0 +1,37 @@
+table:
+  name: payment
+  schema: public
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+array_relationships:
+  - name: events
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: payment_event
+          schema: public
+  - name: refunds
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: refund
+          schema: public
+select_permissions:
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - currency
+        - provider_reference
+      filter: {}

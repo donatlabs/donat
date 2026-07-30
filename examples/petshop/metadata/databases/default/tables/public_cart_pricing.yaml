@@ -1,0 +1,24 @@
+table:
+  name: cart_pricing
+  schema: public
+select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - cart_id
+        - customer_id
+        - variant_id
+        - sku
+        - title
+        - quantity
+        - unit_price_minor
+        - currency
+        - line_total_minor
+        - available_quantity
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}

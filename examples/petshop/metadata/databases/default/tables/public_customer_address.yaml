@@ -1,0 +1,55 @@
+table:
+  name: customer_address
+  schema: public
+object_relationships:
+  - name: customer
+    using:
+      foreign_key_constraint_on: customer_id
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+      set:
+        customer_id: X-Donat-User-Id
+      columns:
+        - label
+        - line1
+        - line2
+        - city
+        - postal_code
+        - country_code
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - label
+        - line1
+        - line2
+        - city
+        - postal_code
+        - country_code
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+delete_permissions:
+  - role: customer
+    permission:
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id

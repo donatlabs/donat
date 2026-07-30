@@ -3438,6 +3438,7 @@ mod tests {
             "jwt",
             "mcp_tools",
             "migrate",
+            "petshop",
             "remote_schemas",
             "rest_endpoints",
             "roles_inheritance",

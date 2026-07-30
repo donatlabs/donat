@@ -1,22 +1,12 @@
 table:
   name: customer
   schema: public
-# Per-column documentation. Written for an LLM consuming the MCP
-# `describe_table` tool (and surfaced as the GraphQL field description).
 configuration:
   column_config:
-    id:
+    customer_id:
       comment: >-
-        Primary key of the customer. A TEXT value (not numeric) that equals the
-        X-Donat-User-Id session variable used for row-level auth: a `customer`
-        role may only read or edit the row whose id matches their own.
-        Referenced by orders.customer_id.
-    name:
-      comment: The customer's full display name, e.g. "Alice Buyer". Free text.
-    email:
-      comment: >-
-        Contact email address, unique across all customers; used for order
-        confirmations. Format: a valid email such as "alice@example.com".
+        Stable customer identity equal to the X-Donat-User-Id session variable.
+        A customer role may only read or edit a row whose customer_id matches it.
 array_relationships:
   - name: orders
     using:
@@ -25,22 +15,35 @@ array_relationships:
         table:
           name: orders
           schema: public
-# A shopper sees only their own profile; staff see every customer.
+  - name: addresses
+    using:
+      foreign_key_constraint_on:
+        column: customer_id
+        table:
+          name: customer_address
+          schema: public
+  - name: carts
+    using:
+      foreign_key_constraint_on:
+        column: customer_id
+        table:
+          name: cart
+          schema: public
 select_permissions:
   - role: customer
     permission:
       columns:
         - id
+        - customer_id
         - name
         - email
       filter:
-        id:
+        customer_id:
           _eq: X-Donat-User-Id
-  - role: staff
+  - role: support
     permission:
       columns: "*"
       filter: {}
-# A shopper may edit their own profile (id is fixed by the row filter + check).
 update_permissions:
   - role: customer
     permission:
@@ -48,8 +51,8 @@ update_permissions:
         - name
         - email
       filter:
-        id:
+        customer_id:
           _eq: X-Donat-User-Id
       check:
-        id:
+        customer_id:
           _eq: X-Donat-User-Id

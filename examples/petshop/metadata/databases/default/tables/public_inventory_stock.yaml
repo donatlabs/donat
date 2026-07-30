@@ -1,0 +1,56 @@
+table:
+  name: inventory_stock
+  schema: public
+object_relationships:
+  - name: variant
+    using:
+      foreign_key_constraint_on: variant_id
+select_permissions:
+  - role: anonymous
+    permission:
+      columns:
+        - variant_id
+        - available_quantity
+      filter:
+        _and:
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+  - role: customer
+    permission:
+      columns:
+        - variant_id
+        - available_quantity
+      filter:
+        _and:
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - variant_id
+        - on_hand
+        - reserved
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - on_hand
+        - reserved
+      filter: {}
+      check: {}

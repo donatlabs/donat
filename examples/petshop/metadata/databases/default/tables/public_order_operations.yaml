@@ -1,28 +1,17 @@
 table:
-  name: orders
+  name: order_operations
   schema: public
-object_relationships:
-  - name: customer
-    using:
-      foreign_key_constraint_on: customer_id
-array_relationships:
-  - name: lines
-    using:
-      foreign_key_constraint_on:
-        column: order_id
-        table:
-          name: order_line
-          schema: public
 select_permissions:
   - role: customer
     permission:
       columns:
-        - id
+        - order_id
         - customer_id
         - order_status
+        - payment_status
+        - fulfilment_status
         - total_minor
         - currency
-        - created_at
       filter:
         customer_id:
           _eq: X-Donat-User-Id
@@ -32,13 +21,7 @@ select_permissions:
       filter: {}
   - role: fulfilment
     permission:
-      columns:
-        - id
-        - customer_id
-        - order_status
-        - total_minor
-        - currency
-        - created_at
+      columns: "*"
       filter:
         order_status:
           _eq: paid
@@ -49,9 +32,9 @@ select_permissions:
   - role: payment_worker
     permission:
       columns:
-        - id
-        - customer_id
+        - order_id
         - order_status
+        - payment_status
         - total_minor
         - currency
       filter: {}

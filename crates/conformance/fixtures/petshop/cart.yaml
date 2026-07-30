@@ -1,0 +1,193 @@
+- description: A customer creates their open cart through the regular GraphQL insert mutation.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation CreateCart {
+        insert_cart(objects: [{}]) {
+          returning {
+            id
+            customer_id
+            status
+          }
+        }
+      }
+  response:
+    data:
+      insert_cart:
+        returning:
+          - id: 1
+            customer_id: customer-1
+            status: open
+
+- description: REST exposes the same public product catalogue operation.
+  url: /api/rest/products
+  method: GET
+  status: 200
+  headers:
+    X-Donat-Role: anonymous
+  response:
+    product:
+      - slug: cat-scratcher
+        title: Cat Scratcher
+        variants:
+          - sku: CAT-SCRATCH-POST
+            price_minor: 1599
+            currency: USD
+            stock:
+              available_quantity: 5
+      - slug: dog-kibble
+        title: Dog Kibble
+        variants:
+          - sku: DOG-CHICKEN-1KG
+            price_minor: 1999
+            currency: USD
+            stock:
+              available_quantity: 1
+          - sku: DOG-SALMON-1KG
+            price_minor: 2499
+            currency: USD
+            stock:
+              available_quantity: 3
+
+- description: REST binds a product slug path parameter into its saved operation.
+  url: /api/rest/products/dog-kibble
+  method: GET
+  status: 200
+  headers:
+    X-Donat-Role: anonymous
+  response:
+    product:
+      - slug: dog-kibble
+        title: Dog Kibble
+        description: Balanced chicken and salmon recipes.
+        variants:
+          - sku: DOG-CHICKEN-1KG
+            price_minor: 1999
+            currency: USD
+            stock:
+              available_quantity: 1
+          - sku: DOG-SALMON-1KG
+            price_minor: 2499
+            currency: USD
+            stock:
+              available_quantity: 3
+
+- description: A customer adds an active catalogue variant to their own open cart.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation AddCartLine {
+        insert_cart_line(
+          objects: [{cart_id: 1, variant_id: 1, quantity: 1}]
+          on_conflict: {
+            constraint: cart_line_cart_id_variant_id_key
+            update_columns: [quantity]
+          }
+        ) {
+          returning {
+            cart_id
+            variant_id
+            quantity
+          }
+        }
+      }
+  response:
+    data:
+      insert_cart_line:
+        returning:
+          - cart_id: 1
+            variant_id: 1
+            quantity: 1
+
+- description: The same upsert edits the existing line instead of creating a second line.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation EditCartLine {
+        insert_cart_line(
+          objects: [{cart_id: 1, variant_id: 1, quantity: 2}]
+          on_conflict: {
+            constraint: cart_line_cart_id_variant_id_key
+            update_columns: [quantity]
+          }
+        ) {
+          returning {
+            cart_id
+            variant_id
+            quantity
+          }
+        }
+      }
+  response:
+    data:
+      insert_cart_line:
+        returning:
+          - cart_id: 1
+            variant_id: 1
+            quantity: 2
+
+- description: REST PUT reuses the same cart-line GraphQL upsert.
+  url: /api/rest/cart/lines
+  method: PUT
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  body:
+    cart_id: 1
+    variant_id: 1
+    quantity: 3
+  response:
+    insert_cart_line:
+      returning:
+        - cart_id: 1
+          variant_id: 1
+          quantity: 3
+
+- description: REST cart reads remain scoped to the calling customer.
+  url: /api/rest/cart
+  method: GET
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  response:
+    cart:
+      - id: 1
+        customer_id: customer-1
+        status: open
+        lines:
+          - variant_id: 1
+            quantity: 3
+
+- description: REST orders returns only the caller's orders.
+  url: /api/rest/orders
+  method: GET
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  response:
+    orders: []
+
+- description: REST binds an order UUID path parameter without bypassing row permissions.
+  url: /api/rest/orders/00000000-0000-0000-0000-000000000001
+  method: GET
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  response:
+    orders: []

@@ -1,0 +1,107 @@
+table:
+  name: product_variant
+  schema: public
+object_relationships:
+  - name: product
+    using:
+      foreign_key_constraint_on: product_id
+  - name: stock
+    using:
+      foreign_key_constraint_on:
+        table:
+          name: inventory_stock
+          schema: public
+        column: variant_id
+array_relationships:
+  - name: cart_lines
+    using:
+      foreign_key_constraint_on:
+        column: variant_id
+        table:
+          name: cart_line
+          schema: public
+  - name: order_lines
+    using:
+      foreign_key_constraint_on:
+        column: variant_id
+        table:
+          name: order_line
+          schema: public
+select_permissions:
+  - role: anonymous
+    permission:
+      columns:
+        - id
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+      filter:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+  - role: customer
+    permission:
+      columns:
+        - id
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+      filter:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: staff
+    permission:
+      check:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+      columns:
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+      filter: {}
+      check:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

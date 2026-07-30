@@ -1,0 +1,80 @@
+table:
+  name: cart_line
+  schema: public
+object_relationships:
+  - name: cart
+    using:
+      foreign_key_constraint_on: cart_id
+  - name: variant
+    using:
+      foreign_key_constraint_on: variant_id
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        cart:
+          customer_id:
+            _eq: X-Donat-User-Id
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: open
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+      columns:
+        - cart_id
+        - variant_id
+        - quantity
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - variant_id
+        - quantity
+      filter:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: open
+      check:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: open
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+delete_permissions:
+  - role: customer
+    permission:
+      filter:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: open

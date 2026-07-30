@@ -1,0 +1,33 @@
+table:
+  name: order_line
+  schema: public
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+  - name: variant
+    using:
+      foreign_key_constraint_on: variant_id
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+  - role: fulfilment
+    permission:
+      columns: "*"
+      filter:
+        order:
+          order_status:
+            _eq: paid
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
