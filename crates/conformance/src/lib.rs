@@ -1008,6 +1008,7 @@ fn default_metadata_with_configuration(
         commands: vec![],
         rules: Default::default(),
         connectors: vec![],
+        processes: vec![],
     }
 }
 
