@@ -72,6 +72,10 @@ fn opaque_json_type(maximum_bytes: u32, maximum_depth: u32, maximum_nodes: u32) 
     .expect("the closed opaque JSON rule type must deserialize")
 }
 
+fn int64_type() -> RuleType {
+    serde_json::from_value(json!("Int64")).expect("the closed bigint rule type must deserialize")
+}
+
 fn decision_row(id: &str, when: BTreeMap<String, &str>, output: Value) -> DecisionRow {
     DecisionRow {
         id: id.to_owned(),
@@ -226,6 +230,111 @@ fn opaque_json_is_bounded_pass_through_data_not_executable_structure() {
         structural_access,
         RuleError::TypeMismatch { ref expected, .. } if expected == "object"
     ));
+}
+
+#[test]
+fn bigint_preserves_i64_ranges_and_checked_arithmetic() {
+    let bigint = int64_type();
+    let identity = rule(
+        "bigint_identity",
+        map([("value", bigint.clone())]),
+        bigint.clone(),
+        "value",
+    );
+    let catalog = compile_catalog(&[identity], &[]).expect("a bigint rule must compile");
+    let compiled = catalog.rule("bigint_identity").expect("bigint rule exists");
+
+    for value in [
+        json!(i64::MIN),
+        json!(i64::from(i32::MIN) - 1),
+        json!(i64::from(i32::MAX) + 1),
+        json!(i64::MAX),
+    ] {
+        let evaluated = evaluate_value(compiled, &map([("value", value.clone())]))
+            .expect("every signed 64-bit boundary value must evaluate");
+        assert_eq!(evaluated.type_, bigint);
+        assert_eq!(evaluated.value, value);
+    }
+    assert!(matches!(
+        evaluate_value(
+            compiled,
+            &map([("value", json!(i64::MAX as u64 + 1))])
+        ),
+        Err(RuleError::InvalidBinding { ref name, .. }) if name == "value"
+    ));
+
+    let int_catalog = compile_catalog(
+        &[rule(
+            "int_identity",
+            map([("value", RuleType::Int)]),
+            RuleType::Int,
+            "value",
+        )],
+        &[],
+    )
+    .expect("an Int rule must compile");
+    assert!(matches!(
+        evaluate_value(
+            int_catalog.rule("int_identity").expect("Int rule exists"),
+            &map([("value", json!(i64::from(i32::MAX) + 1))])
+        ),
+        Err(RuleError::InvalidBinding { ref name, .. }) if name == "value"
+    ));
+
+    let arithmetic = compile_catalog(
+        &[
+            rule(
+                "increment",
+                map([("value", int64_type())]),
+                int64_type(),
+                "value + 1",
+            ),
+            rule(
+                "divide",
+                map([("numerator", int64_type()), ("denominator", int64_type())]),
+                int64_type(),
+                "numerator / denominator",
+            ),
+            rule(
+                "above_int",
+                map([("value", int64_type())]),
+                RuleType::Bool,
+                "value > 2147483647",
+            ),
+        ],
+        &[],
+    )
+    .expect("safe Int literals must promote inside bigint expressions");
+    assert_eq!(
+        evaluate_value(
+            arithmetic.rule("increment").expect("increment rule"),
+            &map([("value", json!(i64::MAX - 1))])
+        )
+        .expect("in-range bigint arithmetic")
+        .value,
+        json!(i64::MAX)
+    );
+    assert!(matches!(
+        evaluate_value(
+            arithmetic.rule("increment").expect("increment rule"),
+            &map([("value", json!(i64::MAX))])
+        ),
+        Err(RuleError::InvalidLiteral { .. })
+    ));
+    assert!(matches!(
+        evaluate_value(
+            arithmetic.rule("divide").expect("divide rule"),
+            &map([("numerator", json!(1)), ("denominator", json!(0))])
+        ),
+        Err(RuleError::DivisionByZero { .. })
+    ));
+    assert!(
+        evaluate_bool(
+            arithmetic.rule("above_int").expect("comparison rule"),
+            &map([("value", json!(i64::from(i32::MAX) + 1))])
+        )
+        .expect("mixed-width integer comparison remains exact")
+    );
 }
 
 #[test]

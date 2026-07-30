@@ -15,6 +15,11 @@ fn map<T>(entries: impl IntoIterator<Item = (&'static str, T)>) -> BTreeMap<Stri
         .collect()
 }
 
+fn int64_type() -> RuleType {
+    serde_json::from_value(serde_json::json!("Int64"))
+        .expect("the closed bigint rule type must deserialize")
+}
+
 fn rule(
     name: &str,
     bindings: BTreeMap<String, RuleType>,
@@ -469,6 +474,27 @@ fn canonical_semantic_changes_change_the_affected_definition_or_input_digest() {
     assert_ne!(
         one, two,
         "a typed input value changes its canonical digest bytes"
+    );
+}
+
+#[test]
+fn canonical_rule_types_distinguish_int_from_bigint() {
+    let (int_bytes, _) = canonical_rule_bytes(rule(
+        "identity",
+        map([("value", RuleType::Int)]),
+        RuleType::Int,
+        "value",
+    ));
+    let (bigint_bytes, _) = canonical_rule_bytes(rule(
+        "identity",
+        map([("value", int64_type())]),
+        int64_type(),
+        "value",
+    ));
+
+    assert_ne!(
+        int_bytes, bigint_bytes,
+        "width is part of the immutable Rule fingerprint"
     );
 }
 

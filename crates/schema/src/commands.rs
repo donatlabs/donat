@@ -4731,6 +4731,7 @@ fn rule_type(type_: &RuleType) -> StaticType {
         RuleType::Bool => StaticType::Scalar("Boolean".to_string()),
         RuleType::String => StaticType::Scalar("String".to_string()),
         RuleType::Int => StaticType::Scalar("Int".to_string()),
+        RuleType::Int64 => StaticType::Scalar("int8".to_string()),
         RuleType::Decimal => StaticType::Scalar("Float".to_string()),
         RuleType::Uuid => StaticType::Scalar("uuid".to_string()),
         RuleType::Date => StaticType::Scalar("date".to_string()),

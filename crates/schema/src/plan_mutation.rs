@@ -3843,7 +3843,8 @@ fn command_rule_pg_type(type_: &RuleType) -> &'static str {
     match type_ {
         RuleType::Bool => "bool",
         RuleType::String | RuleType::Enum { .. } => "text",
-        RuleType::Int => "int8",
+        RuleType::Int => "int4",
+        RuleType::Int64 => "int8",
         RuleType::Decimal => "numeric",
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
@@ -3999,7 +4000,9 @@ fn command_rule_item_pg_type(type_: &RuleType) -> &'static str {
     match type_ {
         RuleType::Bool => "boolean",
         RuleType::String | RuleType::Enum { .. } => "text",
-        RuleType::Int | RuleType::Decimal => "numeric",
+        RuleType::Int => "int4",
+        RuleType::Int64 => "int8",
+        RuleType::Decimal => "numeric",
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",

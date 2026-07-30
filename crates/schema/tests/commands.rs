@@ -295,6 +295,43 @@ fn rules() -> RuleCatalog {
     .expect("rule catalog compiles")
 }
 
+fn int64_type() -> RuleType {
+    serde_json::from_value(json!("Int64")).expect("the closed bigint rule type must deserialize")
+}
+
+fn bigint_binding_rules(binding_type: RuleType) -> RuleCatalog {
+    compile_catalog(
+        &[
+            RuleDefinition {
+                name: "customer_is_allowed".to_owned(),
+                bindings: BTreeMap::from([("customer_id".to_owned(), RuleType::Uuid)]),
+                result: RuleType::Bool,
+                expression: "true".to_owned(),
+            },
+            RuleDefinition {
+                name: "double_quantity".to_owned(),
+                bindings: BTreeMap::from([("quantity".to_owned(), RuleType::Int)]),
+                result: RuleType::Int,
+                expression: "quantity * 2".to_owned(),
+            },
+            RuleDefinition {
+                name: "count_is_valid".to_owned(),
+                bindings: BTreeMap::from([("count".to_owned(), binding_type.clone())]),
+                result: RuleType::Bool,
+                expression: "count >= 0".to_owned(),
+            },
+            RuleDefinition {
+                name: "amount_is_valid".to_owned(),
+                bindings: BTreeMap::from([("amount".to_owned(), binding_type)]),
+                result: RuleType::Bool,
+                expression: "amount >= 0".to_owned(),
+            },
+        ],
+        &[],
+    )
+    .expect("bigint binding rules compile")
+}
+
 fn compile(metadata: &Metadata, relation_kind: RelationKind) -> Result<(), PlanError> {
     let catalogs = HashMap::from([("default".to_string(), catalog(relation_kind))]);
     compile_command_catalog(metadata, &catalogs, &rules(), true).map(|_| ())
@@ -2930,6 +2967,81 @@ fn rejects_wrong_scalar_and_rule_binding_types() {
         rule_mismatch,
         "is not assignable to rule binding 'customer_id'",
     );
+}
+
+#[test]
+fn aggregate_count_and_bigint_columns_bind_only_to_bigint_rules() {
+    let mut count_command = relational_batch_command();
+    count_command["steps"]
+        .as_array_mut()
+        .expect("relational steps")
+        .push(json!({
+            "name": "count_valid",
+            "assert": {
+                "rule": "count_is_valid",
+                "with": {
+                    "count": { "step": "totals", "column": "line_count" }
+                },
+                "message": "count must be valid"
+            }
+        }));
+    let count_metadata = metadata(vec![count_command.clone()]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    compile_command_catalog(
+        &count_metadata,
+        &catalogs,
+        &bigint_binding_rules(int64_type()),
+        true,
+    )
+    .expect("aggregate count must bind to a bigint Rule parameter");
+
+    let mismatch = compile_command_catalog(
+        &count_metadata,
+        &catalogs,
+        &bigint_binding_rules(RuleType::Int),
+        true,
+    )
+    .expect_err("aggregate count must not narrow to GraphQL Int");
+    assert_eq!(
+        mismatch.message,
+        "int8 is not assignable to rule binding 'count' (Int)"
+    );
+
+    let mut bigint_catalog = catalog(RelationKind::Table);
+    bigint_catalog
+        .tables
+        .get_mut("public.orders")
+        .expect("orders table")
+        .columns
+        .push(column("amount_minor", "int8"));
+    let mut column_command = select_one_command();
+    column_command["steps"][0]["select_one"]["by"] = json!({
+        "id": { "arg": "customer_id" }
+    });
+    column_command["steps"][0]["select_one"]["returning"]
+        .as_array_mut()
+        .expect("returning columns")
+        .push(json!("amount_minor"));
+    column_command["steps"]
+        .as_array_mut()
+        .expect("select steps")
+        .push(json!({
+            "name": "amount_valid",
+            "assert": {
+                "rule": "amount_is_valid",
+                "with": {
+                    "amount": { "step": "order", "column": "amount_minor" }
+                },
+                "message": "amount must be valid"
+            }
+        }));
+    compile_command_catalog(
+        &metadata(vec![column_command]),
+        &HashMap::from([("default".to_owned(), bigint_catalog)]),
+        &bigint_binding_rules(int64_type()),
+        true,
+    )
+    .expect("an int8 column must bind to a bigint Rule parameter");
 }
 
 #[test]

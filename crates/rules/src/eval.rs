@@ -702,13 +702,19 @@ fn check_literal(rule_name: &str, literal: &Literal) -> Result<CheckedType, Rule
         Literal::Null => Ok(CheckedType::Null),
         Literal::Bool(_) => Ok(CheckedType::Concrete(RuleType::Bool)),
         Literal::String(_) => Ok(CheckedType::Concrete(RuleType::String)),
-        Literal::Int(value) => value
-            .parse::<i128>()
-            .map(|_| CheckedType::Concrete(RuleType::Int))
-            .map_err(|_| RuleError::InvalidLiteral {
-                rule: rule_name.to_owned(),
-                expected: "int".to_owned(),
-            }),
+        Literal::Int(value) => {
+            let type_ = if value.parse::<i32>().is_ok() {
+                RuleType::Int
+            } else if value.parse::<i64>().is_ok() {
+                RuleType::Int64
+            } else {
+                return Err(RuleError::InvalidLiteral {
+                    rule: rule_name.to_owned(),
+                    expected: "int or bigint".to_owned(),
+                });
+            };
+            Ok(CheckedType::Concrete(type_))
+        }
         Literal::Decimal(value) => Decimal::parse(value)
             .map(|_| CheckedType::Concrete(RuleType::Decimal))
             .ok_or_else(|| RuleError::InvalidLiteral {
@@ -824,7 +830,7 @@ fn check_binary(
         | BinaryOp::GreaterThanOrEqual => {
             let left = required_concrete(rule_name, left)?;
             let right = required_concrete(rule_name, right)?;
-            if left == right && supports_ordering(left) {
+            if (left == right && supports_ordering(left)) || is_mixed_integer_pair(left, right) {
                 Ok(CheckedType::Concrete(RuleType::Bool))
             } else {
                 Err(type_mismatch(
@@ -839,6 +845,8 @@ fn check_binary(
             let right = required_concrete(rule_name, right)?;
             if left == right && is_numeric(left) {
                 Ok(CheckedType::Concrete(left.clone()))
+            } else if is_mixed_integer_pair(left, right) {
+                Ok(CheckedType::Concrete(RuleType::Int64))
             } else {
                 Err(type_mismatch(
                     rule_name,
@@ -879,6 +887,11 @@ fn check_equality(
         {
             Ok(())
         }
+        (CheckedType::Concrete(left), CheckedType::Concrete(right))
+            if is_mixed_integer_pair(left, right) =>
+        {
+            Ok(())
+        }
         _ => Err(type_mismatch(
             rule_name,
             checked_type_name(left),
@@ -906,6 +919,11 @@ fn merge_branch_types(
     match (when_true, when_false) {
         (CheckedType::Concrete(left), CheckedType::Concrete(right)) if left == right => {
             Ok(CheckedType::Concrete(left.clone()))
+        }
+        (CheckedType::Concrete(left), CheckedType::Concrete(right))
+            if is_mixed_integer_pair(left, right) =>
+        {
+            Ok(CheckedType::Concrete(RuleType::Int64))
         }
         (CheckedType::Null, CheckedType::Concrete(other))
         | (CheckedType::Concrete(other), CheckedType::Null)
@@ -944,7 +962,9 @@ fn required_concrete<'a>(
 fn is_assignable(actual: &CheckedType, expected: &RuleType) -> bool {
     match actual {
         CheckedType::Null => expected.accepts_null(),
-        CheckedType::Concrete(actual) => actual == expected,
+        CheckedType::Concrete(actual) => {
+            actual == expected || matches!((actual, expected), (RuleType::Int, RuleType::Int64))
+        }
     }
 }
 
@@ -968,7 +988,14 @@ fn type_mismatch(
 }
 
 fn is_numeric(type_: &RuleType) -> bool {
-    matches!(type_, RuleType::Int | RuleType::Decimal)
+    matches!(type_, RuleType::Int | RuleType::Int64 | RuleType::Decimal)
+}
+
+fn is_mixed_integer_pair(left: &RuleType, right: &RuleType) -> bool {
+    matches!(
+        (left, right),
+        (RuleType::Int, RuleType::Int64) | (RuleType::Int64, RuleType::Int)
+    )
 }
 
 fn evaluate_decision_table(
@@ -1128,8 +1155,12 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
             .map(|value| RuntimeValue::String(value.to_owned())),
         RuleType::Int => value
             .as_number()
-            .and_then(|number| number.to_string().parse::<i128>().ok())
+            .and_then(|number| number.to_string().parse::<i32>().ok())
             .map(RuntimeValue::Int),
+        RuleType::Int64 => value
+            .as_number()
+            .and_then(|number| number.to_string().parse::<i64>().ok())
+            .map(RuntimeValue::Int64),
         RuleType::Decimal => value
             .as_number()
             .and_then(|number| Decimal::parse(&number.to_string()))
@@ -1406,6 +1437,10 @@ fn evaluate_expression(
                     .checked_neg()
                     .map(RuntimeValue::Int)
                     .ok_or_else(|| arithmetic_overflow(rule_name)),
+                (UnaryOp::Negate, RuntimeValue::Int64(value)) => value
+                    .checked_neg()
+                    .map(RuntimeValue::Int64)
+                    .ok_or_else(|| arithmetic_overflow(rule_name)),
                 (UnaryOp::Negate, RuntimeValue::Decimal(value)) => value
                     .checked_neg()
                     .map(RuntimeValue::Decimal)
@@ -1469,13 +1504,16 @@ fn evaluate_literal(rule_name: &str, literal: &Literal) -> Result<RuntimeValue, 
         Literal::Bool(value) => Ok(RuntimeValue::Bool(*value)),
         Literal::String(value) => Ok(RuntimeValue::String(value.clone())),
         Literal::Int(value) => {
-            value
-                .parse::<i128>()
-                .map(RuntimeValue::Int)
-                .map_err(|_| RuleError::InvalidLiteral {
+            if let Ok(value) = value.parse::<i32>() {
+                Ok(RuntimeValue::Int(value))
+            } else if let Ok(value) = value.parse::<i64>() {
+                Ok(RuntimeValue::Int64(value))
+            } else {
+                Err(RuleError::InvalidLiteral {
                     rule: rule_name.to_owned(),
-                    expected: "int".to_owned(),
+                    expected: "int or bigint".to_owned(),
                 })
+            }
         }
         Literal::Decimal(value) => {
             Decimal::parse(value)
@@ -1503,8 +1541,12 @@ fn evaluate_call(
     };
     match function {
         Function::Size => match evaluate_expression(rule_name, first()?, context)? {
-            RuntimeValue::String(value) => Ok(RuntimeValue::Int(value.chars().count() as i128)),
-            RuntimeValue::List(values) => Ok(RuntimeValue::Int(values.len() as i128)),
+            RuntimeValue::String(value) => i32::try_from(value.chars().count())
+                .map(RuntimeValue::Int)
+                .map_err(|_| arithmetic_overflow(rule_name)),
+            RuntimeValue::List(values) => i32::try_from(values.len())
+                .map(RuntimeValue::Int)
+                .map_err(|_| arithmetic_overflow(rule_name)),
             other => Err(type_mismatch(
                 rule_name,
                 "string or list",
@@ -1546,8 +1588,8 @@ fn evaluate_binary(
     right: RuntimeValue,
 ) -> Result<RuntimeValue, RuleError> {
     match operation {
-        BinaryOp::Equal => Ok(RuntimeValue::Bool(left == right)),
-        BinaryOp::NotEqual => Ok(RuntimeValue::Bool(left != right)),
+        BinaryOp::Equal => Ok(RuntimeValue::Bool(values_equal(&left, &right))),
+        BinaryOp::NotEqual => Ok(RuntimeValue::Bool(!values_equal(&left, &right))),
         BinaryOp::LessThan
         | BinaryOp::LessThanOrEqual
         | BinaryOp::GreaterThan
@@ -1582,6 +1624,9 @@ fn compare_values(
 ) -> Result<std::cmp::Ordering, RuleError> {
     match (left, right) {
         (RuntimeValue::Int(left), RuntimeValue::Int(right)) => Ok(left.cmp(right)),
+        (RuntimeValue::Int64(left), RuntimeValue::Int64(right)) => Ok(left.cmp(right)),
+        (RuntimeValue::Int(left), RuntimeValue::Int64(right)) => Ok(i64::from(*left).cmp(right)),
+        (RuntimeValue::Int64(left), RuntimeValue::Int(right)) => Ok(left.cmp(&i64::from(*right))),
         (RuntimeValue::Decimal(left), RuntimeValue::Decimal(right)) => Ok(left.cmp(right)),
         (RuntimeValue::Timestamp(left), RuntimeValue::Timestamp(right)) => {
             compare_canonical_timestamps(left, right).ok_or_else(|| RuleError::InternalInvariant {
@@ -1593,6 +1638,14 @@ fn compare_values(
             "matching numeric or timestamp operands",
             format!("{} and {}", left.type_name(), right.type_name()),
         )),
+    }
+}
+
+fn values_equal(left: &RuntimeValue, right: &RuntimeValue) -> bool {
+    match (left, right) {
+        (RuntimeValue::Int(left), RuntimeValue::Int64(right)) => i64::from(*left) == *right,
+        (RuntimeValue::Int64(left), RuntimeValue::Int(right)) => *left == i64::from(*right),
+        _ => left == right,
     }
 }
 
@@ -1659,6 +1712,17 @@ fn arithmetic_values(
                 .map(RuntimeValue::Int)
                 .ok_or_else(|| arithmetic_overflow(rule_name))
         }
+        (RuntimeValue::Int64(left), RuntimeValue::Int64(right)) => {
+            checked_i64_arithmetic(rule_name, operation, left, right).map(RuntimeValue::Int64)
+        }
+        (RuntimeValue::Int(left), RuntimeValue::Int64(right)) => {
+            checked_i64_arithmetic(rule_name, operation, i64::from(left), right)
+                .map(RuntimeValue::Int64)
+        }
+        (RuntimeValue::Int64(left), RuntimeValue::Int(right)) => {
+            checked_i64_arithmetic(rule_name, operation, left, i64::from(right))
+                .map(RuntimeValue::Int64)
+        }
         (RuntimeValue::Decimal(left), RuntimeValue::Decimal(right)) => {
             if matches!(operation, BinaryOp::Divide) && right.is_zero() {
                 return Err(RuleError::DivisionByZero {
@@ -1688,6 +1752,33 @@ fn arithmetic_values(
     }
 }
 
+fn checked_i64_arithmetic(
+    rule_name: &str,
+    operation: BinaryOp,
+    left: i64,
+    right: i64,
+) -> Result<i64, RuleError> {
+    let value = match operation {
+        BinaryOp::Add => left.checked_add(right),
+        BinaryOp::Subtract => left.checked_sub(right),
+        BinaryOp::Multiply => left.checked_mul(right),
+        BinaryOp::Divide => {
+            if right == 0 {
+                return Err(RuleError::DivisionByZero {
+                    rule: rule_name.to_owned(),
+                });
+            }
+            left.checked_div(right)
+        }
+        _ => {
+            return Err(RuleError::InternalInvariant {
+                rule: rule_name.to_owned(),
+            });
+        }
+    };
+    value.ok_or_else(|| arithmetic_overflow(rule_name))
+}
+
 fn arithmetic_overflow(rule_name: &str) -> RuleError {
     RuleError::InvalidLiteral {
         rule: rule_name.to_owned(),
@@ -1700,7 +1791,8 @@ enum RuntimeValue {
     Null,
     Bool(bool),
     String(String),
-    Int(i128),
+    Int(i32),
+    Int64(i64),
     Decimal(Decimal),
     Uuid(String),
     Date(String),
@@ -1718,6 +1810,7 @@ impl RuntimeValue {
             Self::Bool(_) => "bool",
             Self::String(_) => "string",
             Self::Int(_) => "int",
+            Self::Int64(_) => "bigint",
             Self::Decimal(_) => "decimal",
             Self::Uuid(_) => "uuid",
             Self::Date(_) => "date",
@@ -1738,9 +1831,9 @@ impl RuntimeValue {
             (Self::Null, RuleType::Nullable(_)) => Ok(Value::Null),
             (Self::Bool(value), RuleType::Bool) => Ok(Value::Bool(*value)),
             (Self::String(value), RuleType::String) => Ok(Value::String(value.clone())),
-            (Self::Int(value), RuleType::Int) => serde_json::Number::from_i128(*value)
-                .map(Value::Number)
-                .ok_or_else(invariant),
+            (Self::Int(value), RuleType::Int) => Ok(Value::Number((*value).into())),
+            (Self::Int64(value), RuleType::Int64) => Ok(Value::Number((*value).into())),
+            (Self::Int(value), RuleType::Int64) => Ok(Value::Number(i64::from(*value).into())),
             (Self::Decimal(value), RuleType::Decimal) => {
                 serde_json::from_str(&value.canonical_string()).map_err(|_| invariant())
             }
@@ -2169,6 +2262,7 @@ fn encode_type(output: &mut Vec<u8>, type_: &RuleType) {
         RuleType::Bool => output.push(0x10),
         RuleType::String => output.push(0x11),
         RuleType::Int => output.push(0x12),
+        RuleType::Int64 => output.push(0x1c),
         RuleType::Decimal => output.push(0x13),
         RuleType::Uuid => output.push(0x14),
         RuleType::Date => output.push(0x15),
@@ -2309,7 +2403,13 @@ fn expression_type(
             .expect("validated null expression has a nullable resolved type"),
         ExprKind::Literal(Literal::Bool(_)) => RuleType::Bool,
         ExprKind::Literal(Literal::String(_)) => RuleType::String,
-        ExprKind::Literal(Literal::Int(_)) => RuleType::Int,
+        ExprKind::Literal(Literal::Int(value)) => {
+            if matches!(expected, Some(RuleType::Int64)) || value.parse::<i32>().is_err() {
+                RuleType::Int64
+            } else {
+                RuleType::Int
+            }
+        }
         ExprKind::Literal(Literal::Decimal(_)) => RuleType::Decimal,
         ExprKind::Name(name) => context
             .bindings
@@ -2353,7 +2453,9 @@ fn expression_type(
             UnaryOp::Not => RuleType::Bool,
             UnaryOp::Negate => expression_type(operand, context, None),
         },
-        ExprKind::Binary { op, left, .. } => match op {
+        ExprKind::Binary {
+            op, left, right, ..
+        } => match op {
             BinaryOp::Or
             | BinaryOp::And
             | BinaryOp::Equal
@@ -2363,7 +2465,13 @@ fn expression_type(
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual => RuleType::Bool,
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
-                expression_type(left, context, None)
+                let left = expression_type(left, context, None);
+                let right = expression_type(right, context, None);
+                if is_mixed_integer_pair(&left, &right) {
+                    RuleType::Int64
+                } else {
+                    left
+                }
             }
         },
         ExprKind::Conditional {
@@ -2525,6 +2633,10 @@ fn encode_typed_value(output: &mut Vec<u8>, type_: &RuleType, value: &RuntimeVal
         }
         RuntimeValue::Int(value) => {
             output.push(0x33);
+            encode_string(output, &value.to_string());
+        }
+        RuntimeValue::Int64(value) => {
+            output.push(0x3c);
             encode_string(output, &value.to_string());
         }
         RuntimeValue::Decimal(value) => {

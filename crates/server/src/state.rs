@@ -1154,7 +1154,8 @@ fn scalar_rule_type(source: &str) -> Option<RuleType> {
     match source {
         "bool" => Some(RuleType::Bool),
         "string" => Some(RuleType::String),
-        "int" | "bigint" => Some(RuleType::Int),
+        "int" => Some(RuleType::Int),
+        "bigint" => Some(RuleType::Int64),
         "decimal" => Some(RuleType::Decimal),
         "uuid" => Some(RuleType::Uuid),
         "date" => Some(RuleType::Date),
@@ -2759,11 +2760,13 @@ mod snapshot_tests {
 
         let catalog =
             compile_rule_catalog(&metadata).expect("every active Petshop scalar compiles");
+        let bigint: donat_rules::RuleType = serde_json::from_value(json!("Int64"))
+            .expect("the closed bigint rule type deserializes");
         for (rule, expected) in [
             ("round_trip_bool", donat_rules::RuleType::Bool),
             ("round_trip_string", donat_rules::RuleType::String),
             ("round_trip_int", donat_rules::RuleType::Int),
-            ("round_trip_bigint", donat_rules::RuleType::Int),
+            ("round_trip_bigint", bigint),
             ("round_trip_uuid", donat_rules::RuleType::Uuid),
             ("round_trip_timestamptz", donat_rules::RuleType::Timestamp),
         ] {

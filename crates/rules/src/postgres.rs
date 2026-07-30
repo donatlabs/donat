@@ -444,7 +444,7 @@ fn lower_expression(
         ExprKind::Binary { op, left, right } => {
             let left = lower_expression(rule, bindings, left)?;
             let right = lower_expression(rule, bindings, right)?;
-            lower_binary(*op, left, right)
+            lower_binary(*op, left, right, &type_)
         }
         ExprKind::Conditional {
             condition,
@@ -478,10 +478,15 @@ fn infer_expression_type(
         ExprKind::Literal(Literal::Null) => Ok(ExpressionType::Null),
         ExprKind::Literal(Literal::Bool(_)) => Ok(ExpressionType::Concrete(RuleType::Bool)),
         ExprKind::Literal(Literal::String(_)) => Ok(ExpressionType::Concrete(RuleType::String)),
-        ExprKind::Literal(Literal::Int(value)) => value
-            .parse::<i128>()
-            .map(|_| ExpressionType::Concrete(RuleType::Int))
-            .map_err(|_| invariant()),
+        ExprKind::Literal(Literal::Int(value)) => {
+            if value.parse::<i32>().is_ok() {
+                Ok(ExpressionType::Concrete(RuleType::Int))
+            } else if value.parse::<i64>().is_ok() {
+                Ok(ExpressionType::Concrete(RuleType::Int64))
+            } else {
+                Err(invariant())
+            }
+        }
         ExprKind::Literal(Literal::Decimal(value)) if is_decimal(value) => {
             Ok(ExpressionType::Concrete(RuleType::Decimal))
         }
@@ -559,8 +564,22 @@ fn infer_expression_type(
         ExprKind::Binary {
             op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide,
             left,
-            ..
-        } => infer_expression_type(rule, left),
+            right,
+        } => {
+            let left = infer_expression_type(rule, left)?;
+            let right = infer_expression_type(rule, right)?;
+            match (&left, &right) {
+                (
+                    ExpressionType::Concrete(RuleType::Int),
+                    ExpressionType::Concrete(RuleType::Int64),
+                )
+                | (
+                    ExpressionType::Concrete(RuleType::Int64),
+                    ExpressionType::Concrete(RuleType::Int),
+                ) => Ok(ExpressionType::Concrete(RuleType::Int64)),
+                _ => Ok(left),
+            }
+        }
         ExprKind::Conditional {
             when_true,
             when_false,
@@ -694,15 +713,19 @@ fn lower_value_literal(
                 .ok_or_else(|| invalid_binding(binding_name, type_))?;
             Ok(format!("{}::text", donat_sqlgen::quote_lit(value)))
         }
-        RuleType::Int => {
+        RuleType::Int | RuleType::Int64 => {
             let value = value
                 .as_number()
                 .ok_or_else(|| invalid_literal(rule_name, type_))?;
-            value
-                .to_string()
-                .parse::<i128>()
-                .map_err(|_| invalid_binding(binding_name, type_))?;
-            Ok(format!("({})::numeric", value))
+            let valid = match type_ {
+                RuleType::Int => value.to_string().parse::<i32>().is_ok(),
+                RuleType::Int64 => value.to_string().parse::<i64>().is_ok(),
+                _ => unreachable!("outer match restricts integer types"),
+            };
+            if !valid {
+                return Err(invalid_binding(binding_name, type_));
+            }
+            Ok(format!("({})::{}", value, postgres_type(type_)))
         }
         RuleType::Decimal => {
             let value = value
@@ -757,13 +780,18 @@ fn lower_literal(rule_name: &str, literal: &Literal) -> Result<String, RuleError
         Literal::Null => Ok("NULL".to_owned()),
         Literal::Bool(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_owned()),
         Literal::String(value) => Ok(format!("{}::text", donat_sqlgen::quote_lit(value))),
-        Literal::Int(value) => value
-            .parse::<i128>()
-            .map(|_| format!("({value})::numeric"))
-            .map_err(|_| RuleError::InvalidLiteral {
-                rule: rule_name.to_owned(),
-                expected: "int".to_owned(),
-            }),
+        Literal::Int(value) => {
+            if value.parse::<i32>().is_ok() {
+                Ok(format!("({value})::int4"))
+            } else if value.parse::<i64>().is_ok() {
+                Ok(format!("({value})::int8"))
+            } else {
+                Err(RuleError::InvalidLiteral {
+                    rule: rule_name.to_owned(),
+                    expected: "int or bigint".to_owned(),
+                })
+            }
+        }
         Literal::Decimal(value) => Ok(format!("({value})::numeric")),
     }
 }
@@ -809,8 +837,12 @@ fn lower_call(
     }
 }
 
-fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpression) -> String {
-    let left_type = left.type_.clone();
+fn lower_binary(
+    operation: BinaryOp,
+    left: LoweredExpression,
+    right: LoweredExpression,
+    result_type: &ExpressionType,
+) -> String {
     match operation {
         BinaryOp::Or => format!(
             "(CASE WHEN ({}) THEN TRUE ELSE ({}) END)",
@@ -838,13 +870,22 @@ fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpr
         BinaryOp::LessThanOrEqual => format!("(({}) <= ({}))", left.sql, right.sql),
         BinaryOp::GreaterThan => format!("(({}) > ({}))", left.sql, right.sql),
         BinaryOp::GreaterThanOrEqual => format!("(({}) >= ({}))", left.sql, right.sql),
-        BinaryOp::Add => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "+"),
-        BinaryOp::Subtract => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "-"),
-        BinaryOp::Multiply => lower_checked_numeric_binary(&left_type, &left.sql, &right.sql, "*"),
-        BinaryOp::Divide if matches!(left_type, ExpressionType::Concrete(RuleType::Int)) => {
-            checked_i128_result(&format!("trunc(({}) / ({}))", left.sql, right.sql))
+        BinaryOp::Add => lower_checked_numeric_binary(result_type, &left.sql, &right.sql, "+"),
+        BinaryOp::Subtract => lower_checked_numeric_binary(result_type, &left.sql, &right.sql, "-"),
+        BinaryOp::Multiply => lower_checked_numeric_binary(result_type, &left.sql, &right.sql, "*"),
+        BinaryOp::Divide
+            if matches!(
+                result_type,
+                ExpressionType::Concrete(RuleType::Int | RuleType::Int64)
+            ) =>
+        {
+            let value = format!(
+                "trunc((({})::numeric) / (({})::numeric))",
+                left.sql, right.sql
+            );
+            checked_integer_result(result_type, &value)
         }
-        BinaryOp::Divide if matches!(left_type, ExpressionType::Concrete(RuleType::Decimal)) => {
+        BinaryOp::Divide if matches!(result_type, ExpressionType::Concrete(RuleType::Decimal)) => {
             lower_checked_decimal_divide(&left.sql, &right.sql)
         }
         BinaryOp::Divide => format!("(({}) / ({}))", left.sql, right.sql),
@@ -854,7 +895,9 @@ fn lower_binary(operation: BinaryOp, left: LoweredExpression, right: LoweredExpr
 fn lower_numeric_negate(operand: &LoweredExpression) -> String {
     let value = format!("(-({}))", operand.sql);
     match &operand.type_ {
-        ExpressionType::Concrete(RuleType::Int) => checked_i128_result(&value),
+        ExpressionType::Concrete(RuleType::Int | RuleType::Int64) => {
+            checked_integer_result(&operand.type_, &format!("-(({})::numeric)", operand.sql))
+        }
         ExpressionType::Concrete(RuleType::Decimal) => lower_checked_decimal_negate(&operand.sql),
         _ => value,
     }
@@ -866,9 +909,11 @@ fn lower_checked_numeric_binary(
     right: &str,
     operator: &str,
 ) -> String {
-    let value = format!("(({left}) {operator} ({right}))");
+    let value = format!("((({left})::numeric) {operator} (({right})::numeric))");
     match type_ {
-        ExpressionType::Concrete(RuleType::Int) => checked_i128_result(&value),
+        ExpressionType::Concrete(RuleType::Int | RuleType::Int64) => {
+            checked_integer_result(type_, &value)
+        }
         ExpressionType::Concrete(RuleType::Decimal) => match operator {
             "+" | "-" => lower_checked_decimal_binary(left, right, operator),
             "*" => lower_checked_decimal_multiply(left, right),
@@ -878,12 +923,17 @@ fn lower_checked_numeric_binary(
     }
 }
 
-fn checked_i128_result(value: &str) -> String {
-    const I128_MIN: &str = "-170141183460469231731687303715884105728";
-    const I128_MAX: &str = "170141183460469231731687303715884105727";
+fn checked_integer_result(type_: &ExpressionType, value: &str) -> String {
+    let (minimum, maximum, postgres_type) = match type_ {
+        ExpressionType::Concrete(RuleType::Int) => ("-2147483648", "2147483647", "int4"),
+        ExpressionType::Concrete(RuleType::Int64) => {
+            ("-9223372036854775808", "9223372036854775807", "int8")
+        }
+        _ => return value.to_owned(),
+    };
     format!(
-        "(CASE WHEN (({value}) BETWEEN ({I128_MIN})::numeric AND ({I128_MAX})::numeric) THEN ({value}) ELSE {} END)",
-        arithmetic_overflow_rejection()
+        "((CASE WHEN (({value}) BETWEEN ({minimum})::numeric AND ({maximum})::numeric) THEN ({value}) ELSE {} END))::{postgres_type}",
+        arithmetic_overflow_rejection(),
     )
 }
 
@@ -1097,7 +1147,9 @@ fn postgres_type(type_: &RuleType) -> &'static str {
     match strip_nullable(type_) {
         RuleType::Bool => "boolean",
         RuleType::String | RuleType::Enum { .. } => "text",
-        RuleType::Int | RuleType::Decimal => "numeric",
+        RuleType::Int => "int4",
+        RuleType::Int64 => "int8",
+        RuleType::Decimal => "numeric",
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",

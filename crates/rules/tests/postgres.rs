@@ -35,6 +35,10 @@ fn opaque_json_type(maximum_bytes: u32, maximum_depth: u32, maximum_nodes: u32) 
     .expect("the closed opaque JSON rule type must deserialize")
 }
 
+fn int64_type() -> RuleType {
+    serde_json::from_value(json!("Int64")).expect("the closed bigint rule type must deserialize")
+}
+
 fn compiled_rule(
     bindings: BTreeMap<String, RuleType>,
     expression: &str,
@@ -484,6 +488,57 @@ fn opaque_json_pass_through_lowers_only_as_bounded_jsonb() {
 }
 
 #[test]
+fn bigint_lowering_uses_int8_and_rejects_width_overflow() {
+    let bigint = int64_type();
+    let rule = compiled_value_rule(
+        bigint.clone(),
+        map([("value", bigint.clone())]),
+        "value + 1",
+    );
+    let mut client = postgres_client();
+
+    let lowered = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([("value".to_owned(), SqlBinding::literal(json!(i64::MAX - 1)))]),
+    )
+    .expect("in-range bigint arithmetic must lower");
+    assert_eq!(lowered.type_, bigint);
+    assert!(
+        lowered.sql.contains("::int8"),
+        "bigint lowering must retain int8 typing: {}",
+        lowered.sql
+    );
+    assert_eq!(
+        client
+            .query_one(&format!("SELECT ({})::text AS value", lowered.sql), &[])
+            .expect("in-range bigint SQL executes")
+            .get::<_, String>("value"),
+        i64::MAX.to_string()
+    );
+
+    let overflow = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([("value".to_owned(), SqlBinding::literal(json!(i64::MAX)))]),
+    )
+    .expect("overflow remains a safely lowered runtime rejection");
+    let error = client
+        .query_one(&format!("SELECT {} AS value", overflow.sql), &[])
+        .expect_err("Postgres must reject the same bigint overflow as Rust");
+    assert_eq!(error.code(), Some(&SqlState::DIVISION_BY_ZERO));
+
+    let int = compiled_value_rule(RuleType::Int, map([("value", RuleType::Int)]), "value");
+    assert!(matches!(
+        lower_postgres_value(
+            &int,
+            &SqlBindings::new([(
+                "value".to_owned(),
+                SqlBinding::literal(json!(i64::from(i32::MAX) + 1)),
+            )])
+        ),
+        Err(RuleError::InvalidBinding { ref name, .. }) if name == "value"
+    ));
+}
+#[test]
 fn object_value_rejects_missing_non_null_members_in_rust_and_postgres() {
     let customer = object("Customer", map([("name", RuleType::String)]));
     let rule = compiled_value_rule(customer.clone(), map([("customer", customer)]), "customer");
@@ -556,13 +611,13 @@ fn object_value_allows_missing_nullable_members_in_rust_and_postgres() {
 }
 
 #[test]
-fn lowerer_rejects_i128_arithmetic_overflow_like_the_rust_evaluator() {
+fn lowerer_rejects_integer_and_decimal_overflow_like_the_rust_evaluator() {
     let decimal_maximum_at_scale_one = "17014118346046923173168730371588410572.7";
     let tiny_decimal_at_scale_4000 = format!("0.{}1", "0".repeat(3999));
     let cases = [
         (
             "integer result overflow",
-            format!("{} + 1 > {}", i128::MAX, i128::MAX),
+            format!("{} + 1 > {}", i32::MAX, i32::MAX),
         ),
         (
             "decimal result overflow",
