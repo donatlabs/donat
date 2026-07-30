@@ -855,6 +855,205 @@ fn commands_deserialize_all_step_and_value_forms() {
 }
 
 #[test]
+fn relational_batch_deserializes_closed_step_and_value_forms() {
+    // This proves the metadata boundary accepts only the declarative batch
+    // shape. Relation kinds, primary keys, permissions, and step ordering are
+    // deliberately catalog-validation concerns.
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: reserve_cart_stock
+source: default
+steps:
+  - name: priced_lines
+    select_many:
+      table: { schema: public, name: cart_pricing }
+      by:
+        cart_id: { step: cart, column: id }
+      order_by: [variant_id]
+      returning: [variant_id, quantity, line_total_minor, currency]
+      require_non_empty: true
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        line_count: { count: {} }
+        subtotal_minor: { sum: { column: line_total_minor } }
+        currency_count: { count_distinct: { column: currency } }
+        currency: { min: { column: currency } }
+  - name: reserve_stock
+    update_many:
+      table: { schema: public, name: inventory_stock }
+      for_each: { step: priced_lines }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: add_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_reserve
+        with:
+          on_hand: { current_column: on_hand }
+          reserved: { current_column: reserved }
+          requested: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+"#,
+    )
+    .expect("the relational batch metadata surface must deserialize");
+
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::SelectMany { select_many }
+            if select_many.order_by == ["variant_id"] && select_many.require_non_empty
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Aggregate { aggregate }
+            if matches!(&aggregate.values["line_count"], donat_metadata::CommandAggregate::Count { .. })
+                && matches!(&aggregate.values["subtotal_minor"], donat_metadata::CommandAggregate::Sum { .. })
+                && matches!(&aggregate.values["currency_count"], donat_metadata::CommandAggregate::CountDistinct { .. })
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::UpdateMany { update_many }
+            if update_many.require_each
+                && matches!(
+                    &update_many.set["reserved"],
+                    CommandValue::Rule { bindings, .. }
+                        if matches!(bindings["left"], CommandValue::CurrentColumn { .. })
+                )
+    ));
+}
+
+#[test]
+fn relational_batch_rejects_invalid_local_yaml_shapes() {
+    // These failures catch a future widening of the closed batch grammar.
+    // They do not cover catalog-dependent source/order/scope semantics.
+    let invalid_documents = [
+        (
+            "unknown select_many key",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+      order_by: [variant_id]
+      arbitrary_sql: SELECT 1
+"#,
+        ),
+        (
+            "empty select_many by",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: {}
+      order_by: [variant_id]
+"#,
+        ),
+        (
+            "missing select_many order_by",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+"#,
+        ),
+        (
+            "duplicate select_many order_by column",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+      order_by: [variant_id, variant_id]
+"#,
+        ),
+        (
+            "unsupported aggregate",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        average: { avg: { column: line_total_minor } }
+"#,
+        ),
+    ];
+
+    for (kind, document) in invalid_documents {
+        let error = serde_yaml::from_str::<Command>(document)
+            .expect_err(&format!("{kind} must be rejected"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field")
+                || rendered.contains("did not match")
+                || rendered.contains("non-empty")
+                || rendered.contains("duplicate"),
+            "{kind} must fail as a closed local shape, got: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn relational_batch_catalog_semantic_cases_remain_loadable_for_task_five() {
+    // Aggregate row-set sources, current_column scope, and reference order
+    // require a resolved command graph and catalog facts. Task 5 owns those
+    // semantic rejections; serde must retain the declarations intact.
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: deferred_semantics
+source: default
+steps:
+  - name: totals
+    aggregate:
+      from: { step: scalar_step }
+      values: { total: { count: {} } }
+  - name: scalar_step
+    select_one:
+      table: public.carts
+      by: { id: { step: later, column: id } }
+      returning: [id]
+  - name: invalid_current_column_scope
+    insert:
+      table: public.carts
+      object: { reserved: { current_column: reserved } }
+"#,
+    )
+    .expect("catalog-validation cases must remain representable in metadata");
+
+    assert_eq!(command.steps.len(), 3);
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::Aggregate { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::Insert { insert }
+            if matches!(&insert.object["reserved"], CommandValue::CurrentColumn { .. })
+    ));
+}
+
+#[test]
 fn commands_retain_unvalidated_duplicate_names_and_effect_references() {
     // Name uniqueness and process contracts are catalog-validation concerns;
     // loading metadata must retain these declarations for that later phase.

@@ -301,6 +301,45 @@ argument, rejects an empty list unless allow_empty: true is set, and preserves
 input order in its returned list. update and delete affect at most one row
 because of their complete primary-key predicate.
 
+### 7.3.1 Bounded relational batches
+
+A command may add a bounded relational batch made only of `select_many`,
+`aggregate`, and `update_many` steps. This is a closed declarative grammar, not
+a general query or workflow language. It contains no free-form predicate, SQL,
+identifier template, function call, join declaration, loop, or dynamic
+relation.
+
+`select_many` reads a tracked table or tracked view in the command's source.
+Its non-empty `by` map is an equality map over catalog columns and scalar
+values, and its mandatory non-empty `order_by` list has no repeated column.
+The compiled SQL rejects a duplicate complete `order_by` tuple before a later
+step consumes the row set. This makes the observed list order total even when a
+view has no catalog primary key. The command role must hold the underlying
+select permission for the read target and every referenced column.
+
+`aggregate` accepts exactly one prior `select_many` row set and returns exactly
+one row. Its named values may use only `sum`, `count`, `min`, `max`, and
+`count_distinct`; `count` takes no column and every other operation takes one
+declared column. Aggregates have no grouping, filter, window, or user
+expression.
+
+`update_many` consumes exactly one prior `select_many` row set. Its target must
+be an ordinary Postgres table with a non-empty primary key, never a view or
+other relation kind. Its `by` map contains every target primary-key column,
+sourced from the current item; its `set` and optional `check` are the only
+places where `current_column` may be used. The command role must hold the
+underlying update permission for the target and every referenced column.
+Duplicate input primary keys are rejected before DML. When `require_each` is
+true, the command compares the distinct input-key count, input-row count, and
+affected-row count, rejecting any mismatch.
+
+Row sets are source-local, cannot cross sources, and cannot escape the command
+statement that produced them. A result list preserves the declared total order.
+Metadata parsing closes the YAML shape; catalog-aware command validation proves
+row-set source kinds, prior-step ordering, primary-key coverage, permissions,
+and `current_column` scope before a command is published. See
+[[knowledgebase/declarative-saas/decisions/014-command-relational-batches]].
+
 ## 8. Idempotency and durable hand-off
 
 A command that starts a process must declare idempotency. Other commands may

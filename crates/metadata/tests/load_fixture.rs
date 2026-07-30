@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use donat_metadata::{Columns, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir};
+use donat_metadata::{
+    Columns, CommandStepOperation, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir,
+};
 
 fn fixture_dir() -> &'static Path {
     Path::new(concat!(
@@ -160,13 +162,28 @@ fn loads_types_only_rules_wrapper() {
 fn loads_commands_section_with_quoted_include() {
     let md = load_metadata_dir(commands_fixture_dir()).expect("commands metadata should load");
 
-    assert_eq!(md.commands.len(), 1);
+    assert_eq!(md.commands.len(), 2);
     let command = &md.commands[0];
     assert_eq!(command.name, "create_order");
     assert_eq!(command.source, "default");
     assert_eq!(command.permissions[0].role, "customer");
     assert_eq!(command.steps.len(), 2);
     assert_eq!(command.effects.len(), 1);
+
+    let relational_batch = &md.commands[1];
+    assert_eq!(relational_batch.name, "reserve_cart_stock");
+    assert!(matches!(
+        &relational_batch.steps[0].operation,
+        CommandStepOperation::SelectMany { .. }
+    ));
+    assert!(matches!(
+        &relational_batch.steps[1].operation,
+        CommandStepOperation::Aggregate { .. }
+    ));
+    assert!(matches!(
+        &relational_batch.steps[2].operation,
+        CommandStepOperation::UpdateMany { .. }
+    ));
 }
 
 #[test]

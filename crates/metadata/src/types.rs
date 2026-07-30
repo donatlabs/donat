@@ -6,7 +6,7 @@
 //! `serde_json::Value` for now; they get a typed AST when the sqlgen
 //! milestone needs to compile them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{
@@ -431,10 +431,13 @@ pub struct CommandStep {
 #[serde(untagged, deny_unknown_fields)]
 pub enum CommandStepOperation {
     SelectOne { select_one: SelectOneCommandStep },
+    SelectMany { select_many: SelectManyCommandStep },
     Insert { insert: InsertCommandStep },
     InsertMany { insert_many: InsertManyCommandStep },
     Update { update: UpdateCommandStep },
+    UpdateMany { update_many: UpdateManyCommandStep },
     Delete { delete: DeleteCommandStep },
+    Aggregate { aggregate: AggregateCommandStep },
     Assert { assert: AssertCommandStep },
 }
 
@@ -447,6 +450,23 @@ pub struct SelectOneCommandStep {
     pub returning: Vec<String>,
     #[serde(default = "default_true")]
     pub require_found: bool,
+}
+
+/// A bounded ordered row-set read. Catalog compilation later proves the
+/// relation, predicate columns, source, and role permissions; this type keeps
+/// the YAML grammar closed before that phase.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectManyCommandStep {
+    pub table: QualifiedTable,
+    #[serde(deserialize_with = "deserialize_non_empty_command_value_map")]
+    pub by: BTreeMap<String, CommandValue>,
+    #[serde(deserialize_with = "deserialize_non_empty_unique_columns")]
+    pub order_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default)]
+    pub require_non_empty: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -483,6 +503,24 @@ pub struct UpdateCommandStep {
     pub require_affected: bool,
 }
 
+/// A bounded update over one prior row-set. The catalog-aware command
+/// validator owns primary-key, row-set source, and `current_column` scope
+/// checks; metadata parsing only retains the closed declaration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateManyCommandStep {
+    pub table: QualifiedTable,
+    pub for_each: CommandValue,
+    pub by: BTreeMap<String, CommandValue>,
+    pub set: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CommandRuleBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default)]
+    pub require_each: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeleteCommandStep {
     pub table: QualifiedTable,
@@ -501,6 +539,91 @@ pub struct AssertCommandStep {
     pub bindings: BTreeMap<String, CommandValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A closed Rule invocation bound to a relational update check. It has no
+/// message or executable expression surface; Rule lookup is deferred to the
+/// catalog-aware command compiler.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandRuleBinding {
+    pub rule: String,
+    #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, CommandValue>,
+}
+
+/// One aggregation over a prior `select_many` row-set. Its source and column
+/// semantics are validated after metadata loading, against the command graph
+/// and catalog.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateCommandStep {
+    pub from: CommandValue,
+    pub values: BTreeMap<String, CommandAggregate>,
+}
+
+/// The only aggregations available to a relational command batch. There is no
+/// free-form expression, filter, grouping, or window declaration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CommandAggregate {
+    Count {
+        count: CountCommandAggregate,
+    },
+    Sum {
+        sum: ColumnCommandAggregate,
+    },
+    Min {
+        min: ColumnCommandAggregate,
+    },
+    Max {
+        max: ColumnCommandAggregate,
+    },
+    CountDistinct {
+        count_distinct: ColumnCommandAggregate,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountCommandAggregate {}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnCommandAggregate {
+    pub column: String,
+}
+
+fn deserialize_non_empty_command_value_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, CommandValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = BTreeMap::deserialize(deserializer)?;
+    if values.is_empty() {
+        return Err(serde::de::Error::custom(
+            "must contain at least one equality binding",
+        ));
+    }
+    Ok(values)
+}
+
+fn deserialize_non_empty_unique_columns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let columns = Vec::<String>::deserialize(deserializer)?;
+    if columns.is_empty() {
+        return Err(serde::de::Error::custom("must contain at least one column"));
+    }
+    let mut seen = BTreeSet::new();
+    if columns.iter().any(|column| !seen.insert(column)) {
+        return Err(serde::de::Error::custom(
+            "must not contain duplicate columns",
+        ));
+    }
+    Ok(columns)
 }
 
 /// A closed, SQL-free reference used by command steps, results, guards, and
@@ -529,6 +652,9 @@ pub enum CommandValue {
     },
     SessionVariable {
         session_variable: String,
+    },
+    CurrentColumn {
+        current_column: String,
     },
 }
 
