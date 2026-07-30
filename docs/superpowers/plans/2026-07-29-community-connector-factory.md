@@ -814,6 +814,12 @@ pub struct StableSemver {
     pub patch: u32,
 }
 
+/// One exact canonical SemVer 2.0.0 donor-package version.
+///
+/// The checked parser admits canonical prerelease/build components and
+/// rejects ranges, tags, a leading `v`, and noncanonical numeric identifiers.
+pub struct ExactSemver(String);
+
 pub struct VersionedProcessorRef<Id> {
     pub id: Id,
     pub implementation_revision: u32,
@@ -1548,6 +1554,10 @@ pub struct SubscriptionOperationIds {
 
 The version taxonomy is closed. Connector, credential, operation, trigger,
 and event versions are stable SemVer cores; Phase 1 rejects prerelease/build.
+`ExactNpmPackage.version` alone uses `ExactSemver`, which admits and preserves
+one canonical SemVer 2.0.0 donor version such as
+`1.2.3-alpha.1+build.5`. It rejects `^1.2.3`, `latest`, `v1.2.3`,
+`01.2.3`, and `1.2.3-01`.
 Runtime ABI, canonical/source-record schema, classifier/generator, and every
 static processor/authenticator/codec/normalizer implementation revision are
 `u32` epochs named `implementation_revision`. A processorless declarative operation has exactly one step;
@@ -1597,7 +1607,6 @@ pub struct SemanticMaterialV1 {
     pub origins: Vec<SemanticOriginMaterialV1>,
     pub operations: Vec<SemanticOperationMaterialV1>,
     pub triggers: Vec<SemanticTriggerMaterialV1>,
-    pub resolved_fact_values: Vec<ResolvedFactValueMaterialV1>,
 }
 pub struct ProvenanceMaterialV1 {
     pub canonical_schema_epoch: u32,
@@ -1611,7 +1620,6 @@ pub struct ProvenanceMaterialV1 {
     pub notices: Vec<NoticeMaterialV1>,
     pub manifest_references: Vec<ManifestProvenanceMaterialV1>,
     pub provider_evidence: Vec<ProviderEvidenceOriginMaterialV1>,
-    pub resolved_fact_origins: Vec<ResolvedFactOriginMaterialV1>,
     pub donat_policy_ids: Vec<DonatPolicyId>,
     pub classifier_epoch: u32,
     pub generator_epoch: u32,
@@ -1636,10 +1644,12 @@ exactly as ADR 012 lists them through primitive leaves.
 `TriggerSpec`, `ManifestProvenanceReference`, or any fact origin.
 
 `SourceRecordMaterialV1` is the exact field-for-field projection of the
-complete normalized owner; the bidirectional
-`canonical_projection_field_matrix_is_total` compile/test gate fails when an
-owner field/variant is absent, a projection member lacks an owner, or a field
-is mapped twice outside the intentional fact value/origin split. Optional values
+complete normalized owner. The machine-readable owner manifest in ADR 012 is
+the test input for the bidirectional
+`canonical_projection_field_matrix_is_total` compile/test gate. It fails when
+an owner leaf/branch is absent, a projection member lacks an owner, an owner
+entry contains wildcard/family shorthand, or a direct material maps a
+normalized leaf to two canonical paths. Optional values
 are explicit value-or-null and enums use the one tagged
 `{kind,value}` form. Set-like collections sort by stable ID and reject
 duplicates; steps, transforms, and error rules retain declared order.
@@ -1652,6 +1662,14 @@ Section 5.1 tag and uses strings for `I64`, `U64`, and exact decimal values.
 Inline bytes use canonical unpadded base64url. This code stays in catalog;
 `donat-value-contract` gains no Serde/JCS dependency and `canonical_size`
 remains a distinct contract.
+
+Resolved fact values serialize only at the owning
+`SemanticOperationMaterialV1.resolved_fact_values` use sites. Resolved fact
+origins serialize only at
+`ManifestProvenanceMaterialV1.contract_fact_origins`. Within each direct
+material, `(use_site,fact)` is unique; the semantic and provenance use-site
+sets are equal. Provider-evidence inventory facts remain source evidence and
+are not resolved use-site origins.
 
 The domain functions and calculation order are exact:
 
@@ -1782,8 +1800,8 @@ lines and hashes in ADR 012:
 ```text
 source-record 420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991
 value-contract 79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
-semantic 86758001d76edf0087fbe3e734462391c4855b0862a00fa1e20b93610aa53419
-provenance 4147281e4df2d68b86e3b9909a083355991a342b36766c8ea732a6a264ea9b59
+semantic f6bc86c9d5004885bb3156ab320fa76ad3ff7e9686320c54735dcfbd8c27e934
+provenance 326236f741dfa72628b63ae308599b94e83b1c2aa1aa00bd80025ff5381a7531
 ```
 
 Do not obtain expected bytes from the production serializer. The full suite
@@ -1838,6 +1856,9 @@ are closed; no generic parser message or replacement-character recovery is
 accepted.
 
 Add `source_record_variants_are_closed`,
+`exact_npm_version_uses_exact_semver`,
+`exact_semver_accepts_prerelease_and_build`,
+`exact_semver_rejects_range_tag_leading_v_and_leading_zero`,
 `npm_integrity_and_repository_mapping_are_exact`,
 `npm_signature_provenance_tag_maintainer_and_owner_state_is_exact`,
 `reacquisition_plan_matches_source_subject`,
@@ -1846,11 +1867,14 @@ Add `source_record_variants_are_closed`,
 `donat_policy_cannot_satisfy_required_provider_evidence`,
 `contract_fact_semantic_and_provenance_hashes_are_separate`,
 `canonical_projection_field_matrix_is_total`,
+`canonical_owner_manifest_has_no_wildcards_or_duplicate_paths`,
+`canonical_owner_manifest_matches_normalized_leaf_and_branch_set`,
 `canonical_projection_every_field_mutation_is_observable`,
 `canonical_projection_every_enum_branch_is_covered`,
 `semantic_projection_uses_no_provenance_bearing_runtime_descriptor`,
 `origin_only_mutation_preserves_semantic_hash`,
 `value_only_mutation_preserves_direct_origin_material`,
+`resolved_fact_use_sites_are_unique_and_equal_across_domains`,
 `final_provenance_commits_semantic_hash`,
 `canonical_projection_domains_and_calculation_order_are_exact`,
 `canonical_projection_one_field_mutations_are_separate`,
@@ -1939,8 +1963,9 @@ value. Every `ContractFact::ProviderEvidence` resolves to a distinct matching
 The two variants are not substitutable. Provider normalized values and Donat
 policy values enter semantic material; provider record/artifact/fact
 identities and locations plus Donat policy IDs enter provenance material.
-Changing either origin or value changes the corresponding domain-separated
-hash. `EvidenceAccepted` is valid only for a
+Changing an origin or value changes its assigned domain-separated hash.
+Reject a duplicate resolved `(use_site,fact)` value or origin and reject
+unequal semantic/provenance use-site sets. `EvidenceAccepted` is valid only for a
 `ProviderArtifact`; `ApprovedForPort` is valid only for a donor or Donat-owned
 operation source. The five catalog-local provenance IDs use one strict
 `1..=96`-byte ASCII grammar
@@ -2245,7 +2270,6 @@ pub struct GeneratedTriggerSpec {
     pub event_version: StableSemver,
     pub runtime_abi_epoch: u32,
     pub kind: GeneratedTriggerKind,
-    pub resolved_fact_values: &'static [GeneratedResolvedFactValue],
     pub catalog_identity: GeneratedCatalogIdentity,
 }
 

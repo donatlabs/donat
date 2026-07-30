@@ -581,9 +581,17 @@ Full-width catalog integers/decimals remain tagged strings. RFC 7493's
 interoperable-integer recommendation is not a mandatory rejection of exactly
 representable `2^53`.
 
+The `ExactSemver` constructor accepts and preserves
+`1.2.3-alpha.1+build.5` and `1.2.3`; it rejects `^1.2.3`, `latest`,
+`v1.2.3`, `01.2.3`, and `1.2.3-01`. These are normative Task-3 vectors.
+
 Connector, credential, operation, trigger, and event versions are stable
 SemVer core `{major,minor,patch}` values. Phase 1 rejects prerelease/build
-metadata. Runtime ABI, canonical/source-record schema,
+metadata. Donor-package `ExactNpmPackage.version` instead uses the distinct
+`ExactSemver`: one exact canonical SemVer 2.0.0 string that preserves admitted
+prerelease/build components and rejects ranges, distribution tags, leading
+`v`, empty/non-ASCII identifiers, and noncanonical leading zeros. Runtime ABI,
+canonical/source-record schema,
 classifier/generator, and static processor/authenticator/codec/normalizer
 implementation versions are `Epoch = u32`. Every processor-like reference is
 `{id: <ABI-owned ID>, implementation_revision: Epoch}`; no processor field is
@@ -593,8 +601,8 @@ Safe-width schema/version integers remain JSON numbers. All other `u64` and
 `NonZeroU64` fields are minimal unsigned-decimal JSON strings.
 
 The catalog owns four exact closed projections. ADR 012's normative primitive
-table, branch-complete composite v1 shapes, and bidirectional field-totality
-matrix define every normalized owner field/variant, projection member, enum
+table, branch-complete composite v1 shapes, and machine-checkable owner
+manifest define each normalized leaf/discriminant, projection member, enum
 tag, null, array order, and set sort key through primitive leaves.
 Implementation-struct serialization is not a projection and canonical
 material is not a second behavioral schema:
@@ -603,8 +611,8 @@ material is not a second behavioral schema:
   `ConnectorSourceRecord` in Section 4.1. Nothing is dropped as review-only.
 - `SemanticMaterialV1` has top-level fields
   `canonical_schema_epoch`, `value_language_epoch`, `connector`,
-  `credentials`, `origins`, `operations`, `triggers`, and
-  `resolved_fact_values`. Its credentials, origins, operations, and triggers
+  `credentials`, `origins`, `operations`, and `triggers`. Its credentials,
+  origins, operations, and triggers
   are the recursively closed `SemanticCredentialMaterialV1`,
   `SemanticOriginMaterialV1`, `SemanticOperationMaterialV1`, and
   `SemanticTriggerMaterialV1` projections. They retain every behavioral
@@ -616,8 +624,8 @@ material is not a second behavioral schema:
 - `ProvenanceMaterialV1` has top-level fields
   `canonical_schema_epoch`, `connector`, `sources`, `artifacts`, `files`,
   `licenses`, `dependencies`, `embedded_material`, `notices`,
-  `manifest_references`, `provider_evidence`, `resolved_fact_origins`,
-  `donat_policy_ids`, `classifier_epoch`, and `generator_epoch`. Connector
+  `manifest_references`, `provider_evidence`, `donat_policy_ids`,
+  `classifier_epoch`, and `generator_epoch`. Connector
   retains ID/version/semantic hash; sources are sorted identities with record
   hashes; the remaining entries retain exact immutable attribution decisions.
 - `ValueContractMaterialV1` has `value_language_epoch`, `roots`, and
@@ -631,23 +639,22 @@ Optional fields are always present as value-or-null. Every enum uses
 stable ID and reject duplicates; steps, transforms, and error rules retain
 declared order. No material contains the hash it produces.
 
-Field-totality includes, without summaries: npm/provider/Donat source
-branches; provider evidence source/access date/content hash/terms/facts;
-the exact five dependency dispositions `shipped`, `build_only`,
-`type_only_replaced`, `behavior_only`, and `rejected`; credential field
-secret/redaction/size data, aggregate/token bounds, every auth-plan binding,
-allowed origins/scopes, auth processor, and credential-test operation;
-complete steps/request/response/effects/defaults/bounds; all six pagination
-branches with mandatory bounds; all four matchers, complete error actions,
-and all eight fallback actions; and complete webhook and poll branches.
+Task 3 parses the ADR manifest and rejects wildcard/family entries, a missing
+normalized leaf/discriminant, an unowned canonical member, duplicate
+`(domain,canonical_path)`, or two direct-material mappings for one normalized
+owner. Recursive composite expansion proves exact normalized-leaf coverage.
 
 Resolved evidence is structurally `(value, origin)`. At each stable fact-use
-site, `ResolvedFactValueMaterialV1` stores `{use_site,value}` in semantic
-material and `ResolvedFactOriginMaterialV1` stores `{use_site,origin}` in
-provenance material. Origin-only mutation leaves semantic bytes/hash
-unchanged. Value-only mutation leaves the direct origin projection unchanged,
-but final provenance changes because its connector member commits the new
-`semantic_sha256`.
+site, `ResolvedFactValueMaterialV1` stores `{use_site,value}` exactly once at
+the owning `SemanticOperationMaterialV1.resolved_fact_values[]`, and
+`ResolvedFactOriginMaterialV1` stores `{use_site,origin}` exactly once at
+`ManifestProvenanceMaterialV1.contract_fact_origins[]`. No top-level fact
+value/origin collection exists. Duplicate `(use_site,fact)` entries reject,
+and semantic/provenance use-site sets must match. Provider-evidence inventory
+facts retain immutable identity/location without becoming a second use-site
+origin. Origin-only mutation leaves semantic bytes/hash unchanged. Value-only
+mutation leaves direct origin material unchanged, but final provenance
+changes because its connector member commits the new `semantic_sha256`.
 
 The catalog, not `donat-value-contract`, projects `TypedValue` losslessly:
 
@@ -704,8 +711,8 @@ nonempty full-material canonical bytes and hashes:
 ```text
 source-record 420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991
 value-contract 79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
-semantic 86758001d76edf0087fbe3e734462391c4855b0862a00fa1e20b93610aa53419
-provenance 4147281e4df2d68b86e3b9909a083355991a342b36766c8ea732a6a264ea9b59
+semantic f6bc86c9d5004885bb3156ab320fa76ad3ff7e9686320c54735dcfbd8c27e934
+provenance 326236f741dfa72628b63ae308599b94e83b1c2aa1aa00bd80025ff5381a7531
 ```
 
 The suite exercises complete provider evidence, credential/OAuth behavior,
@@ -2040,6 +2047,7 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `catalog_contracts_are_closed_and_complete` | phase 2 catalog unit | credentials/auth plans, fixed origins/steps, operations/effects/pagination/error maps/bounds, webhook/poll triggers, and provenance references round-trip together; every unknown variant/field, dynamic destination, raw provider message, missing reference, or unbounded declaration rejects |
 | `contract_fact_origins_are_non_substitutable` | phase 2 catalog unit | provider evidence resolves to its exact immutable record/fact location, Donat policy resolves to its reviewed policy ID, each hashes in its assigned semantic/provenance material, and neither origin can satisfy the other |
 | `npm_provenance_state_is_exact` | catalog/acquisition unit | signature and signed-provenance present/absent/rejected decisions, optional tag/provenance commits, maintainers, and repository-owner decisions round-trip and every mismatch fails |
+| `exact_npm_semver_is_exact` | catalog/acquisition unit | `1.2.3-alpha.1+build.5` round-trips byte-for-byte as `ExactSemver`; `^1.2.3`, `latest`, `v1.2.3`, `01.2.3`, and `1.2.3-01` reject; the donor-package version owner is exclusively `ExactSemver` |
 | `acquisition_command_schemas_are_disjoint` | acquisition CLI unit | npm acquisition requires expected SRI, provider acquisition requires exactly one provider identity form, cross-form flags reject, unallowlisted Stripe documentation rejects, and record-derived reacquisition permits no locator override |
 | `generated_catalog_ids_match_abi` | phase 3b post-codegen catalog compile | after deterministic codegen creates the actual checked-in entries, every generated connector/operation/step/processor-family/credential/capability/trigger/authenticator/codec/normalizer/origin ID assigns directly to its ABI-owned type |
 | `generated_consumers_use_catalog_types` | phase 3b compile | Task-7-shaped credential validation accepts `&'static GeneratedCredentialSpec` and Task-16-shaped webhook lookup accepts `&'static GeneratedTriggerSpec` without any server-owned descriptor |
@@ -2050,9 +2058,9 @@ webhook bytes, and payloads. Tests never call a live provider API.
 | `sul_source_cannot_generate_artifacts` | policy integration | every donor marks `n8n-workflow` `TypeOnlyReplaced`; SUL bytes are absent from parser input, manifests, generated Rust, fixtures, Cargo metadata, and release artifacts |
 | `imperative_ast_emits_work_item_not_rust` | codegen snapshot | function-valued routing, `execute`, `poll`, webhook code, or an ambiguous expression produces a processor/unsupported inventory finding, never guessed behavior |
 | `canonical_projection_domains_are_exact` | catalog unit | independent bytes produce every source-record/semantic/provenance/value-contract Section 5.1 vector; one-field mutation changes the applicable domain; no material includes its result; calculation order is record, resolved manifest/value contract, semantic, provenance, generated tree |
-| `canonical_projection_field_matrix_is_total` | catalog compile/unit | bidirectional coverage fails when any normalized field/variant lacks one canonical path, any projection member lacks a normalized/constant/derived owner, or any field is mapped twice outside the resolved fact split |
+| `canonical_projection_field_matrix_is_total` | catalog compile/unit | the ADR-012 owner manifest parses without wildcard/family entries or duplicate `(domain,canonical_path)`; recursive expansion equals the normalized leaf/discriminant set, every projection member has a normalized/constant/named-derived owner, and one direct material never maps an owner twice |
 | `canonical_projection_every_field_and_branch_mutates` | catalog unit | generated mutations visit every normalized field and every source/auth/request/response/effect/pagination/error/retry/redaction/trigger/value/provenance branch; each changes its applicable direct bytes/hash and preserves the other direct domain |
-| `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes its resolved value only to semantic material and its exact provider/policy origin only to provenance material; substitution, omission, or mismatched pairing rejects |
+| `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes one resolved value only at its semantic operation owner and one exact provider/policy origin only at its manifest-reference owner; duplicate `(use_site,fact)`, substitution, omission, or unequal semantic/provenance use-site sets reject |
 | `typed_value_jcs_projection_is_lossless` | catalog unit | tagged `I64(1)`, `U64(1)`, `Decimal("1")`, and `String("1")` do not collide; `u64::MAX`, exact decimal spelling, canonical base64url, inline metadata nulls, and U+10000-before-U+FFFD UTF-16 member ordering match independent bytes |
 | `operation_snapshot_is_complete_and_versioned` | catalog unit | every behavioral Section 5.3 field, stable SemVer/epoch distinction, input/output recomputed hash, resolved origin/value, transform/processor `implementation_revision`, default, bound, and stored selected-header mapping is required; provenance identities are forbidden; prerelease/build versions reject; processorless multi-step rejects |
 | `response_header_capabilities_are_persisted_and_scoped` | catalog/codegen unit | case folding matches the exact Section 5.3 vector; connector/operation/version/step changes separate IDs; missing/ambiguous/duplicate/more-than-64 mappings reject; every result is 80 ASCII bytes and fits the 96-byte ABI ID |
