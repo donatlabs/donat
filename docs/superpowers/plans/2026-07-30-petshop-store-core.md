@@ -167,7 +167,7 @@ let running = Suite::new("petshop_catalog")
     .admin_secret("petshop-secret")
     .start();
 apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
-running.apply("petshop/catalog.yaml", "/v1/graphql");
+running.check_query_f("petshop/catalog.yaml", Transport::Http);
 ```
 
 The catalog fixture initially describes the current example and passes before
