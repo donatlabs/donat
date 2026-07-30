@@ -1,0 +1,269 @@
+types:
+  - name: PaymentOutcome
+    enum: [authorized, declined, failed, challenged, captured, voided, refunded, chargeback]
+  - name: ApprovalDecision
+    enum: [approved, rejected, escalated]
+  - name: InspectionDecision
+    enum: [accepted, restock, exchange, rejected]
+  - name: BookingOutcome
+    enum: [confirmed, cancelled, no_show, expired]
+  - name: ReconciliationDecision
+    enum: [matched, manual_review, resolved]
+  - name: CheckoutState
+    enum: [cart_open, checkout_started, cancelled, expired]
+  - name: PaymentState
+    enum: [pending, authorized, captured, voided, refunded, failed, chargeback]
+  - name: ShipmentState
+    enum: [unallocated, allocated, packed, shipped, delivered, cancelled]
+  - name: ReturnState
+    enum: [requested, approved, rejected, received, inspected, refunded, exchanged]
+  - name: SubscriptionState
+    enum: [active, payment_due, paused, cancelled]
+  - name: ApprovalState
+    enum: [submitted, approved, rejected, escalated]
+  - name: PayoutState
+    enum: [pending, submitted, paid, failed, reconciled]
+  - name: BookingState
+    enum: [held, confirmed, cancelled, no_show, expired]
+  - name: PrescriptionState
+    enum: [submitted, approved, rejected, expired, released]
+  - name: FraudState
+    enum: [clear, review_required, approved, rejected]
+  - name: ReconciliationState
+    enum: [pending, matched, review_required, resolved]
+
+rules:
+  - name: can_reserve_stock
+    parameters: { on_hand: int!, reserved: int!, requested: int! }
+    result: bool!
+    expression: "requested > 0 && reserved + requested <= on_hand"
+  - name: add_int
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left + right"
+  - name: payment_was_authorized
+    parameters: { outcome: PaymentOutcome! }
+    result: bool!
+    expression: "outcome == PaymentOutcome::authorized"
+  - name: can_transition_checkout
+    parameters: { current: CheckoutState!, next: CheckoutState! }
+    result: bool!
+    expression: "(current == CheckoutState::cart_open && (next == CheckoutState::checkout_started || next == CheckoutState::cancelled)) || (current == CheckoutState::checkout_started && (next == CheckoutState::cancelled || next == CheckoutState::expired))"
+  - name: can_transition_payment
+    parameters: { current: PaymentState!, next: PaymentState! }
+    result: bool!
+    expression: "(current == PaymentState::pending && (next == PaymentState::authorized || next == PaymentState::failed)) || (current == PaymentState::authorized && (next == PaymentState::captured || next == PaymentState::voided || next == PaymentState::failed)) || (current == PaymentState::captured && (next == PaymentState::refunded || next == PaymentState::chargeback))"
+  - name: can_transition_shipment
+    parameters: { current: ShipmentState!, next: ShipmentState! }
+    result: bool!
+    expression: "(current == ShipmentState::unallocated && (next == ShipmentState::allocated || next == ShipmentState::cancelled)) || (current == ShipmentState::allocated && (next == ShipmentState::packed || next == ShipmentState::cancelled)) || (current == ShipmentState::packed && next == ShipmentState::shipped) || (current == ShipmentState::shipped && next == ShipmentState::delivered)"
+  - name: can_transition_return
+    parameters: { current: ReturnState!, next: ReturnState! }
+    result: bool!
+    expression: "(current == ReturnState::requested && (next == ReturnState::approved || next == ReturnState::rejected)) || (current == ReturnState::approved && next == ReturnState::received) || (current == ReturnState::received && next == ReturnState::inspected) || (current == ReturnState::inspected && (next == ReturnState::refunded || next == ReturnState::exchanged || next == ReturnState::rejected))"
+  - name: can_transition_subscription
+    parameters: { current: SubscriptionState!, next: SubscriptionState! }
+    result: bool!
+    expression: "(current == SubscriptionState::active && (next == SubscriptionState::payment_due || next == SubscriptionState::paused || next == SubscriptionState::cancelled)) || (current == SubscriptionState::payment_due && (next == SubscriptionState::active || next == SubscriptionState::paused || next == SubscriptionState::cancelled)) || (current == SubscriptionState::paused && next == SubscriptionState::active)"
+  - name: can_transition_approval
+    parameters: { current: ApprovalState!, next: ApprovalState! }
+    result: bool!
+    expression: "current == ApprovalState::submitted && (next == ApprovalState::approved || next == ApprovalState::rejected || next == ApprovalState::escalated)"
+  - name: can_transition_payout
+    parameters: { current: PayoutState!, next: PayoutState! }
+    result: bool!
+    expression: "(current == PayoutState::pending && next == PayoutState::submitted) || (current == PayoutState::submitted && (next == PayoutState::paid || next == PayoutState::failed || next == PayoutState::reconciled)) || (current == PayoutState::failed && next == PayoutState::reconciled)"
+  - name: can_transition_booking
+    parameters: { current: BookingState!, next: BookingState! }
+    result: bool!
+    expression: "(current == BookingState::held && (next == BookingState::confirmed || next == BookingState::cancelled || next == BookingState::expired)) || (current == BookingState::confirmed && (next == BookingState::cancelled || next == BookingState::no_show))"
+  - name: can_transition_prescription
+    parameters: { current: PrescriptionState!, next: PrescriptionState! }
+    result: bool!
+    expression: "(current == PrescriptionState::submitted && (next == PrescriptionState::approved || next == PrescriptionState::rejected || next == PrescriptionState::expired)) || (current == PrescriptionState::approved && next == PrescriptionState::released)"
+  - name: can_transition_fraud
+    parameters: { current: FraudState!, next: FraudState! }
+    result: bool!
+    expression: "(current == FraudState::clear && next == FraudState::review_required) || (current == FraudState::review_required && (next == FraudState::approved || next == FraudState::rejected))"
+  - name: can_transition_reconciliation
+    parameters: { current: ReconciliationState!, next: ReconciliationState! }
+    result: bool!
+    expression: "(current == ReconciliationState::pending && (next == ReconciliationState::matched || next == ReconciliationState::review_required)) || (current == ReconciliationState::review_required && next == ReconciliationState::resolved)"
+
+decision_tables:
+  - name: price_list_route
+    inputs: { customer_tier: string!, sales_channel: string! }
+    output: { price_list_code: string! }
+    hit_policy: first
+    rows:
+      - id: wholesale_online
+        when: { customer_tier: "customer_tier == 'wholesale'", sales_channel: "sales_channel == 'online'" }
+        output: { price_list_code: wholesale_usd }
+      - id: default_retail
+        when: { customer_tier: "true", sales_channel: "true" }
+        output: { price_list_code: retail_usd }
+    test_cases:
+      - name: wholesale online price list
+        input: { customer_tier: wholesale, sales_channel: online }
+        expect:
+          output: { price_list_code: wholesale_usd }
+          matched_row_id: wholesale_online
+  - name: promotion_route
+    inputs: { coupon_present: bool!, order_total_minor: int! }
+    output: { promotion_code: string!, discount_bps: int! }
+    hit_policy: first
+    rows:
+      - id: coupon_over_threshold
+        when: { coupon_present: "coupon_present", order_total_minor: "order_total_minor >= 5000" }
+        output: { promotion_code: cart_coupon, discount_bps: 1000 }
+      - id: default_no_promotion
+        when: { coupon_present: "true", order_total_minor: "true" }
+        output: { promotion_code: none, discount_bps: 0 }
+    test_cases:
+      - name: eligible coupon discount
+        input: { coupon_present: true, order_total_minor: 5000 }
+        expect:
+          output: { promotion_code: cart_coupon, discount_bps: 1000 }
+          matched_row_id: coupon_over_threshold
+  - name: tax_route
+    inputs: { country_code: string!, taxable_category: string! }
+    output: { tax_code: string!, tax_bps: int! }
+    hit_policy: first
+    rows:
+      - id: us_standard_goods
+        when: { country_code: "country_code == 'US'", taxable_category: "taxable_category == 'goods'" }
+        output: { tax_code: us_standard, tax_bps: 750 }
+      - id: default_zero_tax
+        when: { country_code: "true", taxable_category: "true" }
+        output: { tax_code: zero_rated, tax_bps: 0 }
+    test_cases:
+      - name: United States standard goods tax
+        input: { country_code: US, taxable_category: goods }
+        expect:
+          output: { tax_code: us_standard, tax_bps: 750 }
+          matched_row_id: us_standard_goods
+  - name: shipping_service_route
+    inputs: { country_code: string!, order_total_minor: int! }
+    output: { service_code: string!, shipping_minor: int! }
+    hit_policy: first
+    rows:
+      - id: us_free_shipping
+        when: { country_code: "country_code == 'US'", order_total_minor: "order_total_minor >= 5000" }
+        output: { service_code: ground, shipping_minor: 0 }
+      - id: default_standard_shipping
+        when: { country_code: "true", order_total_minor: "true" }
+        output: { service_code: standard, shipping_minor: 799 }
+    test_cases:
+      - name: United States free shipping threshold
+        input: { country_code: US, order_total_minor: 5000 }
+        expect:
+          output: { service_code: ground, shipping_minor: 0 }
+          matched_row_id: us_free_shipping
+  - name: inventory_location_route
+    inputs: { region: string!, location_code: string! }
+    output: { allocation_rank: int! }
+    hit_policy: first
+    rows:
+      - id: northeast_primary_location
+        when: { region: "region == 'northeast'", location_code: "location_code == 'east-1'" }
+        output: { allocation_rank: 1 }
+      - id: default_location_rank
+        when: { region: "true", location_code: "true" }
+        output: { allocation_rank: 100 }
+    test_cases:
+      - name: northeast primary location ranks first
+        input: { region: northeast, location_code: east-1 }
+        expect:
+          output: { allocation_rank: 1 }
+          matched_row_id: northeast_primary_location
+  - name: b2b_approval_route
+    inputs: { amount_minor: int!, available_credit_minor: int! }
+    output: { decision: ApprovalDecision!, route: string! }
+    hit_policy: first
+    rows:
+      - id: automatic_within_credit
+        when: { amount_minor: "amount_minor <= 10000", available_credit_minor: "available_credit_minor >= amount_minor" }
+        output: { decision: approved, route: automatic }
+      - id: default_finance_review
+        when: { amount_minor: "true", available_credit_minor: "true" }
+        output: { decision: escalated, route: finance_review }
+    test_cases:
+      - name: credit-covered small purchase is automatic
+        input: { amount_minor: 7500, available_credit_minor: 7500 }
+        expect:
+          output: { decision: approved, route: automatic }
+          matched_row_id: automatic_within_credit
+  - name: marketplace_commission_route
+    inputs: { gross_minor: int!, product_category: string! }
+    output: { commission_bps: int!, commission_tier: string! }
+    hit_policy: first
+    rows:
+      - id: services_commission
+        when: { gross_minor: "gross_minor > 0", product_category: "product_category == 'services'" }
+        output: { commission_bps: 1500, commission_tier: services }
+      - id: default_goods_commission
+        when: { gross_minor: "true", product_category: "true" }
+        output: { commission_bps: 1000, commission_tier: goods }
+    test_cases:
+      - name: services commission
+        input: { gross_minor: 20000, product_category: services }
+        expect:
+          output: { commission_bps: 1500, commission_tier: services }
+          matched_row_id: services_commission
+  - name: return_disposition_route
+    inputs: { inspection: InspectionDecision!, replacement_requested: bool! }
+    output: { disposition: string! }
+    hit_policy: first
+    rows:
+      - id: accepted_exchange
+        when: { inspection: "inspection == InspectionDecision::exchange", replacement_requested: "replacement_requested" }
+        output: { disposition: exchange }
+      - id: accepted_refund
+        when: { inspection: "inspection == InspectionDecision::accepted", replacement_requested: "true" }
+        output: { disposition: refund }
+      - id: default_reject
+        when: { inspection: "true", replacement_requested: "true" }
+        output: { disposition: reject }
+    test_cases:
+      - name: accepted inspection receives refund
+        input: { inspection: accepted, replacement_requested: false }
+        expect:
+          output: { disposition: refund }
+          matched_row_id: accepted_refund
+  - name: dunning_schedule
+    inputs: { attempt: int! }
+    output: { delay_seconds: int!, terminal: bool! }
+    hit_policy: first
+    rows:
+      - id: first_retry
+        when: { attempt: "attempt == 1" }
+        output: { delay_seconds: 86400, terminal: false }
+      - id: second_retry
+        when: { attempt: "attempt == 2" }
+        output: { delay_seconds: 259200, terminal: false }
+      - id: default_pause
+        when: { attempt: "true" }
+        output: { delay_seconds: 0, terminal: true }
+    test_cases:
+      - name: first dunning retry waits one day
+        input: { attempt: 1 }
+        expect:
+          output: { delay_seconds: 86400, terminal: false }
+          matched_row_id: first_retry
+  - name: fraud_route
+    inputs: { payment_outcome: PaymentOutcome!, score: int! }
+    output: { hold: bool!, route: string! }
+    hit_policy: first
+    rows:
+      - id: high_score_review
+        when: { payment_outcome: "payment_outcome == PaymentOutcome::authorized", score: "score >= 80" }
+        output: { hold: true, route: manual_review }
+      - id: default_clear
+        when: { payment_outcome: "true", score: "true" }
+        output: { hold: false, route: clear }
+    test_cases:
+      - name: high score authorization requires review
+        input: { payment_outcome: authorized, score: 90 }
+        expect:
+          output: { hold: true, route: manual_review }
+          matched_row_id: high_score_review

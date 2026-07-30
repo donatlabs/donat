@@ -1,0 +1,5 @@
+- "!include connectors/mock-payment.yaml"
+- "!include connectors/mock-carrier.yaml"
+- "!include connectors/mock-tax.yaml"
+- "!include connectors/mock-notification.yaml"
+- "!include connectors/mock-payout.yaml"
