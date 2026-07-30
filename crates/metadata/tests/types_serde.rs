@@ -712,6 +712,51 @@ types:
 }
 
 #[test]
+fn opaque_json_rule_type_retains_exact_closed_bounds() {
+    let rules: RulesMetadata = serde_yaml::from_str(
+        r#"
+types:
+  - name: BoundedProviderEvidence
+    opaque_json:
+      maximum_bytes: 4096
+      maximum_depth: 8
+      maximum_nodes: 128
+"#,
+    )
+    .expect("a bounded opaque JSON declaration must deserialize");
+
+    let serialized = serde_json::to_value(&rules).expect("rules wrapper serializes");
+    assert_eq!(
+        serialized["types"][0]["opaque_json"],
+        json!({
+            "maximum_bytes": 4096,
+            "maximum_depth": 8,
+            "maximum_nodes": 128
+        })
+    );
+
+    for yaml in [
+        r#"
+types:
+  - name: Evidence
+    opaque_json:
+      maximum_bytes: 64
+      maximum_depth: 4
+      maximum_nodes: 16
+      expression: request.body
+"#,
+        r#"
+types:
+  - name: Evidence
+    script: request.body
+"#,
+    ] {
+        serde_yaml::from_str::<RulesMetadata>(yaml)
+            .expect_err("opaque JSON declarations must reject executable or unknown fields");
+    }
+}
+
+#[test]
 fn commands_deserialize_all_step_and_value_forms() {
     // This exercises parsing only. Cross-step references, table targets, and
     // rule names are deliberately validated later by catalog compilation.

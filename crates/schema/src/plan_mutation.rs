@@ -3780,7 +3780,7 @@ fn command_rule_pg_type(type_: &RuleType) -> &'static str {
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",
-        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
+        RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. } => "jsonb",
         RuleType::Nullable(inner) => command_rule_pg_type(inner),
     }
 }
@@ -3935,7 +3935,7 @@ fn command_rule_item_pg_type(type_: &RuleType) -> &'static str {
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",
-        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
+        RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. } => "jsonb",
         RuleType::Nullable(inner) => command_rule_item_pg_type(inner),
     }
 }

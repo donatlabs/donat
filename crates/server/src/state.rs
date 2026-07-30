@@ -983,10 +983,13 @@ fn resolve_declared_rule_types(
                 format!("duplicate declared rule type `{}`", declaration.name),
             ));
         }
-        if declaration.object.is_some() == declaration.enum_values.is_some() {
+        let body_count = usize::from(declaration.object.is_some())
+            + usize::from(declaration.enum_values.is_some())
+            + usize::from(declaration.opaque_json.is_some());
+        if body_count != 1 {
             return Err(PlanError::validation(
                 &path,
-                "a declared rule type requires exactly one of object or enum",
+                "a declared rule type requires exactly one of object, enum, or opaque_json",
             ));
         }
     }
@@ -1080,10 +1083,23 @@ fn resolve_declared_rule_type(
             name: declaration.name.clone(),
             fields,
         }
+    } else if let Some(opaque) = &declaration.opaque_json {
+        if opaque.maximum_bytes == 0 || opaque.maximum_depth == 0 || opaque.maximum_nodes == 0 {
+            return Err(PlanError::validation(
+                &format!("{path}.opaque_json"),
+                "an opaque JSON declaration requires non-zero bounds",
+            ));
+        }
+        RuleType::OpaqueJson {
+            name: declaration.name.clone(),
+            maximum_bytes: opaque.maximum_bytes,
+            maximum_depth: opaque.maximum_depth,
+            maximum_nodes: opaque.maximum_nodes,
+        }
     } else {
         return Err(PlanError::validation(
             &path,
-            "a declared rule type requires exactly one of object or enum",
+            "a declared rule type requires exactly one of object, enum, or opaque_json",
         ));
     };
     resolved.insert(name.to_owned(), TypeResolution::Resolved(type_.clone()));
@@ -2141,7 +2157,8 @@ mod snapshot_tests {
 
     use super::{
         AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, compile_allowed_queries,
-        run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime, stage_postgres_runtime,
+        compile_rule_catalog, run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime,
+        stage_postgres_runtime,
     };
 
     fn candidate(
@@ -2665,6 +2682,37 @@ mod snapshot_tests {
                 .remote_permission_schemas
                 .contains_key(&("remote".into(), "user".into()))
         );
+    }
+
+    #[test]
+    fn compiles_closed_opaque_json_rule_type_from_metadata() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "types": [{
+                    "name": "BoundedProviderEvidence",
+                    "opaque_json": {
+                        "maximum_bytes": 4096,
+                        "maximum_depth": 8,
+                        "maximum_nodes": 128
+                    }
+                }],
+                "rules": [{
+                    "name": "retain_evidence",
+                    "parameters": {
+                        "evidence": "BoundedProviderEvidence!"
+                    },
+                    "result": "BoundedProviderEvidence!",
+                    "expression": "evidence"
+                }]
+            }
+        }))
+        .expect("opaque JSON metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("opaque JSON declaration compiles at boot");
+        assert!(catalog.rule("retain_evidence").is_some());
     }
 
     #[test]

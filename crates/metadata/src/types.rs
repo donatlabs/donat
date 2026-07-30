@@ -1606,16 +1606,30 @@ impl RulesMetadata {
     }
 }
 
-/// One finite named object or enum declaration from `rules.yaml`. Validation
-/// that exactly one body is present and that references form an acyclic graph
-/// belongs to deploy-time catalog compilation, where metadata paths are known.
+/// One finite named object, enum, or bounded opaque JSON declaration from
+/// `rules.yaml`. Validation that exactly one body is present and that object
+/// references form an acyclic graph belongs to deploy-time catalog
+/// compilation, where metadata paths are known.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleTypeDeclaration {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<BTreeMap<String, String>>,
     #[serde(rename = "enum", default, skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_json: Option<RuleOpaqueJsonDeclaration>,
+}
+
+/// A JSON value that can be passed through the typed Rule boundary but cannot
+/// be inspected through the expression grammar.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleOpaqueJsonDeclaration {
+    pub maximum_bytes: u32,
+    pub maximum_depth: u32,
+    pub maximum_nodes: u32,
 }
 
 /// A named CEL-profile expression. The metadata crate intentionally preserves

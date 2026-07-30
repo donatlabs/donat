@@ -60,6 +60,18 @@ fn object(name: &str, fields: BTreeMap<String, RuleType>) -> RuleType {
     }
 }
 
+fn opaque_json_type(maximum_bytes: u32, maximum_depth: u32, maximum_nodes: u32) -> RuleType {
+    serde_json::from_value(json!({
+        "OpaqueJson": {
+            "name": "BoundedProviderEvidence",
+            "maximum_bytes": maximum_bytes,
+            "maximum_depth": maximum_depth,
+            "maximum_nodes": maximum_nodes
+        }
+    }))
+    .expect("the closed opaque JSON rule type must deserialize")
+}
+
 fn decision_row(id: &str, when: BTreeMap<String, &str>, output: Value) -> DecisionRow {
     DecisionRow {
         id: id.to_owned(),
@@ -162,6 +174,58 @@ fn evaluates_exact_scalars_and_rejects_missing_bindings_or_unknown_object_fields
     assert!(
         matches!(catalog, donat_rules::RuleError::UnknownField { ref field, .. } if field == "email")
     );
+}
+
+#[test]
+fn opaque_json_is_bounded_pass_through_data_not_executable_structure() {
+    let evidence = opaque_json_type(64, 3, 5);
+    let definition = rule(
+        "retain_evidence",
+        map([("evidence", evidence.clone())]),
+        evidence.clone(),
+        "evidence",
+    );
+    let catalog = compile_catalog_with_declared_types(
+        &map([("BoundedProviderEvidence", evidence.clone())]),
+        &[definition],
+        &[],
+    )
+    .expect("a bounded opaque JSON pass-through rule must compile");
+    let compiled = catalog
+        .rule("retain_evidence")
+        .expect("the compiled rule remains in the catalog");
+    let value = json!({"provider": {"id": "evt_1"}, "ok": true});
+
+    let evaluated = evaluate_value(compiled, &map([("evidence", value.clone())]))
+        .expect("an in-bounds opaque JSON value must evaluate");
+    assert_eq!(evaluated.type_, evidence);
+    assert_eq!(evaluated.value, value);
+
+    let oversized = evaluate_value(
+        compiled,
+        &map([("evidence", json!({"payload": "x".repeat(65)}))]),
+    )
+    .expect_err("the declared canonical byte bound must be enforced");
+    assert!(matches!(
+        oversized,
+        RuleError::InvalidBinding { ref name, .. } if name == "evidence"
+    ));
+
+    let structural_access = compile_catalog_with_declared_types(
+        &map([("BoundedProviderEvidence", opaque_json_type(64, 3, 5))]),
+        &[rule(
+            "inspect_evidence",
+            map([("evidence", opaque_json_type(64, 3, 5))]),
+            RuleType::String,
+            "evidence.provider",
+        )],
+        &[],
+    )
+    .expect_err("opaque JSON must not add dynamic member expressions");
+    assert!(matches!(
+        structural_access,
+        RuleError::TypeMismatch { ref expected, .. } if expected == "object"
+    ));
 }
 
 #[test]

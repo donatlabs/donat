@@ -4656,6 +4656,7 @@ fn rule_type(type_: &RuleType) -> StaticType {
                 .map(|(name, type_)| (name.clone(), rule_type(type_)))
                 .collect(),
         },
+        RuleType::OpaqueJson { .. } => StaticType::Scalar("jsonb".to_owned()),
         RuleType::Nullable(inner) => StaticType::nullable(rule_type(inner)),
     }
 }

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::types::{
     CanonicalValue, CheckedExpr, CheckedType, CompiledDecisionRow, CompiledDecisionTable,
     CompiledDecisionTestCase, DecisionOutputField, DefinitionRevision, EvaluatedRuleValue,
-    RuleArtifact, access_result_type,
+    RuleArtifact, access_result_type, opaque_json_within_bounds,
 };
 use crate::{
     BinaryOp, CanonicalRoot, CompiledRule, DecisionConditionTrace, DecisionRejection,
@@ -888,7 +888,10 @@ fn check_equality(
 }
 
 fn supports_whole_value_equality(type_: &RuleType) -> bool {
-    !matches!(type_, RuleType::List(_) | RuleType::Object { .. })
+    !matches!(
+        type_,
+        RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. }
+    )
 }
 
 fn merge_branch_types(
@@ -1167,6 +1170,15 @@ fn decode_value(value: &Value, type_: &RuleType) -> Option<RuntimeValue> {
                 .collect::<Option<BTreeMap<_, _>>>()
                 .map(RuntimeValue::Object)
         }),
+        RuleType::OpaqueJson {
+            maximum_bytes,
+            maximum_depth,
+            maximum_nodes,
+            ..
+        } if opaque_json_within_bounds(value, *maximum_bytes, *maximum_depth, *maximum_nodes) => {
+            Some(RuntimeValue::OpaqueJson(value.clone()))
+        }
+        RuleType::OpaqueJson { .. } => None,
     }
 }
 
@@ -1654,6 +1666,7 @@ enum RuntimeValue {
     Enum { enum_name: String, symbol: String },
     List(Vec<RuntimeValue>),
     Object(BTreeMap<String, RuntimeValue>),
+    OpaqueJson(Value),
 }
 
 impl RuntimeValue {
@@ -1670,6 +1683,7 @@ impl RuntimeValue {
             Self::Enum { .. } => "enum",
             Self::List(_) => "list",
             Self::Object(_) => "object",
+            Self::OpaqueJson(_) => "opaque JSON",
         }
         .to_owned()
     }
@@ -1727,6 +1741,7 @@ impl RuntimeValue {
                 })
                 .collect::<Result<serde_json::Map<_, _>, _>>()
                 .map(Value::Object),
+            (Self::OpaqueJson(value), RuleType::OpaqueJson { .. }) => Ok(value.clone()),
             (_, RuleType::Nullable(inner)) => self.canonical_json(rule_name, inner),
             _ => Err(invariant()),
         }
@@ -2081,7 +2096,19 @@ fn encode_declaration(output: &mut Vec<u8>, declaration: &RuleType) {
             encode_string(output, name);
             encode_type_map(output, fields);
         }
-        _ => panic!("resolved declarations are object or enum types"),
+        RuleType::OpaqueJson {
+            name,
+            maximum_bytes,
+            maximum_depth,
+            maximum_nodes,
+        } => {
+            output.push(0x42);
+            encode_string(output, name);
+            output.extend_from_slice(&maximum_bytes.to_be_bytes());
+            output.extend_from_slice(&maximum_depth.to_be_bytes());
+            output.extend_from_slice(&maximum_nodes.to_be_bytes());
+        }
+        _ => panic!("resolved declarations are named declaration types"),
     }
 }
 
@@ -2120,6 +2147,18 @@ fn encode_type(output: &mut Vec<u8>, type_: &RuleType) {
             output.push(0x19);
             encode_string(output, name);
             encode_type_map(output, fields);
+        }
+        RuleType::OpaqueJson {
+            name,
+            maximum_bytes,
+            maximum_depth,
+            maximum_nodes,
+        } => {
+            output.push(0x1b);
+            encode_string(output, name);
+            output.extend_from_slice(&maximum_bytes.to_be_bytes());
+            output.extend_from_slice(&maximum_depth.to_be_bytes());
+            output.extend_from_slice(&maximum_nodes.to_be_bytes());
         }
         RuleType::Nullable(inner) => {
             output.push(0x1a);
@@ -2483,6 +2522,45 @@ fn encode_typed_value(output: &mut Vec<u8>, type_: &RuleType, value: &RuntimeVal
                 panic!("validated object value has an object type");
             };
             encode_runtime_map(output, fields, values);
+        }
+        RuntimeValue::OpaqueJson(value) => {
+            output.push(0x3b);
+            encode_opaque_json(output, value);
+        }
+    }
+}
+
+fn encode_opaque_json(output: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Null => output.push(0x00),
+        Value::Bool(value) => {
+            output.push(0x01);
+            encode_bool(output, *value);
+        }
+        Value::Number(value) => {
+            output.push(0x02);
+            encode_string(output, &value.to_string());
+        }
+        Value::String(value) => {
+            output.push(0x03);
+            encode_string(output, value);
+        }
+        Value::Array(items) => {
+            output.push(0x04);
+            encode_count(output, items.len());
+            for item in items {
+                encode_opaque_json(output, item);
+            }
+        }
+        Value::Object(fields) => {
+            output.push(0x05);
+            encode_count(output, fields.len());
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            for (name, value) in fields {
+                encode_string(output, name);
+                encode_opaque_json(output, value);
+            }
         }
     }
 }

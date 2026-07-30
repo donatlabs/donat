@@ -23,6 +23,18 @@ fn object(name: &str, fields: BTreeMap<String, RuleType>) -> RuleType {
     }
 }
 
+fn opaque_json_type(maximum_bytes: u32, maximum_depth: u32, maximum_nodes: u32) -> RuleType {
+    serde_json::from_value(json!({
+        "OpaqueJson": {
+            "name": "BoundedProviderEvidence",
+            "maximum_bytes": maximum_bytes,
+            "maximum_depth": maximum_depth,
+            "maximum_nodes": maximum_nodes
+        }
+    }))
+    .expect("the closed opaque JSON rule type must deserialize")
+}
+
 fn compiled_rule(
     bindings: BTreeMap<String, RuleType>,
     expression: &str,
@@ -433,6 +445,42 @@ fn lower_postgres_value_matches_live_postgres() {
 
         assert_eq!(actual, value, "Postgres value mismatch for {}", rule.name);
     }
+}
+
+#[test]
+fn opaque_json_pass_through_lowers_only_as_bounded_jsonb() {
+    let evidence = opaque_json_type(64, 3, 5);
+    let rule = compiled_value_rule(
+        evidence.clone(),
+        map([("evidence", evidence.clone())]),
+        "evidence",
+    );
+    let value = json!({"provider": {"id": "evt_1"}, "ok": true});
+    let lowered = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([("evidence".to_owned(), SqlBinding::literal(value.clone()))]),
+    )
+    .expect("an in-bounds opaque JSON literal must lower");
+
+    assert_eq!(lowered.type_, evidence);
+    assert!(
+        lowered.sql.ends_with("::jsonb"),
+        "opaque JSON must remain a jsonb value: {}",
+        lowered.sql
+    );
+
+    let rejected = lower_postgres_value(
+        &rule,
+        &SqlBindings::new([(
+            "evidence".to_owned(),
+            SqlBinding::literal(json!({"payload": "x".repeat(65)})),
+        )]),
+    )
+    .expect_err("the SQL lowerer must enforce the same opaque JSON bounds");
+    assert!(matches!(
+        rejected,
+        RuleError::InvalidBinding { ref name, .. } if name == "evidence"
+    ));
 }
 
 #[test]

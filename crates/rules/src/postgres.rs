@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::types::access_result_type;
+use crate::types::{access_result_type, opaque_json_within_bounds};
 use crate::{
     BinaryOp, CompiledDecisionTable, CompiledRule, Expr, ExprKind, Function, HitPolicy, Literal,
     LoweredRuleValue, RuleArtifact, RuleError, RuleType, UnaryOp,
@@ -181,6 +181,15 @@ fn validate_complete_value_literal(
             }
             Ok(())
         }
+        RuleType::OpaqueJson {
+            maximum_bytes,
+            maximum_depth,
+            maximum_nodes,
+            ..
+        } if opaque_json_within_bounds(value, *maximum_bytes, *maximum_depth, *maximum_nodes) => {
+            Ok(())
+        }
+        RuleType::OpaqueJson { .. } => Err(invalid_binding(binding_name, type_)),
         _ => Ok(()),
     }
 }
@@ -728,6 +737,17 @@ fn lower_value_literal(
             }
             Ok(format!("jsonb_build_object({})", pairs.join(", ")))
         }
+        RuleType::OpaqueJson {
+            maximum_bytes,
+            maximum_depth,
+            maximum_nodes,
+            ..
+        } if opaque_json_within_bounds(value, *maximum_bytes, *maximum_depth, *maximum_nodes) => {
+            let value =
+                serde_json::to_string(value).map_err(|_| invalid_binding(binding_name, type_))?;
+            Ok(format!("{}::jsonb", donat_sqlgen::quote_lit(&value)))
+        }
+        RuleType::OpaqueJson { .. } => Err(invalid_binding(binding_name, type_)),
         RuleType::Nullable(_) => unreachable!("nullable values are handled above"),
     }
 }
@@ -1040,7 +1060,7 @@ fn json_index(target: &str, index: usize, type_: &RuleType) -> String {
 
 fn json_value(value: String, type_: &RuleType) -> String {
     match strip_nullable(type_) {
-        RuleType::List(_) | RuleType::Object { .. } => {
+        RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. } => {
             format!("NULLIF(({value}), 'null'::jsonb)")
         }
         type_ => format!(
@@ -1081,7 +1101,7 @@ fn postgres_type(type_: &RuleType) -> &'static str {
         RuleType::Uuid => "uuid",
         RuleType::Date => "date",
         RuleType::Timestamp => "timestamptz",
-        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
+        RuleType::List(_) | RuleType::Object { .. } | RuleType::OpaqueJson { .. } => "jsonb",
         RuleType::Nullable(_) => unreachable!("nullable types are unwrapped above"),
     }
 }

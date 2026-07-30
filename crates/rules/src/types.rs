@@ -68,6 +68,12 @@ pub enum RuleType {
         name: String,
         fields: BTreeMap<String, RuleType>,
     },
+    OpaqueJson {
+        name: String,
+        maximum_bytes: u32,
+        maximum_depth: u32,
+        maximum_nodes: u32,
+    },
     Nullable(Box<RuleType>),
 }
 
@@ -95,6 +101,7 @@ impl RuleType {
             Self::Enum { name, .. } => format!("enum {name}"),
             Self::List(inner) => format!("list<{}>", inner.display_name()),
             Self::Object { name, .. } => format!("object {name}"),
+            Self::OpaqueJson { name, .. } => format!("opaque JSON {name}"),
             Self::Nullable(inner) => format!("nullable<{}>", inner.display_name()),
         }
     }
@@ -102,6 +109,46 @@ impl RuleType {
 
 pub(crate) fn access_result_type(member_or_item: &RuleType) -> RuleType {
     RuleType::nullable(member_or_item.clone())
+}
+
+pub(crate) fn opaque_json_within_bounds(
+    value: &Value,
+    maximum_bytes: u32,
+    maximum_depth: u32,
+    maximum_nodes: u32,
+) -> bool {
+    let Ok(bytes) = serde_json::to_vec(value) else {
+        return false;
+    };
+    if bytes.len() > maximum_bytes as usize {
+        return false;
+    }
+
+    let mut nodes = 0_u32;
+    let mut pending = vec![(value, 1_u32)];
+    while let Some((value, depth)) = pending.pop() {
+        nodes = match nodes.checked_add(1) {
+            Some(nodes) if nodes <= maximum_nodes => nodes,
+            _ => return false,
+        };
+        if depth > maximum_depth {
+            return false;
+        }
+        match value {
+            Value::Array(items) => {
+                pending.extend(items.iter().map(|item| (item, depth.saturating_add(1))));
+            }
+            Value::Object(fields) => {
+                pending.extend(
+                    fields
+                        .values()
+                        .map(|field| (field, depth.saturating_add(1))),
+                );
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    true
 }
 
 /// Source-level definition of one named boolean or value rule. Metadata is
