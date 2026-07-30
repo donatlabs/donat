@@ -930,15 +930,9 @@ fn parse_rule_type_ref(
         };
         RuleType::List(Box::new(parse_rule_type_ref(inner, declared, path)?))
     } else {
-        match source {
-            "bool" => RuleType::Bool,
-            "string" => RuleType::String,
-            "int" => RuleType::Int,
-            "decimal" => RuleType::Decimal,
-            "uuid" => RuleType::Uuid,
-            "date" => RuleType::Date,
-            "timestamp" => RuleType::Timestamp,
-            _ => declared.get(source).cloned().ok_or_else(|| {
+        match scalar_rule_type(source) {
+            Some(type_) => type_,
+            None => declared.get(source).cloned().ok_or_else(|| {
                 PlanError::validation(path, format!("unsupported rule type `{source}`"))
             })?,
         }
@@ -1160,11 +1154,11 @@ fn scalar_rule_type(source: &str) -> Option<RuleType> {
     match source {
         "bool" => Some(RuleType::Bool),
         "string" => Some(RuleType::String),
-        "int" => Some(RuleType::Int),
+        "int" | "bigint" => Some(RuleType::Int),
         "decimal" => Some(RuleType::Decimal),
         "uuid" => Some(RuleType::Uuid),
         "date" => Some(RuleType::Date),
-        "timestamp" => Some(RuleType::Timestamp),
+        "timestamp" | "timestamptz" => Some(RuleType::Timestamp),
         _ => None,
     }
 }
@@ -2713,6 +2707,72 @@ mod snapshot_tests {
         let catalog =
             compile_rule_catalog(&metadata).expect("opaque JSON declaration compiles at boot");
         assert!(catalog.rule("retain_evidence").is_some());
+    }
+
+    #[test]
+    fn compiles_every_active_petshop_builtin_rule_scalar() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "rules": [
+                    {
+                        "name": "round_trip_bool",
+                        "parameters": { "value": "bool!" },
+                        "result": "bool!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_string",
+                        "parameters": { "value": "string!" },
+                        "result": "string!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_int",
+                        "parameters": { "value": "int!" },
+                        "result": "int!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_bigint",
+                        "parameters": { "value": "bigint!" },
+                        "result": "bigint!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_uuid",
+                        "parameters": { "value": "uuid!" },
+                        "result": "uuid!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_timestamptz",
+                        "parameters": { "value": "timestamptz!" },
+                        "result": "timestamptz!",
+                        "expression": "value"
+                    }
+                ]
+            }
+        }))
+        .expect("active Petshop scalar metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("every active Petshop scalar compiles");
+        for (rule, expected) in [
+            ("round_trip_bool", donat_rules::RuleType::Bool),
+            ("round_trip_string", donat_rules::RuleType::String),
+            ("round_trip_int", donat_rules::RuleType::Int),
+            ("round_trip_bigint", donat_rules::RuleType::Int),
+            ("round_trip_uuid", donat_rules::RuleType::Uuid),
+            ("round_trip_timestamptz", donat_rules::RuleType::Timestamp),
+        ] {
+            assert_eq!(
+                catalog.rule(rule).expect("compiled scalar rule").result,
+                expected,
+                "{rule} maps to its closed Rule scalar"
+            );
+        }
     }
 
     #[test]
