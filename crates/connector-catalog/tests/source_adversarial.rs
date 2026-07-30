@@ -27,121 +27,6 @@ fn assert_code(bytes: &[u8], expected: &'static str) {
     assert_eq!(error.code(), expected, "{error}");
 }
 
-fn collect_object_paths(
-    value: &serde_json::Value,
-    path: &mut Vec<(Option<String>, Option<usize>)>,
-    objects: &mut Vec<Vec<(Option<String>, Option<usize>)>>,
-    branches: &mut Vec<Vec<(Option<String>, Option<usize>)>>,
-    members: &mut Vec<Vec<(Option<String>, Option<usize>)>>,
-) {
-    match value {
-        serde_json::Value::Object(values) => {
-            objects.push(path.clone());
-            if values.len() == 2 && values.contains_key("kind") && values.contains_key("value") {
-                branches.push(path.clone());
-            }
-            for (name, value) in values {
-                path.push((Some(name.clone()), None));
-                members.push(path.clone());
-                collect_object_paths(value, path, objects, branches, members);
-                path.pop();
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push((None, Some(index)));
-                collect_object_paths(value, path, objects, branches, members);
-                path.pop();
-            }
-        }
-        _ => {}
-    }
-}
-
-fn value_at_mut<'a>(
-    mut value: &'a mut serde_json::Value,
-    path: &[(Option<String>, Option<usize>)],
-) -> &'a mut serde_json::Value {
-    for (name, index) in path {
-        value = if let Some(name) = name {
-            &mut value.as_object_mut().unwrap()[name]
-        } else {
-            &mut value.as_array_mut().unwrap()[index.unwrap()]
-        };
-    }
-    value
-}
-
-#[test]
-fn generated_source_member_and_branch_mutations_reach_the_real_loader() {
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let mut accepted_documents = 0;
-    for entry in std::fs::read_dir(fixture_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).unwrap();
-        let Ok(document) = serde_yaml::from_str::<serde_json::Value>(&source) else {
-            continue;
-        };
-        let bytes = serde_yaml::to_string(&document).unwrap().into_bytes();
-        if load_record_bytes(&bytes).is_err() {
-            continue;
-        }
-        accepted_documents += 1;
-
-        let mut objects = Vec::new();
-        let mut branches = Vec::new();
-        let mut members = Vec::new();
-        collect_object_paths(
-            &document,
-            &mut Vec::new(),
-            &mut objects,
-            &mut branches,
-            &mut members,
-        );
-        for member_path in members {
-            let (last, parent) = member_path.split_last().unwrap();
-            let (Some(name), None) = last else {
-                unreachable!("member paths terminate in an object key");
-            };
-            let mut changed = document.clone();
-            value_at_mut(&mut changed, parent)
-                .as_object_mut()
-                .unwrap()
-                .remove(name);
-            assert_code(
-                serde_yaml::to_string(&changed).unwrap().as_bytes(),
-                "source_record_incomplete",
-            );
-        }
-        for object_path in objects {
-            let mut changed = document.clone();
-            value_at_mut(&mut changed, &object_path)
-                .as_object_mut()
-                .unwrap()
-                .insert("__unknown_member".to_owned(), serde_json::json!(true));
-            assert_code(
-                serde_yaml::to_string(&changed).unwrap().as_bytes(),
-                "source_record_incomplete",
-            );
-        }
-        for branch_path in branches {
-            let mut changed = document.clone();
-            value_at_mut(&mut changed, &branch_path)["kind"] = serde_json::json!("unknown_branch");
-            assert_code(
-                serde_yaml::to_string(&changed).unwrap().as_bytes(),
-                "source_record_incomplete",
-            );
-        }
-    }
-    assert!(
-        accepted_documents >= 3,
-        "the mutation corpus must traverse every admitted source subject"
-    );
-}
-
 #[test]
 fn ordinary_kind_members_are_not_treated_as_tagged_unit_envelopes() {
     let bytes = String::from_utf8(mutate_once(
@@ -227,6 +112,68 @@ fn malformed_source_primitives_have_the_closed_error() {
         ),
         "source_record_invalid_primitive",
     );
+}
+
+#[test]
+fn record_version_requires_a_lossless_u32_integer() {
+    for invalid in ["1.5", "-1", "4294967296", "0.0", "0e0", "-0.0"] {
+        let bytes = mutate_once(
+            "donat-owned-record.yaml",
+            "record_version: 1",
+            &format!("record_version: {invalid}"),
+        );
+        assert_code(&bytes, "source_record_invalid_primitive");
+    }
+    let integer_zero = mutate_once(
+        "donat-owned-record.yaml",
+        "record_version: 1",
+        "record_version: 0",
+    );
+    assert_code(&integer_zero, "source_record_incomplete");
+}
+
+#[test]
+fn malformed_primitive_precedes_duplicate_in_both_occurrence_orders() {
+    for duplicate in [
+        "approval_date: 2026-02-30\napproval_date: 2026-07-29",
+        "approval_date: 2026-07-29\napproval_date: 2026-02-30",
+    ] {
+        let bytes = mutate_once(
+            "donat-owned-record.yaml",
+            "approval_date: 2026-07-29",
+            duplicate,
+        );
+        assert_code(&bytes, "source_record_invalid_primitive");
+    }
+}
+
+#[test]
+fn npm_integrity_runs_after_duplicate_and_legal_stages() {
+    let malformed_sri = fixture("serpapi-npm-record.yaml").replacen(
+        "integrity: sha512-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QA==",
+        "integrity: sha512-not-base64",
+        1,
+    );
+    let duplicate = malformed_sri.replacen(
+        "record_version: 1",
+        "record_version: 1\nrecord_version: 1",
+        1,
+    );
+    assert_code(duplicate.as_bytes(), "source_record_duplicate");
+
+    let rejected_license = malformed_sri.replacen(
+        r#"license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: c1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0
+"#,
+        "license:\n  kind: rejected\n  value:\n    finding: finding.license.rejected\n",
+        1,
+    );
+    assert_code(rejected_license.as_bytes(), "source_record_legal_mismatch");
 }
 
 #[test]

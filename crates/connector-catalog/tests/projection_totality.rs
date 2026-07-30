@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use donat_connector_catalog::{
     CANONICAL_PROJECTION_MUTATION_DESCRIPTORS, CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS,
-    CANONICAL_PROJECTION_SCHEMA_DECLARATIONS, CanonicalDeclarationSource,
-    CanonicalMutationDisposition, canonical_projection_owner_manifest,
+    CANONICAL_PROJECTION_ROUTES, CANONICAL_PROJECTION_SCHEMA_DECLARATIONS,
+    CanonicalDeclarationSource, CanonicalMutationCase, CanonicalMutationDisposition,
+    CanonicalProjectionAssignment, CanonicalProjectionInputBinding, CanonicalProjectionMount,
+    CanonicalProjectionMountSegment, CanonicalProjectionProbeDisposition,
+    CanonicalProjectionProducer, CanonicalProjectionRouteId, CanonicalProjectionStaticSegment,
+    CanonicalPublicInputProbeId, canonical_projection_owner_manifest,
 };
 use syn::{
-    Attribute, Fields, FnArg, GenericArgument, Item, LitStr, Pat, PathArguments, Type, TypePath,
-    Visibility,
+    Attribute, Fields, GenericArgument, Item, LitStr, PathArguments, Type, TypePath, Visibility,
 };
 
 #[derive(Clone)]
@@ -772,31 +775,599 @@ fn declared_identity(schema: &Schema, identity: &str) -> Result<Member, String> 
     }
 }
 
-fn builder_parameter_is_declared(identity: &str) -> bool {
-    let Some((function_name, parameter_name)) = identity.split_once("::") else {
-        return false;
+#[test]
+fn value_contract_route_generates_exact_builder_and_public_probe_evidence() {
+    const VALUE_CONTRACT_EPOCH_PROBE: CanonicalPublicInputProbeId =
+        CanonicalPublicInputProbeId::new(
+            CanonicalMutationCase::ValueContract,
+            "ValueContractMaterialV1",
+            "ValueContractEpoch",
+        );
+    let route = CANONICAL_PROJECTION_ROUTES
+        .iter()
+        .find(|route| {
+            route.probe_memberships.iter().any(|membership| {
+                membership.probe == VALUE_CONTRACT_EPOCH_PROBE
+                    && membership.disposition == CanonicalProjectionProbeDisposition::Accepted
+            })
+        })
+        .expect("the production epoch row must join the accepted public probe");
+
+    assert_eq!(route.disposition, CanonicalMutationDisposition::Mutable);
+    assert_eq!(
+        route.route_id,
+        CanonicalProjectionRouteId {
+            case: CanonicalMutationCase::ValueContract,
+            material_owner: "ValueContractMaterialV1",
+            material_field: "value_language_epoch",
+        }
+    );
+    assert_eq!(
+        route.producer,
+        CanonicalProjectionProducer::PublicBuilder {
+            function: "value_contract_material",
+        }
+    );
+    assert_eq!(
+        route.owner.normalized_source,
+        CanonicalDeclarationSource::BuilderDerived
+    );
+    assert!(
+        CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS.contains(&route.owner),
+        "the legacy owner API must be a generated view of the route row"
+    );
+    assert!(
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .any(|descriptor| {
+                descriptor.case == route.route_id.case
+                    && descriptor.disposition == route.disposition
+                    && descriptor.domain == route.owner.domain
+                    && descriptor.canonical_path == route.owner.canonical_path
+                    && descriptor.material_member == route.owner.material_member
+            }),
+        "the legacy mutation API must be a generated view of the route row"
+    );
+
+    let CanonicalProjectionInputBinding::PublicParameter {
+        parameter,
+        validated_context_owner,
+        validated_context_field,
+    } = route.input_binding
+    else {
+        panic!("the ValueContract epoch route must bind a public parameter");
     };
-    syn::parse_file(include_str!("../src/canonical.rs"))
-        .unwrap()
-        .items
+    assert_eq!(parameter, "value_language_epoch");
+    assert_eq!(
+        (validated_context_owner, validated_context_field),
+        ("ValueContractProjectionContext", "value_language_epoch")
+    );
+    assert_eq!(
+        route.assignment,
+        donat_connector_catalog::CanonicalProjectionAssignment::ValidatedContext {
+            source_context_owner: validated_context_owner,
+            source_context_field: validated_context_field,
+            target: route.route_id,
+        }
+    );
+    assert_eq!(
+        route.mounts,
+        &[CanonicalProjectionMount::RootField {
+            canonical_json_path: "$.value_language_epoch",
+        }]
+    );
+    assert!(
+        route.dependency_edges.iter().next().is_none(),
+        "the value-language epoch is an independent projection leaf"
+    );
+}
+
+#[test]
+fn migrated_route_dispositions_have_exact_public_probe_evidence() {
+    for route in CANONICAL_PROJECTION_ROUTES {
+        match route.disposition {
+            CanonicalMutationDisposition::Mutable => {
+                assert!(
+                    route.probe_memberships.iter().any(|membership| {
+                        membership.disposition == CanonicalProjectionProbeDisposition::Accepted
+                    }),
+                    "a migrated mutable route has no accepted public-input probe: {:?}",
+                    route.route_id
+                );
+            }
+            CanonicalMutationDisposition::Singleton => {
+                assert!(
+                    route.probe_memberships.iter().next().is_none(),
+                    "a singleton route cannot claim a public mutation probe: {:?}",
+                    route.route_id
+                );
+            }
+            CanonicalMutationDisposition::PublicPipelineRejected => {
+                assert!(
+                    route.probe_memberships.iter().any(|membership| {
+                        membership.disposition
+                            == CanonicalProjectionProbeDisposition::PublicPipelineRejected
+                    }) && route.probe_memberships.iter().all(|membership| {
+                        membership.disposition
+                            == CanonicalProjectionProbeDisposition::PublicPipelineRejected
+                    }),
+                    "a rejected route must name only exact public rejection probes: {:?}",
+                    route.route_id
+                );
+            }
+        }
+
+        for edge in route.dependency_edges {
+            assert!(
+                CANONICAL_PROJECTION_ROUTES
+                    .iter()
+                    .any(|candidate| candidate.route_id == edge.dependent_route),
+                "a generated dependency edge has no production route target: {:?}",
+                edge.dependent_route
+            );
+        }
+    }
+}
+
+#[test]
+fn every_typed_value_owner_and_mutation_view_has_one_generated_route() {
+    for mutation in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.case == CanonicalMutationCase::TypedValue)
+    {
+        let owner = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+            .iter()
+            .find(|owner| {
+                owner.domain == mutation.domain
+                    && owner.canonical_path == mutation.canonical_path
+                    && owner.material_member == mutation.material_member
+                    && owner.material_source == mutation.material_source
+            })
+            .expect("the independent owner/mutation bijection must remain intact");
+        let mut routes = CANONICAL_PROJECTION_ROUTES.iter().filter(|route| {
+            route.route_id.case == CanonicalMutationCase::TypedValue
+                && route.owner == *owner
+                && route.disposition == mutation.disposition
+        });
+        let route = routes.next().unwrap_or_else(|| {
+            panic!(
+                "typed-value owner has no generated production route: {}",
+                mutation.material_member
+            )
+        });
+        assert!(
+            routes.next().is_none(),
+            "typed-value owner has duplicate generated production routes: {}",
+            mutation.material_member
+        );
+        assert_eq!(
+            route.producer,
+            CanonicalProjectionProducer::PublicBuilder {
+                function: "typed_value_material",
+            },
+            "typed-value route does not name its generated public builder: {:?}",
+            route.route_id
+        );
+        assert_eq!(
+            route.input_binding,
+            CanonicalProjectionInputBinding::NormalizedMember {
+                normalized_owner: owner.normalized_owner,
+                normalized_member: owner.normalized_member,
+            },
+            "typed-value route input is not bound to its normalized member: {:?}",
+            route.route_id
+        );
+        assert_eq!(
+            route.assignment,
+            CanonicalProjectionAssignment::NormalizedMember {
+                normalized_owner: owner.normalized_owner,
+                normalized_member: owner.normalized_member,
+                target: route.route_id,
+            },
+            "typed-value route assignment does not target its material member: {:?}",
+            route.route_id
+        );
+        assert_eq!(
+            route.disposition,
+            CanonicalMutationDisposition::Mutable,
+            "typed-value route is not mutable: {:?}",
+            route.route_id
+        );
+        assert!(
+            !route.mounts.is_empty(),
+            "typed-value route has no route-global mount: {:?}",
+            route.route_id
+        );
+        assert!(
+            route.dependency_edges.is_empty(),
+            "typed-value routes may not use dependency edges: {:?}",
+            route.route_id
+        );
+    }
+}
+
+#[test]
+fn source_owner_and_mutation_views_are_exactly_the_generated_routes() {
+    let routes = CANONICAL_PROJECTION_ROUTES
+        .iter()
+        .filter(|route| route.route_id.case == CanonicalMutationCase::SourceRecord)
+        .collect::<Vec<_>>();
+    let route_ids = routes
+        .iter()
+        .map(|route| route.route_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        route_ids.len(),
+        routes.len(),
+        "Source production route IDs are not unique"
+    );
+
+    let route_owners = routes
+        .iter()
+        .map(|route| route.owner)
+        .collect::<BTreeSet<_>>();
+    let owner_views = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .filter(|owner| owner.domain == "source-record")
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        route_owners, owner_views,
+        "Source owner descriptors diverged from generated production routes"
+    );
+
+    let route_mutations = routes
+        .iter()
+        .map(|route| {
+            (
+                route.owner.domain,
+                route.owner.canonical_path,
+                route.owner.material_member,
+                route.owner.material_source,
+                route.owner.branch_type,
+                route.owner.null_empty,
+                route.disposition,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mutation_views = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|mutation| mutation.case == CanonicalMutationCase::SourceRecord)
+        .map(|mutation| {
+            (
+                mutation.domain,
+                mutation.canonical_path,
+                mutation.material_member,
+                mutation.material_source,
+                mutation.branch_type,
+                mutation.null_empty,
+                mutation.disposition,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        route_mutations, mutation_views,
+        "Source mutation descriptors diverged from generated production routes"
+    );
+
+    for route in &routes {
+        assert_eq!(
+            route.producer,
+            CanonicalProjectionProducer::PublicBuilder {
+                function: "source_record_material",
+            },
+            "Source route does not name its real production builder: {:?}",
+            route.route_id
+        );
+        assert_eq!(
+            route.input_binding,
+            CanonicalProjectionInputBinding::NormalizedMember {
+                normalized_owner: route.owner.normalized_owner,
+                normalized_member: route.owner.normalized_member,
+            },
+            "Source route is not bound to its normalized production member: {:?}",
+            route.route_id
+        );
+        assert_eq!(
+            route.assignment,
+            CanonicalProjectionAssignment::NormalizedMember {
+                normalized_owner: route.owner.normalized_owner,
+                normalized_member: route.owner.normalized_member,
+                target: route.route_id,
+            },
+            "Source route assignment does not target its production member: {:?}",
+            route.route_id
+        );
+        assert!(
+            !route.mounts.is_empty(),
+            "Source production route has no explicit mount: {:?}",
+            route.route_id
+        );
+        for mount in route.mounts {
+            match mount {
+                CanonicalProjectionMount::SourcePath { segments } => assert!(
+                    !segments.is_empty(),
+                    "Source production route has an empty structural mount: {:?}",
+                    route.route_id
+                ),
+                CanonicalProjectionMount::RootField { .. } => panic!(
+                    "Source production route used an untyped root-field mount: {:?}",
+                    route.route_id
+                ),
+            }
+        }
+    }
+
+    let singleton_routes = routes
+        .iter()
+        .filter(|route| route.disposition == CanonicalMutationDisposition::Singleton)
+        .map(|route| {
+            assert!(
+                route.probe_memberships.is_empty(),
+                "Source singleton routes cannot have public probe memberships"
+            );
+            (
+                route.owner.canonical_path,
+                route.route_id.material_owner,
+                route.route_id.material_field,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        singleton_routes,
+        [(
+            "NpmIntegrity.algorithm",
+            "NpmIntegrityAlgorithmMaterialV1",
+            "Sha512",
+        )]
         .into_iter()
-        .any(|item| {
-            let Item::Fn(function) = item else {
-                return false;
+        .collect(),
+        "the Source singleton route is not the exact closed npm integrity algorithm"
+    );
+}
+
+fn source_mount_segments(segments: &[CanonicalProjectionMountSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            CanonicalProjectionMountSegment::Field(field) => format!("field:{field}"),
+            CanonicalProjectionMountSegment::TaggedKind { expected_kind } => {
+                format!("kind:{expected_kind}")
+            }
+            CanonicalProjectionMountSegment::TaggedValue { expected_kind } => {
+                format!("tagged:{expected_kind}")
+            }
+            CanonicalProjectionMountSegment::KeyedElement { key } => format!(
+                "key:{}",
+                key.iter()
+                    .map(|part| part
+                        .path
+                        .iter()
+                        .map(|segment| match segment {
+                            CanonicalProjectionStaticSegment::Field(field) =>
+                                format!("field:{field}"),
+                            CanonicalProjectionStaticSegment::TaggedValue { expected_kind } =>
+                                format!("tagged:{expected_kind}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[test]
+fn source_type_bases_are_complete_and_license_contexts_are_exact() {
+    for route in CANONICAL_PROJECTION_ROUTES
+        .iter()
+        .filter(|route| route.route_id.case == CanonicalMutationCase::SourceRecord)
+    {
+        for mount in route.mounts {
+            let CanonicalProjectionMount::SourcePath { segments } = mount else {
+                panic!("Source route has a non-Source mount: {:?}", route.route_id);
             };
-            function.sig.ident == function_name
-                && matches!(function.vis, Visibility::Public(_))
-                && function.sig.inputs.iter().any(|argument| {
-                    matches!(
-                        argument,
-                        FnArg::Typed(argument)
-                            if matches!(
-                                argument.pat.as_ref(),
-                                Pat::Ident(name) if name.ident == parameter_name
-                            )
-                    )
+            if route.route_id.material_owner == "SourceRecordMaterialV1" {
+                assert_eq!(
+                    segments.len(),
+                    1,
+                    "a Source root field has a non-root base: {:?}",
+                    route.route_id
+                );
+            } else {
+                assert!(
+                    segments.len() > 1,
+                    "a nested Source type retained an empty base: {:?}",
+                    route.route_id
+                );
+            }
+        }
+    }
+
+    let rejected_kind = CANONICAL_PROJECTION_ROUTES
+        .iter()
+        .find(|route| {
+            route.route_id
+                == (CanonicalProjectionRouteId {
+                    case: CanonicalMutationCase::SourceRecord,
+                    material_owner: "LicenseDecisionMaterialV1::Rejected",
+                    material_field: "kind",
                 })
         })
+        .expect("the rejected License route exists");
+    let contexts = rejected_kind
+        .mounts
+        .iter()
+        .map(|mount| {
+            let CanonicalProjectionMount::SourcePath { segments } = mount else {
+                unreachable!("Source routes have only Source mounts");
+            };
+            assert_eq!(
+                segments.last(),
+                Some(&CanonicalProjectionMountSegment::TaggedKind {
+                    expected_kind: "rejected",
+                })
+            );
+            source_mount_segments(&segments[..segments.len() - 1])
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        contexts,
+        [
+            "field:dependencies/key:field:dependency/field:disposition/tagged:build_only/field:license",
+            "field:dependencies/key:field:dependency/field:disposition/tagged:shipped/field:license",
+            "field:embedded_material/key:field:material_id/field:disposition/tagged:shipped/field:license",
+            "field:license",
+            "field:subject/tagged:provider_artifact/field:evidence/key:field:source+field:content_sha256/field:terms/tagged:permissive/field:license",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "License routes do not name the exact legitimate public contexts"
+    );
+}
+
+#[test]
+fn source_routes_are_the_exact_adr_set_once_and_closed_enums_are_exactly_singletons() {
+    let owners = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.domain == "source-record")
+        .map(|descriptor| {
+            assert_eq!(
+                descriptor.normalized_source,
+                CanonicalDeclarationSource::Source
+            );
+            assert_eq!(
+                descriptor.material_source,
+                CanonicalDeclarationSource::ProjectionSchema
+            );
+            (
+                descriptor.normalized_owner,
+                descriptor.domain,
+                descriptor.canonical_path,
+                descriptor.owner_class,
+                descriptor.order,
+                descriptor.null_empty,
+                descriptor.branch_type,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let adr = canonical_projection_owner_manifest()
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns = line.split('|').collect::<Vec<_>>();
+            (columns[1] == "source-record").then_some((
+                columns[0], columns[1], columns[2], columns[3], columns[4], columns[5], columns[6],
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(owners, adr, "generated source routes and ADR 012 diverged");
+
+    let owner_routes = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.domain == "source-record")
+        .map(|descriptor| {
+            (
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.branch_type,
+                descriptor.null_empty,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mutation_routes = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.case == CanonicalMutationCase::SourceRecord)
+        .map(|descriptor| {
+            assert_eq!(
+                descriptor.material_source,
+                CanonicalDeclarationSource::ProjectionSchema
+            );
+            (
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.branch_type,
+                descriptor.null_empty,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        owner_routes.len(),
+        CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.domain == "source-record")
+            .count(),
+        "the schema generated a duplicate source owner route"
+    );
+    assert_eq!(
+        mutation_routes.len(),
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.case == CanonicalMutationCase::SourceRecord)
+            .count(),
+        "the schema generated a duplicate source mutation route"
+    );
+    assert_eq!(
+        owner_routes, mutation_routes,
+        "source owner and production mutation routes are not bijective"
+    );
+
+    let singletons = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| {
+            descriptor.case == CanonicalMutationCase::SourceRecord
+                && descriptor.disposition == CanonicalMutationDisposition::Singleton
+        })
+        .map(|descriptor| {
+            (
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.branch_type,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        singletons,
+        [("NpmIntegrity.algorithm", "NpmIntegrity.algorithm", "sha512")]
+            .into_iter()
+            .collect()
+    );
+
+    let all_singletons = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.disposition == CanonicalMutationDisposition::Singleton)
+        .map(|descriptor| {
+            (
+                descriptor.case,
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.branch_type,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        all_singletons,
+        [
+            (
+                CanonicalMutationCase::SourceRecord,
+                "NpmIntegrity.algorithm",
+                "NpmIntegrity.algorithm",
+                "sha512",
+            ),
+            (
+                CanonicalMutationCase::Semantic,
+                "SemanticOriginMaterialV1.scheme",
+                "SemanticOriginMaterialV1.scheme",
+                "HttpsOnly",
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        "the generated schema must expose exactly the two closed singleton enums"
+    );
 }
 
 #[test]
@@ -880,11 +1451,22 @@ fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
             }
             CanonicalDeclarationSource::BuilderDerived => {
                 assert_eq!(row.owner_class, "normalized");
-                assert!(
-                    builder_parameter_is_declared(row.normalized_member),
-                    "generated builder-derived member is not an exact public parameter: {}",
-                    row.normalized_member
-                );
+                let route = CANONICAL_PROJECTION_ROUTES
+                    .iter()
+                    .find(|route| {
+                        route.owner.normalized_owner == row.owner
+                            && route.owner.normalized_member == row.normalized_member
+                            && route.owner.normalized_source == row.normalized_source
+                            && route.owner.owner_class == row.owner_class
+                            && route.owner.canonical_path == row.path
+                            && route.owner.material_member == row.material_member
+                            && route.owner.material_source == row.material_source
+                    })
+                    .expect("builder-derived owner must come from its production route row");
+                assert!(matches!(
+                    route.input_binding,
+                    CanonicalProjectionInputBinding::PublicParameter { .. }
+                ));
             }
             CanonicalDeclarationSource::Constant => {
                 assert_eq!(row.owner_class, "constant");
@@ -1001,6 +1583,39 @@ fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
 fn projection_schema_macro_is_the_only_material_declaration_source() {
     let implementation = include_str!("../src/canonical.rs");
     assert!(implementation.contains("macro_rules! projection_schema"));
+    let invocation = implementation
+        .split_once("projection_schema! {")
+        .expect("projection schema invocation exists")
+        .1;
+    let (shared_projection, provenance_projection) = invocation
+        .split_once("\nprovenance_projection {")
+        .expect("provenance is one section of the projection schema");
+    let shared_owner_paths = shared_projection
+        .split_once("owner_paths {")
+        .expect("shared owner paths exist")
+        .1
+        .split_once("\n}\nvalue_contract_projection")
+        .expect("shared owner paths terminate before value-contract projection")
+        .0;
+    assert!(
+        !shared_owner_paths.contains("\"provenance\","),
+        "a provenance owner row escaped the provenance projection section"
+    );
+    let provenance_owner_paths = provenance_projection
+        .split_once("owner_paths {")
+        .expect("provenance owner paths exist")
+        .1
+        .split_once("\n    }\n    context struct")
+        .expect("provenance owner paths terminate before their context")
+        .0;
+    assert_eq!(
+        provenance_owner_paths.matches("\"provenance\",").count(),
+        CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.domain == "provenance")
+            .count(),
+        "the provenance section and generated provenance owner rows diverged"
+    );
     let generated = collect_schema(CANONICAL_PROJECTION_SCHEMA_DECLARATIONS);
     assert!(
         generated

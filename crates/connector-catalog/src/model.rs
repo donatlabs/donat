@@ -918,6 +918,7 @@ pub fn compile_connector_manifest<'checked>(
     validate_manifest_selected_headers(manifest)?;
     validate_manifest_error_maps(manifest)?;
     validate_manifest_effects(manifest)?;
+    validate_fact_use_sites(manifest)?;
     let fact_requirements = check_fact_requirements(
         &manifest
             .operations
@@ -1541,7 +1542,6 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
                     return effect_incomplete("every side-effecting step needs exact evidence");
                 }
                 let mut steps = BTreeSet::new();
-                let mut required_use_sites = BTreeSet::new();
                 for side_effect in side_effect_steps {
                     let Some(step) = operation
                         .steps
@@ -1573,39 +1573,25 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
                         operation.operation.as_str(),
                         step.step.as_str()
                     );
-                    required_use_sites.extend([
-                        scope_site.clone(),
-                        retention_site.clone(),
-                        margin_site.clone(),
-                    ]);
-                    if !matches!(
-                        exact_fact_value(operation, &scope_site),
-                        Some(TypedValue::String(value)) if value == &side_effect.scope
-                    ) || !matches!(
-                        exact_fact_value(operation, &retention_site),
-                        Some(TypedValue::Number(CanonicalNumber::U64(value)))
-                            if *value == side_effect.minimum_retention_ms.get()
-                    ) || !matches!(
-                        exact_fact_value(operation, &margin_site),
-                        Some(TypedValue::Number(CanonicalNumber::U64(value)))
-                            if *value == side_effect.clock_safety_margin_ms.get()
-                    ) {
-                        return effect_incomplete(
-                            "idempotency behavior differs from its exact admitted fact bindings",
-                        );
-                    }
-                }
-                let declared_use_sites = operation
-                    .resolved_fact_values
-                    .iter()
-                    .map(|binding| binding.use_site.clone())
-                    .collect::<BTreeSet<_>>();
-                if declared_use_sites.len() != operation.resolved_fact_values.len()
-                    || !required_use_sites.is_subset(&declared_use_sites)
-                {
-                    return effect_incomplete(
-                        "idempotency fact requirements do not cover every structural use site",
-                    );
+                    validate_optional_effect_fact(
+                        operation,
+                        &scope_site,
+                        |value| matches!(value, TypedValue::String(value) if value == &side_effect.scope),
+                    )?;
+                    validate_optional_effect_fact(operation, &retention_site, |value| {
+                        matches!(
+                            value,
+                            TypedValue::Number(CanonicalNumber::U64(value))
+                                if *value == side_effect.minimum_retention_ms.get()
+                        )
+                    })?;
+                    validate_optional_effect_fact(operation, &margin_site, |value| {
+                        matches!(
+                            value,
+                            TypedValue::Number(CanonicalNumber::U64(value))
+                                if *value == side_effect.clock_safety_margin_ms.get()
+                        )
+                    })?;
                 }
             }
         }
@@ -1613,16 +1599,29 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
     Ok(())
 }
 
-fn exact_fact_value<'operation>(
-    operation: &'operation OperationSpec,
+fn validate_optional_effect_fact(
+    operation: &OperationSpec,
     use_site: &str,
-) -> Option<&'operation TypedValue> {
+    expected: impl FnOnce(&TypedValue) -> bool,
+) -> Result<(), CatalogError> {
     let mut matches = operation
         .resolved_fact_values
         .iter()
         .filter(|binding| binding.use_site == use_site);
-    let value = &matches.next()?.value;
-    matches.next().is_none().then_some(value)
+    let Some(value) = matches.next().map(|binding| &binding.value) else {
+        return Ok(());
+    };
+    if matches.next().is_some() {
+        // The checked requirement map owns use-site uniqueness and its
+        // catalog_fact_binding_mismatch error.
+        return Ok(());
+    }
+    if !expected(value) {
+        return effect_incomplete(
+            "idempotency behavior differs from its exact admitted fact bindings",
+        );
+    }
+    Ok(())
 }
 
 fn idempotency_binding_exists(step: &CompiledStepSpec, binding: &FixedIdempotencyBinding) -> bool {

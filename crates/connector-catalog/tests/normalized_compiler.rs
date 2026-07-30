@@ -136,6 +136,10 @@ fn provider_record_with_retention() -> ConnectorSourceRecord {
 }
 
 fn provider_record_with_retention_order(reverse_evidence: bool) -> ConnectorSourceRecord {
+    load_record_bytes(&provider_record_with_retention_bytes(reverse_evidence)).unwrap()
+}
+
+fn provider_record_with_retention_bytes(reverse_evidence: bool) -> Vec<u8> {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
     )
@@ -163,7 +167,7 @@ fn provider_record_with_retention_order(reverse_evidence: bool) -> ConnectorSour
             .unwrap()
             .reverse();
     }
-    load_record_bytes(serde_yaml::to_string(&document).unwrap().as_bytes()).unwrap()
+    serde_yaml::to_string(&document).unwrap().into_bytes()
 }
 
 fn idempotent_manifest_with_origins_on(
@@ -587,6 +591,164 @@ fn normalized_manifest_bytes(value: &serde_json::Value) -> Vec<u8> {
     serde_yaml::to_string(value).unwrap().into_bytes()
 }
 
+fn public_pipeline_catalog(provider_source: &[u8]) -> AcceptedRecordCatalog {
+    let owned_source = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/donat-owned-record.yaml"),
+    )
+    .unwrap();
+    let owned = load_record_bytes(&owned_source).unwrap();
+    let owned_id = owned.record_id();
+    let provider = load_record_bytes(provider_source).unwrap();
+    let mut reviews = SourceReviewRegistry::default();
+    reviews.approve_reviewed_use("review.demo").unwrap();
+    AcceptedRecordCatalog::build(
+        vec![owned, provider],
+        &[(
+            owned_id,
+            [OperationId::literal("get")].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        &reviews,
+    )
+    .unwrap()
+}
+
+fn public_pipeline_manifest_document(provider_idempotent: bool) -> serde_json::Value {
+    let mut document = normalized_manifest_document();
+    let operation = &mut document["operations"][0];
+    operation["resolved_fact_values"] = serde_json::json!([{
+        "use_site": "effect.request.binding",
+        "value": {"kind": "string", "value": "Idempotency-Key"}
+    }]);
+    if provider_idempotent {
+        let binding = operation["steps"][0]["query"][0]["binding"].clone();
+        operation["steps"][0]["query"] = serde_json::json!([]);
+        operation["steps"][0]["headers"] = serde_json::json!([{
+            "name": "idempotency-key",
+            "binding": binding
+        }]);
+        operation["effect"] = serde_json::json!({
+            "kind": "provider_idempotent",
+            "value": {
+                "side_effect_steps": [{
+                    "step": "request",
+                    "fixed_binding": {
+                        "kind": "header",
+                        "value": {"name": "idempotency-key"}
+                    },
+                    "scope": "scope.demo",
+                    "minimum_retention_ms": "86400000",
+                    "clock_safety_margin_ms": "1000"
+                }]
+            }
+        });
+    }
+    document["provenance"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "source_record_id": "source.demo.provider.v1",
+            "artifact_hashes": [{
+                "artifact_id": "artifact.openapi",
+                "algorithm": {"kind": "sha256"},
+                "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+                "path": "openapi.json"
+            }],
+            "license_id": "MIT",
+            "notice_id": "notice.demo",
+            "contract_facts": [{
+                "use_site": "effect.request.binding",
+                "fact": {
+                    "kind": "provider_evidence",
+                    "value": {
+                        "source_record_id": "source.demo.provider.v1",
+                        "fact_id": "fact.idempotency"
+                    }
+                }
+            }]
+        }));
+    document
+}
+
+fn public_structural_fact_manifest_document() -> serde_json::Value {
+    let mut document = public_pipeline_manifest_document(true);
+    let scope_site = "operation.get.step.request.idempotency.scope";
+    let retention_site = "operation.get.step.request.idempotency.minimum_retention_ms";
+    let margin_site = "operation.get.step.request.idempotency.clock_safety_margin_ms";
+    let operation = &mut document["operations"][0];
+    operation["effect"]["value"]["side_effect_steps"][0]["scope"] =
+        serde_json::json!("Idempotency-Key");
+    operation["effect"]["value"]["side_effect_steps"][0]["minimum_retention_ms"] =
+        serde_json::json!("1000");
+    operation["effect"]["value"]["side_effect_steps"][0]["clock_safety_margin_ms"] =
+        serde_json::json!("1");
+    operation["resolved_fact_values"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({
+                "use_site": scope_site,
+                "value": {"kind": "string", "value": "Idempotency-Key"}
+            }),
+            serde_json::json!({
+                "use_site": retention_site,
+                "value": {"kind": "u64", "value": "1000"}
+            }),
+            serde_json::json!({
+                "use_site": margin_site,
+                "value": {"kind": "u64", "value": "1"}
+            }),
+        ]);
+
+    let provider = &mut document["provenance"][1];
+    provider["artifact_hashes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "artifact_id": "artifact.openapi.retention",
+            "algorithm": {"kind": "sha256"},
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "path": "openapi.json"
+        }));
+    provider["contract_facts"].as_array_mut().unwrap().extend([
+        serde_json::json!({
+            "use_site": scope_site,
+            "fact": {
+                "kind": "provider_evidence",
+                "value": {
+                    "source_record_id": "source.demo.provider.v1",
+                    "fact_id": "fact.idempotency"
+                }
+            }
+        }),
+        serde_json::json!({
+            "use_site": retention_site,
+            "fact": {
+                "kind": "provider_evidence",
+                "value": {
+                    "source_record_id": "source.demo.provider.v1",
+                    "fact_id": "fact.retention"
+                }
+            }
+        }),
+    ]);
+    document["provenance"][0]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "use_site": margin_site,
+            "fact": {
+                "kind": "donat_policy",
+                "value": {
+                    "policy_id": "policy.clock.margin",
+                    "value": {"kind": "u64", "value": "1"}
+                }
+            }
+        }));
+    document
+}
+
 #[derive(Clone)]
 enum PathSegment {
     Key(String),
@@ -759,6 +921,276 @@ fn generic_provider_facts_compile_for_read_only_operations() {
 }
 
 #[test]
+fn provider_idempotent_generic_fact_compiles_through_public_pipeline() {
+    let provider_source = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
+    )
+    .unwrap();
+    let accepted = public_pipeline_catalog(&provider_source);
+    let manifest_bytes = normalized_manifest_bytes(&public_pipeline_manifest_document(true));
+    let manifest = load_connector_manifest_bytes(&manifest_bytes).unwrap();
+    let policies = BTreeMap::new();
+    let checked = compile_connector_manifest(&manifest, &accepted, &policies).unwrap();
+    let semantic = serde_json::from_slice::<serde_json::Value>(
+        &canonical_material_bytes(&semantic_material(&checked, 1).unwrap()).unwrap(),
+    );
+    let semantic = semantic.unwrap();
+    assert_eq!(
+        semantic["operations"][0]["resolved_fact_values"],
+        serde_json::json!([{
+            "use_site": "effect.request.binding",
+            "value": {"kind": "string", "value": "Idempotency-Key"}
+        }])
+    );
+
+    let provenance = serde_json::from_slice::<serde_json::Value>(
+        &canonical_material_bytes(&provenance_material(&checked, 1, 1, 1).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let provider_reference = provenance["manifest_references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|reference| reference["source_record_id"] == "source.demo.provider.v1")
+        .unwrap();
+    assert_eq!(
+        provider_reference["contract_fact_origins"],
+        serde_json::json!([{
+            "use_site": "effect.request.binding",
+            "origin": {
+                "kind": "provider_evidence",
+                "value": {
+                    "source_record_id": "source.demo.provider.v1",
+                    "fact_id": "fact.idempotency",
+                    "artifact_content_sha256":
+                        "1111111111111111111111111111111111111111111111111111111111111111",
+                    "location": {
+                        "kind": "json_pointer",
+                        "value": {
+                            "path": "openapi.json",
+                            "pointer": "/paths/~1widgets/post"
+                        }
+                    }
+                }
+            }
+        }])
+    );
+}
+
+#[test]
+fn read_only_provider_fact_compiles_through_public_pipeline() {
+    let provider_source = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
+    )
+    .unwrap();
+    let accepted = public_pipeline_catalog(&provider_source);
+    let manifest_bytes = normalized_manifest_bytes(&public_pipeline_manifest_document(false));
+    let manifest = load_connector_manifest_bytes(&manifest_bytes).unwrap();
+    let policies = BTreeMap::new();
+    let checked = compile_connector_manifest(&manifest, &accepted, &policies).unwrap();
+    let semantic = canonical_material_bytes(&semantic_material(&checked, 1).unwrap()).unwrap();
+    let provenance =
+        canonical_material_bytes(&provenance_material(&checked, 1, 1, 1).unwrap()).unwrap();
+
+    assert!(
+        std::str::from_utf8(&semantic)
+            .unwrap()
+            .contains(r#""use_site":"effect.request.binding""#)
+    );
+    assert!(
+        std::str::from_utf8(&provenance)
+            .unwrap()
+            .contains(r#""use_site":"effect.request.binding""#)
+    );
+}
+
+#[test]
+fn optional_structural_facts_compile_through_public_pipeline() {
+    let provider_source = provider_record_with_retention_bytes(false);
+    let accepted = public_pipeline_catalog(&provider_source);
+    let manifest_bytes = normalized_manifest_bytes(&public_structural_fact_manifest_document());
+    let manifest = load_connector_manifest_bytes(&manifest_bytes).unwrap();
+    let policies = BTreeMap::from([(
+        DonatPolicyId::literal("policy.clock.margin"),
+        TypedValue::Number(CanonicalNumber::U64(1)),
+    )]);
+    let checked = compile_connector_manifest(&manifest, &accepted, &policies).unwrap();
+    let semantic = canonical_material_bytes(&semantic_material(&checked, 1).unwrap()).unwrap();
+    let provenance =
+        canonical_material_bytes(&provenance_material(&checked, 1, 1, 1).unwrap()).unwrap();
+
+    for use_site in [
+        "effect.request.binding",
+        "operation.get.step.request.idempotency.scope",
+        "operation.get.step.request.idempotency.minimum_retention_ms",
+        "operation.get.step.request.idempotency.clock_safety_margin_ms",
+    ] {
+        let needle = format!(r#""use_site":"{use_site}""#);
+        assert!(std::str::from_utf8(&semantic).unwrap().contains(&needle));
+        assert!(std::str::from_utf8(&provenance).unwrap().contains(&needle));
+    }
+}
+
+#[test]
+fn public_loader_defers_fact_use_site_cardinality_to_the_shared_validator() {
+    let provider_source = provider_record_with_retention_bytes(false);
+    let accepted = public_pipeline_catalog(&provider_source);
+    let base_policies = BTreeMap::from([(
+        DonatPolicyId::literal("policy.clock.margin"),
+        TypedValue::Number(CanonicalNumber::U64(1)),
+    )]);
+    let assert_use_site_mismatch = |document: &serde_json::Value| {
+        let bytes = normalized_manifest_bytes(document);
+        let manifest = load_connector_manifest_bytes(&bytes)
+            .expect("fact use-site cardinality is a compiler validation concern");
+        assert_eq!(
+            compile_connector_manifest(&manifest, &accepted, &base_policies)
+                .err()
+                .expect("invalid fact use-site cardinality must fail compilation")
+                .code(),
+            "catalog_fact_use_site_mismatch"
+        );
+    };
+
+    let mut duplicate_semantic = public_structural_fact_manifest_document();
+    let duplicate_binding = duplicate_semantic["operations"][0]["resolved_fact_values"][0].clone();
+    duplicate_semantic["operations"][0]["resolved_fact_values"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_binding);
+    assert_use_site_mismatch(&duplicate_semantic);
+
+    let mut duplicate_origin = public_structural_fact_manifest_document();
+    let duplicate_binding = duplicate_origin["provenance"][1]["contract_facts"][0].clone();
+    duplicate_origin["provenance"][1]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_binding);
+    assert_use_site_mismatch(&duplicate_origin);
+
+    let mut omitted_origin = public_structural_fact_manifest_document();
+    omitted_origin["provenance"][1]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|binding| binding["use_site"] != "effect.request.binding");
+    assert_use_site_mismatch(&omitted_origin);
+
+    let mut extra_origin = public_structural_fact_manifest_document();
+    extra_origin["provenance"][1]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "use_site": "effect.extra.binding",
+            "fact": {
+                "kind": "provider_evidence",
+                "value": {
+                    "source_record_id": "source.demo.provider.v1",
+                    "fact_id": "fact.idempotency"
+                }
+            }
+        }));
+    assert_use_site_mismatch(&extra_origin);
+}
+
+#[test]
+fn public_pipeline_fact_failures_keep_their_owned_codes() {
+    let provider_source = provider_record_with_retention_bytes(false);
+    let accepted = public_pipeline_catalog(&provider_source);
+    let base_policies = BTreeMap::from([(
+        DonatPolicyId::literal("policy.clock.margin"),
+        TypedValue::Number(CanonicalNumber::U64(1)),
+    )]);
+    let compile_error = |document: &serde_json::Value,
+                         policies: &BTreeMap<DonatPolicyId, TypedValue>| {
+        let bytes = normalized_manifest_bytes(document);
+        match load_connector_manifest_bytes(&bytes) {
+            Ok(manifest) => compile_connector_manifest(&manifest, &accepted, policies)
+                .err()
+                .expect("fact mutation must fail closed")
+                .code(),
+            Err(error) => error.code(),
+        }
+    };
+
+    let mut unequal = public_structural_fact_manifest_document();
+    unequal["operations"][0]["resolved_fact_values"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|binding| binding["use_site"] == "operation.get.step.request.idempotency.scope")
+        .unwrap()["value"]["value"] = serde_json::json!("scope.foreign");
+    assert_eq!(
+        compile_error(&unequal, &base_policies),
+        "catalog_operation_effect_incomplete"
+    );
+
+    let margin_site = "operation.get.step.request.idempotency.clock_safety_margin_ms";
+    let mut provider_for_policy = public_structural_fact_manifest_document();
+    provider_for_policy["provenance"][0]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|binding| binding["use_site"] != margin_site);
+    provider_for_policy["provenance"][1]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "use_site": margin_site,
+            "fact": {
+                "kind": "provider_evidence",
+                "value": {
+                    "source_record_id": "source.demo.provider.v1",
+                    "fact_id": "fact.retention"
+                }
+            }
+        }));
+    assert_eq!(
+        compile_error(&provider_for_policy, &base_policies),
+        "catalog_fact_binding_mismatch"
+    );
+
+    let scope_site = "operation.get.step.request.idempotency.scope";
+    let mut policy_for_provider = public_structural_fact_manifest_document();
+    policy_for_provider["provenance"][1]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|binding| binding["use_site"] != scope_site);
+    policy_for_provider["provenance"][0]["contract_facts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "use_site": scope_site,
+            "fact": {
+                "kind": "donat_policy",
+                "value": {
+                    "policy_id": "policy.scope",
+                    "value": {"kind": "string", "value": "Idempotency-Key"}
+                }
+            }
+        }));
+    let mut policy_for_provider_registry = base_policies.clone();
+    policy_for_provider_registry.insert(
+        DonatPolicyId::literal("policy.scope"),
+        TypedValue::String("Idempotency-Key".to_owned()),
+    );
+    assert_eq!(
+        compile_error(&policy_for_provider, &policy_for_provider_registry),
+        "catalog_fact_binding_mismatch"
+    );
+
+    let mut unequal_provider_value = public_structural_fact_manifest_document();
+    unequal_provider_value["operations"][0]["resolved_fact_values"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|binding| binding["use_site"] == "effect.request.binding")
+        .unwrap()["value"]["value"] = serde_json::json!("Different-Key");
+    assert_eq!(
+        compile_error(&unequal_provider_value, &base_policies),
+        "catalog_fact_binding_mismatch"
+    );
+}
+
+#[test]
 fn evidence_provenance_may_be_empty_only_when_semantic_facts_are_empty() {
     let provider = load_record(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
@@ -791,7 +1223,7 @@ fn evidence_provenance_may_be_empty_only_when_semantic_facts_are_empty() {
             .err()
             .unwrap()
             .code(),
-        "catalog_fact_binding_mismatch"
+        "catalog_fact_use_site_mismatch"
     );
 }
 

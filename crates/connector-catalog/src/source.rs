@@ -9,6 +9,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::CatalogError;
+use crate::canonical::{TypedValueMaterial, TypedValueMaterialV1};
 
 pub(crate) trait SourcePrimitive: Sized {
     fn parse_source_primitive(value: &str) -> Result<Self, CatalogError>;
@@ -647,43 +648,6 @@ pub enum ExactFactLocation {
     DocumentSection { path: SourcePath, section: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Closed typed-value projection material.
-///
-/// Use the checked constructors or projection builder; raw JSON
-/// deserialization is intentionally unavailable.
-///
-/// ```compile_fail
-/// use donat_connector_catalog::TypedValueMaterialV1;
-/// let _: TypedValueMaterialV1 =
-///     serde_json::from_str(r#"{"kind":"i64","value":"not-an-integer"}"#).unwrap();
-/// ```
-pub struct TypedValueMaterialV1(TypedValueMaterial);
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(
-    deny_unknown_fields,
-    tag = "kind",
-    content = "value",
-    rename_all = "snake_case"
-)]
-enum TypedValueMaterial {
-    Null,
-    Boolean(bool),
-    String(String),
-    I64(String),
-    U64(String),
-    Decimal(String),
-    List(Vec<TypedValueMaterial>),
-    Object(BTreeMap<String, TypedValueMaterial>),
-    InlineBytes {
-        #[serde(rename = "$binary")]
-        binary: String,
-        file_name: Option<String>,
-        media_type: Option<String>,
-    },
-}
-
 impl TypedValueMaterialV1 {
     pub fn string(value: impl Into<String>) -> Result<Self, CatalogError> {
         let value = Self(TypedValueMaterial::String(value.into()));
@@ -707,41 +671,6 @@ impl TypedValueMaterialV1 {
         let value = Self(TypedValueMaterial::Decimal(value.to_owned()));
         value.validate()?;
         Ok(value)
-    }
-
-    pub(crate) fn from_typed_value(value: &TypedValue) -> Self {
-        fn convert(value: &TypedValue) -> TypedValueMaterial {
-            match value {
-                TypedValue::Null => TypedValueMaterial::Null,
-                TypedValue::Boolean(value) => TypedValueMaterial::Boolean(*value),
-                TypedValue::String(value) => TypedValueMaterial::String(value.clone()),
-                TypedValue::Number(CanonicalNumber::I64(value)) => {
-                    TypedValueMaterial::I64(value.to_string())
-                }
-                TypedValue::Number(CanonicalNumber::U64(value)) => {
-                    TypedValueMaterial::U64(value.to_string())
-                }
-                TypedValue::Number(CanonicalNumber::Decimal(value)) => {
-                    TypedValueMaterial::Decimal(value.as_str().to_owned())
-                }
-                TypedValue::List(values) => {
-                    TypedValueMaterial::List(values.iter().map(convert).collect())
-                }
-                TypedValue::Object(values) => TypedValueMaterial::Object(
-                    values
-                        .iter()
-                        .map(|(name, value)| (name.clone(), convert(value)))
-                        .collect(),
-                ),
-                TypedValue::InlineBytes(value) => TypedValueMaterial::InlineBytes {
-                    binary: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(value.as_slice()),
-                    file_name: value.file_name().map(str::to_owned),
-                    media_type: Some(value.media_type().to_owned()),
-                },
-            }
-        }
-        Self(convert(value))
     }
 
     pub(crate) fn to_typed_value(&self) -> Result<TypedValue, CatalogError> {
@@ -1148,6 +1077,27 @@ pub struct SafetyFinding {
     pub(crate) kind: String,
     pub(crate) location: Option<SourcePath>,
     pub(crate) message: String,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawStructDeclaration {
+    name: &'static str,
+    fields: Vec<&'static str>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawVariantDeclaration {
+    tag: &'static str,
+    fields: Vec<&'static str>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTaggedDeclaration {
+    name: &'static str,
+    variants: Vec<RawVariantDeclaration>,
 }
 
 mod source_record_input {
@@ -1793,6 +1743,331 @@ mod source_record_input {
         D: Deserializer<'de>,
     {
         ContractFactInput::deserialize(deserializer).map(|value| value.0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn raw_declaration_inventory()
+    -> (Vec<RawStructDeclaration>, Vec<RawTaggedDeclaration>) {
+        macro_rules! raw_struct {
+            ($output:ident, $type:ident { $($field:ident),+ $(,)? }) => {{
+                #[allow(dead_code)]
+                fn exhaustive(value: $type) {
+                    let $type { $($field: _),+ } = value;
+                }
+                $output.push(RawStructDeclaration {
+                    name: stringify!($type),
+                    fields: vec![$(stringify!($field)),+],
+                });
+            }};
+        }
+        macro_rules! raw_unit_enum {
+            ($output:ident, $type:ident { $($variant:ident => $tag:literal),+ $(,)? }) => {{
+                #[allow(dead_code)]
+                fn exhaustive(value: $type) {
+                    match value {
+                        $($type::$variant => {}),+
+                    }
+                }
+                $output.push(RawTaggedDeclaration {
+                    name: stringify!($type),
+                    variants: vec![
+                        $(RawVariantDeclaration {
+                            tag: $tag,
+                            fields: Vec::new(),
+                        }),+
+                    ],
+                });
+            }};
+        }
+        macro_rules! raw_tuple_enum {
+            ($output:ident, $type:ident { $($variant:ident => $tag:literal),+ $(,)? }) => {{
+                #[allow(dead_code)]
+                fn exhaustive(value: $type) {
+                    match value {
+                        $($type::$variant(_) => {}),+
+                    }
+                }
+                $output.push(RawTaggedDeclaration {
+                    name: stringify!($type),
+                    variants: vec![
+                        $(RawVariantDeclaration {
+                            tag: $tag,
+                            fields: Vec::new(),
+                        }),+
+                    ],
+                });
+            }};
+        }
+        macro_rules! raw_struct_enum {
+            (
+                $output:ident,
+                $type:ident {
+                    $(
+                        $variant:ident { $($field:ident),+ $(,)? } => $tag:literal
+                    ),+ $(,)?
+                }
+            ) => {{
+                #[allow(dead_code)]
+                fn exhaustive(value: $type) {
+                    match value {
+                        $(
+                            $type::$variant { $($field: _),+ } => {}
+                        ),+
+                    }
+                }
+                $output.push(RawTaggedDeclaration {
+                    name: stringify!($type),
+                    variants: vec![
+                        $(
+                            RawVariantDeclaration {
+                                tag: $tag,
+                                fields: vec![$(stringify!($field)),+],
+                            }
+                        ),+
+                    ],
+                });
+            }};
+        }
+
+        let mut structs = Vec::new();
+        raw_struct!(
+            structs,
+            ConnectorSourceRecordDef {
+                record_version,
+                record_id,
+                subject,
+                reacquisition,
+                artifact_hashes,
+                license,
+                notice,
+                entrypoints,
+                dependencies,
+                embedded_material,
+                provider_contracts,
+                compatibility,
+                admission,
+                safety_findings,
+                reviewer,
+                approval_date,
+                proposed_manifest,
+                proposed_destinations,
+                red_tests,
+            }
+        );
+        raw_struct!(
+            structs,
+            ExactNpmPackageDef {
+                name,
+                version,
+                tarball_url,
+                integrity,
+                repository,
+                npm_git_head,
+                package_repository,
+                signature,
+                provenance,
+                tag_commit,
+                provenance_commit,
+                maintainers,
+                repository_owner,
+            }
+        );
+        raw_struct!(structs, ImmutableRepositoryDef { url, commit, tree });
+        raw_struct!(
+            structs,
+            VerifiedNpmSignatureDef {
+                key_id,
+                signature_sha256,
+            }
+        );
+        raw_struct!(structs, ExactProviderArtifactDef { provider, evidence });
+        raw_struct!(
+            structs,
+            ProviderEvidenceArtifactDef {
+                source,
+                accessed_on,
+                content_sha256,
+                terms,
+                facts,
+            }
+        );
+        raw_struct!(
+            structs,
+            ProviderFactDef {
+                fact_id,
+                location,
+                normalized_value,
+            }
+        );
+        raw_struct!(structs, ProviderContractReferenceDef { contract_id, facts });
+        raw_struct!(
+            structs,
+            DonatOwnedSourceDef {
+                repository_commit,
+                files,
+            }
+        );
+        raw_struct!(structs, RepoFileHashDef { path, sha256 });
+        raw_struct!(
+            structs,
+            ArtifactHashDef {
+                artifact_id,
+                algorithm,
+                digest,
+                path,
+            }
+        );
+        raw_struct!(
+            structs,
+            NoticeIdentityDef {
+                id,
+                license_file_path,
+                license_file_sha256,
+                required_copyright_lines,
+                notice_bundle_destination,
+            }
+        );
+        raw_struct!(
+            structs,
+            DependencyDecisionDef {
+                dependency,
+                disposition,
+            }
+        );
+        raw_struct!(
+            structs,
+            EmbeddedMaterialDecisionDef {
+                material_id,
+                path,
+                sha256,
+                disposition,
+            }
+        );
+        raw_struct!(structs, SafetyFindingsDef { findings });
+        raw_struct!(
+            structs,
+            SafetyFindingDef {
+                finding_id,
+                kind,
+                location,
+                message,
+            }
+        );
+
+        let mut tagged = Vec::new();
+        raw_tuple_enum!(tagged, RawSourceSubject {
+            ExactNpm => "exact_npm",
+            ProviderArtifact => "provider_artifact",
+            DonatOwned => "donat_owned",
+        });
+        raw_unit_enum!(tagged, ReacquisitionPlanDef {
+            ExactNpmReview => "exact_npm_review",
+            ProviderRepositoryReview => "provider_repository_review",
+            ProviderVersionedArtifactReview => "provider_versioned_artifact_review",
+            DonatOwnedNoNetwork => "donat_owned_no_network",
+        });
+        raw_struct_enum!(tagged, NpmSignatureDecisionDef {
+            Verified {
+                signatures,
+                registry_metadata_sha256,
+            } => "verified",
+            VerifiedAbsent {
+                registry_metadata_sha256,
+            } => "verified_absent",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, NpmProvenanceDecisionDef {
+            Verified {
+                statement_sha256,
+                source_commit,
+            } => "verified",
+            VerifiedAbsent {
+                registry_metadata_sha256,
+            } => "verified_absent",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, RepositoryOwnerDecisionDef {
+            Consistent {
+                package_owner,
+                repository_owner,
+            } => "consistent",
+            ReviewedMismatch { decision_id } => "reviewed_mismatch",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, ImmutableProviderEvidenceSourceDef {
+            RepositoryFile {
+                repository,
+                commit,
+                path,
+            } => "repository_file",
+            VersionedArtifact {
+                url,
+                provider_revision,
+            } => "versioned_artifact",
+        });
+        raw_struct_enum!(tagged, EvidenceTermsDispositionDef {
+            Permissive {
+                license,
+                evidence_url,
+            } => "permissive",
+            ReviewedUse {
+                decision_id,
+                evidence_url,
+            } => "reviewed_use",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, ExactFactLocationDef {
+            JsonPointer { path, pointer } => "json_pointer",
+            DocumentSection { path, section } => "document_section",
+        });
+        raw_struct_enum!(tagged, ContractFactDef {
+            ProviderEvidence {
+                source_record_id,
+                fact_id,
+            } => "provider_evidence",
+            DonatPolicy { policy_id, value } => "donat_policy",
+        });
+        raw_unit_enum!(tagged, CompatibilityDecisionDef {
+            TierA => "tier_a",
+            TierB => "tier_b",
+            TierC => "tier_c",
+            Rejected => "rejected",
+        });
+        raw_struct_enum!(tagged, AdmissionStateDef {
+            InventoryOnly { findings } => "inventory_only",
+            ApprovedForPort { operations } => "approved_for_port",
+            EvidenceAccepted { contracts } => "evidence_accepted",
+        });
+        raw_unit_enum!(tagged, HashAlgorithmDef {
+            Sha256 => "sha256",
+            Sha512 => "sha512",
+        });
+        raw_struct_enum!(tagged, LicenseDecisionDef {
+            Permissive {
+                spdx_id,
+                selected_dual_license_branch,
+                license_file_path,
+                license_file_sha256,
+            } => "permissive",
+            WrittenGrant {
+                decision_id,
+                grant_sha256,
+            } => "written_grant",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, DependencyDispositionDef {
+            Shipped { license } => "shipped",
+            BuildOnly { license } => "build_only",
+            TypeOnlyReplaced { replacement } => "type_only_replaced",
+            BehaviorOnly { reason } => "behavior_only",
+            Rejected { finding } => "rejected",
+        });
+        raw_struct_enum!(tagged, EmbeddedMaterialDispositionDef {
+            Shipped { license } => "shipped",
+            BehaviorOnly { reason } => "behavior_only",
+            Rejected { finding } => "rejected",
+        });
+        (structs, tagged)
     }
 
     #[derive(Deserialize)]
@@ -2506,214 +2781,273 @@ struct SourceVariantShape {
 enum SourceShape {
     Null,
     Bool,
-    Integer,
-    String,
+    U32,
+    String(SourceStringShape),
     Sequence(&'static SourceShape),
-    Struct(&'static [SourceFieldShape]),
-    Tagged(&'static [SourceVariantShape]),
+    Struct {
+        declaration: Option<&'static str>,
+        fields: &'static [SourceFieldShape],
+    },
+    Tagged {
+        declaration: &'static str,
+        variants: &'static [SourceVariantShape],
+    },
     Nullable(&'static SourceShape),
     TypedValue,
 }
 
+#[derive(Clone, Copy)]
+enum SourceStringShape {
+    Any,
+    Id,
+    IdOrEmpty,
+    Date,
+    ExactHttpsUrl,
+    ExactSemver,
+    Git,
+    Hash256,
+    HashDigest,
+    NonEmpty,
+    NpmName,
+    Path,
+    TypedString,
+    TypedI64,
+    TypedU64,
+    TypedDecimal,
+    InlineBinary,
+    InlineFileName,
+    InlineMediaType,
+    JsonPointer,
+}
+
 static NULL_SHAPE: SourceShape = SourceShape::Null;
 static BOOL_SHAPE: SourceShape = SourceShape::Bool;
-static INTEGER_SHAPE: SourceShape = SourceShape::Integer;
-static STRING_SHAPE: SourceShape = SourceShape::String;
+static U32_SHAPE: SourceShape = SourceShape::U32;
+static STRING_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Any);
+static ID_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Id);
+static ID_OR_EMPTY_SHAPE: SourceShape = SourceShape::String(SourceStringShape::IdOrEmpty);
+static DATE_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Date);
+static HTTPS_SHAPE: SourceShape = SourceShape::String(SourceStringShape::ExactHttpsUrl);
+static EXACT_SEMVER_SHAPE: SourceShape = SourceShape::String(SourceStringShape::ExactSemver);
+static GIT_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Git);
+static HASH256_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Hash256);
+static HASH_DIGEST_SHAPE: SourceShape = SourceShape::String(SourceStringShape::HashDigest);
+static NONEMPTY_STRING_SHAPE: SourceShape = SourceShape::String(SourceStringShape::NonEmpty);
+static NPM_NAME_SHAPE: SourceShape = SourceShape::String(SourceStringShape::NpmName);
+static PATH_SHAPE: SourceShape = SourceShape::String(SourceStringShape::Path);
+static JSON_POINTER_SHAPE: SourceShape = SourceShape::String(SourceStringShape::JsonPointer);
 static STRING_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&STRING_SHAPE);
+static ID_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&ID_SHAPE);
+static PATH_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&PATH_SHAPE);
 
 macro_rules! source_struct_shape {
+    ($name:ident as $declaration:literal { $($field:literal => $shape:ident),+ $(,)? }) => {
+        static $name: SourceShape = SourceShape::Struct {
+            declaration: Some($declaration),
+            fields: &[
+                $(SourceFieldShape { name: $field, value: &$shape }),+
+            ],
+        };
+    };
     ($name:ident { $($field:literal => $shape:ident),+ $(,)? }) => {
-        static $name: SourceShape = SourceShape::Struct(&[
-            $(SourceFieldShape { name: $field, value: &$shape }),+
-        ]);
+        static $name: SourceShape = SourceShape::Struct {
+            declaration: None,
+            fields: &[
+                $(SourceFieldShape { name: $field, value: &$shape }),+
+            ],
+        };
     };
 }
 
 macro_rules! source_tagged_shape {
-    ($name:ident { $($kind:literal => $shape:ident),+ $(,)? }) => {
-        static $name: SourceShape = SourceShape::Tagged(&[
-            $(SourceVariantShape { kind: $kind, value: &$shape }),+
-        ]);
+    ($name:ident as $declaration:literal { $($kind:literal => $shape:ident),+ $(,)? }) => {
+        static $name: SourceShape = SourceShape::Tagged {
+            declaration: $declaration,
+            variants: &[
+                $(SourceVariantShape { kind: $kind, value: &$shape }),+
+            ],
+        };
     };
 }
 
-source_struct_shape!(IMMUTABLE_REPOSITORY_SHAPE {
-    "url" => STRING_SHAPE,
-    "commit" => STRING_SHAPE,
-    "tree" => STRING_SHAPE,
+source_struct_shape!(IMMUTABLE_REPOSITORY_SHAPE as "ImmutableRepositoryDef" {
+    "url" => HTTPS_SHAPE,
+    "commit" => GIT_SHAPE,
+    "tree" => GIT_SHAPE,
 });
-source_struct_shape!(VERIFIED_SIGNATURE_SHAPE {
-    "key_id" => STRING_SHAPE,
-    "signature_sha256" => STRING_SHAPE,
+source_struct_shape!(VERIFIED_SIGNATURE_SHAPE as "VerifiedNpmSignatureDef" {
+    "key_id" => ID_SHAPE,
+    "signature_sha256" => HASH256_SHAPE,
 });
 static VERIFIED_SIGNATURE_SEQUENCE_SHAPE: SourceShape =
     SourceShape::Sequence(&VERIFIED_SIGNATURE_SHAPE);
 source_struct_shape!(NPM_SIGNATURE_VERIFIED_SHAPE {
     "signatures" => VERIFIED_SIGNATURE_SEQUENCE_SHAPE,
-    "registry_metadata_sha256" => STRING_SHAPE,
+    "registry_metadata_sha256" => HASH256_SHAPE,
 });
 source_struct_shape!(REGISTRY_METADATA_SHAPE {
-    "registry_metadata_sha256" => STRING_SHAPE,
+    "registry_metadata_sha256" => HASH256_SHAPE,
 });
 source_struct_shape!(FINDING_SHAPE {
-    "finding" => STRING_SHAPE,
+    "finding" => ID_SHAPE,
 });
-source_tagged_shape!(NPM_SIGNATURE_SHAPE {
+source_tagged_shape!(NPM_SIGNATURE_SHAPE as "NpmSignatureDecisionDef" {
     "verified" => NPM_SIGNATURE_VERIFIED_SHAPE,
     "verified_absent" => REGISTRY_METADATA_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
 source_struct_shape!(NPM_PROVENANCE_VERIFIED_SHAPE {
-    "statement_sha256" => STRING_SHAPE,
-    "source_commit" => STRING_SHAPE,
+    "statement_sha256" => HASH256_SHAPE,
+    "source_commit" => GIT_SHAPE,
 });
-source_tagged_shape!(NPM_PROVENANCE_SHAPE {
+source_tagged_shape!(NPM_PROVENANCE_SHAPE as "NpmProvenanceDecisionDef" {
     "verified" => NPM_PROVENANCE_VERIFIED_SHAPE,
     "verified_absent" => REGISTRY_METADATA_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
 source_struct_shape!(REPOSITORY_OWNER_CONSISTENT_SHAPE {
-    "package_owner" => STRING_SHAPE,
-    "repository_owner" => STRING_SHAPE,
+    "package_owner" => ID_SHAPE,
+    "repository_owner" => ID_SHAPE,
 });
 source_struct_shape!(DECISION_ID_SHAPE {
-    "decision_id" => STRING_SHAPE,
+    "decision_id" => ID_SHAPE,
 });
-source_tagged_shape!(REPOSITORY_OWNER_SHAPE {
+source_tagged_shape!(REPOSITORY_OWNER_SHAPE as "RepositoryOwnerDecisionDef" {
     "consistent" => REPOSITORY_OWNER_CONSISTENT_SHAPE,
     "reviewed_mismatch" => DECISION_ID_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
 static NULLABLE_STRING_SHAPE: SourceShape = SourceShape::Nullable(&STRING_SHAPE);
-source_struct_shape!(EXACT_NPM_SHAPE {
-    "name" => STRING_SHAPE,
-    "version" => STRING_SHAPE,
-    "tarball_url" => STRING_SHAPE,
+static NULLABLE_GIT_SHAPE: SourceShape = SourceShape::Nullable(&GIT_SHAPE);
+source_struct_shape!(EXACT_NPM_SHAPE as "ExactNpmPackageDef" {
+    "name" => NPM_NAME_SHAPE,
+    "version" => EXACT_SEMVER_SHAPE,
+    "tarball_url" => HTTPS_SHAPE,
     "integrity" => STRING_SHAPE,
     "repository" => IMMUTABLE_REPOSITORY_SHAPE,
-    "npm_git_head" => STRING_SHAPE,
-    "package_repository" => STRING_SHAPE,
+    "npm_git_head" => GIT_SHAPE,
+    "package_repository" => HTTPS_SHAPE,
     "signature" => NPM_SIGNATURE_SHAPE,
     "provenance" => NPM_PROVENANCE_SHAPE,
-    "tag_commit" => NULLABLE_STRING_SHAPE,
-    "provenance_commit" => NULLABLE_STRING_SHAPE,
-    "maintainers" => STRING_SEQUENCE_SHAPE,
+    "tag_commit" => NULLABLE_GIT_SHAPE,
+    "provenance_commit" => NULLABLE_GIT_SHAPE,
+    "maintainers" => ID_SEQUENCE_SHAPE,
     "repository_owner" => REPOSITORY_OWNER_SHAPE,
 });
 
 source_struct_shape!(REPOSITORY_FILE_SOURCE_SHAPE {
-    "repository" => STRING_SHAPE,
-    "commit" => STRING_SHAPE,
-    "path" => STRING_SHAPE,
+    "repository" => HTTPS_SHAPE,
+    "commit" => GIT_SHAPE,
+    "path" => PATH_SHAPE,
 });
 source_struct_shape!(VERSIONED_ARTIFACT_SOURCE_SHAPE {
-    "url" => STRING_SHAPE,
-    "provider_revision" => STRING_SHAPE,
+    "url" => HTTPS_SHAPE,
+    "provider_revision" => NONEMPTY_STRING_SHAPE,
 });
-source_tagged_shape!(PROVIDER_EVIDENCE_SOURCE_SHAPE {
+source_tagged_shape!(PROVIDER_EVIDENCE_SOURCE_SHAPE as "ImmutableProviderEvidenceSourceDef" {
     "repository_file" => REPOSITORY_FILE_SOURCE_SHAPE,
     "versioned_artifact" => VERSIONED_ARTIFACT_SOURCE_SHAPE,
 });
 source_struct_shape!(PERMISSIVE_LICENSE_SHAPE {
     "spdx_id" => STRING_SHAPE,
     "selected_dual_license_branch" => NULLABLE_STRING_SHAPE,
-    "license_file_path" => STRING_SHAPE,
-    "license_file_sha256" => STRING_SHAPE,
+    "license_file_path" => PATH_SHAPE,
+    "license_file_sha256" => HASH256_SHAPE,
 });
 source_struct_shape!(WRITTEN_GRANT_SHAPE {
-    "decision_id" => STRING_SHAPE,
-    "grant_sha256" => STRING_SHAPE,
+    "decision_id" => ID_SHAPE,
+    "grant_sha256" => HASH256_SHAPE,
 });
-source_tagged_shape!(LICENSE_SHAPE {
+source_tagged_shape!(LICENSE_SHAPE as "LicenseDecisionDef" {
     "permissive" => PERMISSIVE_LICENSE_SHAPE,
     "written_grant" => WRITTEN_GRANT_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
 source_struct_shape!(PERMISSIVE_TERMS_SHAPE {
     "license" => LICENSE_SHAPE,
-    "evidence_url" => STRING_SHAPE,
+    "evidence_url" => HTTPS_SHAPE,
 });
 source_struct_shape!(REVIEWED_USE_SHAPE {
-    "decision_id" => STRING_SHAPE,
-    "evidence_url" => STRING_SHAPE,
+    "decision_id" => ID_SHAPE,
+    "evidence_url" => HTTPS_SHAPE,
 });
-source_tagged_shape!(EVIDENCE_TERMS_SHAPE {
+source_tagged_shape!(EVIDENCE_TERMS_SHAPE as "EvidenceTermsDispositionDef" {
     "permissive" => PERMISSIVE_TERMS_SHAPE,
     "reviewed_use" => REVIEWED_USE_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
 source_struct_shape!(JSON_POINTER_LOCATION_SHAPE {
-    "path" => STRING_SHAPE,
-    "pointer" => STRING_SHAPE,
+    "path" => PATH_SHAPE,
+    "pointer" => JSON_POINTER_SHAPE,
 });
 source_struct_shape!(DOCUMENT_SECTION_LOCATION_SHAPE {
-    "path" => STRING_SHAPE,
-    "section" => STRING_SHAPE,
+    "path" => PATH_SHAPE,
+    "section" => NONEMPTY_STRING_SHAPE,
 });
-source_tagged_shape!(FACT_LOCATION_SHAPE {
+source_tagged_shape!(FACT_LOCATION_SHAPE as "ExactFactLocationDef" {
     "json_pointer" => JSON_POINTER_LOCATION_SHAPE,
     "document_section" => DOCUMENT_SECTION_LOCATION_SHAPE,
 });
 static TYPED_VALUE_SHAPE: SourceShape = SourceShape::TypedValue;
-source_struct_shape!(PROVIDER_FACT_SHAPE {
-    "fact_id" => STRING_SHAPE,
+source_struct_shape!(PROVIDER_FACT_SHAPE as "ProviderFactDef" {
+    "fact_id" => ID_SHAPE,
     "location" => FACT_LOCATION_SHAPE,
     "normalized_value" => TYPED_VALUE_SHAPE,
 });
 static PROVIDER_FACT_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&PROVIDER_FACT_SHAPE);
-source_struct_shape!(PROVIDER_EVIDENCE_SHAPE {
+source_struct_shape!(PROVIDER_EVIDENCE_SHAPE as "ProviderEvidenceArtifactDef" {
     "source" => PROVIDER_EVIDENCE_SOURCE_SHAPE,
-    "accessed_on" => STRING_SHAPE,
-    "content_sha256" => STRING_SHAPE,
+    "accessed_on" => DATE_SHAPE,
+    "content_sha256" => HASH256_SHAPE,
     "terms" => EVIDENCE_TERMS_SHAPE,
     "facts" => PROVIDER_FACT_SEQUENCE_SHAPE,
 });
 static PROVIDER_EVIDENCE_SEQUENCE_SHAPE: SourceShape =
     SourceShape::Sequence(&PROVIDER_EVIDENCE_SHAPE);
-source_struct_shape!(PROVIDER_ARTIFACT_SHAPE {
-    "provider" => STRING_SHAPE,
+source_struct_shape!(PROVIDER_ARTIFACT_SHAPE as "ExactProviderArtifactDef" {
+    "provider" => ID_OR_EMPTY_SHAPE,
     "evidence" => PROVIDER_EVIDENCE_SEQUENCE_SHAPE,
 });
 
-source_struct_shape!(REPO_FILE_SHAPE {
-    "path" => STRING_SHAPE,
-    "sha256" => STRING_SHAPE,
+source_struct_shape!(REPO_FILE_SHAPE as "RepoFileHashDef" {
+    "path" => PATH_SHAPE,
+    "sha256" => HASH256_SHAPE,
 });
 static REPO_FILE_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&REPO_FILE_SHAPE);
-source_struct_shape!(DONAT_OWNED_SHAPE {
-    "repository_commit" => STRING_SHAPE,
+source_struct_shape!(DONAT_OWNED_SHAPE as "DonatOwnedSourceDef" {
+    "repository_commit" => GIT_SHAPE,
     "files" => REPO_FILE_SEQUENCE_SHAPE,
 });
-source_tagged_shape!(SOURCE_SUBJECT_SHAPE {
+source_tagged_shape!(SOURCE_SUBJECT_SHAPE as "RawSourceSubject" {
     "exact_npm" => EXACT_NPM_SHAPE,
     "provider_artifact" => PROVIDER_ARTIFACT_SHAPE,
     "donat_owned" => DONAT_OWNED_SHAPE,
 });
-source_tagged_shape!(REACQUISITION_SHAPE {
+source_tagged_shape!(REACQUISITION_SHAPE as "ReacquisitionPlanDef" {
     "exact_npm_review" => NULL_SHAPE,
     "provider_repository_review" => NULL_SHAPE,
     "provider_versioned_artifact_review" => NULL_SHAPE,
     "donat_owned_no_network" => NULL_SHAPE,
 });
-source_tagged_shape!(HASH_ALGORITHM_SHAPE {
+source_tagged_shape!(HASH_ALGORITHM_SHAPE as "HashAlgorithmDef" {
     "sha256" => NULL_SHAPE,
     "sha512" => NULL_SHAPE,
 });
-source_struct_shape!(ARTIFACT_HASH_SHAPE {
-    "artifact_id" => STRING_SHAPE,
+source_struct_shape!(ARTIFACT_HASH_SHAPE as "ArtifactHashDef" {
+    "artifact_id" => ID_SHAPE,
     "algorithm" => HASH_ALGORITHM_SHAPE,
-    "digest" => STRING_SHAPE,
-    "path" => NULLABLE_STRING_SHAPE,
+    "digest" => HASH_DIGEST_SHAPE,
+    "path" => NULLABLE_PATH_SHAPE,
 });
 static ARTIFACT_HASH_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&ARTIFACT_HASH_SHAPE);
-source_struct_shape!(NOTICE_SHAPE {
-    "id" => STRING_SHAPE,
-    "license_file_path" => STRING_SHAPE,
-    "license_file_sha256" => STRING_SHAPE,
+source_struct_shape!(NOTICE_SHAPE as "NoticeIdentityDef" {
+    "id" => ID_SHAPE,
+    "license_file_path" => PATH_SHAPE,
+    "license_file_sha256" => HASH256_SHAPE,
     "required_copyright_lines" => STRING_SEQUENCE_SHAPE,
-    "notice_bundle_destination" => STRING_SHAPE,
+    "notice_bundle_destination" => PATH_SHAPE,
 });
-source_tagged_shape!(DEPENDENCY_DISPOSITION_SHAPE {
+source_tagged_shape!(DEPENDENCY_DISPOSITION_SHAPE as "DependencyDispositionDef" {
     "shipped" => SHIPPED_LICENSE_SHAPE,
     "build_only" => SHIPPED_LICENSE_SHAPE,
     "type_only_replaced" => REPLACEMENT_SHAPE,
@@ -2724,104 +3058,174 @@ source_struct_shape!(SHIPPED_LICENSE_SHAPE {
     "license" => LICENSE_SHAPE,
 });
 source_struct_shape!(REPLACEMENT_SHAPE {
-    "replacement" => STRING_SHAPE,
+    "replacement" => ID_SHAPE,
 });
 source_struct_shape!(REASON_SHAPE {
-    "reason" => STRING_SHAPE,
+    "reason" => ID_SHAPE,
 });
-source_struct_shape!(DEPENDENCY_SHAPE {
-    "dependency" => STRING_SHAPE,
+source_struct_shape!(DEPENDENCY_SHAPE as "DependencyDecisionDef" {
+    "dependency" => ID_SHAPE,
     "disposition" => DEPENDENCY_DISPOSITION_SHAPE,
 });
 static DEPENDENCY_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&DEPENDENCY_SHAPE);
-source_tagged_shape!(EMBEDDED_DISPOSITION_SHAPE {
+source_tagged_shape!(EMBEDDED_DISPOSITION_SHAPE as "EmbeddedMaterialDispositionDef" {
     "shipped" => SHIPPED_LICENSE_SHAPE,
     "behavior_only" => REASON_SHAPE,
     "rejected" => FINDING_SHAPE,
 });
-source_struct_shape!(EMBEDDED_SHAPE {
-    "material_id" => STRING_SHAPE,
-    "path" => STRING_SHAPE,
-    "sha256" => STRING_SHAPE,
+source_struct_shape!(EMBEDDED_SHAPE as "EmbeddedMaterialDecisionDef" {
+    "material_id" => ID_SHAPE,
+    "path" => PATH_SHAPE,
+    "sha256" => HASH256_SHAPE,
     "disposition" => EMBEDDED_DISPOSITION_SHAPE,
 });
 static EMBEDDED_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&EMBEDDED_SHAPE);
 source_struct_shape!(PROVIDER_CONTRACT_FACT_SHAPE {
-    "source_record_id" => STRING_SHAPE,
-    "fact_id" => STRING_SHAPE,
+    "source_record_id" => ID_SHAPE,
+    "fact_id" => ID_SHAPE,
 });
 source_struct_shape!(POLICY_CONTRACT_FACT_SHAPE {
-    "policy_id" => STRING_SHAPE,
+    "policy_id" => ID_SHAPE,
     "value" => TYPED_VALUE_SHAPE,
 });
-source_tagged_shape!(CONTRACT_FACT_SHAPE {
+source_tagged_shape!(CONTRACT_FACT_SHAPE as "ContractFactDef" {
     "provider_evidence" => PROVIDER_CONTRACT_FACT_SHAPE,
     "donat_policy" => POLICY_CONTRACT_FACT_SHAPE,
 });
 static CONTRACT_FACT_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&CONTRACT_FACT_SHAPE);
-source_struct_shape!(PROVIDER_CONTRACT_SHAPE {
-    "contract_id" => STRING_SHAPE,
+source_struct_shape!(PROVIDER_CONTRACT_SHAPE as "ProviderContractReferenceDef" {
+    "contract_id" => ID_SHAPE,
     "facts" => CONTRACT_FACT_SEQUENCE_SHAPE,
 });
 static PROVIDER_CONTRACT_SEQUENCE_SHAPE: SourceShape =
     SourceShape::Sequence(&PROVIDER_CONTRACT_SHAPE);
-source_tagged_shape!(COMPATIBILITY_SHAPE {
+source_tagged_shape!(COMPATIBILITY_SHAPE as "CompatibilityDecisionDef" {
     "tier_a" => NULL_SHAPE,
     "tier_b" => NULL_SHAPE,
     "tier_c" => NULL_SHAPE,
     "rejected" => NULL_SHAPE,
 });
 source_struct_shape!(INVENTORY_ADMISSION_SHAPE {
-    "findings" => STRING_SEQUENCE_SHAPE,
+    "findings" => ID_SEQUENCE_SHAPE,
 });
 source_struct_shape!(PORT_ADMISSION_SHAPE {
-    "operations" => STRING_SEQUENCE_SHAPE,
+    "operations" => ID_SEQUENCE_SHAPE,
 });
 source_struct_shape!(EVIDENCE_ADMISSION_SHAPE {
-    "contracts" => STRING_SEQUENCE_SHAPE,
+    "contracts" => ID_SEQUENCE_SHAPE,
 });
-source_tagged_shape!(ADMISSION_SHAPE {
+source_tagged_shape!(ADMISSION_SHAPE as "AdmissionStateDef" {
     "inventory_only" => INVENTORY_ADMISSION_SHAPE,
     "approved_for_port" => PORT_ADMISSION_SHAPE,
     "evidence_accepted" => EVIDENCE_ADMISSION_SHAPE,
 });
-source_struct_shape!(SAFETY_FINDING_SHAPE {
-    "finding_id" => STRING_SHAPE,
-    "kind" => STRING_SHAPE,
-    "location" => NULLABLE_STRING_SHAPE,
-    "message" => STRING_SHAPE,
+source_struct_shape!(SAFETY_FINDING_SHAPE as "SafetyFindingDef" {
+    "finding_id" => ID_SHAPE,
+    "kind" => ID_SHAPE,
+    "location" => NULLABLE_PATH_SHAPE,
+    "message" => NONEMPTY_STRING_SHAPE,
 });
 static SAFETY_FINDING_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&SAFETY_FINDING_SHAPE);
-source_struct_shape!(SAFETY_FINDINGS_SHAPE {
+source_struct_shape!(SAFETY_FINDINGS_SHAPE as "SafetyFindingsDef" {
     "findings" => SAFETY_FINDING_SEQUENCE_SHAPE,
 });
-static NULLABLE_PROPOSED_MANIFEST_SHAPE: SourceShape = SourceShape::Nullable(&STRING_SHAPE);
-source_struct_shape!(SOURCE_RECORD_SHAPE {
-    "record_version" => INTEGER_SHAPE,
-    "record_id" => STRING_SHAPE,
+static NULLABLE_PATH_SHAPE: SourceShape = SourceShape::Nullable(&PATH_SHAPE);
+static NULLABLE_PROPOSED_MANIFEST_SHAPE: SourceShape = SourceShape::Nullable(&PATH_SHAPE);
+source_struct_shape!(SOURCE_RECORD_SHAPE as "ConnectorSourceRecordDef" {
+    "record_version" => U32_SHAPE,
+    "record_id" => ID_SHAPE,
     "subject" => SOURCE_SUBJECT_SHAPE,
     "reacquisition" => REACQUISITION_SHAPE,
     "artifact_hashes" => ARTIFACT_HASH_SEQUENCE_SHAPE,
     "license" => LICENSE_SHAPE,
     "notice" => NOTICE_SHAPE,
-    "entrypoints" => STRING_SEQUENCE_SHAPE,
+    "entrypoints" => PATH_SEQUENCE_SHAPE,
     "dependencies" => DEPENDENCY_SEQUENCE_SHAPE,
     "embedded_material" => EMBEDDED_SEQUENCE_SHAPE,
     "provider_contracts" => PROVIDER_CONTRACT_SEQUENCE_SHAPE,
     "compatibility" => COMPATIBILITY_SHAPE,
     "admission" => ADMISSION_SHAPE,
     "safety_findings" => SAFETY_FINDINGS_SHAPE,
-    "reviewer" => STRING_SHAPE,
-    "approval_date" => STRING_SHAPE,
+    "reviewer" => ID_SHAPE,
+    "approval_date" => DATE_SHAPE,
     "proposed_manifest" => NULLABLE_PROPOSED_MANIFEST_SHAPE,
-    "proposed_destinations" => STRING_SEQUENCE_SHAPE,
-    "red_tests" => STRING_SEQUENCE_SHAPE,
+    "proposed_destinations" => PATH_SEQUENCE_SHAPE,
+    "red_tests" => ID_SEQUENCE_SHAPE,
 });
 
 #[derive(Default)]
 struct SourceShapeIssues {
     structure: bool,
-    scalar_kind: bool,
+    invalid_primitive: bool,
+    material_schema: bool,
+}
+
+fn inspect_source_string(value: &str, shape: SourceStringShape, issues: &mut SourceShapeIssues) {
+    let valid = match shape {
+        SourceStringShape::Any => true,
+        SourceStringShape::Id => valid_id(value),
+        SourceStringShape::IdOrEmpty => value.is_empty() || valid_id(value),
+        SourceStringShape::Date => valid_date(value),
+        SourceStringShape::ExactHttpsUrl => valid_https(value),
+        SourceStringShape::ExactSemver => valid_exact_semver(value),
+        SourceStringShape::Git => valid_git(value),
+        SourceStringShape::Hash256 => valid_hash256(value),
+        SourceStringShape::HashDigest => valid_hash(value, 64) || valid_hash(value, 128),
+        SourceStringShape::NonEmpty => valid_nonempty_string(value),
+        SourceStringShape::NpmName => value.is_empty() || valid_npm_name(value),
+        SourceStringShape::Path => valid_path(value),
+        SourceStringShape::JsonPointer => valid_json_pointer(value),
+        SourceStringShape::TypedString => validate_unicode_scalar_string(value).is_ok(),
+        SourceStringShape::TypedI64 => value
+            .parse::<i64>()
+            .is_ok_and(|parsed| parsed.to_string() == value),
+        SourceStringShape::TypedU64 => value
+            .parse::<u64>()
+            .is_ok_and(|parsed| parsed.to_string() == value),
+        SourceStringShape::TypedDecimal => {
+            donat_value_contract::CanonicalDecimal::try_new(value).is_ok()
+        }
+        SourceStringShape::InlineBinary => base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|decoded| {
+                decoded.len() <= 131_072
+                    && base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded) == value
+            }),
+        SourceStringShape::InlineFileName => {
+            BoundedInlineBytes::try_new(Vec::new(), "application/octet-stream", Some(value), 0)
+                .is_ok()
+        }
+        SourceStringShape::InlineMediaType => {
+            BoundedInlineBytes::try_new(Vec::new(), value, None, 0).is_ok()
+        }
+    };
+    if !valid {
+        if matches!(
+            shape,
+            SourceStringShape::TypedString
+                | SourceStringShape::TypedI64
+                | SourceStringShape::TypedU64
+                | SourceStringShape::TypedDecimal
+                | SourceStringShape::InlineBinary
+                | SourceStringShape::InlineFileName
+                | SourceStringShape::InlineMediaType
+        ) {
+            issues.material_schema = true;
+        } else {
+            issues.invalid_primitive = true;
+        }
+    }
+}
+
+fn inspect_lossless_u32(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) {
+    let valid = match node {
+        LosslessYamlNode::Number(LosslessYamlNumber::I64(value)) => u32::try_from(*value).is_ok(),
+        LosslessYamlNode::Number(LosslessYamlNumber::U64(value)) => u32::try_from(*value).is_ok(),
+        _ => false,
+    };
+    if !valid {
+        issues.invalid_primitive = true;
+    }
 }
 
 fn mapping_entries<'node>(
@@ -2892,15 +3296,19 @@ fn inspect_tagged_shape(
     }) {
         issues.structure = true;
     }
-    let Some(kind) = kinds.first() else {
-        return;
-    };
-    let LosslessYamlNode::String(kind) = kind else {
-        issues.structure = true;
-        return;
-    };
-    let Some(variant) = variants.iter().find(|variant| variant.kind == kind) else {
-        issues.structure = true;
+    let mut selected_variant = None;
+    for kind in kinds {
+        let LosslessYamlNode::String(kind) = kind else {
+            issues.structure = true;
+            continue;
+        };
+        let Some(variant) = variants.iter().find(|variant| variant.kind == kind) else {
+            issues.structure = true;
+            continue;
+        };
+        selected_variant.get_or_insert(variant);
+    }
+    let Some(variant) = selected_variant else {
         return;
     };
     for value in values {
@@ -2909,33 +3317,52 @@ fn inspect_tagged_shape(
 }
 
 fn inspect_typed_value(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) {
-    static INLINE_BYTES_SHAPE: SourceShape = SourceShape::Struct(&[
-        SourceFieldShape {
-            name: "$binary",
-            value: &STRING_SHAPE,
-        },
-        SourceFieldShape {
-            name: "file_name",
-            value: &NULLABLE_STRING_SHAPE,
-        },
-        SourceFieldShape {
-            name: "media_type",
-            value: &NULLABLE_STRING_SHAPE,
-        },
-    ]);
+    static TYPED_STRING_SHAPE: SourceShape = SourceShape::String(SourceStringShape::TypedString);
+    static TYPED_I64_SHAPE: SourceShape = SourceShape::String(SourceStringShape::TypedI64);
+    static TYPED_U64_SHAPE: SourceShape = SourceShape::String(SourceStringShape::TypedU64);
+    static TYPED_DECIMAL_SHAPE: SourceShape = SourceShape::String(SourceStringShape::TypedDecimal);
+    static INLINE_BINARY_SHAPE: SourceShape = SourceShape::String(SourceStringShape::InlineBinary);
+    static INLINE_FILE_NAME_SHAPE: SourceShape =
+        SourceShape::String(SourceStringShape::InlineFileName);
+    static INLINE_MEDIA_TYPE_SHAPE: SourceShape =
+        SourceShape::String(SourceStringShape::InlineMediaType);
+    static NULLABLE_INLINE_FILE_NAME_SHAPE: SourceShape =
+        SourceShape::Nullable(&INLINE_FILE_NAME_SHAPE);
+    static NULLABLE_INLINE_MEDIA_TYPE_SHAPE: SourceShape =
+        SourceShape::Nullable(&INLINE_MEDIA_TYPE_SHAPE);
+    static INLINE_BYTES_SHAPE: SourceShape = SourceShape::Struct {
+        declaration: None,
+        fields: &[
+            SourceFieldShape {
+                name: "$binary",
+                value: &INLINE_BINARY_SHAPE,
+            },
+            SourceFieldShape {
+                name: "file_name",
+                value: &NULLABLE_INLINE_FILE_NAME_SHAPE,
+            },
+            SourceFieldShape {
+                name: "media_type",
+                value: &NULLABLE_INLINE_MEDIA_TYPE_SHAPE,
+            },
+        ],
+    };
     let Some(entries) = mapping_entries(node, issues) else {
         return;
     };
-    let kind = entries.iter().find_map(|(key, value)| {
-        matches!(key, LosslessYamlNode::String(name) if name == "kind").then_some(value)
-    });
+    let kinds = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(key, LosslessYamlNode::String(name) if name == "kind").then_some(value)
+        })
+        .collect::<Vec<_>>();
     let values = entries
         .iter()
         .filter_map(|(key, value)| {
             matches!(key, LosslessYamlNode::String(name) if name == "value").then_some(value)
         })
         .collect::<Vec<_>>();
-    if kind.is_none()
+    if kinds.is_empty()
         || values.is_empty()
         || entries.iter().any(|(key, _)| {
             !matches!(key, LosslessYamlNode::String(name) if name == "kind" || name == "value")
@@ -2943,14 +3370,39 @@ fn inspect_typed_value(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) 
     {
         issues.structure = true;
     }
-    let Some(LosslessYamlNode::String(kind)) = kind else {
-        issues.structure = true;
+    let mut selected_kind = None;
+    for kind in kinds {
+        let LosslessYamlNode::String(kind) = kind else {
+            issues.structure = true;
+            continue;
+        };
+        if !matches!(
+            kind.as_str(),
+            "null"
+                | "boolean"
+                | "string"
+                | "i64"
+                | "u64"
+                | "decimal"
+                | "inline_bytes"
+                | "list"
+                | "object"
+        ) {
+            issues.structure = true;
+            continue;
+        }
+        selected_kind.get_or_insert(kind.as_str());
+    }
+    let Some(kind) = selected_kind else {
         return;
     };
-    let scalar_shape = match kind.as_str() {
+    let scalar_shape = match kind {
         "null" => Some(&NULL_SHAPE),
         "boolean" => Some(&BOOL_SHAPE),
-        "string" | "i64" | "u64" | "decimal" => Some(&STRING_SHAPE),
+        "string" => Some(&TYPED_STRING_SHAPE),
+        "i64" => Some(&TYPED_I64_SHAPE),
+        "u64" => Some(&TYPED_U64_SHAPE),
+        "decimal" => Some(&TYPED_DECIMAL_SHAPE),
         "inline_bytes" => Some(&INLINE_BYTES_SHAPE),
         "list" | "object" => None,
         _ => {
@@ -2959,7 +3411,7 @@ fn inspect_typed_value(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) 
         }
     };
     for value in values {
-        match kind.as_str() {
+        match kind {
             "list" => match value {
                 LosslessYamlNode::Sequence(values) => {
                     for value in values {
@@ -2971,8 +3423,13 @@ fn inspect_typed_value(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) 
             "object" => match value {
                 LosslessYamlNode::Mapping(entries) => {
                     for (key, value) in entries {
-                        if !matches!(key, LosslessYamlNode::String(_)) {
-                            issues.structure = true;
+                        match key {
+                            LosslessYamlNode::String(name) => {
+                                if validate_unicode_scalar_string(name).is_err() {
+                                    issues.material_schema = true;
+                                }
+                            }
+                            _ => issues.structure = true,
                         }
                         inspect_typed_value(value, issues);
                     }
@@ -2996,11 +3453,12 @@ fn inspect_source_shape(
     match shape {
         SourceShape::Null if matches!(node, LosslessYamlNode::Null) => {}
         SourceShape::Bool if matches!(node, LosslessYamlNode::Bool(_)) => {}
-        SourceShape::Integer if matches!(node, LosslessYamlNode::Number(_)) => {}
-        SourceShape::String if matches!(node, LosslessYamlNode::String(_)) => {}
-        SourceShape::Null | SourceShape::Bool | SourceShape::Integer | SourceShape::String => {
-            issues.scalar_kind = true
-        }
+        SourceShape::U32 => inspect_lossless_u32(node, issues),
+        SourceShape::String(shape) => match node {
+            LosslessYamlNode::String(value) => inspect_source_string(value, *shape, issues),
+            _ => issues.invalid_primitive = true,
+        },
+        SourceShape::Null | SourceShape::Bool => issues.invalid_primitive = true,
         SourceShape::Sequence(value_shape) => match node {
             LosslessYamlNode::Sequence(values) => {
                 for value in values {
@@ -3009,8 +3467,20 @@ fn inspect_source_shape(
             }
             _ => issues.structure = true,
         },
-        SourceShape::Struct(fields) => inspect_struct_shape(node, fields, issues),
-        SourceShape::Tagged(variants) => inspect_tagged_shape(node, variants, issues),
+        SourceShape::Struct {
+            declaration,
+            fields,
+        } => {
+            let _ = declaration;
+            inspect_struct_shape(node, fields, issues);
+        }
+        SourceShape::Tagged {
+            declaration,
+            variants,
+        } => {
+            let _ = declaration;
+            inspect_tagged_shape(node, variants, issues);
+        }
         SourceShape::Nullable(value_shape) => {
             if !matches!(node, LosslessYamlNode::Null) {
                 inspect_source_shape(node, value_shape, issues);
@@ -3018,6 +3488,356 @@ fn inspect_source_shape(
         }
         SourceShape::TypedValue => inspect_typed_value(node, issues),
     }
+}
+
+fn lossless_mapping(node: &LosslessYamlNode) -> &[(LosslessYamlNode, LosslessYamlNode)] {
+    let LosslessYamlNode::Mapping(entries) = node else {
+        unreachable!("lossless source structure was validated before staged access");
+    };
+    entries
+}
+
+fn lossless_field<'node>(node: &'node LosslessYamlNode, name: &str) -> &'node LosslessYamlNode {
+    lossless_mapping(node)
+        .iter()
+        .find_map(|(key, value)| {
+            matches!(key, LosslessYamlNode::String(candidate) if candidate == name).then_some(value)
+        })
+        .unwrap_or_else(|| {
+            unreachable!("lossless source member was validated before staged access: {name}")
+        })
+}
+
+fn lossless_string(node: &LosslessYamlNode) -> &str {
+    let LosslessYamlNode::String(value) = node else {
+        unreachable!("lossless source scalar kind was validated before staged access");
+    };
+    value
+}
+
+fn lossless_sequence(node: &LosslessYamlNode) -> &[LosslessYamlNode] {
+    let LosslessYamlNode::Sequence(values) = node else {
+        unreachable!("lossless source sequence was validated before staged access");
+    };
+    values
+}
+
+fn lossless_tagged(node: &LosslessYamlNode) -> (&str, &LosslessYamlNode) {
+    (
+        lossless_string(lossless_field(node, "kind")),
+        lossless_field(node, "value"),
+    )
+}
+
+fn lossless_fields<'node>(
+    node: &'node LosslessYamlNode,
+    name: &'node str,
+) -> impl Iterator<Item = &'node LosslessYamlNode> {
+    lossless_mapping(node)
+        .iter()
+        .filter_map(move |(key, value)| {
+            matches!(key, LosslessYamlNode::String(candidate) if candidate == name).then_some(value)
+        })
+}
+
+fn lossless_is_zero_u32(node: &LosslessYamlNode) -> bool {
+    matches!(
+        node,
+        LosslessYamlNode::Number(LosslessYamlNumber::I64(0))
+            | LosslessYamlNode::Number(LosslessYamlNumber::U64(0))
+    )
+}
+
+fn validate_lossless_required_structure(node: &LosslessYamlNode) -> Result<(), CatalogError> {
+    if lossless_is_zero_u32(lossless_field(node, "record_version"))
+        || lossless_sequence(lossless_field(node, "entrypoints")).is_empty()
+        || lossless_sequence(lossless_field(node, "proposed_destinations")).is_empty()
+        || lossless_sequence(lossless_field(node, "red_tests")).is_empty()
+        || matches!(
+            lossless_field(node, "reviewer"),
+            LosslessYamlNode::String(value) if value.is_empty()
+        )
+    {
+        return source_error(
+            "source_record_incomplete",
+            "required source-record collection or review identity is empty",
+        );
+    }
+
+    let (subject_kind, subject) = lossless_tagged(lossless_field(node, "subject"));
+    match subject_kind {
+        "exact_npm"
+            if matches!(
+                lossless_field(subject, "name"),
+                LosslessYamlNode::String(value) if value.is_empty()
+            ) || lossless_sequence(lossless_field(subject, "maintainers")).is_empty() =>
+        {
+            source_error(
+                "source_record_incomplete",
+                "exact npm identity and maintainer inventory must be nonempty",
+            )
+        }
+        "provider_artifact"
+            if matches!(
+                lossless_field(subject, "provider"),
+                LosslessYamlNode::String(value) if value.is_empty()
+            ) =>
+        {
+            source_error(
+                "source_record_incomplete",
+                "provider identity must be nonempty",
+            )
+        }
+        "donat_owned" if lossless_sequence(lossless_field(subject, "files")).is_empty() => {
+            source_error(
+                "source_record_incomplete",
+                "Donat-owned file inventory must be nonempty",
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_lossless_contextual_primitives(node: &LosslessYamlNode) -> Result<(), CatalogError> {
+    for artifact in lossless_sequence(lossless_field(node, "artifact_hashes")) {
+        let algorithms = lossless_fields(artifact, "algorithm")
+            .map(lossless_tagged)
+            .map(|(kind, _)| kind)
+            .collect::<Vec<_>>();
+        for digest in lossless_fields(artifact, "digest").map(lossless_string) {
+            let matches_an_algorithm = algorithms.iter().any(|algorithm| match *algorithm {
+                "sha256" => valid_hash(digest, 64),
+                "sha512" => valid_hash(digest, 128),
+                _ => unreachable!("lossless hash algorithm was structurally validated"),
+            });
+            if !matches_an_algorithm {
+                return invalid_primitive("artifact digest does not match its hash algorithm");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_lossless_license_legal(node: &LosslessYamlNode) -> Result<(), CatalogError> {
+    let (kind, value) = lossless_tagged(node);
+    match kind {
+        "permissive" => validate_permissive_license_legal(
+            lossless_string(lossless_field(value, "spdx_id")),
+            match lossless_field(value, "selected_dual_license_branch") {
+                LosslessYamlNode::Null => None,
+                value => Some(lossless_string(value)),
+            },
+        ),
+        "written_grant" => Ok(()),
+        "rejected" => legal_mismatch("license is rejected"),
+        _ => unreachable!("lossless license branch was structurally validated"),
+    }
+}
+
+fn validate_lossless_legal_state(node: &LosslessYamlNode) -> Result<(), CatalogError> {
+    let license = lossless_field(node, "license");
+    validate_lossless_license_legal(license)?;
+    let (license_kind, license_value) = lossless_tagged(license);
+    if license_kind == "permissive" {
+        let notice = lossless_field(node, "notice");
+        if lossless_string(lossless_field(license_value, "license_file_path"))
+            != lossless_string(lossless_field(notice, "license_file_path"))
+            || lossless_string(lossless_field(license_value, "license_file_sha256"))
+                != lossless_string(lossless_field(notice, "license_file_sha256"))
+        {
+            return legal_mismatch("license and notice identities disagree");
+        }
+    }
+
+    for dependency in lossless_sequence(lossless_field(node, "dependencies")) {
+        let (kind, value) = lossless_tagged(lossless_field(dependency, "disposition"));
+        if matches!(kind, "shipped" | "build_only") {
+            validate_lossless_license_legal(lossless_field(value, "license"))?;
+        }
+    }
+    for embedded in lossless_sequence(lossless_field(node, "embedded_material")) {
+        let (kind, value) = lossless_tagged(lossless_field(embedded, "disposition"));
+        if kind == "shipped" {
+            validate_lossless_license_legal(lossless_field(value, "license"))?;
+        }
+    }
+
+    let (subject_kind, subject) = lossless_tagged(lossless_field(node, "subject"));
+    if subject_kind == "provider_artifact" {
+        for evidence in lossless_sequence(lossless_field(subject, "evidence")) {
+            let (kind, value) = lossless_tagged(lossless_field(evidence, "terms"));
+            match kind {
+                "permissive" => {
+                    validate_lossless_license_legal(lossless_field(value, "license"))?;
+                }
+                "reviewed_use" => {}
+                "rejected" => {
+                    return legal_mismatch("provider evidence terms are rejected");
+                }
+                _ => unreachable!("lossless evidence-terms branch was structurally validated"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lossless_unique<'node>(
+    values: impl IntoIterator<Item = &'node str>,
+) -> Result<(), CatalogError> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !seen.insert(value) {
+            return duplicate(value.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn lossless_member_string<'node>(node: &'node LosslessYamlNode, name: &str) -> &'node str {
+    lossless_string(lossless_field(node, name))
+}
+
+fn lossless_contract_fact_key(fact: &LosslessYamlNode) -> String {
+    let (kind, value) = lossless_tagged(fact);
+    match kind {
+        "provider_evidence" => format!(
+            "provider:{}:{}",
+            lossless_member_string(value, "source_record_id"),
+            lossless_member_string(value, "fact_id")
+        ),
+        "donat_policy" => format!("policy:{}", lossless_member_string(value, "policy_id")),
+        _ => unreachable!("lossless contract-fact branch was structurally validated"),
+    }
+}
+
+fn lossless_provider_source_key(source: &LosslessYamlNode) -> String {
+    let (kind, value) = lossless_tagged(source);
+    match kind {
+        "repository_file" => format!(
+            "repository:{}\0{}\0{}",
+            lossless_member_string(value, "repository"),
+            lossless_member_string(value, "commit"),
+            lossless_member_string(value, "path")
+        ),
+        "versioned_artifact" => format!(
+            "artifact:{}\0{}",
+            lossless_member_string(value, "url"),
+            lossless_member_string(value, "provider_revision")
+        ),
+        _ => unreachable!("lossless provider-source branch was structurally validated"),
+    }
+}
+
+fn validate_lossless_duplicates(node: &LosslessYamlNode) -> Result<(), CatalogError> {
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "entrypoints"))
+            .iter()
+            .map(lossless_string),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "artifact_hashes"))
+            .iter()
+            .map(|artifact| lossless_member_string(artifact, "artifact_id")),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "dependencies"))
+            .iter()
+            .map(|dependency| lossless_member_string(dependency, "dependency")),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "embedded_material"))
+            .iter()
+            .map(|embedded| lossless_member_string(embedded, "material_id")),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "provider_contracts"))
+            .iter()
+            .map(|contract| lossless_member_string(contract, "contract_id")),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "proposed_destinations"))
+            .iter()
+            .map(lossless_string),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(node, "red_tests"))
+            .iter()
+            .map(lossless_string),
+    )?;
+    lossless_unique(
+        lossless_sequence(lossless_field(
+            lossless_field(node, "safety_findings"),
+            "findings",
+        ))
+        .iter()
+        .map(|finding| lossless_member_string(finding, "finding_id")),
+    )?;
+
+    let (admission_kind, admission) = lossless_tagged(lossless_field(node, "admission"));
+    let admission_member = match admission_kind {
+        "inventory_only" => "findings",
+        "approved_for_port" => "operations",
+        "evidence_accepted" => "contracts",
+        _ => unreachable!("lossless admission branch was structurally validated"),
+    };
+    lossless_unique(
+        lossless_sequence(lossless_field(admission, admission_member))
+            .iter()
+            .map(lossless_string),
+    )?;
+
+    let (subject_kind, subject) = lossless_tagged(lossless_field(node, "subject"));
+    match subject_kind {
+        "exact_npm" => {
+            lossless_unique(
+                lossless_sequence(lossless_field(subject, "maintainers"))
+                    .iter()
+                    .map(lossless_string),
+            )?;
+            let (signature_kind, signature) = lossless_tagged(lossless_field(subject, "signature"));
+            if signature_kind == "verified" {
+                lossless_unique(
+                    lossless_sequence(lossless_field(signature, "signatures"))
+                        .iter()
+                        .map(|value| lossless_member_string(value, "key_id")),
+                )?;
+            }
+        }
+        "provider_artifact" => {
+            let mut evidence_keys = BTreeSet::new();
+            let mut fact_ids = BTreeSet::new();
+            for evidence in lossless_sequence(lossless_field(subject, "evidence")) {
+                let key = (
+                    lossless_provider_source_key(lossless_field(evidence, "source")),
+                    lossless_member_string(evidence, "content_sha256"),
+                );
+                if !evidence_keys.insert(key) {
+                    return duplicate("provider evidence");
+                }
+                for fact in lossless_sequence(lossless_field(evidence, "facts")) {
+                    if !fact_ids.insert(lossless_member_string(fact, "fact_id")) {
+                        return duplicate("provider fact");
+                    }
+                }
+            }
+            for contract in lossless_sequence(lossless_field(node, "provider_contracts")) {
+                let keys = lossless_sequence(lossless_field(contract, "facts"))
+                    .iter()
+                    .map(lossless_contract_fact_key)
+                    .collect::<Vec<_>>();
+                lossless_unique(keys.iter().map(String::as_str))?;
+            }
+        }
+        "donat_owned" => {
+            lossless_unique(
+                lossless_sequence(lossless_field(subject, "files"))
+                    .iter()
+                    .map(|file| lossless_member_string(file, "path")),
+            )?;
+        }
+        _ => unreachable!("lossless source-subject branch was structurally validated"),
+    }
+    Ok(())
 }
 
 pub fn load_record(path: impl AsRef<Path>) -> Result<ConnectorSourceRecord, CatalogError> {
@@ -3037,18 +3857,25 @@ pub fn load_record_bytes(bytes: &[u8]) -> Result<ConnectorSourceRecord, CatalogE
             "source record has an unknown, missing, or malformed structural member",
         ));
     }
-    if issues.scalar_kind {
+    validate_lossless_required_structure(&parsed)?;
+    if issues.invalid_primitive {
         return invalid_primitive("source record scalar kind");
     }
+    if issues.material_schema {
+        return Err(material_schema_error());
+    }
+    validate_lossless_contextual_primitives(&parsed)?;
+    if parsed.has_duplicate_mapping_key() {
+        return duplicate("source mapping member");
+    }
+    validate_lossless_duplicates(&parsed)?;
+    validate_lossless_legal_state(&parsed)?;
 
     let deduplicated = parsed.to_yaml_value();
     let record = serde_yaml::from_value::<source_record_input::Input>(deduplicated)
         .map_err(map_source_decode_error)?
         .0;
-    if parsed.has_duplicate_mapping_key() {
-        return duplicate("source mapping member");
-    }
-    validate_record(&record)?;
+    validate_record_after_lossless_stages(&record)?;
     Ok(record)
 }
 
@@ -3087,6 +3914,12 @@ fn validate_record(record: &ConnectorSourceRecord) -> Result<(), CatalogError> {
     validate_record_primitives(record)?;
     validate_record_duplicates(record)?;
     validate_record_legal_state(record)?;
+    validate_record_after_lossless_stages(record)
+}
+
+fn validate_record_after_lossless_stages(
+    record: &ConnectorSourceRecord,
+) -> Result<(), CatalogError> {
     validate_record_evidence(record)?;
     validate_record_admission(record)
 }
@@ -3877,6 +4710,21 @@ fn validate_license_primitives(license: &LicenseDecision) -> Result<(), CatalogE
 }
 
 fn validate_license_legal(license: &LicenseDecision) -> Result<(), CatalogError> {
+    match license {
+        LicenseDecision::Permissive {
+            spdx_id,
+            selected_dual_license_branch,
+            ..
+        } => validate_permissive_license_legal(spdx_id, selected_dual_license_branch.as_deref()),
+        LicenseDecision::WrittenGrant { .. } => Ok(()),
+        LicenseDecision::Rejected { .. } => legal_mismatch("license is rejected"),
+    }
+}
+
+fn validate_permissive_license_legal(
+    spdx_id: &str,
+    selected_dual_license_branch: Option<&str>,
+) -> Result<(), CatalogError> {
     const ALLOWED: &[&str] = &[
         "MIT",
         "Apache-2.0",
@@ -3885,32 +4733,20 @@ fn validate_license_legal(license: &LicenseDecision) -> Result<(), CatalogError>
         "ISC",
         "0BSD",
     ];
-    match license {
-        LicenseDecision::Permissive {
-            spdx_id,
-            selected_dual_license_branch,
-            ..
-        } => {
-            if ALLOWED.contains(&spdx_id.as_str()) {
-                if selected_dual_license_branch.is_some() {
-                    return legal_mismatch("single license cannot select a dual branch");
-                }
-                return Ok(());
-            }
-            let branches = spdx_id.split(" OR ").collect::<Vec<_>>();
-            if branches.len() < 2
-                || branches.iter().any(|branch| !ALLOWED.contains(branch))
-                || selected_dual_license_branch
-                    .as_ref()
-                    .is_none_or(|selected| !branches.contains(&selected.as_str()))
-            {
-                return legal_mismatch("Phase-1 permissive license decision");
-            }
-            Ok(())
+    if ALLOWED.contains(&spdx_id) {
+        if selected_dual_license_branch.is_some() {
+            return legal_mismatch("single license cannot select a dual branch");
         }
-        LicenseDecision::WrittenGrant { .. } => Ok(()),
-        LicenseDecision::Rejected { .. } => legal_mismatch("license is rejected"),
+        return Ok(());
     }
+    let branches = spdx_id.split(" OR ").collect::<Vec<_>>();
+    if branches.len() < 2
+        || branches.iter().any(|branch| !ALLOWED.contains(branch))
+        || selected_dual_license_branch.is_none_or(|selected| !branches.contains(&selected))
+    {
+        return legal_mismatch("Phase-1 permissive license decision");
+    }
+    Ok(())
 }
 
 fn valid_date(value: &str) -> bool {
@@ -4144,4 +4980,810 @@ fn evidence_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
 
 fn admission_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
     source_error("source_record_admission_mismatch", detail)
+}
+
+#[cfg(test)]
+mod declaration_totality_tests {
+    use super::*;
+
+    type StructInventory = BTreeMap<&'static str, BTreeSet<&'static str>>;
+    type TaggedInventory = BTreeMap<&'static str, BTreeMap<&'static str, BTreeSet<&'static str>>>;
+
+    fn typed_value_raw_declaration() -> RawTaggedDeclaration {
+        #[allow(dead_code)]
+        fn exhaustive(value: TypedValueMaterial) {
+            match value {
+                TypedValueMaterial::Null => {}
+                TypedValueMaterial::Boolean(_) => {}
+                TypedValueMaterial::String(_) => {}
+                TypedValueMaterial::I64(_) => {}
+                TypedValueMaterial::U64(_) => {}
+                TypedValueMaterial::Decimal(_) => {}
+                TypedValueMaterial::List(_) => {}
+                TypedValueMaterial::Object(_) => {}
+                TypedValueMaterial::InlineBytes {
+                    binary: _,
+                    file_name: _,
+                    media_type: _,
+                } => {}
+            }
+        }
+        RawTaggedDeclaration {
+            name: "TypedValueMaterial",
+            variants: vec![
+                RawVariantDeclaration {
+                    tag: "null",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "boolean",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "string",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "i64",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "u64",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "decimal",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "list",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "object",
+                    fields: Vec::new(),
+                },
+                RawVariantDeclaration {
+                    tag: "inline_bytes",
+                    fields: vec!["$binary", "file_name", "media_type"],
+                },
+            ],
+        }
+    }
+
+    fn declared_inventory() -> (StructInventory, TaggedInventory) {
+        let (structs, mut tagged) = source_record_input::raw_declaration_inventory();
+        tagged.push(typed_value_raw_declaration());
+        let structs = structs
+            .into_iter()
+            .map(|declaration| (declaration.name, declaration.fields.into_iter().collect()))
+            .collect();
+        let tagged = tagged
+            .into_iter()
+            .map(|declaration| {
+                (
+                    declaration.name,
+                    declaration
+                        .variants
+                        .into_iter()
+                        .map(|variant| (variant.tag, variant.fields.into_iter().collect()))
+                        .collect(),
+                )
+            })
+            .collect();
+        (structs, tagged)
+    }
+
+    fn shape_inventory() -> (StructInventory, TaggedInventory) {
+        fn visit(
+            shape: &'static SourceShape,
+            structs: &mut StructInventory,
+            tagged: &mut TaggedInventory,
+            visited: &mut BTreeSet<usize>,
+        ) {
+            let identity = std::ptr::from_ref(shape) as usize;
+            if !visited.insert(identity) {
+                return;
+            }
+            match shape {
+                SourceShape::Null
+                | SourceShape::Bool
+                | SourceShape::U32
+                | SourceShape::String(_) => {}
+                SourceShape::Sequence(value) | SourceShape::Nullable(value) => {
+                    visit(value, structs, tagged, visited);
+                }
+                SourceShape::Struct {
+                    declaration,
+                    fields,
+                } => {
+                    if let Some(declaration) = declaration {
+                        let prior = structs
+                            .insert(declaration, fields.iter().map(|field| field.name).collect());
+                        assert!(prior.is_none(), "duplicate struct shape {declaration}");
+                    }
+                    for field in *fields {
+                        visit(field.value, structs, tagged, visited);
+                    }
+                }
+                SourceShape::Tagged {
+                    declaration,
+                    variants,
+                } => {
+                    let branches = variants
+                        .iter()
+                        .map(|variant| {
+                            let fields = match variant.value {
+                                SourceShape::Struct {
+                                    declaration: None,
+                                    fields,
+                                } => fields.iter().map(|field| field.name).collect(),
+                                _ => BTreeSet::new(),
+                            };
+                            (variant.kind, fields)
+                        })
+                        .collect();
+                    let prior = tagged.insert(declaration, branches);
+                    assert!(prior.is_none(), "duplicate tagged shape {declaration}");
+                    for variant in *variants {
+                        visit(variant.value, structs, tagged, visited);
+                    }
+                }
+                SourceShape::TypedValue => {
+                    tagged.insert(
+                        "TypedValueMaterial",
+                        [
+                            ("null", BTreeSet::new()),
+                            ("boolean", BTreeSet::new()),
+                            ("string", BTreeSet::new()),
+                            ("i64", BTreeSet::new()),
+                            ("u64", BTreeSet::new()),
+                            ("decimal", BTreeSet::new()),
+                            ("list", BTreeSet::new()),
+                            ("object", BTreeSet::new()),
+                            (
+                                "inline_bytes",
+                                ["$binary", "file_name", "media_type"].into_iter().collect(),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
+                }
+            }
+        }
+
+        let mut structs = BTreeMap::new();
+        let mut tagged = BTreeMap::new();
+        visit(
+            &SOURCE_RECORD_SHAPE,
+            &mut structs,
+            &mut tagged,
+            &mut BTreeSet::new(),
+        );
+        (structs, tagged)
+    }
+
+    fn case_coverage(
+        node: &LosslessYamlNode,
+        shape: &'static SourceShape,
+        structs: &mut BTreeSet<&'static str>,
+        tagged: &mut BTreeSet<(&'static str, String)>,
+    ) {
+        match shape {
+            SourceShape::Null | SourceShape::Bool | SourceShape::U32 | SourceShape::String(_) => {}
+            SourceShape::Sequence(value_shape) => {
+                for value in lossless_sequence(node) {
+                    case_coverage(value, value_shape, structs, tagged);
+                }
+            }
+            SourceShape::Struct {
+                declaration,
+                fields,
+            } => {
+                if let Some(declaration) = declaration {
+                    structs.insert(declaration);
+                }
+                for field in *fields {
+                    case_coverage(
+                        lossless_field(node, field.name),
+                        field.value,
+                        structs,
+                        tagged,
+                    );
+                }
+            }
+            SourceShape::Tagged {
+                declaration,
+                variants,
+            } => {
+                let (kind, value) = lossless_tagged(node);
+                tagged.insert((declaration, kind.to_owned()));
+                let variant = variants
+                    .iter()
+                    .find(|variant| variant.kind == kind)
+                    .expect("case branch is declared");
+                case_coverage(value, variant.value, structs, tagged);
+            }
+            SourceShape::Nullable(value_shape) => {
+                if !matches!(node, LosslessYamlNode::Null) {
+                    case_coverage(node, value_shape, structs, tagged);
+                }
+            }
+            SourceShape::TypedValue => {
+                let (kind, value) = lossless_tagged(node);
+                tagged.insert(("TypedValueMaterial", kind.to_owned()));
+                match kind {
+                    "list" => {
+                        for value in lossless_sequence(value) {
+                            case_coverage(value, &TYPED_VALUE_SHAPE, structs, tagged);
+                        }
+                    }
+                    "object" => {
+                        for (_, value) in lossless_mapping(value) {
+                            case_coverage(value, &TYPED_VALUE_SHAPE, structs, tagged);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    struct BranchCase {
+        name: &'static str,
+        document: serde_json::Value,
+        expected_error: Option<&'static str>,
+    }
+
+    fn fixture_value(source: &str) -> serde_json::Value {
+        serde_yaml::from_str(source).unwrap()
+    }
+
+    fn branch_cases() -> Vec<BranchCase> {
+        let npm = fixture_value(include_str!("../tests/fixtures/serpapi-npm-record.yaml"));
+        let provider = fixture_value(include_str!(
+            "../tests/fixtures/provider-contract-record.yaml"
+        ));
+        let donat = fixture_value(include_str!("../tests/fixtures/donat-owned-record.yaml"));
+        let permissive_license = serde_json::json!({
+            "kind": "permissive",
+            "value": {
+                "spdx_id": "MIT",
+                "selected_dual_license_branch": null,
+                "license_file_path": "LICENSE",
+                "license_file_sha256":
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+            }
+        });
+        let written_grant = serde_json::json!({
+            "kind": "written_grant",
+            "value": {
+                "decision_id": "review.written.grant",
+                "grant_sha256":
+                    "3333333333333333333333333333333333333333333333333333333333333333"
+            }
+        });
+
+        let mut npm_collections = npm.clone();
+        npm_collections["dependencies"] = serde_json::json!([
+            {
+                "dependency": "dependency.shipped",
+                "disposition": {
+                    "kind": "shipped",
+                    "value": {"license": permissive_license.clone()}
+                }
+            },
+            {
+                "dependency": "dependency.build",
+                "disposition": {
+                    "kind": "build_only",
+                    "value": {"license": written_grant.clone()}
+                }
+            },
+            {
+                "dependency": "dependency.type",
+                "disposition": {
+                    "kind": "type_only_replaced",
+                    "value": {"replacement": "donat.value.contract"}
+                }
+            },
+            {
+                "dependency": "dependency.behavior",
+                "disposition": {
+                    "kind": "behavior_only",
+                    "value": {"reason": "finding.behavior.only"}
+                }
+            },
+            {
+                "dependency": "dependency.rejected",
+                "disposition": {
+                    "kind": "rejected",
+                    "value": {"finding": "finding.dependency.rejected"}
+                }
+            }
+        ]);
+        npm_collections["embedded_material"] = serde_json::json!([
+            {
+                "material_id": "embedded.shipped",
+                "path": "embedded/shipped.json",
+                "sha256":
+                    "4444444444444444444444444444444444444444444444444444444444444444",
+                "disposition": {
+                    "kind": "shipped",
+                    "value": {"license": permissive_license.clone()}
+                }
+            },
+            {
+                "material_id": "embedded.behavior",
+                "path": "embedded/behavior.json",
+                "sha256":
+                    "5555555555555555555555555555555555555555555555555555555555555555",
+                "disposition": {
+                    "kind": "behavior_only",
+                    "value": {"reason": "finding.embedded.behavior"}
+                }
+            },
+            {
+                "material_id": "embedded.rejected",
+                "path": "embedded/rejected.json",
+                "sha256":
+                    "6666666666666666666666666666666666666666666666666666666666666666",
+                "disposition": {
+                    "kind": "rejected",
+                    "value": {"finding": "finding.embedded.rejected"}
+                }
+            }
+        ]);
+        npm_collections["provider_contracts"] = serde_json::json!([{
+            "contract_id": "contract.policy.values",
+            "facts": [
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.null",
+                        "value": {"kind": "null", "value": null}
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.boolean",
+                        "value": {"kind": "boolean", "value": true}
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.i64",
+                        "value": {"kind": "i64", "value": "-1"}
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.u64",
+                        "value": {"kind": "u64", "value": "1"}
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.decimal",
+                        "value": {"kind": "decimal", "value": "1.5"}
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.list",
+                        "value": {
+                            "kind": "list",
+                            "value": [{"kind": "string", "value": "list-value"}]
+                        }
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.object",
+                        "value": {
+                            "kind": "object",
+                            "value": {
+                                "member": {"kind": "string", "value": "object-value"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "kind": "donat_policy",
+                    "value": {
+                        "policy_id": "policy.inline",
+                        "value": {
+                            "kind": "inline_bytes",
+                            "value": {
+                                "$binary": "Wg",
+                                "file_name": null,
+                                "media_type": "application/octet-stream"
+                            }
+                        }
+                    }
+                }
+            ]
+        }]);
+        npm_collections["compatibility"] = serde_json::json!({"kind": "tier_b", "value": null});
+
+        let mut npm_absent_mismatch_written = npm.clone();
+        npm_absent_mismatch_written["subject"]["value"]["signature"] = serde_json::json!({
+            "kind": "verified_absent",
+            "value": {
+                "registry_metadata_sha256":
+                    "8192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90"
+            }
+        });
+        npm_absent_mismatch_written["subject"]["value"]["repository_owner"] = serde_json::json!({
+            "kind": "reviewed_mismatch",
+            "value": {"decision_id": "review.owner.mismatch"}
+        });
+        npm_absent_mismatch_written["license"] = written_grant.clone();
+        npm_absent_mismatch_written["compatibility"] =
+            serde_json::json!({"kind": "tier_c", "value": null});
+
+        let mut npm_rejected_verified = npm.clone();
+        npm_rejected_verified["subject"]["value"]["signature"] = serde_json::json!({
+            "kind": "rejected",
+            "value": {"finding": "finding.signature.rejected"}
+        });
+        npm_rejected_verified["subject"]["value"]["provenance"] = serde_json::json!({
+            "kind": "verified",
+            "value": {
+                "statement_sha256":
+                    "7777777777777777777777777777777777777777777777777777777777777777",
+                "source_commit": "0123456789abcdef0123456789abcdef01234567"
+            }
+        });
+        npm_rejected_verified["subject"]["value"]["provenance_commit"] =
+            serde_json::json!("0123456789abcdef0123456789abcdef01234567");
+        npm_rejected_verified["subject"]["value"]["repository_owner"] = serde_json::json!({
+            "kind": "rejected",
+            "value": {"finding": "finding.owner.rejected"}
+        });
+        npm_rejected_verified["compatibility"] =
+            serde_json::json!({"kind": "rejected", "value": null});
+
+        let mut npm_provenance_rejected = npm.clone();
+        npm_provenance_rejected["subject"]["value"]["provenance"] = serde_json::json!({
+            "kind": "rejected",
+            "value": {"finding": "finding.provenance.rejected"}
+        });
+
+        let mut provider_permissive = provider.clone();
+        provider_permissive["subject"]["value"]["evidence"][0]["terms"] = serde_json::json!({
+            "kind": "permissive",
+            "value": {
+                "license": permissive_license.clone(),
+                "evidence_url": "https://example.test/terms/permissive"
+            }
+        });
+
+        let mut provider_versioned = provider.clone();
+        provider_versioned["subject"]["value"]["evidence"][0]["source"] = serde_json::json!({
+            "kind": "versioned_artifact",
+            "value": {
+                "url": "https://example.test/releases/v1/openapi.json",
+                "provider_revision": "v1"
+            }
+        });
+        provider_versioned["subject"]["value"]["evidence"][0]["facts"][0]["location"] = serde_json::json!({
+            "kind": "document_section",
+            "value": {
+                "path": "releases/v1/openapi.json",
+                "section": "Idempotency"
+            }
+        });
+        provider_versioned["reacquisition"] = serde_json::json!({
+            "kind": "provider_versioned_artifact_review",
+            "value": null
+        });
+        provider_versioned["artifact_hashes"][0]["path"] =
+            serde_json::json!("releases/v1/openapi.json");
+
+        let mut rejected_license = npm.clone();
+        rejected_license["license"] = serde_json::json!({
+            "kind": "rejected",
+            "value": {"finding": "finding.license.rejected"}
+        });
+
+        let mut rejected_terms = provider.clone();
+        rejected_terms["subject"]["value"]["evidence"][0]["terms"] = serde_json::json!({
+            "kind": "rejected",
+            "value": {"finding": "finding.terms.rejected"}
+        });
+
+        vec![
+            BranchCase {
+                name: "npm-verified",
+                document: npm,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "provider-repository-reviewed-use",
+                document: provider,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "donat-owned",
+                document: donat,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "npm-collections-and-typed-values",
+                document: npm_collections,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "npm-absent-mismatch-written-grant",
+                document: npm_absent_mismatch_written,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "npm-rejected-and-verified-provenance",
+                document: npm_rejected_verified,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "npm-rejected-provenance",
+                document: npm_provenance_rejected,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "provider-permissive-terms",
+                document: provider_permissive,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "provider-versioned-document-section",
+                document: provider_versioned,
+                expected_error: None,
+            },
+            BranchCase {
+                name: "rejected-license",
+                document: rejected_license,
+                expected_error: Some("source_record_legal_mismatch"),
+            },
+            BranchCase {
+                name: "rejected-evidence-terms",
+                document: rejected_terms,
+                expected_error: Some("source_record_legal_mismatch"),
+            },
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum CasePathStep {
+        Member(String),
+        Index(usize),
+    }
+
+    #[derive(Clone, Debug)]
+    enum StructuralMutation {
+        UnknownMember(Vec<CasePathStep>),
+        MissingMember {
+            object: Vec<CasePathStep>,
+            member: String,
+        },
+        InvalidTag(Vec<CasePathStep>),
+    }
+
+    fn collect_structural_mutations(
+        value: &serde_json::Value,
+        shape: &'static SourceShape,
+        path: &mut Vec<CasePathStep>,
+        mutations: &mut Vec<StructuralMutation>,
+    ) {
+        match shape {
+            SourceShape::Null | SourceShape::Bool | SourceShape::U32 | SourceShape::String(_) => {}
+            SourceShape::Sequence(value_shape) => {
+                for (index, value) in value.as_array().unwrap().iter().enumerate() {
+                    path.push(CasePathStep::Index(index));
+                    collect_structural_mutations(value, value_shape, path, mutations);
+                    path.pop();
+                }
+            }
+            SourceShape::Struct { fields, .. } => {
+                mutations.push(StructuralMutation::UnknownMember(path.clone()));
+                for field in *fields {
+                    mutations.push(StructuralMutation::MissingMember {
+                        object: path.clone(),
+                        member: field.name.to_owned(),
+                    });
+                    path.push(CasePathStep::Member(field.name.to_owned()));
+                    collect_structural_mutations(&value[field.name], field.value, path, mutations);
+                    path.pop();
+                }
+            }
+            SourceShape::Tagged { variants, .. } => {
+                mutations.push(StructuralMutation::UnknownMember(path.clone()));
+                mutations.push(StructuralMutation::MissingMember {
+                    object: path.clone(),
+                    member: "kind".to_owned(),
+                });
+                mutations.push(StructuralMutation::MissingMember {
+                    object: path.clone(),
+                    member: "value".to_owned(),
+                });
+                mutations.push(StructuralMutation::InvalidTag(path.clone()));
+                let kind = value["kind"].as_str().unwrap();
+                let variant = variants
+                    .iter()
+                    .find(|variant| variant.kind == kind)
+                    .unwrap();
+                path.push(CasePathStep::Member("value".to_owned()));
+                collect_structural_mutations(&value["value"], variant.value, path, mutations);
+                path.pop();
+            }
+            SourceShape::Nullable(value_shape) => {
+                if !value.is_null() {
+                    collect_structural_mutations(value, value_shape, path, mutations);
+                }
+            }
+            SourceShape::TypedValue => {
+                mutations.push(StructuralMutation::UnknownMember(path.clone()));
+                mutations.push(StructuralMutation::MissingMember {
+                    object: path.clone(),
+                    member: "kind".to_owned(),
+                });
+                mutations.push(StructuralMutation::MissingMember {
+                    object: path.clone(),
+                    member: "value".to_owned(),
+                });
+                mutations.push(StructuralMutation::InvalidTag(path.clone()));
+                match value["kind"].as_str().unwrap() {
+                    "list" => {
+                        path.push(CasePathStep::Member("value".to_owned()));
+                        for (index, value) in value["value"].as_array().unwrap().iter().enumerate()
+                        {
+                            path.push(CasePathStep::Index(index));
+                            collect_structural_mutations(
+                                value,
+                                &TYPED_VALUE_SHAPE,
+                                path,
+                                mutations,
+                            );
+                            path.pop();
+                        }
+                        path.pop();
+                    }
+                    "object" => {
+                        path.push(CasePathStep::Member("value".to_owned()));
+                        for (name, value) in value["value"].as_object().unwrap() {
+                            path.push(CasePathStep::Member(name.clone()));
+                            collect_structural_mutations(
+                                value,
+                                &TYPED_VALUE_SHAPE,
+                                path,
+                                mutations,
+                            );
+                            path.pop();
+                        }
+                        path.pop();
+                    }
+                    "inline_bytes" => {
+                        let payload_path = {
+                            let mut payload = path.clone();
+                            payload.push(CasePathStep::Member("value".to_owned()));
+                            payload
+                        };
+                        mutations.push(StructuralMutation::UnknownMember(payload_path.clone()));
+                        for member in ["$binary", "file_name", "media_type"] {
+                            mutations.push(StructuralMutation::MissingMember {
+                                object: payload_path.clone(),
+                                member: member.to_owned(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn value_at_path_mut<'value>(
+        mut value: &'value mut serde_json::Value,
+        path: &[CasePathStep],
+    ) -> &'value mut serde_json::Value {
+        for step in path {
+            value = match step {
+                CasePathStep::Member(member) => &mut value[member],
+                CasePathStep::Index(index) => &mut value[*index],
+            };
+        }
+        value
+    }
+
+    fn apply_structural_mutation(document: &mut serde_json::Value, mutation: &StructuralMutation) {
+        match mutation {
+            StructuralMutation::UnknownMember(path) => {
+                value_at_path_mut(document, path)
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("__unknown_member".to_owned(), serde_json::json!(true));
+            }
+            StructuralMutation::MissingMember { object, member } => {
+                value_at_path_mut(document, object)
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(member);
+            }
+            StructuralMutation::InvalidTag(path) => {
+                value_at_path_mut(document, path)["kind"] = serde_json::json!("unknown_branch");
+            }
+        }
+    }
+
+    #[test]
+    fn private_raw_declarations_and_public_loader_cases_are_branch_total() {
+        let declared = declared_inventory();
+        assert_eq!(shape_inventory(), declared);
+
+        let mut covered_structs = BTreeSet::new();
+        let mut covered_tagged = BTreeSet::new();
+        for case in branch_cases() {
+            let bytes = serde_yaml::to_string(&case.document).unwrap();
+            match case.expected_error {
+                None => {
+                    load_record_bytes(bytes.as_bytes()).unwrap_or_else(|error| {
+                        panic!("branch case {} must be accepted: {error}", case.name)
+                    });
+                }
+                Some(expected) => {
+                    let error = load_record_bytes(bytes.as_bytes()).unwrap_err();
+                    assert_eq!(error.code(), expected, "branch case {}", case.name);
+                }
+            }
+            let node = serde_yaml::from_str::<LosslessYamlNode>(&bytes).unwrap();
+            case_coverage(
+                &node,
+                &SOURCE_RECORD_SHAPE,
+                &mut covered_structs,
+                &mut covered_tagged,
+            );
+
+            let mut mutations = Vec::new();
+            collect_structural_mutations(
+                &case.document,
+                &SOURCE_RECORD_SHAPE,
+                &mut Vec::new(),
+                &mut mutations,
+            );
+            for mutation in mutations {
+                let mut changed = case.document.clone();
+                apply_structural_mutation(&mut changed, &mutation);
+                let changed = serde_yaml::to_string(&changed).unwrap();
+                let error = load_record_bytes(changed.as_bytes()).unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    "source_record_incomplete",
+                    "branch case {} mutation {mutation:?}: {error}",
+                    case.name,
+                );
+            }
+        }
+        assert_eq!(
+            covered_structs,
+            declared.0.keys().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            covered_tagged,
+            declared
+                .1
+                .iter()
+                .flat_map(|(name, variants)| {
+                    variants
+                        .keys()
+                        .map(move |variant| (*name, (*variant).to_owned()))
+                })
+                .collect::<BTreeSet<_>>()
+        );
+    }
 }
