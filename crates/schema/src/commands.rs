@@ -1025,6 +1025,14 @@ fn collect_required_session_variables(
                 perms: Vec::new(),
                 type_name: table_base_name(entry),
             };
+            collect_step_session_assignments(
+                &step.operation,
+                info,
+                role,
+                &mut required,
+                &declared_custom_scalars,
+                path,
+            )?;
             if let Some(context) = planner.table_ctx_by_name(&entry.table, role) {
                 for permission in context.perms {
                     collect_sessions_from_predicate(
@@ -1199,6 +1207,56 @@ fn collect_required_session_variables(
         by_role.insert(permission.role.clone(), required);
     }
     Ok(by_role)
+}
+
+fn collect_step_session_assignments(
+    operation: &CommandStepOperation,
+    info: &TableInfo,
+    role: &str,
+    required: &mut BTreeMap<String, TypeRef>,
+    declared_custom_scalars: &BTreeSet<&str>,
+    path: &str,
+) -> Result<(), PlanError> {
+    let maps: Vec<&BTreeMap<String, CommandValue>> = match operation {
+        CommandStepOperation::SelectOne { select_one } => vec![&select_one.by],
+        CommandStepOperation::SelectMany { select_many } => vec![&select_many.by],
+        CommandStepOperation::Insert { insert } => vec![&insert.object],
+        CommandStepOperation::InsertMany { insert_many } => vec![&insert_many.object],
+        CommandStepOperation::Update { update } => vec![&update.predicate, &update.set],
+        CommandStepOperation::UpdateMany { update_many } => vec![&update_many.set],
+        CommandStepOperation::Delete { delete } => vec![&delete.predicate],
+        CommandStepOperation::UpdateWhen { update_when } => {
+            vec![&update_when.predicate, &update_when.set]
+        }
+        CommandStepOperation::InsertWhen { insert_when } => vec![&insert_when.object],
+        CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::Assert { .. }
+        | CommandStepOperation::AssertWhen { .. }
+        | CommandStepOperation::Decision { .. }
+        | CommandStepOperation::DecisionMany { .. }
+        | CommandStepOperation::Project { .. }
+        | CommandStepOperation::ProjectMany { .. }
+        | CommandStepOperation::FixedRows { .. }
+        | CommandStepOperation::AllocateMany { .. } => Vec::new(),
+    };
+    for values in maps {
+        for (column_name, value) in values {
+            let CommandValue::SessionVariable { session_variable } = value else {
+                continue;
+            };
+            let column = info.column(column_name).ok_or_else(|| {
+                PlanError::validation(path, format!("unknown command column '{column_name}'"))
+            })?;
+            insert_session_contract(
+                required,
+                role,
+                session_variable,
+                required_column_contract(column, declared_custom_scalars, path)?,
+                path,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_sessions_from_predicate(
@@ -4394,19 +4452,36 @@ fn value_type(
             Ok(actual)
         }
         CommandValue::SessionVariable { session_variable } => {
-            if !matches!(use_, ValueUse::Effect) {
-                return Err(PlanError::validation(
-                    path,
-                    "session variables are allowed only in command effect bindings",
-                ));
+            if matches!(use_, ValueUse::Effect) {
+                if secret_looking(session_variable) {
+                    return Err(PlanError::validation(
+                        path,
+                        "effect bindings cannot use a secret-looking session variable",
+                    ));
+                }
+                return Ok(StaticType::Scalar("String".to_string()));
             }
             if secret_looking(session_variable) {
                 return Err(PlanError::validation(
                     path,
-                    "effect bindings cannot use a secret-looking session variable",
+                    "command bindings cannot use a secret-looking session variable",
                 ));
             }
-            Ok(StaticType::Scalar("String".to_string()))
+            let concrete_scalar = matches!(expected, Some(StaticType::Scalar(_)))
+                || matches!(
+                    expected,
+                    Some(StaticType::Nullable(inner))
+                        if matches!(inner.as_ref(), StaticType::Scalar(_))
+                );
+            if matches!(use_, ValueUse::Data) && concrete_scalar {
+                return Ok(expected
+                    .expect("a concrete scalar target was matched")
+                    .clone());
+            }
+            Err(PlanError::validation(
+                path,
+                "session variables require a concrete scalar command target",
+            ))
         }
         CommandValue::DatabaseTime { database_time } => {
             if database_time != "now" {

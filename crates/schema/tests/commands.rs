@@ -1138,6 +1138,8 @@ fn command_execution_identity_is_source_and_explicit_role_qualified() {
 #[test]
 fn command_planning_resolves_execution_facts_without_raw_metadata() {
     let mut command = valid_command();
+    command["steps"][0]["insert"]["object"]["customer_id"] =
+        json!({ "session_variable": "x-donat-user-id" });
     command["guards"] = json!([{
         "rule": "customer_is_allowed",
         "with": { "customer_id": { "arg": "customer_id" } },
@@ -1155,11 +1157,23 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
         .check = json!({ "customer_id": { "_eq": "X-Donat-User-Id" } });
     let catalogs = HashMap::from([("default".to_string(), catalog(RelationKind::Table))]);
     let commands = command_catalog(&metadata, &catalogs);
+    assert_eq!(
+        commands
+            .source("default")
+            .unwrap()
+            .command("create_order")
+            .unwrap()
+            .descriptor()
+            .required_session_variables["customer"]["x-donat-user-id"],
+        required_scalar(ValueScalar::Uuid),
+        "a typed command assignment contributes its concrete column contract"
+    );
+    let user_id = "550e8400-e29b-41d4-a716-446655440001";
     let plan = plan_runtime_for_session(
         &metadata,
         &catalogs,
-        commands,
-        session_with_vars("customer", [("x-donat-user-id", "customer-7")]),
+        commands.clone(),
+        session_with_vars("customer", [("x-donat-user-id", user_id)]),
         r#"
             mutation {
               submitted: create_order(
@@ -1191,7 +1205,7 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
     assert!(matches!(
         &customer_id.value,
         CommandExecutionValue::Scalar { value, pg_type }
-            if value == &Scalar::Json(json!("550e8400-e29b-41d4-a716-446655440001"))
+            if value == &Scalar::Json(json!(user_id))
                 && pg_type == "uuid"
     ));
     assert!(check.is_some(), "the explicit role's insert check is in IR");
@@ -1225,9 +1239,9 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
             [CommandExecutionValue::Scalar {
                 value: Scalar::Json(value),
                 pg_type,
-            }] if value == &json!("customer-7") && pg_type == "text"
+            }] if value == &json!(user_id) && pg_type == "uuid"
         ),
-        "declared session scope is resolved into typed execution values before SQLgen"
+        "the same session value keeps its typed contract in the idempotency scope"
     );
     assert_eq!(idempotency.retention_seconds, Some(30 * 24 * 60 * 60));
     let serialized = serde_json::to_value(command).expect("execution IR serializes");
@@ -1238,6 +1252,30 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
     assert!(
         !serialized.to_string().contains("customer_is_allowed"),
         "the raw rule name/source is absent from execution IR: {serialized:#}"
+    );
+
+    let missing = plan_runtime_for_session(
+        &metadata,
+        &catalogs,
+        commands,
+        session("customer"),
+        r#"
+            mutation {
+              create_order(
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                customer_id: "550e8400-e29b-41d4-a716-446655440001"
+                status: "new"
+                quantity: 1
+                request_id: "550e8400-e29b-41d4-a716-446655440002"
+              ) { order_id }
+            }
+        "#,
+    )
+    .expect_err("a typed command session binding requires its header");
+    assert_eq!(missing.code, "not-found");
+    assert_eq!(
+        missing.message,
+        "missing session variable: \"x-donat-user-id\""
     );
 }
 

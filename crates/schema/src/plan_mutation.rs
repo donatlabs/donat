@@ -292,13 +292,8 @@ impl<'a> Planner<'a> {
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
 
-        let idempotency = self.resolve_command_idempotency(
-            definition,
-            &arguments,
-            &resolved_steps,
-            session,
-            path,
-        )?;
+        let idempotency =
+            self.resolve_command_idempotency(command, &arguments, &resolved_steps, session, path)?;
         let effects = definition
             .effects
             .iter()
@@ -392,6 +387,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 let filter = self.permission_predicate(&context, session, path)?;
@@ -425,6 +421,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 let order_by =
@@ -696,6 +693,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -745,6 +743,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -827,6 +826,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     Some(&item),
                     None,
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -892,6 +892,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 let mut set = self.resolve_command_assignments(
@@ -902,6 +903,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -955,6 +957,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 let mut set = self.resolve_command_assignments(
@@ -965,6 +968,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -1032,6 +1036,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     Some(&item),
                     Some(&current),
+                    session,
                     path,
                 )?;
                 let mut assignments = self.resolve_command_assignments(
@@ -1042,6 +1047,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     Some(&item),
                     Some(&current),
+                    session,
                     path,
                 )?;
                 self.apply_command_presets(
@@ -1114,6 +1120,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     None,
                     None,
+                    session,
                     path,
                 )?;
                 let returning = self.command_columns(&delete.table, &delete.returning, path)?;
@@ -1180,6 +1187,7 @@ impl<'a> Planner<'a> {
                     &request_column,
                     arguments,
                     previous_steps,
+                    None,
                     None,
                     None,
                     path,
@@ -1417,6 +1425,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     item,
                     None,
+                    None,
                     path,
                 )?;
                 Ok(CommandNamedValue {
@@ -1447,6 +1456,7 @@ impl<'a> Planner<'a> {
                     column,
                     arguments,
                     previous_steps,
+                    None,
                     None,
                     None,
                     path,
@@ -1487,6 +1497,7 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     item,
+                    None,
                     None,
                     path,
                 )?;
@@ -1574,6 +1585,7 @@ impl<'a> Planner<'a> {
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         item: Option<&CommandItemContext>,
         current: Option<&CommandCurrentContext>,
+        session: &Session,
         path: &str,
     ) -> Result<Vec<CommandAssignment>, PlanError> {
         let info = self.catalog_table(table).ok_or_else(|| {
@@ -1593,6 +1605,7 @@ impl<'a> Planner<'a> {
                     previous_steps,
                     item,
                     current,
+                    Some(session),
                     path,
                 )?;
                 Ok(CommandAssignment { column, value })
@@ -1610,6 +1623,7 @@ impl<'a> Planner<'a> {
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         item: Option<&CommandItemContext>,
         current: Option<&CommandCurrentContext>,
+        session: Option<&Session>,
         path: &str,
     ) -> Result<CommandExecutionValue, PlanError> {
         match value {
@@ -1621,6 +1635,25 @@ impl<'a> Planner<'a> {
                 value: Scalar::Json(literal.clone()),
                 pg_type: target.pg_type.clone(),
             }),
+            CommandValue::SessionVariable { session_variable } => {
+                let session = session.ok_or_else(|| {
+                    PlanError::validation(path, "session variable escaped its typed command target")
+                })?;
+                let value = session.var(session_variable).ok_or_else(|| {
+                    PlanError::new(
+                        path,
+                        "not-found",
+                        format!(
+                            "missing session variable: \"{}\"",
+                            session_variable.to_ascii_lowercase()
+                        ),
+                    )
+                })?;
+                Ok(CommandExecutionValue::Scalar {
+                    value: Scalar::Json(Json::String(value.to_owned())),
+                    pg_type: target.pg_type.clone(),
+                })
+            }
             CommandValue::Step {
                 step,
                 column: Some(column),
@@ -1693,12 +1726,9 @@ impl<'a> Planner<'a> {
                     pg_type: target.pg_type.clone(),
                 })
             }
-            CommandValue::Step { .. }
-            | CommandValue::SessionVariable { .. }
-            | CommandValue::DatabaseTime { .. } => Err(PlanError::validation(
-                path,
-                "command value cannot lower to a scalar target",
-            )),
+            CommandValue::Step { .. } | CommandValue::DatabaseTime { .. } => Err(
+                PlanError::validation(path, "command value cannot lower to a scalar target"),
+            ),
         }
     }
 
@@ -2043,13 +2073,14 @@ impl<'a> Planner<'a> {
 
     fn resolve_command_idempotency(
         &self,
-        command: &Command,
+        command: &CompiledCommand,
         arguments: &BTreeMap<String, Scalar>,
         steps: &BTreeMap<String, ResolvedCommandStep>,
         session: &Session,
         path: &str,
     ) -> Result<Option<CommandIdempotency>, PlanError> {
-        let Some(idempotency) = &command.idempotency else {
+        let definition = command.definition();
+        let Some(idempotency) = &definition.idempotency else {
             return Ok(None);
         };
         let CommandIdempotencyKey::Argument { argument } = &idempotency.key;
@@ -2062,7 +2093,8 @@ impl<'a> Planner<'a> {
                     CommandIdempotencyScope::Argument { argument } => {
                         Ok(CommandExecutionValue::Scalar {
                             value: command_argument(arguments, argument, path)?,
-                            pg_type: command_argument_pg_type(command, argument, path)?.to_owned(),
+                            pg_type: command_argument_pg_type(definition, argument, path)?
+                                .to_owned(),
                         })
                     }
                     CommandIdempotencyScope::SessionVariable { session_variable } => {
@@ -2078,7 +2110,16 @@ impl<'a> Planner<'a> {
                         })?;
                         Ok(CommandExecutionValue::Scalar {
                             value: Scalar::Json(Json::String(value.to_owned())),
-                            pg_type: "text".to_owned(),
+                            pg_type: command
+                                .descriptor()
+                                .required_session_variables
+                                .get(&session.role)
+                                .and_then(|required| {
+                                    required.get(&session_variable.to_ascii_lowercase())
+                                })
+                                .map(session_contract_pg_type)
+                                .transpose()?
+                                .unwrap_or_else(|| "text".to_owned()),
                         })
                     }
                     CommandIdempotencyScope::Step { step, column } => {
@@ -3770,6 +3811,32 @@ fn command_argument_nullable(command: &Command, name: &str, path: &str) -> Resul
     Ok(!command_argument_definition(command, name, path)?
         .type_
         .ends_with('!'))
+}
+
+fn session_contract_pg_type(contract: &TypeRef) -> Result<String, PlanError> {
+    let pg_type = match &contract.value_type {
+        ValueType::Scalar { scalar } => match scalar {
+            ValueScalar::Boolean => "bool".to_owned(),
+            ValueScalar::String => "text".to_owned(),
+            ValueScalar::Int32 => "int4".to_owned(),
+            ValueScalar::Int64 => "int8".to_owned(),
+            ValueScalar::UInt64 | ValueScalar::Decimal => "numeric".to_owned(),
+            ValueScalar::Uuid => "uuid".to_owned(),
+            ValueScalar::Date => "date".to_owned(),
+            ValueScalar::Timestamp => "timestamp".to_owned(),
+            ValueScalar::TimestampTz => "timestamptz".to_owned(),
+            ValueScalar::Json => "jsonb".to_owned(),
+            ValueScalar::Custom { name } => name.clone(),
+        },
+        ValueType::Enum { .. } => "text".to_owned(),
+        ValueType::Object { .. } | ValueType::List { .. } | ValueType::Ref { .. } => {
+            return Err(PlanError::validation(
+                "$",
+                "command session contract must resolve to one scalar value",
+            ));
+        }
+    };
+    Ok(pg_type)
 }
 
 fn command_rule_pg_type(type_: &RuleType) -> &'static str {
