@@ -16,6 +16,9 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/010-static-community-connector-factory-and-runtime-boundaries]]
 - [[decisions/011-version-independent-rust-boundary-lexer]]
 - [[decisions/012-canonical-catalog-projections-and-persisted-header-capabilities]]
+- [[decisions/013-petshop-first-executable-requirements]]
+- [[decisions/014-command-relational-batches]]
+- [[decisions/015-petshop-modular-pressure-suite]]
 
 ## Reference governance
 
