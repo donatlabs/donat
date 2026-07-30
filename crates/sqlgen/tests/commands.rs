@@ -2295,17 +2295,15 @@ fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinalit
                 CommandNamedValue {
                     name: "unit_price_minor".to_owned(),
                     column: column("unit_price_minor", "int8"),
-                    value: CommandExecutionValue::Item {
-                        field: "unit_price_minor".to_owned(),
-                        pg_type: "int8".to_owned(),
+                    value: CommandExecutionValue::CurrentColumn {
+                        column: column("unit_price_minor", "int8"),
                     },
                 },
                 CommandNamedValue {
                     name: "currency".to_owned(),
                     column: column("currency", "text"),
-                    value: CommandExecutionValue::Item {
-                        field: "currency".to_owned(),
-                        pg_type: "text".to_owned(),
+                    value: CommandExecutionValue::CurrentColumn {
+                        column: column("currency", "text"),
                     },
                 },
             ],

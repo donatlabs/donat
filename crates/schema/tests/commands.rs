@@ -680,7 +680,7 @@ fn relational_batch_rejects_invalid_update_many_input_and_assignments() {
         json!({ "current_column": "quantity" });
     assert_rejected(
         current_outside_update_many,
-        "current_column values are allowed only inside update_many",
+        "current_column values require a bounded current-row or update_many target-row scope",
     );
 }
 
@@ -1026,8 +1026,8 @@ fn aggregate_accepts_cardinality_preserving_project_many_without_inventing_non_e
                     "from": { "step": "selected" },
                     "maximum_rows": 256,
                     "values": {
-                        "quantity": { "item": "quantity" },
-                        "status": { "item": "status" }
+                        "quantity": { "current_column": "quantity" },
+                        "status": { "current_column": "status" }
                     }
                 }
             }),
@@ -4273,6 +4273,150 @@ fn petshop_decision_rejects_input_type_mismatch() {
         error.message,
         "String is not assignable to decision input 'quantity' (Int)"
     );
+}
+
+#[test]
+fn bounded_row_current_column_compiles_and_plans_for_decision_and_projection() {
+    let mut command = relational_batch_command();
+    command["steps"] = json!([
+        command["steps"][0].clone(),
+        {
+            "name": "routed",
+            "decision_many": {
+                "decision_table": "quantity_route",
+                "from": { "step": "selected" },
+                "input": {
+                    "quantity": { "current_column": "quantity" }
+                },
+                "returning": [
+                    "id", "customer_id", "status", "quantity", "route", "multiplier"
+                ],
+                "order_by": ["id"]
+            }
+        },
+        {
+            "name": "projected",
+            "project_many": {
+                "from": { "step": "routed" },
+                "maximum_rows": 256,
+                "values": {
+                    "status": { "current_column": "status" },
+                    "route": { "current_column": "route" },
+                    "quantity": {
+                        "rule": "double_quantity",
+                        "with": {
+                            "quantity": { "current_column": "quantity" }
+                        }
+                    }
+                }
+            }
+        }
+    ]);
+    command["result"] = json!({ "projected": { "step": "projected" } });
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = Arc::new(
+        compile_command_catalog(&metadata, &catalogs, &petshop_decision_rules(), true)
+            .expect("bounded current rows compile"),
+    );
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"
+          mutation {
+            reserve_orders(customer_id: "00000000-0000-0000-0000-000000000001") {
+              projected { status route quantity }
+            }
+          }
+        "#,
+    )
+    .expect("bounded current rows plan");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one command root");
+    };
+    let CommandExecutionStep::DecisionMany { input, .. } = &command.steps[1] else {
+        panic!("second step is decision_many");
+    };
+    assert!(matches!(
+        &input[0].value,
+        CommandExecutionValue::CurrentColumn { column }
+            if column.name == "quantity" && column.pg_type == "int4" && !column.nullable
+    ));
+    let CommandExecutionStep::ProjectMany { values, .. } = &command.steps[2] else {
+        panic!("third step is project_many");
+    };
+    assert!(values.iter().any(|value| {
+        value.name == "status"
+            && matches!(
+                &value.value,
+                CommandExecutionValue::CurrentColumn { column }
+                    if column.name == "status" && column.pg_type == "text"
+            )
+    }));
+    assert!(values.iter().any(|value| {
+        value.name == "quantity"
+            && matches!(
+                &value.value,
+                CommandExecutionValue::Rule { sql, pg_type }
+                    if sql.contains("\"_cmd_input\".\"quantity\"") && pg_type == "int4"
+            )
+    }));
+}
+
+#[test]
+fn current_column_and_item_namespaces_remain_context_specific() {
+    let mut scalar_project = pure_petshop_command(
+        vec![json!({
+            "name": "projected",
+            "project": {
+                "values": {
+                    "quantity": { "current_column": "quantity" }
+                }
+            }
+        })],
+        json!({}),
+    );
+    let error = compile_petshop_command(scalar_project.clone())
+        .expect_err("scalar project has no bounded current row");
+    assert_eq!(
+        error.message,
+        "current_column values require a bounded current-row or update_many target-row scope"
+    );
+
+    scalar_project["steps"][0]["project"]["values"]["quantity"] = json!({ "item": "quantity" });
+    let error =
+        compile_petshop_command(scalar_project).expect_err("scalar project has no item namespace");
+    assert_eq!(
+        error.message,
+        "item values are allowed only inside an insert/update-many item scope"
+    );
+
+    let mut unknown = relational_batch_command();
+    unknown
+        .get_mut("steps")
+        .and_then(Json::as_array_mut)
+        .expect("relational steps")
+        .insert(
+            1,
+            json!({
+                "name": "projected",
+                "project_many": {
+                    "from": { "step": "selected" },
+                    "maximum_rows": 256,
+                    "values": {
+                        "missing": { "current_column": "missing" }
+                    }
+                }
+            }),
+        );
+    let error = compile(&metadata(vec![unknown]), RelationKind::Table)
+        .expect_err("bounded current rows reject unknown fields");
+    assert_eq!(error.message, "unknown bounded current-row field 'missing'");
 }
 
 #[test]

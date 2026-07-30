@@ -646,6 +646,13 @@ struct ValueContext<'a> {
     declared_steps: &'a HashSet<String>,
     item: Option<&'a BTreeMap<String, StaticType>>,
     current: Option<&'a BTreeMap<String, StaticType>>,
+    current_scope: Option<CurrentScope>,
+}
+
+#[derive(Clone, Copy)]
+enum CurrentScope {
+    BoundedRow,
+    UpdateTarget,
 }
 
 #[derive(Clone, Copy)]
@@ -839,6 +846,7 @@ fn build_command_descriptor(
             declared_steps: &declared_steps,
             item: None,
             current: None,
+            current_scope: None,
         };
         let output = validate_step(
             source,
@@ -858,6 +866,7 @@ fn build_command_descriptor(
         declared_steps: &declared_steps,
         item: None,
         current: None,
+        current_scope: None,
     };
     let mut result_roots = BTreeMap::new();
     for field in &command.result.fields {
@@ -2255,6 +2264,7 @@ fn validate_command(
             declared_steps: &declared_steps,
             item: None,
             current: None,
+            current_scope: None,
         };
         let output = validate_step(source, catalog, &roles, step, &context, &step_path)?;
         steps.insert(step.name.clone(), output);
@@ -2268,6 +2278,7 @@ fn validate_command(
         declared_steps: &declared_steps,
         item: None,
         current: None,
+        current_scope: None,
     };
     validate_idempotency_step_scopes(command, &context, &path)?;
     for (index, guard) in command.guards.iter().enumerate() {
@@ -2688,6 +2699,7 @@ fn validate_step(
             let update_context = ValueContext {
                 item: Some(&input_fields),
                 current: Some(&current_fields),
+                current_scope: Some(CurrentScope::UpdateTarget),
                 ..*context
             };
             validate_object(&update_many.set, info, &update_context, path)?;
@@ -2757,11 +2769,12 @@ fn validate_step(
         CommandStepOperation::ProjectMany { project_many } => {
             validate_row_bound(project_many.maximum_rows, "project_many", path)?;
             let input = prior_row_set_output(&project_many.from, context, "project_many", path)?;
-            let item_context = ValueContext {
-                item: Some(&input.fields),
+            let current_context = ValueContext {
+                current: Some(&input.fields),
+                current_scope: Some(CurrentScope::BoundedRow),
                 ..*context
             };
-            let fields = validate_projection_values(&project_many.values, &item_context, path)?;
+            let fields = validate_projection_values(&project_many.values, &current_context, path)?;
             Ok(StepOutput {
                 fields,
                 many: true,
@@ -2811,15 +2824,16 @@ fn validate_step(
         }
         CommandStepOperation::DecisionMany { decision_many } => {
             let input = prior_row_set_output(&decision_many.from, context, "decision_many", path)?;
-            let item_context = ValueContext {
-                item: Some(&input.fields),
+            let current_context = ValueContext {
+                current: Some(&input.fields),
+                current_scope: Some(CurrentScope::BoundedRow),
                 ..*context
             };
             let fields = validate_decision(
                 &decision_many.decision_table,
                 &decision_many.input,
                 &decision_many.returning,
-                &item_context,
+                &current_context,
                 path,
             )?;
             validate_total_output_order(&decision_many.order_by, &fields, "decision_many", path)?;
@@ -3381,7 +3395,8 @@ fn validate_decision(
                 return Ok((name.clone(), rule_type(&field.type_)));
             }
             context
-                .item
+                .current
+                .or(context.item)
                 .and_then(|fields| fields.get(name))
                 .cloned()
                 .map(|field| (name.clone(), field))
@@ -4363,7 +4378,7 @@ fn value_type(
             let fields = context.item.ok_or_else(|| {
                 PlanError::validation(
                     path,
-                    "item values are allowed only inside a relational item scope",
+                    "item values are allowed only inside an insert/update-many item scope",
                 )
             })?;
             fields.get(item).cloned().ok_or_else(|| {
@@ -4374,14 +4389,15 @@ fn value_type(
             let fields = context.current.ok_or_else(|| {
                 PlanError::validation(
                     path,
-                    "current_column values are allowed only inside update_many set or check",
+                    "current_column values require a bounded current-row or update_many target-row scope",
                 )
             })?;
             fields.get(current_column).cloned().ok_or_else(|| {
-                PlanError::validation(
-                    path,
-                    format!("unknown update_many current column '{current_column}'"),
-                )
+                let scope = match context.current_scope {
+                    Some(CurrentScope::UpdateTarget) => "update_many target-row column",
+                    Some(CurrentScope::BoundedRow) | None => "bounded current-row field",
+                };
+                PlanError::validation(path, format!("unknown {scope} '{current_column}'"))
             })
         }
         CommandValue::Step {

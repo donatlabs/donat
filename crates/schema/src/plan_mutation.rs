@@ -501,6 +501,7 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     None,
+                    None,
                     path,
                 )?;
                 let returning = values
@@ -520,7 +521,7 @@ impl<'a> Planner<'a> {
             CommandStepOperation::ProjectMany { project_many } => {
                 let input =
                     self.resolve_any_command_row_set(&project_many.from, previous_steps, path)?;
-                let item = CommandItemContext {
+                let current = CommandCurrentContext {
                     fields: input.columns.clone(),
                     alias: "_cmd_input",
                 };
@@ -529,7 +530,8 @@ impl<'a> Planner<'a> {
                     &project_many.values,
                     arguments,
                     previous_steps,
-                    Some(&item),
+                    None,
+                    Some(&current),
                     path,
                 )?;
                 let returning = values
@@ -564,6 +566,7 @@ impl<'a> Planner<'a> {
                     first,
                     arguments,
                     previous_steps,
+                    None,
                     None,
                     path,
                 )?;
@@ -609,6 +612,7 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     None,
+                    None,
                     path,
                 )?;
                 Ok((
@@ -626,7 +630,7 @@ impl<'a> Planner<'a> {
             CommandStepOperation::DecisionMany { decision_many } => {
                 let row_set =
                     self.resolve_any_command_row_set(&decision_many.from, previous_steps, path)?;
-                let item = CommandItemContext {
+                let current = CommandCurrentContext {
                     fields: row_set.columns.clone(),
                     alias: "_cmd_input",
                 };
@@ -637,7 +641,8 @@ impl<'a> Planner<'a> {
                     &decision_many.returning,
                     arguments,
                     previous_steps,
-                    Some(&item),
+                    None,
+                    Some(&current),
                     path,
                 )?;
                 let order_by = decision_many
@@ -1216,6 +1221,7 @@ impl<'a> Planner<'a> {
                     &allocate_many.request_id,
                     previous_steps,
                     None,
+                    None,
                     path,
                 )?;
                 let request_id = self.resolve_command_value(
@@ -1415,13 +1421,21 @@ impl<'a> Planner<'a> {
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         item: Option<&CommandItemContext>,
+        current: Option<&CommandCurrentContext>,
         path: &str,
     ) -> Result<Vec<CommandNamedValue>, PlanError> {
         values
             .iter()
             .map(|(name, value)| {
-                let column =
-                    resolved_value_column(command, name, value, previous_steps, item, path)?;
+                let column = resolved_value_column(
+                    command,
+                    name,
+                    value,
+                    previous_steps,
+                    item,
+                    current,
+                    path,
+                )?;
                 let value = self.resolve_command_value(
                     command,
                     value,
@@ -1429,7 +1443,7 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     item,
-                    None,
+                    current,
                     None,
                     path,
                 )?;
@@ -1480,6 +1494,7 @@ impl<'a> Planner<'a> {
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
         item: Option<&CommandItemContext>,
+        current: Option<&CommandCurrentContext>,
         path: &str,
     ) -> Result<(CommandDecision, Vec<CommandNamedValue>, Vec<CommandColumn>), PlanError> {
         let table = command.rules().decision_table(table_name).ok_or_else(|| {
@@ -1502,7 +1517,7 @@ impl<'a> Planner<'a> {
                     arguments,
                     previous_steps,
                     item,
-                    None,
+                    current,
                     None,
                     path,
                 )?;
@@ -1535,7 +1550,10 @@ impl<'a> Planner<'a> {
                         nullable: matches!(output.type_, RuleType::Nullable(_)),
                     });
                 }
-                item.and_then(|item| item.fields.get(name))
+                current
+                    .map(|current| &current.fields)
+                    .or_else(|| item.map(|item| &item.fields))
+                    .and_then(|fields| fields.get(name))
                     .cloned()
                     .ok_or_else(|| {
                         PlanError::validation(
@@ -3717,6 +3735,7 @@ fn resolved_value_column(
     value: &CommandValue,
     previous_steps: &BTreeMap<String, ResolvedCommandStep>,
     item: Option<&CommandItemContext>,
+    current: Option<&CommandCurrentContext>,
     path: &str,
 ) -> Result<CommandColumn, PlanError> {
     let (pg_type, nullable) = match value {
@@ -3746,6 +3765,14 @@ fn resolved_value_column(
             let column = item
                 .and_then(|item| item.fields.get(field))
                 .ok_or_else(|| PlanError::validation(path, "projected item was not resolved"))?;
+            (column.pg_type.clone(), column.nullable)
+        }
+        CommandValue::CurrentColumn { current_column } => {
+            let column = current
+                .and_then(|current| current.fields.get(current_column))
+                .ok_or_else(|| {
+                    PlanError::validation(path, "projected current row was not resolved")
+                })?;
             (column.pg_type.clone(), column.nullable)
         }
         CommandValue::Rule { rule, .. } => {

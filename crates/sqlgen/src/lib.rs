@@ -2043,7 +2043,7 @@ fn command_step_cte(
             ..
         } => {
             let input_alias = "_cmd_input";
-            let projection = command_named_values_sql(ctx, values, input_alias, "_cmd_target");
+            let projection = command_named_values_sql(ctx, values, input_alias, input_alias);
             Some(format!(
                 "{cte} AS MATERIALIZED (SELECT {input_alias}.{ordinal}, {projection} FROM {input} AS {input_alias} WHERE {execution_gate} ORDER BY {input_alias}.{ordinal})",
                 cte = quote_ident(cte),
@@ -2681,7 +2681,12 @@ fn command_decision_ctes(
     order_by: &[CommandColumn],
     execution_gate: &str,
 ) -> String {
-    let input_projection = command_named_values_sql(ctx, input, "_cmd_input", "_cmd_target");
+    let current_alias = if input_cte.is_some() {
+        "_cmd_input"
+    } else {
+        "_cmd_target"
+    };
+    let input_projection = command_named_values_sql(ctx, input, "_cmd_input", current_alias);
     let source = match input_cte {
         Some(input_cte) => format!(
             "{input} AS {input_alias} CROSS JOIN LATERAL (SELECT {projection}) AS {decision_input}",
