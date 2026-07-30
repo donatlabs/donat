@@ -202,6 +202,13 @@ git commit -m "test(petshop): execute the checked-in example"
 
 ### Task 2: Replace the toy schema with a quantitative store model
 
+**Execution boundary:** Implement and commit Tasks 2 and 3 as one TDD unit.
+The example's metadata is loaded against its migrated database at engine
+startup, so landing the replacement DDL while it still tracks `pet` and
+`order_item` would deliberately leave the branch broken. The combined commit
+must keep the Task 1 catalog contract green while changing it to the new
+product/variant result and adding the cart cases.
+
 **Files:**
 
 - Delete: `examples/petshop/migrations/V1__create_category.sql`
