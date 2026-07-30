@@ -22,3 +22,18 @@ select_permissions:
         - quantity
         - status
       filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+update_permissions:
+  - role: payment_worker
+    permission:
+      columns:
+        - status
+      filter: {}
+      check: {}

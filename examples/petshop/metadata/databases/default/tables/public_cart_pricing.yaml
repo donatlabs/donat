@@ -22,3 +22,9 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+  - role: b2b_buyer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id

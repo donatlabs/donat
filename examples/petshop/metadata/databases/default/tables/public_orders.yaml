@@ -55,3 +55,47 @@ select_permissions:
         - total_minor
         - currency
       filter: {}
+  - role: marketplace_worker
+    permission:
+      columns: "*"
+      filter: {}
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - order_status
+        - cancellation_reason
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns:
+        - order_status
+        - cancellation_reason
+      filter: {}
+      check: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - order_status
+      filter: {}
+      check: {}

@@ -10,3 +10,22 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+  - role: fulfilment
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: fulfilment
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: payment_worker
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}

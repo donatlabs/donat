@@ -26,7 +26,7 @@ insert_permissions:
                 _eq: X-Donat-User-Id
           - cart:
               status:
-                _eq: open
+                _eq: cart_open
           - variant:
               active:
                 _eq: true
@@ -51,7 +51,7 @@ update_permissions:
                 _eq: X-Donat-User-Id
           - cart:
               status:
-                _eq: open
+                _eq: cart_open
       check:
         _and:
           - cart:
@@ -59,7 +59,7 @@ update_permissions:
                 _eq: X-Donat-User-Id
           - cart:
               status:
-                _eq: open
+                _eq: cart_open
           - variant:
               active:
                 _eq: true
@@ -77,4 +77,4 @@ delete_permissions:
                 _eq: X-Donat-User-Id
           - cart:
               status:
-                _eq: open
+                _eq: cart_open

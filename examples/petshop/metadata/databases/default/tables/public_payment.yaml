@@ -21,6 +21,13 @@ array_relationships:
           name: refund
           schema: public
 select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
   - role: support
     permission:
       columns: "*"
@@ -35,3 +42,45 @@ select_permissions:
         - currency
         - provider_reference
       filter: {}
+  - role: reconciliation_worker
+    permission:
+      columns: "*"
+      filter: {}
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}
+  - role: payment_worker
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}

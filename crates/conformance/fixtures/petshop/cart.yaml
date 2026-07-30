@@ -21,7 +21,7 @@
         returning:
           - id: 1
             customer_id: customer-1
-            status: open
+            status: cart_open
 
 - description: REST exposes the same public product catalogue operation.
   url: /api/rest/products
@@ -167,7 +167,7 @@
     cart:
       - id: 1
         customer_id: customer-1
-        status: open
+        status: cart_open
         lines:
           - variant_id: 1
             quantity: 3

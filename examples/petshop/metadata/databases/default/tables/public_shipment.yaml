@@ -13,7 +13,15 @@ select_permissions:
   - role: fulfilment
     permission:
       columns: "*"
-      filter:
-        order:
-          order_status:
-            _eq: paid
+      filter: {}
+insert_permissions:
+  - role: fulfilment
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: fulfilment
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}

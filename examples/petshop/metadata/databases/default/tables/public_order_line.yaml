@@ -31,3 +31,22 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: veterinary_reviewer
+    permission:
+      columns:
+        - prescription_release_id
+      filter: {}
+      check: {}

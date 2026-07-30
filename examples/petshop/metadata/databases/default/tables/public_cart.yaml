@@ -20,6 +20,12 @@ select_permissions:
       filter:
         customer_id:
           _eq: X-Donat-User-Id
+  - role: b2b_buyer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
 insert_permissions:
   - role: customer
     permission:
@@ -28,10 +34,21 @@ insert_permissions:
           - customer_id:
               _eq: X-Donat-User-Id
           - status:
-              _eq: open
+              _eq: cart_open
       set:
         customer_id: X-Donat-User-Id
       columns: []
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - status
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
 delete_permissions:
   - role: customer
     permission:
@@ -40,4 +57,4 @@ delete_permissions:
           - customer_id:
               _eq: X-Donat-User-Id
           - status:
-              _eq: open
+              _eq: cart_open

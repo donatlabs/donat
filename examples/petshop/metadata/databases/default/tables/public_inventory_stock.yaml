@@ -54,3 +54,15 @@ update_permissions:
         - reserved
       filter: {}
       check: {}
+  - role: customer
+    permission:
+      columns:
+        - reserved
+      filter: {}
+      check: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - reserved
+      filter: {}
+      check: {}

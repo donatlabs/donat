@@ -15,3 +15,514 @@
 - "!include public_refund.yaml"
 - "!include public_cart_pricing.yaml"
 - "!include public_order_operations.yaml"
+
+- table: {schema: public, name: cart_checkout_context}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: cart_price_candidate}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: checkout_quote}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+  update_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: checkout_quote_line}
+  object_relationships:
+    - name: quote
+      using:
+        foreign_key_constraint_on: checkout_quote_id
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {quote: {customer_id: {_eq: X-Donat-User-Id}}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {quote: {customer_id: {_eq: X-Donat-User-Id}}}
+
+- table: {schema: public, name: order_adjustment}
+  object_relationships:
+    - name: order
+      using:
+        foreign_key_constraint_on: order_id
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {order: {customer_id: {_eq: X-Donat-User-Id}}}
+
+- table: {schema: public, name: payment_authorization}
+  object_relationships:
+    - name: payment
+      using:
+        foreign_key_constraint_on: payment_id
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
+    - role: support
+      permission: {columns: "*", filter: {}}
+    - role: payment_worker
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
+        check: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: payment_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: payment_capture_claim}
+  select_permissions:
+    - role: payment_worker
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: payment_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: payment_capture}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: payment_void}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: payment_chargeback}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: payment_reconciliation}
+  select_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: reconciliation_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: payment_reconciliation_resolution}
+  insert_permissions:
+    - role: support
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: payment_fraud_review}
+  select_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: payment_fraud_decision}
+  insert_permissions:
+    - role: payment_worker
+      permission: {columns: "*", check: {}}
+    - role: support
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: notification_delivery}
+  insert_permissions:
+    - role: notification_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: order_current_authorization}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+    - role: support
+      permission: {columns: "*", filter: {}}
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: inventory_level}
+  update_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: order_inventory_allocation_candidate}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: inventory_allocation}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: inventory_allocation_line}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: inventory_backorder}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: shipment_item}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: shipment_result}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: order_return_context}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: return_request}
+  select_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}}
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+  update_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: fulfilment
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: return_item}
+  object_relationships:
+    - name: request
+      using:
+        foreign_key_constraint_on: return_request_id
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {request: {customer_id: {_eq: X-Donat-User-Id}}}
+  update_permissions:
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: fulfilment
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: return_event}
+  object_relationships:
+    - name: request
+      using:
+        foreign_key_constraint_on: return_request_id
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {request: {customer_id: {_eq: X-Donat-User-Id}}}
+    - role: support
+      permission: {columns: "*", check: {}}
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: return_inspection}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: return_refund_context}
+  select_permissions:
+    - role: fulfilment
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: exchange}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: exchange_item}
+  insert_permissions:
+    - role: fulfilment
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: subscription}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+    - role: subscription_worker
+      permission: {columns: "*", filter: {}}
+  update_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+    - role: subscription_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: subscription_renewal}
+  select_permissions:
+    - role: subscription_worker
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: subscription_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: subscription_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: subscription_dunning_attempt}
+  insert_permissions:
+    - role: subscription_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: organization}
+  select_permissions:
+    - role: b2b_buyer
+      permission: {columns: "*", filter: {}}
+    - role: b2b_approver
+      permission: {columns: "*", filter: {}}
+    - role: b2b_finance
+      permission: {columns: "*", filter: {}}
+  update_permissions:
+    - role: b2b_approver
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: b2b_finance
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: organization_membership}
+  select_permissions:
+    - role: b2b_buyer
+      permission:
+        columns: "*"
+        filter: {user_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: quote}
+  select_permissions:
+    - role: b2b_approver
+      permission: {columns: "*", filter: {}}
+    - role: b2b_finance
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: b2b_buyer
+      permission:
+        columns: "*"
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: quote_line}
+  insert_permissions:
+    - role: b2b_buyer
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: purchase_approval}
+  select_permissions:
+    - role: b2b_approver
+      permission: {columns: "*", filter: {}}
+    - role: b2b_finance
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: b2b_buyer
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: b2b_approver
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: b2b_finance
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: credit_usage}
+  insert_permissions:
+    - role: b2b_approver
+      permission: {columns: "*", check: {}}
+    - role: b2b_finance
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: order_vendor_split_candidate}
+  select_permissions:
+    - role: marketplace_worker
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: vendor_order}
+  select_permissions:
+    - role: vendor
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: marketplace_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: vendor
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: vendor_membership}
+  select_permissions:
+    - role: vendor
+      permission:
+        columns: "*"
+        filter: {user_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: vendor_order_acceptance}
+  insert_permissions:
+    - role: vendor
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: vendor_payout_candidate}
+  select_permissions:
+    - role: marketplace_worker
+      permission: {columns: "*", filter: {}}
+
+- table: {schema: public, name: vendor_payout}
+  select_permissions:
+    - role: payout_worker
+      permission: {columns: "*", filter: {}}
+    - role: support
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: marketplace_worker
+      permission: {columns: "*", check: {}}
+  update_permissions:
+    - role: payout_worker
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: support
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: vendor_payout_event}
+  insert_permissions:
+    - role: payout_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: vendor_payout_reconciliation}
+  insert_permissions:
+    - role: support
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: vendor_dispute}
+  insert_permissions:
+    - role: vendor
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: grooming_booking}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+    - role: groomer
+      permission: {columns: "*", filter: {}}
+    - role: booking_worker
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+  update_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+    - role: groomer
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: booking_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: grooming_booking_event}
+  insert_permissions:
+    - role: customer
+      permission: {columns: "*", check: {}}
+    - role: groomer
+      permission: {columns: "*", check: {}}
+    - role: booking_worker
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: customer_prescription_order_line}
+  select_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        filter: {customer_id: {_eq: X-Donat-User-Id}}
+
+- table: {schema: public, name: prescription_request}
+  select_permissions:
+    - role: veterinary_reviewer
+      permission: {columns: "*", filter: {}}
+    - role: prescription_worker
+      permission: {columns: "*", filter: {}}
+  insert_permissions:
+    - role: customer
+      permission:
+        columns: "*"
+        check: {customer_id: {_eq: X-Donat-User-Id}}
+  update_permissions:
+    - role: veterinary_reviewer
+      permission: {columns: "*", filter: {}, check: {}}
+    - role: prescription_worker
+      permission: {columns: "*", filter: {}, check: {}}
+
+- table: {schema: public, name: prescription_review}
+  insert_permissions:
+    - role: veterinary_reviewer
+      permission: {columns: "*", check: {}}
+
+- table: {schema: public, name: prescription_event}
+  insert_permissions:
+    - role: customer
+      permission: {columns: "*", check: {}}
+    - role: veterinary_reviewer
+      permission: {columns: "*", check: {}}
+    - role: prescription_worker
+      permission: {columns: "*", check: {}}

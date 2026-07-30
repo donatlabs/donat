@@ -15,3 +15,12 @@ select_permissions:
         - provider_event_id
         - created_at
       filter: {}
+insert_permissions:
+  - role: payment_worker
+    permission:
+      columns: "*"
+      check: {}
+  - role: reconciliation_worker
+    permission:
+      columns: "*"
+      check: {}
