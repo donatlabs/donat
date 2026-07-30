@@ -1,0 +1,58 @@
+name: confirm_booking
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: booking_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: booking
+    select_one:
+      table: public.grooming_booking
+      by:
+        id: { arg: booking_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning: [id, customer_id, slot_key, status]
+      require_found: true
+  - name: confirmation_is_allowed
+    assert:
+      rule: can_transition_booking
+      with:
+        current: { step: booking, column: status }
+        next: { literal: confirmed }
+  - name: confirmed_booking
+    update:
+      table: public.grooming_booking
+      where: { id: { step: booking, column: id }, status: { literal: held } }
+      set: { status: { literal: confirmed } }
+      returning: [id, slot_key, status]
+      require_affected: true
+  - name: confirmation_audit
+    insert:
+      table: public.grooming_booking_event
+      object:
+        booking_id: { step: confirmed_booking, column: id }
+        event_type: { literal: confirmed }
+        actor_role: { literal: customer }
+        request_id: { arg: request_id }
+      returning: [id, booking_id, event_type, request_id]
+result:
+  booking_id: { step: confirmed_booking, column: id }
+  slot_key: { step: confirmed_booking, column: slot_key }
+  status: { step: confirmed_booking, column: status }
+  audit: { step: confirmation_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: booking_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: grooming_booking
+      signal: booking_transition_recorded
+      correlate:
+        booking_id: { step: confirmed_booking, column: id }
+      payload: { outcome: { literal: confirmed } }
+      idempotency_key: { argument: request_id }

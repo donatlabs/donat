@@ -181,6 +181,10 @@ rules:
     parameters: { current: PayoutState!, next: PayoutState! }
     result: bool!
     expression: "(current == PayoutState::pending && next == PayoutState::submitted) || (current == PayoutState::submitted && (next == PayoutState::paid || next == PayoutState::failed || next == PayoutState::reconciled)) || (current == PayoutState::failed && next == PayoutState::reconciled)"
+  - name: can_record_provider_payout_outcome
+    parameters: { current: PayoutState!, next: PayoutState! }
+    result: bool!
+    expression: "(current == PayoutState::pending && next == PayoutState::submitted) || (current == PayoutState::submitted && (next == PayoutState::paid || next == PayoutState::failed))"
   - name: can_transition_booking
     parameters: { current: BookingState!, next: BookingState! }
     result: bool!
@@ -193,10 +197,18 @@ rules:
     parameters: { current: FraudState!, next: FraudState! }
     result: bool!
     expression: "(current == FraudState::clear && next == FraudState::review_required) || (current == FraudState::review_required && (next == FraudState::approved || next == FraudState::rejected))"
+  - name: fraud_state_for_route
+    parameters: { hold: bool! }
+    result: FraudState!
+    expression: "hold ? FraudState::review_required : FraudState::clear"
   - name: can_transition_reconciliation
     parameters: { current: ReconciliationState!, next: ReconciliationState! }
     result: bool!
     expression: "(current == ReconciliationState::pending && (next == ReconciliationState::matched || next == ReconciliationState::review_required)) || (current == ReconciliationState::review_required && next == ReconciliationState::resolved)"
+  - name: payment_reconciliation_supports_decision
+    parameters: { local_amount_minor: bigint!, local_currency: string!, local_status: PaymentState!, local_provider_reference: string!, provider_amount_minor: bigint!, provider_currency: string!, provider_status: PaymentState!, provider_reference: string!, decision: ReconciliationDecision! }
+    result: bool!
+    expression: "(decision == ReconciliationDecision::matched && local_amount_minor == provider_amount_minor && local_currency == provider_currency && local_status == provider_status && local_provider_reference == provider_reference) || (decision == ReconciliationDecision::manual_review && (local_amount_minor != provider_amount_minor || local_currency != provider_currency || local_status != provider_status || local_provider_reference != provider_reference))"
 
 decision_tables:
   - name: price_list_route

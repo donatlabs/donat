@@ -1,0 +1,73 @@
+name: resolve_payment_reconciliation
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: resolution_id
+    type: uuid!
+  - name: note
+    type: string
+steps:
+  - name: reconciliation
+    select_one:
+      table: public.payment_reconciliation
+      by:
+        payment_id: { arg: payment_id }
+        provider_event_id: { arg: provider_event_id }
+        status: { literal: review_required }
+      returning: [id, payment_id, provider_event_id, status]
+      require_found: true
+  - name: resolution_is_allowed
+    assert:
+      rule: can_transition_reconciliation
+      with:
+        current: { step: reconciliation, column: status }
+        next: { literal: resolved }
+  # Resolution evidence is immutable: the guarded status update below never
+  # overwrites the support actor, resolution key, or note retained here.
+  - name: resolution_audit
+    insert:
+      table: public.payment_reconciliation_resolution
+      object:
+        reconciliation_id: { step: reconciliation, column: id }
+        resolution_id: { arg: resolution_id }
+        actor_user_id: { session_variable: x-donat-user-id }
+        actor_role: { literal: support }
+        note: { arg: note }
+      returning: [id, reconciliation_id, resolution_id, actor_user_id, actor_role, note]
+  - name: resolved_reconciliation
+    update:
+      table: public.payment_reconciliation
+      where:
+        id: { step: reconciliation, column: id }
+        status: { literal: review_required }
+      set:
+        status: { literal: resolved }
+      returning: [id, payment_id, provider_event_id, status]
+      require_affected: true
+result:
+  reconciliation_id: { step: resolved_reconciliation, column: id }
+  payment_id: { step: resolved_reconciliation, column: payment_id }
+  provider_event_id: { step: resolved_reconciliation, column: provider_event_id }
+  reconciliation_status: { step: resolved_reconciliation, column: status }
+  audit: { step: resolution_audit }
+idempotency:
+  key: { argument: resolution_id }
+  scope:
+    - { step: reconciliation, column: id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: payment_reconciliation
+      signal: payment_reconciliation_resolved
+      correlate:
+        payment_id: { step: resolved_reconciliation, column: payment_id }
+        provider_event_id: { step: resolved_reconciliation, column: provider_event_id }
+      payload:
+        reconciliation_id: { step: resolved_reconciliation, column: id }
+        reconciliation_status: { step: resolved_reconciliation, column: status }
+      idempotency_key: { argument: resolution_id }

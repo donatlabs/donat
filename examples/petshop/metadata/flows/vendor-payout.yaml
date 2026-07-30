@@ -1,0 +1,95 @@
+name: vendor_payout
+kind: process
+version: 1
+source: default
+permissions:
+  - role: marketplace_worker
+input:
+  - { name: payout_cycle_id, type: uuid! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: payout_cycle_id, type: uuid! }
+  - { name: payouts, type: "[json!]!" }
+  - { name: reconciliation, type: json }
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { input: payout_cycle_id }
+start_at: create_payout_candidates
+states:
+  - id: create_payout_candidates
+    command:
+      name: create_vendor_payout
+      run_as: marketplace_worker
+      arguments:
+        payout_cycle_id: { input: payout_cycle_id }
+        request_id: { input: request_id }
+      next: request_payouts
+
+  - id: request_payouts
+    for_each:
+      input: { state: create_payout_candidates, field: payouts }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      request:
+        connector: mock_payout
+        operation: create_payout
+        input:
+          payout_id: { item: id }
+          payout_key: { item: payout_key }
+          vendor_id: { item: vendor_id }
+          amount_minor: { item: net_minor }
+          currency: { item: currency }
+        idempotency_key:
+          stable: { run: id, state: request_payouts, item_key: vendor_id }
+        timeout: 5s
+        retry:
+          maximum_attempts: 4
+          backoff: 250ms
+          retry_on: [transport, timeout, http_429, http_5xx]
+      next: record_payout_outcomes
+
+  - id: record_payout_outcomes
+    for_each:
+      input: { state: request_payouts, field: ordered_results }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_payout_outcome
+        run_as: payout_worker
+        arguments:
+          payout_id: { item: payout_id }
+          provider_payout_id: { item: provider_payout_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: outcome }
+          payload: { item: normalized_payload }
+      next: await_cycle_settlement
+
+  - id: await_cycle_settlement
+    wait:
+      signal: payout_cycle_status_changed
+      verification: required
+      persist_before_match: true
+      correlate:
+        payout_cycle_id: { input: payout_cycle_id }
+      match:
+        all_settled: true
+      deadline: 7d
+      next: settled
+      on_timeout: reconciliation_timed_out
+
+  - id: settled
+    output:
+      values:
+        payout_cycle_id: { input: payout_cycle_id }
+        payouts: { event: payouts }
+        reconciliation: { literal: null }
+
+  - id: reconciliation_timed_out
+    fail:
+      code: payout_reconciliation_timed_out
+      message: Support did not reconcile the payout outcome before its deadline

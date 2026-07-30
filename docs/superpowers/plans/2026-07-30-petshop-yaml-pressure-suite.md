@@ -33,8 +33,11 @@ HTTP Connectors.
   filters, or tenant-derived roles.
 - Marketplace vendors, customers, organizations, and locations are domain
   entities within one tenant.
-- One command file owns one atomic operation. One flow file owns one durable
-  orchestration.
+- One command file owns one atomic operation. One flow file owns one
+  `kind: process`, explicitly versioned durable orchestration.
+- Commands are synchronous. `start_process` and `signal_process` effects
+  represent transactional-outbox intent and never invoke Process code before
+  the command transaction commits.
 - No SQL, executable code, dynamic relation, dynamic role, general loop,
   recursion, or child-flow language is allowed in metadata.
 - Command roles are fixed classic explicit roles and still require underlying
@@ -68,9 +71,11 @@ HTTP Connectors.
 - `commands/subscriptions/` — renewal, dunning outcome, pause, cancellation.
 - `commands/b2b/` — quote, approval, credit.
 - `commands/marketplace/` — vendor orders, payout, disputes.
-- `commands/booking/` — slot reservation and lifecycle.
+- `commands/booking/` — slot reservation, customer cancellation, worker
+  expiry, and attendance lifecycle.
 - `commands/prescription/` — review and expiry.
-- `commands/operations/` — fraud and notification outcomes.
+- `commands/operations/` — fraud, payment-reconciliation resolution, and
+  notification outcomes.
 
 ### Flow and connector directories
 
@@ -364,8 +369,10 @@ Snapshot quoted pricing and make credit consumption atomic with approval.
 
 - [ ] **Step 2: Author approval Flow**
 
-Use `b2b_approval_route` to auto-approve, wait for a fixed approver role,
-escalate to finance, or reject on deadline.
+Have `submit_quote` commit a `start_process` outbox effect and mirror that
+typed start contract in the versioned Process. Use `b2b_approval_route` to
+auto-approve, wait for a fixed approver role, escalate to finance, or reject
+on deadline.
 
 ---
 
@@ -377,6 +384,7 @@ escalate to finance, or reject on deadline.
 - Create: `commands/marketplace/record-vendor-acceptance.yaml`
 - Create: `commands/marketplace/create-vendor-payout.yaml`
 - Create: `commands/marketplace/record-payout-outcome.yaml`
+- Create: `commands/marketplace/reconcile-vendor-payout.yaml`
 - Create: `commands/marketplace/open-vendor-dispute.yaml`
 - Create: `flows/vendor-payout.yaml`
 - Create: `connectors/mock-payout.yaml`
@@ -407,6 +415,7 @@ idempotently, and wait for support reconciliation on mismatches.
 - Create: `commands/booking/confirm-booking.yaml`
 - Create: `commands/booking/reschedule-booking.yaml`
 - Create: `commands/booking/cancel-booking.yaml`
+- Create: `commands/booking/expire-booking-hold.yaml`
 - Create: `commands/booking/record-no-show.yaml`
 - Create: `flows/grooming-booking.yaml`
 - Create: `commands/prescription/submit-prescription-review.yaml`
@@ -438,6 +447,7 @@ on deadline, and expose only safe customer output.
 
 - Create: `commands/operations/route-fraud-review.yaml`
 - Create: `commands/operations/resolve-fraud-review.yaml`
+- Create: `commands/operations/resolve-payment-reconciliation.yaml`
 - Create: `commands/operations/record-notification-delivery.yaml`
 - Create: `flows/payment-reconciliation.yaml`
 - Create: `connectors/mock-notification.yaml`

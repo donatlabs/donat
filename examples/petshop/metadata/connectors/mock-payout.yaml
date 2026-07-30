@@ -1,0 +1,40 @@
+name: mock_payout
+module: http
+config:
+  endpoint_identity: petshop_mock_payout_v1
+  credential_identity: petshop_mock_payout_fixture
+  base_url: { value_from_env: PETSHOP_PAYOUT_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: PETSHOP_PAYOUT_API_TOKEN
+operations:
+  - name: create_payout
+    version: v1
+    method: POST
+    path: /v1/payouts
+    body:
+      payout_id: { input: payout_id }
+      payout_key: { input: payout_key }
+      vendor_id: { input: vendor_id }
+      amount_minor: { input: amount_minor }
+      currency: { input: currency }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string! }
+      provider_payout_id: { json_pointer: /payout_id, type: string! }
+      outcome: { json_pointer: /outcome, type: PayoutState! }
+      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: vendor_id }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [payout_key]
+      response_body: [provider_payout_id, normalized_payload]

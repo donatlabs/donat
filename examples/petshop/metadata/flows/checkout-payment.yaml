@@ -1,4 +1,6 @@
 name: checkout_payment
+kind: process
+version: 1
 source: default
 permissions:
   - role: customer

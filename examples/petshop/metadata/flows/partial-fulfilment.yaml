@@ -1,4 +1,6 @@
 name: partial_fulfilment
+kind: process
+version: 1
 source: default
 permissions:
   - role: fulfilment

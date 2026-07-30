@@ -1,4 +1,6 @@
 name: return_refund
+kind: process
+version: 1
 source: default
 permissions:
   - role: customer
@@ -104,7 +106,7 @@ states:
     when:
       decision_table: return_disposition_route
       input:
-        inspection: { event: inspection }
+        inspection: { event: inspection_decision }
         replacement_requested: { state: request_return, field: replacement_requested }
       cases:
         - matches: { disposition: refund }

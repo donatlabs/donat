@@ -1,0 +1,35 @@
+name: record_notification_delivery
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: notification_id
+    type: uuid!
+  - name: provider_message_id
+    type: string!
+  - name: channel
+    type: string!
+  - name: normalized_status
+    type: string!
+  - name: occurred_at
+    type: timestamptz!
+steps:
+  - name: delivery
+    insert:
+      table: public.notification_delivery
+      object:
+        notification_id: { arg: notification_id }
+        provider_message_id: { arg: provider_message_id }
+        channel: { arg: channel }
+        status: { arg: normalized_status }
+        occurred_at: { arg: occurred_at }
+      returning: [id, notification_id, provider_message_id, channel, status, occurred_at]
+result:
+  notification_delivery_id: { step: delivery, column: id }
+  provider_message_id: { step: delivery, column: provider_message_id }
+  status: { step: delivery, column: status }
+idempotency:
+  key: { argument: provider_message_id }
+  scope:
+    - { argument: notification_id }
+  retention: 365d

@@ -111,3 +111,18 @@ idempotency:
   scope:
     - { argument: return_id }
   retention: 365d
+effects:
+  - signal_process:
+      process: return_refund
+      signal: return_inspection_recorded
+      correlate:
+        return_id: { step: inspected_return, column: id }
+      payload:
+        inspection_decision: { arg: inspection }
+        inspection: { step: inspection_record }
+        inspection_audit: { step: inspection_audit }
+        payment_id: { step: return_context, column: payment_id }
+        refund_id: { step: approved_refund, column: id }
+        refund_amount_minor: { arg: refund_amount_minor }
+        currency: { step: return_context, column: currency }
+      idempotency_key: { argument: inspection_id }

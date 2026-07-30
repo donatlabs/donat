@@ -1,0 +1,63 @@
+name: cancel_booking
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: booking_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: booking
+    select_one:
+      table: public.grooming_booking
+      by:
+        id: { arg: booking_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning: [id, customer_id, slot_key, status]
+      require_found: true
+  - name: cancellation_is_allowed
+    assert:
+      rule: can_transition_booking
+      with:
+        current: { step: booking, column: status }
+        next: { literal: cancelled }
+  - name: cancelled_booking
+    update:
+      table: public.grooming_booking
+      where: { id: { step: booking, column: id }, status: { step: booking, column: status } }
+      set:
+        status: { literal: cancelled }
+        cancellation_reason: { arg: reason }
+      returning: [id, slot_key, status, cancellation_reason]
+      require_affected: true
+  - name: cancellation_audit
+    insert:
+      table: public.grooming_booking_event
+      object:
+        booking_id: { step: cancelled_booking, column: id }
+        event_type: { step: cancelled_booking, column: status }
+        actor_role: { literal: customer }
+        request_id: { arg: request_id }
+        reason: { arg: reason }
+      returning: [id, booking_id, event_type, request_id, reason]
+result:
+  booking_id: { step: cancelled_booking, column: id }
+  slot_key: { step: cancelled_booking, column: slot_key }
+  status: { step: cancelled_booking, column: status }
+  audit: { step: cancellation_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: booking_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: grooming_booking
+      signal: booking_transition_recorded
+      correlate:
+        booking_id: { step: cancelled_booking, column: id }
+      payload: { outcome: { step: cancelled_booking, column: status } }
+      idempotency_key: { argument: request_id }

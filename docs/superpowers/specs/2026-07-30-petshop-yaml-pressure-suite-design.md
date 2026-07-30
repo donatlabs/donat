@@ -72,10 +72,14 @@ examples/petshop/metadata/
 ```
 
 Each command file contains one atomic domain operation. Each flow file
-contains one durable orchestration. `commands.yaml`, `flows.yaml`, and
-`connectors.yaml` contain only ordered `!include` entries. `rules.yaml` owns
-named rules, finite types, and decision tables because those artifacts must be
-compiled and fingerprinted together.
+contains one explicitly versioned `kind: process` durable orchestration.
+Commands remain synchronous; `start_process` and `signal_process` effects
+commit transactional-outbox intent with the domain statement. Only Process
+definitions receive durable state, activity attempts, signal inboxes, timers,
+and recovery semantics. `commands.yaml`, `flows.yaml`, and `connectors.yaml`
+contain only ordered `!include` entries. `rules.yaml` owns named rules, finite
+types, and decision tables because those artifacts must be compiled and
+fingerprinted together.
 
 ## Scenario modules
 
@@ -139,14 +143,16 @@ The first YAML catalog includes:
 - B2B: `submit_quote`, `approve_purchase`, `reject_purchase`,
   `consume_credit`;
 - marketplace: `split_vendor_orders`, `record_vendor_acceptance`,
-  `create_vendor_payout`, `record_payout_outcome`, `open_vendor_dispute`;
+  `create_vendor_payout`, `record_payout_outcome`,
+  `reconcile_vendor_payout`, `open_vendor_dispute`;
 - booking: `reserve_grooming_slot`, `confirm_booking`,
-  `reschedule_booking`, `cancel_booking`, `record_no_show`;
+  `reschedule_booking`, `cancel_booking`, `expire_booking_hold`,
+  `record_no_show`;
 - prescription: `submit_prescription_review`,
   `approve_prescription`, `reject_prescription`,
   `expire_prescription`;
 - operations: `route_fraud_review`, `resolve_fraud_review`,
-  `record_notification_delivery`.
+  `resolve_payment_reconciliation`, `record_notification_delivery`.
 
 Command permissions name explicit classic roles. A fixed flow role still
 needs the same command and table permissions as a direct caller. No command
@@ -184,9 +190,11 @@ renewal or pauses the subscription.
 
 ### `b2b_order_approval`
 
-Routes by amount, organization policy, and available credit. It may complete
-automatically, wait for one or more named approver roles, escalate on a
-deadline, or reject without creating a payable order.
+`submit_quote` commits the quote, approval, and a `start_process` outbox intent
+in one transaction. The Process mirrors that start contract, routes by amount,
+organization policy, and available credit, and may complete automatically,
+wait for one or more named approver roles, escalate on a deadline, or reject
+without creating a payable order.
 
 ### `vendor_payout`
 
@@ -256,9 +264,11 @@ carrier, tax, notification, and payout behavior. Manual configuration may
 point generic HTTP operations at a request-capture endpoint.
 
 Every mutation operation declares retry classification, timeout, capacity,
-redaction, and provider idempotency. Verified inbound events are persisted
-before flow matching, so callback-before-wait and duplicate delivery are safe.
-Provider payloads are normalized before commands consume them.
+redaction, and provider idempotency. Process start and command-signal effects
+are generic transactional outbox records, never immediate Process calls.
+Verified inbound events are persisted before flow matching, so
+callback-before-wait and duplicate delivery are safe. Provider payloads are
+normalized before commands consume them.
 
 ## Public execution contract
 
@@ -280,8 +290,12 @@ Business outcomes such as payment decline, rejected approval, expired booking,
 or failed inspection are explicit terminal outputs. Infrastructure exhaustion
 uses a typed `fail` result after declared compensation has completed.
 
-Atomic commands roll back all domain writes on rejection. HTTP never runs
-inside the command transaction. Duplicate callbacks, cron occurrences,
+Atomic commands roll back all domain writes and Process intent on rejection.
+After commit, a generic dispatcher may redeliver outbox intent until the
+Process inbox accepts it idempotently. HTTP never runs inside the command
+transaction. Durable activities reuse one provider key across retry and worker
+takeover; a provider without a sufficient idempotency guarantee requires an
+explicit reconciliation path. Duplicate callbacks, cron occurrences,
 approvals, and manual retries converge through declared idempotency keys.
 Partial fulfilment and payout flows retain per-item outcomes for reconciliation
 instead of pretending the batch was all-or-nothing.

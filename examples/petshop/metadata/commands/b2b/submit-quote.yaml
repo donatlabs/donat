@@ -98,3 +98,13 @@ idempotency:
     - { argument: organization_id }
     - { session_variable: x-donat-user-id }
   retention: 30d
+effects:
+  - start_process:
+      process: b2b_order_approval
+      process_key: { step: approval, column: id }
+      input:
+        quote_id: { step: quote, column: id }
+        approval_id: { step: approval, column: id }
+        total_minor: { step: quote, column: total_minor }
+        available_credit_minor: { step: quote, column: available_credit_minor }
+      idempotency_key: { argument: request_id }

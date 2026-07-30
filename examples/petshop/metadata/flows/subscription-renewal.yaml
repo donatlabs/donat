@@ -1,4 +1,6 @@
 name: subscription_renewal
+kind: process
+version: 1
 source: default
 permissions:
   - role: subscription_worker

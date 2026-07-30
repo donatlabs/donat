@@ -1,0 +1,72 @@
+name: reconcile_vendor_payout
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: payout_id
+    type: uuid!
+  - name: reconciliation_id
+    type: uuid!
+  - name: note
+    type: string!
+steps:
+  - name: payout
+    select_one:
+      table: public.vendor_payout
+      by:
+        id: { arg: payout_id }
+        status: { literal: failed }
+      returning: [id, payout_cycle_id, vendor_id, status, net_minor, currency]
+      require_found: true
+  - name: reconciliation_is_allowed
+    assert:
+      rule: can_transition_payout
+      with:
+        current: { step: payout, column: status }
+        next: { literal: reconciled }
+  - name: reconciliation
+    insert:
+      table: public.vendor_payout_reconciliation
+      object:
+        reconciliation_id: { arg: reconciliation_id }
+        payout_id: { step: payout, column: id }
+        payout_cycle_id: { step: payout, column: payout_cycle_id }
+        note: { arg: note }
+        reconciled_by_user_id: { session_variable: x-donat-user-id }
+      returning: [id, reconciliation_id, payout_id, payout_cycle_id]
+  - name: reconciled_payout
+    update:
+      table: public.vendor_payout
+      where:
+        id: { step: payout, column: id }
+        status: { step: payout, column: status }
+      set:
+        status: { literal: reconciled }
+      returning: [id, payout_cycle_id, vendor_id, status, provider_payout_id, net_minor, currency]
+      require_affected: true
+  - name: cycle_summary
+    select_one:
+      table: public.vendor_payout_cycle_summary
+      by:
+        payout_cycle_id: { step: reconciled_payout, column: payout_cycle_id }
+      returning: [payout_cycle_id, all_settled, payouts]
+      require_found: true
+result:
+  payout: { step: reconciled_payout }
+  reconciliation: { step: reconciliation }
+  cycle_summary: { step: cycle_summary }
+idempotency:
+  key: { argument: reconciliation_id }
+  scope:
+    - { argument: payout_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: vendor_payout
+      signal: payout_cycle_status_changed
+      correlate:
+        payout_cycle_id: { step: reconciled_payout, column: payout_cycle_id }
+      payload:
+        all_settled: { step: cycle_summary, column: all_settled }
+        payouts: { step: cycle_summary, column: payouts }
+      idempotency_key: { argument: reconciliation_id }

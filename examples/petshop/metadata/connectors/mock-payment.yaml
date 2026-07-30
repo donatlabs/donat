@@ -136,12 +136,16 @@ operations:
       payment_id: { input: payment_id }
       provider_event_id: { input: provider_event_id }
       provider_reference: { input: provider_reference }
-    success_statuses: [200, 201, 202]
+    # Reconciliation is a synchronous comparison operation. Its response is
+    # the complete normalized provider evidence used by the command gate.
+    success_statuses: [200]
     response:
       provider_event_id: { json_pointer: /provider_event_id, type: string! }
       provider_reconciliation_id: { json_pointer: /reconciliation_id, type: string! }
+      provider_amount_minor: { json_pointer: /amount_minor, type: bigint! }
+      provider_currency: { json_pointer: /currency, type: string! }
+      provider_status: { json_pointer: /status, type: PaymentState! }
       provider_reference: { json_pointer: /provider_reference, type: string! }
-      status: { json_pointer: /status, type: PaymentOutcome! }
       normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
     timeout: 5s
     retry:

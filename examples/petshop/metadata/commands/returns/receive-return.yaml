@@ -72,3 +72,13 @@ idempotency:
   scope:
     - { argument: return_id }
   retention: 365d
+effects:
+  - signal_process:
+      process: return_refund
+      signal: return_receipt_recorded
+      correlate:
+        return_id: { step: received_return, column: id }
+      payload:
+        receipt: { step: received_return }
+        receipt_audit: { step: receipt_audit }
+      idempotency_key: { argument: receipt_id }

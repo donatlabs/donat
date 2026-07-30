@@ -1,0 +1,75 @@
+name: record_payout_outcome
+source: default
+permissions:
+  - role: payout_worker
+arguments:
+  - name: payout_id
+    type: uuid!
+  - name: provider_payout_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: outcome
+    type: PayoutState!
+  - name: payload
+    type: json!
+steps:
+  - name: payout
+    select_one:
+      table: public.vendor_payout
+      by:
+        id: { arg: payout_id }
+      returning: [id, payout_cycle_id, vendor_id, status, net_minor, currency]
+      require_found: true
+  - name: outcome_is_allowed
+    assert:
+      rule: can_record_provider_payout_outcome
+      with:
+        current: { step: payout, column: status }
+        next: { arg: outcome }
+  - name: payout_event
+    insert:
+      table: public.vendor_payout_event
+      object:
+        payout_id: { step: payout, column: id }
+        provider_event_id: { arg: provider_event_id }
+        provider_payout_id: { arg: provider_payout_id }
+        outcome: { arg: outcome }
+        payload: { arg: payload }
+      returning: [id, payout_id, provider_event_id, outcome]
+  - name: apply_outcome
+    update:
+      table: public.vendor_payout
+      where:
+        id: { step: payout, column: id }
+        status: { step: payout, column: status }
+      set:
+        status: { arg: outcome }
+        provider_payout_id: { arg: provider_payout_id }
+      returning: [id, payout_cycle_id, vendor_id, status, provider_payout_id, net_minor, currency]
+      require_affected: true
+  - name: cycle_summary
+    select_one:
+      table: public.vendor_payout_cycle_summary
+      by:
+        payout_cycle_id: { step: apply_outcome, column: payout_cycle_id }
+      returning: [payout_cycle_id, all_settled, payouts]
+      require_found: true
+result:
+  payout: { step: apply_outcome }
+  cycle_summary: { step: cycle_summary }
+  provider_event_id: { step: payout_event, column: provider_event_id }
+idempotency:
+  key: { argument: provider_event_id }
+  scope: command
+  retention: 365d
+effects:
+  - signal_process:
+      process: vendor_payout
+      signal: payout_cycle_status_changed
+      correlate:
+        payout_cycle_id: { step: apply_outcome, column: payout_cycle_id }
+      payload:
+        all_settled: { step: cycle_summary, column: all_settled }
+        payouts: { step: cycle_summary, column: payouts }
+      idempotency_key: { argument: provider_event_id }

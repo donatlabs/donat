@@ -229,6 +229,166 @@ curl -s localhost:8080/mcp \
 `list_tables` reports only what the role may touch — as `staff` it lists every
 table with its allowed operations; as `anonymous` it shows just the catalogue.
 
+## Active declarative YAML contract
+
+The YAML under [`metadata/`](metadata) is an active **pressure-suite
+contract**, intentionally ahead of the current runtime and generated schema.
+It is not currently runnable and is not conformance-green; in particular, this
+section does not claim that Rust support exists. It documents the declarative
+surface under review so that implementation can follow a stable user contract.
+
+### Commands
+
+Commands are synchronous database transactions. They perform domain writes and
+may atomically persist `effects.start_process` or `effects.signal_process`
+intent with those writes in one generic transactional outbox. They do not call
+providers directly.
+
+| Domain | Active commands |
+| --- | --- |
+| Checkout | `begin_checkout`, `cancel_order`, `release_expired_checkout` |
+| Payments | `record_payment_outcome`, `authorize_payment`, `capture_payment`, `void_authorization`, `complete_refund`, `record_chargeback`, `reconcile_payment` |
+| Fulfilment | `allocate_inventory`, `mark_order_packed`, `create_shipment`, `record_shipment_result`, `record_delivery` |
+| Returns | `request_return`, `approve_return`, `reject_return`, `receive_return`, `record_return_inspection`, `create_exchange` |
+| Subscriptions | `create_subscription_order`, `record_renewal_outcome`, `pause_subscription`, `cancel_subscription` |
+| B2B | `submit_quote`, `approve_purchase`, `reject_purchase`, `consume_credit` |
+| Marketplace | `split_vendor_orders`, `record_vendor_acceptance`, `create_vendor_payout`, `record_payout_outcome`, `reconcile_vendor_payout`, `open_vendor_dispute` |
+| Booking | `reserve_grooming_slot`, `confirm_booking`, `reschedule_booking`, `cancel_booking`, `expire_booking_hold`, `record_no_show` |
+| Prescription | `submit_prescription_review`, `approve_prescription`, `reject_prescription`, `expire_prescription` |
+| Operations | `route_fraud_review`, `resolve_fraud_review`, `resolve_payment_reconciliation`, `record_notification_delivery` |
+
+### Processes and flows
+
+Only a definition declaring `kind: process` is durable. A durable process
+persists its state, signal inbox, activity attempts, and timers, so it can
+recover after a crash. A command effect is consumed from the transactional
+outbox to start or signal that process; the command itself remains synchronous.
+
+| Module | Current intent |
+| --- | --- |
+| `checkout_payment` | Checkout, provider authorization, verified payment outcome, and expiry handling. |
+| `partial_fulfilment` | Allocate, pack, label, ship, and capture per fulfilment unit. |
+| `return_refund` | Support approval, return label, receipt, inspection, refund, exchange, or rejection. |
+| `subscription_renewal` | Renewal authorization with dunning timers and a terminal pause. |
+| `b2b_order_approval` | Quote routing, automatic credit use, and approver/finance waits. |
+| `vendor_payout` | Create vendor payouts, submit provider requests, and await settlement. |
+| `grooming_booking` | Reserve a grooming slot and await confirmation, cancellation, or hold expiry. |
+| `prescription_review` | Submit a prescription review and await the recorded decision or expiry. |
+| `payment_reconciliation` | Retrieve provider evidence, reconcile it, and await manual resolution when needed. |
+
+All nine active flow modules declare `kind: process` and `version: 1`. The YAML
+remains the target contract, not an assertion that these modules execute today.
+
+### Connectors
+
+All active connectors are HTTP declarations with bounded retries, capacity
+limits, redaction, and idempotency policy:
+
+| Connector | Operations |
+| --- | --- |
+| `mock_payment` | `authorize`, `capture`, `void`, `refund`, `reconcile` |
+| `mock_carrier` | `quote`, `create_label`, `create_return_label`, `track` |
+| `mock_tax` | `quote_order` |
+| `mock_notification` | `send_email`, `send_webhook` |
+| `mock_payout` | `create_payout` |
+
+HTTP delivery is at-least-once at the provider boundary: retries reuse stable
+provider idempotency keys. When a provider cannot offer exactly-once behavior,
+the declarative contract requires reconciliation rather than claiming an
+unavailable guarantee.
+
+### Rules and decision tables
+
+`metadata/rules.yaml` defines typed enums/states for payment, approval,
+inspection, booking, reconciliation, checkout, shipment, return,
+subscription, payout, prescription, and fraud, plus typed return-line objects.
+Its active Rules are:
+
+- Arithmetic and inventory: `can_reserve_stock`, `add_int`,
+  `is_single_currency`, `subtract_int`, `add_minor`, `can_release_stock`.
+- Payments and reconciliation: `payment_was_authorized`,
+  `normalize_payment_outcome_state`, `can_authorize_payment_amount`,
+  `can_capture_payment_amount`, `can_void_authorization`,
+  `can_refund_payment_amount`, `can_record_chargeback_amount`,
+  `can_reconcile_payment`, `reconciliation_state_for_decision`,
+  `payment_reconciliation_supports_decision`.
+- Lifecycle gates: `can_transition_checkout`, `can_transition_payment`,
+  `can_transition_shipment`, `can_transition_return`,
+  `can_transition_subscription`, `can_transition_approval`,
+  `can_transition_payout`, `can_record_provider_payout_outcome`,
+  `can_transition_booking`, `can_transition_prescription`,
+  `can_transition_fraud`, `fraud_state_for_route`,
+  `can_transition_reconciliation`.
+- Returns and B2B: `return_approval_matches_request`,
+  `return_approved_quantity_is_bounded`, `return_receipt_matches_approval`,
+  `return_received_quantity_is_bounded`, `return_inspection_matches_receipt`,
+  `return_inspected_quantity_is_bounded`, `return_refund_amount_is_bounded`,
+  `return_is_exchange_eligible`, `return_decision_was_approved`,
+  `approval_was_approved`, `approval_was_rejected`, `can_consume_credit`.
+
+The first-match decision tables are `price_list_route`, `promotion_route`,
+`tax_route`, `shipping_service_route`, `inventory_location_route`,
+`b2b_approval_route`, `marketplace_commission_route`,
+`return_disposition_route`, `dunning_schedule`, and `fraud_route`.
+
+### B2B producer/consumer example
+
+The following abbreviated form shows the intended hand-off. The quote Command
+commits its domain change and a start intent; the approving Command commits its
+domain change and a signal intent; the durable Process consumes that signal
+while waiting. Both effects are transactional-outbox intent, not immediate
+Process calls. This is declarative contract documentation, not a runnable
+request today.
+
+```yaml
+# commands/b2b/submit-quote.yaml (producer: start intent)
+name: submit_quote
+effects:
+  - start_process:
+      process: b2b_order_approval
+      process_key: { step: approval, column: id }
+      input:
+        quote_id: { step: quote, column: id }
+        approval_id: { step: approval, column: id }
+        total_minor: { step: quote, column: total_minor }
+        available_credit_minor: { step: quote, column: available_credit_minor }
+      idempotency_key: { argument: request_id }
+
+# commands/b2b/approve-purchase.yaml (producer: signal intent)
+name: approve_purchase
+effects:
+  - signal_process:
+      process: b2b_order_approval
+      signal: approval_decision
+      correlate:
+        approval_id: { step: approve, column: id }
+      payload:
+        decision: { literal: approved }
+      idempotency_key: { argument: request_id }
+
+# flows/b2b-order-approval.yaml (consumer)
+name: b2b_order_approval
+kind: process
+version: 1
+start:
+  command: submit_quote
+  input:
+    quote_id: { command_result: quote_id }
+    approval_id: { command_result: approval_id }
+    total_minor: { command_result: total_minor }
+    available_credit_minor: { command_result: available_credit_minor }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: approval_id }
+states:
+  - id: await_approver
+    wait:
+      signal: approval_decision
+      correlate:
+        approval_id: { input: approval_id }
+      deadline: 2d
+      next: route_approver_decision
+```
+
 ## Reset
 
 ```bash

@@ -1,0 +1,65 @@
+name: mock_notification
+module: http
+config:
+  endpoint_identity: petshop_mock_notification_v1
+  credential_identity: petshop_mock_notification_fixture
+  base_url: { value_from_env: PETSHOP_NOTIFICATION_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: PETSHOP_NOTIFICATION_API_TOKEN
+operations:
+  - name: send_email
+    version: v1
+    method: POST
+    path: /v1/email/messages
+    body:
+      message_key: { input: message_key }
+      recipient: { input: recipient }
+      template: { input: template }
+      variables: { input: variables }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_message_id: { json_pointer: /message_id, type: string! }
+      normalized_status: { json_pointer: /status, type: string! }
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: message_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [recipient, variables]
+      response_body: [provider_message_id]
+
+  - name: send_webhook
+    version: v1
+    method: POST
+    path: /v1/webhook/messages
+    body:
+      message_key: { input: message_key }
+      destination: { input: destination }
+      event_type: { input: event_type }
+      payload: { input: payload }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_message_id: { json_pointer: /message_id, type: string! }
+      normalized_status: { json_pointer: /status, type: string! }
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: message_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [destination, payload]
+      response_body: [provider_message_id]

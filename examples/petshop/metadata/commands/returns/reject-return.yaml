@@ -49,3 +49,14 @@ idempotency:
   scope:
     - { argument: return_id }
   retention: 365d
+effects:
+  - signal_process:
+      process: return_refund
+      signal: return_decision_recorded
+      correlate:
+        return_id: { step: rejected_return, column: id }
+      payload:
+        decision: { literal: rejected }
+        approval: { step: rejected_return }
+        approval_audit: { step: rejection_audit }
+      idempotency_key: { argument: decision_id }
