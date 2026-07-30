@@ -1,0 +1,9 @@
+{
+  "idempotency": {
+    "fixed_binding": "Idempotency-Key",
+    "scope": "one-stable-key-per-operation-resource",
+    "minimum_retention_ms": 604800000,
+    "clock_safety_margin_ms": 300000,
+    "maximum_execution_horizon_ms": 120000
+  }
+}
