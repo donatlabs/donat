@@ -714,6 +714,88 @@ fn manifest_fact_origins_are_owned_by_present_provenance_capabilities() {
 }
 
 #[test]
+fn generic_provider_facts_compile_for_read_only_operations() {
+    let provider = load_record(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
+    )
+    .unwrap();
+    let provider_id = provider.record_id();
+    let accepted = accepted_catalog_with_exact_provider(provider.clone());
+    let mut value = manifest();
+    value.operations[0]
+        .resolved_fact_values
+        .push(ResolvedFactValue {
+            use_site: "effect.request.binding".to_owned(),
+            value: TypedValue::String("Idempotency-Key".to_owned()),
+        });
+    value.provenance.push(ManifestProvenanceReference {
+        source_record_id: provider_id,
+        artifact_hashes: provider.artifact_hashes().to_vec(),
+        license_id: "MIT".to_owned(),
+        notice_id: NoticeId::literal("notice.demo"),
+        contract_facts: vec![ResolvedContractFactBinding {
+            use_site: "effect.request.binding".to_owned(),
+            fact: ContractFact::ProviderEvidence {
+                source_record_id: provider_id,
+                fact_id: ProviderFactId::literal("fact.idempotency"),
+            },
+        }],
+    });
+
+    let policies = BTreeMap::new();
+    let checked = compile_connector_manifest(&value, &accepted, &policies).unwrap();
+    let semantic = semantic_material(&checked, 1).unwrap();
+    let provenance = provenance_material(&checked, 1, 1, 1).unwrap();
+    assert!(
+        std::str::from_utf8(&canonical_material_bytes(&semantic).unwrap())
+            .unwrap()
+            .contains(r#""use_site":"effect.request.binding""#)
+    );
+    assert!(
+        std::str::from_utf8(&canonical_material_bytes(&provenance).unwrap())
+            .unwrap()
+            .contains(r#""use_site":"effect.request.binding""#)
+    );
+}
+
+#[test]
+fn evidence_provenance_may_be_empty_only_when_semantic_facts_are_empty() {
+    let provider = load_record(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
+    )
+    .unwrap();
+    let provider_id = provider.record_id();
+    let accepted = accepted_catalog_with_exact_provider(provider.clone());
+    let empty_reference = || ManifestProvenanceReference {
+        source_record_id: provider_id,
+        artifact_hashes: provider.artifact_hashes().to_vec(),
+        license_id: "MIT".to_owned(),
+        notice_id: NoticeId::literal("notice.demo"),
+        contract_facts: Vec::new(),
+    };
+
+    let mut empty = manifest();
+    empty.provenance.push(empty_reference());
+    compile_connector_manifest(&empty, &accepted, &BTreeMap::new()).unwrap();
+
+    let mut required = manifest();
+    required.operations[0]
+        .resolved_fact_values
+        .push(ResolvedFactValue {
+            use_site: "effect.request.binding".to_owned(),
+            value: TypedValue::String("Idempotency-Key".to_owned()),
+        });
+    required.provenance.push(empty_reference());
+    assert_eq!(
+        compile_connector_manifest(&required, &accepted, &BTreeMap::new())
+            .err()
+            .unwrap()
+            .code(),
+        "catalog_fact_binding_mismatch"
+    );
+}
+
+#[test]
 fn inventory_only_record_cannot_enter_manifest_provenance() {
     let (accepted, inventory) = accepted_catalog_with_inventory();
     let mut value = manifest();

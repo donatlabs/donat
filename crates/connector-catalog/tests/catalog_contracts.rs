@@ -4,7 +4,7 @@ use std::path::Path;
 
 use donat_connector_abi::{
     AuthenticatorId, CodecId, CompiledStepId, ConnectorId, CredentialFieldId, NormalizerId,
-    OriginId, ProcessorFamilyId, TriggerId,
+    OperationId, OriginId, ProcessorFamilyId, TriggerId,
 };
 use donat_connector_catalog::*;
 use donat_value_contract::ValueContractCatalog;
@@ -210,8 +210,21 @@ fn manifest_provenance_references_match_exact_records() {
     reviews.approve_reviewed_use("review.demo").unwrap();
     let catalog =
         AcceptedRecordCatalog::build(vec![record.clone()], &BTreeMap::new(), &reviews).unwrap();
-    let (_, origins) =
-        resolve_fact_bindings(&values, &[binding], &catalog, &BTreeMap::new()).unwrap();
+    let effect = OperationEffect::ReadOnly;
+    let requirements = check_fact_requirements(&[OperationFactRequirement::new(
+        OperationId::literal("get"),
+        &effect,
+        &values,
+    )])
+    .unwrap();
+    let (_, origins) = resolve_fact_bindings(
+        &values,
+        &[binding],
+        &requirements,
+        &catalog,
+        &BTreeMap::new(),
+    )
+    .unwrap();
     let (source_record_id, _, artifact_content_sha256, _) = origins[0]
         .provider_evidence()
         .expect("provider fact must resolve to immutable evidence");

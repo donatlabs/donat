@@ -58,18 +58,10037 @@ fn domain_hash_bytes(domain: CatalogHashDomain, canonical_bytes: &[u8]) -> [u8; 
     hash.finalize().into()
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalOwnerPathDescriptor {
+    pub normalized_owner: &'static str,
+    pub normalized_member: &'static str,
+    pub normalized_source: CanonicalDeclarationSource,
+    pub domain: &'static str,
+    pub canonical_path: &'static str,
+    pub owner_class: &'static str,
+    pub order: &'static str,
+    pub null_empty: &'static str,
+    pub branch_type: &'static str,
+    pub material_member: &'static str,
+    pub material_source: CanonicalDeclarationSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CanonicalDeclarationSource {
+    Source,
+    Model,
+    ValueContract,
+    ConnectorAbi,
+    ProjectionSchema,
+    BuilderDerived,
+    Constant,
+    NamedDerived,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalMutationDescriptor {
+    pub case: CanonicalMutationCase,
+    pub disposition: CanonicalMutationDisposition,
+    pub material_source: CanonicalDeclarationSource,
+    pub domain: &'static str,
+    pub canonical_path: &'static str,
+    pub material_member: &'static str,
+    pub branch_type: &'static str,
+    pub null_empty: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CanonicalMutationDisposition {
+    Mutable,
+    Singleton,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CanonicalMutationCase {
+    SourceRecord,
+    Semantic,
+    Provenance,
+    ValueContract,
+    TypedValue,
+}
+
 macro_rules! projection_schema {
-    ($($declaration:item)*) => {
+    (
+        owner_paths {
+            $(
+                (
+                    $owner:literal,
+                    $normalized_member:literal,
+                    $normalized_source:ident,
+                    $domain:literal,
+                    $path:literal,
+                    $class:literal,
+                    $order:literal,
+                    $null_empty:literal,
+                    $branch:literal,
+                    $member:literal,
+                    $material_source:ident,
+                    $case:ident,
+                    $disposition:ident $(,)?
+                );
+            )*
+        }
+        $($declaration:item)*
+    ) => {
         $($declaration)*
 
         /// The exact declaration descriptor that generated every closed
         /// canonical material type.
         pub const CANONICAL_PROJECTION_SCHEMA_DECLARATIONS: &str =
             stringify!($($declaration)*);
+
+        pub const CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS:
+            &[CanonicalOwnerPathDescriptor] = &[
+                $(
+                    CanonicalOwnerPathDescriptor {
+                        normalized_owner: $owner,
+                        normalized_member: $normalized_member,
+                        normalized_source:
+                            CanonicalDeclarationSource::$normalized_source,
+                        domain: $domain,
+                        canonical_path: $path,
+                        owner_class: $class,
+                        order: $order,
+                        null_empty: $null_empty,
+                        branch_type: $branch,
+                        material_member: $member,
+                        material_source:
+                            CanonicalDeclarationSource::$material_source,
+                    },
+                )*
+            ];
+
+        pub const CANONICAL_PROJECTION_MUTATION_DESCRIPTORS:
+            &[CanonicalMutationDescriptor] = &[
+                $(
+                    CanonicalMutationDescriptor {
+                        case: CanonicalMutationCase::$case,
+                        disposition: CanonicalMutationDisposition::$disposition,
+                        material_source:
+                            CanonicalDeclarationSource::$material_source,
+                        domain: $domain,
+                        canonical_path: $path,
+                        material_member: $member,
+                        branch_type: $branch,
+                        null_empty: $null_empty,
+                    },
+                )*
+            ];
     };
 }
 
 projection_schema! {
+owner_paths {
+    (
+        "StableSemver.major",
+        "StableSemver.major",
+        Model,
+        "semantic",
+        "StableSemver.major",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.major",
+        Model,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StableSemver.minor",
+        "StableSemver.minor",
+        Model,
+        "semantic",
+        "StableSemver.minor",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.minor",
+        Model,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StableSemver.patch",
+        "StableSemver.patch",
+        Model,
+        "semantic",
+        "StableSemver.patch",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.patch",
+        Model,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StableSemver.major",
+        "StableSemver.major",
+        Model,
+        "provenance",
+        "StableSemver.major",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.major",
+        Model,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "StableSemver.minor",
+        "StableSemver.minor",
+        Model,
+        "provenance",
+        "StableSemver.minor",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.minor",
+        Model,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "StableSemver.patch",
+        "StableSemver.patch",
+        Model,
+        "provenance",
+        "StableSemver.patch",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StableSemver.patch",
+        Model,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.record_version",
+        "ConnectorSourceRecord.record_version",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.record_version",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SourceRecordMaterialV1.record_version",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.record_id",
+        "ConnectorSourceRecord.record_id",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.record_id",
+        "normalized",
+        "scalar",
+        "required",
+        "SourceRecordId",
+        "SourceRecordMaterialV1.record_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.subject",
+        "ConnectorSourceRecord.subject",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.subject",
+        "normalized",
+        "scalar",
+        "required",
+        "SourceSubjectMaterialV1",
+        "SourceRecordMaterialV1.subject",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.reacquisition",
+        "ConnectorSourceRecord.reacquisition",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.reacquisition",
+        "normalized",
+        "scalar",
+        "required",
+        "ReacquisitionMaterialV1",
+        "SourceRecordMaterialV1.reacquisition",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.artifact_hashes",
+        "ConnectorSourceRecord.artifact_hashes",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.artifact_hashes",
+        "normalized",
+        "artifact_id",
+        "empty_array",
+        "Vec<ArtifactHashMaterialV1>",
+        "SourceRecordMaterialV1.artifact_hashes",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.license",
+        "ConnectorSourceRecord.license",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "SourceRecordMaterialV1.license",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.notice",
+        "ConnectorSourceRecord.notice",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.notice",
+        "normalized",
+        "scalar",
+        "required",
+        "NoticeMaterialV1",
+        "SourceRecordMaterialV1.notice",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.entrypoints",
+        "ConnectorSourceRecord.entrypoints",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.entrypoints",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<SourcePath>",
+        "SourceRecordMaterialV1.entrypoints",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.dependencies",
+        "ConnectorSourceRecord.dependencies",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.dependencies",
+        "normalized",
+        "dependency",
+        "empty_array",
+        "Vec<DependencyDecisionMaterialV1>",
+        "SourceRecordMaterialV1.dependencies",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.embedded_material",
+        "ConnectorSourceRecord.embedded_material",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.embedded_material",
+        "normalized",
+        "material_id",
+        "empty_array",
+        "Vec<EmbeddedDecisionMaterialV1>",
+        "SourceRecordMaterialV1.embedded_material",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.provider_contracts",
+        "ConnectorSourceRecord.provider_contracts",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.provider_contracts",
+        "normalized",
+        "contract_id",
+        "empty_array",
+        "Vec<ProviderContractMaterialV1>",
+        "SourceRecordMaterialV1.provider_contracts",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.compatibility",
+        "ConnectorSourceRecord.compatibility",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.compatibility",
+        "normalized",
+        "scalar",
+        "required",
+        "CompatibilityMaterialV1",
+        "SourceRecordMaterialV1.compatibility",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.admission",
+        "ConnectorSourceRecord.admission",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.admission",
+        "normalized",
+        "scalar",
+        "required",
+        "AdmissionMaterialV1",
+        "SourceRecordMaterialV1.admission",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.safety_findings",
+        "ConnectorSourceRecord.safety_findings",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.safety_findings",
+        "normalized",
+        "scalar",
+        "required",
+        "SafetyFindingsMaterialV1",
+        "SourceRecordMaterialV1.safety_findings",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.reviewer",
+        "ConnectorSourceRecord.reviewer",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.reviewer",
+        "normalized",
+        "scalar",
+        "required",
+        "ReviewIdentity",
+        "SourceRecordMaterialV1.reviewer",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.approval_date",
+        "ConnectorSourceRecord.approval_date",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.approval_date",
+        "normalized",
+        "scalar",
+        "required",
+        "Date",
+        "SourceRecordMaterialV1.approval_date",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.proposed_manifest",
+        "ConnectorSourceRecord.proposed_manifest",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.proposed_manifest",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<RepoPath>",
+        "SourceRecordMaterialV1.proposed_manifest",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.proposed_destinations",
+        "ConnectorSourceRecord.proposed_destinations",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.proposed_destinations",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<RepoPath>",
+        "SourceRecordMaterialV1.proposed_destinations",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorSourceRecord.red_tests",
+        "ConnectorSourceRecord.red_tests",
+        Source,
+        "source-record",
+        "SourceRecordMaterialV1.red_tests",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<TestId>",
+        "SourceRecordMaterialV1.red_tests",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SourceSubject::ExactNpm",
+        "SourceSubject::ExactNpm",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "exact_npm",
+        "SourceSubjectMaterialV1::ExactNpm",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SourceSubject::ProviderArtifact",
+        "SourceSubject::ProviderArtifact",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=provider_artifact}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_artifact",
+        "SourceSubjectMaterialV1::ProviderArtifact",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SourceSubject::DonatOwned",
+        "SourceSubject::DonatOwned",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=donat_owned}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "donat_owned",
+        "SourceSubjectMaterialV1::DonatOwned",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.name",
+        "ExactNpmPackage.name",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ExactNpmMaterialV1.name",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.version",
+        "ExactNpmPackage.version",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.version",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactSemver",
+        "ExactNpmMaterialV1.version",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.tarball_url",
+        "ExactNpmPackage.tarball_url",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.tarball_url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "ExactNpmMaterialV1.tarball_url",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.integrity",
+        "ExactNpmPackage.integrity",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.integrity",
+        "normalized",
+        "scalar",
+        "required",
+        "NpmIntegrity",
+        "ExactNpmMaterialV1.integrity",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.repository",
+        "ExactNpmPackage.repository",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.repository",
+        "normalized",
+        "scalar",
+        "required",
+        "ImmutableRepository",
+        "ExactNpmMaterialV1.repository",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.npm_git_head",
+        "ExactNpmPackage.npm_git_head",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.npm_git_head",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "ExactNpmMaterialV1.npm_git_head",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.package_repository",
+        "ExactNpmPackage.package_repository",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.package_repository",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryUrl",
+        "ExactNpmMaterialV1.package_repository",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.signature",
+        "ExactNpmPackage.signature",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.signature",
+        "normalized",
+        "scalar",
+        "required",
+        "NpmSignatureMaterialV1",
+        "ExactNpmMaterialV1.signature",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.provenance",
+        "ExactNpmPackage.provenance",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.provenance",
+        "normalized",
+        "scalar",
+        "required",
+        "NpmProvenanceMaterialV1",
+        "ExactNpmMaterialV1.provenance",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.tag_commit",
+        "ExactNpmPackage.tag_commit",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.tag_commit",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<GitCommit>",
+        "ExactNpmMaterialV1.tag_commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.provenance_commit",
+        "ExactNpmPackage.provenance_commit",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.provenance_commit",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<GitCommit>",
+        "ExactNpmMaterialV1.provenance_commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.maintainers",
+        "ExactNpmPackage.maintainers",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.maintainers",
+        "normalized",
+        "identity",
+        "empty_array",
+        "Vec<NpmMaintainerIdentity>",
+        "ExactNpmMaterialV1.maintainers",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactNpmPackage.repository_owner",
+        "ExactNpmPackage.repository_owner",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=exact_npm}.value.repository_owner",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryOwnerMaterialV1",
+        "ExactNpmMaterialV1.repository_owner",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmIntegrity.algorithm",
+        "NpmIntegrity.algorithm",
+        Source,
+        "source-record",
+        "NpmIntegrity.algorithm",
+        "normalized",
+        "scalar",
+        "required",
+        "sha512",
+        "NpmIntegrity.algorithm",
+        ProjectionSchema,
+        SourceRecord,
+        Singleton,
+    );
+
+    (
+        "NpmIntegrity.digest",
+        "NpmIntegrity.digest",
+        Source,
+        "source-record",
+        "NpmIntegrity.digest",
+        "normalized",
+        "scalar",
+        "required",
+        "bytes64",
+        "NpmIntegrity.digest",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableRepository.url",
+        "ImmutableRepository.url",
+        Source,
+        "source-record",
+        "ImmutableRepository.url",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryUrl",
+        "ImmutableRepository.url",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableRepository.commit",
+        "ImmutableRepository.commit",
+        Source,
+        "source-record",
+        "ImmutableRepository.commit",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "ImmutableRepository.commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableRepository.tree",
+        "ImmutableRepository.tree",
+        Source,
+        "source-record",
+        "ImmutableRepository.tree",
+        "normalized",
+        "scalar",
+        "required",
+        "GitTree",
+        "ImmutableRepository.tree",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::Verified",
+        "NpmSignatureDecision::Verified",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=verified}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "verified",
+        "NpmSignatureMaterialV1::Verified",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::VerifiedAbsent",
+        "NpmSignatureDecision::VerifiedAbsent",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=verified_absent}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "verified_absent",
+        "NpmSignatureMaterialV1::VerifiedAbsent",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::Rejected",
+        "NpmSignatureDecision::Rejected",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "NpmSignatureMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::Verified.signatures",
+        "NpmSignatureDecision::Verified.signatures",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=verified}.value.signatures",
+        "normalized",
+        "key_id",
+        "nonempty_array",
+        "NonEmptyVec<VerifiedNpmSignature>",
+        "NpmSignatureMaterialV1::Verified.signatures",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::Verified.registry_metadata_sha256",
+        "NpmSignatureDecision::Verified.registry_metadata_sha256",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=verified}.value.registry_metadata_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "NpmSignatureMaterialV1::Verified.registry_metadata_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::VerifiedAbsent.registry_metadata_sha256",
+        "NpmSignatureDecision::VerifiedAbsent.registry_metadata_sha256",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=verified_absent}.value.registry_metadata_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "NpmSignatureMaterialV1::VerifiedAbsent.registry_metadata_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmSignatureDecision::Rejected.finding",
+        "NpmSignatureDecision::Rejected.finding",
+        Source,
+        "source-record",
+        "NpmSignatureMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "NpmSignatureMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "VerifiedNpmSignature.key_id",
+        "VerifiedNpmSignature.key_id",
+        Source,
+        "source-record",
+        "VerifiedNpmSignatureMaterialV1.key_id",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "VerifiedNpmSignatureMaterialV1.key_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "VerifiedNpmSignature.signature_sha256",
+        "VerifiedNpmSignature.signature_sha256",
+        Source,
+        "source-record",
+        "VerifiedNpmSignatureMaterialV1.signature_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "VerifiedNpmSignatureMaterialV1.signature_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::Verified",
+        "NpmProvenanceDecision::Verified",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=verified}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "verified",
+        "NpmProvenanceMaterialV1::Verified",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::VerifiedAbsent",
+        "NpmProvenanceDecision::VerifiedAbsent",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=verified_absent}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "verified_absent",
+        "NpmProvenanceMaterialV1::VerifiedAbsent",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::Rejected",
+        "NpmProvenanceDecision::Rejected",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "NpmProvenanceMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::Verified.statement_sha256",
+        "NpmProvenanceDecision::Verified.statement_sha256",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=verified}.value.statement_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "NpmProvenanceMaterialV1::Verified.statement_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::Verified.source_commit",
+        "NpmProvenanceDecision::Verified.source_commit",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=verified}.value.source_commit",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "NpmProvenanceMaterialV1::Verified.source_commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::VerifiedAbsent.registry_metadata_sha256",
+        "NpmProvenanceDecision::VerifiedAbsent.registry_metadata_sha256",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=verified_absent}.value.registry_metadata_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "NpmProvenanceMaterialV1::VerifiedAbsent.registry_metadata_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NpmProvenanceDecision::Rejected.finding",
+        "NpmProvenanceDecision::Rejected.finding",
+        Source,
+        "source-record",
+        "NpmProvenanceMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "NpmProvenanceMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::Consistent",
+        "RepositoryOwnerDecision::Consistent",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=consistent}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "consistent",
+        "RepositoryOwnerMaterialV1::Consistent",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::ReviewedMismatch",
+        "RepositoryOwnerDecision::ReviewedMismatch",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=reviewed_mismatch}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "reviewed_mismatch",
+        "RepositoryOwnerMaterialV1::ReviewedMismatch",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::Rejected",
+        "RepositoryOwnerDecision::Rejected",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "RepositoryOwnerMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::Consistent.package_owner",
+        "RepositoryOwnerDecision::Consistent.package_owner",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=consistent}.value.package_owner",
+        "normalized",
+        "scalar",
+        "required",
+        "NpmOwnerIdentity",
+        "RepositoryOwnerMaterialV1::Consistent.package_owner",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::Consistent.repository_owner",
+        "RepositoryOwnerDecision::Consistent.repository_owner",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=consistent}.value.repository_owner",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryOwnerIdentity",
+        "RepositoryOwnerMaterialV1::Consistent.repository_owner",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::ReviewedMismatch.decision_id",
+        "RepositoryOwnerDecision::ReviewedMismatch.decision_id",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=reviewed_mismatch}.value.decision_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ReviewDecisionId",
+        "RepositoryOwnerMaterialV1::ReviewedMismatch.decision_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepositoryOwnerDecision::Rejected.finding",
+        "RepositoryOwnerDecision::Rejected.finding",
+        Source,
+        "source-record",
+        "RepositoryOwnerMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "RepositoryOwnerMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactProviderArtifact.provider",
+        "ExactProviderArtifact.provider",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=provider_artifact}.value.provider",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ProviderArtifactMaterialV1.provider",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactProviderArtifact.evidence",
+        "ExactProviderArtifact.evidence",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=provider_artifact}.value.evidence",
+        "normalized",
+        "canonical_source_identity_content_sha256",
+        "nonempty_array",
+        "NonEmptyVec<ProviderEvidenceMaterialV1>",
+        "ProviderArtifactMaterialV1.evidence",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.source",
+        "ProviderEvidenceArtifact.source",
+        Source,
+        "source-record",
+        "ProviderEvidenceMaterialV1.source",
+        "normalized",
+        "scalar",
+        "required",
+        "ImmutableProviderEvidenceSource",
+        "ProviderEvidenceMaterialV1.source",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.accessed_on",
+        "ProviderEvidenceArtifact.accessed_on",
+        Source,
+        "source-record",
+        "ProviderEvidenceMaterialV1.accessed_on",
+        "normalized",
+        "scalar",
+        "required",
+        "Date",
+        "ProviderEvidenceMaterialV1.accessed_on",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.content_sha256",
+        "ProviderEvidenceArtifact.content_sha256",
+        Source,
+        "source-record",
+        "ProviderEvidenceMaterialV1.content_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "ProviderEvidenceMaterialV1.content_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.terms",
+        "ProviderEvidenceArtifact.terms",
+        Source,
+        "source-record",
+        "ProviderEvidenceMaterialV1.terms",
+        "normalized",
+        "scalar",
+        "required",
+        "EvidenceTermsMaterialV1",
+        "ProviderEvidenceMaterialV1.terms",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.facts",
+        "ProviderEvidenceArtifact.facts",
+        Source,
+        "source-record",
+        "ProviderEvidenceMaterialV1.facts",
+        "normalized",
+        "fact_id",
+        "nonempty_array",
+        "NonEmptyVec<ProviderFactMaterialV1>",
+        "ProviderEvidenceMaterialV1.facts",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile",
+        "ImmutableProviderEvidenceSource::RepositoryFile",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=repository_file}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "repository_file",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact",
+        "ImmutableProviderEvidenceSource::VersionedArtifact",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=versioned_artifact}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "versioned_artifact",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.repository",
+        "ImmutableProviderEvidenceSource::RepositoryFile.repository",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=repository_file}.value.repository",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryUrl",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.repository",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.commit",
+        "ImmutableProviderEvidenceSource::RepositoryFile.commit",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=repository_file}.value.commit",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.path",
+        "ImmutableProviderEvidenceSource::RepositoryFile.path",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=repository_file}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact.url",
+        "ImmutableProviderEvidenceSource::VersionedArtifact.url",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=versioned_artifact}.value.url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact.url",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact.provider_revision",
+        "ImmutableProviderEvidenceSource::VersionedArtifact.provider_revision",
+        Source,
+        "source-record",
+        "ProviderEvidenceSourceMaterialV1{kind=versioned_artifact}.value.provider_revision",
+        "normalized",
+        "scalar",
+        "required",
+        "NonEmptyString",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact.provider_revision",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive",
+        "EvidenceTermsDisposition::Permissive",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=permissive}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "permissive",
+        "EvidenceTermsMaterialV1::Permissive",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse",
+        "EvidenceTermsDisposition::ReviewedUse",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=reviewed_use}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "reviewed_use",
+        "EvidenceTermsMaterialV1::ReviewedUse",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Rejected",
+        "EvidenceTermsDisposition::Rejected",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "EvidenceTermsMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive.license",
+        "EvidenceTermsDisposition::Permissive.license",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=permissive}.value.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "EvidenceTermsMaterialV1::Permissive.license",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive.evidence_url",
+        "EvidenceTermsDisposition::Permissive.evidence_url",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=permissive}.value.evidence_url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "EvidenceTermsMaterialV1::Permissive.evidence_url",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse.decision_id",
+        "EvidenceTermsDisposition::ReviewedUse.decision_id",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=reviewed_use}.value.decision_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ReviewDecisionId",
+        "EvidenceTermsMaterialV1::ReviewedUse.decision_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse.evidence_url",
+        "EvidenceTermsDisposition::ReviewedUse.evidence_url",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=reviewed_use}.value.evidence_url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "EvidenceTermsMaterialV1::ReviewedUse.evidence_url",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Rejected.finding",
+        "EvidenceTermsDisposition::Rejected.finding",
+        Source,
+        "source-record",
+        "EvidenceTermsMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "EvidenceTermsMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderFact.fact_id",
+        "ProviderFact.fact_id",
+        Source,
+        "source-record",
+        "ProviderFactMaterialV1.fact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderFactId",
+        "ProviderFactMaterialV1.fact_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderFact.location",
+        "ProviderFact.location",
+        Source,
+        "source-record",
+        "ProviderFactMaterialV1.location",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactFactLocationMaterialV1",
+        "ProviderFactMaterialV1.location",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderFact.normalized_value",
+        "ProviderFact.normalized_value",
+        Source,
+        "source-record",
+        "ProviderFactMaterialV1.normalized_value",
+        "normalized",
+        "scalar",
+        "required",
+        "TypedValueMaterialV1",
+        "ProviderFactMaterialV1.normalized_value",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer",
+        "ExactFactLocation::JsonPointer",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=json_pointer}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "json_pointer",
+        "ExactFactLocationMaterialV1::JsonPointer",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection",
+        "ExactFactLocation::DocumentSection",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=document_section}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "document_section",
+        "ExactFactLocationMaterialV1::DocumentSection",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer.path",
+        "ExactFactLocation::JsonPointer.path",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=json_pointer}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ExactFactLocationMaterialV1::JsonPointer.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer.pointer",
+        "ExactFactLocation::JsonPointer.pointer",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=json_pointer}.value.pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "ExactFactLocationMaterialV1::JsonPointer.pointer",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection.path",
+        "ExactFactLocation::DocumentSection.path",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=document_section}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ExactFactLocationMaterialV1::DocumentSection.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection.section",
+        "ExactFactLocation::DocumentSection.section",
+        Source,
+        "source-record",
+        "ExactFactLocationMaterialV1{kind=document_section}.value.section",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ExactFactLocationMaterialV1::DocumentSection.section",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DonatOwnedSource.repository_commit",
+        "DonatOwnedSource.repository_commit",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=donat_owned}.value.repository_commit",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "DonatOwnedMaterialV1.repository_commit",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DonatOwnedSource.files",
+        "DonatOwnedSource.files",
+        Source,
+        "source-record",
+        "SourceSubjectMaterialV1{kind=donat_owned}.value.files",
+        "normalized",
+        "path",
+        "nonempty_array",
+        "NonEmptyVec<RepoFileHash>",
+        "DonatOwnedMaterialV1.files",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepoFileHash.path",
+        "RepoFileHash.path",
+        Source,
+        "source-record",
+        "RepoFileHashMaterialV1.path",
+        "normalized",
+        "scalar",
+        "required",
+        "RepoPath",
+        "RepoFileHashMaterialV1.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "RepoFileHash.sha256",
+        "RepoFileHash.sha256",
+        Source,
+        "source-record",
+        "RepoFileHashMaterialV1.sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "RepoFileHashMaterialV1.sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ReacquisitionPlan::ExactNpmReview",
+        "ReacquisitionPlan::ExactNpmReview",
+        Source,
+        "source-record",
+        "ReacquisitionMaterialV1{kind=exact_npm_review}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "exact_npm_review",
+        "ReacquisitionMaterialV1::ExactNpmReview",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ReacquisitionPlan::ProviderRepositoryReview",
+        "ReacquisitionPlan::ProviderRepositoryReview",
+        Source,
+        "source-record",
+        "ReacquisitionMaterialV1{kind=provider_repository_review}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_repository_review",
+        "ReacquisitionMaterialV1::ProviderRepositoryReview",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ReacquisitionPlan::ProviderVersionedArtifactReview",
+        "ReacquisitionPlan::ProviderVersionedArtifactReview",
+        Source,
+        "source-record",
+        "ReacquisitionMaterialV1{kind=provider_versioned_artifact_review}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_versioned_artifact_review",
+        "ReacquisitionMaterialV1::ProviderVersionedArtifactReview",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ReacquisitionPlan::DonatOwnedNoNetwork",
+        "ReacquisitionPlan::DonatOwnedNoNetwork",
+        Source,
+        "source-record",
+        "ReacquisitionMaterialV1{kind=donat_owned_no_network}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "donat_owned_no_network",
+        "ReacquisitionMaterialV1::DonatOwnedNoNetwork",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ArtifactHash.artifact_id",
+        "ArtifactHash.artifact_id",
+        Source,
+        "source-record",
+        "ArtifactHashMaterialV1.artifact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ArtifactId",
+        "ArtifactHashMaterialV1.artifact_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ArtifactHash.algorithm",
+        "ArtifactHash.algorithm",
+        Source,
+        "source-record",
+        "ArtifactHashMaterialV1.algorithm",
+        "normalized",
+        "scalar",
+        "required",
+        "HashAlgorithm",
+        "ArtifactHashMaterialV1.algorithm",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ArtifactHash.digest",
+        "ArtifactHash.digest",
+        Source,
+        "source-record",
+        "ArtifactHashMaterialV1.digest",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256_or_Hash512",
+        "ArtifactHashMaterialV1.digest",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ArtifactHash.path",
+        "ArtifactHash.path",
+        Source,
+        "source-record",
+        "ArtifactHashMaterialV1.path",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<SourcePath>",
+        "ArtifactHashMaterialV1.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "HashAlgorithm::Sha256",
+        "HashAlgorithm::Sha256",
+        Source,
+        "source-record",
+        "HashAlgorithmMaterialV1{kind=sha256}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "sha256",
+        "HashAlgorithmMaterialV1::Sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "HashAlgorithm::Sha512",
+        "HashAlgorithm::Sha512",
+        Source,
+        "source-record",
+        "HashAlgorithmMaterialV1{kind=sha512}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "sha512",
+        "HashAlgorithmMaterialV1::Sha512",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive",
+        "LicenseDecision::Permissive",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=permissive}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "permissive",
+        "LicenseDecisionMaterialV1::Permissive",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant",
+        "LicenseDecision::WrittenGrant",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=written_grant}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "written_grant",
+        "LicenseDecisionMaterialV1::WrittenGrant",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Rejected",
+        "LicenseDecision::Rejected",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "LicenseDecisionMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.spdx_id",
+        "LicenseDecision::Permissive.spdx_id",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=permissive}.value.spdx_id",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "LicenseDecisionMaterialV1::Permissive.spdx_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.selected_dual_license_branch",
+        "LicenseDecision::Permissive.selected_dual_license_branch",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=permissive}.value.selected_dual_license_branch",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<string>",
+        "LicenseDecisionMaterialV1::Permissive.selected_dual_license_branch",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.license_file_path",
+        "LicenseDecision::Permissive.license_file_path",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=permissive}.value.license_file_path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "LicenseDecisionMaterialV1::Permissive.license_file_path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.license_file_sha256",
+        "LicenseDecision::Permissive.license_file_sha256",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=permissive}.value.license_file_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "LicenseDecisionMaterialV1::Permissive.license_file_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant.decision_id",
+        "LicenseDecision::WrittenGrant.decision_id",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=written_grant}.value.decision_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ReviewDecisionId",
+        "LicenseDecisionMaterialV1::WrittenGrant.decision_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant.grant_sha256",
+        "LicenseDecision::WrittenGrant.grant_sha256",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=written_grant}.value.grant_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "LicenseDecisionMaterialV1::WrittenGrant.grant_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Rejected.finding",
+        "LicenseDecision::Rejected.finding",
+        Source,
+        "source-record",
+        "LicenseDecisionMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "LicenseDecisionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.id",
+        "NoticeIdentity.id",
+        Source,
+        "source-record",
+        "NoticeMaterialV1.id",
+        "normalized",
+        "scalar",
+        "required",
+        "NoticeId",
+        "NoticeMaterialV1.id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.license_file_path",
+        "NoticeIdentity.license_file_path",
+        Source,
+        "source-record",
+        "NoticeMaterialV1.license_file_path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "NoticeMaterialV1.license_file_path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.license_file_sha256",
+        "NoticeIdentity.license_file_sha256",
+        Source,
+        "source-record",
+        "NoticeMaterialV1.license_file_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "NoticeMaterialV1.license_file_sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.required_copyright_lines",
+        "NoticeIdentity.required_copyright_lines",
+        Source,
+        "source-record",
+        "NoticeMaterialV1.required_copyright_lines",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<string>",
+        "NoticeMaterialV1.required_copyright_lines",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.notice_bundle_destination",
+        "NoticeIdentity.notice_bundle_destination",
+        Source,
+        "source-record",
+        "NoticeMaterialV1.notice_bundle_destination",
+        "normalized",
+        "scalar",
+        "required",
+        "RepoPath",
+        "NoticeMaterialV1.notice_bundle_destination",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDecision.dependency",
+        "DependencyDecision.dependency",
+        Source,
+        "source-record",
+        "DependencyDecisionMaterialV1.dependency",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "DependencyDecisionMaterialV1.dependency",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDecision.disposition",
+        "DependencyDecision.disposition",
+        Source,
+        "source-record",
+        "DependencyDecisionMaterialV1.disposition",
+        "normalized",
+        "scalar",
+        "required",
+        "DependencyDispositionMaterialV1",
+        "DependencyDecisionMaterialV1.disposition",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Shipped",
+        "DependencyDisposition::Shipped",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=shipped}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "shipped",
+        "DependencyDispositionMaterialV1::Shipped",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BuildOnly",
+        "DependencyDisposition::BuildOnly",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=build_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "build_only",
+        "DependencyDispositionMaterialV1::BuildOnly",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::TypeOnlyReplaced",
+        "DependencyDisposition::TypeOnlyReplaced",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=type_only_replaced}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "type_only_replaced",
+        "DependencyDispositionMaterialV1::TypeOnlyReplaced",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BehaviorOnly",
+        "DependencyDisposition::BehaviorOnly",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=behavior_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "behavior_only",
+        "DependencyDispositionMaterialV1::BehaviorOnly",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Rejected",
+        "DependencyDisposition::Rejected",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "DependencyDispositionMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Shipped.license",
+        "DependencyDisposition::Shipped.license",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=shipped}.value.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "DependencyDispositionMaterialV1::Shipped.license",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BuildOnly.license",
+        "DependencyDisposition::BuildOnly.license",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=build_only}.value.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "DependencyDispositionMaterialV1::BuildOnly.license",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::TypeOnlyReplaced.replacement",
+        "DependencyDisposition::TypeOnlyReplaced.replacement",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=type_only_replaced}.value.replacement",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "DependencyDispositionMaterialV1::TypeOnlyReplaced.replacement",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BehaviorOnly.reason",
+        "DependencyDisposition::BehaviorOnly.reason",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=behavior_only}.value.reason",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "DependencyDispositionMaterialV1::BehaviorOnly.reason",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Rejected.finding",
+        "DependencyDisposition::Rejected.finding",
+        Source,
+        "source-record",
+        "DependencyDispositionMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "DependencyDispositionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.material_id",
+        "EmbeddedMaterialDecision.material_id",
+        Source,
+        "source-record",
+        "EmbeddedDecisionMaterialV1.material_id",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "EmbeddedDecisionMaterialV1.material_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.path",
+        "EmbeddedMaterialDecision.path",
+        Source,
+        "source-record",
+        "EmbeddedDecisionMaterialV1.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "EmbeddedDecisionMaterialV1.path",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.sha256",
+        "EmbeddedMaterialDecision.sha256",
+        Source,
+        "source-record",
+        "EmbeddedDecisionMaterialV1.sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "EmbeddedDecisionMaterialV1.sha256",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.disposition",
+        "EmbeddedMaterialDecision.disposition",
+        Source,
+        "source-record",
+        "EmbeddedDecisionMaterialV1.disposition",
+        "normalized",
+        "scalar",
+        "required",
+        "EmbeddedMaterialDispositionMaterialV1",
+        "EmbeddedDecisionMaterialV1.disposition",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Shipped",
+        "EmbeddedMaterialDisposition::Shipped",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=shipped}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "shipped",
+        "EmbeddedMaterialDispositionMaterialV1::Shipped",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::BehaviorOnly",
+        "EmbeddedMaterialDisposition::BehaviorOnly",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=behavior_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "behavior_only",
+        "EmbeddedMaterialDispositionMaterialV1::BehaviorOnly",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Rejected",
+        "EmbeddedMaterialDisposition::Rejected",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "EmbeddedMaterialDispositionMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Shipped.license",
+        "EmbeddedMaterialDisposition::Shipped.license",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=shipped}.value.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "EmbeddedMaterialDispositionMaterialV1::Shipped.license",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::BehaviorOnly.reason",
+        "EmbeddedMaterialDisposition::BehaviorOnly.reason",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=behavior_only}.value.reason",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "EmbeddedMaterialDispositionMaterialV1::BehaviorOnly.reason",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Rejected.finding",
+        "EmbeddedMaterialDisposition::Rejected.finding",
+        Source,
+        "source-record",
+        "EmbeddedMaterialDispositionMaterialV1{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "EmbeddedMaterialDispositionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderContractReference.contract_id",
+        "ProviderContractReference.contract_id",
+        Source,
+        "source-record",
+        "ProviderContractMaterialV1.contract_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderContractId",
+        "ProviderContractMaterialV1.contract_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ProviderContractReference.facts",
+        "ProviderContractReference.facts",
+        Source,
+        "source-record",
+        "ProviderContractMaterialV1.facts",
+        "normalized",
+        "kind_then_fact_or_policy_id",
+        "nonempty_array",
+        "NonEmptyVec<ContractFactMaterialV1>",
+        "ProviderContractMaterialV1.facts",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence",
+        "ContractFact::ProviderEvidence",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=provider_evidence}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_evidence",
+        "ContractFactMaterialV1::ProviderEvidence",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::DonatPolicy",
+        "ContractFact::DonatPolicy",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=donat_policy}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "donat_policy",
+        "ContractFactMaterialV1::DonatPolicy",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence.source_record_id",
+        "ContractFact::ProviderEvidence.source_record_id",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=provider_evidence}.value.source_record_id",
+        "normalized",
+        "scalar",
+        "required",
+        "SourceRecordId",
+        "ContractFactMaterialV1::ProviderEvidence.source_record_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence.fact_id",
+        "ContractFact::ProviderEvidence.fact_id",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=provider_evidence}.value.fact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderFactId",
+        "ContractFactMaterialV1::ProviderEvidence.fact_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::DonatPolicy.policy_id",
+        "ContractFact::DonatPolicy.policy_id",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=donat_policy}.value.policy_id",
+        "normalized",
+        "scalar",
+        "required",
+        "DonatPolicyId",
+        "ContractFactMaterialV1::DonatPolicy.policy_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ContractFact::DonatPolicy.value",
+        "ContractFact::DonatPolicy.value",
+        Source,
+        "source-record",
+        "ContractFactMaterialV1{kind=donat_policy}.value.value",
+        "normalized",
+        "scalar",
+        "required",
+        "TypedValueMaterialV1",
+        "ContractFactMaterialV1::DonatPolicy.value",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "CompatibilityDecision::TierA",
+        "CompatibilityDecision::TierA",
+        Source,
+        "source-record",
+        "CompatibilityMaterialV1{kind=tier_a}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "tier_a",
+        "CompatibilityMaterialV1::TierA",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "CompatibilityDecision::TierB",
+        "CompatibilityDecision::TierB",
+        Source,
+        "source-record",
+        "CompatibilityMaterialV1{kind=tier_b}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "tier_b",
+        "CompatibilityMaterialV1::TierB",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "CompatibilityDecision::TierC",
+        "CompatibilityDecision::TierC",
+        Source,
+        "source-record",
+        "CompatibilityMaterialV1{kind=tier_c}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "tier_c",
+        "CompatibilityMaterialV1::TierC",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "CompatibilityDecision::Rejected",
+        "CompatibilityDecision::Rejected",
+        Source,
+        "source-record",
+        "CompatibilityMaterialV1{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "CompatibilityMaterialV1::Rejected",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::InventoryOnly",
+        "AdmissionState::InventoryOnly",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=inventory_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "inventory_only",
+        "AdmissionMaterialV1::InventoryOnly",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::ApprovedForPort",
+        "AdmissionState::ApprovedForPort",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=approved_for_port}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "approved_for_port",
+        "AdmissionMaterialV1::ApprovedForPort",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::EvidenceAccepted",
+        "AdmissionState::EvidenceAccepted",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=evidence_accepted}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "evidence_accepted",
+        "AdmissionMaterialV1::EvidenceAccepted",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::InventoryOnly.findings",
+        "AdmissionState::InventoryOnly.findings",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=inventory_only}.value.findings",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<FindingId>",
+        "AdmissionMaterialV1::InventoryOnly.findings",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::ApprovedForPort.operations",
+        "AdmissionState::ApprovedForPort.operations",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=approved_for_port}.value.operations",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<OperationId>",
+        "AdmissionMaterialV1::ApprovedForPort.operations",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "AdmissionState::EvidenceAccepted.contracts",
+        "AdmissionState::EvidenceAccepted.contracts",
+        Source,
+        "source-record",
+        "AdmissionMaterialV1{kind=evidence_accepted}.value.contracts",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<ProviderContractId>",
+        "AdmissionMaterialV1::EvidenceAccepted.contracts",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SafetyFindings.findings",
+        "SafetyFindings.findings",
+        Source,
+        "source-record",
+        "SafetyFindingsMaterialV1.findings",
+        "normalized",
+        "finding_id",
+        "empty_array",
+        "Vec<SafetyFindingMaterialV1>",
+        "SafetyFindingsMaterialV1.findings",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SafetyFinding.finding_id",
+        "SafetyFinding.finding_id",
+        Source,
+        "source-record",
+        "SafetyFindingMaterialV1.finding_id",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "SafetyFindingMaterialV1.finding_id",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SafetyFinding.kind",
+        "SafetyFinding.kind",
+        Source,
+        "source-record",
+        "SafetyFindingMaterialV1.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "SafetyFindingMaterialV1.kind",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SafetyFinding.location",
+        "SafetyFinding.location",
+        Source,
+        "source-record",
+        "SafetyFindingMaterialV1.location",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<SourcePath>",
+        "SafetyFindingMaterialV1.location",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "SafetyFinding.message",
+        "SafetyFinding.message",
+        Source,
+        "source-record",
+        "SafetyFindingMaterialV1.message",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "SafetyFindingMaterialV1.message",
+        ProjectionSchema,
+        SourceRecord,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.connector",
+        "ConnectorManifest.connector",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.id",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorId",
+        "SemanticConnectorMaterialV1.id",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.connector_version",
+        "ConnectorManifest.connector_version",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticConnectorMaterialV1.version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.connector",
+        "ConnectorManifest.connector",
+        Model,
+        "provenance",
+        "ProvenanceMaterialV1.connector.id",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorId",
+        "ProvenanceConnectorIdentity.id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.connector_version",
+        "ConnectorManifest.connector_version",
+        Model,
+        "provenance",
+        "ProvenanceMaterialV1.connector.version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "ProvenanceConnectorIdentity.version",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.manifest_version",
+        "ConnectorManifest.manifest_version",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.manifest_version",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticConnectorMaterialV1.manifest_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.runtime_abi_epoch",
+        "ConnectorManifest.runtime_abi_epoch",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.runtime_abi_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticConnectorMaterialV1.runtime_abi_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.value_language_epoch",
+        "ConnectorManifest.value_language_epoch",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.value_language_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticMaterialV1.value_language_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.provider",
+        "ConnectorManifest.provider",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.provider",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderId",
+        "SemanticConnectorMaterialV1.provider",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.api_identity",
+        "ConnectorManifest.api_identity",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.connector.api_identity",
+        "normalized",
+        "scalar",
+        "required",
+        "ApiIdentity",
+        "SemanticConnectorMaterialV1.api_identity",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.credentials",
+        "ConnectorManifest.credentials",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.credentials",
+        "normalized",
+        "credential",
+        "empty_array",
+        "Vec<SemanticCredentialMaterialV1>",
+        "SemanticMaterialV1.credentials",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.origins",
+        "ConnectorManifest.origins",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.origins",
+        "normalized",
+        "origin",
+        "nonempty_array",
+        "NonEmptyVec<SemanticOriginMaterialV1>",
+        "SemanticMaterialV1.origins",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.operations",
+        "ConnectorManifest.operations",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.operations",
+        "normalized",
+        "operation",
+        "nonempty_array",
+        "NonEmptyVec<SemanticOperationMaterialV1>",
+        "SemanticMaterialV1.operations",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.triggers",
+        "ConnectorManifest.triggers",
+        Model,
+        "semantic",
+        "SemanticMaterialV1.triggers",
+        "normalized",
+        "kind_then_trigger",
+        "empty_array",
+        "Vec<SemanticTriggerMaterialV1>",
+        "SemanticMaterialV1.triggers",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorManifest.provenance",
+        "ConnectorManifest.provenance",
+        Model,
+        "provenance",
+        "ProvenanceMaterialV1.manifest_references",
+        "normalized",
+        "source_record_id",
+        "nonempty_array",
+        "NonEmptyVec<ManifestProvenanceMaterialV1>",
+        "ProvenanceMaterialV1.manifest_references",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.credential",
+        "CredentialSpec.credential",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.credential",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialSpecId",
+        "SemanticCredentialMaterialV1.credential",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.version",
+        "CredentialSpec.version",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticCredentialMaterialV1.version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.fields",
+        "CredentialSpec.fields",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.fields",
+        "normalized",
+        "field",
+        "nonempty_array",
+        "NonEmptyVec<CredentialFieldMaterialV1>",
+        "SemanticCredentialMaterialV1.fields",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.auth_plan",
+        "CredentialSpec.auth_plan",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.auth_plan",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialAuthMaterialV1",
+        "SemanticCredentialMaterialV1.auth_plan",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.allowed_origins",
+        "CredentialSpec.allowed_origins",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.allowed_origins",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<OriginId>",
+        "SemanticCredentialMaterialV1.allowed_origins",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.scopes",
+        "CredentialSpec.scopes",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.scopes",
+        "normalized",
+        "lexical",
+        "empty_array",
+        "Vec<StaticScope>",
+        "SemanticCredentialMaterialV1.scopes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.auth_processor",
+        "CredentialSpec.auth_processor",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.auth_processor",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<VersionedProcessorRef>",
+        "SemanticCredentialMaterialV1.auth_processor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.credential_test_operation",
+        "CredentialSpec.credential_test_operation",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.credential_test_operation",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<VersionedOperationReference>",
+        "SemanticCredentialMaterialV1.credential_test_operation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialSpec.bounds",
+        "CredentialSpec.bounds",
+        Model,
+        "semantic",
+        "SemanticCredentialMaterialV1.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialBoundsMaterialV1",
+        "SemanticCredentialMaterialV1.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialFieldSpec.field",
+        "CredentialFieldSpec.field",
+        Model,
+        "semantic",
+        "CredentialFieldMaterialV1.field",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialFieldMaterialV1.field",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialFieldSpec.required",
+        "CredentialFieldSpec.required",
+        Model,
+        "semantic",
+        "CredentialFieldMaterialV1.required",
+        "normalized",
+        "scalar",
+        "required",
+        "bool",
+        "CredentialFieldMaterialV1.required",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialFieldSpec.secret",
+        "CredentialFieldSpec.secret",
+        Model,
+        "semantic",
+        "CredentialFieldMaterialV1.secret",
+        "normalized",
+        "scalar",
+        "required",
+        "SecretClassificationMaterialV1",
+        "CredentialFieldMaterialV1.secret",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialFieldSpec.maximum_bytes",
+        "CredentialFieldSpec.maximum_bytes",
+        Model,
+        "semantic",
+        "CredentialFieldMaterialV1.maximum_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "CredentialFieldMaterialV1.maximum_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialFieldSpec.redaction",
+        "CredentialFieldSpec.redaction",
+        Model,
+        "semantic",
+        "CredentialFieldMaterialV1.redaction",
+        "normalized",
+        "scalar",
+        "required",
+        "RedactionMaterialV1",
+        "CredentialFieldMaterialV1.redaction",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialBounds.maximum_field_bytes",
+        "CredentialBounds.maximum_field_bytes",
+        Model,
+        "semantic",
+        "CredentialBoundsMaterialV1.maximum_field_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "CredentialBoundsMaterialV1.maximum_field_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialBounds.maximum_aggregate_bytes",
+        "CredentialBounds.maximum_aggregate_bytes",
+        Model,
+        "semantic",
+        "CredentialBoundsMaterialV1.maximum_aggregate_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "CredentialBoundsMaterialV1.maximum_aggregate_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CredentialBounds.maximum_token_bytes",
+        "CredentialBounds.maximum_token_bytes",
+        Model,
+        "semantic",
+        "CredentialBoundsMaterialV1.maximum_token_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "CredentialBoundsMaterialV1.maximum_token_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SecretClassification::Secret",
+        "SecretClassification::Secret",
+        Model,
+        "semantic",
+        "SecretClassificationMaterialV1{kind=secret}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "secret",
+        "SecretClassificationMaterialV1::Secret",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SecretClassification::Sensitive",
+        "SecretClassification::Sensitive",
+        Model,
+        "semantic",
+        "SecretClassificationMaterialV1{kind=sensitive}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "sensitive",
+        "SecretClassificationMaterialV1::Sensitive",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SecretClassification::NonSecret",
+        "SecretClassification::NonSecret",
+        Model,
+        "semantic",
+        "SecretClassificationMaterialV1{kind=non_secret}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "non_secret",
+        "SecretClassificationMaterialV1::NonSecret",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RedactionPlan::Omit",
+        "RedactionPlan::Omit",
+        Model,
+        "semantic",
+        "RedactionMaterialV1{kind=omit}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "omit",
+        "RedactionMaterialV1::Omit",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RedactionPlan::Fixed",
+        "RedactionPlan::Fixed",
+        Model,
+        "semantic",
+        "RedactionMaterialV1{kind=fixed}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "fixed",
+        "RedactionMaterialV1::Fixed",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RedactionPlan::PreserveLast",
+        "RedactionPlan::PreserveLast",
+        Model,
+        "semantic",
+        "RedactionMaterialV1{kind=preserve_last}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "preserve_last",
+        "RedactionMaterialV1::PreserveLast",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RedactionPlan::Fixed.replacement",
+        "RedactionPlan::Fixed.replacement",
+        Model,
+        "semantic",
+        "RedactionMaterialV1{kind=fixed}.value.replacement",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "RedactionMaterialV1::Fixed.replacement",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RedactionPlan::PreserveLast.characters",
+        "RedactionPlan::PreserveLast.characters",
+        Model,
+        "semantic",
+        "RedactionMaterialV1{kind=preserve_last}.value.characters",
+        "normalized",
+        "scalar",
+        "required",
+        "u8",
+        "RedactionMaterialV1::PreserveLast.characters",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedHeaderApiKey",
+        "AuthPlan::FixedHeaderApiKey",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_header_api_key}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "fixed_header_api_key",
+        "CredentialAuthMaterialV1::FixedHeaderApiKey",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedQueryApiKey",
+        "AuthPlan::FixedQueryApiKey",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_query_api_key}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "fixed_query_api_key",
+        "CredentialAuthMaterialV1::FixedQueryApiKey",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::Bearer",
+        "AuthPlan::Bearer",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=bearer}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "bearer",
+        "CredentialAuthMaterialV1::Bearer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::HttpBasic",
+        "AuthPlan::HttpBasic",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=http_basic}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "http_basic",
+        "CredentialAuthMaterialV1::HttpBasic",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials",
+        "AuthPlan::OAuth2ClientCredentials",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "oauth2_client_credentials",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::PreprovisionedOAuthAccessToken",
+        "AuthPlan::PreprovisionedOAuthAccessToken",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=preprovisioned_oauth_access_token}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "preprovisioned_oauth_access_token",
+        "CredentialAuthMaterialV1::PreprovisionedOAuthAccessToken",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedHeaderApiKey.field",
+        "AuthPlan::FixedHeaderApiKey.field",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_header_api_key}.value.field",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::FixedHeaderApiKey.field",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedHeaderApiKey.header",
+        "AuthPlan::FixedHeaderApiKey.header",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_header_api_key}.value.header",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "CredentialAuthMaterialV1::FixedHeaderApiKey.header",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedQueryApiKey.field",
+        "AuthPlan::FixedQueryApiKey.field",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_query_api_key}.value.field",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::FixedQueryApiKey.field",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::FixedQueryApiKey.query",
+        "AuthPlan::FixedQueryApiKey.query",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=fixed_query_api_key}.value.query",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticQueryKey",
+        "CredentialAuthMaterialV1::FixedQueryApiKey.query",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::Bearer.token",
+        "AuthPlan::Bearer.token",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=bearer}.value.token",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::Bearer.token",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::HttpBasic.username",
+        "AuthPlan::HttpBasic.username",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=http_basic}.value.username",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::HttpBasic.username",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::HttpBasic.password",
+        "AuthPlan::HttpBasic.password",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=http_basic}.value.password",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::HttpBasic.password",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.client_id",
+        "AuthPlan::OAuth2ClientCredentials.client_id",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.client_id",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.client_id",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.client_secret",
+        "AuthPlan::OAuth2ClientCredentials.client_secret",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.client_secret",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.client_secret",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.token_origin",
+        "AuthPlan::OAuth2ClientCredentials.token_origin",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.token_origin",
+        "normalized",
+        "scalar",
+        "required",
+        "OriginId",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.token_origin",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.token_step",
+        "AuthPlan::OAuth2ClientCredentials.token_step",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.token_step",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledStepId",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.token_step",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.scopes",
+        "AuthPlan::OAuth2ClientCredentials.scopes",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.scopes",
+        "normalized",
+        "lexical",
+        "empty_array",
+        "Vec<StaticScope>",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.scopes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::OAuth2ClientCredentials.token_pointer",
+        "AuthPlan::OAuth2ClientCredentials.token_pointer",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=oauth2_client_credentials}.value.token_pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "CredentialAuthMaterialV1::OAuth2ClientCredentials.token_pointer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "AuthPlan::PreprovisionedOAuthAccessToken.token",
+        "AuthPlan::PreprovisionedOAuthAccessToken.token",
+        Model,
+        "semantic",
+        "CredentialAuthMaterialV1{kind=preprovisioned_oauth_access_token}.value.token",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialFieldId",
+        "CredentialAuthMaterialV1::PreprovisionedOAuthAccessToken.token",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedOrigin.origin",
+        "FixedOrigin.origin",
+        Model,
+        "semantic",
+        "SemanticOriginMaterialV1.origin",
+        "normalized",
+        "scalar",
+        "required",
+        "OriginId",
+        "SemanticOriginMaterialV1.origin",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedOrigin.scheme",
+        "FixedOrigin.scheme",
+        Model,
+        "semantic",
+        "SemanticOriginMaterialV1.scheme",
+        "normalized",
+        "scalar",
+        "required",
+        "HttpsOnly",
+        "SemanticOriginMaterialV1.scheme",
+        ProjectionSchema,
+        Semantic,
+        Singleton,
+    );
+
+    (
+        "FixedOrigin.host",
+        "FixedOrigin.host",
+        Model,
+        "semantic",
+        "SemanticOriginMaterialV1.host",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticDnsName",
+        "SemanticOriginMaterialV1.host",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedOrigin.port",
+        "FixedOrigin.port",
+        Model,
+        "semantic",
+        "SemanticOriginMaterialV1.port",
+        "normalized",
+        "scalar",
+        "required",
+        "u16",
+        "SemanticOriginMaterialV1.port",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedOrigin.network_policy",
+        "FixedOrigin.network_policy",
+        Model,
+        "semantic",
+        "SemanticOriginMaterialV1.network_policy",
+        "normalized",
+        "scalar",
+        "required",
+        "NetworkPolicyMaterialV1",
+        "SemanticOriginMaterialV1.network_policy",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "NetworkPolicy::PublicOnly",
+        "NetworkPolicy::PublicOnly",
+        Model,
+        "semantic",
+        "NetworkPolicyMaterialV1{kind=public_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "public_only",
+        "NetworkPolicyMaterialV1::PublicOnly",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "NetworkPolicy::PrivateAllowed",
+        "NetworkPolicy::PrivateAllowed",
+        Model,
+        "semantic",
+        "NetworkPolicyMaterialV1{kind=private_allowed}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "private_allowed",
+        "NetworkPolicyMaterialV1::PrivateAllowed",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "NetworkPolicy::PrivateAllowed.policy",
+        "NetworkPolicy::PrivateAllowed.policy",
+        Model,
+        "semantic",
+        "NetworkPolicyMaterialV1{kind=private_allowed}.value.policy",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "NetworkPolicyMaterialV1::PrivateAllowed.policy",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.connector",
+        "OperationSpec.connector",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.connector",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorId",
+        "SemanticOperationMaterialV1.connector",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.connector_version",
+        "OperationSpec.connector_version",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.connector_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticOperationMaterialV1.connector_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.operation",
+        "OperationSpec.operation",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.operation",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationId",
+        "SemanticOperationMaterialV1.operation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.operation_version",
+        "OperationSpec.operation_version",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.operation_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticOperationMaterialV1.operation_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.runtime_abi_epoch",
+        "OperationSpec.runtime_abi_epoch",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.runtime_abi_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticOperationMaterialV1.runtime_abi_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.value_language_epoch",
+        "OperationSpec.value_language_epoch",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.value_language_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticOperationMaterialV1.value_language_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.input",
+        "OperationSpec.input",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.input",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticOperationMaterialV1.input",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.input_contract_sha256",
+        "OperationSpec.input_contract_sha256",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.input_contract_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "SemanticOperationMaterialV1.input_contract_sha256",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.output",
+        "OperationSpec.output",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.output",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticOperationMaterialV1.output",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.output_contract_sha256",
+        "OperationSpec.output_contract_sha256",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.output_contract_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "SemanticOperationMaterialV1.output_contract_sha256",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.credential",
+        "OperationSpec.credential",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.credential",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<VersionedCredentialMaterialV1>",
+        "SemanticOperationMaterialV1.credential",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.origins",
+        "OperationSpec.origins",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.origins",
+        "normalized",
+        "origin",
+        "nonempty_array",
+        "NonEmptyVec<SemanticOriginMaterialV1>",
+        "SemanticOperationMaterialV1.origins",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.steps",
+        "OperationSpec.steps",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.steps",
+        "normalized",
+        "declared",
+        "nonempty_array",
+        "NonEmptyVec<SemanticStepMaterialV1>",
+        "SemanticOperationMaterialV1.steps",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.pre_request_transforms",
+        "OperationSpec.pre_request_transforms",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.pre_request_transforms",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<VersionedProcessorMaterialV1>",
+        "SemanticOperationMaterialV1.pre_request_transforms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.post_response_transforms",
+        "OperationSpec.post_response_transforms",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.post_response_transforms",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<VersionedProcessorMaterialV1>",
+        "SemanticOperationMaterialV1.post_response_transforms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.operation_processor",
+        "OperationSpec.operation_processor",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.operation_processor",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<VersionedProcessorMaterialV1>",
+        "SemanticOperationMaterialV1.operation_processor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.effect",
+        "OperationSpec.effect",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.effect",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationEffectMaterialV1",
+        "SemanticOperationMaterialV1.effect",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.pagination",
+        "OperationSpec.pagination",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.pagination",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationMaterialV1",
+        "SemanticOperationMaterialV1.pagination",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.error_map",
+        "OperationSpec.error_map",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.error_map",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorMapMaterialV1",
+        "SemanticOperationMaterialV1.error_map",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.capacity",
+        "OperationSpec.capacity",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.capacity",
+        "normalized",
+        "scalar",
+        "required",
+        "CapacityDefaultsMaterialV1",
+        "SemanticOperationMaterialV1.capacity",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.rate",
+        "OperationSpec.rate",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.rate",
+        "normalized",
+        "scalar",
+        "required",
+        "RateDefaultsMaterialV1",
+        "SemanticOperationMaterialV1.rate",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.serialization_key_default",
+        "OperationSpec.serialization_key_default",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.serialization_key_default",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<TypedSerializationKeyDefaultMaterialV1>",
+        "SemanticOperationMaterialV1.serialization_key_default",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.bounds",
+        "OperationSpec.bounds",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationBoundsMaterialV1",
+        "SemanticOperationMaterialV1.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationSpec.resolved_fact_values",
+        "OperationSpec.resolved_fact_values",
+        Model,
+        "semantic",
+        "SemanticOperationMaterialV1.resolved_fact_values",
+        "normalized",
+        "use_site",
+        "empty_array",
+        "Vec<ResolvedFactValueMaterialV1>",
+        "SemanticOperationMaterialV1.resolved_fact_values",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedCredentialReference.credential",
+        "VersionedCredentialReference.credential",
+        Model,
+        "semantic",
+        "VersionedCredentialMaterialV1.credential",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialSpecId",
+        "VersionedCredentialMaterialV1.credential",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedCredentialReference.version",
+        "VersionedCredentialReference.version",
+        Model,
+        "semantic",
+        "VersionedCredentialMaterialV1.version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "VersionedCredentialMaterialV1.version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedProcessorRef.id",
+        "VersionedProcessorRef.id",
+        Model,
+        "semantic",
+        "VersionedProcessorMaterialV1.id",
+        "normalized",
+        "scalar",
+        "required",
+        "typed_processor_id",
+        "VersionedProcessorMaterialV1.id",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedProcessorRef.implementation_revision",
+        "VersionedProcessorRef.implementation_revision",
+        Model,
+        "semantic",
+        "VersionedProcessorMaterialV1.implementation_revision",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "VersionedProcessorMaterialV1.implementation_revision",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedOperationReference.operation",
+        "VersionedOperationReference.operation",
+        Model,
+        "semantic",
+        "VersionedOperationReferenceMaterialV1.operation",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationId",
+        "VersionedOperationReferenceMaterialV1.operation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "VersionedOperationReference.version",
+        "VersionedOperationReference.version",
+        Model,
+        "semantic",
+        "VersionedOperationReferenceMaterialV1.version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "VersionedOperationReferenceMaterialV1.version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.step",
+        "CompiledStepSpec.step",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.step",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledStepId",
+        "SemanticStepMaterialV1.step",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.method",
+        "CompiledStepSpec.method",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.method",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHttpMethod",
+        "SemanticStepMaterialV1.method",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.origin",
+        "CompiledStepSpec.origin",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.origin",
+        "normalized",
+        "scalar",
+        "required",
+        "OriginId",
+        "SemanticStepMaterialV1.origin",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.path",
+        "CompiledStepSpec.path",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.path",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticPathTemplate",
+        "SemanticStepMaterialV1.path",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.query",
+        "CompiledStepSpec.query",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.query",
+        "normalized",
+        "name",
+        "empty_array",
+        "Vec<CompiledQueryBindingMaterialV1>",
+        "SemanticStepMaterialV1.query",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.headers",
+        "CompiledStepSpec.headers",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.headers",
+        "normalized",
+        "name",
+        "empty_array",
+        "Vec<CompiledHeaderBindingMaterialV1>",
+        "SemanticStepMaterialV1.headers",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.credential_action",
+        "CompiledStepSpec.credential_action",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.credential_action",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<CompiledCredentialActionMaterialV1>",
+        "SemanticStepMaterialV1.credential_action",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.request",
+        "CompiledStepSpec.request",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.request",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledRequestMaterialV1",
+        "SemanticStepMaterialV1.request",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.success_statuses",
+        "CompiledStepSpec.success_statuses",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.success_statuses",
+        "normalized",
+        "minimum_then_maximum",
+        "nonempty_array",
+        "NonEmptyVec<StatusRangeMaterialV1>",
+        "SemanticStepMaterialV1.success_statuses",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.response",
+        "CompiledStepSpec.response",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.response",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledResponseMaterialV1",
+        "SemanticStepMaterialV1.response",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.selected_response_headers",
+        "CompiledStepSpec.selected_response_headers",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.selected_response_headers",
+        "normalized",
+        "canonical_lowercase_header_name",
+        "empty_array",
+        "Vec<SelectedResponseHeaderMaterialV1>",
+        "SemanticStepMaterialV1.selected_response_headers",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledStepSpec.bounds",
+        "CompiledStepSpec.bounds",
+        Model,
+        "semantic",
+        "SemanticStepMaterialV1.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "StepBoundsMaterialV1",
+        "SemanticStepMaterialV1.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledQueryBinding.name",
+        "CompiledQueryBinding.name",
+        Model,
+        "semantic",
+        "CompiledQueryBindingMaterialV1.name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticQueryKey",
+        "CompiledQueryBindingMaterialV1.name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledQueryBinding.binding",
+        "CompiledQueryBinding.binding",
+        Model,
+        "semantic",
+        "CompiledQueryBindingMaterialV1.binding",
+        "normalized",
+        "scalar",
+        "required",
+        "BindingMaterialV1",
+        "CompiledQueryBindingMaterialV1.binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledHeaderBinding.name",
+        "CompiledHeaderBinding.name",
+        Model,
+        "semantic",
+        "CompiledHeaderBindingMaterialV1.name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "CompiledHeaderBindingMaterialV1.name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledHeaderBinding.binding",
+        "CompiledHeaderBinding.binding",
+        Model,
+        "semantic",
+        "CompiledHeaderBindingMaterialV1.binding",
+        "normalized",
+        "scalar",
+        "required",
+        "BindingMaterialV1",
+        "CompiledHeaderBindingMaterialV1.binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBinding.field",
+        "CompiledBinding.field",
+        Model,
+        "semantic",
+        "BindingMaterialV1.field",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "BindingMaterialV1.field",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBinding.source",
+        "CompiledBinding.source",
+        Model,
+        "semantic",
+        "BindingMaterialV1.source",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledBindingSourceMaterialV1",
+        "BindingMaterialV1.source",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBinding.required",
+        "CompiledBinding.required",
+        Model,
+        "semantic",
+        "BindingMaterialV1.required",
+        "normalized",
+        "scalar",
+        "required",
+        "bool",
+        "BindingMaterialV1.required",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBinding.default",
+        "CompiledBinding.default",
+        Model,
+        "semantic",
+        "BindingMaterialV1.default",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<TypedValueMaterialV1>",
+        "BindingMaterialV1.default",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBinding.mapping",
+        "CompiledBinding.mapping",
+        Model,
+        "semantic",
+        "BindingMaterialV1.mapping",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<Id>",
+        "BindingMaterialV1.mapping",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBindingSource::Input",
+        "CompiledBindingSource::Input",
+        Model,
+        "semantic",
+        "CompiledBindingSourceMaterialV1{kind=input}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "input",
+        "CompiledBindingSourceMaterialV1::Input",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBindingSource::Constant",
+        "CompiledBindingSource::Constant",
+        Model,
+        "semantic",
+        "CompiledBindingSourceMaterialV1{kind=constant}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "constant",
+        "CompiledBindingSourceMaterialV1::Constant",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledBindingSource::Constant.value",
+        "CompiledBindingSource::Constant.value",
+        Model,
+        "semantic",
+        "CompiledBindingSourceMaterialV1{kind=constant}.value.value",
+        "normalized",
+        "scalar",
+        "required",
+        "TypedValueMaterialV1",
+        "CompiledBindingSourceMaterialV1::Constant.value",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledCredentialAction.credential",
+        "CompiledCredentialAction.credential",
+        Model,
+        "semantic",
+        "CompiledCredentialActionMaterialV1.credential",
+        "normalized",
+        "scalar",
+        "required",
+        "CredentialSpecId",
+        "CompiledCredentialActionMaterialV1.credential",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::None",
+        "CompiledRequestShape::None",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=none}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "none",
+        "CompiledRequestMaterialV1::None",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::Json",
+        "CompiledRequestShape::Json",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=json}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "json",
+        "CompiledRequestMaterialV1::Json",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::FormUrlencoded",
+        "CompiledRequestShape::FormUrlencoded",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=form_urlencoded}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "form_urlencoded",
+        "CompiledRequestMaterialV1::FormUrlencoded",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::Multipart",
+        "CompiledRequestShape::Multipart",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=multipart}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "multipart",
+        "CompiledRequestMaterialV1::Multipart",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::RawBytes",
+        "CompiledRequestShape::RawBytes",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=raw_bytes}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "raw_bytes",
+        "CompiledRequestMaterialV1::RawBytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::Json.bindings",
+        "CompiledRequestShape::Json.bindings",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=json}.value.bindings",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<Id>",
+        "CompiledRequestMaterialV1::Json.bindings",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::FormUrlencoded.bindings",
+        "CompiledRequestShape::FormUrlencoded.bindings",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=form_urlencoded}.value.bindings",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<Id>",
+        "CompiledRequestMaterialV1::FormUrlencoded.bindings",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::Multipart.bindings",
+        "CompiledRequestShape::Multipart.bindings",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=multipart}.value.bindings",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<Id>",
+        "CompiledRequestMaterialV1::Multipart.bindings",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledRequestShape::RawBytes.binding",
+        "CompiledRequestShape::RawBytes.binding",
+        Model,
+        "semantic",
+        "CompiledRequestMaterialV1{kind=raw_bytes}.value.binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "CompiledRequestMaterialV1::RawBytes.binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledResponseShape::Json",
+        "CompiledResponseShape::Json",
+        Model,
+        "semantic",
+        "CompiledResponseMaterialV1{kind=json}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "json",
+        "CompiledResponseMaterialV1::Json",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledResponseShape::RawBytes",
+        "CompiledResponseShape::RawBytes",
+        Model,
+        "semantic",
+        "CompiledResponseMaterialV1{kind=raw_bytes}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "raw_bytes",
+        "CompiledResponseMaterialV1::RawBytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledResponseShape::Json.mappings",
+        "CompiledResponseShape::Json.mappings",
+        Model,
+        "semantic",
+        "CompiledResponseMaterialV1{kind=json}.value.mappings",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<ResponseMappingMaterialV1>",
+        "CompiledResponseMaterialV1::Json.mappings",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompiledResponseShape::RawBytes.target",
+        "CompiledResponseShape::RawBytes.target",
+        Model,
+        "semantic",
+        "CompiledResponseMaterialV1{kind=raw_bytes}.value.target",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "CompiledResponseMaterialV1::RawBytes.target",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ResponseMapping.pointer",
+        "ResponseMapping.pointer",
+        Model,
+        "semantic",
+        "ResponseMappingMaterialV1.pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "ResponseMappingMaterialV1.pointer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ResponseMapping.target",
+        "ResponseMapping.target",
+        Model,
+        "semantic",
+        "ResponseMappingMaterialV1.target",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "ResponseMappingMaterialV1.target",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StatusRange.minimum",
+        "StatusRange.minimum",
+        Model,
+        "semantic",
+        "StatusRangeMaterialV1.minimum",
+        "normalized",
+        "scalar",
+        "required",
+        "u16",
+        "StatusRangeMaterialV1.minimum",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StatusRange.maximum",
+        "StatusRange.maximum",
+        Model,
+        "semantic",
+        "StatusRangeMaterialV1.maximum",
+        "normalized",
+        "scalar",
+        "required",
+        "u16",
+        "StatusRangeMaterialV1.maximum",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SelectedResponseHeader.canonical_lowercase_header_name",
+        "SelectedResponseHeader.canonical_lowercase_header_name",
+        Model,
+        "semantic",
+        "SelectedResponseHeaderMaterialV1.canonical_lowercase_header_name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "SelectedResponseHeaderMaterialV1.canonical_lowercase_header_name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SelectedResponseHeader.capability",
+        "SelectedResponseHeader.capability",
+        Model,
+        "semantic",
+        "SelectedResponseHeaderMaterialV1.capability",
+        "normalized",
+        "scalar",
+        "required",
+        "CapabilityId",
+        "SelectedResponseHeaderMaterialV1.capability",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_headers",
+        "StepBounds.maximum_headers",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_headers",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_headers",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_header_bytes",
+        "StepBounds.maximum_header_bytes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_header_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_header_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_url_bytes",
+        "StepBounds.maximum_url_bytes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_url_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_url_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_request_bytes",
+        "StepBounds.maximum_request_bytes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_request_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_request_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_response_bytes",
+        "StepBounds.maximum_response_bytes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_response_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_response_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_json_depth",
+        "StepBounds.maximum_json_depth",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_json_depth",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_json_depth",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_json_nodes",
+        "StepBounds.maximum_json_nodes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_json_nodes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_json_nodes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.maximum_inline_binary_bytes",
+        "StepBounds.maximum_inline_binary_bytes",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.maximum_inline_binary_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "StepBoundsMaterialV1.maximum_inline_binary_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "StepBounds.deadline_ms",
+        "StepBounds.deadline_ms",
+        Model,
+        "semantic",
+        "StepBoundsMaterialV1.deadline_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "StepBoundsMaterialV1.deadline_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_calls",
+        "OperationBounds.maximum_calls",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_calls",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_calls",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_pages",
+        "OperationBounds.maximum_pages",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_pages",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_pages",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_items",
+        "OperationBounds.maximum_items",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_items",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_items",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_aggregate_request_bytes",
+        "OperationBounds.maximum_aggregate_request_bytes",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_aggregate_request_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_aggregate_request_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_aggregate_response_bytes",
+        "OperationBounds.maximum_aggregate_response_bytes",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_aggregate_response_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_aggregate_response_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_output_canonical_bytes",
+        "OperationBounds.maximum_output_canonical_bytes",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_output_canonical_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "OperationBoundsMaterialV1.maximum_output_canonical_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.maximum_redirects",
+        "OperationBounds.maximum_redirects",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.maximum_redirects",
+        "normalized",
+        "scalar",
+        "required",
+        "u8",
+        "OperationBoundsMaterialV1.maximum_redirects",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationBounds.deadline_ms",
+        "OperationBounds.deadline_ms",
+        Model,
+        "semantic",
+        "OperationBoundsMaterialV1.deadline_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "OperationBoundsMaterialV1.deadline_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationEffect::ReadOnly",
+        "OperationEffect::ReadOnly",
+        Model,
+        "semantic",
+        "OperationEffectMaterialV1{kind=read_only}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "read_only",
+        "OperationEffectMaterialV1::ReadOnly",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationEffect::ProviderIdempotent",
+        "OperationEffect::ProviderIdempotent",
+        Model,
+        "semantic",
+        "OperationEffectMaterialV1{kind=provider_idempotent}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_idempotent",
+        "OperationEffectMaterialV1::ProviderIdempotent",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "OperationEffect::ProviderIdempotent.side_effect_steps",
+        "OperationEffect::ProviderIdempotent.side_effect_steps",
+        Model,
+        "semantic",
+        "OperationEffectMaterialV1{kind=provider_idempotent}.value.side_effect_steps",
+        "normalized",
+        "step",
+        "nonempty_array",
+        "NonEmptyVec<ProviderIdempotentStepMaterialV1>",
+        "OperationEffectMaterialV1::ProviderIdempotent.side_effect_steps",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ProviderIdempotentStep.step",
+        "ProviderIdempotentStep.step",
+        Model,
+        "semantic",
+        "ProviderIdempotentStepMaterialV1.step",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledStepId",
+        "ProviderIdempotentStepMaterialV1.step",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ProviderIdempotentStep.fixed_binding",
+        "ProviderIdempotentStep.fixed_binding",
+        Model,
+        "semantic",
+        "ProviderIdempotentStepMaterialV1.fixed_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "FixedIdempotencyBindingMaterialV1",
+        "ProviderIdempotentStepMaterialV1.fixed_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ProviderIdempotentStep.scope",
+        "ProviderIdempotentStep.scope",
+        Model,
+        "semantic",
+        "ProviderIdempotentStepMaterialV1.scope",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderIdempotencyScope",
+        "ProviderIdempotentStepMaterialV1.scope",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ProviderIdempotentStep.minimum_retention_ms",
+        "ProviderIdempotentStep.minimum_retention_ms",
+        Model,
+        "semantic",
+        "ProviderIdempotentStepMaterialV1.minimum_retention_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "ProviderIdempotentStepMaterialV1.minimum_retention_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ProviderIdempotentStep.clock_safety_margin_ms",
+        "ProviderIdempotentStep.clock_safety_margin_ms",
+        Model,
+        "semantic",
+        "ProviderIdempotentStepMaterialV1.clock_safety_margin_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "ProviderIdempotentStepMaterialV1.clock_safety_margin_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedIdempotencyBinding::Header",
+        "FixedIdempotencyBinding::Header",
+        Model,
+        "semantic",
+        "FixedIdempotencyBindingMaterialV1{kind=header}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "header",
+        "FixedIdempotencyBindingMaterialV1::Header",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedIdempotencyBinding::BodyField",
+        "FixedIdempotencyBinding::BodyField",
+        Model,
+        "semantic",
+        "FixedIdempotencyBindingMaterialV1{kind=body_field}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "body_field",
+        "FixedIdempotencyBindingMaterialV1::BodyField",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedIdempotencyBinding::Header.name",
+        "FixedIdempotencyBinding::Header.name",
+        Model,
+        "semantic",
+        "FixedIdempotencyBindingMaterialV1{kind=header}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "FixedIdempotencyBindingMaterialV1::Header.name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "FixedIdempotencyBinding::BodyField.pointer",
+        "FixedIdempotencyBinding::BodyField.pointer",
+        Model,
+        "semantic",
+        "FixedIdempotencyBindingMaterialV1{kind=body_field}.value.pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticBodyPointer",
+        "FixedIdempotencyBindingMaterialV1::BodyField.pointer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::None",
+        "PaginationPlan::None",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=none}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "none",
+        "PaginationMaterialV1::None",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Cursor",
+        "PaginationPlan::Cursor",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=cursor}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "cursor",
+        "PaginationMaterialV1::Cursor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit",
+        "PaginationPlan::OffsetLimit",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "offset_limit",
+        "PaginationMaterialV1::OffsetLimit",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber",
+        "PaginationPlan::PageNumber",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "page_number",
+        "PaginationMaterialV1::PageNumber",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::LinkRelation",
+        "PaginationPlan::LinkRelation",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=link_relation}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "link_relation",
+        "PaginationMaterialV1::LinkRelation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Processor",
+        "PaginationPlan::Processor",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=processor}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "processor",
+        "PaginationMaterialV1::Processor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Cursor.request_binding",
+        "PaginationPlan::Cursor.request_binding",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=cursor}.value.request_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "PaginationMaterialV1::Cursor.request_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Cursor.response_pointer",
+        "PaginationPlan::Cursor.response_pointer",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=cursor}.value.response_pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "PaginationMaterialV1::Cursor.response_pointer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Cursor.bounds",
+        "PaginationPlan::Cursor.bounds",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=cursor}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationBoundsMaterialV1",
+        "PaginationMaterialV1::Cursor.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit.offset_binding",
+        "PaginationPlan::OffsetLimit.offset_binding",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.value.offset_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "PaginationMaterialV1::OffsetLimit.offset_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit.limit_binding",
+        "PaginationPlan::OffsetLimit.limit_binding",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.value.limit_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "PaginationMaterialV1::OffsetLimit.limit_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit.initial_offset",
+        "PaginationPlan::OffsetLimit.initial_offset",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.value.initial_offset",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "PaginationMaterialV1::OffsetLimit.initial_offset",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit.page_size",
+        "PaginationPlan::OffsetLimit.page_size",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.value.page_size",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationMaterialV1::OffsetLimit.page_size",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::OffsetLimit.bounds",
+        "PaginationPlan::OffsetLimit.bounds",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=offset_limit}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationBoundsMaterialV1",
+        "PaginationMaterialV1::OffsetLimit.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber.page_binding",
+        "PaginationPlan::PageNumber.page_binding",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.value.page_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "PaginationMaterialV1::PageNumber.page_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber.page_size_binding",
+        "PaginationPlan::PageNumber.page_size_binding",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.value.page_size_binding",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "PaginationMaterialV1::PageNumber.page_size_binding",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber.initial_page",
+        "PaginationPlan::PageNumber.initial_page",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.value.initial_page",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "PaginationMaterialV1::PageNumber.initial_page",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber.page_size",
+        "PaginationPlan::PageNumber.page_size",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.value.page_size",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationMaterialV1::PageNumber.page_size",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::PageNumber.bounds",
+        "PaginationPlan::PageNumber.bounds",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=page_number}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationBoundsMaterialV1",
+        "PaginationMaterialV1::PageNumber.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::LinkRelation.relation",
+        "PaginationPlan::LinkRelation.relation",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=link_relation}.value.relation",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "PaginationMaterialV1::LinkRelation.relation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::LinkRelation.selected_header",
+        "PaginationPlan::LinkRelation.selected_header",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=link_relation}.value.selected_header",
+        "normalized",
+        "scalar",
+        "required",
+        "SelectedResponseHeaderMaterialV1",
+        "PaginationMaterialV1::LinkRelation.selected_header",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::LinkRelation.bounds",
+        "PaginationPlan::LinkRelation.bounds",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=link_relation}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationBoundsMaterialV1",
+        "PaginationMaterialV1::LinkRelation.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Processor.processor",
+        "PaginationPlan::Processor.processor",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=processor}.value.processor",
+        "normalized",
+        "scalar",
+        "required",
+        "VersionedProcessorMaterialV1",
+        "PaginationMaterialV1::Processor.processor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationPlan::Processor.bounds",
+        "PaginationPlan::Processor.bounds",
+        Model,
+        "semantic",
+        "PaginationMaterialV1{kind=processor}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "PaginationBoundsMaterialV1",
+        "PaginationMaterialV1::Processor.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_calls",
+        "PaginationBounds.maximum_calls",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_calls",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_calls",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_pages",
+        "PaginationBounds.maximum_pages",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_pages",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_pages",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_items",
+        "PaginationBounds.maximum_items",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_items",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_items",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_response_bytes",
+        "PaginationBounds.maximum_response_bytes",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_response_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_response_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_aggregate_response_bytes",
+        "PaginationBounds.maximum_aggregate_response_bytes",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_aggregate_response_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_aggregate_response_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "PaginationBounds.maximum_output_canonical_bytes",
+        "PaginationBounds.maximum_output_canonical_bytes",
+        Model,
+        "semantic",
+        "PaginationBoundsMaterialV1.maximum_output_canonical_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "PaginationBoundsMaterialV1.maximum_output_canonical_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CapacityDefaults.maximum_in_flight",
+        "CapacityDefaults.maximum_in_flight",
+        Model,
+        "semantic",
+        "CapacityDefaultsMaterialV1.maximum_in_flight",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "CapacityDefaultsMaterialV1.maximum_in_flight",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RateDefaults.burst",
+        "RateDefaults.burst",
+        Model,
+        "semantic",
+        "RateDefaultsMaterialV1.burst",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "RateDefaultsMaterialV1.burst",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RateDefaults.refill_interval_ms",
+        "RateDefaults.refill_interval_ms",
+        Model,
+        "semantic",
+        "RateDefaultsMaterialV1.refill_interval_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "RateDefaultsMaterialV1.refill_interval_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TypedSerializationKeyDefault.field",
+        "TypedSerializationKeyDefault.field",
+        Model,
+        "semantic",
+        "TypedSerializationKeyDefaultMaterialV1.field",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "TypedSerializationKeyDefaultMaterialV1.field",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TypedSerializationKeyDefault.value",
+        "TypedSerializationKeyDefault.value",
+        Model,
+        "semantic",
+        "TypedSerializationKeyDefaultMaterialV1.value",
+        "normalized",
+        "scalar",
+        "required",
+        "TypedValueMaterialV1",
+        "TypedSerializationKeyDefaultMaterialV1.value",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ResolvedFactValue.use_site",
+        "ResolvedFactValue.use_site",
+        Model,
+        "semantic",
+        "ResolvedFactValueMaterialV1.use_site",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "ResolvedFactValueMaterialV1.use_site",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ResolvedFactValue.value",
+        "ResolvedFactValue.value",
+        Model,
+        "semantic",
+        "ResolvedFactValueMaterialV1.value",
+        "normalized",
+        "scalar",
+        "required",
+        "TypedValueMaterialV1",
+        "ResolvedFactValueMaterialV1.value",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMap.rules",
+        "ErrorMap.rules",
+        Model,
+        "semantic",
+        "ErrorMapMaterialV1.rules",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<ErrorRuleMaterialV1>",
+        "ErrorMapMaterialV1.rules",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMap.fallback",
+        "ErrorMap.fallback",
+        Model,
+        "semantic",
+        "ErrorMapMaterialV1.fallback",
+        "normalized",
+        "scalar",
+        "required",
+        "CompleteErrorFallbackMaterialV1",
+        "ErrorMapMaterialV1.fallback",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorRule.matcher",
+        "ErrorRule.matcher",
+        Model,
+        "semantic",
+        "ErrorRuleMaterialV1.matcher",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorMatcherMaterialV1",
+        "ErrorRuleMaterialV1.matcher",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorRule.action",
+        "ErrorRule.action",
+        Model,
+        "semantic",
+        "ErrorRuleMaterialV1.action",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "ErrorRuleMaterialV1.action",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.transport",
+        "CompleteErrorFallback.transport",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.transport",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.transport",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.timeout",
+        "CompleteErrorFallback.timeout",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.timeout",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.timeout",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.http_429",
+        "CompleteErrorFallback.http_429",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.http_429",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.http_429",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.http_5xx",
+        "CompleteErrorFallback.http_5xx",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.http_5xx",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.http_5xx",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.authentication",
+        "CompleteErrorFallback.authentication",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.authentication",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.authentication",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.validation",
+        "CompleteErrorFallback.validation",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.validation",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.validation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.permanent",
+        "CompleteErrorFallback.permanent",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.permanent",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.permanent",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "CompleteErrorFallback.invariant",
+        "CompleteErrorFallback.invariant",
+        Model,
+        "semantic",
+        "CompleteErrorFallbackMaterialV1.invariant",
+        "normalized",
+        "scalar",
+        "required",
+        "ErrorActionMaterialV1",
+        "CompleteErrorFallbackMaterialV1.invariant",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorAction.class",
+        "ErrorAction.class",
+        Model,
+        "semantic",
+        "ErrorActionMaterialV1.class",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorErrorClassMaterialV1",
+        "ErrorActionMaterialV1.class",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorAction.code",
+        "ErrorAction.code",
+        Model,
+        "semantic",
+        "ErrorActionMaterialV1.code",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticErrorCode",
+        "ErrorActionMaterialV1.code",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorAction.safe_message",
+        "ErrorAction.safe_message",
+        Model,
+        "semantic",
+        "ErrorActionMaterialV1.safe_message",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticSafeMessage",
+        "ErrorActionMaterialV1.safe_message",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorAction.retry_after",
+        "ErrorAction.retry_after",
+        Model,
+        "semantic",
+        "ErrorActionMaterialV1.retry_after",
+        "normalized",
+        "scalar",
+        "required",
+        "RetryAfterMaterialV1",
+        "ErrorActionMaterialV1.retry_after",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorAction.correlations",
+        "ErrorAction.correlations",
+        Model,
+        "semantic",
+        "ErrorActionMaterialV1.correlations",
+        "normalized",
+        "step_then_header",
+        "empty_array",
+        "Vec<ErrorCorrelationMaterialV1>",
+        "ErrorActionMaterialV1.correlations",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorCorrelationBinding.canonical_lowercase_header_name",
+        "ErrorCorrelationBinding.canonical_lowercase_header_name",
+        Model,
+        "semantic",
+        "ErrorCorrelationMaterialV1.canonical_lowercase_header_name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "ErrorCorrelationMaterialV1.canonical_lowercase_header_name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorCorrelationBinding.capability",
+        "ErrorCorrelationBinding.capability",
+        Model,
+        "semantic",
+        "ErrorCorrelationMaterialV1.capability",
+        "normalized",
+        "scalar",
+        "required",
+        "CapabilityId",
+        "ErrorCorrelationMaterialV1.capability",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorCorrelationBinding.step",
+        "ErrorCorrelationBinding.step",
+        Model,
+        "semantic",
+        "ErrorCorrelationMaterialV1.step",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledStepId",
+        "ErrorCorrelationMaterialV1.step",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Transport",
+        "ConnectorErrorClass::Transport",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=transport}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "transport",
+        "ConnectorErrorClassMaterialV1::Transport",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Timeout",
+        "ConnectorErrorClass::Timeout",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=timeout}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "timeout",
+        "ConnectorErrorClassMaterialV1::Timeout",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Http429",
+        "ConnectorErrorClass::Http429",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=http_429}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "http_429",
+        "ConnectorErrorClassMaterialV1::Http429",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Http5xx",
+        "ConnectorErrorClass::Http5xx",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=http_5xx}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "http_5xx",
+        "ConnectorErrorClassMaterialV1::Http5xx",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Authentication",
+        "ConnectorErrorClass::Authentication",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=authentication}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "authentication",
+        "ConnectorErrorClassMaterialV1::Authentication",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Validation",
+        "ConnectorErrorClass::Validation",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=validation}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "validation",
+        "ConnectorErrorClassMaterialV1::Validation",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Permanent",
+        "ConnectorErrorClass::Permanent",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=permanent}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "permanent",
+        "ConnectorErrorClassMaterialV1::Permanent",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ConnectorErrorClass::Invariant",
+        "ConnectorErrorClass::Invariant",
+        ConnectorAbi,
+        "semantic",
+        "ConnectorErrorClassMaterialV1{kind=invariant}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "invariant",
+        "ConnectorErrorClassMaterialV1::Invariant",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RetryAfterPolicy::Never",
+        "RetryAfterPolicy::Never",
+        Model,
+        "semantic",
+        "RetryAfterMaterialV1{kind=never}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "never",
+        "RetryAfterMaterialV1::Never",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RetryAfterPolicy::RetryAfterHeader",
+        "RetryAfterPolicy::RetryAfterHeader",
+        Model,
+        "semantic",
+        "RetryAfterMaterialV1{kind=retry_after_header}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "retry_after_header",
+        "RetryAfterMaterialV1::RetryAfterHeader",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RetryAfterPolicy::RetryAfterHeader.step",
+        "RetryAfterPolicy::RetryAfterHeader.step",
+        Model,
+        "semantic",
+        "RetryAfterMaterialV1{kind=retry_after_header}.value.step",
+        "normalized",
+        "scalar",
+        "required",
+        "CompiledStepId",
+        "RetryAfterMaterialV1::RetryAfterHeader.step",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RetryAfterPolicy::RetryAfterHeader.capability",
+        "RetryAfterPolicy::RetryAfterHeader.capability",
+        Model,
+        "semantic",
+        "RetryAfterMaterialV1{kind=retry_after_header}.value.capability",
+        "normalized",
+        "scalar",
+        "required",
+        "CapabilityId",
+        "RetryAfterMaterialV1::RetryAfterHeader.capability",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "RetryAfterPolicy::RetryAfterHeader.maximum_seconds",
+        "RetryAfterPolicy::RetryAfterHeader.maximum_seconds",
+        Model,
+        "semantic",
+        "RetryAfterMaterialV1{kind=retry_after_header}.value.maximum_seconds",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "RetryAfterMaterialV1::RetryAfterHeader.maximum_seconds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Status",
+        "ErrorMatcher::Status",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=status}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "status",
+        "ErrorMatcherMaterialV1::Status",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::ProviderCode",
+        "ErrorMatcher::ProviderCode",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=provider_code}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_code",
+        "ErrorMatcherMaterialV1::ProviderCode",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Header",
+        "ErrorMatcher::Header",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=header}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "header",
+        "ErrorMatcherMaterialV1::Header",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::MalformedDeclaredSuccess",
+        "ErrorMatcher::MalformedDeclaredSuccess",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=malformed_declared_success}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "malformed_declared_success",
+        "ErrorMatcherMaterialV1::MalformedDeclaredSuccess",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Status.minimum",
+        "StatusRange.minimum",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=status}.value.minimum",
+        "normalized",
+        "scalar",
+        "required",
+        "u16",
+        "StatusRangeMaterialV1.minimum",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Status.maximum",
+        "StatusRange.maximum",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=status}.value.maximum",
+        "normalized",
+        "scalar",
+        "required",
+        "u16",
+        "StatusRangeMaterialV1.maximum",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::ProviderCode.pointer",
+        "ErrorMatcher::ProviderCode.pointer",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=provider_code}.value.pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "ErrorMatcherMaterialV1::ProviderCode.pointer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::ProviderCode.codes",
+        "ErrorMatcher::ProviderCode.codes",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=provider_code}.value.codes",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<StaticProviderCode>",
+        "ErrorMatcherMaterialV1::ProviderCode.codes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Header.name",
+        "ErrorMatcher::Header.name",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=header}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticHeaderName",
+        "ErrorMatcherMaterialV1::Header.name",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ErrorMatcher::Header.values",
+        "ErrorMatcher::Header.values",
+        Model,
+        "semantic",
+        "ErrorMatcherMaterialV1{kind=header}.value.values",
+        "normalized",
+        "lexical",
+        "nonempty_array",
+        "NonEmptyVec<StaticHeaderValue>",
+        "ErrorMatcherMaterialV1::Header.values",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook",
+        "TriggerSpec::Webhook",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "webhook",
+        "SemanticTriggerMaterialV1::Webhook",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.connector",
+        "TriggerSpec::Webhook.connector",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.connector",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorId",
+        "SemanticTriggerMaterialV1::Webhook.connector",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.connector_version",
+        "TriggerSpec::Webhook.connector_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.connector_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Webhook.connector_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.trigger",
+        "TriggerSpec::Webhook.trigger",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.trigger",
+        "normalized",
+        "scalar",
+        "required",
+        "TriggerId",
+        "SemanticTriggerMaterialV1::Webhook.trigger",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.trigger_version",
+        "TriggerSpec::Webhook.trigger_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.trigger_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Webhook.trigger_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.event_version",
+        "TriggerSpec::Webhook.event_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.event_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Webhook.event_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.runtime_abi_epoch",
+        "TriggerSpec::Webhook.runtime_abi_epoch",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.runtime_abi_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticTriggerMaterialV1::Webhook.runtime_abi_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.authenticator",
+        "TriggerSpec::Webhook.authenticator",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.authenticator",
+        "normalized",
+        "scalar",
+        "required",
+        "VersionedProcessorMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.authenticator",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.codec",
+        "TriggerSpec::Webhook.codec",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.codec",
+        "normalized",
+        "scalar",
+        "required",
+        "VersionedProcessorMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.codec",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.normalizer",
+        "TriggerSpec::Webhook.normalizer",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.normalizer",
+        "normalized",
+        "scalar",
+        "required",
+        "VersionedProcessorMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.normalizer",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.selected_headers",
+        "TriggerSpec::Webhook.selected_headers",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.selected_headers",
+        "normalized",
+        "lexical",
+        "empty_array",
+        "Vec<StaticHeaderName>",
+        "SemanticTriggerMaterialV1::Webhook.selected_headers",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.raw_body_max_bytes",
+        "TriggerSpec::Webhook.raw_body_max_bytes",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.raw_body_max_bytes",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "SemanticTriggerMaterialV1::Webhook.raw_body_max_bytes",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.timestamp_window_ms",
+        "TriggerSpec::Webhook.timestamp_window_ms",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.timestamp_window_ms",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "SemanticTriggerMaterialV1::Webhook.timestamp_window_ms",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.event_id",
+        "TriggerSpec::Webhook.event_id",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.event_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.event_id",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.event_type",
+        "TriggerSpec::Webhook.event_type",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.event_type",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.event_type",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.output",
+        "TriggerSpec::Webhook.output",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.output",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.output",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.redaction",
+        "TriggerSpec::Webhook.redaction",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.redaction",
+        "normalized",
+        "scalar",
+        "required",
+        "RedactionMaterialV1",
+        "SemanticTriggerMaterialV1::Webhook.redaction",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Webhook.subscription_operations",
+        "TriggerSpec::Webhook.subscription_operations",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=webhook}.value.subscription_operations",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<SubscriptionOperationIdsMaterialV1>",
+        "SemanticTriggerMaterialV1::Webhook.subscription_operations",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll",
+        "TriggerSpec::Poll",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "poll",
+        "SemanticTriggerMaterialV1::Poll",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.connector",
+        "TriggerSpec::Poll.connector",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.connector",
+        "normalized",
+        "scalar",
+        "required",
+        "ConnectorId",
+        "SemanticTriggerMaterialV1::Poll.connector",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.connector_version",
+        "TriggerSpec::Poll.connector_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.connector_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Poll.connector_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.trigger",
+        "TriggerSpec::Poll.trigger",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.trigger",
+        "normalized",
+        "scalar",
+        "required",
+        "TriggerId",
+        "SemanticTriggerMaterialV1::Poll.trigger",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.trigger_version",
+        "TriggerSpec::Poll.trigger_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.trigger_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Poll.trigger_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.event_version",
+        "TriggerSpec::Poll.event_version",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.event_version",
+        "normalized",
+        "scalar",
+        "required",
+        "StableSemver",
+        "SemanticTriggerMaterialV1::Poll.event_version",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.runtime_abi_epoch",
+        "TriggerSpec::Poll.runtime_abi_epoch",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.runtime_abi_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "SemanticTriggerMaterialV1::Poll.runtime_abi_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.checkpoint",
+        "TriggerSpec::Poll.checkpoint",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.checkpoint",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticTriggerMaterialV1::Poll.checkpoint",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.processor",
+        "TriggerSpec::Poll.processor",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.processor",
+        "normalized",
+        "scalar",
+        "required",
+        "VersionedProcessorMaterialV1",
+        "SemanticTriggerMaterialV1::Poll.processor",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.event_type",
+        "TriggerSpec::Poll.event_type",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.event_type",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueContractMaterialV1",
+        "SemanticTriggerMaterialV1::Poll.event_type",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.per_poll_event_limit",
+        "TriggerSpec::Poll.per_poll_event_limit",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.per_poll_event_limit",
+        "normalized",
+        "scalar",
+        "required",
+        "u32",
+        "SemanticTriggerMaterialV1::Poll.per_poll_event_limit",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "TriggerSpec::Poll.bounds",
+        "TriggerSpec::Poll.bounds",
+        Model,
+        "semantic",
+        "SemanticTriggerMaterialV1{kind=poll}.value.bounds",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationBoundsMaterialV1",
+        "SemanticTriggerMaterialV1::Poll.bounds",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SubscriptionOperationIds.create",
+        "SubscriptionOperationIds.create",
+        Model,
+        "semantic",
+        "SubscriptionOperationIdsMaterialV1.create",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationId",
+        "SubscriptionOperationIdsMaterialV1.create",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SubscriptionOperationIds.delete",
+        "SubscriptionOperationIds.delete",
+        Model,
+        "semantic",
+        "SubscriptionOperationIdsMaterialV1.delete",
+        "normalized",
+        "scalar",
+        "required",
+        "OperationId",
+        "SubscriptionOperationIdsMaterialV1.delete",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "SubscriptionOperationIds.check",
+        "SubscriptionOperationIds.check",
+        Model,
+        "semantic",
+        "SubscriptionOperationIdsMaterialV1.check",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<OperationId>",
+        "SubscriptionOperationIdsMaterialV1.check",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "ValueContractCatalog.value_language_epoch",
+        "value_contract_material::value_language_epoch",
+        BuilderDerived,
+        "value-contract",
+        "ValueContractMaterialV1.value_language_epoch",
+        "normalized",
+        "scalar",
+        "required",
+        "Epoch",
+        "ValueContractMaterialV1.value_language_epoch",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueContractCatalog.roots",
+        "ValueContractCatalog.roots",
+        ValueContract,
+        "value-contract",
+        "ValueContractMaterialV1.roots",
+        "normalized",
+        "utf16_member_name",
+        "empty_object",
+        "Map<string,FieldMaterialV1>",
+        "ValueContractMaterialV1.roots",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueContractCatalog.named_objects",
+        "ValueContractCatalog.named_objects",
+        ValueContract,
+        "value-contract",
+        "ValueContractMaterialV1.named_objects",
+        "normalized",
+        "utf16_member_name",
+        "empty_object",
+        "Map<string,NamedObjectMaterialV1>",
+        "ValueContractMaterialV1.named_objects",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "NamedObject.fields",
+        "ValueObjectContract.fields",
+        ValueContract,
+        "value-contract",
+        "NamedObjectMaterialV1.fields",
+        "normalized",
+        "utf16_member_name",
+        "empty_object",
+        "Map<string,FieldMaterialV1>",
+        "NamedObjectMaterialV1.fields",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "Field.required",
+        "ValueContractField.required",
+        ValueContract,
+        "value-contract",
+        "FieldMaterialV1.required",
+        "normalized",
+        "scalar",
+        "required",
+        "bool",
+        "FieldMaterialV1.required",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "Field.type_ref",
+        "ValueContractField.type_ref",
+        ValueContract,
+        "value-contract",
+        "FieldMaterialV1.type_ref",
+        "normalized",
+        "scalar",
+        "required",
+        "TypeRefMaterialV1",
+        "FieldMaterialV1.type_ref",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "TypeRef.nullable",
+        "TypeRef.nullable",
+        ValueContract,
+        "value-contract",
+        "TypeRefMaterialV1.nullable",
+        "normalized",
+        "scalar",
+        "required",
+        "bool",
+        "TypeRefMaterialV1.nullable",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "TypeRef.value_type",
+        "TypeRef.value_type",
+        ValueContract,
+        "value-contract",
+        "TypeRefMaterialV1.value_type",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueTypeMaterialV1",
+        "TypeRefMaterialV1.value_type",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Scalar",
+        "ValueType::Scalar",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=scalar}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "scalar",
+        "ValueTypeMaterial::Scalar",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Enum",
+        "ValueType::Enum",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=enum}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "enum",
+        "ValueTypeMaterial::Enum",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Object",
+        "ValueType::Object",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=object}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "object",
+        "ValueTypeMaterial::Object",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::List",
+        "ValueType::List",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=list}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "list",
+        "ValueTypeMaterial::List",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Ref",
+        "ValueType::Ref",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=ref}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "ref",
+        "ValueTypeMaterial::Ref",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Scalar.scalar",
+        "ValueType::Scalar.scalar",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=scalar}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "ValueScalarMaterialV1",
+        "ValueTypeMaterial::Scalar.value",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Enum.name",
+        "ValueType::Enum.name",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=enum}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ValueTypeMaterial::Enum.name",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Enum.values",
+        "ValueType::Enum.values",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=enum}.value.values",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<string>",
+        "ValueTypeMaterial::Enum.values",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Object.fields",
+        "ValueType::Object.fields",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=object}.value.fields",
+        "normalized",
+        "utf16_member_name",
+        "empty_object",
+        "Map<string,FieldMaterialV1>",
+        "ValueTypeMaterial::Object.fields",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::List.element",
+        "ValueType::List.element",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=list}.value.element",
+        "normalized",
+        "scalar",
+        "required",
+        "TypeRefMaterialV1",
+        "ValueTypeMaterial::List.element",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueType::Ref.name",
+        "ValueType::Ref.name",
+        ValueContract,
+        "value-contract",
+        "ValueTypeMaterialV1{kind=ref}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ValueTypeMaterial::Ref.name",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Boolean",
+        "ValueScalar::Boolean",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=boolean}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "boolean",
+        "ValueScalarMaterial::Boolean",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::String",
+        "ValueScalar::String",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=string}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ValueScalarMaterial::String",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Int32",
+        "ValueScalar::Int32",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=int32}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "int32",
+        "ValueScalarMaterial::Int32",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Int64",
+        "ValueScalar::Int64",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=int64}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "int64",
+        "ValueScalarMaterial::Int64",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::UInt64",
+        "ValueScalar::UInt64",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=uint64}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "uint64",
+        "ValueScalarMaterial::UInt64",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Decimal",
+        "ValueScalar::Decimal",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=decimal}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "decimal",
+        "ValueScalarMaterial::Decimal",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Uuid",
+        "ValueScalar::Uuid",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=uuid}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "uuid",
+        "ValueScalarMaterial::Uuid",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Date",
+        "ValueScalar::Date",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=date}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "date",
+        "ValueScalarMaterial::Date",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Timestamp",
+        "ValueScalar::Timestamp",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=timestamp}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "timestamp",
+        "ValueScalarMaterial::Timestamp",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::TimestampTz",
+        "ValueScalar::TimestampTz",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=timestamptz}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "timestamptz",
+        "ValueScalarMaterial::TimestampTz",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Json",
+        "ValueScalar::Json",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=json}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "json",
+        "ValueScalarMaterial::Json",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Custom",
+        "ValueScalar::Custom",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=custom}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "custom",
+        "ValueScalarMaterial::Custom",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "ValueScalar::Custom.name",
+        "ValueScalar::Custom.name",
+        ValueContract,
+        "value-contract",
+        "ValueScalarMaterialV1{kind=custom}.value.name",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ValueScalarMaterial::Custom.name",
+        ProjectionSchema,
+        ValueContract,
+        Mutable,
+    );
+    (
+        "TypedValue::Null",
+        "TypedValue::Null",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=null}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "null",
+        "TypedValueMaterial::Null",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Boolean",
+        "TypedValue::Boolean",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=boolean}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "boolean",
+        "TypedValueMaterial::Boolean",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::String",
+        "TypedValue::String",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=string}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "TypedValueMaterial::String",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::I64",
+        "CanonicalNumber::I64",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=i64}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "i64",
+        "TypedValueMaterial::I64",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::U64",
+        "CanonicalNumber::U64",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=u64}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "u64",
+        "TypedValueMaterial::U64",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Decimal",
+        "CanonicalNumber::Decimal",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=decimal}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "decimal",
+        "TypedValueMaterial::Decimal",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::List",
+        "TypedValue::List",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=list}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "list",
+        "TypedValueMaterial::List",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Object",
+        "TypedValue::Object",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=object}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "object",
+        "TypedValueMaterial::Object",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::InlineBytes",
+        "TypedValue::InlineBytes",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=inline_bytes}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "inline_bytes",
+        "TypedValueMaterial::InlineBytes",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Boolean.value",
+        "TypedValue::Boolean.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=boolean}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "bool",
+        "TypedValueMaterial::Boolean.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::String.value",
+        "TypedValue::String.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=string}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "TypedValueMaterial::String.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::I64.value",
+        "CanonicalNumber::I64.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=i64}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "i64-string",
+        "TypedValueMaterial::I64.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::U64.value",
+        "CanonicalNumber::U64.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=u64}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "u64-string",
+        "TypedValueMaterial::U64.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Decimal.value",
+        "CanonicalNumber::Decimal.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=decimal}.value",
+        "normalized",
+        "scalar",
+        "required",
+        "decimal-string",
+        "TypedValueMaterial::Decimal.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::List.value",
+        "TypedValue::List.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=list}.value",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<TypedValueMaterialV1>",
+        "TypedValueMaterial::List.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::Object.value",
+        "TypedValue::Object.value",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=object}.value",
+        "normalized",
+        "utf16_member_name",
+        "empty_object",
+        "Map<string,TypedValueMaterialV1>",
+        "TypedValueMaterial::Object.value",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::InlineBytes.bytes",
+        "BoundedInlineBytes.bytes",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=inline_bytes}.value.$binary",
+        "normalized",
+        "scalar",
+        "required",
+        "base64url",
+        "TypedValueMaterial::InlineBytes.binary",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::InlineBytes.media_type",
+        "BoundedInlineBytes.media_type",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=inline_bytes}.value.media_type",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<string>",
+        "TypedValueMaterial::InlineBytes.media_type",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "TypedValue::InlineBytes.file_name",
+        "BoundedInlineBytes.file_name",
+        ValueContract,
+        "value-contract",
+        "TypedValueMaterialV1{kind=inline_bytes}.value.file_name",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<string>",
+        "TypedValueMaterial::InlineBytes.file_name",
+        Source,
+        TypedValue,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.source_record_id",
+        "ManifestProvenanceReference.source_record_id",
+        Model,
+        "provenance",
+        "ManifestProvenanceMaterialV1.source_record_id",
+        "normalized",
+        "scalar",
+        "required",
+        "SourceRecordId",
+        "ManifestProvenanceMaterialV1.source_record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes",
+        "ManifestProvenanceReference.artifact_hashes",
+        Model,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes",
+        "normalized",
+        "artifact_id",
+        "nonempty_array",
+        "NonEmptyVec<ArtifactHashMaterialV1>",
+        "ManifestProvenanceMaterialV1.artifact_hashes",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.license_id",
+        "ManifestProvenanceReference.license_id",
+        Model,
+        "provenance",
+        "ManifestProvenanceMaterialV1.license_id",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseIdentity",
+        "ManifestProvenanceMaterialV1.license_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.notice_id",
+        "ManifestProvenanceReference.notice_id",
+        Model,
+        "provenance",
+        "ManifestProvenanceMaterialV1.notice_id",
+        "normalized",
+        "scalar",
+        "required",
+        "NoticeId",
+        "ManifestProvenanceMaterialV1.notice_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.contract_facts",
+        "ManifestProvenanceReference.contract_facts",
+        Model,
+        "provenance",
+        "ManifestProvenanceMaterialV1.contract_fact_origins",
+        "normalized",
+        "use_site",
+        "empty_array",
+        "Vec<ResolvedFactOriginMaterialV1>",
+        "ManifestProvenanceMaterialV1.contract_fact_origins",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ResolvedContractFactBinding.use_site",
+        "ResolvedContractFactBinding.use_site",
+        Model,
+        "provenance",
+        "ResolvedFactOriginMaterialV1.use_site",
+        "normalized",
+        "scalar",
+        "required",
+        "Id",
+        "ResolvedFactOriginMaterialV1.use_site",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ResolvedContractFactBinding.fact",
+        "ResolvedContractFactBinding.fact",
+        Model,
+        "provenance",
+        "ResolvedFactOriginMaterialV1.origin",
+        "normalized",
+        "scalar",
+        "required",
+        "ResolvedFactOrigin",
+        "ResolvedFactOriginMaterialV1.origin",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence.source_record_id",
+        "ContractFact::ProviderEvidence.source_record_id",
+        Source,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=provider_evidence}.value.source_record_id",
+        "normalized",
+        "scalar",
+        "required",
+        "SourceRecordId",
+        "ResolvedFactOriginV1::ProviderEvidence.source_record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence.fact_id",
+        "ContractFact::ProviderEvidence.fact_id",
+        Source,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=provider_evidence}.value.fact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderFactId",
+        "ResolvedFactOriginV1::ProviderEvidence.fact_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ContractFact::DonatPolicy.policy_id",
+        "ContractFact::DonatPolicy.policy_id",
+        Source,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=donat_policy}.value.policy_id",
+        "normalized",
+        "scalar",
+        "required",
+        "DonatPolicyId",
+        "ResolvedFactOriginV1::DonatPolicy.policy_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ContractFact::ProviderEvidence",
+        "ContractFact::ProviderEvidence",
+        Source,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=provider_evidence}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "provider_evidence",
+        "ResolvedFactOriginV1::ProviderEvidence",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ContractFact::DonatPolicy",
+        "ContractFact::DonatPolicy",
+        Source,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=donat_policy}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "donat_policy",
+        "ResolvedFactOriginV1::DonatPolicy",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].artifact_id",
+        "ArtifactHash.artifact_id",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].artifact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ArtifactId",
+        "ArtifactHashMaterialV1.artifact_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].algorithm",
+        "ArtifactHash.algorithm",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].algorithm",
+        "normalized",
+        "scalar",
+        "required",
+        "HashAlgorithm",
+        "ArtifactHashMaterialV1.algorithm",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].digest",
+        "ArtifactHash.digest",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].digest",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256_or_Hash512",
+        "ArtifactHashMaterialV1.digest",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].path",
+        "ArtifactHash.path",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].path",
+        "normalized",
+        "scalar",
+        "explicit_null",
+        "Option<SourcePath>",
+        "ArtifactHashMaterialV1.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].algorithm::Sha256",
+        "HashAlgorithm::Sha256",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].algorithm{kind=sha256}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "sha256",
+        "HashAlgorithmMaterialV1::Sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ManifestProvenanceReference.artifact_hashes[].algorithm::Sha512",
+        "HashAlgorithm::Sha512",
+        Source,
+        "provenance",
+        "ManifestProvenanceMaterialV1.artifact_hashes[].algorithm{kind=sha512}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "sha512",
+        "HashAlgorithmMaterialV1::Sha512",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactProviderArtifact.provider",
+        "ExactProviderArtifact.provider",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].provider",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ProviderEvidenceOriginMaterialV1.provider",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactProviderArtifact.evidence",
+        "ExactProviderArtifact.evidence",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence",
+        "normalized",
+        "canonical_source_identity",
+        "nonempty_array",
+        "NonEmptyVec<ProviderEvidenceOriginEntryMaterialV1>",
+        "ProviderEvidenceOriginMaterialV1.evidence",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.accessed_on",
+        "ProviderEvidenceArtifact.accessed_on",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].accessed_on",
+        "normalized",
+        "scalar",
+        "required",
+        "Date",
+        "ProviderEvidenceOriginEntryMaterialV1.accessed_on",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.content_sha256",
+        "ProviderEvidenceArtifact.content_sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].content_sha256",
+        "normalized",
+        "scalar",
+        "required",
+        "Hash256",
+        "ProviderEvidenceOriginEntryMaterialV1.content_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.source",
+        "ProviderEvidenceArtifact.source",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source",
+        "normalized",
+        "scalar",
+        "required",
+        "ImmutableProviderEvidenceSource",
+        "ProviderEvidenceOriginEntryMaterialV1.source",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.terms",
+        "ProviderEvidenceArtifact.terms",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms",
+        "normalized",
+        "scalar",
+        "required",
+        "EvidenceTermsMaterialV1",
+        "ProviderEvidenceOriginEntryMaterialV1.terms",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderEvidenceArtifact.facts",
+        "ProviderEvidenceArtifact.facts",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts",
+        "normalized",
+        "fact_id",
+        "nonempty_array",
+        "ProviderEvidenceOriginFactMaterialV1",
+        "ProviderEvidenceOriginEntryMaterialV1.facts",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile",
+        "ImmutableProviderEvidenceSource::RepositoryFile",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=repository_file}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "repository_file",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact",
+        "ImmutableProviderEvidenceSource::VersionedArtifact",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=versioned_artifact}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "versioned_artifact",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.repository",
+        "ImmutableProviderEvidenceSource::RepositoryFile.repository",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=repository_file}.value.repository",
+        "normalized",
+        "scalar",
+        "required",
+        "RepositoryUrl",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.repository",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.commit",
+        "ImmutableProviderEvidenceSource::RepositoryFile.commit",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=repository_file}.value.commit",
+        "normalized",
+        "scalar",
+        "required",
+        "GitCommit",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.commit",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::RepositoryFile.path",
+        "ImmutableProviderEvidenceSource::RepositoryFile.path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=repository_file}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ProviderEvidenceSourceMaterialV1::RepositoryFile.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact.url",
+        "ImmutableProviderEvidenceSource::VersionedArtifact.url",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=versioned_artifact}.value.url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact.url",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ImmutableProviderEvidenceSource::VersionedArtifact.provider_revision",
+        "ImmutableProviderEvidenceSource::VersionedArtifact.provider_revision",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].source{kind=versioned_artifact}.value.provider_revision",
+        "normalized",
+        "scalar",
+        "required",
+        "NonEmptyString",
+        "ProviderEvidenceSourceMaterialV1::VersionedArtifact.provider_revision",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderFact.fact_id",
+        "ProviderFact.fact_id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].fact_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ProviderFactId",
+        "ProviderEvidenceOriginFactMaterialV1.fact_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ProviderFact.location",
+        "ProviderFact.location",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactFactLocationMaterialV1",
+        "ProviderEvidenceOriginFactMaterialV1.location",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer",
+        "ExactFactLocation::JsonPointer",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=json_pointer}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "json_pointer",
+        "ExactFactLocationMaterialV1::JsonPointer",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection",
+        "ExactFactLocation::DocumentSection",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=document_section}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "document_section",
+        "ExactFactLocationMaterialV1::DocumentSection",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer.path",
+        "ExactFactLocation::JsonPointer.path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=json_pointer}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ExactFactLocationMaterialV1::JsonPointer.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::JsonPointer.pointer",
+        "ExactFactLocation::JsonPointer.pointer",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=json_pointer}.value.pointer",
+        "normalized",
+        "scalar",
+        "required",
+        "StaticJsonPointer",
+        "ExactFactLocationMaterialV1::JsonPointer.pointer",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection.path",
+        "ExactFactLocation::DocumentSection.path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=document_section}.value.path",
+        "normalized",
+        "scalar",
+        "required",
+        "SourcePath",
+        "ExactFactLocationMaterialV1::DocumentSection.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "ExactFactLocation::DocumentSection.section",
+        "ExactFactLocation::DocumentSection.section",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].facts[].location{kind=document_section}.value.section",
+        "normalized",
+        "scalar",
+        "required",
+        "string",
+        "ExactFactLocationMaterialV1::DocumentSection.section",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive",
+        "EvidenceTermsDisposition::Permissive",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=permissive}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "permissive",
+        "EvidenceTermsMaterialV1::Permissive",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse",
+        "EvidenceTermsDisposition::ReviewedUse",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=reviewed_use}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "reviewed_use",
+        "EvidenceTermsMaterialV1::ReviewedUse",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Rejected",
+        "EvidenceTermsDisposition::Rejected",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=rejected}.kind",
+        "normalized",
+        "scalar",
+        "required",
+        "rejected",
+        "EvidenceTermsMaterialV1::Rejected",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive.license",
+        "EvidenceTermsDisposition::Permissive.license",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=permissive}.value.license",
+        "normalized",
+        "scalar",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "EvidenceTermsMaterialV1::Permissive.license",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Permissive.evidence_url",
+        "EvidenceTermsDisposition::Permissive.evidence_url",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=permissive}.value.evidence_url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "EvidenceTermsMaterialV1::Permissive.evidence_url",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse.decision_id",
+        "EvidenceTermsDisposition::ReviewedUse.decision_id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=reviewed_use}.value.decision_id",
+        "normalized",
+        "scalar",
+        "required",
+        "ReviewDecisionId",
+        "EvidenceTermsMaterialV1::ReviewedUse.decision_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::ReviewedUse.evidence_url",
+        "EvidenceTermsDisposition::ReviewedUse.evidence_url",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=reviewed_use}.value.evidence_url",
+        "normalized",
+        "scalar",
+        "required",
+        "ExactHttpsUrl",
+        "EvidenceTermsMaterialV1::ReviewedUse.evidence_url",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EvidenceTermsDisposition::Rejected.finding",
+        "EvidenceTermsDisposition::Rejected.finding",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence[].evidence[].terms{kind=rejected}.value.finding",
+        "normalized",
+        "scalar",
+        "required",
+        "FindingId",
+        "EvidenceTermsMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DonatOwnedSource.files[].path",
+        "RepoFileHash.path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.files[].path",
+        "normalized",
+        "source_record_id_then_path",
+        "required",
+        "RepoPath",
+        "FileDecisionMaterialV1.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DonatOwnedSource.files[].sha256",
+        "RepoFileHash.sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.files[].sha256",
+        "normalized",
+        "source_record_id_then_path",
+        "required",
+        "Hash256",
+        "FileDecisionMaterialV1.sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive",
+        "LicenseDecision::Permissive",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=permissive}.kind",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "permissive",
+        "LicenseDecisionMaterialV1::Permissive",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant",
+        "LicenseDecision::WrittenGrant",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=written_grant}.kind",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "written_grant",
+        "LicenseDecisionMaterialV1::WrittenGrant",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Rejected",
+        "LicenseDecision::Rejected",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=rejected}.kind",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "rejected",
+        "LicenseDecisionMaterialV1::Rejected",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.spdx_id",
+        "LicenseDecision::Permissive.spdx_id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=permissive}.value.spdx_id",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "string",
+        "LicenseDecisionMaterialV1::Permissive.spdx_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.selected_dual_license_branch",
+        "LicenseDecision::Permissive.selected_dual_license_branch",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=permissive}.value.selected_dual_license_branch",
+        "normalized",
+        "canonical_bytes",
+        "explicit_null",
+        "Option<string>",
+        "LicenseDecisionMaterialV1::Permissive.selected_dual_license_branch",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.license_file_path",
+        "LicenseDecision::Permissive.license_file_path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=permissive}.value.license_file_path",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "SourcePath",
+        "LicenseDecisionMaterialV1::Permissive.license_file_path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Permissive.license_file_sha256",
+        "LicenseDecision::Permissive.license_file_sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=permissive}.value.license_file_sha256",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "Hash256",
+        "LicenseDecisionMaterialV1::Permissive.license_file_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant.decision_id",
+        "LicenseDecision::WrittenGrant.decision_id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=written_grant}.value.decision_id",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "ReviewDecisionId",
+        "LicenseDecisionMaterialV1::WrittenGrant.decision_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::WrittenGrant.grant_sha256",
+        "LicenseDecision::WrittenGrant.grant_sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=written_grant}.value.grant_sha256",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "Hash256",
+        "LicenseDecisionMaterialV1::WrittenGrant.grant_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "LicenseDecision::Rejected.finding",
+        "LicenseDecision::Rejected.finding",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.licenses[]{kind=rejected}.value.finding",
+        "normalized",
+        "canonical_bytes",
+        "required",
+        "FindingId",
+        "LicenseDecisionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.id",
+        "NoticeIdentity.id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.notices[].id",
+        "normalized",
+        "id",
+        "required",
+        "NoticeId",
+        "NoticeMaterialV1.id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.license_file_path",
+        "NoticeIdentity.license_file_path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.notices[].license_file_path",
+        "normalized",
+        "id",
+        "required",
+        "SourcePath",
+        "NoticeMaterialV1.license_file_path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.license_file_sha256",
+        "NoticeIdentity.license_file_sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.notices[].license_file_sha256",
+        "normalized",
+        "id",
+        "required",
+        "Hash256",
+        "NoticeMaterialV1.license_file_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.required_copyright_lines",
+        "NoticeIdentity.required_copyright_lines",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.notices[].required_copyright_lines",
+        "normalized",
+        "declared",
+        "empty_array",
+        "Vec<string>",
+        "NoticeMaterialV1.required_copyright_lines",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "NoticeIdentity.notice_bundle_destination",
+        "NoticeIdentity.notice_bundle_destination",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.notices[].notice_bundle_destination",
+        "normalized",
+        "id",
+        "required",
+        "RepoPath",
+        "NoticeMaterialV1.notice_bundle_destination",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDecision.dependency",
+        "DependencyDecision.dependency",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].dependency",
+        "normalized",
+        "dependency",
+        "required",
+        "Id",
+        "DependencyDecisionMaterialV1.dependency",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDecision.disposition",
+        "DependencyDecision.disposition",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition",
+        "normalized",
+        "dependency",
+        "required",
+        "DependencyDispositionMaterialV1",
+        "DependencyDecisionMaterialV1.disposition",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Shipped",
+        "DependencyDisposition::Shipped",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=shipped}.kind",
+        "normalized",
+        "dependency",
+        "required",
+        "shipped",
+        "DependencyDispositionMaterialV1::Shipped",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BuildOnly",
+        "DependencyDisposition::BuildOnly",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=build_only}.kind",
+        "normalized",
+        "dependency",
+        "required",
+        "build_only",
+        "DependencyDispositionMaterialV1::BuildOnly",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::TypeOnlyReplaced",
+        "DependencyDisposition::TypeOnlyReplaced",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=type_only_replaced}.kind",
+        "normalized",
+        "dependency",
+        "required",
+        "type_only_replaced",
+        "DependencyDispositionMaterialV1::TypeOnlyReplaced",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BehaviorOnly",
+        "DependencyDisposition::BehaviorOnly",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=behavior_only}.kind",
+        "normalized",
+        "dependency",
+        "required",
+        "behavior_only",
+        "DependencyDispositionMaterialV1::BehaviorOnly",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Rejected",
+        "DependencyDisposition::Rejected",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=rejected}.kind",
+        "normalized",
+        "dependency",
+        "required",
+        "rejected",
+        "DependencyDispositionMaterialV1::Rejected",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Shipped.license",
+        "DependencyDisposition::Shipped.license",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=shipped}.value.license",
+        "normalized",
+        "dependency",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "DependencyDispositionMaterialV1::Shipped.license",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BuildOnly.license",
+        "DependencyDisposition::BuildOnly.license",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=build_only}.value.license",
+        "normalized",
+        "dependency",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "DependencyDispositionMaterialV1::BuildOnly.license",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::TypeOnlyReplaced.replacement",
+        "DependencyDisposition::TypeOnlyReplaced.replacement",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=type_only_replaced}.value.replacement",
+        "normalized",
+        "dependency",
+        "required",
+        "Id",
+        "DependencyDispositionMaterialV1::TypeOnlyReplaced.replacement",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::BehaviorOnly.reason",
+        "DependencyDisposition::BehaviorOnly.reason",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=behavior_only}.value.reason",
+        "normalized",
+        "dependency",
+        "required",
+        "FindingId",
+        "DependencyDispositionMaterialV1::BehaviorOnly.reason",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "DependencyDisposition::Rejected.finding",
+        "DependencyDisposition::Rejected.finding",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies[].disposition{kind=rejected}.value.finding",
+        "normalized",
+        "dependency",
+        "required",
+        "FindingId",
+        "DependencyDispositionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.material_id",
+        "EmbeddedMaterialDecision.material_id",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].material_id",
+        "normalized",
+        "material_id",
+        "required",
+        "Id",
+        "EmbeddedDecisionMaterialV1.material_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.path",
+        "EmbeddedMaterialDecision.path",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].path",
+        "normalized",
+        "material_id",
+        "required",
+        "SourcePath",
+        "EmbeddedDecisionMaterialV1.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.sha256",
+        "EmbeddedMaterialDecision.sha256",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].sha256",
+        "normalized",
+        "material_id",
+        "required",
+        "Hash256",
+        "EmbeddedDecisionMaterialV1.sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDecision.disposition",
+        "EmbeddedMaterialDecision.disposition",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition",
+        "normalized",
+        "material_id",
+        "required",
+        "EmbeddedMaterialDispositionMaterialV1",
+        "EmbeddedDecisionMaterialV1.disposition",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Shipped",
+        "EmbeddedMaterialDisposition::Shipped",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=shipped}.kind",
+        "normalized",
+        "material_id",
+        "required",
+        "shipped",
+        "EmbeddedMaterialDispositionMaterialV1::Shipped",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::BehaviorOnly",
+        "EmbeddedMaterialDisposition::BehaviorOnly",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=behavior_only}.kind",
+        "normalized",
+        "material_id",
+        "required",
+        "behavior_only",
+        "EmbeddedMaterialDispositionMaterialV1::BehaviorOnly",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Rejected",
+        "EmbeddedMaterialDisposition::Rejected",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=rejected}.kind",
+        "normalized",
+        "material_id",
+        "required",
+        "rejected",
+        "EmbeddedMaterialDispositionMaterialV1::Rejected",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Shipped.license",
+        "EmbeddedMaterialDisposition::Shipped.license",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=shipped}.value.license",
+        "normalized",
+        "material_id",
+        "required",
+        "LicenseDecisionMaterialV1",
+        "EmbeddedMaterialDispositionMaterialV1::Shipped.license",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::BehaviorOnly.reason",
+        "EmbeddedMaterialDisposition::BehaviorOnly.reason",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=behavior_only}.value.reason",
+        "normalized",
+        "material_id",
+        "required",
+        "FindingId",
+        "EmbeddedMaterialDispositionMaterialV1::BehaviorOnly.reason",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "EmbeddedMaterialDisposition::Rejected.finding",
+        "EmbeddedMaterialDisposition::Rejected.finding",
+        Source,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material[].disposition{kind=rejected}.value.finding",
+        "normalized",
+        "material_id",
+        "required",
+        "FindingId",
+        "EmbeddedMaterialDispositionMaterialV1::Rejected.finding",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::canonical_schema_epoch",
+        "derived::canonical_schema_epoch",
+        Constant,
+        "semantic",
+        "SemanticMaterialV1.canonical_schema_epoch",
+        "constant",
+        "scalar",
+        "required",
+        "CANONICAL_SCHEMA_EPOCH",
+        "SemanticMaterialV1.canonical_schema_epoch",
+        ProjectionSchema,
+        Semantic,
+        Mutable,
+    );
+
+    (
+        "derived::canonical_schema_epoch",
+        "derived::canonical_schema_epoch",
+        Constant,
+        "provenance",
+        "ProvenanceMaterialV1.canonical_schema_epoch",
+        "constant",
+        "scalar",
+        "required",
+        "CANONICAL_SCHEMA_EPOCH",
+        "ProvenanceMaterialV1.canonical_schema_epoch",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::classifier_epoch",
+        "derived::classifier_epoch",
+        Constant,
+        "provenance",
+        "ProvenanceMaterialV1.classifier_epoch",
+        "constant",
+        "scalar",
+        "required",
+        "CLASSIFIER_EPOCH",
+        "ProvenanceMaterialV1.classifier_epoch",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::generator_epoch",
+        "derived::generator_epoch",
+        Constant,
+        "provenance",
+        "ProvenanceMaterialV1.generator_epoch",
+        "constant",
+        "scalar",
+        "required",
+        "GENERATOR_EPOCH",
+        "ProvenanceMaterialV1.generator_epoch",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::semantic_sha256",
+        "derived::semantic_sha256",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.connector.semantic_sha256",
+        "derived:semantic_domain_hash",
+        "scalar",
+        "required",
+        "Hash256",
+        "ProvenanceConnectorIdentity.semantic_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::source_identity.record_id",
+        "derived::source_identity.record_id",
+        NamedDerived,
+        "provenance",
+        "SourceIdentityMaterialV1.record_id",
+        "derived:accepted_record_join",
+        "record_id",
+        "required",
+        "SourceRecordId",
+        "SourceIdentityMaterialV1.record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::source_identity.record_sha256",
+        "derived::source_identity.record_sha256",
+        NamedDerived,
+        "provenance",
+        "SourceIdentityMaterialV1.record_sha256",
+        "derived:source_record_domain_hash",
+        "record_id",
+        "required",
+        "Hash256",
+        "SourceIdentityMaterialV1.record_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact.source_record_id",
+        "derived::artifact.source_record_id",
+        NamedDerived,
+        "provenance",
+        "ArtifactDecisionMaterialV1.source_record_id",
+        "derived:accepted_record_join",
+        "source_record_id_then_artifact_id",
+        "required",
+        "SourceRecordId",
+        "ArtifactDecisionMaterialV1.source_record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact.artifact_id",
+        "derived::artifact.artifact_id",
+        NamedDerived,
+        "provenance",
+        "ArtifactDecisionMaterialV1.artifact_id",
+        "derived:accepted_record_artifact_inventory",
+        "source_record_id_then_artifact_id",
+        "required",
+        "ArtifactId",
+        "ArtifactDecisionMaterialV1.artifact_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact.algorithm",
+        "derived::artifact.algorithm",
+        NamedDerived,
+        "provenance",
+        "ArtifactDecisionMaterialV1.algorithm",
+        "derived:accepted_record_artifact_inventory",
+        "source_record_id_then_artifact_id",
+        "required",
+        "HashAlgorithm",
+        "ArtifactDecisionMaterialV1.algorithm",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact.digest",
+        "derived::artifact.digest",
+        NamedDerived,
+        "provenance",
+        "ArtifactDecisionMaterialV1.digest",
+        "derived:accepted_record_artifact_inventory",
+        "source_record_id_then_artifact_id",
+        "required",
+        "Hash256_or_Hash512",
+        "ArtifactDecisionMaterialV1.digest",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact.path",
+        "derived::artifact.path",
+        NamedDerived,
+        "provenance",
+        "ArtifactDecisionMaterialV1.path",
+        "derived:accepted_record_artifact_inventory",
+        "source_record_id_then_artifact_id",
+        "explicit_null",
+        "Option<SourcePath>",
+        "ArtifactDecisionMaterialV1.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::file.source_record_id",
+        "derived::file.source_record_id",
+        NamedDerived,
+        "provenance",
+        "FileDecisionMaterialV1.source_record_id",
+        "derived:accepted_donat_record_join",
+        "source_record_id_then_path",
+        "required",
+        "SourceRecordId",
+        "FileDecisionMaterialV1.source_record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::file.path",
+        "derived::file.path",
+        NamedDerived,
+        "provenance",
+        "FileDecisionMaterialV1.path",
+        "derived:accepted_donat_file_inventory",
+        "source_record_id_then_path",
+        "required",
+        "RepoPath",
+        "FileDecisionMaterialV1.path",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::file.sha256",
+        "derived::file.sha256",
+        NamedDerived,
+        "provenance",
+        "FileDecisionMaterialV1.sha256",
+        "derived:accepted_donat_file_inventory",
+        "source_record_id_then_path",
+        "required",
+        "Hash256",
+        "FileDecisionMaterialV1.sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::source_identity",
+        "derived::source_identity",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.sources",
+        "derived:accepted_record_join",
+        "record_id",
+        "empty_array",
+        "Vec<SourceIdentityMaterialV1>",
+        "ProvenanceMaterialV1.sources",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::artifact",
+        "derived::artifact",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.artifacts",
+        "derived:accepted_record_artifact_inventory",
+        "source_record_id_then_artifact_id",
+        "empty_array",
+        "Vec<ArtifactDecisionMaterialV1>",
+        "ProvenanceMaterialV1.artifacts",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::license",
+        "derived::license",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.licenses",
+        "derived:accepted_record_license_inventory",
+        "canonical_bytes",
+        "empty_array",
+        "Vec<LicenseDecisionMaterialV1>",
+        "ProvenanceMaterialV1.licenses",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::dependency",
+        "derived::dependency",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.dependencies",
+        "derived:accepted_record_dependency_inventory",
+        "dependency",
+        "empty_array",
+        "Vec<DependencyDecisionMaterialV1>",
+        "ProvenanceMaterialV1.dependencies",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::embedded_material",
+        "derived::embedded_material",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.embedded_material",
+        "derived:accepted_record_embedded_inventory",
+        "material_id",
+        "empty_array",
+        "Vec<EmbeddedDecisionMaterialV1>",
+        "ProvenanceMaterialV1.embedded_material",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::notice",
+        "derived::notice",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.notices",
+        "derived:accepted_record_notice_inventory",
+        "id",
+        "empty_array",
+        "Vec<NoticeMaterialV1>",
+        "ProvenanceMaterialV1.notices",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::provider_evidence",
+        "derived::provider_evidence",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.provider_evidence",
+        "derived:accepted_provider_record_inventory",
+        "source_record_id",
+        "empty_array",
+        "Vec<ProviderEvidenceOriginMaterialV1>",
+        "ProvenanceMaterialV1.provider_evidence",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::provider_evidence.source_record_id",
+        "derived::provider_evidence.source_record_id",
+        NamedDerived,
+        "provenance",
+        "ProviderEvidenceOriginMaterialV1.source_record_id",
+        "derived:accepted_provider_record_join",
+        "source_record_id",
+        "required",
+        "SourceRecordId",
+        "ProviderEvidenceOriginMaterialV1.source_record_id",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::fact_origin.artifact_content_sha256",
+        "derived::fact_origin.artifact_content_sha256",
+        NamedDerived,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=provider_evidence}.value.artifact_content_sha256",
+        "derived:provider_fact_content_join",
+        "use_site",
+        "required",
+        "Hash256",
+        "ResolvedFactOriginV1::ProviderEvidence.artifact_content_sha256",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::fact_origin.location",
+        "derived::fact_origin.location",
+        NamedDerived,
+        "provenance",
+        "ResolvedFactOriginMaterialV1{kind=provider_evidence}.value.location",
+        "derived:provider_fact_location_join",
+        "use_site",
+        "required",
+        "ExactFactLocationMaterialV1",
+        "ResolvedFactOriginV1::ProviderEvidence.location",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+    (
+        "derived::donat_policy_ids",
+        "derived::donat_policy_ids",
+        NamedDerived,
+        "provenance",
+        "ProvenanceMaterialV1.donat_policy_ids",
+        "derived:contract_fact_policy_set",
+        "lexical",
+        "empty_array",
+        "Vec<DonatPolicyId>",
+        "ProvenanceMaterialV1.donat_policy_ids",
+        ProjectionSchema,
+        Provenance,
+        Mutable,
+    );
+
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
@@ -1127,9 +11146,12 @@ struct ConnectorManifestDto {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestProvenanceInputDto {
+    #[serde(deserialize_with = "crate::source::deserialize_source_primitive")]
     source_record_id: SourceRecordId,
+    #[serde(deserialize_with = "crate::source::deserialize_artifact_hashes")]
     artifact_hashes: Vec<ArtifactHash>,
     license_id: String,
+    #[serde(deserialize_with = "crate::source::deserialize_source_primitive")]
     notice_id: crate::NoticeId,
     contract_facts: Vec<ResolvedContractFactBindingDto>,
 }
@@ -1138,6 +11160,7 @@ struct ManifestProvenanceInputDto {
 #[serde(deny_unknown_fields)]
 struct ResolvedContractFactBindingDto {
     use_site: String,
+    #[serde(deserialize_with = "crate::source::deserialize_contract_fact")]
     fact: ContractFact,
 }
 
@@ -2570,6 +12593,7 @@ impl ResolvedFactOriginMaterialV1 {
 pub fn resolve_fact_bindings(
     values: &[ResolvedFactValue],
     origins: &[ResolvedContractFactBinding],
+    requirements: &crate::CheckedFactRequirements,
     catalog: &AcceptedRecordCatalog,
     reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
 ) -> Result<
@@ -2618,10 +12642,10 @@ pub fn resolve_fact_bindings(
         let fact = origin_by_use_site
             .get(use_site)
             .expect("equal key sets were checked");
-        let required_domain = required_fact_domain(use_site).ok_or_else(|| {
+        let required_domain = requirements.required_domain(use_site).ok_or_else(|| {
             CatalogError::new(
                 "catalog_fact_binding_mismatch",
-                "fact use site has no closed normalized origin requirement",
+                "fact use site has no checked normalized origin requirement",
             )
         })?;
         if !required_domain.accepts(fact) {
@@ -2732,49 +12756,6 @@ pub fn resolve_fact_bindings(
         });
     }
     Ok((semantic, provenance))
-}
-
-#[derive(Clone, Copy)]
-enum RequiredFactDomain {
-    ProviderEvidence,
-    DonatPolicy,
-}
-
-impl RequiredFactDomain {
-    const fn accepts(self, fact: &ContractFact) -> bool {
-        matches!(
-            (self, fact),
-            (
-                Self::ProviderEvidence,
-                ContractFact::ProviderEvidence {
-                    source_record_id: _,
-                    fact_id: _,
-                }
-            ) | (
-                Self::DonatPolicy,
-                ContractFact::DonatPolicy {
-                    policy_id: _,
-                    value: _,
-                },
-            )
-        )
-    }
-}
-
-fn required_fact_domain(use_site: &str) -> Option<RequiredFactDomain> {
-    let is_operation_step = use_site.starts_with("operation.") && use_site.contains(".step.");
-    if !is_operation_step {
-        return None;
-    }
-    if use_site.ends_with(".idempotency.scope")
-        || use_site.ends_with(".idempotency.minimum_retention_ms")
-    {
-        Some(RequiredFactDomain::ProviderEvidence)
-    } else if use_site.ends_with(".idempotency.clock_safety_margin_ms") {
-        Some(RequiredFactDomain::DonatPolicy)
-    } else {
-        None
-    }
 }
 
 pub fn source_record_material(
@@ -4384,6 +14365,7 @@ pub fn provenance_material(
     let (_, resolved_origins) = resolve_fact_bindings(
         &semantic_values,
         &fact_origins,
+        checked.fact_requirements(),
         accepted_records,
         reviewed_policies,
     )?;
@@ -4876,13 +14858,15 @@ pub fn validate_canonical_owner_manifest() -> Result<OwnerManifestValidation, Ca
 
 #[cfg(test)]
 mod projection_schema_mutations {
-    use std::path::Path;
+    use std::{path::Path, sync::OnceLock};
 
+    use donat_value_contract::{BoundedInlineBytes, CanonicalDecimal, CanonicalNumber};
     use serde::de::DeserializeOwned;
+    use syn::{Fields, GenericArgument, Item, PathArguments, Type, TypePath};
 
     use super::*;
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum PathSegment {
         Field(String),
         Element(usize),
@@ -5034,125 +15018,1503 @@ mod projection_schema_mutations {
         value
     }
 
-    fn replacement(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Null => serde_json::Value::Bool(true),
-            serde_json::Value::Bool(value) => serde_json::Value::Bool(!value),
-            serde_json::Value::Number(value) => {
-                if let Some(value) = value.as_u64() {
-                    serde_json::json!(value.saturating_add(1))
-                } else if let Some(value) = value.as_i64() {
-                    serde_json::json!(value.saturating_add(1))
-                } else {
-                    serde_json::Value::String("number-mutation".to_owned())
+    #[derive(Clone, Debug)]
+    enum RouteSegment {
+        Field(String),
+        Element,
+        Branch(String),
+    }
+
+    fn route_segments(canonical_path: &str) -> Vec<RouteSegment> {
+        let root_end = canonical_path
+            .find(['.', '{'])
+            .unwrap_or(canonical_path.len());
+        let mut suffix = &canonical_path[root_end..];
+        let mut segments = Vec::new();
+        while !suffix.is_empty() {
+            if let Some(rest) = suffix.strip_prefix("[]") {
+                segments.push(RouteSegment::Element);
+                suffix = rest;
+                continue;
+            }
+            if let Some(rest) = suffix.strip_prefix("{kind=") {
+                let end = rest.find('}').expect("generated branch route closes");
+                segments.push(RouteSegment::Branch(rest[..end].to_owned()));
+                suffix = &rest[end + 1..];
+                continue;
+            }
+            if let Some(rest) = suffix.strip_prefix('.') {
+                let end = rest.find(['.', '{', '[']).unwrap_or(rest.len());
+                segments.push(RouteSegment::Field(rest[..end].to_owned()));
+                suffix = &rest[end..];
+                continue;
+            }
+            panic!("unparsed generated mutation route: {canonical_path}");
+        }
+        segments
+    }
+
+    fn route_matches(
+        value: &serde_json::Value,
+        segments: &[RouteSegment],
+        path: &mut Vec<PathSegment>,
+        matches: &mut Vec<Vec<PathSegment>>,
+    ) {
+        let Some((segment, rest)) = segments.split_first() else {
+            matches.push(path.clone());
+            return;
+        };
+        match segment {
+            RouteSegment::Field(name) => {
+                if let Some(child) = value.as_object().and_then(|object| object.get(name)) {
+                    path.push(PathSegment::Field(name.clone()));
+                    route_matches(child, rest, path, matches);
+                    path.pop();
                 }
             }
-            serde_json::Value::String(value) => {
-                serde_json::Value::String(format!("{value}.mutation"))
+            RouteSegment::Element => {
+                if let Some(values) = value.as_array() {
+                    for (index, child) in values.iter().enumerate() {
+                        path.push(PathSegment::Element(index));
+                        route_matches(child, rest, path, matches);
+                        path.pop();
+                    }
+                }
             }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::Value::Null,
+            RouteSegment::Branch(kind) => {
+                if value
+                    .as_object()
+                    .and_then(|object| object.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kind)
+                {
+                    route_matches(value, rest, path, matches);
+                }
+            }
         }
     }
 
-    fn generated_mutations(value: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
-        fn walk(
-            baseline: &serde_json::Value,
-            current: &serde_json::Value,
+    fn generated_route_matches(
+        value: &serde_json::Value,
+        segments: &[RouteSegment],
+    ) -> Vec<Vec<PathSegment>> {
+        fn visit_roots(
+            value: &serde_json::Value,
+            segments: &[RouteSegment],
             path: &mut Vec<PathSegment>,
-            label: &mut Vec<String>,
-            output: &mut Vec<(String, serde_json::Value)>,
+            matches: &mut Vec<Vec<PathSegment>>,
         ) {
-            match current {
+            route_matches(value, segments, path, matches);
+            match value {
                 serde_json::Value::Object(object) => {
                     for (name, child) in object {
-                        let mut changed = baseline.clone();
-                        value_at_mut(&mut changed, path)
-                            .as_object_mut()
-                            .unwrap()
-                            .remove(name);
-                        output.push((format!("remove:{}", label.join(".")) + "." + name, changed));
                         path.push(PathSegment::Field(name.clone()));
-                        label.push(name.clone());
-                        walk(baseline, child, path, label, output);
-                        label.pop();
+                        visit_roots(child, segments, path, matches);
                         path.pop();
                     }
                 }
                 serde_json::Value::Array(values) => {
                     for (index, child) in values.iter().enumerate() {
-                        let mut changed = baseline.clone();
-                        value_at_mut(&mut changed, path)
-                            .as_array_mut()
-                            .unwrap()
-                            .remove(index);
-                        output.push((format!("remove:{}[{index}]", label.join(".")), changed));
                         path.push(PathSegment::Element(index));
-                        label.push(format!("[{index}]"));
-                        walk(baseline, child, path, label, output);
-                        label.pop();
+                        visit_roots(child, segments, path, matches);
                         path.pop();
                     }
                 }
-                _ => {
+                _ => {}
+            }
+        }
+
+        let mut matches = Vec::new();
+        visit_roots(value, segments, &mut Vec::new(), &mut matches);
+        matches
+    }
+
+    fn accepted_replacement_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
+        match value {
+            serde_json::Value::Null => vec![
+                serde_json::Value::String("x".to_owned()),
+                serde_json::Value::Bool(true),
+                serde_json::json!(1),
+                serde_json::json!({"id": "x", "implementation_revision": 1}),
+                serde_json::json!({"major": 1, "minor": 0, "patch": 1}),
+                serde_json::json!([]),
+            ],
+            serde_json::Value::Bool(value) => vec![serde_json::Value::Bool(!value)],
+            serde_json::Value::Number(value) => {
+                let replacement = if let Some(value) = value.as_u64() {
+                    serde_json::json!(value.saturating_add(1))
+                } else if let Some(value) = value.as_i64() {
+                    serde_json::json!(value.saturating_add(1))
+                } else {
+                    serde_json::json!(1)
+                };
+                vec![replacement]
+            }
+            serde_json::Value::String(value) => {
+                let mut candidates = Vec::new();
+                if let Ok(number) = value.parse::<u64>() {
+                    candidates.push(serde_json::Value::String(
+                        number.saturating_add(1).to_string(),
+                    ));
+                }
+                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let mut changed = value.clone().into_bytes();
+                    changed[0] = if changed[0] == b'0' { b'1' } else { b'0' };
+                    candidates.push(serde_json::Value::String(
+                        String::from_utf8(changed).unwrap(),
+                    ));
+                }
+                candidates.extend([
+                    serde_json::Value::String(format!("{value}.mutation")),
+                    serde_json::Value::String("x".to_owned()),
+                ]);
+                candidates
+            }
+            serde_json::Value::Array(values) => {
+                let mut candidates = Vec::new();
+                if let Some(first) = values.first() {
+                    for replacement in accepted_replacement_candidates(first) {
+                        let mut changed = values.clone();
+                        changed[0] = replacement;
+                        candidates.push(serde_json::Value::Array(changed));
+                    }
+                    let mut changed = values.clone();
+                    changed.push(first.clone());
+                    candidates.push(serde_json::Value::Array(changed));
+                } else {
+                    candidates.extend([
+                        serde_json::json!(["x"]),
+                        serde_json::json!([1]),
+                        serde_json::json!([{"kind": "string", "value": "x"}]),
+                    ]);
+                }
+                candidates
+            }
+            serde_json::Value::Object(object) => {
+                let mut candidates = Vec::new();
+                for (name, child) in object {
+                    for replacement in accepted_replacement_candidates(child) {
+                        let mut changed = object.clone();
+                        changed.insert(name.clone(), replacement);
+                        candidates.push(serde_json::Value::Object(changed));
+                    }
+                }
+                candidates
+            }
+        }
+    }
+
+    fn mutation_route_segments(descriptor: &CanonicalMutationDescriptor) -> Vec<RouteSegment> {
+        let mut segments = route_segments(descriptor.canonical_path);
+        let Some((_, member)) = descriptor.material_member.split_once("::") else {
+            return segments;
+        };
+        if !member.contains('.')
+            && matches!(segments.last(), Some(RouteSegment::Field(name)) if name == "kind")
+        {
+            segments.pop();
+        }
+        segments
+    }
+
+    fn mutation_case_root(case: CanonicalMutationCase) -> &'static str {
+        match case {
+            CanonicalMutationCase::SourceRecord => "SourceRecordMaterialV1",
+            CanonicalMutationCase::Semantic => "SemanticMaterialV1",
+            CanonicalMutationCase::Provenance => "ProvenanceMaterialV1",
+            CanonicalMutationCase::ValueContract => "ValueContractMaterialV1",
+            CanonicalMutationCase::TypedValue => "TypedValueMaterialV1",
+        }
+    }
+
+    #[derive(Clone)]
+    struct DeclaredField {
+        rust_name: Option<String>,
+        type_name: String,
+    }
+
+    #[derive(Clone)]
+    struct DeclaredVariant {
+        rust_name: String,
+        fields: Vec<DeclaredField>,
+    }
+
+    #[derive(Clone)]
+    enum DeclaredShape {
+        Struct(Vec<DeclaredField>),
+        Enum(Vec<DeclaredVariant>),
+    }
+
+    fn declared_type_name(value: &Type) -> String {
+        match value {
+            Type::Path(TypePath { path, .. }) => {
+                let segment = path.segments.last().unwrap();
+                match &segment.arguments {
+                    PathArguments::None => segment.ident.to_string(),
+                    PathArguments::AngleBracketed(arguments) => {
+                        let values = arguments
+                            .args
+                            .iter()
+                            .filter_map(|argument| match argument {
+                                GenericArgument::Type(value) => Some(declared_type_name(value)),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        format!("{}<{}>", segment.ident, values.join(","))
+                    }
+                    PathArguments::Parenthesized(_) => segment.ident.to_string(),
+                }
+            }
+            Type::Array(value) => format!("Vec<{}>", declared_type_name(&value.elem)),
+            Type::Group(value) => declared_type_name(&value.elem),
+            Type::Paren(value) => declared_type_name(&value.elem),
+            Type::Reference(value) => declared_type_name(&value.elem),
+            Type::Slice(value) => format!("Vec<{}>", declared_type_name(&value.elem)),
+            Type::Tuple(value) if value.elems.is_empty() => "()".to_owned(),
+            _ => "()".to_owned(),
+        }
+    }
+
+    fn declared_fields(fields: &Fields) -> Vec<DeclaredField> {
+        match fields {
+            Fields::Named(fields) => fields
+                .named
+                .iter()
+                .map(|field| DeclaredField {
+                    rust_name: field.ident.as_ref().map(ToString::to_string),
+                    type_name: declared_type_name(&field.ty),
+                })
+                .collect(),
+            Fields::Unnamed(fields) => fields
+                .unnamed
+                .iter()
+                .map(|field| DeclaredField {
+                    rust_name: None,
+                    type_name: declared_type_name(&field.ty),
+                })
+                .collect(),
+            Fields::Unit => Vec::new(),
+        }
+    }
+
+    fn declaration_schema() -> &'static BTreeMap<String, DeclaredShape> {
+        static SCHEMA: OnceLock<BTreeMap<String, DeclaredShape>> = OnceLock::new();
+        SCHEMA.get_or_init(|| {
+            let mut schema = BTreeMap::new();
+            for source in [
+                CANONICAL_PROJECTION_SCHEMA_DECLARATIONS,
+                include_str!("source.rs"),
+            ] {
+                let file = syn::parse_file(source).unwrap();
+                for item in file.items {
+                    match item {
+                        Item::Struct(value) => {
+                            schema.insert(
+                                value.ident.to_string(),
+                                DeclaredShape::Struct(declared_fields(&value.fields)),
+                            );
+                        }
+                        Item::Enum(value) => {
+                            schema.insert(
+                                value.ident.to_string(),
+                                DeclaredShape::Enum(
+                                    value
+                                        .variants
+                                        .iter()
+                                        .map(|variant| DeclaredVariant {
+                                            rust_name: variant.ident.to_string(),
+                                            fields: declared_fields(&variant.fields),
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            schema
+        })
+    }
+
+    fn declared_struct_field_type(owner: &str, field: &str) -> Option<&'static str> {
+        let DeclaredShape::Struct(fields) = declaration_schema().get(owner)? else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|candidate| candidate.rust_name.as_deref() == Some(field))
+            .map(|field| field.type_name.as_str())
+    }
+
+    fn declared_variant(owner: &str, variant: &str) -> Option<&'static DeclaredVariant> {
+        let DeclaredShape::Enum(variants) = declaration_schema().get(owner)? else {
+            return None;
+        };
+        variants
+            .iter()
+            .find(|candidate| candidate.rust_name == variant)
+    }
+
+    fn declared_variant_field_type(
+        owner: &str,
+        variant: &str,
+        field: &str,
+    ) -> Option<&'static str> {
+        declared_variant(owner, variant)?
+            .fields
+            .iter()
+            .find(|candidate| {
+                candidate.rust_name.as_deref() == Some(field)
+                    || (candidate.rust_name.is_none() && field == "value")
+            })
+            .map(|field| field.type_name.as_str())
+    }
+
+    fn material_member_owner(member: &str) -> &str {
+        member
+            .split_once("::")
+            .map_or_else(|| member.split('.').next().unwrap(), |(owner, _)| owner)
+    }
+
+    fn material_owner_exists(case: CanonicalMutationCase, owner: &str) -> bool {
+        declaration_schema().contains_key(owner)
+            || CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+                .iter()
+                .any(|descriptor| {
+                    descriptor.case == case
+                        && material_member_owner(descriptor.material_member) == owner
+                })
+    }
+
+    fn resolve_material_owner(case: CanonicalMutationCase, type_name: &str) -> Option<String> {
+        let type_name = type_name.trim();
+        let mut candidates = vec![type_name.to_owned()];
+        if let Some(value) = type_name.strip_suffix("V1") {
+            candidates.push(value.to_owned());
+        }
+        if let Some(value) = type_name.strip_suffix("MaterialV1") {
+            candidates.push(format!("{value}Material"));
+            candidates.push(format!("{value}V1"));
+        } else {
+            candidates.push(format!("{type_name}MaterialV1"));
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| material_owner_exists(case, candidate))
+    }
+
+    fn type_reaches_material_owner(
+        case: CanonicalMutationCase,
+        type_name: &str,
+        target_owner: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> bool {
+        let type_name = type_name.trim();
+        if let Some(inner) = generic_argument(type_name) {
+            let inner = if type_name.starts_with("Map<") || type_name.starts_with("BTreeMap<") {
+                inner.rsplit_once(',').map_or(inner, |(_, value)| value)
+            } else {
+                inner
+            };
+            return type_reaches_material_owner(case, inner.trim(), target_owner, visiting);
+        }
+        let Some(owner) = resolve_material_owner(case, type_name) else {
+            return false;
+        };
+        if owner == target_owner {
+            return true;
+        }
+        if !visiting.insert(owner.clone()) {
+            return false;
+        }
+        let reaches = match declaration_schema().get(&owner) {
+            Some(DeclaredShape::Struct(fields)) => fields.iter().any(|field| {
+                type_reaches_material_owner(case, &field.type_name, target_owner, visiting)
+            }),
+            Some(DeclaredShape::Enum(variants)) => variants.iter().any(|variant| {
+                variant.fields.iter().any(|field| {
+                    type_reaches_material_owner(case, &field.type_name, target_owner, visiting)
+                })
+            }),
+            None => false,
+        };
+        visiting.remove(&owner);
+        reaches
+    }
+
+    fn populate_reachable_container(
+        case: CanonicalMutationCase,
+        domain: &str,
+        value: &mut serde_json::Value,
+        type_name: &str,
+        target_owner: &str,
+    ) -> bool {
+        let type_name = type_name.trim();
+        if let Some(inner) = generic_argument(type_name) {
+            if type_name.starts_with("Option<") {
+                if value.is_null()
+                    && type_reaches_material_owner(case, inner, target_owner, &mut BTreeSet::new())
+                {
+                    *value = sample_for_type(domain, inner, &mut BTreeSet::new());
+                    return true;
+                }
+                return !value.is_null()
+                    && populate_reachable_container(case, domain, value, inner, target_owner);
+            }
+            if type_name.starts_with("Box<") {
+                return populate_reachable_container(case, domain, value, inner, target_owner);
+            }
+            if type_name.starts_with("Vec<")
+                || type_name.starts_with("NonEmptyVec<")
+                || type_name.starts_with("BTreeSet<")
+            {
+                let Some(values) = value.as_array_mut() else {
+                    return false;
+                };
+                if values.is_empty()
+                    && type_reaches_material_owner(case, inner, target_owner, &mut BTreeSet::new())
+                {
+                    values.push(sample_for_type(domain, inner, &mut BTreeSet::new()));
+                    return true;
+                }
+                return values.iter_mut().any(|child| {
+                    populate_reachable_container(case, domain, child, inner, target_owner)
+                });
+            }
+            if type_name.starts_with("Map<") || type_name.starts_with("BTreeMap<") {
+                let inner = inner.rsplit_once(',').map_or(inner, |(_, value)| value);
+                let Some(values) = value.as_object_mut() else {
+                    return false;
+                };
+                if values.is_empty()
+                    && type_reaches_material_owner(
+                        case,
+                        inner.trim(),
+                        target_owner,
+                        &mut BTreeSet::new(),
+                    )
+                {
+                    values.insert(
+                        "x".to_owned(),
+                        sample_for_type(domain, inner.trim(), &mut BTreeSet::new()),
+                    );
+                    return true;
+                }
+                return values.values_mut().any(|child| {
+                    populate_reachable_container(case, domain, child, inner.trim(), target_owner)
+                });
+            }
+        }
+
+        let Some(owner) = resolve_material_owner(case, type_name) else {
+            return false;
+        };
+        let Some(shape) = declaration_schema().get(&owner) else {
+            return false;
+        };
+        match shape {
+            DeclaredShape::Struct(fields) => {
+                if fields.len() == 1 && fields[0].rust_name.is_none() {
+                    return populate_reachable_container(
+                        case,
+                        domain,
+                        value,
+                        &fields[0].type_name,
+                        target_owner,
+                    );
+                }
+                for field in fields {
+                    if !type_reaches_material_owner(
+                        case,
+                        &field.type_name,
+                        target_owner,
+                        &mut BTreeSet::new(),
+                    ) {
+                        continue;
+                    }
+                    let Some(field_name) = field.rust_name.as_deref() else {
+                        continue;
+                    };
+                    let member = format!("{owner}.{field_name}");
+                    let wire = descriptor_for_member(case, &member)
+                        .map_or(field_name, |descriptor| {
+                            terminal_wire_name(descriptor.canonical_path)
+                        });
+                    let Some(child) = value
+                        .as_object_mut()
+                        .and_then(|object| object.get_mut(wire))
+                    else {
+                        continue;
+                    };
+                    if populate_reachable_container(
+                        case,
+                        domain,
+                        child,
+                        &field.type_name,
+                        target_owner,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
+            DeclaredShape::Enum(variants) => {
+                let Some(kind) = value
+                    .as_object()
+                    .and_then(|object| object.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return false;
+                };
+                let Some(variant) = variants.iter().find(|variant| {
+                    descriptor_for_member(case, &format!("{owner}::{}", variant.rust_name))
+                        .and_then(|descriptor| variant_tag(descriptor.canonical_path))
+                        == Some(kind)
+                }) else {
+                    return false;
+                };
+                let Some(payload) = value
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("value"))
+                else {
+                    return false;
+                };
+                if variant.fields.len() == 1 && variant.fields[0].rust_name.is_none() {
+                    return populate_reachable_container(
+                        case,
+                        domain,
+                        payload,
+                        &variant.fields[0].type_name,
+                        target_owner,
+                    );
+                }
+                for field in &variant.fields {
+                    if !type_reaches_material_owner(
+                        case,
+                        &field.type_name,
+                        target_owner,
+                        &mut BTreeSet::new(),
+                    ) {
+                        continue;
+                    }
+                    let Some(field_name) = field.rust_name.as_deref() else {
+                        continue;
+                    };
+                    let Some(child) = payload
+                        .as_object_mut()
+                        .and_then(|object| object.get_mut(field_name))
+                    else {
+                        continue;
+                    };
+                    if populate_reachable_container(
+                        case,
+                        domain,
+                        child,
+                        &field.type_name,
+                        target_owner,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    fn terminal_wire_name(canonical_path: &str) -> &str {
+        canonical_path
+            .rsplit('.')
+            .next()
+            .unwrap()
+            .split(['{', '['])
+            .next()
+            .unwrap()
+    }
+
+    fn direct_struct_fields(
+        case: CanonicalMutationCase,
+        owner: &str,
+    ) -> Vec<&'static CanonicalMutationDescriptor> {
+        let prefix = format!("{owner}.");
+        let mut members = BTreeSet::new();
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.case == case)
+            .filter(|descriptor| {
+                descriptor
+                    .material_member
+                    .strip_prefix(&prefix)
+                    .is_some_and(|field| !field.contains('.') && !field.contains("::"))
+            })
+            .filter(|descriptor| members.insert(descriptor.material_member))
+            .collect()
+    }
+
+    fn descriptor_for_member(
+        case: CanonicalMutationCase,
+        member: &str,
+    ) -> Option<&'static CanonicalMutationDescriptor> {
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.case == case && descriptor.material_member == member)
+    }
+
+    fn direct_enum_variants(
+        case: CanonicalMutationCase,
+        owner: &str,
+    ) -> Vec<&'static CanonicalMutationDescriptor> {
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.case == case)
+            .filter(|descriptor| {
+                direct_variant(descriptor).is_some_and(|(candidate, _)| candidate == owner)
+            })
+            .collect()
+    }
+
+    fn direct_variant_fields(
+        case: CanonicalMutationCase,
+        variant: &str,
+    ) -> Vec<&'static CanonicalMutationDescriptor> {
+        let prefix = format!("{variant}.");
+        let mut members = BTreeSet::new();
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.case == case)
+            .filter(|descriptor| {
+                descriptor
+                    .material_member
+                    .strip_prefix(&prefix)
+                    .is_some_and(|field| !field.contains('.'))
+            })
+            .filter(|descriptor| members.insert(descriptor.material_member))
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct TypedSelection {
+        member_paths: Vec<Vec<PathSegment>>,
+        owner_paths: Vec<Vec<PathSegment>>,
+    }
+
+    fn typed_selection(
+        case: CanonicalMutationCase,
+        value: &serde_json::Value,
+        target_member: &str,
+    ) -> TypedSelection {
+        fn visit(
+            case: CanonicalMutationCase,
+            value: &serde_json::Value,
+            type_name: &str,
+            target_member: &str,
+            target_owner: &str,
+            path: &mut Vec<PathSegment>,
+            selection: &mut TypedSelection,
+        ) {
+            let type_name = type_name.trim();
+            if let Some(inner) = generic_argument(type_name) {
+                if type_name.starts_with("Option<") || type_name.starts_with("Box<") {
+                    if !value.is_null() {
+                        visit(
+                            case,
+                            value,
+                            inner,
+                            target_member,
+                            target_owner,
+                            path,
+                            selection,
+                        );
+                    }
+                    return;
+                }
+                if type_name.starts_with("Vec<")
+                    || type_name.starts_with("NonEmptyVec<")
+                    || type_name.starts_with("BTreeSet<")
+                {
+                    if let Some(values) = value.as_array() {
+                        for (index, child) in values.iter().enumerate() {
+                            path.push(PathSegment::Element(index));
+                            visit(
+                                case,
+                                child,
+                                inner,
+                                target_member,
+                                target_owner,
+                                path,
+                                selection,
+                            );
+                            path.pop();
+                        }
+                    }
+                    return;
+                }
+                if type_name.starts_with("Map<") || type_name.starts_with("BTreeMap<") {
+                    let inner = inner.rsplit_once(',').map_or(inner, |(_, value)| value);
+                    if let Some(values) = value.as_object() {
+                        for (name, child) in values {
+                            path.push(PathSegment::Field(name.clone()));
+                            visit(
+                                case,
+                                child,
+                                inner.trim(),
+                                target_member,
+                                target_owner,
+                                path,
+                                selection,
+                            );
+                            path.pop();
+                        }
+                    }
+                    return;
+                }
+            }
+
+            let Some(owner) = resolve_material_owner(case, type_name) else {
+                return;
+            };
+            if owner == target_owner {
+                selection.owner_paths.push(path.clone());
+            }
+
+            let variants = direct_enum_variants(case, &owner);
+            if !variants.is_empty() {
+                let Some(kind) = value
+                    .as_object()
+                    .and_then(|object| object.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                let Some(variant) = variants
+                    .into_iter()
+                    .find(|variant| variant_tag(variant.canonical_path) == Some(kind))
+                else {
+                    return;
+                };
+                if variant.material_member == target_member {
+                    selection.member_paths.push(path.clone());
+                }
+                let Some(payload) = value.as_object().and_then(|object| object.get("value")) else {
+                    return;
+                };
+                let (_, variant_name) = direct_variant(variant).unwrap();
+                let fields = direct_variant_fields(case, variant.material_member);
+                let mut visited_payload = false;
+                for field in fields {
+                    let field_name = field
+                        .material_member
+                        .strip_prefix(&format!("{}.", variant.material_member))
+                        .unwrap();
+                    let field_type = declared_variant_field_type(&owner, variant_name, field_name)
+                        .unwrap_or(field.branch_type);
+                    if field_name == "value" {
+                        visited_payload = true;
+                        path.push(PathSegment::Field("value".to_owned()));
+                        if field.material_member == target_member {
+                            selection.member_paths.push(path.clone());
+                        }
+                        visit(
+                            case,
+                            payload,
+                            field_type,
+                            target_member,
+                            target_owner,
+                            path,
+                            selection,
+                        );
+                        path.pop();
+                        continue;
+                    }
+                    let wire = terminal_wire_name(field.canonical_path);
+                    let Some(child) = payload.as_object().and_then(|object| object.get(wire))
+                    else {
+                        continue;
+                    };
+                    path.push(PathSegment::Field("value".to_owned()));
+                    path.push(PathSegment::Field(wire.to_owned()));
+                    if field.material_member == target_member {
+                        selection.member_paths.push(path.clone());
+                    }
+                    visit(
+                        case,
+                        child,
+                        field_type,
+                        target_member,
+                        target_owner,
+                        path,
+                        selection,
+                    );
+                    path.pop();
+                    path.pop();
+                }
+                if !visited_payload
+                    && let Some(declared) = declared_variant(&owner, variant_name)
+                    && declared.fields.len() == 1
+                    && declared.fields[0].rust_name.is_none()
+                    && declared.fields[0].type_name != "()"
+                {
+                    path.push(PathSegment::Field("value".to_owned()));
+                    visit(
+                        case,
+                        payload,
+                        &declared.fields[0].type_name,
+                        target_member,
+                        target_owner,
+                        path,
+                        selection,
+                    );
+                    path.pop();
+                }
+                return;
+            }
+
+            if let Some(DeclaredShape::Struct(fields)) = declaration_schema().get(&owner) {
+                if fields.len() == 1 && fields[0].rust_name.is_none() {
+                    visit(
+                        case,
+                        value,
+                        &fields[0].type_name,
+                        target_member,
+                        target_owner,
+                        path,
+                        selection,
+                    );
+                    return;
+                }
+                for declared in fields {
+                    let Some(field_name) = declared.rust_name.as_deref() else {
+                        continue;
+                    };
+                    let member = format!("{owner}.{field_name}");
+                    let descriptor = descriptor_for_member(case, &member);
+                    let wire = descriptor.map_or(field_name, |descriptor| {
+                        terminal_wire_name(descriptor.canonical_path)
+                    });
+                    let Some(child) = value.as_object().and_then(|object| object.get(wire)) else {
+                        continue;
+                    };
+                    path.push(PathSegment::Field(wire.to_owned()));
+                    if member == target_member {
+                        selection.member_paths.push(path.clone());
+                    }
+                    visit(
+                        case,
+                        child,
+                        &declared.type_name,
+                        target_member,
+                        target_owner,
+                        path,
+                        selection,
+                    );
+                    path.pop();
+                }
+                return;
+            }
+
+            for field in direct_struct_fields(case, &owner) {
+                let wire = terminal_wire_name(field.canonical_path);
+                let Some(child) = value.as_object().and_then(|object| object.get(wire)) else {
+                    continue;
+                };
+                path.push(PathSegment::Field(wire.to_owned()));
+                if field.material_member == target_member {
+                    selection.member_paths.push(path.clone());
+                }
+                visit(
+                    case,
+                    child,
+                    field.branch_type,
+                    target_member,
+                    target_owner,
+                    path,
+                    selection,
+                );
+                path.pop();
+            }
+        }
+
+        let target_owner = material_member_owner(target_member);
+        let mut selection = TypedSelection::default();
+        visit(
+            case,
+            value,
+            mutation_case_root(case),
+            target_member,
+            target_owner,
+            &mut Vec::new(),
+            &mut selection,
+        );
+        selection.member_paths.sort();
+        selection.member_paths.dedup();
+        selection.owner_paths.sort();
+        selection.owner_paths.dedup();
+        selection
+    }
+
+    fn typed_selection_progress(selection: &TypedSelection) -> usize {
+        if !selection.member_paths.is_empty() {
+            2
+        } else if !selection.owner_paths.is_empty() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn generic_argument(value: &str) -> Option<&str> {
+        let start = value.find('<')?;
+        value
+            .ends_with('>')
+            .then_some(&value[start + 1..value.len() - 1])
+    }
+
+    fn variant_base(member: &str) -> Option<&str> {
+        let separator = member.find("::")?;
+        let field = member[separator + 2..]
+            .find('.')
+            .map(|offset| separator + 2 + offset);
+        Some(field.map_or(member, |field| &member[..field]))
+    }
+
+    fn variant_tag(canonical_path: &str) -> Option<&str> {
+        let start = canonical_path.find("{kind=")? + "{kind=".len();
+        let end = canonical_path[start..].find('}')? + start;
+        Some(&canonical_path[start..end])
+    }
+
+    fn sample_for_type(
+        domain: &str,
+        value: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> serde_json::Value {
+        let value = value.trim();
+        if let Some(inner) = generic_argument(value) {
+            if value.starts_with("Option<") {
+                return sample_for_type(domain, inner, visiting);
+            }
+            if value.starts_with("Vec<") || value.starts_with("NonEmptyVec<") {
+                return serde_json::Value::Array(vec![sample_for_type(domain, inner, visiting)]);
+            }
+            if value.starts_with("Map<") || value.starts_with("BTreeMap<") {
+                let inner = inner.rsplit_once(',').map_or(inner, |(_, value)| value);
+                return serde_json::json!({
+                    "x": sample_for_type(domain, inner.trim(), visiting)
+                });
+            }
+            if value.starts_with("Box<") {
+                return sample_for_type(domain, inner, visiting);
+            }
+        }
+        if value.starts_with("Hash256")
+            || value == "GitCommit"
+            || value == "GitTree"
+            || value == "artifact_content_sha256"
+            || value == "semantic_sha256"
+        {
+            return serde_json::Value::String("1".repeat(
+                if value == "GitCommit" || value == "GitTree" {
+                    40
+                } else {
+                    64
+                },
+            ));
+        }
+        if value.starts_with("Hash512") || value == "bytes64" {
+            return serde_json::Value::String("1".repeat(128));
+        }
+        if matches!(
+            value,
+            "Epoch" | "u8" | "u16" | "u32" | "NonZeroU16" | "NonZeroU32"
+        ) {
+            return serde_json::json!(1);
+        }
+        if matches!(
+            value,
+            "u64" | "i64" | "NonZeroU64" | "decimal" | "positive_i64_decimal"
+        ) {
+            return serde_json::Value::String("1".to_owned());
+        }
+        if value == "bool" {
+            return serde_json::Value::Bool(true);
+        }
+        if value == "StableSemver" {
+            return serde_json::json!({"major": 1, "minor": 0, "patch": 0});
+        }
+        if value == "TypedValueMaterialV1" || value == "TypedValue" {
+            return serde_json::json!({"kind": "string", "value": "x"});
+        }
+        if value == "ValueContractMaterialV1" || value == "ValueContractCatalog" {
+            return serde_json::json!({
+                "named_objects": {},
+                "roots": {},
+                "value_language_epoch": 1
+            });
+        }
+        if value == "ValueScalarMaterialV1" || value == "ValueScalar" {
+            return serde_json::json!({"kind": "string", "value": null});
+        }
+        if value == "ValueTypeMaterialV1" || value == "ValueType" {
+            return serde_json::json!({
+                "kind": "scalar",
+                "value": {"kind": "string", "value": null}
+            });
+        }
+        if value == "()" {
+            return serde_json::Value::Null;
+        }
+
+        let candidates = [value.to_owned(), format!("{value}MaterialV1")];
+        for candidate in candidates {
+            if !visiting.insert(candidate.clone()) {
+                continue;
+            }
+            let variant = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+                .iter()
+                .find(|descriptor| {
+                    descriptor.domain == domain
+                        && descriptor
+                            .material_member
+                            .strip_prefix(&format!("{candidate}::"))
+                            .is_some_and(|suffix| !suffix.contains('.'))
+                });
+            if let Some(variant) = variant {
+                let sample = sample_variant(variant, visiting);
+                visiting.remove(&candidate);
+                return sample;
+            }
+
+            let prefix = format!("{candidate}.");
+            let mut fields = BTreeMap::new();
+            for descriptor in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS {
+                if descriptor.domain != domain
+                    || descriptor.material_member.contains("::")
+                    || !descriptor.material_member.starts_with(&prefix)
+                {
+                    continue;
+                }
+                let field = &descriptor.material_member[prefix.len()..];
+                if field.contains('.') {
+                    continue;
+                }
+                let wire = descriptor
+                    .canonical_path
+                    .rsplit('.')
+                    .next()
+                    .unwrap()
+                    .trim_end_matches("[]")
+                    .to_owned();
+                fields
+                    .entry(wire)
+                    .or_insert_with(|| sample_for_type(domain, descriptor.branch_type, visiting));
+            }
+            if !fields.is_empty() {
+                visiting.remove(&candidate);
+                return serde_json::Value::Object(fields.into_iter().collect());
+            }
+            visiting.remove(&candidate);
+        }
+        serde_json::Value::String("x".to_owned())
+    }
+
+    fn sample_variant(
+        descriptor: &CanonicalMutationDescriptor,
+        visiting: &mut BTreeSet<String>,
+    ) -> serde_json::Value {
+        let base = variant_base(descriptor.material_member)
+            .expect("variant descriptor has an exact enum member");
+        let tag =
+            variant_tag(descriptor.canonical_path).expect("variant descriptor has a canonical tag");
+        let prefix = format!("{base}.");
+        let mut fields = BTreeMap::new();
+        for field in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS {
+            if field.domain != descriptor.domain
+                || field.case != descriptor.case
+                || !field.material_member.starts_with(&prefix)
+            {
+                continue;
+            }
+            let member = &field.material_member[prefix.len()..];
+            if member.contains('.') {
+                continue;
+            }
+            let wire = field
+                .canonical_path
+                .rsplit('.')
+                .next()
+                .unwrap()
+                .trim_end_matches("[]");
+            fields
+                .entry(wire.to_owned())
+                .or_insert_with(|| sample_for_type(descriptor.domain, field.branch_type, visiting));
+        }
+        let (owner, variant) = base.split_once("::").unwrap();
+        let declared = declared_variant(owner, variant);
+        let newtype = declared.is_some_and(|variant| {
+            variant.fields.len() == 1 && variant.fields[0].rust_name.is_none()
+        });
+        let unnamed_payload = declared
+            .filter(|variant| {
+                variant.fields.len() == 1
+                    && variant.fields[0].rust_name.is_none()
+                    && variant.fields[0].type_name != "()"
+            })
+            .map(|variant| variant.fields[0].type_name.as_str());
+        let payload = if let Some(type_name) = unnamed_payload {
+            sample_for_type(descriptor.domain, type_name, &mut BTreeSet::new())
+        } else if fields.is_empty() {
+            serde_json::Value::Null
+        } else if newtype && fields.len() == 1 && fields.contains_key("value") {
+            fields.remove("value").unwrap()
+        } else {
+            serde_json::Value::Object(fields.into_iter().collect())
+        };
+        serde_json::json!({"kind": tag, "value": payload})
+    }
+
+    fn variant_samples(descriptor: &CanonicalMutationDescriptor) -> Vec<serde_json::Value> {
+        let sample = sample_variant(descriptor, &mut BTreeSet::new());
+        let mut samples = vec![sample];
+        if !CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .any(|field| {
+                field.domain == descriptor.domain
+                    && field.case == descriptor.case
+                    && field
+                        .material_member
+                        .strip_prefix(&format!("{}.", descriptor.material_member))
+                        .is_some_and(|suffix| !suffix.contains('.'))
+            })
+        {
+            samples.push(serde_json::json!({
+                "kind": variant_tag(descriptor.canonical_path).unwrap()
+            }));
+        }
+        samples
+    }
+
+    fn enum_owner_candidates(value: &str) -> Vec<String> {
+        let value = value.trim();
+        let mut candidates = vec![value.to_owned()];
+        if value.ends_with("MaterialV1") {
+            candidates.push(value.trim_end_matches("V1").to_owned());
+            candidates.push(value.replace("MaterialV1", "V1"));
+        } else {
+            candidates.push(format!("{value}MaterialV1"));
+        }
+        candidates
+    }
+
+    fn typed_replacement_candidates(
+        descriptor: &CanonicalMutationDescriptor,
+        value: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        let mut replacements = Vec::new();
+        match descriptor.branch_type {
+            "i64-string" | "u64-string" => {
+                replacements.push(serde_json::Value::String("2".to_owned()));
+            }
+            "decimal-string" => {
+                replacements.push(serde_json::Value::String("2.5".to_owned()));
+            }
+            "base64url" => {
+                replacements.push(serde_json::Value::String("AA".to_owned()));
+            }
+            _ => {}
+        }
+        let owners = if let Some((owner, _)) = direct_variant(descriptor) {
+            vec![owner.to_owned()]
+        } else {
+            enum_owner_candidates(descriptor.branch_type)
+        };
+        for variant in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|candidate| {
+                candidate.domain == descriptor.domain
+                    && candidate.case == descriptor.case
+                    && direct_variant(candidate)
+                        .is_some_and(|(owner, _)| owners.iter().any(|candidate| candidate == owner))
+            })
+        {
+            replacements.extend(variant_samples(variant));
+        }
+        if !replacements.is_empty() {
+            return replacements;
+        }
+        replacements = accepted_replacement_candidates(value);
+        replacements.push(sample_for_type(
+            descriptor.domain,
+            descriptor.branch_type,
+            &mut BTreeSet::new(),
+        ));
+        replacements
+    }
+
+    #[derive(Clone)]
+    struct RebuiltMaterial {
+        bytes: Vec<u8>,
+        hash: [u8; 32],
+    }
+
+    fn exact_rebuild<T: Serialize>(
+        input: &[u8],
+        material: &T,
+        domain: CatalogHashDomain,
+    ) -> Result<RebuiltMaterial, CatalogError> {
+        let input = canonicalize_raw(input)?;
+        let bytes = canonical_material_bytes(material)?;
+        if bytes != input {
+            return Err(CatalogError::new(
+                "catalog_jcs_schema_mismatch",
+                "projection omitted or changed a declared member",
+            ));
+        }
+        Ok(RebuiltMaterial {
+            hash: domain_hash_bytes(domain, &bytes),
+            bytes,
+        })
+    }
+
+    fn source_rebuild(bytes: &[u8]) -> Result<RebuiltMaterial, CatalogError> {
+        let material = source_material(decode_exact(bytes)?);
+        exact_rebuild(bytes, &material, CatalogHashDomain::SourceRecord)
+    }
+
+    fn semantic_rebuild(bytes: &[u8]) -> Result<RebuiltMaterial, CatalogError> {
+        let material = semantic_material(decode_exact(bytes)?);
+        exact_rebuild(bytes, &material, CatalogHashDomain::Semantic)
+    }
+
+    fn provenance_rebuild(bytes: &[u8]) -> Result<RebuiltMaterial, CatalogError> {
+        let material = provenance_material(decode_exact(bytes)?);
+        exact_rebuild(bytes, &material, CatalogHashDomain::Provenance)
+    }
+
+    fn contract_rebuild(bytes: &[u8]) -> Result<RebuiltMaterial, CatalogError> {
+        let material = decode_value_contract_material(bytes)?;
+        exact_rebuild(bytes, &material, CatalogHashDomain::ValueContract)
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    struct TypedValueMaterialDto(
+        #[serde(deserialize_with = "crate::source::deserialize_typed_value_material")]
+        TypedValueMaterialV1,
+    );
+
+    fn typed_value_rebuild(bytes: &[u8]) -> Result<RebuiltMaterial, CatalogError> {
+        let material = decode_exact::<TypedValueMaterialDto>(bytes)?.0;
+        exact_rebuild(bytes, &material, CatalogHashDomain::ValueContract)
+    }
+
+    #[derive(Clone)]
+    struct BuiltCase {
+        case: CanonicalMutationCase,
+        domain: &'static str,
+        bytes: Vec<u8>,
+        rebuild: fn(&[u8]) -> Result<RebuiltMaterial, CatalogError>,
+    }
+
+    fn accepted_json_case(case: &BuiltCase, value: serde_json::Value) -> Option<BuiltCase> {
+        let bytes = canonicalize_raw(&serde_json::to_vec(&value).unwrap()).ok()?;
+        let rebuilt = (case.rebuild)(&bytes).ok()?;
+        Some(BuiltCase {
+            case: case.case,
+            domain: case.domain,
+            bytes: rebuilt.bytes,
+            rebuild: case.rebuild,
+        })
+    }
+
+    fn direct_variant(descriptor: &CanonicalMutationDescriptor) -> Option<(&str, &str)> {
+        let (owner, member) = descriptor.material_member.split_once("::")?;
+        (!member.contains('.')).then_some((owner, member))
+    }
+
+    fn owning_variant_descriptor(
+        descriptor: &CanonicalMutationDescriptor,
+    ) -> Option<&'static CanonicalMutationDescriptor> {
+        let variant = variant_base(descriptor.material_member)?;
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .find(|candidate| {
+                candidate.case == descriptor.case && candidate.material_member == variant
+            })
+    }
+
+    fn activation_transition(
+        case: &BuiltCase,
+        target: &CanonicalMutationDescriptor,
+        progress: usize,
+    ) -> Option<BuiltCase> {
+        let baseline = serde_json::from_slice::<serde_json::Value>(&case.bytes).unwrap();
+        if progress == 1
+            && let Some(variant) = owning_variant_descriptor(target)
+        {
+            let selection = typed_selection(case.case, &baseline, target.material_member);
+            for path in selection.owner_paths {
+                for replacement in variant_samples(variant) {
                     let mut changed = baseline.clone();
-                    *value_at_mut(&mut changed, path) = replacement(current);
-                    output.push((format!("replace:{}", label.join(".")), changed));
+                    *value_at_mut(&mut changed, &path) = replacement;
+                    let changed_selection =
+                        typed_selection(case.case, &changed, target.material_member);
+                    if typed_selection_progress(&changed_selection) != 2 {
+                        continue;
+                    }
+                    if let Some(candidate) = accepted_json_case(case, changed) {
+                        return Some(candidate);
+                    }
                 }
             }
         }
 
-        let mut output = Vec::new();
-        walk(value, value, &mut Vec::new(), &mut Vec::new(), &mut output);
-        output
-    }
-
-    fn assert_mutation_hashes(
-        bytes: &[u8],
-        hash: impl Fn(&[u8]) -> Result<[u8; 32], CatalogError>,
-    ) {
-        let baseline = hash(bytes).unwrap();
-        let document = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
-        let mutations = generated_mutations(&document);
-        assert!(!mutations.is_empty());
-        for (label, mutation) in mutations {
-            let bytes = serde_json::to_vec(&mutation).unwrap();
-            if let Ok(changed) = hash(&bytes) {
-                assert_ne!(baseline, changed, "mutation was hash-inert: {label}");
+        if progress == 0 {
+            let mut changed = baseline.clone();
+            if populate_reachable_container(
+                case.case,
+                case.domain,
+                &mut changed,
+                mutation_case_root(case.case),
+                material_member_owner(target.material_member),
+            ) {
+                let selection = typed_selection(case.case, &changed, target.material_member);
+                if typed_selection_progress(&selection) > progress
+                    && let Some(candidate) = accepted_json_case(case, changed)
+                {
+                    return Some(candidate);
+                }
             }
         }
-    }
 
-    fn source_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
-        let material = source_material(decode_exact(bytes)?);
-        Ok(*record_sha256(&material)?.as_bytes())
-    }
-
-    fn semantic_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
-        let material = semantic_material(decode_exact(bytes)?);
-        Ok(*semantic_sha256(&material)?.as_bytes())
-    }
-
-    fn provenance_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
-        let material = provenance_material(decode_exact(bytes)?);
-        Ok(*provenance_sha256(&material)?.as_bytes())
-    }
-
-    fn contract_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
-        let material = decode_value_contract_material(bytes)?;
-        let rebuilt = canonical_material_bytes(&material)?;
-        if canonicalize_raw(bytes)? != rebuilt {
-            return Err(CatalogError::new(
-                "catalog_jcs_schema_mismatch",
-                "value-contract projection omitted or changed a declared member",
-            ));
+        let target_owner = material_member_owner(target.material_member);
+        let mut containers = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.domain == case.domain && descriptor.case == case.case)
+            .filter(|descriptor| {
+                descriptor.branch_type.starts_with("Vec<")
+                    || descriptor.branch_type.starts_with("NonEmptyVec<")
+                    || descriptor.branch_type.starts_with("BTreeSet<")
+                    || descriptor.branch_type.starts_with("Map<")
+                    || descriptor.branch_type.starts_with("BTreeMap<")
+                    || descriptor.branch_type.starts_with("Option<")
+            })
+            .collect::<Vec<_>>();
+        containers.sort_by_key(|descriptor| !descriptor.branch_type.contains(target_owner));
+        for descriptor in containers {
+            if progress == 0
+                && !descriptor.branch_type.contains(target_owner)
+                && !type_reaches_material_owner(
+                    case.case,
+                    descriptor.branch_type,
+                    target_owner,
+                    &mut BTreeSet::new(),
+                )
+            {
+                continue;
+            }
+            for path in generated_route_matches(&baseline, &mutation_route_segments(descriptor)) {
+                let current = value_at_mut(&mut baseline.clone(), &path).clone();
+                let empty = match &current {
+                    serde_json::Value::Null => true,
+                    serde_json::Value::Array(values) => values.is_empty(),
+                    serde_json::Value::Object(values) => values.is_empty(),
+                    _ => false,
+                };
+                if !empty {
+                    continue;
+                }
+                let replacement =
+                    sample_for_type(case.domain, descriptor.branch_type, &mut BTreeSet::new());
+                if replacement == current {
+                    continue;
+                }
+                let mut changed = baseline.clone();
+                *value_at_mut(&mut changed, &path) = replacement;
+                let selection = typed_selection(case.case, &changed, target.material_member);
+                if typed_selection_progress(&selection) <= progress {
+                    continue;
+                }
+                let Some(candidate) = accepted_json_case(case, changed) else {
+                    continue;
+                };
+                return Some(candidate);
+            }
         }
-        Ok(*value_contract_sha256(&material)?.as_bytes())
+
+        let variants = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.domain == case.domain && descriptor.case == case.case)
+            .filter_map(|descriptor| {
+                direct_variant(descriptor).map(|(owner, variant)| (descriptor, owner, variant))
+            })
+            .collect::<Vec<_>>();
+        for (active, owner, active_variant) in &variants {
+            let active_segments = mutation_route_segments(active);
+            for path in generated_route_matches(&baseline, &active_segments) {
+                for (target, target_owner, target_variant) in &variants {
+                    if owner != target_owner || active_variant == target_variant {
+                        continue;
+                    }
+                    for replacement in variant_samples(target) {
+                        let mut changed = baseline.clone();
+                        *value_at_mut(&mut changed, &path) = replacement;
+                        let selection =
+                            typed_selection(case.case, &changed, target.material_member);
+                        if typed_selection_progress(&selection) <= progress {
+                            continue;
+                        }
+                        let Some(candidate) = accepted_json_case(case, changed) else {
+                            continue;
+                        };
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
-    #[test]
-    fn generated_material_member_and_branch_mutations_change_bytes_and_hashes() {
+    fn activate_case(
+        cases: &[BuiltCase],
+        descriptor: &CanonicalMutationDescriptor,
+    ) -> Option<BuiltCase> {
+        let bases = cases
+            .iter()
+            .filter(|case| case.domain == descriptor.domain && case.case == descriptor.case)
+            .collect::<Vec<_>>();
+        let mut scored = Vec::new();
+        for base in &bases {
+            let baseline = serde_json::from_slice::<serde_json::Value>(&base.bytes).unwrap();
+            let selection = typed_selection(base.case, &baseline, descriptor.material_member);
+            let progress = typed_selection_progress(&selection);
+            if progress == 2 {
+                return Some((*base).clone());
+            }
+            scored.push(((*base).clone(), progress));
+        }
+        scored.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+        for (base, _) in scored {
+            let mut case = base;
+            loop {
+                let baseline = serde_json::from_slice::<serde_json::Value>(&case.bytes).unwrap();
+                let selection = typed_selection(case.case, &baseline, descriptor.material_member);
+                let progress = typed_selection_progress(&selection);
+                if progress == 2 {
+                    return Some(case);
+                }
+                let Some(candidate) = activation_transition(&case, descriptor, progress) else {
+                    break;
+                };
+                case = candidate;
+            }
+        }
+        None
+    }
+
+    fn built_cases() -> Vec<BuiltCase> {
+        let mut cases = Vec::new();
         let fixture_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let mut built_sources = 0usize;
         for entry in std::fs::read_dir(fixture_directory).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
@@ -5162,15 +16524,241 @@ mod projection_schema_mutations {
                 continue;
             };
             let material = source_record_material(&record).unwrap();
-            let bytes = canonical_material_bytes(&material).unwrap();
-            assert_mutation_hashes(&bytes, source_hash);
-            built_sources += 1;
+            cases.push(BuiltCase {
+                case: CanonicalMutationCase::SourceRecord,
+                domain: "source-record",
+                bytes: canonical_material_bytes(&material).unwrap(),
+                rebuild: source_rebuild,
+            });
         }
-        assert_ne!(built_sources, 0);
+        let source =
+            source_material(decode_exact(full_vector("source-record").as_bytes()).unwrap());
+        cases.push(BuiltCase {
+            case: CanonicalMutationCase::SourceRecord,
+            domain: "source-record",
+            bytes: canonical_material_bytes(&source).unwrap(),
+            rebuild: source_rebuild,
+        });
+        let semantic = semantic_material(decode_exact(full_vector("semantic").as_bytes()).unwrap());
+        cases.push(BuiltCase {
+            case: CanonicalMutationCase::Semantic,
+            domain: "semantic",
+            bytes: canonical_material_bytes(&semantic).unwrap(),
+            rebuild: semantic_rebuild,
+        });
+        let provenance =
+            provenance_material(decode_exact(full_vector("provenance").as_bytes()).unwrap());
+        cases.push(BuiltCase {
+            case: CanonicalMutationCase::Provenance,
+            domain: "provenance",
+            bytes: canonical_material_bytes(&provenance).unwrap(),
+            rebuild: provenance_rebuild,
+        });
+        let contract = decode_value_contract_material(full_vector("value-contract").as_bytes())
+            .expect("accepted full value-contract vector");
+        cases.push(BuiltCase {
+            case: CanonicalMutationCase::ValueContract,
+            domain: "value-contract",
+            bytes: canonical_material_bytes(&contract).unwrap(),
+            rebuild: contract_rebuild,
+        });
+        let inline_bytes =
+            BoundedInlineBytes::try_new(vec![0xff, 0x00], "application/octet-stream", None, 2)
+                .unwrap();
+        let typed_values = [
+            TypedValue::Null,
+            TypedValue::Boolean(true),
+            TypedValue::String("value".to_owned()),
+            TypedValue::Number(CanonicalNumber::I64(-1)),
+            TypedValue::Number(CanonicalNumber::U64(1)),
+            TypedValue::Number(CanonicalNumber::Decimal(
+                CanonicalDecimal::try_new("-1.5").unwrap(),
+            )),
+            TypedValue::List(vec![TypedValue::String("item".to_owned())]),
+            TypedValue::Object(
+                [("field".to_owned(), TypedValue::String("value".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            TypedValue::InlineBytes(inline_bytes),
+        ];
+        cases.extend(typed_values.iter().map(|value| {
+            let material = typed_value_material(value);
+            BuiltCase {
+                case: CanonicalMutationCase::TypedValue,
+                domain: "value-contract",
+                bytes: canonical_material_bytes(&material).unwrap(),
+                rebuild: typed_value_rebuild,
+            }
+        }));
+        cases
+    }
 
-        assert_mutation_hashes(full_vector("semantic").as_bytes(), semantic_hash);
-        assert_mutation_hashes(full_vector("provenance").as_bytes(), provenance_hash);
-        assert_mutation_hashes(full_vector("value-contract").as_bytes(), contract_hash);
+    #[test]
+    fn every_generated_mutation_route_hits_one_declared_path() {
+        let cases = built_cases();
+        let mut active_cases =
+            BTreeMap::<(CanonicalMutationCase, &'static str), Option<BuiltCase>>::new();
+        let mut missed = Vec::new();
+        for descriptor in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS {
+            if descriptor.disposition == CanonicalMutationDisposition::Singleton {
+                continue;
+            }
+            let case = active_cases
+                .entry((descriptor.case, descriptor.material_member))
+                .or_insert_with(|| activate_case(&cases, descriptor))
+                .clone();
+            let Some(case) = case else {
+                missed.push(format!(
+                    "{}:{} ({}) has no accepted builder case",
+                    descriptor.domain, descriptor.canonical_path, descriptor.material_member,
+                ));
+                continue;
+            };
+
+            let baseline_rebuilt = (case.rebuild)(&case.bytes).unwrap();
+            assert_eq!(
+                baseline_rebuilt.bytes, case.bytes,
+                "accepted fixture did not round-trip through the real material builder"
+            );
+            let baseline =
+                serde_json::from_slice::<serde_json::Value>(&baseline_rebuilt.bytes).unwrap();
+            let targets =
+                typed_selection(case.case, &baseline, descriptor.material_member).member_paths;
+            if targets.is_empty() {
+                missed.push(format!(
+                    "{}:{} ({}) has no exact typed occurrence",
+                    descriptor.domain, descriptor.canonical_path, descriptor.material_member,
+                ));
+                continue;
+            }
+
+            for target in targets {
+                let before = value_at_mut(&mut baseline.clone(), &target).clone();
+                let mut path_hit = false;
+                for replacement in typed_replacement_candidates(descriptor, &before) {
+                    let mut changed = baseline.clone();
+                    *value_at_mut(&mut changed, &target) = replacement;
+                    if changed == baseline {
+                        continue;
+                    }
+                    let changed_bytes = serde_json::to_vec(&changed).unwrap();
+                    let Ok(changed_rebuilt) = (case.rebuild)(&changed_bytes) else {
+                        continue;
+                    };
+                    assert_ne!(
+                        baseline_rebuilt.bytes, changed_rebuilt.bytes,
+                        "valid route mutation was canonical-byte-inert: {}",
+                        descriptor.canonical_path
+                    );
+                    assert_ne!(
+                        baseline_rebuilt.hash, changed_rebuilt.hash,
+                        "valid route mutation was hash-inert: {}",
+                        descriptor.canonical_path
+                    );
+
+                    let mut rebuilt_json =
+                        serde_json::from_slice::<serde_json::Value>(&changed_rebuilt.bytes)
+                            .unwrap();
+                    let rebuilt_member = value_at_mut(&mut rebuilt_json, &target).clone();
+                    assert_ne!(
+                        before, rebuilt_member,
+                        "real builder discarded the exact declared-path mutation: {}",
+                        descriptor.canonical_path
+                    );
+                    *value_at_mut(&mut rebuilt_json, &target) = before.clone();
+                    assert_eq!(
+                        baseline, rebuilt_json,
+                        "real builder changed JSON outside the exact declared path: {}",
+                        descriptor.canonical_path
+                    );
+                    path_hit = true;
+                    break;
+                }
+                if !path_hit {
+                    missed.push(format!(
+                        "{}:{} ({}) rejected every mutation at {target:?}",
+                        descriptor.domain, descriptor.canonical_path, descriptor.material_member,
+                    ));
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "generated routes lacked a branch-complete builder case: {missed:#?}"
+        );
+    }
+
+    #[test]
+    fn generated_singleton_dispositions_are_exact_and_decoder_enforced() {
+        fn declared_singleton(descriptor: &CanonicalMutationDescriptor) -> bool {
+            let Some((owner, field)) = descriptor.material_member.split_once('.') else {
+                return false;
+            };
+            if owner.contains("::") || field.contains('.') {
+                return false;
+            }
+            let Some(type_name) = declared_struct_field_type(owner, field) else {
+                return false;
+            };
+            let Some(owner) = resolve_material_owner(descriptor.case, type_name) else {
+                return false;
+            };
+            let Some(DeclaredShape::Enum(variants)) = declaration_schema().get(&owner) else {
+                return false;
+            };
+            variants.len() == 1
+                && (variants[0].fields.is_empty()
+                    || (variants[0].fields.len() == 1
+                        && variants[0].fields[0].rust_name.is_none()
+                        && variants[0].fields[0].type_name == "()"))
+        }
+
+        let declared = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| declared_singleton(descriptor))
+            .map(|descriptor| (descriptor.case, descriptor.material_member))
+            .collect::<BTreeSet<_>>();
+        let generated = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.disposition == CanonicalMutationDisposition::Singleton)
+            .map(|descriptor| (descriptor.case, descriptor.material_member))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generated, declared,
+            "generated singleton dispositions and exact unit-enum declarations diverged"
+        );
+
+        let cases = built_cases();
+        for descriptor in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.disposition == CanonicalMutationDisposition::Singleton)
+        {
+            let case = activate_case(&cases, descriptor)
+                .expect("singleton owner has a real accepted case");
+            (case.rebuild)(&case.bytes).expect("singleton baseline rebuilds");
+            let mut changed = serde_json::from_slice::<serde_json::Value>(&case.bytes).unwrap();
+            let paths =
+                typed_selection(case.case, &changed, descriptor.material_member).member_paths;
+            assert!(
+                !paths.is_empty(),
+                "singleton descriptor has no exact typed member path"
+            );
+            for path in paths {
+                let target = value_at_mut(&mut changed, &path);
+                let kind = target
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("kind"))
+                    .expect("singleton material is tagged");
+                *kind = serde_json::Value::String("__donat_singleton_probe__".to_owned());
+            }
+            let changed_bytes = canonicalize_raw(&serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                (case.rebuild)(&changed_bytes).is_err(),
+                "undeclared singleton alternative passed the real decoder: {}",
+                descriptor.material_member
+            );
+        }
     }
 }
 

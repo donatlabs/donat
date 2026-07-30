@@ -130,19 +130,86 @@ fn source_identity_checker_pins_the_complete_legal_and_notice_disposition() {
         .parent()
         .and_then(Path::parent)
         .expect("catalog crate is nested below workspace root");
-    let checker =
-        std::fs::read_to_string(workspace.join("scripts/check_connector_source_identity.py"))
-            .unwrap();
-    for (field, value) in [
-        ("spdx_id", "Apache-2.0"),
-        ("selected_dual_license_branch", "null"),
-        ("notice_id", "notice.donat.http.v1"),
-        ("required_copyright_lines", "[]"),
-        ("notice_bundle_destination", "THIRD_PARTY_NOTICES.md"),
+    let checker = workspace.join("scripts/check_connector_source_identity.py");
+    let record_path =
+        workspace.join("crates/connector-catalog/sources/records/donat-owned-http-v1.yaml");
+    let record = std::fs::read_to_string(record_path).unwrap();
+    let temporary = std::env::temp_dir().join(format!(
+        "donat-source-identity-mutations-{}",
+        std::process::id()
+    ));
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+    std::fs::create_dir(&temporary).unwrap();
+
+    for (name, from, to) in [
+        (
+            "commit",
+            "29e885a8cbdaca390681b48860db654d4645715d",
+            "39e885a8cbdaca390681b48860db654d4645715d",
+        ),
+        (
+            "source-path",
+            "      - path: crates/server/src/connectors/http.rs",
+            "      - path: crates/server/src/connectors/other.rs",
+        ),
+        (
+            "source-hash",
+            "8111711926cbd522bc175305225daf31e7c6add4b3499265c45bd16872e265b8",
+            "9111711926cbd522bc175305225daf31e7c6add4b3499265c45bd16872e265b8",
+        ),
+        (
+            "license-path",
+            "    license_file_path: LICENSE",
+            "    license_file_path: COPYING",
+        ),
+        (
+            "license-hash",
+            "    license_file_sha256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "    license_file_sha256: dfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        ),
+        ("spdx", "spdx_id: Apache-2.0", "spdx_id: MIT"),
+        (
+            "selected-branch",
+            "selected_dual_license_branch: null",
+            "selected_dual_license_branch: Apache-2.0",
+        ),
+        (
+            "notice-id",
+            "id: notice.donat.http.v1",
+            "id: notice.donat.http.changed",
+        ),
+        (
+            "copyright-lines",
+            "required_copyright_lines: []",
+            "required_copyright_lines: ['Copyright Changed']",
+        ),
+        (
+            "notice-destination",
+            "notice_bundle_destination: THIRD_PARTY_NOTICES.md",
+            "notice_bundle_destination: NOTICES.md",
+        ),
     ] {
+        assert_eq!(
+            record.matches(from).count(),
+            1,
+            "{name} mutation precondition"
+        );
+        let changed = record.replacen(from, to, 1);
+        let candidate = temporary.join(format!("{name}.yaml"));
+        std::fs::write(&candidate, changed).unwrap();
+        let status = Command::new("python3")
+            .arg(&checker)
+            .arg("--record")
+            .arg(&candidate)
+            .current_dir(workspace)
+            .status()
+            .unwrap();
         assert!(
-            checker.contains(&format!("\"{field}\": \"{value}\"")),
-            "checker must pin {field}={value}"
+            !status.success(),
+            "the production checker accepted the isolated {name} mutation"
         );
     }
+    std::fs::remove_dir_all(&temporary).unwrap();
 }

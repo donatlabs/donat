@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::Path;
 
+use donat_connector_abi::{CompiledStepId, OperationId};
 use donat_connector_catalog::{
-    AcceptedRecordCatalog, ContractFact, DonatPolicyId, ResolvedContractFactBinding,
-    ResolvedFactValue, SourceReviewRegistry, SourceSubject, canonical_material_bytes, load_record,
-    resolve_fact_bindings,
+    AcceptedRecordCatalog, ContractFact, DonatPolicyId, FixedIdempotencyBinding, OperationEffect,
+    OperationFactRequirement, ProviderIdempotentStep, ResolvedContractFactBinding,
+    ResolvedFactValue, SourceReviewRegistry, SourceSubject, canonical_material_bytes,
+    check_fact_requirements, load_record, resolve_fact_bindings,
 };
 use donat_value_contract::TypedValue;
 
@@ -34,7 +37,23 @@ fn resolve_policy(
         &SourceReviewRegistry::default(),
     )
     .unwrap();
-    resolve_fact_bindings(values, origins, &catalog, &policies)
+    let effect = OperationEffect::ProviderIdempotent {
+        side_effect_steps: vec![ProviderIdempotentStep {
+            step: CompiledStepId::literal("request"),
+            fixed_binding: FixedIdempotencyBinding::BodyField {
+                pointer: "query".to_owned(),
+            },
+            scope: "Idempotency-Key".to_owned(),
+            minimum_retention_ms: NonZeroU64::new(1_000).unwrap(),
+            clock_safety_margin_ms: NonZeroU64::new(1).unwrap(),
+        }],
+    };
+    let requirements = check_fact_requirements(&[OperationFactRequirement::new(
+        OperationId::literal("get"),
+        &effect,
+        values,
+    )])?;
+    resolve_fact_bindings(values, origins, &requirements, &catalog, &policies)
 }
 
 #[test]

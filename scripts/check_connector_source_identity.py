@@ -60,8 +60,8 @@ def one(pattern: str, text: str, field: str) -> str:
     return matches[0]
 
 
-def main() -> None:
-    text = RECORD.read_text(encoding="utf-8")
+def validate_record(record_path: Path) -> tuple[str, str, str]:
+    text = record_path.read_text(encoding="utf-8")
     record_id = one(r"^record_id:\s*(\S+)\s*$", text, "record_id")
     commit = one(r"^\s{4}repository_commit:\s*([0-9a-f]+)\s*$", text, "repository_commit")
     file_matches = re.findall(
@@ -122,6 +122,19 @@ def main() -> None:
     if hashlib.sha256(license_content).hexdigest() != EXPECTED["license_sha256"]:
         fail("license SHA-256 does not match raw Git content")
 
+    return record_id, commit, source_path
+
+
+def selected_record(arguments: list[str]) -> Path:
+    if not arguments:
+        return RECORD
+    if len(arguments) == 2 and arguments[0] == "--record":
+        return Path(arguments[1])
+    fail("usage: check_connector_source_identity.py [--record PATH]")
+
+
+def main() -> None:
+    record_id, commit, source_path = validate_record(selected_record(sys.argv[1:]))
     print(
         "verified connector source identity: "
         f"{record_id} @ {commit} ({source_path}, {EXPECTED['license_path']})"

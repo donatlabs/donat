@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::path::Path;
 
+use donat_connector_abi::{CompiledStepId, OperationId};
 use donat_connector_catalog::{
-    AcceptedRecordCatalog, ContractFact, DonatPolicyId, ResolvedContractFactBinding,
-    ResolvedFactValue, SourceRecordId, SourceReviewRegistry, TypedValueMaterialV1, load_record,
-    resolve_fact_bindings,
+    AcceptedRecordCatalog, CatalogError, CheckedFactRequirements, ContractFact, DonatPolicyId,
+    FixedIdempotencyBinding, OperationEffect, OperationFactRequirement, ProviderIdempotentStep,
+    ResolvedContractFactBinding, ResolvedFactOriginMaterialV1, ResolvedFactValue,
+    ResolvedFactValueMaterialV1, SourceRecordId, SourceReviewRegistry, TypedValueMaterialV1,
+    check_fact_requirements, load_record, resolve_fact_bindings,
 };
 use donat_value_contract::TypedValue;
 
@@ -40,10 +44,72 @@ fn semantic(value: &str) -> Vec<ResolvedFactValue> {
     }]
 }
 
+fn requirements(values: &[ResolvedFactValue], effect: &OperationEffect) -> CheckedFactRequirements {
+    check_fact_requirements(&[OperationFactRequirement::new(
+        OperationId::literal("get"),
+        effect,
+        values,
+    )])
+    .unwrap()
+}
+
+fn provider_requirements(values: &[ResolvedFactValue]) -> CheckedFactRequirements {
+    requirements(values, &OperationEffect::ReadOnly)
+}
+
+fn policy_requirements(values: &[ResolvedFactValue]) -> CheckedFactRequirements {
+    requirements(
+        values,
+        &OperationEffect::ProviderIdempotent {
+            side_effect_steps: vec![ProviderIdempotentStep {
+                step: CompiledStepId::literal("request"),
+                fixed_binding: FixedIdempotencyBinding::BodyField {
+                    pointer: "query".to_owned(),
+                },
+                scope: "Idempotency-Key".to_owned(),
+                minimum_retention_ms: NonZeroU64::new(1_000).unwrap(),
+                clock_safety_margin_ms: NonZeroU64::new(1).unwrap(),
+            }],
+        },
+    )
+}
+
+fn resolve_provider(
+    values: &[ResolvedFactValue],
+    origins: &[ResolvedContractFactBinding],
+    catalog: &AcceptedRecordCatalog,
+    policies: &BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<
+    (
+        Vec<ResolvedFactValueMaterialV1>,
+        Vec<ResolvedFactOriginMaterialV1>,
+    ),
+    CatalogError,
+> {
+    let requirements = provider_requirements(values);
+    resolve_fact_bindings(values, origins, &requirements, catalog, policies)
+}
+
+fn resolve_policy(
+    values: &[ResolvedFactValue],
+    origins: &[ResolvedContractFactBinding],
+    catalog: &AcceptedRecordCatalog,
+    policies: &BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<
+    (
+        Vec<ResolvedFactValueMaterialV1>,
+        Vec<ResolvedFactOriginMaterialV1>,
+    ),
+    CatalogError,
+> {
+    let requirements = policy_requirements(values);
+    resolve_fact_bindings(values, origins, &requirements, catalog, policies)
+}
+
 #[test]
 fn provider_fact_value_must_equal_the_accepted_evidence_value() {
     let catalog = catalog();
-    resolve_fact_bindings(
+    resolve_provider(
         &semantic("Idempotency-Key"),
         &[provider_origin()],
         &catalog,
@@ -51,7 +117,7 @@ fn provider_fact_value_must_equal_the_accepted_evidence_value() {
     )
     .unwrap();
     assert_eq!(
-        resolve_fact_bindings(
+        resolve_provider(
             &semantic("X-Different"),
             &[provider_origin()],
             &catalog,
@@ -72,7 +138,7 @@ fn unknown_provider_fact_origin_is_unresolved() {
         fact_id: donat_connector_catalog::ProviderFactId::literal("fact.idempotency"),
     };
     assert_eq!(
-        resolve_fact_bindings(
+        resolve_provider(
             &semantic("Idempotency-Key"),
             &[origin],
             &catalog,
@@ -100,7 +166,7 @@ fn reviewed_policy_registry_value_is_exact_and_non_substitutable() {
         use_site: policy_origin.use_site.clone(),
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
-    resolve_fact_bindings(
+    resolve_policy(
         &policy_semantic,
         std::slice::from_ref(&policy_origin),
         &catalog,
@@ -109,7 +175,7 @@ fn reviewed_policy_registry_value_is_exact_and_non_substitutable() {
     .unwrap();
 
     assert_eq!(
-        resolve_fact_bindings(
+        resolve_policy(
             &policy_semantic,
             &[policy_origin],
             &catalog,
@@ -138,7 +204,7 @@ fn required_provider_and_policy_domains_reject_equal_value_substitution() {
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
     assert_eq!(
-        resolve_fact_bindings(
+        resolve_provider(
             &provider_value,
             &[policy_at_provider_site],
             &catalog,
@@ -157,7 +223,7 @@ fn required_provider_and_policy_domains_reject_equal_value_substitution() {
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
     assert_eq!(
-        resolve_fact_bindings(
+        resolve_policy(
             &policy_value,
             &[provider_at_policy_site],
             &catalog,

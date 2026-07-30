@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use donat_connector_catalog::{
-    CANONICAL_PROJECTION_SCHEMA_DECLARATIONS, canonical_projection_owner_manifest,
+    CANONICAL_PROJECTION_MUTATION_DESCRIPTORS, CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS,
+    CANONICAL_PROJECTION_SCHEMA_DECLARATIONS, CanonicalDeclarationSource,
+    CanonicalMutationDisposition, canonical_projection_owner_manifest,
 };
 use syn::{
-    Attribute, Fields, FnArg, GenericArgument, Item, LitStr, PathArguments, Type, TypePath,
+    Attribute, Fields, FnArg, GenericArgument, Item, LitStr, Pat, PathArguments, Type, TypePath,
     Visibility,
 };
 
@@ -37,7 +39,6 @@ struct Definition {
 #[derive(Default)]
 struct Schema {
     definitions: BTreeMap<String, Definition>,
-    extension_fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -61,6 +62,54 @@ enum Cursor {
 struct Member {
     definition: String,
     member: String,
+}
+
+#[test]
+fn projection_macro_emits_typed_owner_paths_and_mutation_routes() {
+    assert!(
+        !CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS.is_empty(),
+        "the declaration macro emitted no typed owner/path rows"
+    );
+    assert!(
+        !CANONICAL_PROJECTION_MUTATION_DESCRIPTORS.is_empty(),
+        "the declaration macro emitted no mutation routes"
+    );
+    let owners = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.domain,
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.material_source,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let routes = CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.domain,
+                descriptor.canonical_path,
+                descriptor.material_member,
+                descriptor.material_source,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        owners.len(),
+        CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS.len(),
+        "duplicate owner/path descriptors are forbidden"
+    );
+    assert_eq!(
+        routes.len(),
+        CANONICAL_PROJECTION_MUTATION_DESCRIPTORS.len(),
+        "duplicate mutation routes are forbidden"
+    );
+    assert_eq!(
+        owners, routes,
+        "owner/path and mutation routes are not bijective"
+    );
 }
 
 impl Member {
@@ -209,13 +258,20 @@ fn collect_schema(source: &str) -> Schema {
 
 fn merge_schema(target: &mut Schema, source: Schema) {
     target.definitions.extend(source.definitions);
-    for (owner, fields) in source.extension_fields {
-        target
-            .extension_fields
-            .entry(owner)
-            .or_default()
-            .extend(fields);
+}
+
+fn normalized_schema() -> Schema {
+    let mut schema = Schema::default();
+    for source in [
+        include_str!("../src/source.rs"),
+        include_str!("../src/model.rs"),
+        include_str!("../../value-contract/src/lib.rs"),
+        include_str!("../../connector-abi/src/lib.rs"),
+        include_str!("../../connector-abi/src/envelope.rs"),
+    ] {
+        merge_schema(&mut schema, collect_schema(source));
     }
+    schema
 }
 
 fn type_name(value: &Type) -> Option<String> {
@@ -246,61 +302,6 @@ fn type_name(value: &Type) -> Option<String> {
     }
 }
 
-fn collect_builder_extensions(schema: &mut Schema, source: &str) {
-    let file = syn::parse_file(source).unwrap();
-    for item in file.items {
-        let Item::Fn(function) = item else {
-            continue;
-        };
-        if !matches!(function.vis, Visibility::Public(_)) {
-            continue;
-        }
-        let arguments = function
-            .sig
-            .inputs
-            .iter()
-            .filter_map(|argument| match argument {
-                FnArg::Typed(argument) => {
-                    let syn::Pat::Ident(name) = argument.pat.as_ref() else {
-                        return None;
-                    };
-                    Some((name.ident.to_string(), argument.ty.as_ref()))
-                }
-                FnArg::Receiver(_) => None,
-            })
-            .collect::<Vec<_>>();
-        for (_, owner_type) in &arguments {
-            let Some(owner) = type_name(owner_type) else {
-                continue;
-            };
-            for (name, sibling_type) in &arguments {
-                if type_name(sibling_type).as_deref() != Some(owner.as_str()) {
-                    schema
-                        .extension_fields
-                        .entry(owner.clone())
-                        .or_default()
-                        .insert(name.clone());
-                }
-            }
-        }
-    }
-}
-
-fn normalized_schema() -> Schema {
-    let mut schema = Schema::default();
-    for source in [
-        include_str!("../src/source.rs"),
-        include_str!("../src/model.rs"),
-        include_str!("../../value-contract/src/lib.rs"),
-        include_str!("../../connector-abi/src/lib.rs"),
-        include_str!("../../connector-abi/src/envelope.rs"),
-    ] {
-        merge_schema(&mut schema, collect_schema(source));
-    }
-    collect_builder_extensions(&mut schema, include_str!("../src/canonical.rs"));
-    schema
-}
-
 fn material_schema() -> Schema {
     let mut schema = normalized_schema();
     merge_schema(
@@ -308,79 +309,6 @@ fn material_schema() -> Schema {
         collect_schema(CANONICAL_PROJECTION_SCHEMA_DECLARATIONS),
     );
     schema
-}
-
-fn owner_root(value: &str) -> &str {
-    value
-        .split(['.', ':', '{'])
-        .next()
-        .expect("owner expression always has a root")
-}
-
-fn immediate_member(value: &str) -> Option<String> {
-    let root = owner_root(value);
-    let suffix = value.strip_prefix(root)?;
-    if let Some(suffix) = suffix.strip_prefix("::") {
-        return Some(
-            suffix
-                .split(['.', ':'])
-                .next()
-                .unwrap()
-                .trim_end_matches("[]")
-                .to_owned(),
-        );
-    }
-    suffix.strip_prefix('.').map(|suffix| {
-        suffix
-            .split(['.', ':'])
-            .next()
-            .unwrap()
-            .trim_end_matches("[]")
-            .to_owned()
-    })
-}
-
-fn structural_roots(schema: &Schema, expressions: &[&str]) -> BTreeMap<String, String> {
-    let mut requirements = BTreeMap::<String, BTreeSet<String>>::new();
-    for expression in expressions {
-        let root = owner_root(expression);
-        if !schema.definitions.contains_key(root)
-            && let Some(member) = immediate_member(expression)
-        {
-            requirements
-                .entry(root.to_owned())
-                .or_default()
-                .insert(member);
-        }
-    }
-    requirements
-        .into_iter()
-        .map(|(logical, expected)| {
-            let candidates = schema
-                .definitions
-                .iter()
-                .filter_map(|(name, definition)| {
-                    let actual = match &definition.shape {
-                        Shape::Struct(fields) => fields
-                            .iter()
-                            .filter_map(|field| field.rust_name.clone())
-                            .collect::<BTreeSet<_>>(),
-                        Shape::Enum(variants) => variants
-                            .iter()
-                            .map(|variant| variant.rust_name.clone())
-                            .collect::<BTreeSet<_>>(),
-                    };
-                    (actual == expected).then_some(name.clone())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                candidates.len(),
-                1,
-                "logical owner {logical} does not resolve by its complete structure: {candidates:?}"
-            );
-            (logical, candidates[0].clone())
-        })
-        .collect()
 }
 
 fn tokenize(value: &str) -> (String, Vec<Segment>) {
@@ -507,14 +435,15 @@ fn select_variant(
 
 fn resolve_expression(
     schema: &Schema,
-    structural: &BTreeMap<String, String>,
     expression: &str,
+    declared_terminal_owner: &str,
 ) -> Result<(Member, BTreeSet<Member>), String> {
     let (logical_root, segments) = tokenize(expression);
-    let root = structural
-        .get(&logical_root)
-        .cloned()
-        .unwrap_or(logical_root);
+    let root = if schema.definitions.contains_key(&logical_root) {
+        logical_root
+    } else {
+        declared_terminal_owner.to_owned()
+    };
     let mut cursor = Cursor::Definition(root);
     let mut terminal = None;
     let mut traversed = BTreeSet::new();
@@ -561,15 +490,6 @@ fn resolve_expression(
                     traversed.insert(member.clone());
                     terminal = Some(member);
                     cursor = Cursor::Value(field.ty.clone());
-                    index += 1;
-                } else if schema
-                    .extension_fields
-                    .get(definition)
-                    .is_some_and(|fields| fields.contains(name))
-                {
-                    let member = Member::field(definition, name);
-                    traversed.insert(member.clone());
-                    terminal = Some(member);
                     index += 1;
                 } else {
                     return Err(format!("{expression}: unknown field {definition}.{name}"));
@@ -741,57 +661,242 @@ fn declared_members(
     output
 }
 
+fn public_declaration_closure(schema: &Schema) -> BTreeSet<String> {
+    let mut closure = schema
+        .definitions
+        .iter()
+        .filter_map(|(name, definition)| definition.public.then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut discovered = BTreeSet::new();
+        for name in &closure {
+            let Some(definition) = schema.definitions.get(name) else {
+                continue;
+            };
+            let fields = match &definition.shape {
+                Shape::Struct(fields) => fields.iter().collect::<Vec<_>>(),
+                Shape::Enum(variants) => variants
+                    .iter()
+                    .flat_map(|variant| variant.fields.iter())
+                    .collect::<Vec<_>>(),
+            };
+            for field in fields {
+                if let Some(name) = type_name(&field.ty)
+                    && schema.definitions.contains_key(&name)
+                {
+                    discovered.insert(name);
+                }
+            }
+        }
+        let before = closure.len();
+        closure.extend(discovered);
+        if closure.len() == before {
+            return closure;
+        }
+    }
+}
+
 struct MappingRow<'a> {
     owner: &'a str,
-    domain: &'a str,
-    path: &'a str,
+    normalized_member: &'a str,
+    normalized_source: CanonicalDeclarationSource,
     owner_class: &'a str,
+    path: &'a str,
+    material_member: &'a str,
+    material_source: CanonicalDeclarationSource,
 }
 
 fn mapping_rows() -> Vec<MappingRow<'static>> {
-    canonical_projection_owner_manifest()
+    CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .map(|descriptor| MappingRow {
+            owner: descriptor.normalized_owner,
+            normalized_member: descriptor.normalized_member,
+            normalized_source: descriptor.normalized_source,
+            owner_class: descriptor.owner_class,
+            path: descriptor.canonical_path,
+            material_member: descriptor.material_member,
+            material_source: descriptor.material_source,
+        })
+        .collect()
+}
+
+fn identity_owner(identity: &str) -> &str {
+    identity
+        .split(['.', ':'])
+        .next()
+        .expect("exact member identity has a declaration owner")
+}
+
+fn declared_identity(schema: &Schema, identity: &str) -> Result<Member, String> {
+    let owner = identity_owner(identity);
+    let definition = schema
+        .definitions
+        .get(owner)
+        .ok_or_else(|| format!("{identity}: declaration source has no {owner}"))?;
+    if let Some(rest) = identity.strip_prefix(&format!("{owner}::")) {
+        let (variant_name, field_name) = rest
+            .split_once('.')
+            .map_or((rest, None), |(variant, field)| (variant, Some(field)));
+        let Shape::Enum(variants) = &definition.shape else {
+            return Err(format!("{identity}: {owner} is not an enum"));
+        };
+        let variant = variants
+            .iter()
+            .find(|variant| variant.rust_name == variant_name)
+            .ok_or_else(|| format!("{identity}: enum variant is not declared"))?;
+        if let Some(field_name) = field_name {
+            let declared = variant.fields.iter().any(|field| {
+                field.rust_name.as_deref() == Some(field_name)
+                    || (field.rust_name.is_none() && field_name == "value")
+            });
+            if !declared {
+                return Err(format!("{identity}: enum payload member is not declared"));
+            }
+            Ok(Member::variant_field(owner, variant_name, field_name))
+        } else {
+            Ok(Member::variant(owner, variant_name))
+        }
+    } else {
+        let field_name = identity
+            .strip_prefix(&format!("{owner}."))
+            .ok_or_else(|| format!("{identity}: malformed struct member identity"))?;
+        let Shape::Struct(fields) = &definition.shape else {
+            return Err(format!("{identity}: {owner} is not a struct"));
+        };
+        fields
+            .iter()
+            .any(|field| field.rust_name.as_deref() == Some(field_name))
+            .then(|| Member::field(owner, field_name))
+            .ok_or_else(|| format!("{identity}: struct field is not declared"))
+    }
+}
+
+fn builder_parameter_is_declared(identity: &str) -> bool {
+    let Some((function_name, parameter_name)) = identity.split_once("::") else {
+        return false;
+    };
+    syn::parse_file(include_str!("../src/canonical.rs"))
+        .unwrap()
+        .items
+        .into_iter()
+        .any(|item| {
+            let Item::Fn(function) = item else {
+                return false;
+            };
+            function.sig.ident == function_name
+                && matches!(function.vis, Visibility::Public(_))
+                && function.sig.inputs.iter().any(|argument| {
+                    matches!(
+                        argument,
+                        FnArg::Typed(argument)
+                            if matches!(
+                                argument.pat.as_ref(),
+                                Pat::Ident(name) if name.ident == parameter_name
+                            )
+                    )
+                })
+        })
+}
+
+#[test]
+fn macro_owner_paths_are_the_exact_independent_adr_set() {
+    let implementation = CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.normalized_owner,
+                descriptor.domain,
+                descriptor.canonical_path,
+                descriptor.owner_class,
+                descriptor.order,
+                descriptor.null_empty,
+                descriptor.branch_type,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        implementation.len(),
+        CANONICAL_PROJECTION_OWNER_PATH_DESCRIPTORS.len(),
+        "the macro emitted a duplicate owner/path descriptor"
+    );
+    let adr = canonical_projection_owner_manifest()
         .lines()
         .skip(1)
         .map(|line| {
             let columns = line.split('|').collect::<Vec<_>>();
-            MappingRow {
-                owner: columns[0],
-                domain: columns[1],
-                path: columns[2],
-                owner_class: columns[3],
-            }
+            (
+                columns[0], columns[1], columns[2], columns[3], columns[4], columns[5], columns[6],
+            )
         })
-        .collect()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(implementation, adr, "macro inventory and ADR 012 diverged");
 }
 
 #[test]
 fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
     let rows = mapping_rows();
+    let source = collect_schema(include_str!("../src/source.rs"));
+    let model = collect_schema(include_str!("../src/model.rs"));
+    let value_contract = collect_schema(include_str!("../../value-contract/src/lib.rs"));
+    let mut connector_abi = collect_schema(include_str!("../../connector-abi/src/lib.rs"));
+    merge_schema(
+        &mut connector_abi,
+        collect_schema(include_str!("../../connector-abi/src/envelope.rs")),
+    );
+    let projection = collect_schema(CANONICAL_PROJECTION_SCHEMA_DECLARATIONS);
     let normalized = normalized_schema();
     let material = material_schema();
-    let owner_expressions = rows
-        .iter()
-        .filter(|row| row.owner_class == "normalized")
-        .map(|row| row.owner)
-        .collect::<Vec<_>>();
-    let material_expressions = rows.iter().map(|row| row.path).collect::<Vec<_>>();
-    let normalized_roots = structural_roots(&normalized, &owner_expressions);
-    let material_roots = structural_roots(&material, &material_expressions);
+    let external_schema = |source_kind| match source_kind {
+        CanonicalDeclarationSource::Source => &source,
+        CanonicalDeclarationSource::Model => &model,
+        CanonicalDeclarationSource::ValueContract => &value_contract,
+        CanonicalDeclarationSource::ConnectorAbi => &connector_abi,
+        other => panic!("expected an external declaration source, got {other:?}"),
+    };
 
-    let mut exact_pairs = BTreeSet::new();
     let mut normalized_members = BTreeSet::new();
-    let mut material_members = BTreeSet::new();
     for row in &rows {
-        let (_material_member, material_trace) =
-            resolve_expression(&material, &material_roots, row.path)
+        match row.normalized_source {
+            CanonicalDeclarationSource::Source
+            | CanonicalDeclarationSource::Model
+            | CanonicalDeclarationSource::ValueContract
+            | CanonicalDeclarationSource::ConnectorAbi => {
+                assert_eq!(row.owner_class, "normalized");
+                let declared = declared_identity(
+                    external_schema(row.normalized_source),
+                    row.normalized_member,
+                )
                 .unwrap_or_else(|error| panic!("{error}"));
-        material_members.extend(material_trace);
-        if row.owner_class == "normalized" {
-            let (_normalized_member, normalized_trace) =
-                resolve_expression(&normalized, &normalized_roots, row.owner)
+                let terminal_owner = identity_owner(row.normalized_member);
+                let (resolved, trace) = resolve_expression(&normalized, row.owner, terminal_owner)
                     .unwrap_or_else(|error| panic!("{error}"));
-            normalized_members.extend(normalized_trace);
-            assert!(exact_pairs.insert((row.owner, row.domain, row.path)));
+                assert_eq!(
+                    declared, resolved,
+                    "normalized owner expression and exact generated member diverged: {}",
+                    row.owner
+                );
+                normalized_members.extend(trace);
+            }
+            CanonicalDeclarationSource::BuilderDerived => {
+                assert_eq!(row.owner_class, "normalized");
+                assert!(
+                    builder_parameter_is_declared(row.normalized_member),
+                    "generated builder-derived member is not an exact public parameter: {}",
+                    row.normalized_member
+                );
+            }
+            CanonicalDeclarationSource::Constant => {
+                assert_eq!(row.owner_class, "constant");
+                assert_eq!(row.normalized_member, row.owner);
+            }
+            CanonicalDeclarationSource::NamedDerived => {
+                assert!(row.owner_class.starts_with("derived:"));
+                assert_eq!(row.normalized_member, row.owner);
+            }
+            CanonicalDeclarationSource::ProjectionSchema => {
+                panic!("normalized owner cannot be declared by the material schema")
+            }
         }
     }
 
@@ -799,23 +904,7 @@ fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
         .iter()
         .map(|member| member.definition.clone())
         .collect::<BTreeSet<_>>();
-    let material_definitions = material_members
-        .iter()
-        .map(|member| member.definition.clone())
-        .collect::<BTreeSet<_>>();
     let declared_normalized = declared_members(&normalized, &normalized_definitions, false);
-    let mut declared_normalized = declared_normalized;
-    declared_normalized.extend(
-        normalized_members
-            .iter()
-            .filter(|member| {
-                normalized
-                    .extension_fields
-                    .get(&member.definition)
-                    .is_some_and(|fields| fields.contains(&member.member))
-            })
-            .cloned(),
-    );
     let missing_normalized = declared_normalized
         .difference(&normalized_members)
         .collect::<Vec<_>>();
@@ -824,9 +913,77 @@ fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
         .collect::<Vec<_>>();
     assert!(
         missing_normalized.is_empty() && stale_normalized.is_empty(),
-        "normalized declaration members and mapped owners diverged\nmissing: {missing_normalized:#?}\nstale: {stale_normalized:#?}"
+        "normalized declarations and exact generated members diverged\nmissing: {missing_normalized:#?}\nstale: {stale_normalized:#?}"
     );
 
+    let mut material_members = BTreeSet::new();
+    for row in &rows {
+        let declared_schema = match row.material_source {
+            CanonicalDeclarationSource::ProjectionSchema => &projection,
+            CanonicalDeclarationSource::Source
+            | CanonicalDeclarationSource::Model
+            | CanonicalDeclarationSource::ValueContract
+            | CanonicalDeclarationSource::ConnectorAbi => external_schema(row.material_source),
+            other => panic!("material member has invalid declaration source {other:?}"),
+        };
+        let declared = declared_identity(declared_schema, row.material_member)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let declared_terminal_owner = identity_owner(row.material_member);
+        let (material_member, material_trace) =
+            resolve_expression(&material, row.path, declared_terminal_owner)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            material_member, declared,
+            "generated route is not tied to its exact declaration member"
+        );
+        material_members.extend(material_trace);
+    }
+
+    for descriptor in CANONICAL_PROJECTION_MUTATION_DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.disposition == CanonicalMutationDisposition::Singleton)
+    {
+        let (owner, field) = descriptor
+            .material_member
+            .split_once('.')
+            .expect("singleton descriptor owns one exact struct field");
+        let Some(Definition {
+            shape: Shape::Struct(fields),
+            ..
+        }) = material.definitions.get(owner)
+        else {
+            panic!("singleton owner declaration is missing: {owner}");
+        };
+        let field = fields
+            .iter()
+            .find(|candidate| candidate.rust_name.as_deref() == Some(field))
+            .expect("singleton field declaration is missing");
+        let singleton = type_name(&field.ty).expect("singleton field has a named enum type");
+        let Some(Definition {
+            shape: Shape::Enum(variants),
+            ..
+        }) = material.definitions.get(&singleton)
+        else {
+            panic!("singleton branch declaration is missing: {singleton}");
+        };
+        assert_eq!(
+            variants.len(),
+            1,
+            "generated singleton disposition names a non-singleton enum"
+        );
+        material_members.insert(Member::variant(&singleton, &variants[0].rust_name));
+    }
+
+    let mut material_definitions = public_declaration_closure(&projection);
+    material_definitions.extend(
+        material_members
+            .iter()
+            .map(|member| member.definition.clone()),
+    );
+    material_definitions.extend(
+        rows.iter()
+            .map(|row| identity_owner(row.material_member).to_owned()),
+    );
     let declared_material = declared_members(&material, &material_definitions, true);
     let missing_material = declared_material
         .difference(&material_members)

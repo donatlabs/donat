@@ -756,6 +756,7 @@ pub struct CheckedConnectorManifest<'checked> {
     manifest: &'checked ConnectorManifest,
     accepted_records: &'checked AcceptedRecordCatalog,
     reviewed_policies: &'checked BTreeMap<DonatPolicyId, TypedValue>,
+    fact_requirements: CheckedFactRequirements,
 }
 
 impl CheckedConnectorManifest<'_> {
@@ -770,6 +771,138 @@ impl CheckedConnectorManifest<'_> {
     pub(crate) const fn reviewed_policies(&self) -> &BTreeMap<DonatPolicyId, TypedValue> {
         self.reviewed_policies
     }
+
+    pub(crate) const fn fact_requirements(&self) -> &CheckedFactRequirements {
+        &self.fact_requirements
+    }
+}
+
+/// Typed operation input used to derive an opaque fact-domain proof.
+///
+/// Callers identify the normalized operation and supply its typed effect;
+/// they cannot directly choose provider-versus-policy ownership.
+pub struct OperationFactRequirement<'operation> {
+    operation: OperationId,
+    effect: &'operation OperationEffect,
+    resolved_fact_values: &'operation [ResolvedFactValue],
+}
+
+impl<'operation> OperationFactRequirement<'operation> {
+    pub const fn new(
+        operation: OperationId,
+        effect: &'operation OperationEffect,
+        resolved_fact_values: &'operation [ResolvedFactValue],
+    ) -> Self {
+        Self {
+            operation,
+            effect,
+            resolved_fact_values,
+        }
+    }
+
+    fn from_operation(operation: &'operation OperationSpec) -> Self {
+        Self::new(
+            operation.operation,
+            &operation.effect,
+            &operation.resolved_fact_values,
+        )
+    }
+}
+
+/// Opaque proof of the origin domain required by each normalized fact use
+/// site. It can only be constructed by exhaustive inspection of typed
+/// operation effects.
+pub struct CheckedFactRequirements {
+    domains: BTreeMap<String, RequiredFactDomain>,
+}
+
+impl CheckedFactRequirements {
+    pub(crate) fn required_domain(&self, use_site: &str) -> Option<RequiredFactDomain> {
+        self.domains.get(use_site).copied()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RequiredFactDomain {
+    ProviderEvidence,
+    DonatPolicy,
+}
+
+impl RequiredFactDomain {
+    pub(crate) const fn accepts(self, fact: &ContractFact) -> bool {
+        matches!(
+            (self, fact),
+            (
+                Self::ProviderEvidence,
+                ContractFact::ProviderEvidence {
+                    source_record_id: _,
+                    fact_id: _,
+                }
+            ) | (
+                Self::DonatPolicy,
+                ContractFact::DonatPolicy {
+                    policy_id: _,
+                    value: _,
+                },
+            )
+        )
+    }
+}
+
+/// Derive exact fact-domain requirements from normalized typed operations.
+///
+/// Generic fact use sites are provider-evidence owned. A typed effect may
+/// override that default only for behavior it structurally owns.
+pub fn check_fact_requirements(
+    operations: &[OperationFactRequirement<'_>],
+) -> Result<CheckedFactRequirements, CatalogError> {
+    let mut domains = BTreeMap::new();
+    for operation in operations {
+        for binding in operation.resolved_fact_values {
+            if binding.use_site.is_empty()
+                || domains
+                    .insert(
+                        binding.use_site.clone(),
+                        RequiredFactDomain::ProviderEvidence,
+                    )
+                    .is_some()
+            {
+                return Err(CatalogError::new(
+                    "catalog_fact_binding_mismatch",
+                    "semantic fact use sites must be nonempty and unique",
+                ));
+            }
+        }
+        match operation.effect {
+            OperationEffect::ReadOnly => {}
+            OperationEffect::ProviderIdempotent { side_effect_steps } => {
+                for side_effect in side_effect_steps {
+                    let step = side_effect.step.as_str();
+                    let scope = format!(
+                        "operation.{}.step.{step}.idempotency.scope",
+                        operation.operation.as_str()
+                    );
+                    let retention = format!(
+                        "operation.{}.step.{step}.idempotency.minimum_retention_ms",
+                        operation.operation.as_str()
+                    );
+                    let margin = format!(
+                        "operation.{}.step.{step}.idempotency.clock_safety_margin_ms",
+                        operation.operation.as_str()
+                    );
+                    for use_site in [scope, retention] {
+                        if let Some(domain) = domains.get_mut(&use_site) {
+                            *domain = RequiredFactDomain::ProviderEvidence;
+                        }
+                    }
+                    if let Some(domain) = domains.get_mut(&margin) {
+                        *domain = RequiredFactDomain::DonatPolicy;
+                    }
+                }
+            }
+        }
+    }
+    Ok(CheckedFactRequirements { domains })
 }
 
 pub fn compile_connector_manifest<'checked>(
@@ -785,12 +918,25 @@ pub fn compile_connector_manifest<'checked>(
     validate_manifest_selected_headers(manifest)?;
     validate_manifest_error_maps(manifest)?;
     validate_manifest_effects(manifest)?;
+    let fact_requirements = check_fact_requirements(
+        &manifest
+            .operations
+            .iter()
+            .map(OperationFactRequirement::from_operation)
+            .collect::<Vec<_>>(),
+    )?;
     validate_manifest_identity(manifest)?;
-    validate_manifest_provenance(manifest, accepted_records, reviewed_policies)?;
+    validate_manifest_provenance(
+        manifest,
+        accepted_records,
+        reviewed_policies,
+        &fact_requirements,
+    )?;
     Ok(CheckedConnectorManifest {
         manifest,
         accepted_records,
         reviewed_policies,
+        fact_requirements,
     })
 }
 
@@ -1389,11 +1535,7 @@ fn validate_manifest_error_maps(manifest: &ConnectorManifest) -> Result<(), Cata
 fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
     for operation in &manifest.operations {
         match &operation.effect {
-            OperationEffect::ReadOnly => {
-                if !operation.resolved_fact_values.is_empty() {
-                    return effect_incomplete("read-only operation declares side-effect facts");
-                }
-            }
+            OperationEffect::ReadOnly => {}
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 if side_effect_steps.len() != operation.steps.len() {
                     return effect_incomplete("every side-effecting step needs exact evidence");
@@ -1459,10 +1601,10 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
                     .map(|binding| binding.use_site.clone())
                     .collect::<BTreeSet<_>>();
                 if declared_use_sites.len() != operation.resolved_fact_values.len()
-                    || declared_use_sites != required_use_sites
+                    || !required_use_sites.is_subset(&declared_use_sites)
                 {
                     return effect_incomplete(
-                        "idempotency fact requirements are not an exact use-site closure",
+                        "idempotency fact requirements do not cover every structural use site",
                     );
                 }
             }
@@ -1578,6 +1720,7 @@ fn validate_manifest_provenance(
     manifest: &ConnectorManifest,
     accepted_records: &AcceptedRecordCatalog,
     reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
+    fact_requirements: &CheckedFactRequirements,
 ) -> Result<(), CatalogError> {
     let reference_ids = manifest
         .provenance
@@ -1641,11 +1784,6 @@ fn validate_manifest_provenance(
                 ContractFact::DonatPolicy { .. } => {}
             }
         }
-        if evidence_capability.is_some() && reference.contract_facts.is_empty() {
-            return manifest_reference_mismatch(
-                "evidence provenance capability has no exact fact binding",
-            );
-        }
     }
 
     for operation in &manifest.operations {
@@ -1681,7 +1819,13 @@ fn validate_manifest_provenance(
             fact: binding.fact.clone(),
         })
         .collect::<Vec<_>>();
-    resolve_fact_bindings(&semantic, &origins, accepted_records, reviewed_policies)?;
+    resolve_fact_bindings(
+        &semantic,
+        &origins,
+        fact_requirements,
+        accepted_records,
+        reviewed_policies,
+    )?;
     Ok(())
 }
 

@@ -374,6 +374,50 @@ fn source_loader_preserves_nested_duplicate_and_evidence_error_oracles() {
 }
 
 #[test]
+fn source_loader_applies_the_literal_multi_defect_precedence() {
+    let unknown_and_primitive = fixture("donat-owned-record.yaml")
+        .replacen("approval_date: 2026-07-29", "approval_date: 2026-02-30", 1)
+        .replacen(
+            "red_tests: [http_exact_source_compiles]",
+            "red_tests: [http_exact_source_compiles]\nunknown_member: true",
+            1,
+        );
+    assert_code(unknown_and_primitive.as_bytes(), "source_record_incomplete");
+
+    let primitive_and_duplicate = fixture("donat-owned-record.yaml")
+        .replacen(
+            "record_version: 1",
+            "record_version: 1\nrecord_version: 1",
+            1,
+        )
+        .replacen("approval_date: 2026-07-29", "approval_date: 2026-02-30", 1);
+    assert_code(
+        primitive_and_duplicate.as_bytes(),
+        "source_record_invalid_primitive",
+    );
+
+    let duplicate_and_legal = fixture("provider-contract-record.yaml")
+        .replacen(
+            "record_version: 1",
+            "record_version: 1\nrecord_version: 1",
+            1,
+        )
+        .replacen(
+            r#"license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+"#,
+            "license:\n  kind: rejected\n  value:\n    finding: finding.license.rejected\n",
+            1,
+        );
+    assert_code(duplicate_and_legal.as_bytes(), "source_record_duplicate");
+}
+
+#[test]
 fn exact_npm_name_tarball_and_artifact_inventory_are_one_identity() {
     let uppercase = fixture("serpapi-npm-record.yaml")
         .replacen("name: serpapi", "name: SerpAPI", 1)
@@ -435,6 +479,58 @@ fn provider_artifact_inventory_is_an_exact_bidirectional_join() {
 }
 
 #[test]
+fn provider_fact_ownership_and_versioned_paths_are_exact() {
+    let duplicate_contract_owner = fixture("provider-contract-record.yaml").replacen(
+        "provider_contracts:\n",
+        "provider_contracts:\n  - contract_id: contract.other\n    facts:\n      - kind: provider_evidence\n        value:\n          source_record_id: source.demo.provider.v1\n          fact_id: fact.idempotency\n",
+        1,
+    );
+    let duplicate_contract_owner = duplicate_contract_owner.replacen(
+        "contracts: [contract.demo]",
+        "contracts: [contract.demo, contract.other]",
+        1,
+    );
+    assert_code(
+        duplicate_contract_owner.as_bytes(),
+        "source_record_evidence_mismatch",
+    );
+
+    let versioned = fixture("provider-contract-record.yaml")
+        .replacen(
+            r#"source:
+          kind: repository_file
+          value:
+            repository: https://github.com/example/demo
+            commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            path: openapi.json
+"#,
+            r#"source:
+          kind: versioned_artifact
+          value:
+            url: https://example.test/releases/v1/openapi.json
+            provider_revision: v1
+"#,
+            1,
+        )
+        .replacen(
+            "kind: provider_repository_review",
+            "kind: provider_versioned_artifact_review",
+            1,
+        )
+        .replacen("path: openapi.json", "path: releases/v1/openapi.json", 2);
+    load_record_bytes(versioned.as_bytes()).unwrap();
+
+    let versioned_same_basename = versioned.replace(
+        "path: releases/v1/openapi.json",
+        "path: other/v1/openapi.json",
+    );
+    assert_code(
+        versioned_same_basename.as_bytes(),
+        "source_record_evidence_mismatch",
+    );
+}
+
+#[test]
 fn inline_bytes_from_source_records_obey_the_accepted_exact_bounds() {
     fn record_with_inline_bytes(
         decoded_len: usize,
@@ -467,7 +563,7 @@ fn inline_bytes_from_source_records_obey_the_accepted_exact_bounds() {
     ] {
         assert_eq!(
             load_record_bytes(&bytes).unwrap_err().code(),
-            "source_record_incomplete"
+            "catalog_jcs_schema_mismatch"
         );
     }
 }

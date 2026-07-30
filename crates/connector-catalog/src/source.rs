@@ -5,9 +5,44 @@ use std::path::Path;
 use base64::Engine;
 use donat_connector_abi::{InlineId, OperationId};
 use donat_value_contract::{BoundedInlineBytes, CanonicalNumber, TypedValue};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::CatalogError;
+
+pub(crate) trait SourcePrimitive: Sized {
+    fn parse_source_primitive(value: &str) -> Result<Self, CatalogError>;
+}
+
+pub(crate) fn deserialize_source_primitive<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: SourcePrimitive,
+{
+    let value = String::deserialize(deserializer)?;
+    T::parse_source_primitive(&value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_source_primitives<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: SourcePrimitive,
+{
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| T::parse_source_primitive(&value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn deserialize_optional_source_primitive<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: SourcePrimitive,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| T::parse_source_primitive(&value).map_err(serde::de::Error::custom))
+        .transpose()
+}
 
 macro_rules! catalog_id {
     ($name:ident) => {
@@ -49,13 +84,9 @@ macro_rules! catalog_id {
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                let value = String::deserialize(deserializer)?;
-                Self::parse(&value).map_err(serde::de::Error::custom)
+        impl SourcePrimitive for $name {
+            fn parse_source_primitive(value: &str) -> Result<Self, CatalogError> {
+                Self::parse(value)
             }
         }
     };
@@ -128,13 +159,9 @@ macro_rules! checked_string {
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                let value = String::deserialize(deserializer)?;
-                Self::parse(&value).map_err(serde::de::Error::custom)
+        impl SourcePrimitive for $name {
+            fn parse_source_primitive(value: &str) -> Result<Self, CatalogError> {
+                Self::parse(value)
             }
         }
     };
@@ -199,13 +226,16 @@ impl Serialize for ExactSemver {
     }
 }
 
-impl<'de> Deserialize<'de> for ExactSemver {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::try_new(&value).map_err(serde::de::Error::custom)
+impl SourcePrimitive for ExactSemver {
+    fn parse_source_primitive(value: &str) -> Result<Self, CatalogError> {
+        Self::try_new(value)
+    }
+}
+
+impl SourcePrimitive for OperationId {
+    fn parse_source_primitive(value: &str) -> Result<Self, CatalogError> {
+        OperationId::parse(value)
+            .map_err(|_| CatalogError::new("source_record_invalid_primitive", value))
     }
 }
 
@@ -266,7 +296,13 @@ fn valid_identifiers(value: &str, numeric_leading_zero_rejects: bool) -> bool {
 ///     record.record_version = 0;
 /// }
 /// ```
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ConnectorSourceRecord;
+///
+/// let _: ConnectorSourceRecord = serde_yaml::from_str("record_version: 1").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorSourceRecord {
     pub(crate) record_version: u32,
@@ -290,7 +326,7 @@ pub struct ConnectorSourceRecord {
     pub(crate) red_tests: Vec<TestId>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -304,7 +340,7 @@ pub enum SourceSubject {
     DonatOwned(DonatOwnedSource),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -318,7 +354,7 @@ pub enum ReacquisitionPlan {
     DonatOwnedNoNetwork,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Exact npm source identity admitted by the strict byte loader.
 ///
@@ -330,6 +366,12 @@ pub enum ReacquisitionPlan {
 /// fn forge(package: &mut ExactNpmPackage) {
 ///     package.name = "other-package".to_owned();
 /// }
+/// ```
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ExactNpmPackage;
+///
+/// let _: ExactNpmPackage = serde_yaml::from_str("{}").unwrap();
 /// ```
 pub struct ExactNpmPackage {
     pub(crate) name: String,
@@ -427,17 +469,13 @@ impl Serialize for NpmIntegrity {
     }
 }
 
-impl<'de> Deserialize<'de> for NpmIntegrity {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(serde::de::Error::custom)
+impl SourcePrimitive for NpmIntegrity {
+    fn parse_source_primitive(value: &str) -> Result<Self, CatalogError> {
+        Self::parse(value)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImmutableRepository {
     pub(crate) url: RepositoryUrl,
@@ -445,7 +483,7 @@ pub struct ImmutableRepository {
     pub(crate) tree: GitTree,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -464,7 +502,7 @@ pub enum NpmSignatureDecision {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -483,7 +521,7 @@ pub enum NpmProvenanceDecision {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -502,14 +540,14 @@ pub enum RepositoryOwnerDecision {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedNpmSignature {
     pub(crate) key_id: String,
     pub(crate) signature_sha256: Hash256,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Exact provider evidence admitted by the strict byte loader.
 ///
@@ -522,12 +560,18 @@ pub struct VerifiedNpmSignature {
 ///     provider.provider = "other-provider".to_owned();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ProviderEvidenceArtifact;
+///
+/// let _: ProviderEvidenceArtifact = serde_yaml::from_str("{}").unwrap();
+/// ```
 pub struct ExactProviderArtifact {
     pub(crate) provider: String,
     pub(crate) evidence: Vec<ProviderEvidenceArtifact>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEvidenceArtifact {
     pub(crate) source: ImmutableProviderEvidenceSource,
@@ -537,7 +581,7 @@ pub struct ProviderEvidenceArtifact {
     pub(crate) facts: Vec<ProviderFact>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -558,7 +602,7 @@ pub enum ImmutableProviderEvidenceSource {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -580,7 +624,7 @@ pub enum EvidenceTermsDisposition {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderFact {
     pub(crate) fact_id: ProviderFactId,
@@ -589,7 +633,7 @@ pub struct ProviderFact {
     pub(crate) normalized_value: TypedValueMaterialV1,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -837,7 +881,7 @@ where
         .transpose()
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -856,28 +900,28 @@ pub enum ContractFact {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderContractReference {
     pub(crate) contract_id: ProviderContractId,
     pub(crate) facts: Vec<ContractFact>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DonatOwnedSource {
     pub(crate) repository_commit: GitCommit,
     pub(crate) files: Vec<RepoFileHash>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoFileHash {
     pub(crate) path: RepoPath,
     pub(crate) sha256: Hash256,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -891,7 +935,7 @@ pub enum CompatibilityDecision {
     Rejected,
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -914,7 +958,7 @@ pub enum AdmissionState {
     InventoryOnly { findings: Vec<FindingId> },
     #[non_exhaustive]
     ApprovedForPort {
-        #[serde(with = "operation_ids")]
+        #[serde(serialize_with = "operation_ids::serialize")]
         operations: Vec<OperationId>,
     },
     #[non_exhaustive]
@@ -948,7 +992,7 @@ impl fmt::Debug for AdmissionState {
 
 mod operation_ids {
     use donat_connector_abi::OperationId;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Serialize, Serializer};
 
     pub fn serialize<S>(values: &[OperationId], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -960,22 +1004,9 @@ mod operation_ids {
             .collect::<Vec<_>>()
             .serialize(serializer)
     }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<OperationId>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Vec::<String>::deserialize(deserializer)?
-            .into_iter()
-            .map(|value| {
-                OperationId::parse(&value)
-                    .map_err(|_| serde::de::Error::custom("invalid operation ID"))
-            })
-            .collect()
-    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Exact artifact identity admitted by the strict byte loader or checked builder.
 ///
@@ -995,7 +1026,7 @@ pub struct ArtifactHash {
     pub(crate) path: Option<SourcePath>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -1007,7 +1038,7 @@ pub enum HashAlgorithm {
     Sha512,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -1042,7 +1073,7 @@ pub enum LicenseDecision {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoticeIdentity {
     pub(crate) id: NoticeId,
@@ -1052,14 +1083,14 @@ pub struct NoticeIdentity {
     pub(crate) notice_bundle_destination: RepoPath,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyDecision {
     pub(crate) dependency: String,
     pub(crate) disposition: DependencyDisposition,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -1079,7 +1110,7 @@ pub enum DependencyDisposition {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddedMaterialDecision {
     pub(crate) material_id: String,
@@ -1088,7 +1119,7 @@ pub struct EmbeddedMaterialDecision {
     pub(crate) disposition: EmbeddedMaterialDisposition,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
     tag = "kind",
@@ -1104,19 +1135,687 @@ pub enum EmbeddedMaterialDisposition {
     Rejected { finding: FindingId },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyFindings {
     pub(crate) findings: Vec<SafetyFinding>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyFinding {
     pub(crate) finding_id: FindingId,
     pub(crate) kind: String,
     pub(crate) location: Option<SourcePath>,
     pub(crate) message: String,
+}
+
+mod source_record_input {
+    use super::*;
+
+    macro_rules! remote_vec {
+        ($module:ident, $value:ty, $remote:literal) => {
+            mod $module {
+                use super::*;
+
+                #[derive(Deserialize)]
+                struct Item(#[serde(with = $remote)] $value);
+
+                pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<$value>, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    Vec::<Item>::deserialize(deserializer)
+                        .map(|values| values.into_iter().map(|value| value.0).collect())
+                }
+            }
+        };
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ConnectorSourceRecord", deny_unknown_fields)]
+    struct ConnectorSourceRecordDef {
+        record_version: u32,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        record_id: SourceRecordId,
+        #[serde(deserialize_with = "deserialize_source_subject")]
+        subject: SourceSubject,
+        #[serde(with = "ReacquisitionPlanDef")]
+        reacquisition: ReacquisitionPlan,
+        #[serde(deserialize_with = "artifact_hashes::deserialize")]
+        artifact_hashes: Vec<ArtifactHash>,
+        #[serde(with = "LicenseDecisionDef")]
+        license: LicenseDecision,
+        #[serde(with = "NoticeIdentityDef")]
+        notice: NoticeIdentity,
+        #[serde(deserialize_with = "deserialize_source_primitives")]
+        entrypoints: Vec<SourcePath>,
+        #[serde(deserialize_with = "dependencies::deserialize")]
+        dependencies: Vec<DependencyDecision>,
+        #[serde(deserialize_with = "embedded_material::deserialize")]
+        embedded_material: Vec<EmbeddedMaterialDecision>,
+        #[serde(deserialize_with = "provider_contracts::deserialize")]
+        provider_contracts: Vec<ProviderContractReference>,
+        #[serde(with = "CompatibilityDecisionDef")]
+        compatibility: CompatibilityDecision,
+        #[serde(with = "AdmissionStateDef")]
+        admission: AdmissionState,
+        #[serde(with = "SafetyFindingsDef")]
+        safety_findings: SafetyFindings,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        reviewer: ReviewIdentity,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        approval_date: Date,
+        #[serde(deserialize_with = "deserialize_optional_source_primitive")]
+        proposed_manifest: Option<RepoPath>,
+        #[serde(deserialize_with = "deserialize_source_primitives")]
+        proposed_destinations: Vec<RepoPath>,
+        #[serde(deserialize_with = "deserialize_source_primitives")]
+        red_tests: Vec<TestId>,
+    }
+
+    #[derive(Deserialize)]
+    struct ExactNpmInput(#[serde(with = "ExactNpmPackageDef")] ExactNpmPackage);
+
+    #[derive(Deserialize)]
+    struct ProviderArtifactInput(#[serde(with = "ExactProviderArtifactDef")] ExactProviderArtifact);
+
+    #[derive(Deserialize)]
+    struct DonatOwnedInput(#[serde(with = "DonatOwnedSourceDef")] DonatOwnedSource);
+
+    #[derive(Deserialize)]
+    #[serde(
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum RawSourceSubject {
+        ExactNpm(Box<ExactNpmInput>),
+        ProviderArtifact(ProviderArtifactInput),
+        DonatOwned(DonatOwnedInput),
+    }
+
+    fn deserialize_source_subject<'de, D>(deserializer: D) -> Result<SourceSubject, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match RawSourceSubject::deserialize(deserializer)? {
+            RawSourceSubject::ExactNpm(value) => {
+                let ExactNpmInput(value) = *value;
+                SourceSubject::ExactNpm(value)
+            }
+            RawSourceSubject::ProviderArtifact(value) => SourceSubject::ProviderArtifact(value.0),
+            RawSourceSubject::DonatOwned(value) => SourceSubject::DonatOwned(value.0),
+        })
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "ReacquisitionPlan",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum ReacquisitionPlanDef {
+        ExactNpmReview,
+        ProviderRepositoryReview,
+        ProviderVersionedArtifactReview,
+        DonatOwnedNoNetwork,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ExactNpmPackage", deny_unknown_fields)]
+    struct ExactNpmPackageDef {
+        name: String,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        version: ExactSemver,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        tarball_url: ExactHttpsUrl,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        integrity: NpmIntegrity,
+        #[serde(with = "ImmutableRepositoryDef")]
+        repository: ImmutableRepository,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        npm_git_head: GitCommit,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        package_repository: RepositoryUrl,
+        #[serde(with = "NpmSignatureDecisionDef")]
+        signature: NpmSignatureDecision,
+        #[serde(with = "NpmProvenanceDecisionDef")]
+        provenance: NpmProvenanceDecision,
+        #[serde(deserialize_with = "deserialize_optional_source_primitive")]
+        tag_commit: Option<GitCommit>,
+        #[serde(deserialize_with = "deserialize_optional_source_primitive")]
+        provenance_commit: Option<GitCommit>,
+        #[serde(deserialize_with = "deserialize_source_primitives")]
+        maintainers: Vec<NpmMaintainerIdentity>,
+        #[serde(with = "RepositoryOwnerDecisionDef")]
+        repository_owner: RepositoryOwnerDecision,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ImmutableRepository", deny_unknown_fields)]
+    struct ImmutableRepositoryDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        url: RepositoryUrl,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        commit: GitCommit,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        tree: GitTree,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "VerifiedNpmSignature", deny_unknown_fields)]
+    struct VerifiedNpmSignatureDef {
+        key_id: String,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        signature_sha256: Hash256,
+    }
+    remote_vec!(
+        verified_signatures,
+        VerifiedNpmSignature,
+        "VerifiedNpmSignatureDef"
+    );
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "NpmSignatureDecision",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum NpmSignatureDecisionDef {
+        Verified {
+            #[serde(deserialize_with = "verified_signatures::deserialize")]
+            signatures: Vec<VerifiedNpmSignature>,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            registry_metadata_sha256: Hash256,
+        },
+        VerifiedAbsent {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            registry_metadata_sha256: Hash256,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "NpmProvenanceDecision",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum NpmProvenanceDecisionDef {
+        Verified {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            statement_sha256: Hash256,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            source_commit: GitCommit,
+        },
+        VerifiedAbsent {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            registry_metadata_sha256: Hash256,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "RepositoryOwnerDecision",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum RepositoryOwnerDecisionDef {
+        Consistent {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            package_owner: NpmOwnerIdentity,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            repository_owner: RepositoryOwnerIdentity,
+        },
+        ReviewedMismatch {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            decision_id: ReviewDecisionId,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ExactProviderArtifact", deny_unknown_fields)]
+    struct ExactProviderArtifactDef {
+        provider: String,
+        #[serde(deserialize_with = "provider_evidence::deserialize")]
+        evidence: Vec<ProviderEvidenceArtifact>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ProviderEvidenceArtifact", deny_unknown_fields)]
+    struct ProviderEvidenceArtifactDef {
+        #[serde(with = "ImmutableProviderEvidenceSourceDef")]
+        source: ImmutableProviderEvidenceSource,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        accessed_on: Date,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        content_sha256: Hash256,
+        #[serde(with = "EvidenceTermsDispositionDef")]
+        terms: EvidenceTermsDisposition,
+        #[serde(deserialize_with = "provider_facts::deserialize")]
+        facts: Vec<ProviderFact>,
+    }
+    remote_vec!(
+        provider_evidence,
+        ProviderEvidenceArtifact,
+        "ProviderEvidenceArtifactDef"
+    );
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "ImmutableProviderEvidenceSource",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum ImmutableProviderEvidenceSourceDef {
+        RepositoryFile {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            repository: RepositoryUrl,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            commit: GitCommit,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            path: SourcePath,
+        },
+        VersionedArtifact {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            url: ExactHttpsUrl,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            provider_revision: NonEmptyString,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "EvidenceTermsDisposition",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum EvidenceTermsDispositionDef {
+        Permissive {
+            #[serde(with = "LicenseDecisionDef")]
+            license: LicenseDecision,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            evidence_url: ExactHttpsUrl,
+        },
+        ReviewedUse {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            decision_id: ReviewDecisionId,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            evidence_url: ExactHttpsUrl,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ProviderFact", deny_unknown_fields)]
+    struct ProviderFactDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        fact_id: ProviderFactId,
+        #[serde(with = "ExactFactLocationDef")]
+        location: ExactFactLocation,
+        #[serde(deserialize_with = "deserialize_typed_value_material")]
+        normalized_value: TypedValueMaterialV1,
+    }
+    remote_vec!(provider_facts, ProviderFact, "ProviderFactDef");
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "ExactFactLocation",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum ExactFactLocationDef {
+        JsonPointer {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            path: SourcePath,
+            pointer: String,
+        },
+        DocumentSection {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            path: SourcePath,
+            section: String,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "ContractFact",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum ContractFactDef {
+        ProviderEvidence {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            source_record_id: SourceRecordId,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            fact_id: ProviderFactId,
+        },
+        DonatPolicy {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            policy_id: DonatPolicyId,
+            #[serde(deserialize_with = "deserialize_typed_value_material")]
+            value: TypedValueMaterialV1,
+        },
+    }
+    remote_vec!(contract_facts, ContractFact, "ContractFactDef");
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ProviderContractReference", deny_unknown_fields)]
+    struct ProviderContractReferenceDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        contract_id: ProviderContractId,
+        #[serde(deserialize_with = "contract_facts::deserialize")]
+        facts: Vec<ContractFact>,
+    }
+    remote_vec!(
+        provider_contracts,
+        ProviderContractReference,
+        "ProviderContractReferenceDef"
+    );
+
+    #[derive(Deserialize)]
+    #[serde(remote = "DonatOwnedSource", deny_unknown_fields)]
+    struct DonatOwnedSourceDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        repository_commit: GitCommit,
+        #[serde(deserialize_with = "repo_files::deserialize")]
+        files: Vec<RepoFileHash>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "RepoFileHash", deny_unknown_fields)]
+    struct RepoFileHashDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        path: RepoPath,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        sha256: Hash256,
+    }
+    remote_vec!(repo_files, RepoFileHash, "RepoFileHashDef");
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "CompatibilityDecision",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum CompatibilityDecisionDef {
+        TierA,
+        TierB,
+        TierC,
+        Rejected,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "AdmissionState",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum AdmissionStateDef {
+        InventoryOnly {
+            #[serde(deserialize_with = "deserialize_source_primitives")]
+            findings: Vec<FindingId>,
+        },
+        ApprovedForPort {
+            #[serde(deserialize_with = "deserialize_source_primitives")]
+            operations: Vec<OperationId>,
+        },
+        EvidenceAccepted {
+            #[serde(deserialize_with = "deserialize_source_primitives")]
+            contracts: Vec<ProviderContractId>,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ArtifactHash", deny_unknown_fields)]
+    struct ArtifactHashDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        artifact_id: ArtifactId,
+        #[serde(with = "HashAlgorithmDef")]
+        algorithm: HashAlgorithm,
+        digest: String,
+        #[serde(deserialize_with = "deserialize_optional_source_primitive")]
+        path: Option<SourcePath>,
+    }
+    remote_vec!(artifact_hashes, ArtifactHash, "ArtifactHashDef");
+
+    #[derive(Deserialize)]
+    struct ArtifactHashesInput(
+        #[serde(deserialize_with = "artifact_hashes::deserialize")] Vec<ArtifactHash>,
+    );
+
+    pub(super) fn deserialize_artifact_hashes<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<ArtifactHash>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ArtifactHashesInput::deserialize(deserializer).map(|value| value.0)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "HashAlgorithm",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum HashAlgorithmDef {
+        Sha256,
+        Sha512,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "LicenseDecision",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum LicenseDecisionDef {
+        Permissive {
+            spdx_id: String,
+            selected_dual_license_branch: Option<String>,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            license_file_path: SourcePath,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            license_file_sha256: Hash256,
+        },
+        WrittenGrant {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            decision_id: ReviewDecisionId,
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            grant_sha256: Hash256,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "NoticeIdentity", deny_unknown_fields)]
+    struct NoticeIdentityDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        id: NoticeId,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        license_file_path: SourcePath,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        license_file_sha256: Hash256,
+        required_copyright_lines: Vec<String>,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        notice_bundle_destination: RepoPath,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "DependencyDecision", deny_unknown_fields)]
+    struct DependencyDecisionDef {
+        dependency: String,
+        #[serde(with = "DependencyDispositionDef")]
+        disposition: DependencyDisposition,
+    }
+    remote_vec!(dependencies, DependencyDecision, "DependencyDecisionDef");
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "DependencyDisposition",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum DependencyDispositionDef {
+        Shipped {
+            #[serde(with = "LicenseDecisionDef")]
+            license: LicenseDecision,
+        },
+        BuildOnly {
+            #[serde(with = "LicenseDecisionDef")]
+            license: LicenseDecision,
+        },
+        TypeOnlyReplaced {
+            replacement: String,
+        },
+        BehaviorOnly {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            reason: FindingId,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "EmbeddedMaterialDecision", deny_unknown_fields)]
+    struct EmbeddedMaterialDecisionDef {
+        material_id: String,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        path: SourcePath,
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        sha256: Hash256,
+        #[serde(with = "EmbeddedMaterialDispositionDef")]
+        disposition: EmbeddedMaterialDisposition,
+    }
+    remote_vec!(
+        embedded_material,
+        EmbeddedMaterialDecision,
+        "EmbeddedMaterialDecisionDef"
+    );
+
+    #[derive(Deserialize)]
+    #[serde(
+        remote = "EmbeddedMaterialDisposition",
+        deny_unknown_fields,
+        tag = "kind",
+        content = "value",
+        rename_all = "snake_case"
+    )]
+    enum EmbeddedMaterialDispositionDef {
+        Shipped {
+            #[serde(with = "LicenseDecisionDef")]
+            license: LicenseDecision,
+        },
+        BehaviorOnly {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            reason: FindingId,
+        },
+        Rejected {
+            #[serde(deserialize_with = "deserialize_source_primitive")]
+            finding: FindingId,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "SafetyFindings", deny_unknown_fields)]
+    struct SafetyFindingsDef {
+        #[serde(deserialize_with = "safety_findings::deserialize")]
+        findings: Vec<SafetyFinding>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "SafetyFinding", deny_unknown_fields)]
+    struct SafetyFindingDef {
+        #[serde(deserialize_with = "deserialize_source_primitive")]
+        finding_id: FindingId,
+        kind: String,
+        #[serde(deserialize_with = "deserialize_optional_source_primitive")]
+        location: Option<SourcePath>,
+        message: String,
+    }
+    remote_vec!(safety_findings, SafetyFinding, "SafetyFindingDef");
+
+    #[derive(Deserialize)]
+    struct ContractFactInput(#[serde(with = "ContractFactDef")] ContractFact);
+
+    pub(super) fn deserialize_contract_fact<'de, D>(
+        deserializer: D,
+    ) -> Result<ContractFact, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ContractFactInput::deserialize(deserializer).map(|value| value.0)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    pub(super) struct Input(
+        #[serde(with = "ConnectorSourceRecordDef")] pub(super) ConnectorSourceRecord,
+    );
+}
+
+pub(crate) fn deserialize_artifact_hashes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ArtifactHash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    source_record_input::deserialize_artifact_hashes(deserializer)
+}
+
+pub(crate) fn deserialize_contract_fact<'de, D>(deserializer: D) -> Result<ContractFact, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    source_record_input::deserialize_contract_fact(deserializer)
 }
 
 impl ConnectorSourceRecord {
@@ -1654,6 +2353,673 @@ impl AcceptedRecordCatalog {
     }
 }
 
+#[derive(Clone, Debug)]
+enum LosslessYamlNumber {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+#[derive(Clone, Debug)]
+enum LosslessYamlNode {
+    Null,
+    Bool(bool),
+    Number(LosslessYamlNumber),
+    String(String),
+    Sequence(Vec<Self>),
+    Mapping(Vec<(Self, Self)>),
+}
+
+impl LosslessYamlNode {
+    fn to_yaml_value(&self) -> serde_yaml::Value {
+        match self {
+            Self::Null => serde_yaml::Value::Null,
+            Self::Bool(value) => serde_yaml::Value::Bool(*value),
+            Self::Number(LosslessYamlNumber::I64(value)) => {
+                serde_yaml::to_value(value).expect("i64 is representable as YAML")
+            }
+            Self::Number(LosslessYamlNumber::U64(value)) => {
+                serde_yaml::to_value(value).expect("u64 is representable as YAML")
+            }
+            Self::Number(LosslessYamlNumber::F64(value)) => {
+                serde_yaml::to_value(value).expect("f64 is representable as YAML")
+            }
+            Self::String(value) => serde_yaml::Value::String(value.clone()),
+            Self::Sequence(values) => {
+                serde_yaml::Value::Sequence(values.iter().map(Self::to_yaml_value).collect())
+            }
+            Self::Mapping(entries) => {
+                let mut mapping = serde_yaml::Mapping::new();
+                for (key, value) in entries {
+                    mapping.insert(key.to_yaml_value(), value.to_yaml_value());
+                }
+                serde_yaml::Value::Mapping(mapping)
+            }
+        }
+    }
+
+    fn has_duplicate_mapping_key(&self) -> bool {
+        match self {
+            Self::Mapping(entries) => {
+                let mut keys = BTreeSet::new();
+                entries.iter().any(|(key, value)| {
+                    let duplicate = match key {
+                        Self::String(value) => !keys.insert(value),
+                        _ => false,
+                    };
+                    duplicate
+                        || key.has_duplicate_mapping_key()
+                        || value.has_duplicate_mapping_key()
+                })
+            }
+            Self::Sequence(values) => values.iter().any(Self::has_duplicate_mapping_key),
+            _ => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LosslessYamlNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LosslessYamlVisitor;
+
+        impl<'de> Visitor<'de> for LosslessYamlVisitor {
+            type Value = LosslessYamlNode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("one YAML node")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Null)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Number(LosslessYamlNumber::I64(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Number(LosslessYamlNumber::U64(value)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::Number(LosslessYamlNumber::F64(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(LosslessYamlNode::String(value))
+            }
+
+            fn visit_seq<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut output = Vec::new();
+                while let Some(value) = values.next_element()? {
+                    output.push(value);
+                }
+                Ok(LosslessYamlNode::Sequence(output))
+            }
+
+            fn visit_map<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut output = Vec::new();
+                while let Some(entry) = values.next_entry()? {
+                    output.push(entry);
+                }
+                Ok(LosslessYamlNode::Mapping(output))
+            }
+        }
+
+        deserializer.deserialize_any(LosslessYamlVisitor)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceFieldShape {
+    name: &'static str,
+    value: &'static SourceShape,
+}
+
+#[derive(Clone, Copy)]
+struct SourceVariantShape {
+    kind: &'static str,
+    value: &'static SourceShape,
+}
+
+enum SourceShape {
+    Null,
+    Bool,
+    Integer,
+    String,
+    Sequence(&'static SourceShape),
+    Struct(&'static [SourceFieldShape]),
+    Tagged(&'static [SourceVariantShape]),
+    Nullable(&'static SourceShape),
+    TypedValue,
+}
+
+static NULL_SHAPE: SourceShape = SourceShape::Null;
+static BOOL_SHAPE: SourceShape = SourceShape::Bool;
+static INTEGER_SHAPE: SourceShape = SourceShape::Integer;
+static STRING_SHAPE: SourceShape = SourceShape::String;
+static STRING_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&STRING_SHAPE);
+
+macro_rules! source_struct_shape {
+    ($name:ident { $($field:literal => $shape:ident),+ $(,)? }) => {
+        static $name: SourceShape = SourceShape::Struct(&[
+            $(SourceFieldShape { name: $field, value: &$shape }),+
+        ]);
+    };
+}
+
+macro_rules! source_tagged_shape {
+    ($name:ident { $($kind:literal => $shape:ident),+ $(,)? }) => {
+        static $name: SourceShape = SourceShape::Tagged(&[
+            $(SourceVariantShape { kind: $kind, value: &$shape }),+
+        ]);
+    };
+}
+
+source_struct_shape!(IMMUTABLE_REPOSITORY_SHAPE {
+    "url" => STRING_SHAPE,
+    "commit" => STRING_SHAPE,
+    "tree" => STRING_SHAPE,
+});
+source_struct_shape!(VERIFIED_SIGNATURE_SHAPE {
+    "key_id" => STRING_SHAPE,
+    "signature_sha256" => STRING_SHAPE,
+});
+static VERIFIED_SIGNATURE_SEQUENCE_SHAPE: SourceShape =
+    SourceShape::Sequence(&VERIFIED_SIGNATURE_SHAPE);
+source_struct_shape!(NPM_SIGNATURE_VERIFIED_SHAPE {
+    "signatures" => VERIFIED_SIGNATURE_SEQUENCE_SHAPE,
+    "registry_metadata_sha256" => STRING_SHAPE,
+});
+source_struct_shape!(REGISTRY_METADATA_SHAPE {
+    "registry_metadata_sha256" => STRING_SHAPE,
+});
+source_struct_shape!(FINDING_SHAPE {
+    "finding" => STRING_SHAPE,
+});
+source_tagged_shape!(NPM_SIGNATURE_SHAPE {
+    "verified" => NPM_SIGNATURE_VERIFIED_SHAPE,
+    "verified_absent" => REGISTRY_METADATA_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(NPM_PROVENANCE_VERIFIED_SHAPE {
+    "statement_sha256" => STRING_SHAPE,
+    "source_commit" => STRING_SHAPE,
+});
+source_tagged_shape!(NPM_PROVENANCE_SHAPE {
+    "verified" => NPM_PROVENANCE_VERIFIED_SHAPE,
+    "verified_absent" => REGISTRY_METADATA_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(REPOSITORY_OWNER_CONSISTENT_SHAPE {
+    "package_owner" => STRING_SHAPE,
+    "repository_owner" => STRING_SHAPE,
+});
+source_struct_shape!(DECISION_ID_SHAPE {
+    "decision_id" => STRING_SHAPE,
+});
+source_tagged_shape!(REPOSITORY_OWNER_SHAPE {
+    "consistent" => REPOSITORY_OWNER_CONSISTENT_SHAPE,
+    "reviewed_mismatch" => DECISION_ID_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+static NULLABLE_STRING_SHAPE: SourceShape = SourceShape::Nullable(&STRING_SHAPE);
+source_struct_shape!(EXACT_NPM_SHAPE {
+    "name" => STRING_SHAPE,
+    "version" => STRING_SHAPE,
+    "tarball_url" => STRING_SHAPE,
+    "integrity" => STRING_SHAPE,
+    "repository" => IMMUTABLE_REPOSITORY_SHAPE,
+    "npm_git_head" => STRING_SHAPE,
+    "package_repository" => STRING_SHAPE,
+    "signature" => NPM_SIGNATURE_SHAPE,
+    "provenance" => NPM_PROVENANCE_SHAPE,
+    "tag_commit" => NULLABLE_STRING_SHAPE,
+    "provenance_commit" => NULLABLE_STRING_SHAPE,
+    "maintainers" => STRING_SEQUENCE_SHAPE,
+    "repository_owner" => REPOSITORY_OWNER_SHAPE,
+});
+
+source_struct_shape!(REPOSITORY_FILE_SOURCE_SHAPE {
+    "repository" => STRING_SHAPE,
+    "commit" => STRING_SHAPE,
+    "path" => STRING_SHAPE,
+});
+source_struct_shape!(VERSIONED_ARTIFACT_SOURCE_SHAPE {
+    "url" => STRING_SHAPE,
+    "provider_revision" => STRING_SHAPE,
+});
+source_tagged_shape!(PROVIDER_EVIDENCE_SOURCE_SHAPE {
+    "repository_file" => REPOSITORY_FILE_SOURCE_SHAPE,
+    "versioned_artifact" => VERSIONED_ARTIFACT_SOURCE_SHAPE,
+});
+source_struct_shape!(PERMISSIVE_LICENSE_SHAPE {
+    "spdx_id" => STRING_SHAPE,
+    "selected_dual_license_branch" => NULLABLE_STRING_SHAPE,
+    "license_file_path" => STRING_SHAPE,
+    "license_file_sha256" => STRING_SHAPE,
+});
+source_struct_shape!(WRITTEN_GRANT_SHAPE {
+    "decision_id" => STRING_SHAPE,
+    "grant_sha256" => STRING_SHAPE,
+});
+source_tagged_shape!(LICENSE_SHAPE {
+    "permissive" => PERMISSIVE_LICENSE_SHAPE,
+    "written_grant" => WRITTEN_GRANT_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(PERMISSIVE_TERMS_SHAPE {
+    "license" => LICENSE_SHAPE,
+    "evidence_url" => STRING_SHAPE,
+});
+source_struct_shape!(REVIEWED_USE_SHAPE {
+    "decision_id" => STRING_SHAPE,
+    "evidence_url" => STRING_SHAPE,
+});
+source_tagged_shape!(EVIDENCE_TERMS_SHAPE {
+    "permissive" => PERMISSIVE_TERMS_SHAPE,
+    "reviewed_use" => REVIEWED_USE_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(JSON_POINTER_LOCATION_SHAPE {
+    "path" => STRING_SHAPE,
+    "pointer" => STRING_SHAPE,
+});
+source_struct_shape!(DOCUMENT_SECTION_LOCATION_SHAPE {
+    "path" => STRING_SHAPE,
+    "section" => STRING_SHAPE,
+});
+source_tagged_shape!(FACT_LOCATION_SHAPE {
+    "json_pointer" => JSON_POINTER_LOCATION_SHAPE,
+    "document_section" => DOCUMENT_SECTION_LOCATION_SHAPE,
+});
+static TYPED_VALUE_SHAPE: SourceShape = SourceShape::TypedValue;
+source_struct_shape!(PROVIDER_FACT_SHAPE {
+    "fact_id" => STRING_SHAPE,
+    "location" => FACT_LOCATION_SHAPE,
+    "normalized_value" => TYPED_VALUE_SHAPE,
+});
+static PROVIDER_FACT_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&PROVIDER_FACT_SHAPE);
+source_struct_shape!(PROVIDER_EVIDENCE_SHAPE {
+    "source" => PROVIDER_EVIDENCE_SOURCE_SHAPE,
+    "accessed_on" => STRING_SHAPE,
+    "content_sha256" => STRING_SHAPE,
+    "terms" => EVIDENCE_TERMS_SHAPE,
+    "facts" => PROVIDER_FACT_SEQUENCE_SHAPE,
+});
+static PROVIDER_EVIDENCE_SEQUENCE_SHAPE: SourceShape =
+    SourceShape::Sequence(&PROVIDER_EVIDENCE_SHAPE);
+source_struct_shape!(PROVIDER_ARTIFACT_SHAPE {
+    "provider" => STRING_SHAPE,
+    "evidence" => PROVIDER_EVIDENCE_SEQUENCE_SHAPE,
+});
+
+source_struct_shape!(REPO_FILE_SHAPE {
+    "path" => STRING_SHAPE,
+    "sha256" => STRING_SHAPE,
+});
+static REPO_FILE_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&REPO_FILE_SHAPE);
+source_struct_shape!(DONAT_OWNED_SHAPE {
+    "repository_commit" => STRING_SHAPE,
+    "files" => REPO_FILE_SEQUENCE_SHAPE,
+});
+source_tagged_shape!(SOURCE_SUBJECT_SHAPE {
+    "exact_npm" => EXACT_NPM_SHAPE,
+    "provider_artifact" => PROVIDER_ARTIFACT_SHAPE,
+    "donat_owned" => DONAT_OWNED_SHAPE,
+});
+source_tagged_shape!(REACQUISITION_SHAPE {
+    "exact_npm_review" => NULL_SHAPE,
+    "provider_repository_review" => NULL_SHAPE,
+    "provider_versioned_artifact_review" => NULL_SHAPE,
+    "donat_owned_no_network" => NULL_SHAPE,
+});
+source_tagged_shape!(HASH_ALGORITHM_SHAPE {
+    "sha256" => NULL_SHAPE,
+    "sha512" => NULL_SHAPE,
+});
+source_struct_shape!(ARTIFACT_HASH_SHAPE {
+    "artifact_id" => STRING_SHAPE,
+    "algorithm" => HASH_ALGORITHM_SHAPE,
+    "digest" => STRING_SHAPE,
+    "path" => NULLABLE_STRING_SHAPE,
+});
+static ARTIFACT_HASH_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&ARTIFACT_HASH_SHAPE);
+source_struct_shape!(NOTICE_SHAPE {
+    "id" => STRING_SHAPE,
+    "license_file_path" => STRING_SHAPE,
+    "license_file_sha256" => STRING_SHAPE,
+    "required_copyright_lines" => STRING_SEQUENCE_SHAPE,
+    "notice_bundle_destination" => STRING_SHAPE,
+});
+source_tagged_shape!(DEPENDENCY_DISPOSITION_SHAPE {
+    "shipped" => SHIPPED_LICENSE_SHAPE,
+    "build_only" => SHIPPED_LICENSE_SHAPE,
+    "type_only_replaced" => REPLACEMENT_SHAPE,
+    "behavior_only" => REASON_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(SHIPPED_LICENSE_SHAPE {
+    "license" => LICENSE_SHAPE,
+});
+source_struct_shape!(REPLACEMENT_SHAPE {
+    "replacement" => STRING_SHAPE,
+});
+source_struct_shape!(REASON_SHAPE {
+    "reason" => STRING_SHAPE,
+});
+source_struct_shape!(DEPENDENCY_SHAPE {
+    "dependency" => STRING_SHAPE,
+    "disposition" => DEPENDENCY_DISPOSITION_SHAPE,
+});
+static DEPENDENCY_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&DEPENDENCY_SHAPE);
+source_tagged_shape!(EMBEDDED_DISPOSITION_SHAPE {
+    "shipped" => SHIPPED_LICENSE_SHAPE,
+    "behavior_only" => REASON_SHAPE,
+    "rejected" => FINDING_SHAPE,
+});
+source_struct_shape!(EMBEDDED_SHAPE {
+    "material_id" => STRING_SHAPE,
+    "path" => STRING_SHAPE,
+    "sha256" => STRING_SHAPE,
+    "disposition" => EMBEDDED_DISPOSITION_SHAPE,
+});
+static EMBEDDED_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&EMBEDDED_SHAPE);
+source_struct_shape!(PROVIDER_CONTRACT_FACT_SHAPE {
+    "source_record_id" => STRING_SHAPE,
+    "fact_id" => STRING_SHAPE,
+});
+source_struct_shape!(POLICY_CONTRACT_FACT_SHAPE {
+    "policy_id" => STRING_SHAPE,
+    "value" => TYPED_VALUE_SHAPE,
+});
+source_tagged_shape!(CONTRACT_FACT_SHAPE {
+    "provider_evidence" => PROVIDER_CONTRACT_FACT_SHAPE,
+    "donat_policy" => POLICY_CONTRACT_FACT_SHAPE,
+});
+static CONTRACT_FACT_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&CONTRACT_FACT_SHAPE);
+source_struct_shape!(PROVIDER_CONTRACT_SHAPE {
+    "contract_id" => STRING_SHAPE,
+    "facts" => CONTRACT_FACT_SEQUENCE_SHAPE,
+});
+static PROVIDER_CONTRACT_SEQUENCE_SHAPE: SourceShape =
+    SourceShape::Sequence(&PROVIDER_CONTRACT_SHAPE);
+source_tagged_shape!(COMPATIBILITY_SHAPE {
+    "tier_a" => NULL_SHAPE,
+    "tier_b" => NULL_SHAPE,
+    "tier_c" => NULL_SHAPE,
+    "rejected" => NULL_SHAPE,
+});
+source_struct_shape!(INVENTORY_ADMISSION_SHAPE {
+    "findings" => STRING_SEQUENCE_SHAPE,
+});
+source_struct_shape!(PORT_ADMISSION_SHAPE {
+    "operations" => STRING_SEQUENCE_SHAPE,
+});
+source_struct_shape!(EVIDENCE_ADMISSION_SHAPE {
+    "contracts" => STRING_SEQUENCE_SHAPE,
+});
+source_tagged_shape!(ADMISSION_SHAPE {
+    "inventory_only" => INVENTORY_ADMISSION_SHAPE,
+    "approved_for_port" => PORT_ADMISSION_SHAPE,
+    "evidence_accepted" => EVIDENCE_ADMISSION_SHAPE,
+});
+source_struct_shape!(SAFETY_FINDING_SHAPE {
+    "finding_id" => STRING_SHAPE,
+    "kind" => STRING_SHAPE,
+    "location" => NULLABLE_STRING_SHAPE,
+    "message" => STRING_SHAPE,
+});
+static SAFETY_FINDING_SEQUENCE_SHAPE: SourceShape = SourceShape::Sequence(&SAFETY_FINDING_SHAPE);
+source_struct_shape!(SAFETY_FINDINGS_SHAPE {
+    "findings" => SAFETY_FINDING_SEQUENCE_SHAPE,
+});
+static NULLABLE_PROPOSED_MANIFEST_SHAPE: SourceShape = SourceShape::Nullable(&STRING_SHAPE);
+source_struct_shape!(SOURCE_RECORD_SHAPE {
+    "record_version" => INTEGER_SHAPE,
+    "record_id" => STRING_SHAPE,
+    "subject" => SOURCE_SUBJECT_SHAPE,
+    "reacquisition" => REACQUISITION_SHAPE,
+    "artifact_hashes" => ARTIFACT_HASH_SEQUENCE_SHAPE,
+    "license" => LICENSE_SHAPE,
+    "notice" => NOTICE_SHAPE,
+    "entrypoints" => STRING_SEQUENCE_SHAPE,
+    "dependencies" => DEPENDENCY_SEQUENCE_SHAPE,
+    "embedded_material" => EMBEDDED_SEQUENCE_SHAPE,
+    "provider_contracts" => PROVIDER_CONTRACT_SEQUENCE_SHAPE,
+    "compatibility" => COMPATIBILITY_SHAPE,
+    "admission" => ADMISSION_SHAPE,
+    "safety_findings" => SAFETY_FINDINGS_SHAPE,
+    "reviewer" => STRING_SHAPE,
+    "approval_date" => STRING_SHAPE,
+    "proposed_manifest" => NULLABLE_PROPOSED_MANIFEST_SHAPE,
+    "proposed_destinations" => STRING_SEQUENCE_SHAPE,
+    "red_tests" => STRING_SEQUENCE_SHAPE,
+});
+
+#[derive(Default)]
+struct SourceShapeIssues {
+    structure: bool,
+    scalar_kind: bool,
+}
+
+fn mapping_entries<'node>(
+    node: &'node LosslessYamlNode,
+    issues: &mut SourceShapeIssues,
+) -> Option<&'node [(LosslessYamlNode, LosslessYamlNode)]> {
+    let LosslessYamlNode::Mapping(entries) = node else {
+        issues.structure = true;
+        return None;
+    };
+    Some(entries)
+}
+
+fn inspect_struct_shape(
+    node: &LosslessYamlNode,
+    fields: &[SourceFieldShape],
+    issues: &mut SourceShapeIssues,
+) {
+    let Some(entries) = mapping_entries(node, issues) else {
+        return;
+    };
+    for field in fields {
+        if !entries
+            .iter()
+            .any(|(key, _)| matches!(key, LosslessYamlNode::String(name) if name == field.name))
+        {
+            issues.structure = true;
+        }
+    }
+    for (key, value) in entries {
+        let LosslessYamlNode::String(name) = key else {
+            issues.structure = true;
+            continue;
+        };
+        let Some(field) = fields.iter().find(|field| field.name == name) else {
+            issues.structure = true;
+            continue;
+        };
+        inspect_source_shape(value, field.value, issues);
+    }
+}
+
+fn inspect_tagged_shape(
+    node: &LosslessYamlNode,
+    variants: &[SourceVariantShape],
+    issues: &mut SourceShapeIssues,
+) {
+    let Some(entries) = mapping_entries(node, issues) else {
+        return;
+    };
+    let kinds = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(key, LosslessYamlNode::String(name) if name == "kind").then_some(value)
+        })
+        .collect::<Vec<_>>();
+    let values = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(key, LosslessYamlNode::String(name) if name == "value").then_some(value)
+        })
+        .collect::<Vec<_>>();
+    if kinds.is_empty() || values.is_empty() {
+        issues.structure = true;
+    }
+    if entries.iter().any(|(key, _)| {
+        !matches!(key, LosslessYamlNode::String(name) if name == "kind" || name == "value")
+    }) {
+        issues.structure = true;
+    }
+    let Some(kind) = kinds.first() else {
+        return;
+    };
+    let LosslessYamlNode::String(kind) = kind else {
+        issues.structure = true;
+        return;
+    };
+    let Some(variant) = variants.iter().find(|variant| variant.kind == kind) else {
+        issues.structure = true;
+        return;
+    };
+    for value in values {
+        inspect_source_shape(value, variant.value, issues);
+    }
+}
+
+fn inspect_typed_value(node: &LosslessYamlNode, issues: &mut SourceShapeIssues) {
+    static INLINE_BYTES_SHAPE: SourceShape = SourceShape::Struct(&[
+        SourceFieldShape {
+            name: "$binary",
+            value: &STRING_SHAPE,
+        },
+        SourceFieldShape {
+            name: "file_name",
+            value: &NULLABLE_STRING_SHAPE,
+        },
+        SourceFieldShape {
+            name: "media_type",
+            value: &NULLABLE_STRING_SHAPE,
+        },
+    ]);
+    let Some(entries) = mapping_entries(node, issues) else {
+        return;
+    };
+    let kind = entries.iter().find_map(|(key, value)| {
+        matches!(key, LosslessYamlNode::String(name) if name == "kind").then_some(value)
+    });
+    let values = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(key, LosslessYamlNode::String(name) if name == "value").then_some(value)
+        })
+        .collect::<Vec<_>>();
+    if kind.is_none()
+        || values.is_empty()
+        || entries.iter().any(|(key, _)| {
+            !matches!(key, LosslessYamlNode::String(name) if name == "kind" || name == "value")
+        })
+    {
+        issues.structure = true;
+    }
+    let Some(LosslessYamlNode::String(kind)) = kind else {
+        issues.structure = true;
+        return;
+    };
+    let scalar_shape = match kind.as_str() {
+        "null" => Some(&NULL_SHAPE),
+        "boolean" => Some(&BOOL_SHAPE),
+        "string" | "i64" | "u64" | "decimal" => Some(&STRING_SHAPE),
+        "inline_bytes" => Some(&INLINE_BYTES_SHAPE),
+        "list" | "object" => None,
+        _ => {
+            issues.structure = true;
+            return;
+        }
+    };
+    for value in values {
+        match kind.as_str() {
+            "list" => match value {
+                LosslessYamlNode::Sequence(values) => {
+                    for value in values {
+                        inspect_typed_value(value, issues);
+                    }
+                }
+                _ => issues.structure = true,
+            },
+            "object" => match value {
+                LosslessYamlNode::Mapping(entries) => {
+                    for (key, value) in entries {
+                        if !matches!(key, LosslessYamlNode::String(_)) {
+                            issues.structure = true;
+                        }
+                        inspect_typed_value(value, issues);
+                    }
+                }
+                _ => issues.structure = true,
+            },
+            _ => inspect_source_shape(
+                value,
+                scalar_shape.expect("all scalar branches select a shape"),
+                issues,
+            ),
+        }
+    }
+}
+
+fn inspect_source_shape(
+    node: &LosslessYamlNode,
+    shape: &SourceShape,
+    issues: &mut SourceShapeIssues,
+) {
+    match shape {
+        SourceShape::Null if matches!(node, LosslessYamlNode::Null) => {}
+        SourceShape::Bool if matches!(node, LosslessYamlNode::Bool(_)) => {}
+        SourceShape::Integer if matches!(node, LosslessYamlNode::Number(_)) => {}
+        SourceShape::String if matches!(node, LosslessYamlNode::String(_)) => {}
+        SourceShape::Null | SourceShape::Bool | SourceShape::Integer | SourceShape::String => {
+            issues.scalar_kind = true
+        }
+        SourceShape::Sequence(value_shape) => match node {
+            LosslessYamlNode::Sequence(values) => {
+                for value in values {
+                    inspect_source_shape(value, value_shape, issues);
+                }
+            }
+            _ => issues.structure = true,
+        },
+        SourceShape::Struct(fields) => inspect_struct_shape(node, fields, issues),
+        SourceShape::Tagged(variants) => inspect_tagged_shape(node, variants, issues),
+        SourceShape::Nullable(value_shape) => {
+            if !matches!(node, LosslessYamlNode::Null) {
+                inspect_source_shape(node, value_shape, issues);
+            }
+        }
+        SourceShape::TypedValue => inspect_typed_value(node, issues),
+    }
+}
+
 pub fn load_record(path: impl AsRef<Path>) -> Result<ConnectorSourceRecord, CatalogError> {
     let bytes = std::fs::read(path)
         .map_err(|error| CatalogError::new("source_record_incomplete", error.to_string()))?;
@@ -1661,53 +3027,29 @@ pub fn load_record(path: impl AsRef<Path>) -> Result<ConnectorSourceRecord, Cata
 }
 
 pub fn load_record_bytes(bytes: &[u8]) -> Result<ConnectorSourceRecord, CatalogError> {
-    let parsed_value =
-        serde_yaml::from_slice::<serde_yaml::Value>(bytes).map_err(map_source_decode_error)?;
-    let record: ConnectorSourceRecord =
-        serde_yaml::from_slice(bytes).map_err(map_source_decode_error)?;
-    let rebuilt = serde_yaml::to_string(&record).map_err(map_source_decode_error)?;
-    let mut rebuilt_value =
-        serde_yaml::from_str::<serde_yaml::Value>(&rebuilt).map_err(map_source_decode_error)?;
-    insert_tagged_unit_values(&mut rebuilt_value);
-    if !same_yaml_shape(&parsed_value, &rebuilt_value) {
+    let parsed =
+        serde_yaml::from_slice::<LosslessYamlNode>(bytes).map_err(map_source_decode_error)?;
+    let mut issues = SourceShapeIssues::default();
+    inspect_source_shape(&parsed, &SOURCE_RECORD_SHAPE, &mut issues);
+    if issues.structure {
         return Err(CatalogError::new(
             "source_record_incomplete",
-            "source record omitted or changed a required member",
+            "source record has an unknown, missing, or malformed structural member",
         ));
+    }
+    if issues.scalar_kind {
+        return invalid_primitive("source record scalar kind");
+    }
+
+    let deduplicated = parsed.to_yaml_value();
+    let record = serde_yaml::from_value::<source_record_input::Input>(deduplicated)
+        .map_err(map_source_decode_error)?
+        .0;
+    if parsed.has_duplicate_mapping_key() {
+        return duplicate("source mapping member");
     }
     validate_record(&record)?;
     Ok(record)
-}
-
-fn same_yaml_shape(left: &serde_yaml::Value, right: &serde_yaml::Value) -> bool {
-    match (left, right) {
-        (serde_yaml::Value::Null, serde_yaml::Value::Null)
-        | (serde_yaml::Value::Bool(_), serde_yaml::Value::Bool(_))
-        | (serde_yaml::Value::Number(_), serde_yaml::Value::Number(_))
-        | (serde_yaml::Value::String(_), serde_yaml::Value::String(_)) => true,
-        (serde_yaml::Value::Mapping(left), serde_yaml::Value::Mapping(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, left_value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right_value| same_yaml_shape(left_value, right_value))
-                })
-        }
-        (serde_yaml::Value::Sequence(left), serde_yaml::Value::Sequence(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| same_yaml_shape(left, right))
-        }
-        (serde_yaml::Value::Tagged(left), serde_yaml::Value::Tagged(right)) => {
-            left.tag == right.tag && same_yaml_shape(&left.value, &right.value)
-        }
-        (serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_), _)
-        | (_, serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)) => false,
-        (serde_yaml::Value::Tagged(_), _) | (_, serde_yaml::Value::Tagged(_)) => false,
-        _ => false,
-    }
 }
 
 fn insert_tagged_unit_values(value: &mut serde_yaml::Value) {
@@ -1752,6 +3094,7 @@ fn validate_record(record: &ConnectorSourceRecord) -> Result<(), CatalogError> {
 fn map_source_decode_error(error: serde_yaml::Error) -> CatalogError {
     let detail = error.to_string();
     for code in [
+        "catalog_jcs_schema_mismatch",
         "source_record_duplicate",
         "source_record_invalid_primitive",
         "source_record_npm_integrity_invalid",
@@ -2396,7 +3739,11 @@ fn validate_provider_joins(
             if source_record_id != &record.record_id || !inventory_facts.contains(fact_id) {
                 return evidence_mismatch("provider contract fact reference");
             }
-            referenced_facts.insert(*fact_id);
+            if !referenced_facts.insert(*fact_id) {
+                return evidence_mismatch(
+                    "provider fact belongs to more than one admitted contract",
+                );
+            }
         }
     }
     if referenced_facts != inventory_facts {
@@ -2492,15 +3839,12 @@ fn versioned_artifact_path(url: &ExactHttpsUrl) -> Result<String, CatalogError> 
     let parsed = url::Url::parse(url.as_str()).map_err(|_| {
         CatalogError::new("source_record_evidence_mismatch", "invalid evidence URL")
     })?;
-    let path = parsed
-        .path_segments()
-        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-        .ok_or_else(|| {
-            CatalogError::new(
-                "source_record_evidence_mismatch",
-                "versioned evidence URL has no immutable artifact path",
-            )
-        })?;
+    let path = parsed.path().strip_prefix('/').ok_or_else(|| {
+        CatalogError::new(
+            "source_record_evidence_mismatch",
+            "versioned evidence URL has no canonical relative artifact path",
+        )
+    })?;
     if !valid_path(path) {
         return evidence_mismatch("versioned evidence artifact path");
     }
