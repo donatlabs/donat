@@ -1011,12 +1011,14 @@ fn collect_required_session_variables(
                 | CommandStepOperation::FixedRows { .. }
                 | CommandStepOperation::AllocateMany { .. } => continue,
             };
-            let (entry, info) =
-                if matches!(&step.operation, CommandStepOperation::SelectMany { .. }) {
-                    command_read_target(source, catalog, table, path)?
-                } else {
-                    command_target(source, catalog, table, path)?
-                };
+            let (entry, info) = if matches!(
+                &step.operation,
+                CommandStepOperation::SelectOne { .. } | CommandStepOperation::SelectMany { .. }
+            ) {
+                command_read_target(source, catalog, table, path)?
+            } else {
+                command_target(source, catalog, table, path)?
+            };
             let filter_context = TableCtx {
                 entry,
                 info,
@@ -2290,8 +2292,18 @@ fn validate_step(
             })
         }
         CommandStepOperation::SelectOne { select_one } => {
-            let (entry, info) = command_target(source, catalog, &select_one.table, path)?;
-            validate_primary_key_predicate(&select_one.by, info, context, path)?;
+            let (entry, info) = command_read_target(source, catalog, &select_one.table, path)?;
+            if info.relation_kind == RelationKind::Table {
+                validate_primary_key_predicate(&select_one.by, info, context, path)?;
+            } else {
+                if select_one.by.is_empty() {
+                    return Err(PlanError::validation(
+                        path,
+                        "select_one over a view requires at least one equality binding",
+                    ));
+                }
+                validate_object(&select_one.by, info, context, path)?;
+            }
             let returning = returning_columns(&select_one.returning, info, path)?;
             require_select_permissions(
                 &planner,
@@ -3070,7 +3082,7 @@ fn command_read_target<'a>(
         kind => Err(PlanError::validation(
             path,
             format!(
-                "select_many target '{}.{}' must be a table or view, not {kind:?}",
+                "command read target '{}.{}' must be a table or view, not {kind:?}",
                 table.schema(),
                 table.name()
             ),

@@ -239,6 +239,41 @@ fn relational_batch_command() -> Json {
     })
 }
 
+fn select_one_command() -> Json {
+    let mut command = valid_command();
+    command["steps"] = json!([{
+        "name": "order",
+        "select_one": {
+            "table": { "schema": "public", "name": "orders" },
+            "by": {
+                "customer_id": { "arg": "customer_id" }
+            },
+            "returning": ["id", "customer_id", "status"],
+            "require_found": true
+        }
+    }]);
+    command
+}
+
+fn select_many_command() -> Json {
+    let mut command = valid_command();
+    command["steps"] = json!([{
+        "name": "orders",
+        "select_many": {
+            "table": { "schema": "public", "name": "orders" },
+            "by": {
+                "customer_id": { "arg": "customer_id" }
+            },
+            "order_by": ["id"],
+            "returning": ["id", "customer_id", "status"]
+        }
+    }]);
+    command["result"] = json!({
+        "orders": { "step": "orders" }
+    });
+    command
+}
+
 fn rules() -> RuleCatalog {
     compile_catalog(
         &[
@@ -627,6 +662,145 @@ fn relational_batch_rejects_view_and_non_postgres_update_targets() {
     let error = compile(&sqlite, RelationKind::Table)
         .expect_err("relational update batches remain Postgres-only");
     assert!(error.message.contains("requires a Postgres source"));
+}
+
+#[test]
+fn command_reads_accept_supported_tracked_view_kinds_without_primary_keys() {
+    for kind in [RelationKind::View, RelationKind::MaterializedView] {
+        let mut read_catalog = catalog(kind);
+        read_catalog
+            .tables
+            .get_mut("public.orders")
+            .expect("orders relation")
+            .primary_key
+            .clear();
+
+        compile_with_catalog(&metadata(vec![select_one_command()]), read_catalog.clone())
+            .unwrap_or_else(|error| panic!("select_one must read {kind:?}: {error:?}"));
+        compile_with_catalog(&metadata(vec![select_many_command()]), read_catalog)
+            .unwrap_or_else(|error| panic!("select_many must read {kind:?}: {error:?}"));
+    }
+}
+
+#[test]
+fn command_reads_over_views_still_require_explicit_select_permission() {
+    for command in [select_one_command(), select_many_command()] {
+        let mut metadata = metadata(vec![command]);
+        metadata.sources[0].tables[0].select_permissions.clear();
+        let error = compile(&metadata, RelationKind::View)
+            .expect_err("a tracked view never bypasses the explicit role's select permission");
+        assert_eq!(error.path, "commands[0].steps[0]");
+        assert_eq!(
+            error.message,
+            "role 'customer' lacks select permission on table public.orders"
+        );
+    }
+}
+
+#[test]
+fn every_command_write_form_rejects_non_ordinary_relations_at_the_step_path() {
+    let relation = json!({ "schema": "public", "name": "orders" });
+    let writes = [
+        (
+            "insert",
+            json!({
+                "insert": {
+                    "table": relation.clone(),
+                    "object": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+        (
+            "insert_many",
+            json!({
+                "insert_many": {
+                    "table": relation.clone(),
+                    "for_each": { "arg": "customer_id" },
+                    "object": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+        (
+            "update",
+            json!({
+                "update": {
+                    "table": relation.clone(),
+                    "where": { "id": { "arg": "id" } },
+                    "set": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+        (
+            "update_many",
+            json!({
+                "update_many": {
+                    "table": relation.clone(),
+                    "for_each": { "arg": "customer_id" },
+                    "by": { "id": { "item": "id" } },
+                    "set": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+        (
+            "delete",
+            json!({
+                "delete": {
+                    "table": relation.clone(),
+                    "where": { "id": { "arg": "id" } }
+                }
+            }),
+        ),
+        (
+            "update_when",
+            json!({
+                "update_when": {
+                    "when": {
+                        "argument_equals": {
+                            "argument": "status",
+                            "value": "new"
+                        }
+                    },
+                    "table": relation.clone(),
+                    "where": { "id": { "arg": "id" } },
+                    "set": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+        (
+            "insert_when",
+            json!({
+                "insert_when": {
+                    "when": {
+                        "argument_equals": {
+                            "argument": "status",
+                            "value": "new"
+                        }
+                    },
+                    "table": relation,
+                    "object": { "status": { "arg": "status" } }
+                }
+            }),
+        ),
+    ];
+
+    for (operation, body) in writes {
+        let mut command = valid_command();
+        command["steps"] = json!([{ "name": "write" }]);
+        command["steps"][0][operation] = body[operation].clone();
+        let error = compile(&metadata(vec![command]), RelationKind::View)
+            .expect_err("command writes must remain limited to ordinary tables");
+        assert_eq!(error.path, "commands[0].steps[0]", "{operation}");
+        let prefix = if operation == "update_many" {
+            "update_many target"
+        } else {
+            "command target"
+        };
+        assert_eq!(
+            error.message,
+            format!("{prefix} 'public.orders' must be an ordinary table, not View"),
+            "{operation}"
+        );
+    }
 }
 
 #[test]
