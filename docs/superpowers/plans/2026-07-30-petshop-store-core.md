@@ -263,7 +263,8 @@ expects one line with the new quantity.
 Run:
 
 ```bash
-cargo test -p donat-conformance --test petshop catalog cart
+cargo test -p donat-conformance --test petshop catalog
+cargo test -p donat-conformance --test petshop cart
 ```
 
 Expected: FAIL because the current example exposes `pet` and has no cart.
@@ -335,7 +336,8 @@ fails before exposing metadata.
 Run:
 
 ```bash
-cargo test -p donat-conformance --test petshop catalog cart
+cargo test -p donat-conformance --test petshop catalog
+cargo test -p donat-conformance --test petshop cart
 ```
 
 Commit:
@@ -431,7 +433,8 @@ Run:
 ```bash
 cargo test -p donat-conformance --test petshop permissions
 cargo build -p donat-server --bin donat
-cargo test -p donat-conformance --test petshop catalog cart
+cargo test -p donat-conformance --test petshop catalog
+cargo test -p donat-conformance --test petshop cart
 ```
 
 - [ ] **Step 6: Commit**
