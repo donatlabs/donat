@@ -102,6 +102,14 @@ schema-owned value through its public fields or checked schema constructors.
 It is not an inherent implementation on the foreign schema type, and it adds
 no schema-to-server dependency.
 
+Command finalization pins source, Process revision, start policy, process-key
+type, signal contract revision, and compatible revision set while retaining
+the already typed symbolic `CommandValue` bindings. Deployment compilation
+cannot produce `CommandExecutionValue` because request arguments, the
+explicit session, and prior-step rows do not exist yet. The request planner
+performs that lowering exactly once after selecting a finalized command; the
+renderer still receives no raw metadata.
+
 Processes are strictly source-local. Start, transition, start-effect, and
 signal-effect commands resolve only in the process's Postgres source. A
 connector instance used by processes is bound to one source, and workers,

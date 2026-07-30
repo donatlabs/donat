@@ -6,7 +6,7 @@ permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { session_variable: x-donat-user-id }
 input:
   - { name: order_line_id, type: uuid! }
@@ -73,7 +73,7 @@ states:
       run_as: prescription_worker
       arguments:
         prescription_id: { state: submit_review, field: prescription_id }
-        deadline_id: { activity_key: expire_review }
+        deadline_id: { activity_key: expire_review, as: uuid }
       next: expired
 
   # Customer output intentionally omits reviewer identity, private note, and
@@ -96,7 +96,7 @@ states:
     output:
       values:
         prescription_id: { state: expire_review, field: prescription_id }
-        status: { state: expire_review, field: status }
+        status: { state: expire_review, field: status, as: PrescriptionState }
         released: { literal: false }
 
   - id: unexpected_reviewer_decision

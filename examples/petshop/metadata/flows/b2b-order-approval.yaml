@@ -6,7 +6,7 @@ permissions:
   - role: b2b_buyer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { input: owner_user_id }
 start:
   command: submit_quote
@@ -23,7 +23,7 @@ input:
   - { name: approval_id, type: uuid! }
   - { name: total_minor, type: bigint! }
   - { name: available_credit_minor, type: bigint! }
-  - { name: owner_user_id, type: bigint! }
+  - { name: owner_user_id, type: string! }
 output:
   - { name: quote_id, type: uuid! }
   - { name: approval_id, type: uuid! }
@@ -81,7 +81,7 @@ states:
       run_as: b2b_finance
       arguments:
         approval_id: { input: approval_id }
-        request_id: { activity_key: open_approver_review }
+        request_id: { activity_key: open_approver_review, as: uuid }
       next: await_approver
 
   - id: await_approver
@@ -115,7 +115,7 @@ states:
       run_as: b2b_finance
       arguments:
         approval_id: { input: approval_id }
-        request_id: { activity_key: escalate_after_approver_timeout }
+        request_id: { activity_key: escalate_after_approver_timeout, as: uuid }
       next: await_finance
 
   - id: await_finance
@@ -167,7 +167,8 @@ states:
       values:
         quote_id: { input: quote_id }
         approval_id: { state: consume_automatic_credit, field: approval_id }
-        approval_status: { state: consume_automatic_credit, field: approval_status }
+        approval_status:
+          { state: consume_automatic_credit, field: approval_status, as: ApprovalState }
         credit_consumed: { literal: true }
 
   - id: manually_approved
@@ -207,7 +208,8 @@ states:
       values:
         quote_id: { input: quote_id }
         approval_id: { state: reject_after_finance_deadline, field: approval_id }
-        approval_status: { state: reject_after_finance_deadline, field: approval_status }
+        approval_status:
+          { state: reject_after_finance_deadline, field: approval_status, as: ApprovalState }
         credit_consumed: { literal: false }
 
   - id: route_rejected
@@ -215,5 +217,6 @@ states:
       values:
         quote_id: { input: quote_id }
         approval_id: { state: reject_unroutable_quote, field: approval_id }
-        approval_status: { state: reject_unroutable_quote, field: approval_status }
+        approval_status:
+          { state: reject_unroutable_quote, field: approval_status, as: ApprovalState }
         credit_consumed: { literal: false }

@@ -61,7 +61,7 @@ steps:
       exact_quantity_columns:
         requested: requested_quantity
         available: available_quantity
-        allocated: allocated_quantity
+        allocated: quantity
         backordered: backordered_quantity
       allocation_id: deterministic
       returning:
@@ -71,7 +71,7 @@ steps:
         lines:
           [allocation_id, order_id, order_line_id, line_sequence, variant_id,
            location_code, inventory_level_id, requested_quantity,
-           allocated_quantity, unit_price_minor, currency]
+           quantity, unit_price_minor, currency]
         backorders:
           [order_id, order_line_id, requested_quantity, backordered_quantity]
       group_order_by: [first_line_sequence, allocation_rank, location_code, allocation_id]
@@ -97,13 +97,13 @@ steps:
           rule: add_int
           with:
             left: { current_column: reserved_quantity }
-            right: { item: allocated_quantity }
+            right: { item: quantity }
       check:
         rule: can_reserve_stock
         with:
           on_hand: { current_column: on_hand_quantity }
           reserved: { current_column: reserved_quantity }
-          requested: { item: allocated_quantity }
+          requested: { item: quantity }
       returning: [id, reserved_quantity]
       require_each: true
   - name: allocations
@@ -116,7 +116,7 @@ steps:
         order_line_id: { item: order_line_id }
         stock_location_code: { item: location_code }
         inventory_level_id: { item: inventory_level_id }
-        quantity: { item: allocated_quantity }
+        quantity: { item: quantity }
         unit_price_minor: { item: unit_price_minor }
         currency: { item: currency }
         status: { literal: allocated }

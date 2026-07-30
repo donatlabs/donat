@@ -1,6 +1,14 @@
 use donat_server::connectors::{ConnectorRegistry, stripe::StripeConnector};
 use serde_json::json;
 
+fn postgres_sources() -> serde_json::Value {
+    json!([{
+        "name": "default",
+        "kind": "postgres",
+        "configuration": {}
+    }])
+}
+
 #[test]
 fn stripe_registry_rejects_endpoint_overrides_and_unadvertised_operations() {
     // This fails if deployment metadata can turn the narrow module into a
@@ -14,7 +22,7 @@ fn stripe_registry_rejects_endpoint_overrides_and_unadvertised_operations() {
     }
     let metadata = serde_json::from_value(json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "payments",
             "module": "stripe",

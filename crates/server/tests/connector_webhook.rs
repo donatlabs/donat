@@ -23,6 +23,14 @@ const BODY_LIMIT: usize = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
+fn postgres_sources() -> serde_json::Value {
+    serde_json::json!([{
+        "name": "default",
+        "kind": "postgres",
+        "configuration": {}
+    }])
+}
+
 fn configure_test_environment() {
     static CONFIGURED: Once = Once::new();
     CONFIGURED.call_once(|| {
@@ -39,7 +47,7 @@ fn state() -> SharedState {
     configure_test_environment();
     let metadata: donat_metadata::Metadata = serde_json::from_value(serde_json::json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "payments",
             "module": "stripe",

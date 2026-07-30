@@ -6,7 +6,7 @@ permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { input: owner_user_id }
 start:
   command: request_authorized_order_cancellation
@@ -20,10 +20,10 @@ start:
   process_key: { command_result: order_id }
 input:
   - { name: order_id, type: uuid! }
-  - { name: owner_user_id, type: bigint! }
+  - { name: owner_user_id, type: string! }
   - { name: payment_id, type: uuid! }
   - { name: authorization_id, type: uuid! }
-  - { name: reason, type: string! }
+  - { name: reason, type: string }
 output:
   - { name: order_id, type: uuid! }
   - { name: status, type: CheckoutState! }
@@ -36,7 +36,7 @@ states:
       input:
         payment_id: { input: payment_id }
         authorization_id: { input: authorization_id }
-        reason: { input: reason }
+        reason: { input: reason, require_non_null: true }
       idempotency_key:
         stable: { run: id, state: request_void }
       timeout:
@@ -81,7 +81,7 @@ states:
       input:
         payment_id: { input: payment_id }
         resource_kind: { literal: void }
-        resource_id: { input: authorization_id }
+        resource_id: { input: authorization_id, as: string }
         activity_key: { activity_key: request_void }
       timeout:
         schedule_to_start: 5s
@@ -127,7 +127,7 @@ states:
     output:
       values:
         order_id: { state: finalize_cancellation, field: order_id }
-        status: { state: finalize_cancellation, field: order_status }
+        status: { state: finalize_cancellation, field: order_status, as: CheckoutState }
   - id: manual_reconciliation_required
     fail:
       code: payment_void_requires_reconciliation

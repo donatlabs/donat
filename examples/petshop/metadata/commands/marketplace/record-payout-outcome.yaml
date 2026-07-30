@@ -58,7 +58,10 @@ result:
   payout_id: { step: apply_outcome, column: id }
   vendor_id: { step: apply_outcome, column: vendor_id }
   provider_payout_id: { step: apply_outcome, column: provider_payout_id }
-  outcome: { step: apply_outcome, column: status }
+  outcome:
+    rule: payout_state_for_provider_outcome
+    with:
+      outcome: { arg: outcome }
   requires_reconciliation: { literal: false }
 idempotency:
   key: { argument: provider_event_id }

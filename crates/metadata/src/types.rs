@@ -1203,6 +1203,8 @@ pub struct Process {
     pub kind: ProcessKind,
     pub version: u32,
     pub source: String,
+    #[serde(default, skip_serializing_if = "ProcessLifecycle::is_active")]
+    pub lifecycle: ProcessLifecycle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<ProcessPermission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1225,6 +1227,20 @@ pub struct Process {
 #[serde(rename_all = "snake_case")]
 pub enum ProcessKind {
     Process,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessLifecycle {
+    #[default]
+    Active,
+    Retired,
+}
+
+impl ProcessLifecycle {
+    fn is_active(&self) -> bool {
+        *self == Self::Active
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1545,6 +1561,10 @@ pub struct ProcessFailState {
 pub enum ProcessValue {
     Input {
         input: String,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_non_null: bool,
     },
     State {
         state: String,
@@ -1553,18 +1573,26 @@ pub enum ProcessValue {
         project: Option<Vec<String>>,
         #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
         as_: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_non_null: bool,
     },
     Item {
         item: String,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
     },
     Literal {
         literal: serde_json::Value,
     },
     ActivityKey {
         activity_key: String,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
     },
     ActivityKeyForState {
         activity_key_for_state: String,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
     },
     Run {
         run: String,

@@ -64,7 +64,9 @@ steps:
       require_affected: true
   - name: approved_quantity
     aggregate:
-      from: { step: approved_items }
+      from: { arg: lines }
+      minimum_items: 1
+      maximum_items: 256
       values:
         quantity: { sum: { column: approved_quantity } }
 result:
@@ -87,7 +89,7 @@ effects:
         return_id: { step: approved_return, column: id }
       payload:
         decision: { literal: approved }
-        status: { step: approved_return, column: status }
+        status: { literal: approved }
         approved_quantity: { step: approved_quantity, column: quantity }
         public_reason_code: { literal: return_approved }
       idempotency_key: { argument: decision_id }

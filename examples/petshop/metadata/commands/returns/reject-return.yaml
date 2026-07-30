@@ -59,7 +59,7 @@ effects:
         return_id: { step: rejected_return, column: id }
       payload:
         decision: { literal: rejected }
-        status: { step: rejected_return, column: status }
+        status: { literal: rejected }
         approved_quantity: { literal: 0 }
         public_reason_code: { literal: return_rejected }
       idempotency_key: { argument: decision_id }

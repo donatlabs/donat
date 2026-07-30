@@ -18,7 +18,10 @@ use donat_rules::{
     DecisionTestExpectation as RuleDecisionTestExpectation, ExpressionContext, ExpressionOwner,
     HitPolicy, RuleCatalog, RuleDefinition, RuleType,
 };
-use donat_schema::{CompiledMultiSourceSchema, PlanError, compile_command_catalog};
+use donat_schema::{
+    CompiledCommandCatalog, CompiledMultiSourceSchema, FinalizedCommandCatalog, PlanError,
+    ProcessEffectContractCatalog, compile_command_catalog, finalize_command_effects,
+};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
@@ -614,6 +617,77 @@ pub struct Engine {
     pub(crate) rest_queries: crate::rest::CompiledRestQueries,
     /// Parsed role permission SDLs for remote schemas.
     pub(crate) remote_permission_schemas: crate::remote::CompiledRemoteSchemas,
+}
+
+/// Stages 1-7 of Process candidate construction. The value contains only
+/// immutable, deploy-time compiler output: no database client, journal,
+/// worker, connector executor, or resolved credential can enter it.
+pub struct PureEngineCandidate {
+    rule_catalog: Arc<RuleCatalog>,
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    pub process_effects: Arc<ProcessEffectContractCatalog>,
+    pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+}
+
+impl PureEngineCandidate {
+    pub fn rule_catalog(&self) -> &RuleCatalog {
+        self.rule_catalog.as_ref()
+    }
+}
+
+/// Compile one all-or-nothing serving candidate in dependency order without
+/// touching a database or publishing mutable state.
+pub fn compile_pure_engine_candidate(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    connectors: &crate::connectors::ConnectorRegistry,
+    infer_function_permissions: bool,
+) -> Result<PureEngineCandidate, PlanError> {
+    let rule_catalog = Arc::new(compile_rule_catalog(metadata)?);
+    let command_catalog = Arc::new(compile_command_catalog(
+        metadata,
+        catalogs,
+        rule_catalog.as_ref(),
+        infer_function_permissions,
+    )?);
+    let dependencies = crate::processes::ServerProcessDependencies::new(
+        metadata,
+        command_catalog.as_ref(),
+        rule_catalog.as_ref(),
+        connectors,
+    );
+    let process_catalog = Arc::new(crate::processes::compile_process_catalog(
+        metadata,
+        &dependencies,
+    )?);
+    let process_effects = Arc::new(crate::processes::build_process_effect_contract_catalog(
+        process_catalog.as_ref(),
+    )?);
+    let finalized_command_catalog = Arc::new(finalize_command_effects(
+        command_catalog.as_ref().clone(),
+        process_effects.as_ref(),
+    )?);
+    let compiled = Some(Arc::new(
+        CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+            metadata,
+            catalogs,
+            rule_catalog.as_ref(),
+            finalized_command_catalog.as_ref(),
+            process_effects.as_ref(),
+            infer_function_permissions,
+        )?,
+    ));
+
+    Ok(PureEngineCandidate {
+        rule_catalog,
+        command_catalog,
+        finalized_command_catalog,
+        process_catalog,
+        process_effects,
+        compiled,
+    })
 }
 
 impl Engine {
@@ -1886,9 +1960,8 @@ impl AppState {
         .map_err(MysqlMutationError::Other)?
     }
 
-    /// Reconcile pools and catalogs with the current metadata sources,
-    /// pruning metadata that refers to dropped objects (run_sql untracks
-    /// dropped tables/functions, like Donat).
+    /// Refresh source catalogs and rebuild one pure immutable candidate.
+    /// Runtime DDL and administrative metadata-mutation APIs do not exist.
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         let metadata = self.engine_snapshot().await.metadata.clone();
         self.sync_candidate(metadata).await

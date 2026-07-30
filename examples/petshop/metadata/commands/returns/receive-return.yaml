@@ -64,7 +64,9 @@ steps:
       require_affected: true
   - name: received_quantity
     aggregate:
-      from: { step: received_items }
+      from: { arg: lines }
+      minimum_items: 1
+      maximum_items: 256
       values:
         quantity: { sum: { column: received_quantity } }
 result:
@@ -85,6 +87,6 @@ effects:
       correlate:
         return_id: { step: received_return, column: id }
       payload:
-        status: { step: received_return, column: status }
+        status: { literal: received }
         received_quantity: { step: received_quantity, column: quantity }
       idempotency_key: { argument: receipt_id }

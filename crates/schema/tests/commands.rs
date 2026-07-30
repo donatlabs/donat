@@ -3735,6 +3735,38 @@ fn allocate_many_compiles_to_bounded_typed_ir_with_named_row_sets() {
     let metadata = metadata(vec![command]);
     let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
     let commands = command_catalog(&metadata, &catalogs);
+    let allocations = &commands
+        .source("default")
+        .and_then(|source| source.command("allocate_test"))
+        .expect("compiled allocation command exists")
+        .descriptor()
+        .result
+        .roots["allocations"]
+        .type_ref;
+    let ValueType::List { element: groups } = &allocations.value_type else {
+        panic!("allocation groups must be a bounded list");
+    };
+    let ValueType::Object {
+        fields: group_fields,
+    } = &groups.value_type
+    else {
+        panic!("each allocation group must be a typed object");
+    };
+    let ValueType::List {
+        element: group_item,
+    } = &group_fields["items"].type_ref.value_type
+    else {
+        panic!("allocation group items must retain their typed row-set contract");
+    };
+    let ValueType::Object {
+        fields: group_item_fields,
+    } = &group_item.value_type
+    else {
+        panic!("each allocation group item must be a typed object");
+    };
+    assert!(group_item_fields.contains_key("order_line_id"));
+    assert!(group_item_fields.contains_key("allocated_quantity"));
+
     let plan = plan_runtime(
         &metadata,
         &catalogs,

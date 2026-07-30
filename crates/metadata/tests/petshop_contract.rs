@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use donat_metadata::{
     Command, CommandIdempotencyScopeSpec, CommandResultValue, CommandStepOperation, CommandValue,
     ConnectorBounds, ConnectorEffect, ConnectorErrorMap, ConnectorInstance, ConnectorRedaction,
-    ConnectorRetry, ConnectorSuccessContract, Process, load_metadata_dir,
+    ConnectorRetry, ConnectorSuccessContract, Process, ProcessLifecycle, load_metadata_dir,
 };
 use serde_yaml::Value;
 
@@ -61,6 +61,12 @@ fn every_petshop_flow_file_uses_the_closed_process_grammar() {
         let yaml = std::fs::read_to_string(&path).expect("flow file must be readable");
         let process = serde_yaml::from_str::<Process>(&yaml)
             .unwrap_or_else(|error| panic!("{} must load: {error}", path.display()));
+        assert_eq!(
+            process.lifecycle,
+            ProcessLifecycle::Active,
+            "{} must default to the active lifecycle",
+            path.display()
+        );
         let serialized = serde_yaml::to_string(&process)
             .unwrap_or_else(|error| panic!("{} must serialize: {error}", path.display()));
         serde_yaml::from_str::<Process>(&serialized)
@@ -134,6 +140,37 @@ fn petshop_contract_loads_complete_active_grammar() {
                 .expect("process states must be a sequence")
         })
         .collect::<Vec<_>>();
+    let states_per_process = processes
+        .iter()
+        .map(|process| {
+            (
+                process["name"]
+                    .as_str()
+                    .expect("process name must be a string"),
+                process["states"]
+                    .as_sequence()
+                    .expect("process states must be a sequence")
+                    .len(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        states_per_process,
+        BTreeMap::from([
+            ("authorized_order_cancellation", 10),
+            ("b2b_order_approval", 17),
+            ("checkout_cancellation", 14),
+            ("checkout_payment", 15),
+            ("grooming_booking", 8),
+            ("partial_fulfilment", 14),
+            ("payment_reconciliation", 9),
+            ("prescription_review", 8),
+            ("return_refund", 28),
+            ("subscription_renewal", 39),
+            ("vendor_payout", 6),
+        ]),
+        "every reviewed Petshop process must remain present in full"
+    );
     let process_operations = process_states
         .iter()
         .flat_map(|state| mapping_key_set(state))
@@ -145,6 +182,35 @@ fn petshop_contract_loads_complete_active_grammar() {
             "command", "fail", "for_each", "output", "request", "wait", "when",
         ]),
         "the real flows must retain all seven closed state forms"
+    );
+    let process_operation_counts =
+        process_states
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, state| {
+                let operation = mapping_key_set(state)
+                    .into_iter()
+                    .find(|key| *key != "id")
+                    .expect("every process state has exactly one operation");
+                *counts.entry(operation).or_default() += 1;
+                counts
+            });
+    assert_eq!(
+        process_states.len(),
+        168,
+        "the complete Petshop state inventory must not shrink silently"
+    );
+    assert_eq!(
+        process_operation_counts,
+        BTreeMap::from([
+            ("command", 57),
+            ("fail", 16),
+            ("for_each", 15),
+            ("output", 29),
+            ("request", 18),
+            ("wait", 10),
+            ("when", 23),
+        ]),
+        "every declarative execution form must retain its reviewed coverage"
     );
     let wait_forms = process_states
         .iter()

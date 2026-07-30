@@ -6,7 +6,7 @@ permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { session_variable: x-donat-user-id }
 input:
   - { name: service_resource_id, type: uuid! }
@@ -75,7 +75,7 @@ states:
       run_as: booking_worker
       arguments:
         booking_id: { state: reserve_slot, field: booking_id }
-        deadline_id: { activity_key: expire_hold }
+        deadline_id: { activity_key: expire_hold, as: uuid }
       next: expired
 
   - id: confirmed
@@ -97,7 +97,7 @@ states:
       values:
         booking_id: { state: expire_hold, field: booking_id }
         slot_key: { state: expire_hold, field: slot_key }
-        status: { state: expire_hold, field: status }
+        status: { state: expire_hold, field: status, as: BookingState }
 
   - id: unexpected_hold_transition
     fail:

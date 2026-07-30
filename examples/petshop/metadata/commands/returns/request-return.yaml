@@ -20,8 +20,21 @@ steps:
       by:
         order_id: { arg: order_id }
         customer_id: { session_variable: x-donat-user-id }
-      returning: [order_id, customer_id, payment_id, currency, return_from]
+      returning:
+        [order_id, customer_id, payment_id, currency, recipient_name,
+         address_line_1, address_line_2, city, region, postal_code,
+         country_code]
       require_found: true
+  - name: return_address
+    project:
+      values:
+        recipient_name: { step: return_context, column: recipient_name }
+        address_line_1: { step: return_context, column: address_line_1 }
+        address_line_2: { step: return_context, column: address_line_2 }
+        city: { step: return_context, column: city }
+        region: { step: return_context, column: region }
+        postal_code: { step: return_context, column: postal_code }
+        country_code: { step: return_context, column: country_code }
   - name: return_request
     insert:
       table: { schema: public, name: return_request }
@@ -62,7 +75,7 @@ result:
   replacement_requested: { step: return_request, column: replacement_requested }
   payment_id: { step: return_context, column: payment_id }
   currency: { step: return_context, column: currency }
-  return_from: { step: return_context, column: return_from }
+  return_from: { step: return_address }
   items:
     step: return_items
     project:

@@ -98,7 +98,9 @@ steps:
       require_affected: true
   - name: inspected_quantity
     aggregate:
-      from: { step: inspected_items }
+      from: { arg: lines }
+      minimum_items: 1
+      maximum_items: 256
       values:
         quantity: { sum: { column: inspected_quantity } }
 result:
@@ -127,7 +129,7 @@ effects:
         return_id: { step: inspected_return, column: id }
       payload:
         inspection_decision: { arg: inspection }
-        status: { step: inspected_return, column: status }
+        status: { literal: inspected }
         inspected_quantity: { step: inspected_quantity, column: quantity }
         payment_id: { step: return_context, column: payment_id }
         refund_id: { step: approved_refund, column: id }

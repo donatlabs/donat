@@ -15,11 +15,19 @@ use donat_server::connectors::{
 use serde_json::json;
 use tokio::sync::Mutex;
 
+fn postgres_sources() -> serde_json::Value {
+    json!([{
+        "name": "default",
+        "kind": "postgres",
+        "configuration": {}
+    }])
+}
+
 #[test]
 fn registry_has_only_the_compiled_http_and_stripe_modules_and_is_immutable_after_build() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "logistics",
             "module": "http",
@@ -47,7 +55,7 @@ fn registry_has_only_the_compiled_http_and_stripe_modules_and_is_immutable_after
 fn registry_rejects_private_network_policy_in_deployment_metadata() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "internal_only",
             "module": "http",
@@ -78,7 +86,7 @@ fn registry_rejects_private_network_policy_in_deployment_metadata() {
 async fn declarative_registry_rejects_undeclared_job_transport_input_before_network() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "logistics",
             "module": "http",
@@ -134,7 +142,7 @@ async fn declarative_registry_rejects_undeclared_job_transport_input_before_netw
 fn declarative_registry_rejects_a_serialization_key_outside_declared_input_bindings() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
-        "sources": [],
+        "sources": postgres_sources(),
         "connectors": [{
             "name": "logistics",
             "module": "http",
@@ -178,7 +186,7 @@ fn declarative_registry_rejects_case_insensitive_header_collisions_before_any_he
                      idempotency_header: &str| {
         serde_json::from_value::<donat_metadata::Metadata>(json!({
             "version": 3,
-            "sources": [],
+            "sources": postgres_sources(),
             "connectors": [{
                 "name": "logistics",
                 "module": "http",
@@ -259,7 +267,7 @@ fn declarative_registry_exposes_a_non_secret_operation_configuration_fingerprint
     let metadata = || {
         serde_json::from_value::<donat_metadata::Metadata>(json!({
             "version": 3,
-            "sources": [],
+            "sources": postgres_sources(),
             "connectors": [{
                 "name": "logistics",
                 "module": "http",
@@ -370,7 +378,7 @@ fn declarative_registry_fingerprint_distinguishes_base_url_environment_source_na
     let metadata = |base_url_environment: &str| {
         serde_json::from_value::<donat_metadata::Metadata>(json!({
             "version": 3,
-            "sources": [],
+            "sources": postgres_sources(),
             "connectors": [{
                 "name": "logistics",
                 "module": "http",

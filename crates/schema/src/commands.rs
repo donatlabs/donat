@@ -28,6 +28,11 @@ use crate::introspection::build_schema_json;
 use crate::naming::{command_pascal_case, table_base_name};
 use crate::plan::{MutationKind, PlanError, Planner, Session, TableCtx};
 use crate::predicate::PermissionSessionOperand;
+use crate::process_effects::{
+    FinalizedCommandCatalog, FinalizedCommandEffect, FinalizedCompiledCommand,
+    FinalizedSignalProcessEffect, FinalizedSourceCommandCatalog, FinalizedStartProcessEffect,
+    ProcessEffectContractSource,
+};
 
 /// Immutable command definitions grouped by their Postgres source.
 #[derive(Debug, Clone)]
@@ -71,8 +76,10 @@ impl CompiledSourceCommandCatalog {
 #[derive(Debug, Clone)]
 pub struct CompiledCommand {
     source: String,
+    metadata_path: String,
     definition: Command,
     descriptor: CommandDescriptor,
+    effect_contracts: Vec<CompiledCommandEffectContract>,
     rules: Arc<RuleCatalog>,
     literal_annotation_pg_types: BTreeMap<String, String>,
 }
@@ -86,6 +93,18 @@ pub struct CommandDescriptor {
     pub allowed_roles: BTreeSet<String>,
     pub required_session_variables: BTreeMap<String, BTreeMap<String, TypeRef>>,
     pub definition_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+enum CompiledCommandEffectContract {
+    Start {
+        process_key: Option<TypeRef>,
+        input: ValueContractCatalog,
+    },
+    Signal {
+        correlation: ValueContractCatalog,
+        payload: ValueContractCatalog,
+    },
 }
 
 impl CompiledCommand {
@@ -719,6 +738,792 @@ pub fn compile_command_catalog(
     }
 }
 
+/// Pin every raw Command effect to one source-local Process contract without
+/// changing the pre-process Command descriptor or its fingerprint.
+pub fn finalize_command_effects(
+    commands: CompiledCommandCatalog,
+    contracts: &dyn ProcessEffectContractSource,
+) -> Result<FinalizedCommandCatalog, PlanError> {
+    let mut finalized_sources = BTreeMap::new();
+    for (source_name, source) in &commands.sources {
+        let mut finalized_commands = BTreeMap::new();
+        for (command_name, command) in &source.commands {
+            let effects = finalize_one_command_effects(command, contracts)?;
+            finalized_commands.insert(
+                command_name.clone(),
+                FinalizedCompiledCommand {
+                    command: command.clone(),
+                    effects,
+                },
+            );
+        }
+        finalized_sources.insert(
+            source_name.clone(),
+            FinalizedSourceCommandCatalog {
+                source_name: source_name.clone(),
+                commands: finalized_commands,
+            },
+        );
+    }
+    Ok(FinalizedCommandCatalog {
+        sources: finalized_sources,
+    })
+}
+
+pub(crate) fn validate_and_extract_finalized_command_catalog(
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    finalized: &FinalizedCommandCatalog,
+    contracts: &dyn ProcessEffectContractSource,
+) -> Result<CompiledCommandCatalog, PlanError> {
+    let expected_sources = metadata
+        .sources
+        .iter()
+        .filter(|source| source.kind == SourceKind::Postgres)
+        .map(|source| source.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let finalized_sources = finalized
+        .sources
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if finalized_sources != expected_sources {
+        return Err(PlanError::validation(
+            "commands.yaml",
+            "finalized command sources do not match the Postgres metadata sources",
+        ));
+    }
+
+    let mut sources = BTreeMap::new();
+    for (source_name, source) in &finalized.sources {
+        if source.source_name != *source_name {
+            return Err(PlanError::validation(
+                "commands.yaml",
+                "finalized command source identity does not match its catalog key",
+            ));
+        }
+        let mut commands = BTreeMap::new();
+        for (command_name, command) in &source.commands {
+            let descriptor = command.command.descriptor();
+            if descriptor.source != *source_name
+                || descriptor.name != *command_name
+                || command.command.source() != source_name
+            {
+                return Err(PlanError::validation(
+                    "commands.yaml",
+                    "finalized command identity does not match its catalog key",
+                ));
+            }
+            commands.insert(command_name.clone(), command.command.clone());
+        }
+        sources.insert(
+            source_name.clone(),
+            CompiledSourceCommandCatalog { commands },
+        );
+    }
+    let commands = CompiledCommandCatalog { sources };
+    let finalized_command_count = finalized
+        .sources
+        .values()
+        .map(|source| source.commands.len())
+        .sum::<usize>();
+    if finalized_command_count != metadata.commands.len() {
+        return Err(PlanError::validation(
+            "commands.yaml",
+            "finalized command catalog does not match metadata",
+        ));
+    }
+
+    for (index, definition) in metadata.commands.iter().enumerate() {
+        let path = format!("commands[{index}]");
+        let command = commands
+            .source(&definition.source)
+            .and_then(|source| source.command(&definition.name))
+            .ok_or_else(|| {
+                PlanError::validation(&path, "finalized command catalog does not match metadata")
+            })?;
+        let source = metadata
+            .sources
+            .iter()
+            .find(|source| source.name == definition.source)
+            .ok_or_else(|| {
+                PlanError::validation(
+                    &path,
+                    format!("command source '{}' does not exist", definition.source),
+                )
+            })?;
+        let descriptor = command.descriptor();
+        if !serialized_equal(command.definition(), definition) {
+            return Err(PlanError::validation(
+                &path,
+                "finalized command definition does not match metadata",
+            ));
+        }
+        let fingerprint = command_descriptor_fingerprint(
+            source,
+            command.definition(),
+            rules,
+            &descriptor.arguments,
+            &descriptor.result,
+            &descriptor.allowed_roles,
+            &descriptor.required_session_variables,
+        );
+        if fingerprint != descriptor.definition_fingerprint {
+            return Err(PlanError::validation(
+                &path,
+                "finalized command was compiled against a different Rules snapshot",
+            ));
+        }
+    }
+
+    let expected = finalize_command_effects(commands.clone(), contracts)?;
+    for (index, definition) in metadata.commands.iter().enumerate() {
+        let supplied = finalized
+            .source(&definition.source)
+            .and_then(|source| source.command(&definition.name))
+            .ok_or_else(|| {
+                PlanError::validation(
+                    &format!("commands[{index}]"),
+                    "finalized command catalog does not match metadata",
+                )
+            })?;
+        let rebuilt = expected
+            .source(&definition.source)
+            .and_then(|source| source.command(&definition.name))
+            .ok_or_else(|| {
+                PlanError::validation(
+                    &format!("commands[{index}]"),
+                    "rebuilt finalized command catalog does not match metadata",
+                )
+            })?;
+        if !finalized_effects_equal(&supplied.effects, &rebuilt.effects) {
+            return Err(PlanError::validation(
+                &format!("commands[{index}].effects"),
+                "finalized command effects do not match the process contract snapshot",
+            ));
+        }
+    }
+    Ok(commands)
+}
+
+fn finalized_effects_equal(
+    left: &[FinalizedCommandEffect],
+    right: &[FinalizedCommandEffect],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (FinalizedCommandEffect::Start(left), FinalizedCommandEffect::Start(right)) => {
+                    left.source == right.source
+                        && left.process_name == right.process_name
+                        && left.process_revision == right.process_revision
+                        && left.start_policy == right.start_policy
+                        && serialized_equal(&left.process_key, &right.process_key)
+                        && serialized_equal(&left.input, &right.input)
+                        && serialized_equal(
+                            &left.semantic_idempotency_key,
+                            &right.semantic_idempotency_key,
+                        )
+                        && left.effect_position == right.effect_position
+                }
+                (FinalizedCommandEffect::Signal(left), FinalizedCommandEffect::Signal(right)) => {
+                    left.source == right.source
+                        && left.process_name == right.process_name
+                        && left.process_revision == right.process_revision
+                        && left.signal_name == right.signal_name
+                        && serialized_equal(&left.correlation, &right.correlation)
+                        && serialized_equal(&left.payload, &right.payload)
+                        && serialized_equal(
+                            &left.semantic_idempotency_key,
+                            &right.semantic_idempotency_key,
+                        )
+                        && left.compatible_revisions == right.compatible_revisions
+                        && left.effect_position == right.effect_position
+                }
+                _ => false,
+            })
+}
+
+fn serialized_equal<T: serde::Serialize>(left: &T, right: &T) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn finalize_one_command_effects(
+    command: &CompiledCommand,
+    contracts: &dyn ProcessEffectContractSource,
+) -> Result<Vec<FinalizedCommandEffect>, PlanError> {
+    if command.definition.effects.len() != command.effect_contracts.len() {
+        return Err(PlanError::validation(
+            &command.metadata_path,
+            "compiled command effect contracts do not match the immutable definition",
+        ));
+    }
+    command
+        .definition
+        .effects
+        .iter()
+        .zip(&command.effect_contracts)
+        .enumerate()
+        .map(|(index, (effect, actual_contract))| {
+            let effect_position = u32::try_from(index).map_err(|_| {
+                PlanError::validation(
+                    &command.metadata_path,
+                    "command declares too many process effects",
+                )
+            })?;
+            let effect_path = format!("{}.effects[{index}]", command.metadata_path);
+            match (effect, actual_contract) {
+                (
+                    CommandEffect::StartProcess { start_process },
+                    CompiledCommandEffectContract::Start { process_key, input },
+                ) => {
+                    let target = contracts
+                        .process_effect_contract(&command.source, &start_process.process)
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &format!("{effect_path}.start_process.process"),
+                                format!(
+                                    "process '{}.{}' does not exist",
+                                    command.source, start_process.process
+                                ),
+                            )
+                        })?;
+                    validate_process_contract_identity(
+                        target.process_name.as_str(),
+                        start_process.process.as_str(),
+                        &target.current_revision,
+                        &format!("{effect_path}.start_process.process"),
+                    )?;
+                    validate_effect_binding_catalog(
+                        &target.start_input,
+                        input,
+                        &start_process.input,
+                        &format!("{effect_path}.start_process.input"),
+                    )?;
+                    validate_effect_process_key(
+                        target.process_key.as_ref(),
+                        process_key.as_ref(),
+                        start_process.process_key.as_ref(),
+                        &target.start_input,
+                        input,
+                        &format!("{effect_path}.start_process.process_key"),
+                    )?;
+                    let semantic_idempotency_key =
+                        start_process.idempotency_key.clone().ok_or_else(|| {
+                            PlanError::validation(
+                                &effect_path,
+                                "command effect requires an idempotency key",
+                            )
+                        })?;
+                    Ok(FinalizedCommandEffect::Start(FinalizedStartProcessEffect {
+                        source: command.source.clone(),
+                        process_name: start_process.process.clone(),
+                        process_revision: target.current_revision.clone(),
+                        start_policy: target.start_policy,
+                        process_key: start_process.process_key.clone(),
+                        input: start_process.input.clone(),
+                        semantic_idempotency_key,
+                        effect_position,
+                    }))
+                }
+                (
+                    CommandEffect::SignalProcess { signal_process },
+                    CompiledCommandEffectContract::Signal {
+                        correlation,
+                        payload,
+                    },
+                ) => {
+                    let target = contracts
+                        .process_effect_contract(&command.source, &signal_process.process)
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &format!("{effect_path}.signal_process.process"),
+                                format!(
+                                    "process '{}.{}' does not exist",
+                                    command.source, signal_process.process
+                                ),
+                            )
+                        })?;
+                    validate_process_contract_identity(
+                        target.process_name.as_str(),
+                        signal_process.process.as_str(),
+                        &target.current_revision,
+                        &format!("{effect_path}.signal_process.process"),
+                    )?;
+                    let signal = target.signals.get(&signal_process.signal).ok_or_else(|| {
+                        PlanError::validation(
+                            &format!("{effect_path}.signal_process.signal"),
+                            format!(
+                                "process '{}.{}' has no signal '{}'",
+                                command.source, signal_process.process, signal_process.signal
+                            ),
+                        )
+                    })?;
+                    if signal.signal_name != signal_process.signal {
+                        return Err(PlanError::validation(
+                            &format!("{effect_path}.signal_process.signal"),
+                            "process signal contract identity does not match its catalog key",
+                        ));
+                    }
+                    if signal.contract_revision.is_empty()
+                        || !signal
+                            .compatible_revisions
+                            .contains(&signal.contract_revision)
+                    {
+                        return Err(PlanError::validation(
+                            &format!("{effect_path}.signal_process.signal"),
+                            "process signal contract has no compatible pinned revision",
+                        ));
+                    }
+                    validate_effect_binding_catalog(
+                        &signal.correlation,
+                        correlation,
+                        &signal_process.correlate,
+                        &format!("{effect_path}.signal_process.correlate"),
+                    )?;
+                    validate_effect_binding_catalog(
+                        &signal.payload,
+                        payload,
+                        &signal_process.payload,
+                        &format!("{effect_path}.signal_process.payload"),
+                    )?;
+                    let semantic_idempotency_key =
+                        signal_process.idempotency_key.clone().ok_or_else(|| {
+                            PlanError::validation(
+                                &effect_path,
+                                "command effect requires an idempotency key",
+                            )
+                        })?;
+                    Ok(FinalizedCommandEffect::Signal(
+                        FinalizedSignalProcessEffect {
+                            source: command.source.clone(),
+                            process_name: signal_process.process.clone(),
+                            process_revision: signal.contract_revision.clone(),
+                            signal_name: signal_process.signal.clone(),
+                            correlation: signal_process.correlate.clone(),
+                            payload: signal_process.payload.clone(),
+                            semantic_idempotency_key,
+                            compatible_revisions: signal.compatible_revisions.clone(),
+                            effect_position,
+                        },
+                    ))
+                }
+                _ => Err(PlanError::validation(
+                    &effect_path,
+                    "compiled command effect kind does not match the immutable definition",
+                )),
+            }
+        })
+        .collect()
+}
+
+fn validate_process_contract_identity(
+    actual_name: &str,
+    expected_name: &str,
+    revision: &str,
+    path: &str,
+) -> Result<(), PlanError> {
+    if actual_name != expected_name {
+        return Err(PlanError::validation(
+            path,
+            "process effect contract identity does not match its catalog key",
+        ));
+    }
+    if revision.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "process effect contract revision cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_effect_process_key(
+    target: Option<&TypeRef>,
+    actual: Option<&TypeRef>,
+    raw: Option<&CommandValue>,
+    target_catalog: &ValueContractCatalog,
+    actual_catalog: &ValueContractCatalog,
+    path: &str,
+) -> Result<(), PlanError> {
+    match (target, actual) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(PlanError::validation(
+            path,
+            "process requires a command effect process_key",
+        )),
+        (None, Some(_)) => Err(PlanError::validation(
+            path,
+            "process does not declare a process_key contract",
+        )),
+        (Some(target), Some(actual)) => {
+            let raw = raw.ok_or_else(|| {
+                PlanError::validation(
+                    path,
+                    "compiled process-key contract does not match its immutable definition",
+                )
+            })?;
+            validate_effect_value(
+                target,
+                &target_catalog.named_objects,
+                actual,
+                &actual_catalog.named_objects,
+                raw,
+                path,
+            )
+        }
+    }
+}
+
+fn validate_effect_binding_catalog(
+    target: &ValueContractCatalog,
+    actual: &ValueContractCatalog,
+    raw: &BTreeMap<String, CommandValue>,
+    path: &str,
+) -> Result<(), PlanError> {
+    if !actual.roots.keys().eq(raw.keys()) {
+        return Err(PlanError::validation(
+            path,
+            "compiled effect bindings do not match the immutable definition",
+        ));
+    }
+    for name in actual.roots.keys() {
+        if !target.roots.contains_key(name) {
+            return Err(PlanError::validation(
+                &format!("{path}.{name}"),
+                format!("process contract has no field '{name}'"),
+            ));
+        }
+    }
+    for (name, target_field) in &target.roots {
+        let Some(actual_field) = actual.roots.get(name) else {
+            if target_field.required {
+                return Err(PlanError::validation(
+                    &format!("{path}.{name}"),
+                    format!("process contract requires command effect field '{name}'"),
+                ));
+            }
+            continue;
+        };
+        let raw_value = raw.get(name).ok_or_else(|| {
+            PlanError::validation(
+                &format!("{path}.{name}"),
+                "compiled effect binding does not match its immutable definition",
+            )
+        })?;
+        validate_effect_value(
+            &target_field.type_ref,
+            &target.named_objects,
+            &actual_field.type_ref,
+            &actual.named_objects,
+            raw_value,
+            &format!("{path}.{name}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_effect_value(
+    target: &TypeRef,
+    target_objects: &BTreeMap<String, ValueObjectContract>,
+    actual: &TypeRef,
+    actual_objects: &BTreeMap<String, ValueObjectContract>,
+    raw: &CommandValue,
+    path: &str,
+) -> Result<(), PlanError> {
+    if let CommandValue::Literal { literal, as_: None } = raw {
+        return validate_unannotated_effect_literal(literal, target, path);
+    }
+    validate_effect_type(target, target_objects, actual, actual_objects, path)
+}
+
+fn validate_unannotated_effect_literal(
+    literal: &serde_json::Value,
+    target: &TypeRef,
+    path: &str,
+) -> Result<(), PlanError> {
+    let accepted = if matches!(
+        target.value_type,
+        ValueType::Scalar {
+            scalar: ValueScalar::Json
+        }
+    ) {
+        true
+    } else if literal.is_null() {
+        target.nullable
+    } else {
+        match (&target.value_type, literal) {
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Boolean,
+                },
+                serde_json::Value::Bool(_),
+            ) => true,
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Int32,
+                },
+                serde_json::Value::Number(number),
+            ) => {
+                number
+                    .as_i64()
+                    .is_some_and(|value| i32::try_from(value).is_ok())
+                    || number
+                        .as_u64()
+                        .is_some_and(|value| i32::try_from(value).is_ok())
+            }
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Int64,
+                },
+                serde_json::Value::Number(number),
+            ) => {
+                number.as_i64().is_some()
+                    || number
+                        .as_u64()
+                        .is_some_and(|value| i64::try_from(value).is_ok())
+            }
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::UInt64,
+                },
+                serde_json::Value::Number(number),
+            ) => number.as_u64().is_some(),
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Decimal,
+                },
+                serde_json::Value::Number(_),
+            ) => true,
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::String,
+                },
+                serde_json::Value::String(_),
+            ) => true,
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Uuid,
+                },
+                serde_json::Value::String(value),
+            ) => Uuid::parse_str(value).is_ok(),
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Date,
+                },
+                serde_json::Value::String(value),
+            ) => NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok(),
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::Timestamp,
+                },
+                serde_json::Value::String(value),
+            ) => parse_timestamp(value).is_some(),
+            (
+                ValueType::Scalar {
+                    scalar: ValueScalar::TimestampTz,
+                },
+                serde_json::Value::String(value),
+            ) => DateTime::parse_from_rfc3339(value).is_ok(),
+            (ValueType::Enum { values, .. }, serde_json::Value::String(value)) => {
+                values.iter().any(|candidate| candidate == value)
+            }
+            _ => false,
+        }
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(PlanError::validation(
+            path,
+            format!(
+                "command effect literal is not assignable to {}",
+                render_contract_type(target)
+            ),
+        ))
+    }
+}
+
+fn validate_effect_type(
+    target: &TypeRef,
+    target_objects: &BTreeMap<String, ValueObjectContract>,
+    actual: &TypeRef,
+    actual_objects: &BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<(), PlanError> {
+    if effect_type_assignable(
+        target,
+        target_objects,
+        actual,
+        actual_objects,
+        &mut HashSet::new(),
+    ) {
+        Ok(())
+    } else {
+        Err(PlanError::validation(
+            path,
+            format!(
+                "command effect value of type {} is not assignable to {}",
+                render_contract_type(actual),
+                render_contract_type(target)
+            ),
+        ))
+    }
+}
+
+fn effect_type_assignable(
+    target: &TypeRef,
+    target_objects: &BTreeMap<String, ValueObjectContract>,
+    actual: &TypeRef,
+    actual_objects: &BTreeMap<String, ValueObjectContract>,
+    visited: &mut HashSet<(String, String)>,
+) -> bool {
+    if actual.nullable && !target.nullable {
+        return false;
+    }
+    match (&target.value_type, &actual.value_type) {
+        (
+            ValueType::Scalar {
+                scalar: ValueScalar::Json,
+            },
+            _,
+        ) => true,
+        (
+            ValueType::Scalar {
+                scalar: target_scalar,
+            },
+            ValueType::Scalar {
+                scalar: actual_scalar,
+            },
+        ) => {
+            target_scalar == actual_scalar
+                || matches!(
+                    (target_scalar, actual_scalar),
+                    (ValueScalar::Int64, ValueScalar::Int32)
+                        | (
+                            ValueScalar::Decimal,
+                            ValueScalar::Int32 | ValueScalar::Int64
+                        )
+                )
+        }
+        (
+            ValueType::Enum {
+                name: target_name,
+                values: target_values,
+            },
+            ValueType::Enum {
+                name: actual_name,
+                values: actual_values,
+            },
+        ) => target_name == actual_name && target_values == actual_values,
+        (
+            ValueType::List {
+                element: target_element,
+            },
+            ValueType::List {
+                element: actual_element,
+            },
+        ) => effect_type_assignable(
+            target_element,
+            target_objects,
+            actual_element,
+            actual_objects,
+            visited,
+        ),
+        (
+            ValueType::Object {
+                fields: target_fields,
+            },
+            ValueType::Object {
+                fields: actual_fields,
+            },
+        ) => effect_fields_assignable(
+            target_fields,
+            target_objects,
+            actual_fields,
+            actual_objects,
+            visited,
+        ),
+        (ValueType::Ref { name: target_name }, ValueType::Ref { name: actual_name })
+            if target_name == actual_name =>
+        {
+            if !visited.insert((target_name.clone(), actual_name.clone())) {
+                return true;
+            }
+            let Some(target_object) = target_objects.get(target_name) else {
+                return false;
+            };
+            let Some(actual_object) = actual_objects.get(actual_name) else {
+                return false;
+            };
+            effect_fields_assignable(
+                &target_object.fields,
+                target_objects,
+                &actual_object.fields,
+                actual_objects,
+                visited,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn effect_fields_assignable(
+    target: &BTreeMap<String, ValueContractField>,
+    target_objects: &BTreeMap<String, ValueObjectContract>,
+    actual: &BTreeMap<String, ValueContractField>,
+    actual_objects: &BTreeMap<String, ValueObjectContract>,
+    visited: &mut HashSet<(String, String)>,
+) -> bool {
+    if target.len() != actual.len() {
+        return false;
+    }
+    target.iter().all(|(name, target_field)| {
+        actual.get(name).is_some_and(|actual_field| {
+            (!target_field.required || actual_field.required)
+                && effect_type_assignable(
+                    &target_field.type_ref,
+                    target_objects,
+                    &actual_field.type_ref,
+                    actual_objects,
+                    visited,
+                )
+        })
+    })
+}
+
+fn render_contract_type(type_ref: &TypeRef) -> String {
+    let inner = match &type_ref.value_type {
+        ValueType::Scalar { scalar } => match scalar {
+            ValueScalar::Boolean => "Boolean".to_owned(),
+            ValueScalar::String => "String".to_owned(),
+            ValueScalar::Int32 => "Int".to_owned(),
+            ValueScalar::Int64 => "bigint".to_owned(),
+            ValueScalar::UInt64 => "uint64".to_owned(),
+            ValueScalar::Decimal => "decimal".to_owned(),
+            ValueScalar::Uuid => "uuid".to_owned(),
+            ValueScalar::Date => "date".to_owned(),
+            ValueScalar::Timestamp => "timestamp".to_owned(),
+            ValueScalar::TimestampTz => "timestamptz".to_owned(),
+            ValueScalar::Json => "json".to_owned(),
+            ValueScalar::Custom { name } => name.clone(),
+        },
+        ValueType::Enum { name, .. } | ValueType::Ref { name } => name.clone(),
+        ValueType::Object { .. } => "object".to_owned(),
+        ValueType::List { element } => format!("[{}]", render_contract_type(element)),
+    };
+    if type_ref.nullable {
+        inner
+    } else {
+        format!("{inner}!")
+    }
+}
+
 pub fn compile_command_source_catalog(
     metadata: &Metadata,
     source_name: &str,
@@ -800,7 +1605,7 @@ fn compile_one_command(
         command,
         command_index,
     )?;
-    let descriptor = build_command_descriptor(
+    let (descriptor, effect_contracts) = build_command_descriptor(
         context.metadata,
         source,
         catalog,
@@ -811,8 +1616,10 @@ fn compile_one_command(
     )?;
     Ok(CompiledCommand {
         source: source.name.clone(),
+        metadata_path: format!("commands[{command_index}]"),
         definition: command.clone(),
         descriptor,
+        effect_contracts,
         rules: context.rules.clone(),
         literal_annotation_pg_types: context
             .metadata
@@ -840,7 +1647,7 @@ fn build_command_descriptor(
     command: &Command,
     command_index: usize,
     infer_function_permissions: bool,
-) -> Result<CommandDescriptor, PlanError> {
+) -> Result<(CommandDescriptor, Vec<CompiledCommandEffectContract>), PlanError> {
     let path = format!("commands[{command_index}]");
     let arguments = compile_command_argument_contract(metadata, rules, command, &path)?;
 
@@ -887,20 +1694,28 @@ fn build_command_descriptor(
         current_scope: None,
     };
     let mut result_roots = BTreeMap::new();
+    let mut result_named_objects = BTreeMap::new();
     for field in &command.result.fields {
         let static_type = result_value_type(&field.value, &context, &path)?;
         result_roots.insert(
             field.name.clone(),
             ValueContractField {
                 required: true,
-                type_ref: contract_type_from_static(&static_type, &path)?,
+                type_ref: contract_type_from_static_closed(
+                    &static_type,
+                    metadata,
+                    rules,
+                    &mut result_named_objects,
+                    &path,
+                )?,
             },
         );
     }
     let result = ValueContractCatalog {
         roots: result_roots,
-        named_objects: BTreeMap::new(),
+        named_objects: result_named_objects,
     };
+    let effect_contracts = compile_command_effect_contracts(command, &context, &arguments, &path)?;
     let allowed_roles = command
         .permissions
         .iter()
@@ -923,15 +1738,187 @@ fn build_command_descriptor(
         &allowed_roles,
         &required_session_variables,
     );
-    Ok(CommandDescriptor {
-        source: source.name.clone(),
-        name: command.name.clone(),
-        arguments,
-        result,
-        allowed_roles,
-        required_session_variables,
-        definition_fingerprint,
+    Ok((
+        CommandDescriptor {
+            source: source.name.clone(),
+            name: command.name.clone(),
+            arguments,
+            result,
+            allowed_roles,
+            required_session_variables,
+            definition_fingerprint,
+        },
+        effect_contracts,
+    ))
+}
+
+fn compile_command_effect_contracts(
+    command: &Command,
+    context: &ValueContext<'_>,
+    arguments: &ValueContractCatalog,
+    path: &str,
+) -> Result<Vec<CompiledCommandEffectContract>, PlanError> {
+    command
+        .effects
+        .iter()
+        .enumerate()
+        .map(|(index, effect)| {
+            let effect_path = format!("{path}.effects[{index}]");
+            match effect {
+                CommandEffect::StartProcess { start_process } => {
+                    let process_key = start_process
+                        .process_key
+                        .as_ref()
+                        .map(|value| {
+                            effect_value_contract(
+                                value,
+                                context,
+                                arguments,
+                                &format!("{effect_path}.start_process.process_key"),
+                            )
+                        })
+                        .transpose()?;
+                    Ok(CompiledCommandEffectContract::Start {
+                        process_key,
+                        input: effect_bindings_contract(
+                            &start_process.input,
+                            context,
+                            arguments,
+                            &format!("{effect_path}.start_process.input"),
+                        )?,
+                    })
+                }
+                CommandEffect::SignalProcess { signal_process } => {
+                    Ok(CompiledCommandEffectContract::Signal {
+                        correlation: effect_bindings_contract(
+                            &signal_process.correlate,
+                            context,
+                            arguments,
+                            &format!("{effect_path}.signal_process.correlate"),
+                        )?,
+                        payload: effect_bindings_contract(
+                            &signal_process.payload,
+                            context,
+                            arguments,
+                            &format!("{effect_path}.signal_process.payload"),
+                        )?,
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+fn effect_bindings_contract(
+    bindings: &BTreeMap<String, CommandValue>,
+    context: &ValueContext<'_>,
+    arguments: &ValueContractCatalog,
+    path: &str,
+) -> Result<ValueContractCatalog, PlanError> {
+    let mut named_objects = BTreeMap::new();
+    let mut roots = BTreeMap::new();
+    for (name, value) in bindings {
+        let type_ref =
+            effect_value_contract_with_named(value, context, arguments, &mut named_objects, path)?;
+        roots.insert(
+            name.clone(),
+            ValueContractField {
+                required: true,
+                type_ref,
+            },
+        );
+    }
+    Ok(ValueContractCatalog {
+        roots,
+        named_objects,
     })
+}
+
+fn effect_value_contract(
+    value: &CommandValue,
+    context: &ValueContext<'_>,
+    arguments: &ValueContractCatalog,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
+    effect_value_contract_with_named(value, context, arguments, &mut BTreeMap::new(), path)
+}
+
+fn effect_value_contract_with_named(
+    value: &CommandValue,
+    context: &ValueContext<'_>,
+    arguments: &ValueContractCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
+    if matches!(
+        value,
+        CommandValue::Literal {
+            literal: serde_json::Value::Null,
+            as_: None,
+        }
+    ) {
+        // An unannotated null is intentionally resolved only after the
+        // Process contract is known. The JSON placeholder never escapes
+        // finalization and is ignored by its literal-aware type check.
+        return Ok(TypeRef {
+            nullable: true,
+            value_type: ValueType::Scalar {
+                scalar: ValueScalar::Json,
+            },
+        });
+    }
+    if let CommandValue::Argument { arg } = value {
+        let field = arguments.roots.get(arg).ok_or_else(|| {
+            PlanError::validation(path, format!("unknown command argument '{arg}'"))
+        })?;
+        copy_referenced_named_objects(
+            &field.type_ref,
+            &arguments.named_objects,
+            named_objects,
+            path,
+        )?;
+        return Ok(field.type_ref.clone());
+    }
+    let static_type = value_type(value, context, None, ValueUse::Effect, path)?;
+    contract_type_from_static_closed(
+        &static_type,
+        context.metadata,
+        context.rules,
+        named_objects,
+        path,
+    )
+}
+
+fn copy_referenced_named_objects(
+    root: &TypeRef,
+    source: &BTreeMap<String, ValueObjectContract>,
+    target: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<(), PlanError> {
+    let mut pending = vec![root.clone()];
+    while let Some(type_ref) = pending.pop() {
+        match type_ref.value_type {
+            ValueType::List { element } => pending.push(*element),
+            ValueType::Object { fields } => {
+                pending.extend(fields.into_values().map(|field| field.type_ref));
+            }
+            ValueType::Ref { name } => {
+                if target.contains_key(&name) {
+                    continue;
+                }
+                let object = source.get(&name).cloned().ok_or_else(|| {
+                    PlanError::validation(
+                        path,
+                        format!("value contract references unknown object '{name}'"),
+                    )
+                })?;
+                pending.extend(object.fields.values().map(|field| field.type_ref.clone()));
+                target.insert(name, object);
+            }
+            ValueType::Scalar { .. } | ValueType::Enum { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn compile_command_argument_contract(
@@ -1099,50 +2086,217 @@ fn contract_type_from_rule(
     })
 }
 
-fn contract_type_from_static(type_: &StaticType, path: &str) -> Result<TypeRef, PlanError> {
-    let parsed = match type_ {
-        StaticType::Scalar(name) => TypeRef::parse(name).map(|mut type_ref| {
-            type_ref.nullable = false;
-            type_ref
-        }),
-        StaticType::Object { name, .. } | StaticType::ObjectRef { name } => Ok(TypeRef {
-            nullable: false,
-            value_type: ValueType::Ref { name: name.clone() },
-        }),
-        StaticType::List(element) => Ok(TypeRef {
-            nullable: false,
-            value_type: ValueType::List {
-                element: Box::new(contract_type_from_static(element, path)?),
-            },
-        }),
-        StaticType::Row(fields) => Ok(TypeRef {
-            nullable: false,
-            value_type: ValueType::Object {
-                fields: contract_fields_from_static(fields, path)?,
-            },
-        }),
-        StaticType::Rows(fields) => Ok(TypeRef {
-            nullable: false,
-            value_type: ValueType::List {
-                element: Box::new(TypeRef {
-                    nullable: false,
-                    value_type: ValueType::Object {
-                        fields: contract_fields_from_static(fields, path)?,
-                    },
-                }),
-            },
-        }),
-        StaticType::Nullable(inner) => {
-            let mut type_ref = contract_type_from_static(inner, path)?;
-            type_ref.nullable = true;
-            Ok(type_ref)
+fn contract_type_from_static_closed(
+    type_: &StaticType,
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
+    if let StaticType::Nullable(inner) = type_ {
+        let mut type_ref =
+            contract_type_from_static_closed(inner, metadata, rules, named_objects, path)?;
+        type_ref.nullable = true;
+        return Ok(type_ref);
+    }
+    let value_type = match type_ {
+        StaticType::Scalar(name) => {
+            return contract_scalar_type(name, metadata, rules, named_objects, path);
         }
+        StaticType::Object { name, fields } => {
+            ensure_static_named_object(name, fields, metadata, rules, named_objects, path)?;
+            ValueType::Ref { name: name.clone() }
+        }
+        StaticType::ObjectRef { name } => {
+            ensure_resolved_named_object(name, metadata, rules, named_objects, path)?;
+            ValueType::Ref { name: name.clone() }
+        }
+        StaticType::List(element) => ValueType::List {
+            element: Box::new(contract_type_from_static_closed(
+                element,
+                metadata,
+                rules,
+                named_objects,
+                path,
+            )?),
+        },
+        StaticType::Row(fields) => ValueType::Object {
+            fields: contract_fields_from_static_closed(
+                fields,
+                true,
+                metadata,
+                rules,
+                named_objects,
+                path,
+            )?,
+        },
+        StaticType::Rows(fields) => ValueType::List {
+            element: Box::new(TypeRef {
+                nullable: false,
+                value_type: ValueType::Object {
+                    fields: contract_fields_from_static_closed(
+                        fields,
+                        true,
+                        metadata,
+                        rules,
+                        named_objects,
+                        path,
+                    )?,
+                },
+            }),
+        },
+        StaticType::Nullable(_) => unreachable!("nullable types are handled above"),
     };
-    parsed.map_err(|error| PlanError::validation(path, error.to_string()))
+    Ok(TypeRef {
+        nullable: false,
+        value_type,
+    })
 }
 
-fn contract_fields_from_static(
+fn contract_scalar_type(
+    name: &str,
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<TypeRef, PlanError> {
+    let scalar = match name {
+        "Boolean" | "bool" | "boolean" => Some(ValueScalar::Boolean),
+        "String" | "string" | "ID" | "text" | "varchar" | "bpchar" | "name" | "citext" => {
+            Some(ValueScalar::String)
+        }
+        "Int" | "int" | "int2" | "int4" | "serial" | "int32" => Some(ValueScalar::Int32),
+        "int8" | "bigint" | "bigserial" | "int64" => Some(ValueScalar::Int64),
+        "uint64" => Some(ValueScalar::UInt64),
+        "Float" | "float" | "float4" | "float8" | "numeric" | "decimal" => {
+            Some(ValueScalar::Decimal)
+        }
+        "uuid" => Some(ValueScalar::Uuid),
+        "date" => Some(ValueScalar::Date),
+        "timestamp" | "timestamp without time zone" => Some(ValueScalar::Timestamp),
+        "timestamptz" | "timestamp with time zone" => Some(ValueScalar::TimestampTz),
+        "json" | "jsonb" => Some(ValueScalar::Json),
+        _ => None,
+    };
+    if let Some(scalar) = scalar {
+        return Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::Scalar { scalar },
+        });
+    }
+    if let Some(enum_) = metadata
+        .custom_types
+        .enums
+        .iter()
+        .find(|enum_| enum_.name == name)
+    {
+        return Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::Enum {
+                name: name.to_owned(),
+                values: enum_
+                    .values
+                    .iter()
+                    .map(|value| value.value.clone())
+                    .collect(),
+            },
+        });
+    }
+    if metadata
+        .custom_types
+        .scalars
+        .iter()
+        .any(|scalar| scalar.name == name)
+    {
+        return Ok(TypeRef {
+            nullable: false,
+            value_type: ValueType::Scalar {
+                scalar: ValueScalar::Custom {
+                    name: name.to_owned(),
+                },
+            },
+        });
+    }
+    if let Some(rule_type) = rules.declared_type(name) {
+        let mut type_ref = contract_type_from_rule(rule_type, named_objects, path)?;
+        type_ref.nullable = false;
+        return Ok(type_ref);
+    }
+    Err(PlanError::validation(
+        path,
+        format!("scalar '{name}' has no closed value contract"),
+    ))
+}
+
+fn ensure_static_named_object(
+    name: &str,
     fields: &BTreeMap<String, StaticType>,
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<(), PlanError> {
+    if named_objects.contains_key(name) {
+        return Ok(());
+    }
+    named_objects.insert(
+        name.to_owned(),
+        ValueObjectContract {
+            fields: BTreeMap::new(),
+        },
+    );
+    let fields =
+        contract_fields_from_static_closed(fields, false, metadata, rules, named_objects, path)?;
+    named_objects.insert(name.to_owned(), ValueObjectContract { fields });
+    Ok(())
+}
+
+fn ensure_resolved_named_object(
+    name: &str,
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
+    path: &str,
+) -> Result<(), PlanError> {
+    if named_objects.contains_key(name) {
+        return Ok(());
+    }
+    if let Some(input) = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .find(|input| input.name == name)
+    {
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| {
+                Ok((
+                    field.name.clone(),
+                    parse_command_type(metadata, rules, &field.type_, path)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
+        return ensure_static_named_object(name, &fields, metadata, rules, named_objects, path);
+    }
+    if let Some(declared_type) = rules.declared_type(name) {
+        let static_type = rule_type(declared_type);
+        if let StaticType::Object { fields, .. } = static_type {
+            return ensure_static_named_object(name, &fields, metadata, rules, named_objects, path);
+        }
+    }
+    Err(PlanError::validation(
+        path,
+        format!("value contract references unknown object '{name}'"),
+    ))
+}
+
+fn contract_fields_from_static_closed(
+    fields: &BTreeMap<String, StaticType>,
+    values_are_always_present: bool,
+    metadata: &Metadata,
+    rules: &RuleCatalog,
+    named_objects: &mut BTreeMap<String, ValueObjectContract>,
     path: &str,
 ) -> Result<BTreeMap<String, ValueContractField>, PlanError> {
     fields
@@ -1151,8 +2305,15 @@ fn contract_fields_from_static(
             Ok((
                 name.clone(),
                 ValueContractField {
-                    required: true,
-                    type_ref: contract_type_from_static(type_, path)?,
+                    required: values_are_always_present
+                        || !matches!(type_, StaticType::Nullable(_)),
+                    type_ref: contract_type_from_static_closed(
+                        type_,
+                        metadata,
+                        rules,
+                        named_objects,
+                        path,
+                    )?,
                 },
             ))
         })
@@ -3273,9 +4434,21 @@ fn validate_step(
                     .map(|name| Ok((name.clone(), output_type(name)?)))
                     .collect::<Result<BTreeMap<_, _>, PlanError>>()
             };
-            let groups = output(&allocate_many.returning.groups)?;
             let lines = output(&allocate_many.returning.lines)?;
             let backorders = output(&allocate_many.returning.backorders)?;
+            let groups = allocate_many
+                .returning
+                .groups
+                .iter()
+                .map(|name| {
+                    let type_ = if name == "items" {
+                        StaticType::List(Box::new(StaticType::Row(lines.clone())))
+                    } else {
+                        output_type(name)?
+                    };
+                    Ok((name.clone(), type_))
+                })
+                .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
             validate_total_output_order(
                 &allocate_many.group_order_by,
                 &groups,

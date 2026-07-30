@@ -8,7 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
+use donat_connector_abi::OperationId;
+use donat_connector_catalog::OperationSpec;
 use donat_metadata::{ConnectorBaseUrl, ConnectorConfig, ConnectorOperation, Metadata};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -16,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::state::{ConnectorStartupError, validate_connector_startup};
 
+mod catalog;
 pub mod http;
 pub mod stripe;
 
@@ -283,9 +287,13 @@ fn stripe_configuration_fingerprint(
     format!("{:x}", Sha256::digest(bytes))
 }
 
+type OperationSpecHandles =
+    BTreeMap<String, BTreeMap<String, BTreeMap<OperationId, Arc<OperationSpec>>>>;
+
 /// Immutable lookup table of deployment-selected connector instances.
 pub struct ConnectorRegistry {
     instances: BTreeMap<String, RegistryInstance>,
+    operation_specs: OperationSpecHandles,
 }
 
 impl ConnectorRegistry {
@@ -300,7 +308,26 @@ impl ConnectorRegistry {
     pub fn build(metadata: &Metadata) -> Result<Self, ConnectorRegistryError> {
         validate_connector_startup(metadata).map_err(ConnectorRegistryError::Startup)?;
 
+        let source_name = if metadata.connectors.is_empty() {
+            None
+        } else {
+            let postgres_sources = metadata
+                .sources
+                .iter()
+                .filter(|source| source.kind == donat_metadata::SourceKind::Postgres)
+                .collect::<Vec<_>>();
+            if postgres_sources.len() != 1 {
+                return Err(ConnectorRegistryError::ImplicitSourceBinding {
+                    postgres_sources: postgres_sources.len(),
+                });
+            }
+            Some(postgres_sources[0].name.clone())
+        };
         let mut instances = BTreeMap::new();
+        let mut operation_specs = BTreeMap::new();
+        if let Some(source_name) = &source_name {
+            operation_specs.insert(source_name.clone(), BTreeMap::new());
+        }
         for instance in &metadata.connectors {
             let registered = match instance.module.as_str() {
                 "http" => {
@@ -311,12 +338,46 @@ impl ConnectorRegistry {
                         })?;
                     let base_url_digest = connector.base_url_digest();
                     let mut operations = BTreeMap::new();
+                    let executable_specs = operation_specs
+                        .get_mut(
+                            source_name
+                                .as_deref()
+                                .expect("connector instances have one Postgres source"),
+                        )
+                        .expect("the connector source operation table was initialized")
+                        .entry(instance.name.clone())
+                        .or_insert_with(BTreeMap::new);
                     for operation in &instance.operations {
                         let validated = http::ValidatedHttpOperation::from_metadata(operation)
                             .map_err(|error| ConnectorRegistryError::InvalidConfiguration {
                                 instance: instance.name.clone(),
                                 message: error.to_string(),
                             })?;
+                        if let Some(spec) = catalog::compile_http_operation_spec(
+                            metadata,
+                            HTTP_DEFINITION,
+                            instance,
+                            operation,
+                        )
+                        .map_err(|message| {
+                            ConnectorRegistryError::InvalidConfiguration {
+                                instance: instance.name.clone(),
+                                message,
+                            }
+                        })? {
+                            if executable_specs
+                                .insert(spec.operation, Arc::new(spec))
+                                .is_some()
+                            {
+                                return Err(ConnectorRegistryError::InvalidConfiguration {
+                                    instance: instance.name.clone(),
+                                    message: format!(
+                                        "executable catalog operation `{}` is declared more than once",
+                                        operation.name
+                                    ),
+                                });
+                            }
+                        }
                         let compiled = CompiledHttpOperation {
                             configuration_fingerprint: http_configuration_fingerprint(
                                 HTTP_DEFINITION,
@@ -397,7 +458,10 @@ impl ConnectorRegistry {
             };
             instances.insert(instance.name.clone(), registered);
         }
-        Ok(Self { instances })
+        Ok(Self {
+            instances,
+            operation_specs,
+        })
     }
 
     /// Empty immutable registry for existing server tests that deliberately do
@@ -405,7 +469,46 @@ impl ConnectorRegistry {
     pub fn empty() -> Self {
         Self {
             instances: BTreeMap::new(),
+            operation_specs: BTreeMap::new(),
         }
+    }
+
+    /// Resolve one executable, catalog-owned operation descriptor within its
+    /// deployment source. Runtime transport state, secret values, and resolved
+    /// endpoint URLs are deliberately absent from the returned snapshot.
+    pub fn operation_spec(
+        &self,
+        source_name: &str,
+        instance_name: &str,
+        operation: OperationId,
+    ) -> Option<&OperationSpec> {
+        self.operation_spec_entry(source_name, instance_name, operation)
+            .map(Arc::as_ref)
+    }
+
+    /// Clone the shared immutable handle for a compiled dependency that must
+    /// outlive a temporary registry borrow. This clones only the `Arc`, never
+    /// the catalog-owned behavioral snapshot.
+    pub fn operation_spec_handle(
+        &self,
+        source_name: &str,
+        instance_name: &str,
+        operation: OperationId,
+    ) -> Option<Arc<OperationSpec>> {
+        self.operation_spec_entry(source_name, instance_name, operation)
+            .cloned()
+    }
+
+    fn operation_spec_entry(
+        &self,
+        source_name: &str,
+        instance_name: &str,
+        operation: OperationId,
+    ) -> Option<&Arc<OperationSpec>> {
+        self.operation_specs
+            .get(source_name)?
+            .get(instance_name)?
+            .get(&operation)
     }
 
     pub fn http_instance(&self, name: &str) -> Option<&http::HttpConnector> {
@@ -505,6 +608,7 @@ impl ConnectorRegistry {
 #[derive(Debug)]
 pub enum ConnectorRegistryError {
     Startup(ConnectorStartupError),
+    ImplicitSourceBinding { postgres_sources: usize },
     UnknownModule { instance: String, module: String },
     InvalidConfiguration { instance: String, message: String },
 }
@@ -513,6 +617,10 @@ impl fmt::Display for ConnectorRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Startup(error) => error.fmt(formatter),
+            Self::ImplicitSourceBinding { postgres_sources } => write!(
+                formatter,
+                "connector instances without an explicit source require exactly one Postgres source; found {postgres_sources}"
+            ),
             Self::UnknownModule { instance, module } => write!(
                 formatter,
                 "connector instance `{instance}` selects unavailable compiled module `{module}`"

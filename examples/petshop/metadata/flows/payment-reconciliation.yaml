@@ -41,8 +41,6 @@ states:
         payment_id: { input: payment_id }
         provider_event_id: { input: provider_event_id }
         provider_reference: { input: expected_provider_reference }
-      idempotency_key:
-        stable: { run: id, state: request_reconciliation }
       timeout:
         schedule_to_start: 5s
         start_to_close: 6s
@@ -66,7 +64,7 @@ states:
           with:
             local_amount_minor: { input: expected_amount_minor }
             local_currency: { input: expected_currency }
-            local_status: { input: expected_status }
+            local_status: { input: expected_status, as: string }
             local_provider_reference: { input: expected_provider_reference }
             provider_amount_minor: { state: request_reconciliation, field: provider_amount_minor }
             provider_currency: { state: request_reconciliation, field: provider_currency }

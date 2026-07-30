@@ -8,9 +8,9 @@ use std::path::Path;
 use donat_metadata::{
     ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandResultValue,
     CommandStepOperation, CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger,
-    DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable, RemoteSchema,
-    RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration, TableEntry,
-    action_visible_to_role, load_metadata_dir,
+    DatabaseUrl, InsertPermission, Metadata, PermissionEntry, Process, ProcessLifecycle,
+    ProcessValue, QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission,
+    SourceKind, TableConfiguration, TableEntry, action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -40,6 +40,86 @@ permission:
         entry.permission.filter["$or"][1]["is_public"]["$eq"],
         json!(true)
     );
+}
+
+#[test]
+fn process_lifecycle_defaults_active_and_retains_explicit_retired() {
+    let definition = |lifecycle: &str| {
+        format!(
+            r#"
+name: archived_checkout
+kind: process
+version: 1
+source: default
+{lifecycle}
+permissions:
+  - role: customer
+start_at: done
+states:
+  - id: done
+    output: {{ values: {{}} }}
+"#
+        )
+    };
+
+    let active: Process = serde_yaml::from_str(&definition(""))
+        .expect("omitted process lifecycle defaults to active");
+    assert_eq!(active.lifecycle, ProcessLifecycle::Active);
+
+    let retired: Process = serde_yaml::from_str(&definition("lifecycle: retired"))
+        .expect("explicit retired process lifecycle deserializes");
+    assert_eq!(retired.lifecycle, ProcessLifecycle::Retired);
+    let serialized = serde_yaml::to_string(&retired).expect("retired lifecycle serializes");
+    assert!(serialized.contains("lifecycle: retired"));
+}
+
+#[test]
+fn process_values_retain_explicit_closed_casts() {
+    let value: ProcessValue = serde_yaml::from_str("{ input: order_id, as: string }")
+        .expect("input values accept the closed scalar cast");
+    let ProcessValue::Input {
+        input,
+        as_,
+        require_non_null,
+    } = value
+    else {
+        panic!("input binding must retain its variant");
+    };
+    assert_eq!(input, "order_id");
+    assert_eq!(as_.as_deref(), Some("string"));
+    assert!(!require_non_null);
+
+    let value: ProcessValue = serde_yaml::from_str("{ activity_key: finalize_order, as: uuid }")
+        .expect("activity keys accept an explicit deterministic UUID cast");
+    let ProcessValue::ActivityKey { activity_key, as_ } = value else {
+        panic!("activity key binding must retain its variant");
+    };
+    assert_eq!(activity_key, "finalize_order");
+    assert_eq!(as_.as_deref(), Some("uuid"));
+
+    let value: ProcessValue = serde_yaml::from_str("{ item: outcome, as: string }")
+        .expect("for_each items accept the closed scalar cast");
+    let ProcessValue::Item { item, as_ } = value else {
+        panic!("item binding must retain its variant");
+    };
+    assert_eq!(item, "outcome");
+    assert_eq!(as_.as_deref(), Some("string"));
+
+    let value: ProcessValue =
+        serde_yaml::from_str("{ state: inspected, field: refund_id, require_non_null: true }")
+            .expect("state values retain an explicit non-null runtime assertion");
+    let ProcessValue::State {
+        state,
+        field,
+        require_non_null,
+        ..
+    } = value
+    else {
+        panic!("state binding must retain its variant");
+    };
+    assert_eq!(state, "inspected");
+    assert_eq!(field, "refund_id");
+    assert!(require_non_null);
 }
 
 #[test]

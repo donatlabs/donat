@@ -1099,6 +1099,7 @@ pub struct ProcessEffectContract {
     pub current_revision: String,
     pub start_policy: ProcessStartPolicy,
     pub start_input: ValueContractCatalog,
+    pub process_key: Option<TypeRef>,
     pub signals: BTreeMap<String, ProcessSignalEffectContract>,
 }
 
@@ -1138,8 +1139,9 @@ pub struct FinalizedStartProcessEffect {
     pub process_name: String,
     pub process_revision: String,
     pub start_policy: ProcessStartPolicy,
-    pub input: BTreeMap<String, CommandExecutionValue>,
-    pub semantic_idempotency_key: CommandExecutionValue,
+    pub process_key: Option<CommandValue>,
+    pub input: BTreeMap<String, CommandValue>,
+    pub semantic_idempotency_key: CommandIdempotencyKey,
     pub effect_position: u32,
 }
 
@@ -1148,9 +1150,10 @@ pub struct FinalizedSignalProcessEffect {
     pub process_name: String,
     pub process_revision: String,
     pub signal_name: String,
-    pub correlation: BTreeMap<String, CommandExecutionValue>,
-    pub payload: BTreeMap<String, CommandExecutionValue>,
-    pub semantic_idempotency_key: CommandExecutionValue,
+    pub correlation: BTreeMap<String, CommandValue>,
+    pub payload: BTreeMap<String, CommandValue>,
+    pub semantic_idempotency_key: CommandIdempotencyKey,
+    pub compatible_revisions: BTreeSet<String>,
     pub effect_position: u32,
 }
 
@@ -1245,6 +1248,12 @@ dependency.
   Finalization validates exact source/type/binding/compatible revisions
   without changing the pre-process command fingerprint. Keep the process
   compiler and free constructor server-owned.
+
+  Finalized effects retain typed symbolic `CommandValue` bindings because
+  request arguments, the explicit session, and prior-step rows do not exist
+  during deployment compilation. Request planning is the only stage that
+  lowers those pinned templates to `CommandExecutionValue`; SQLgen never
+  receives raw metadata.
 
 - [ ] **Step 4: Remove stale state commentary**
 

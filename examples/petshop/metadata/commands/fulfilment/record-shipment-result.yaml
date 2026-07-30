@@ -5,6 +5,8 @@ permissions:
 arguments:
   - name: shipment_id
     type: uuid!
+  - name: allocation_id
+    type: uuid!
   - name: provider_event_id
     type: string!
   - name: outcome
@@ -21,7 +23,9 @@ steps:
   - name: shipment
     select_one:
       table: { schema: public, name: shipment }
-      by: { id: { arg: shipment_id } }
+      by:
+        id: { arg: shipment_id }
+        allocation_id: { arg: allocation_id }
       returning: [id, allocation_id, order_id, shipment_key, status, shipped_value_minor, currency]
       require_found: true
   - name: result_event
@@ -58,7 +62,7 @@ steps:
       require_affected: true
 result:
   shipment_id: { arg: shipment_id }
-  allocation_id: { step: shipment, column: allocation_id }
+  allocation_id: { arg: allocation_id }
   outcome: { arg: outcome }
   tracking_number: { arg: tracking_number }
   failure_code: { arg: failure_code }

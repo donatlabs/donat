@@ -226,6 +226,10 @@ rules:
     parameters: { outcome: PaymentOutcome! }
     result: PaymentState!
     expression: "outcome == PaymentOutcome::authorized ? PaymentState::authorized : outcome == PaymentOutcome::challenged ? PaymentState::pending : outcome == PaymentOutcome::captured ? PaymentState::captured : outcome == PaymentOutcome::voided ? PaymentState::voided : outcome == PaymentOutcome::refunded ? PaymentState::refunded : outcome == PaymentOutcome::chargeback ? PaymentState::chargeback : PaymentState::failed"
+  - name: normalize_payment_state_text
+    parameters: { state: string! }
+    result: PaymentState!
+    expression: "state == \"pending\" ? PaymentState::pending : state == \"cancellation_requested\" ? PaymentState::cancellation_requested : state == \"authorized\" ? PaymentState::authorized : state == \"void_in_progress\" ? PaymentState::void_in_progress : state == \"captured\" ? PaymentState::captured : state == \"voided\" ? PaymentState::voided : state == \"refunded\" ? PaymentState::refunded : state == \"chargeback\" ? PaymentState::chargeback : PaymentState::failed"
   - name: can_authorize_payment_amount
     parameters: { current_state: string!, payment_amount_minor: bigint!, requested_amount_minor: bigint! }
     result: bool!

@@ -72,7 +72,7 @@ states:
         connector: mock_payout
         operation: lookup_payout
         input:
-          payout_id: { item: payout_id }
+          payout_id: { item: id }
           payout_key: { item: payout_key }
           activity_key: { item: activity_key }
         timeout:

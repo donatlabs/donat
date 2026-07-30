@@ -739,6 +739,8 @@ dependencies = [
  "deadpool-postgres",
  "donat-backend",
  "donat-catalog",
+ "donat-connector-abi",
+ "donat-connector-catalog",
  "donat-ir",
  "donat-metadata",
  "donat-rules",

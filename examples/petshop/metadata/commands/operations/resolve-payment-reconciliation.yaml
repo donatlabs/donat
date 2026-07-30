@@ -69,5 +69,5 @@ effects:
         provider_event_id: { step: resolved_reconciliation, column: provider_event_id }
       payload:
         reconciliation_id: { step: resolved_reconciliation, column: id }
-        reconciliation_status: { step: resolved_reconciliation, column: status }
+        reconciliation_status: { literal: resolved }
       idempotency_key: { argument: resolution_id }

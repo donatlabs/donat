@@ -6,7 +6,7 @@ permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { session_variable: x-donat-user-id }
 input:
   - { name: cart_id, type: bigint! }
@@ -79,7 +79,7 @@ states:
         payment_id: { state: checkout, field: payment_id }
         amount_minor: { state: checkout, field: total_minor }
         currency: { state: checkout, field: currency }
-        request_id: { state: checkout, field: authorization_activity_key }
+        request_id: { state: checkout, field: authorization_activity_key, require_non_null: true }
       idempotency_key:
         stable: { run: id, state: request_authorization }
       timeout:
@@ -149,7 +149,7 @@ states:
       input:
         payment_id: { state: checkout, field: payment_id }
         resource_kind: { literal: authorization }
-        resource_id: { state: checkout, field: order_id }
+        resource_id: { state: checkout, field: order_id, as: string }
         activity_key: { activity_key: request_authorization }
       timeout:
         schedule_to_start: 5s

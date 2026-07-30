@@ -45,7 +45,7 @@ states:
         arguments:
           allocation_id: { item: allocation_id }
           packed_at: { workflow_time: now }
-          request_id: { activity_key: packed }
+          request_id: { activity_key: packed, as: uuid }
       next: create_shipment_units
 
   - id: create_shipment_units
@@ -61,7 +61,7 @@ states:
         arguments:
           allocation_id: { item: allocation_id }
           shipment_key: { activity_key: shipment }
-          request_id: { activity_key: create_shipment }
+          request_id: { activity_key: create_shipment, as: uuid }
       next: request_labels
 
   - id: request_labels
@@ -71,6 +71,7 @@ states:
       max_items: 64
       max_concurrency: 8
       completion: collect
+      preserve_input: true
       request:
         connector: mock_carrier
         operation: create_label
@@ -142,8 +143,9 @@ states:
         run_as: fulfilment
         arguments:
           shipment_id: { item: shipment_id }
+          allocation_id: { item: allocation_id }
           provider_event_id: { item: provider_event_id }
-          outcome: { item: normalized_outcome }
+          outcome: { item: normalized_outcome, as: string }
           carrier_shipment_reference: { item: carrier_shipment_reference }
           tracking_number: { item: tracking_number }
           failure_code: { item: failure_code }
@@ -162,8 +164,9 @@ states:
         run_as: fulfilment
         arguments:
           shipment_id: { item: shipment_id }
+          allocation_id: { item: allocation_id }
           provider_event_id: { item: provider_event_id }
-          outcome: { item: normalized_outcome }
+          outcome: { item: normalized_outcome, as: string }
           carrier_shipment_reference: { item: carrier_shipment_reference }
           tracking_number: { item: tracking_number }
           failure_code: { item: failure_code }
@@ -196,7 +199,7 @@ states:
               currency: currency
             maximum_lists: 64
             maximum_items: 64
-        request_id: { activity_key: claim_payment_captures }
+        request_id: { activity_key: claim_payment_captures, as: uuid }
       next: request_payment_captures
 
   - id: request_payment_captures

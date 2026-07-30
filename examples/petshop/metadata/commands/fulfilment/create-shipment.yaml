@@ -57,9 +57,9 @@ steps:
       returning: [shipment_id, order_line_id, quantity, line_value_minor]
 result:
   shipment_id: { step: shipment, column: id }
-  allocation_id: { step: shipment, column: allocation_id }
-  shipment_key: { step: shipment, column: shipment_key }
-  stock_location_code: { step: shipment, column: stock_location_code }
+  allocation_id: { arg: allocation_id }
+  shipment_key: { arg: shipment_key }
+  stock_location_code: { step: allocation, column: stock_location_code }
   shipped_value_minor: { step: shipment, column: shipped_value_minor }
   currency: { step: shipment, column: currency }
   items:

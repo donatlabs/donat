@@ -62,7 +62,7 @@ states:
       input:
         payment_id: { state: create_renewal_order, field: payment_id }
         resource_kind: { literal: authorization }
-        resource_id: { state: create_renewal_order, field: renewal_id }
+        resource_id: { state: create_renewal_order, field: renewal_id, as: string }
         activity_key: { activity_key: authorize_initial }
       timeout:
         schedule_to_start: 5s
@@ -219,7 +219,7 @@ states:
       input:
         payment_id: { state: create_renewal_order, field: payment_id }
         resource_kind: { literal: authorization }
-        resource_id: { state: create_renewal_order, field: renewal_id }
+        resource_id: { state: create_renewal_order, field: renewal_id, as: string }
         activity_key: { activity_key: authorize_first_retry }
       timeout:
         schedule_to_start: 5s
@@ -376,7 +376,7 @@ states:
       input:
         payment_id: { state: create_renewal_order, field: payment_id }
         resource_kind: { literal: authorization }
-        resource_id: { state: create_renewal_order, field: renewal_id }
+        resource_id: { state: create_renewal_order, field: renewal_id, as: string }
         activity_key: { activity_key: authorize_second_retry }
       timeout:
         schedule_to_start: 5s
@@ -520,7 +520,7 @@ states:
       arguments:
         subscription_id: { input: subscription_id }
         reason: { literal: dunning_schedule_exhausted }
-        request_id: { activity_key: terminal_pause }
+        request_id: { activity_key: terminal_pause, as: uuid }
       next: paused
 
   - id: renewed

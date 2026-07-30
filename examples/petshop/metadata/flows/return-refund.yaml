@@ -6,7 +6,7 @@ permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
 owner:
-  type: bigint!
+  type: string!
   capture: { session_variable: x-donat-user-id }
 input:
   - { name: order_id, type: uuid! }
@@ -100,7 +100,7 @@ states:
       operation: create_return_label
       input:
         return_id: { state: request_return, field: return_id }
-        return_key: { state: request_return, field: return_id }
+        return_key: { state: request_return, field: return_id, as: string }
         return_from: { state: request_return, field: return_from }
         currency: { state: request_return, field: currency }
         return_items: { state: request_return, field: items }
@@ -164,10 +164,10 @@ states:
       connector: mock_payment
       operation: refund
       input:
-        payment_id: { state: await_inspection, field: payment_id }
-        refund_id: { state: await_inspection, field: refund_id }
-        amount_minor: { state: await_inspection, field: refund_amount_minor }
-        currency: { state: await_inspection, field: currency }
+        payment_id: { state: await_inspection, field: payment_id, require_non_null: true }
+        refund_id: { state: await_inspection, field: refund_id, require_non_null: true }
+        amount_minor: { state: await_inspection, field: refund_amount_minor, require_non_null: true }
+        currency: { state: await_inspection, field: currency, require_non_null: true }
         reason: { input: reason }
       idempotency_key:
         stable: { run: id, state: request_refund }
@@ -202,12 +202,12 @@ states:
       name: complete_refund
       run_as: payment_worker
       arguments:
-        payment_id: { state: await_inspection, field: payment_id }
-        refund_id: { state: await_inspection, field: refund_id }
+        payment_id: { state: await_inspection, field: payment_id, require_non_null: true }
+        refund_id: { state: await_inspection, field: refund_id, require_non_null: true }
         provider_refund_id: { state: request_refund, field: provider_refund_id }
         provider_event_id: { state: request_refund, field: provider_event_id }
-        amount_minor: { state: await_inspection, field: refund_amount_minor }
-        currency: { state: await_inspection, field: currency }
+        amount_minor: { state: await_inspection, field: refund_amount_minor, require_non_null: true }
+        currency: { state: await_inspection, field: currency, require_non_null: true }
         payload: { state: request_refund, field: normalized_payload }
       next: finalize_refund
 
@@ -216,9 +216,9 @@ states:
       connector: mock_payment
       operation: lookup_operation
       input:
-        payment_id: { state: await_inspection, field: payment_id }
+        payment_id: { state: await_inspection, field: payment_id, require_non_null: true }
         resource_kind: { literal: refund }
-        resource_id: { state: await_inspection, field: refund_id, as: string }
+        resource_id: { state: await_inspection, field: refund_id, as: string, require_non_null: true }
         activity_key: { activity_key_for_state: request_refund }
       timeout:
         schedule_to_start: 5s
@@ -251,8 +251,8 @@ states:
       name: complete_refund
       run_as: payment_worker
       arguments:
-        payment_id: { state: await_inspection, field: payment_id }
-        refund_id: { state: await_inspection, field: refund_id }
+        payment_id: { state: await_inspection, field: payment_id, require_non_null: true }
+        refund_id: { state: await_inspection, field: refund_id, require_non_null: true }
         provider_refund_id: { state: lookup_refund, field: provider_mutation_id }
         provider_event_id: { state: lookup_refund, field: provider_event_id }
         amount_minor: { state: lookup_refund, field: amount_minor }
@@ -267,7 +267,7 @@ states:
       arguments:
         return_id: { state: request_return, field: return_id }
         refund_id: { state: record_refund, field: refund_id }
-        request_id: { activity_key: finalize_refund }
+        request_id: { activity_key: finalize_refund, as: uuid }
       next: refunded
 
   - id: finalize_reconciled_refund
@@ -277,7 +277,7 @@ states:
       arguments:
         return_id: { state: request_return, field: return_id }
         refund_id: { state: record_reconciled_refund, field: refund_id }
-        request_id: { activity_key: finalize_reconciled_refund }
+        request_id: { activity_key: finalize_reconciled_refund, as: uuid }
       next: reconciled_refund
 
   - id: create_exchange
@@ -286,8 +286,8 @@ states:
       run_as: fulfilment
       arguments:
         return_id: { state: request_return, field: return_id }
-        exchange_id: { activity_key: exchange }
-        request_id: { activity_key: create_exchange }
+        exchange_id: { activity_key: exchange, as: uuid }
+        request_id: { activity_key: create_exchange, as: uuid }
       next: exchanged
 
   - id: reject_after_inspection
@@ -297,14 +297,14 @@ states:
       arguments:
         return_id: { state: request_return, field: return_id }
         reason_code: { literal: inspection_rejected }
-        request_id: { activity_key: reject_after_inspection }
+        request_id: { activity_key: reject_after_inspection, as: uuid }
       next: rejected_after_inspection
 
   - id: refunded
     output:
       values:
         return_id: { state: request_return, field: return_id }
-        status: { state: finalize_refund, field: status }
+        status: { state: finalize_refund, field: status, as: ReturnState }
         approved_quantity: { state: await_support_decision, field: approved_quantity }
         received_quantity: { state: await_warehouse_receipt, field: received_quantity }
         inspected_quantity: { state: await_inspection, field: inspected_quantity }
@@ -319,7 +319,7 @@ states:
     output:
       values:
         return_id: { state: request_return, field: return_id }
-        status: { state: finalize_reconciled_refund, field: status }
+        status: { state: finalize_reconciled_refund, field: status, as: ReturnState }
         approved_quantity: { state: await_support_decision, field: approved_quantity }
         received_quantity: { state: await_warehouse_receipt, field: received_quantity }
         inspected_quantity: { state: await_inspection, field: inspected_quantity }
@@ -364,7 +364,7 @@ states:
     output:
       values:
         return_id: { state: request_return, field: return_id }
-        status: { state: reject_after_inspection, field: status }
+        status: { state: reject_after_inspection, field: status, as: ReturnState }
         approved_quantity: { state: await_support_decision, field: approved_quantity }
         received_quantity: { state: await_warehouse_receipt, field: received_quantity }
         inspected_quantity: { state: await_inspection, field: inspected_quantity }

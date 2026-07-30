@@ -13,12 +13,15 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::commands::CompiledCommandCatalog;
+use donat_rules::RuleCatalog;
+
+use crate::commands::{CompiledCommandCatalog, validate_and_extract_finalized_command_catalog};
 use crate::introspection::{build_schema_json, execute_introspection_schema_lazy};
 use crate::naming::table_base_name;
 use crate::plan::{
     Fragments, Plan, PlanError, Planner, PlannerIndex, Session, flatten, value_to_json,
 };
+use crate::process_effects::{FinalizedCommandCatalog, ProcessEffectContractCatalog};
 
 /// A source-local query IR, ready for exactly one backend request.
 #[derive(Debug, Clone)]
@@ -238,6 +241,33 @@ impl CompiledMultiSourceSchema {
             },
             infer_function_permissions,
         })
+    }
+
+    /// Construct a serving schema only from a command snapshot whose Process
+    /// effects have been pinned to this exact immutable contract catalog.
+    ///
+    /// This performs validation only. It never reparses metadata into command
+    /// or Process definitions and owns no runtime or journal handles.
+    pub fn compile_with_command_catalog_and_process_effects(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        rules: &RuleCatalog,
+        commands: &FinalizedCommandCatalog,
+        process_effects: &ProcessEffectContractCatalog,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        let command_catalog = validate_and_extract_finalized_command_catalog(
+            metadata,
+            rules,
+            commands,
+            process_effects,
+        )?;
+        Self::compile_with_command_catalog(
+            metadata,
+            catalogs,
+            Arc::new(command_catalog),
+            infer_function_permissions,
+        )
     }
 
     /// The immutable command catalog accepted with this schema snapshot.

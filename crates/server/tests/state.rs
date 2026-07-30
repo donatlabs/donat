@@ -1,14 +1,148 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use donat_metadata::Metadata;
+use donat_catalog::Catalog;
+use donat_ir::ProcessStartPolicy;
+use donat_metadata::{Metadata, ProcessLifecycle};
+use donat_schema::FinalizedCommandEffect;
 use donat_server::{
+    connectors::ConnectorRegistry,
     migrate::check_consistency,
-    state::{ConnectorStartupError, validate_connector_metadata, validate_connector_startup},
+    state::{
+        ConnectorStartupError, compile_pure_engine_candidate, validate_connector_metadata,
+        validate_connector_startup,
+    },
 };
 use serde_json::{Value as Json, json};
 
 static NEXT_METADATA_DIR: AtomicUsize = AtomicUsize::new(0);
+
+fn process_candidate_metadata() -> Metadata {
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": { "database_url": "postgres://unused" }
+            }
+        }],
+        "commands": [{
+            "name": "begin_checkout",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "request_id", "type": "uuid!" },
+                { "name": "order_id", "type": "uuid!" }
+            ],
+            "steps": [],
+            "result": { "order_id": { "arg": "order_id" } },
+            "idempotency": {
+                "key": { "argument": "request_id" },
+                "scope": "command"
+            },
+            "effects": [{
+                "start_process": {
+                    "process": "checkout",
+                    "input": { "order_id": { "arg": "order_id" } },
+                    "idempotency_key": { "argument": "request_id" }
+                }
+            }]
+        }],
+        "processes": [{
+            "name": "checkout",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "input": [{ "name": "order_id", "type": "uuid!" }],
+            "output": [{ "name": "status", "type": "string!" }],
+            "start_at": "done",
+            "states": [{
+                "id": "done",
+                "output": {
+                    "values": { "status": { "literal": "ready" } }
+                }
+            }]
+        }]
+    }))
+    .expect("pure candidate metadata deserializes")
+}
+
+#[test]
+fn process_candidate_stages_are_pure_and_pin_one_snapshot() {
+    let metadata = process_candidate_metadata();
+    let catalogs = HashMap::from([("default".to_owned(), Catalog::default())]);
+    let connectors = ConnectorRegistry::build(&metadata).expect("empty registry compiles");
+
+    let candidate = compile_pure_engine_candidate(&metadata, &catalogs, &connectors, true)
+        .expect("all seven candidate stages compile");
+
+    assert_eq!(candidate.process_catalog.len(), 1);
+    assert!(candidate.rule_catalog().rule("ambient_rule").is_none());
+    let process = candidate
+        .process_catalog
+        .source("default")
+        .unwrap()
+        .process("checkout")
+        .unwrap();
+    let finalized = candidate
+        .finalized_command_catalog
+        .source("default")
+        .unwrap()
+        .command("begin_checkout")
+        .unwrap();
+    let FinalizedCommandEffect::Start(effect) = &finalized.effects[0] else {
+        panic!("begin_checkout must retain one typed start effect");
+    };
+    assert_eq!(effect.process_revision, process.revision_fingerprint);
+    assert_eq!(
+        finalized.command.descriptor().definition_fingerprint,
+        candidate
+            .command_catalog
+            .source("default")
+            .unwrap()
+            .command("begin_checkout")
+            .unwrap()
+            .descriptor()
+            .definition_fingerprint
+    );
+    assert!(
+        candidate
+            .compiled
+            .as_deref()
+            .expect("serving schema is compiled")
+            .command_catalog()
+            .source("default")
+            .unwrap()
+            .command("begin_checkout")
+            .is_some()
+    );
+}
+
+#[test]
+fn process_effect_catalog_retains_explicit_retired_policy() {
+    let mut metadata = process_candidate_metadata();
+    metadata.processes[0].lifecycle = ProcessLifecycle::Retired;
+    let catalogs = HashMap::from([("default".to_owned(), Catalog::default())]);
+    let connectors = ConnectorRegistry::build(&metadata).expect("empty registry compiles");
+
+    let candidate = compile_pure_engine_candidate(&metadata, &catalogs, &connectors, true)
+        .expect("retired definitions remain resolvable");
+    let contract = &candidate.process_effects.sources["default"]["checkout"];
+    assert_eq!(contract.start_policy, ProcessStartPolicy::RejectRetired);
+    let finalized = candidate
+        .finalized_command_catalog
+        .source("default")
+        .unwrap()
+        .command("begin_checkout")
+        .unwrap();
+    let FinalizedCommandEffect::Start(effect) = &finalized.effects[0] else {
+        panic!("begin_checkout must retain one typed start effect");
+    };
+    assert_eq!(effect.start_policy, ProcessStartPolicy::RejectRetired);
+}
 
 fn metadata(connectors: Json) -> Metadata {
     serde_json::from_value(json!({

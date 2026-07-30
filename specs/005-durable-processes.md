@@ -565,6 +565,7 @@ pub struct ProcessEffectContract {
     pub current_revision: String,
     pub start_policy: ProcessStartPolicy,
     pub start_input: ValueContractCatalog,
+    pub process_key: Option<TypeRef>,
     pub signals: BTreeMap<String, ProcessSignalEffectContract>,
 }
 
@@ -580,7 +581,8 @@ pub struct ProcessSignalEffectContract {
 `ProcessStartPolicy` is the closed `donat-ir` enum from Section 2.1;
 `donat-schema` imports it rather than defining a schema-owned copy.
 For each declared process it contains the current revision, explicit start
-policy, and exact start input. A retired declaration remains resolvable but
+policy, exact start input, and optional typed process-key contract. A retired
+declaration remains resolvable but
 finalizes to `RejectRetired`; Task-owned SQL lowering turns that policy into a
 materialized pre-DML `validation-failed` gate with path
 `$.selectionSet.<command-field>` and message
