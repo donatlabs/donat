@@ -38,8 +38,34 @@ register does not waive upstream obligations.
 | CAMUNDA-DMN-DOCS | [Camunda decision-table hit policies](https://docs.camunda.io/docs/8.8/components/modeler/dmn/decision-table-hit-policy/), accessed 2026-07-28 | first/unique decision-table semantics | documentation | behavior-only reference; no code, fixture, or text copy | rules decision-table tests |
 | INNGEST-DOCS | [Inngest concurrency](https://www.inngest.com/docs/guides/concurrency) and [throttling](https://www.inngest.com/docs/guides/throttling), accessed 2026-07-28 | deployment-wide concurrency and throttling concepts | documentation | behavior-only reference for shared operation capacity; no code, fixture, or text copy | two-worker capacity integration tests |
 | IANA-IPV6-SPECIAL | [IANA IPv6 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml), accessed 2026-07-29 | `Globally Reachable` classifications for special-purpose IPv6 prefixes | documentation | behavior-only source for `public_only` egress screening; no code, fixture, or text copy | `crates/server/src/connectors/http.rs` IPv6 public-address regression |
+| RYU-JS-1.0.2 | [boa-dev/ryu-js](https://github.com/boa-dev/ryu-js) b8e8098f350af02a1ad7d21488ed41ab71ec5438 | `src/pretty/mod.rs`, `tests/d2s_test.rs`, crates.io package `ryu-js` 1.0.2 | Apache-2.0 OR BSL-1.0; Donat selects Apache-2.0 | compiled dependency for RFC 8785 / ECMAScript finite-binary64 formatting only; no upstream source is copied | `crates/connector-catalog/tests/remediation_red.rs` |
 
 ## Verified behavior references
+
+### RYU-JS-1.0.2 — RFC 8785 number-format dependency
+
+- Upstream: [boa-dev/ryu-js](https://github.com/boa-dev/ryu-js) @
+  `b8e8098f350af02a1ad7d21488ed41ab71ec5438`
+- Crates.io package checksum:
+  `dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15`
+- Formatter: `src/pretty/mod.rs`
+  (SHA-256: `3d02810bb9bf62756591a46a1a0aef1729ff8d94443b268a147dcd65a5ca6b2b`)
+- Upstream vectors: `tests/d2s_test.rs`
+  (SHA-256: `570a6bcfb6fe3a3c3593f6dbf6bd2e6240668141574f8f3d436d6dc595dc41b1`)
+- License: Apache-2.0 OR BSL-1.0; Donat selects Apache-2.0.
+  `LICENSE-APACHE` SHA-256:
+  `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`.
+- Selected behavior: `Buffer::format_finite` supplies the ECMAScript
+  `Number::toString` spelling required by RFC 8785 after Donat independently
+  proves that a preserved raw decimal token has the same mathematical value
+  as the parsed finite binary64.
+- Destination: direct pure-Rust dependency of `donat-connector-catalog`; it
+  adds no mandatory dependency, build script, JavaScript, Node, WASM,
+  sidecar, or runtime-loaded module. No upstream source is copied.
+- Initial RED evidence: `raw_numbers_use_exact_ecmascript_canonicalization`
+  rejected the old formatter's `1.0 -> 1` contract and
+  `every_finite_rfc_8785_appendix_b_vector_is_exact` independently fixes all
+  finite Appendix B bit-pattern/output pairs.
 
 ### STRIPE-CHECKOUT-PHASE-1 — behavior-only contract audit
 

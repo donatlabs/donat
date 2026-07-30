@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use donat_connector_catalog::{
-    ContractFact, DonatPolicyId, ResolvedContractFactBinding, ResolvedFactValue, SourceSubject,
-    canonical_material_bytes, load_record, split_resolved_fact_bindings,
+    AcceptedRecordCatalog, ContractFact, DonatPolicyId, ResolvedContractFactBinding,
+    ResolvedFactValue, SourceReviewRegistry, SourceSubject, canonical_material_bytes, load_record,
+    resolve_fact_bindings,
 };
 use donat_value_contract::TypedValue;
 
@@ -13,6 +15,26 @@ fn load(name: &str) -> donat_connector_catalog::ConnectorSourceRecord {
             .join(name),
     )
     .unwrap()
+}
+
+fn resolve_policy(
+    values: &[ResolvedFactValue],
+    origins: &[ResolvedContractFactBinding],
+    policies: BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<
+    (
+        Vec<donat_connector_catalog::ResolvedFactValueMaterialV1>,
+        Vec<donat_connector_catalog::ResolvedFactOriginMaterialV1>,
+    ),
+    donat_connector_catalog::CatalogError,
+> {
+    let catalog = AcceptedRecordCatalog::build(
+        Vec::new(),
+        &BTreeMap::new(),
+        &SourceReviewRegistry::default(),
+    )
+    .unwrap();
+    resolve_fact_bindings(values, origins, &catalog, &policies)
 }
 
 #[test]
@@ -59,13 +81,18 @@ fn resolved_fact_use_sites_are_unique_and_equal_across_domains() {
         use_site: "effect.request.binding".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
-            value: donat_connector_catalog::TypedValueMaterialV1::String(
-                "Idempotency-Key".to_owned(),
-            ),
+            value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
+                .unwrap(),
         },
     }];
-    let (semantic, provenance) = split_resolved_fact_bindings(&values, &origins, &[]).unwrap();
-    assert_eq!(semantic[0].use_site, provenance[0].use_site);
+    let policies = [(
+        DonatPolicyId::literal("policy.idempotency.header"),
+        TypedValue::String("Idempotency-Key".to_owned()),
+    )]
+    .into_iter()
+    .collect();
+    let (semantic, provenance) = resolve_policy(&values, &origins, policies).unwrap();
+    assert_eq!(semantic[0].use_site(), provenance[0].use_site());
 
     let duplicate = vec![
         ResolvedFactValue {
@@ -77,7 +104,13 @@ fn resolved_fact_use_sites_are_unique_and_equal_across_domains() {
             value: TypedValue::String("second".to_owned()),
         },
     ];
-    assert!(split_resolved_fact_bindings(&duplicate, &origins, &[]).is_err());
+    let policies = [(
+        DonatPolicyId::literal("policy.idempotency.header"),
+        TypedValue::String("Idempotency-Key".to_owned()),
+    )]
+    .into_iter()
+    .collect();
+    assert!(resolve_policy(&duplicate, &origins, policies).is_err());
 }
 
 #[test]
@@ -90,14 +123,29 @@ fn origin_only_mutation_preserves_semantic_hash() {
         use_site: "effect.request.binding".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::parse(policy).unwrap(),
-            value: donat_connector_catalog::TypedValueMaterialV1::String(
-                "Idempotency-Key".to_owned(),
-            ),
+            value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
+                .unwrap(),
         },
     };
-    let (left, _) =
-        split_resolved_fact_bindings(&values, &[origin("policy.idempotency.header")], &[]).unwrap();
-    let (right, _) = split_resolved_fact_bindings(&values, &[origin("policy.other")], &[]).unwrap();
+    let policies = [
+        (
+            DonatPolicyId::literal("policy.idempotency.header"),
+            TypedValue::String("Idempotency-Key".to_owned()),
+        ),
+        (
+            DonatPolicyId::literal("policy.other"),
+            TypedValue::String("Idempotency-Key".to_owned()),
+        ),
+    ]
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let (left, _) = resolve_policy(
+        &values,
+        &[origin("policy.idempotency.header")],
+        policies.clone(),
+    )
+    .unwrap();
+    let (right, _) = resolve_policy(&values, &[origin("policy.other")], policies).unwrap();
     assert_eq!(
         canonical_material_bytes(&left).unwrap(),
         canonical_material_bytes(&right).unwrap()
@@ -105,14 +153,13 @@ fn origin_only_mutation_preserves_semantic_hash() {
 }
 
 #[test]
-fn value_only_mutation_preserves_direct_origin_material() {
+fn value_only_mutation_is_rejected_before_origin_material_exists() {
     let origin = ResolvedContractFactBinding {
         use_site: "effect.request.binding".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
-            value: donat_connector_catalog::TypedValueMaterialV1::String(
-                "Idempotency-Key".to_owned(),
-            ),
+            value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
+                .unwrap(),
         },
     };
     let values = |value: &str| {
@@ -121,14 +168,17 @@ fn value_only_mutation_preserves_direct_origin_material() {
             value: TypedValue::String(value.to_owned()),
         }]
     };
-    let (_, left) =
-        split_resolved_fact_bindings(&values("first"), std::slice::from_ref(&origin), &[]).unwrap();
-    let (_, right) =
-        split_resolved_fact_bindings(&values("second"), std::slice::from_ref(&origin), &[])
-            .unwrap();
+    let policies = [(
+        DonatPolicyId::literal("policy.idempotency.header"),
+        TypedValue::String("Idempotency-Key".to_owned()),
+    )]
+    .into_iter()
+    .collect();
     assert_eq!(
-        canonical_material_bytes(&left).unwrap(),
-        canonical_material_bytes(&right).unwrap()
+        resolve_policy(&values("first"), std::slice::from_ref(&origin), policies)
+            .unwrap_err()
+            .code(),
+        "catalog_fact_binding_mismatch"
     );
 }
 
@@ -142,12 +192,17 @@ fn contract_fact_semantic_and_provenance_hashes_are_separate() {
         use_site: "effect.request.binding".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
-            value: donat_connector_catalog::TypedValueMaterialV1::String(
-                "Idempotency-Key".to_owned(),
-            ),
+            value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
+                .unwrap(),
         },
     }];
-    let (semantic, provenance) = split_resolved_fact_bindings(&values, &origins, &[]).unwrap();
+    let policies = [(
+        DonatPolicyId::literal("policy.idempotency.header"),
+        TypedValue::String("Idempotency-Key".to_owned()),
+    )]
+    .into_iter()
+    .collect();
+    let (semantic, provenance) = resolve_policy(&values, &origins, policies).unwrap();
     let semantic_bytes = canonical_material_bytes(&semantic).unwrap();
     let provenance_bytes = canonical_material_bytes(&provenance).unwrap();
     assert!(

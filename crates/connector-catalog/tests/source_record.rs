@@ -14,8 +14,14 @@ fn fixture(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn source_record_requires_exact_artifacts() {
-    let error = load_record(fixture("missing-license-file-hash.yaml"))
-        .expect_err("an incomplete record fails closed");
+    let complete = std::fs::read_to_string(fixture("serpapi-npm-record.yaml")).unwrap();
+    let incomplete = complete.replacen(
+        "    license_file_sha256: c1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0\n",
+        "",
+        1,
+    );
+    let error =
+        load_record_bytes(incomplete.as_bytes()).expect_err("an incomplete record fails closed");
     assert_eq!(error.code(), "source_record_incomplete");
 }
 
@@ -87,14 +93,60 @@ fn serpapi_npm_record_round_trips_without_information_loss() {
 }
 
 #[test]
-fn npm_integrity_and_repository_mapping_are_exact() {
-    for name in [
-        "npm-repository-mismatch.yaml",
-        "npm-provenance-mismatch.yaml",
-        "open-dependency-disposition.yaml",
+fn plan_owned_negative_fixtures_are_complete_and_reach_the_named_validator() {
+    let fixture = |name: &str| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    };
+    for (name, code) in [
+        ("missing-license-file-hash.yaml", "source_record_incomplete"),
+        (
+            "npm-repository-mismatch.yaml",
+            "source_record_npm_identity_mismatch",
+        ),
+        (
+            "npm-provenance-mismatch.yaml",
+            "source_record_npm_identity_mismatch",
+        ),
+        (
+            "open-dependency-disposition.yaml",
+            "source_record_incomplete",
+        ),
+        (
+            "policy-as-provider-fact.yaml",
+            "source_record_evidence_mismatch",
+        ),
     ] {
-        assert!(load_record(fixture(name)).is_err(), "{name}");
+        let error = load_record(fixture(name)).unwrap_err();
+        assert_eq!(error.code(), code, "{name}");
     }
+}
+
+#[test]
+fn npm_integrity_and_repository_mapping_are_exact() {
+    let complete = std::fs::read_to_string(fixture("serpapi-npm-record.yaml")).unwrap();
+    let repository_mismatch = complete.replacen(
+        "      commit: 0123456789abcdef0123456789abcdef01234567",
+        "      commit: 1123456789abcdef0123456789abcdef01234567",
+        1,
+    );
+    assert_eq!(
+        load_record_bytes(repository_mismatch.as_bytes())
+            .unwrap_err()
+            .code(),
+        "source_record_npm_identity_mismatch"
+    );
+    let provenance_mismatch = complete.replace(
+        "    provenance_commit: null",
+        "    provenance_commit: 1123456789abcdef0123456789abcdef01234567",
+    );
+    assert_eq!(
+        load_record_bytes(provenance_mismatch.as_bytes())
+            .unwrap_err()
+            .code(),
+        "source_record_npm_identity_mismatch"
+    );
 }
 
 #[test]
@@ -116,7 +168,7 @@ fn npm_signature_provenance_tag_maintainer_and_owner_state_is_exact() {
         package.provenance,
         NpmProvenanceDecision::VerifiedAbsent { .. }
     ));
-    assert_eq!(
+    assert_ne!(
         package.tag_commit.as_deref(),
         Some(package.npm_git_head.as_str())
     );
@@ -159,7 +211,12 @@ fn dependency_and_embedded_dispositions_are_closed() {
             | DependencyDisposition::Rejected { .. } => {}
         }
     }
-    assert!(load_record(fixture("open-dependency-disposition.yaml")).is_err());
+    let complete = std::fs::read_to_string(fixture("serpapi-npm-record.yaml")).unwrap();
+    let open = complete.replace("kind: type_only_replaced", "kind: open");
+    assert_eq!(
+        load_record_bytes(open.as_bytes()).unwrap_err().code(),
+        "source_record_incomplete"
+    );
 }
 
 #[test]

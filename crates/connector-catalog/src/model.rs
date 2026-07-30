@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use donat_connector_abi::{
@@ -6,10 +6,14 @@ use donat_connector_abi::{
     CredentialFieldId, CredentialSpecId, NormalizerId, OperationId, OriginId, ProcessorFamilyId,
     StaticErrorCode, StaticSafeMessage, TriggerId, catalog_construction,
 };
-use donat_value_contract::{TypedValue, ValueContractCatalog};
+use donat_value_contract::{CanonicalNumber, TypedValue, ValueContractCatalog};
 use serde::{Deserialize, Serialize};
 
-use crate::{CatalogError, ContractFact, NoticeId, SourceRecordId};
+use crate::{
+    AcceptedRecordCatalog, CatalogError, ContractFact, DonatPolicyId, LicenseDecision, NoticeId,
+    SourceRecordId, resolve_fact_bindings, selected_response_header, value_contract_material,
+    value_contract_sha256,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -438,6 +442,7 @@ pub struct TypedSerializationKeyDefault {
     pub value: TypedValue,
 }
 
+#[derive(Clone)]
 pub struct ResolvedFactValue {
     pub use_site: String,
     pub value: TypedValue,
@@ -741,6 +746,986 @@ impl ConnectorManifest {
         }
         validate_fact_use_sites(self)
     }
+}
+
+/// A manifest that has passed the complete offline catalog compiler.
+///
+/// Construction is intentionally private so runtime code cannot mistake a
+/// parsed or hand-built manifest for an executable one.
+pub struct CheckedConnectorManifest<'manifest> {
+    manifest: &'manifest ConnectorManifest,
+}
+
+impl CheckedConnectorManifest<'_> {
+    pub const fn manifest(&self) -> &ConnectorManifest {
+        self.manifest
+    }
+}
+
+pub fn compile_connector_manifest<'manifest>(
+    manifest: &'manifest ConnectorManifest,
+    accepted_records: &AcceptedRecordCatalog,
+    reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<CheckedConnectorManifest<'manifest>, CatalogError> {
+    validate_manifest_structure(manifest)?;
+    validate_manifest_primitives(manifest)?;
+    validate_manifest_credentials(manifest)?;
+    validate_manifest_contracts(manifest)?;
+    validate_manifest_selected_headers(manifest)?;
+    validate_manifest_error_maps(manifest)?;
+    validate_manifest_effects(manifest)?;
+    validate_manifest_identity(manifest)?;
+    validate_manifest_provenance(manifest, accepted_records, reviewed_policies)?;
+    Ok(CheckedConnectorManifest { manifest })
+}
+
+fn validate_manifest_structure(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    if manifest.manifest_version == 0
+        || manifest.runtime_abi_epoch == 0
+        || manifest.value_language_epoch == 0
+        || manifest.origins.is_empty()
+        || manifest.operations.is_empty()
+        || manifest.provenance.is_empty()
+    {
+        return Err(CatalogError::new(
+            "catalog_manifest_incomplete",
+            "manifest requires nonzero epochs and complete collections",
+        ));
+    }
+    if manifest
+        .credentials
+        .iter()
+        .any(|credential| credential.fields.is_empty() || credential.allowed_origins.is_empty())
+        || manifest.operations.iter().any(|operation| {
+            operation.origins.is_empty()
+                || operation.steps.is_empty()
+                || operation
+                    .steps
+                    .iter()
+                    .any(|step| step.success_statuses.is_empty())
+        })
+    {
+        return Err(CatalogError::new(
+            "catalog_manifest_incomplete",
+            "credential and operation structural collections are nonempty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_primitives(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    if !valid_catalog_id(&manifest.provider) || !valid_catalog_id(&manifest.api_identity) {
+        return invalid_manifest_primitive("provider/API identity");
+    }
+    for origin in &manifest.origins {
+        if !valid_dns_name(&origin.host) {
+            return invalid_manifest_primitive("fixed-origin DNS host");
+        }
+        if let NetworkPolicy::PrivateAllowed { policy } = &origin.network_policy
+            && !valid_catalog_id(policy)
+        {
+            return invalid_manifest_primitive("private-network policy");
+        }
+    }
+    for credential in &manifest.credentials {
+        if credential
+            .auth_processor
+            .as_ref()
+            .is_some_and(|processor| processor.implementation_revision == 0)
+        {
+            return invalid_manifest_primitive("credential processor revision");
+        }
+        if credential
+            .scopes
+            .iter()
+            .any(|scope| !valid_catalog_token(scope))
+        {
+            return invalid_manifest_primitive("credential scope");
+        }
+        match &credential.auth_plan {
+            AuthPlan::FixedHeaderApiKey { header, .. } => {
+                validate_manifest_header(header)?;
+            }
+            AuthPlan::FixedQueryApiKey { query, .. } => {
+                validate_manifest_query_key(query)?;
+            }
+            AuthPlan::OAuth2ClientCredentials {
+                scopes,
+                token_pointer,
+                ..
+            } => {
+                if scopes.iter().any(|scope| !valid_catalog_token(scope))
+                    || !valid_json_pointer(token_pointer)
+                {
+                    return invalid_manifest_primitive("OAuth scope or token pointer");
+                }
+            }
+            AuthPlan::Bearer { .. }
+            | AuthPlan::HttpBasic { .. }
+            | AuthPlan::PreprovisionedOAuthAccessToken { .. } => {}
+        }
+    }
+    for operation in &manifest.operations {
+        if operation
+            .pre_request_transforms
+            .iter()
+            .chain(&operation.post_response_transforms)
+            .any(|processor| processor.implementation_revision == 0)
+            || operation
+                .operation_processor
+                .as_ref()
+                .is_some_and(|processor| processor.implementation_revision == 0)
+        {
+            return invalid_manifest_primitive("operation processor revision");
+        }
+        for origin in &operation.origins {
+            if !valid_dns_name(&origin.host) {
+                return invalid_manifest_primitive("operation DNS host");
+            }
+        }
+        for step in &operation.steps {
+            if !matches!(
+                step.method.as_str(),
+                "DELETE" | "GET" | "HEAD" | "OPTIONS" | "PATCH" | "POST" | "PUT"
+            ) || !valid_path_template(&step.path)
+                || step
+                    .success_statuses
+                    .iter()
+                    .any(|status| status.minimum > status.maximum)
+            {
+                return invalid_manifest_primitive(
+                    "HTTP method, path template, or success status range",
+                );
+            }
+            for query in &step.query {
+                validate_manifest_query_key(&query.name)?;
+                validate_compiled_binding_primitive(&query.binding)?;
+            }
+            for header in &step.headers {
+                validate_manifest_header(&header.name)?;
+                validate_compiled_binding_primitive(&header.binding)?;
+            }
+            match &step.request {
+                CompiledRequestShape::RawBytes { binding } => {
+                    if !valid_catalog_id(binding) {
+                        return invalid_manifest_primitive("raw request binding");
+                    }
+                }
+                CompiledRequestShape::Json { bindings }
+                | CompiledRequestShape::FormUrlencoded { bindings }
+                | CompiledRequestShape::Multipart { bindings } => {
+                    if bindings.iter().any(|binding| !valid_catalog_id(binding)) {
+                        return invalid_manifest_primitive("request binding");
+                    }
+                }
+                CompiledRequestShape::None => {}
+            }
+            match &step.response {
+                CompiledResponseShape::Json { mappings } => {
+                    if mappings.iter().any(|mapping| {
+                        !valid_json_pointer(&mapping.pointer) || !valid_catalog_id(&mapping.target)
+                    }) {
+                        return invalid_manifest_primitive("response mapping");
+                    }
+                }
+                CompiledResponseShape::RawBytes { target } => {
+                    if !valid_catalog_id(target) {
+                        return invalid_manifest_primitive("raw response target");
+                    }
+                }
+            }
+            for selected in &step.selected_response_headers {
+                validate_manifest_header(&selected.canonical_lowercase_header_name)?;
+            }
+        }
+        validate_pagination_primitives(&operation.pagination)?;
+        for rule in &operation.error_map.rules {
+            match &rule.matcher {
+                ErrorMatcher::ProviderCode { pointer, codes } => {
+                    if !valid_json_pointer(pointer)
+                        || codes.is_empty()
+                        || codes.iter().any(|code| !valid_catalog_token(code))
+                    {
+                        return invalid_manifest_primitive("provider error code");
+                    }
+                }
+                ErrorMatcher::Header { name, values } => {
+                    validate_manifest_header(name)?;
+                    if values.is_empty()
+                        || values.iter().any(|value| {
+                            value.is_empty()
+                                || !value
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+                        })
+                    {
+                        return invalid_manifest_primitive("error header value");
+                    }
+                }
+                ErrorMatcher::Status(status) => {
+                    if status.minimum > status.maximum {
+                        return invalid_manifest_primitive("status range");
+                    }
+                }
+                ErrorMatcher::MalformedDeclaredSuccess => {}
+            }
+        }
+    }
+    for trigger in &manifest.triggers {
+        match trigger {
+            TriggerSpec::Webhook {
+                authenticator,
+                codec,
+                normalizer,
+                selected_headers,
+                ..
+            } => {
+                if [
+                    authenticator.implementation_revision,
+                    codec.implementation_revision,
+                    normalizer.implementation_revision,
+                ]
+                .contains(&0)
+                {
+                    return invalid_manifest_primitive("webhook processor revision");
+                }
+                for header in selected_headers {
+                    validate_manifest_header(header)?;
+                }
+            }
+            TriggerSpec::Poll { processor, .. } => {
+                if processor.implementation_revision == 0 {
+                    return invalid_manifest_primitive("poll processor revision");
+                }
+            }
+        }
+    }
+    for reference in &manifest.provenance {
+        if !valid_license_identity(&reference.license_id)
+            || reference
+                .contract_facts
+                .iter()
+                .any(|binding| !valid_catalog_id(&binding.use_site))
+        {
+            return invalid_manifest_primitive("provenance license or use-site identity");
+        }
+    }
+    Ok(())
+}
+
+fn validate_compiled_binding_primitive(binding: &CompiledBinding) -> Result<(), CatalogError> {
+    if !valid_catalog_id(&binding.field)
+        || binding
+            .mapping
+            .as_ref()
+            .is_some_and(|mapping| !valid_catalog_token(mapping))
+    {
+        return invalid_manifest_primitive("compiled binding");
+    }
+    Ok(())
+}
+
+fn validate_pagination_primitives(pagination: &PaginationPlan) -> Result<(), CatalogError> {
+    match pagination {
+        PaginationPlan::None => Ok(()),
+        PaginationPlan::Processor { processor, .. } => {
+            if processor.implementation_revision == 0 {
+                return invalid_manifest_primitive("pagination processor revision");
+            }
+            Ok(())
+        }
+        PaginationPlan::Cursor {
+            request_binding,
+            response_pointer,
+            ..
+        } => {
+            if !valid_catalog_id(request_binding) || !valid_json_pointer(response_pointer) {
+                return invalid_manifest_primitive("cursor pagination");
+            }
+            Ok(())
+        }
+        PaginationPlan::OffsetLimit {
+            offset_binding,
+            limit_binding,
+            ..
+        }
+        | PaginationPlan::PageNumber {
+            page_binding: offset_binding,
+            page_size_binding: limit_binding,
+            ..
+        } => {
+            if !valid_catalog_id(offset_binding) || !valid_catalog_id(limit_binding) {
+                return invalid_manifest_primitive("pagination binding");
+            }
+            Ok(())
+        }
+        PaginationPlan::LinkRelation { relation, .. } => {
+            if !valid_catalog_token(relation) {
+                return invalid_manifest_primitive("link relation");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_manifest_credentials(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    let origins = manifest
+        .origins
+        .iter()
+        .map(|origin| (origin.origin, origin))
+        .collect::<BTreeMap<_, _>>();
+    if origins.len() != manifest.origins.len() {
+        return credential_incomplete("duplicate manifest origin");
+    }
+    let operation_ids = manifest
+        .operations
+        .iter()
+        .map(|operation| (operation.operation, operation.operation_version))
+        .collect::<BTreeSet<_>>();
+    let mut credentials = BTreeMap::new();
+    for credential in &manifest.credentials {
+        if credentials
+            .insert((credential.credential, credential.version), credential)
+            .is_some()
+        {
+            return credential_incomplete("duplicate credential identity");
+        }
+        let fields = credential
+            .fields
+            .iter()
+            .map(|field| field.field)
+            .collect::<BTreeSet<_>>();
+        if fields.len() != credential.fields.len()
+            || credential
+                .allowed_origins
+                .iter()
+                .any(|origin| !origins.contains_key(origin))
+            || credential
+                .credential_test_operation
+                .as_ref()
+                .is_some_and(|reference| {
+                    !operation_ids.contains(&(reference.operation, reference.version))
+                })
+        {
+            return credential_incomplete("credential field/origin/operation closure");
+        }
+        let require_field = |field: CredentialFieldId| {
+            if fields.contains(&field) {
+                Ok(())
+            } else {
+                credential_incomplete("auth-plan field does not resolve")
+            }
+        };
+        match &credential.auth_plan {
+            AuthPlan::FixedHeaderApiKey { field, .. }
+            | AuthPlan::FixedQueryApiKey { field, .. } => require_field(*field)?,
+            AuthPlan::Bearer { token } | AuthPlan::PreprovisionedOAuthAccessToken { token } => {
+                require_field(*token)?
+            }
+            AuthPlan::HttpBasic { username, password } => {
+                require_field(*username)?;
+                require_field(*password)?;
+            }
+            AuthPlan::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                token_origin,
+                token_step,
+                ..
+            } => {
+                require_field(*client_id)?;
+                require_field(*client_secret)?;
+                if !credential.allowed_origins.contains(token_origin)
+                    || manifest
+                        .operations
+                        .iter()
+                        .flat_map(|operation| &operation.steps)
+                        .filter(|step| step.step == *token_step && step.origin == *token_origin)
+                        .count()
+                        != 1
+                {
+                    return credential_incomplete("OAuth token origin/step does not resolve");
+                }
+            }
+        }
+    }
+
+    for operation in &manifest.operations {
+        let credential = match operation.credential {
+            Some(reference) => Some(
+                *credentials
+                    .get(&(reference.credential, reference.version))
+                    .ok_or_else(|| {
+                        CatalogError::new(
+                            "catalog_credential_incomplete",
+                            "operation credential identity does not resolve",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let operation_origins = operation
+            .origins
+            .iter()
+            .map(|origin| origin.origin)
+            .collect::<BTreeSet<_>>();
+        if operation_origins.len() != operation.origins.len()
+            || operation.origins.iter().any(|origin| {
+                origins
+                    .get(&origin.origin)
+                    .is_none_or(|manifest_origin| !same_origin(origin, manifest_origin))
+            })
+        {
+            return credential_incomplete("operation origin differs from manifest origin");
+        }
+        for step in &operation.steps {
+            if !operation_origins.contains(&step.origin) {
+                return credential_incomplete("step origin is absent from operation");
+            }
+            match (&step.credential_action, credential) {
+                (None, None) => {}
+                (Some(action), Some(spec))
+                    if action.credential == spec.credential
+                        && spec.allowed_origins.contains(&step.origin) => {}
+                _ => return credential_incomplete("step credential action/origin mismatch"),
+            }
+            validate_request_binding_closure(operation, step)?;
+        }
+    }
+    Ok(())
+}
+
+fn same_origin(left: &FixedOrigin, right: &FixedOrigin) -> bool {
+    left.origin == right.origin
+        && left.host == right.host
+        && left.port == right.port
+        && match (&left.network_policy, &right.network_policy) {
+            (NetworkPolicy::PublicOnly, NetworkPolicy::PublicOnly) => true,
+            (
+                NetworkPolicy::PrivateAllowed { policy: left },
+                NetworkPolicy::PrivateAllowed { policy: right },
+            ) => left == right,
+            _ => false,
+        }
+}
+
+fn validate_request_binding_closure(
+    operation: &OperationSpec,
+    step: &CompiledStepSpec,
+) -> Result<(), CatalogError> {
+    let declared = operation
+        .input
+        .roots
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut compiled = BTreeSet::new();
+    for binding in step
+        .query
+        .iter()
+        .map(|binding| &binding.binding)
+        .chain(step.headers.iter().map(|binding| &binding.binding))
+    {
+        if !declared.contains(binding.field.as_str()) || !compiled.insert(binding.field.as_str()) {
+            return credential_incomplete(
+                "compiled query/header binding is unresolved or duplicate",
+            );
+        }
+    }
+    let request_bindings: &[String] = match &step.request {
+        CompiledRequestShape::None => &[],
+        CompiledRequestShape::Json { bindings }
+        | CompiledRequestShape::FormUrlencoded { bindings }
+        | CompiledRequestShape::Multipart { bindings } => bindings,
+        CompiledRequestShape::RawBytes { binding } => std::slice::from_ref(binding),
+    };
+    for binding in request_bindings {
+        if !declared.contains(binding.as_str()) || !compiled.insert(binding.as_str()) {
+            return credential_incomplete("compiled request binding is unresolved or duplicate");
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_contracts(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    for operation in &manifest.operations {
+        if operation.input_contract_sha256 == [0; 32] || operation.output_contract_sha256 == [0; 32]
+        {
+            return contract_hash_mismatch("zero value-contract hash");
+        }
+        let input = value_contract_material(&operation.input, operation.value_language_epoch)?;
+        let output = value_contract_material(&operation.output, operation.value_language_epoch)?;
+        if value_contract_sha256(&input)?.as_bytes() != &operation.input_contract_sha256
+            || value_contract_sha256(&output)?.as_bytes() != &operation.output_contract_sha256
+        {
+            return contract_hash_mismatch("stored value-contract hash is not recomputed hash");
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_selected_headers(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    for operation in &manifest.operations {
+        for step in &operation.steps {
+            if step.selected_response_headers.len() > 64 {
+                return selected_header_invalid("selected-header limit");
+            }
+            let mut names = BTreeSet::new();
+            let mut capabilities = BTreeSet::new();
+            for selected in &step.selected_response_headers {
+                let recomputed = selected_response_header(
+                    operation.connector,
+                    operation.operation,
+                    operation.operation_version,
+                    step.step,
+                    &selected.canonical_lowercase_header_name,
+                )?;
+                if *selected != recomputed
+                    || !names.insert(selected.canonical_lowercase_header_name.as_str())
+                    || !capabilities.insert(selected.capability)
+                {
+                    return selected_header_invalid(
+                        "selected header is forged, stale, or duplicate",
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_error_maps(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    for operation in &manifest.operations {
+        let actions = [
+            &operation.error_map.fallback.transport,
+            &operation.error_map.fallback.timeout,
+            &operation.error_map.fallback.http_429,
+            &operation.error_map.fallback.http_5xx,
+            &operation.error_map.fallback.authentication,
+            &operation.error_map.fallback.validation,
+            &operation.error_map.fallback.permanent,
+            &operation.error_map.fallback.invariant,
+        ];
+        for action in actions
+            .into_iter()
+            .chain(operation.error_map.rules.iter().map(|rule| &rule.action))
+        {
+            for correlation in &action.correlations {
+                let matches = operation
+                    .steps
+                    .iter()
+                    .filter(|step| step.step == correlation.step)
+                    .flat_map(|step| &step.selected_response_headers)
+                    .filter(|selected| {
+                        selected.canonical_lowercase_header_name
+                            == correlation.canonical_lowercase_header_name
+                            && selected.capability == correlation.capability
+                    })
+                    .count();
+                if matches != 1 {
+                    return error_map_invalid("error correlation is not exact and step-local");
+                }
+            }
+            if let RetryAfterPolicy::RetryAfterHeader {
+                step, capability, ..
+            } = action.retry_after
+            {
+                let matches = operation
+                    .steps
+                    .iter()
+                    .filter(|candidate| candidate.step == step)
+                    .flat_map(|candidate| &candidate.selected_response_headers)
+                    .filter(|selected| selected.capability == capability)
+                    .count();
+                if matches != 1 {
+                    return error_map_invalid("Retry-After capability is foreign or unresolved");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    for operation in &manifest.operations {
+        match &operation.effect {
+            OperationEffect::ReadOnly => {}
+            OperationEffect::ProviderIdempotent { side_effect_steps } => {
+                if side_effect_steps.len() != operation.steps.len() {
+                    return effect_incomplete("every side-effecting step needs exact evidence");
+                }
+                let mut steps = BTreeSet::new();
+                for side_effect in side_effect_steps {
+                    let Some(step) = operation
+                        .steps
+                        .iter()
+                        .find(|candidate| candidate.step == side_effect.step)
+                    else {
+                        return effect_incomplete("idempotency evidence names an unknown step");
+                    };
+                    if !steps.insert(side_effect.step)
+                        || side_effect.clock_safety_margin_ms >= side_effect.minimum_retention_ms
+                        || !idempotency_binding_exists(step, &side_effect.fixed_binding)
+                    {
+                        return effect_incomplete(
+                            "idempotency binding, retention, or margin is incomplete",
+                        );
+                    }
+                    let scope_site = format!(
+                        "operation.{}.step.{}.idempotency.scope",
+                        operation.operation.as_str(),
+                        step.step.as_str()
+                    );
+                    let retention_site = format!(
+                        "operation.{}.step.{}.idempotency.minimum_retention_ms",
+                        operation.operation.as_str(),
+                        step.step.as_str()
+                    );
+                    let margin_site = format!(
+                        "operation.{}.step.{}.idempotency.clock_safety_margin_ms",
+                        operation.operation.as_str(),
+                        step.step.as_str()
+                    );
+                    if !matches!(
+                        exact_fact_value(operation, &scope_site),
+                        Some(TypedValue::String(value)) if value == &side_effect.scope
+                    ) || !matches!(
+                        exact_fact_value(operation, &retention_site),
+                        Some(TypedValue::Number(CanonicalNumber::U64(value)))
+                            if *value == side_effect.minimum_retention_ms.get()
+                    ) || !matches!(
+                        exact_fact_value(operation, &margin_site),
+                        Some(TypedValue::Number(CanonicalNumber::U64(value)))
+                            if *value == side_effect.clock_safety_margin_ms.get()
+                    ) {
+                        return effect_incomplete(
+                            "idempotency behavior differs from its exact admitted fact bindings",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exact_fact_value<'operation>(
+    operation: &'operation OperationSpec,
+    use_site: &str,
+) -> Option<&'operation TypedValue> {
+    let mut matches = operation
+        .resolved_fact_values
+        .iter()
+        .filter(|binding| binding.use_site == use_site);
+    let value = &matches.next()?.value;
+    matches.next().is_none().then_some(value)
+}
+
+fn idempotency_binding_exists(step: &CompiledStepSpec, binding: &FixedIdempotencyBinding) -> bool {
+    match binding {
+        FixedIdempotencyBinding::Header { name } => {
+            step.headers.iter().any(|header| header.name == *name)
+        }
+        FixedIdempotencyBinding::BodyField { pointer } => match &step.request {
+            CompiledRequestShape::Json { bindings }
+            | CompiledRequestShape::FormUrlencoded { bindings }
+            | CompiledRequestShape::Multipart { bindings } => bindings.contains(pointer),
+            CompiledRequestShape::RawBytes { binding } => binding == pointer,
+            CompiledRequestShape::None => false,
+        },
+    }
+}
+
+fn validate_manifest_identity(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    let mut operation_ids = BTreeSet::new();
+    for operation in &manifest.operations {
+        if operation.connector != manifest.connector
+            || operation.connector_version != manifest.connector_version
+            || operation.runtime_abi_epoch != manifest.runtime_abi_epoch
+            || operation.value_language_epoch != manifest.value_language_epoch
+            || !operation_ids.insert((operation.operation, operation.operation_version))
+        {
+            return manifest_identity_mismatch("operation identity differs from manifest");
+        }
+        if operation.steps.len() != 1 && operation.operation_processor.is_none() {
+            return manifest_identity_mismatch("multi-step operation lacks a processor identity");
+        }
+    }
+    let mut trigger_ids = BTreeSet::new();
+    for trigger in &manifest.triggers {
+        let (connector, version, trigger_id, trigger_version, runtime_abi_epoch) = match trigger {
+            TriggerSpec::Webhook {
+                connector,
+                connector_version,
+                trigger,
+                trigger_version,
+                runtime_abi_epoch,
+                ..
+            }
+            | TriggerSpec::Poll {
+                connector,
+                connector_version,
+                trigger,
+                trigger_version,
+                runtime_abi_epoch,
+                ..
+            } => (
+                connector,
+                connector_version,
+                trigger,
+                trigger_version,
+                runtime_abi_epoch,
+            ),
+        };
+        if *connector != manifest.connector
+            || *version != manifest.connector_version
+            || *runtime_abi_epoch != manifest.runtime_abi_epoch
+            || !trigger_ids.insert((*trigger_id, *trigger_version))
+        {
+            return manifest_identity_mismatch("trigger identity differs from manifest");
+        }
+        if let TriggerSpec::Webhook {
+            subscription_operations: Some(subscription),
+            ..
+        } = trigger
+            && [
+                Some(subscription.create),
+                Some(subscription.delete),
+                subscription.check,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|operation| {
+                manifest
+                    .operations
+                    .iter()
+                    .filter(|candidate| candidate.operation == operation)
+                    .count()
+                    != 1
+            })
+        {
+            return manifest_identity_mismatch(
+                "webhook subscription operation does not resolve exactly once",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_provenance(
+    manifest: &ConnectorManifest,
+    accepted_records: &AcceptedRecordCatalog,
+    reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<(), CatalogError> {
+    let records = accepted_records
+        .records()
+        .map(|record| (record.record_id, record))
+        .collect::<BTreeMap<_, _>>();
+    let mut references = BTreeSet::new();
+    for reference in &manifest.provenance {
+        if !references.insert(reference.source_record_id) {
+            return manifest_reference_mismatch("duplicate provenance source record");
+        }
+        let record = records.get(&reference.source_record_id).ok_or_else(|| {
+            CatalogError::new(
+                "catalog_manifest_reference_mismatch",
+                "provenance source record is unresolved",
+            )
+        })?;
+        let reference_artifacts = artifact_keys(&reference.artifact_hashes);
+        if reference_artifacts.len() != reference.artifact_hashes.len()
+            || reference_artifacts != artifact_keys(&record.artifact_hashes)
+            || reference.notice_id != record.notice.id
+            || !license_identity_matches(&reference.license_id, &record.license)
+        {
+            return manifest_reference_mismatch(
+                "provenance artifacts, license, or notice differ from source record",
+            );
+        }
+    }
+
+    for operation in &manifest.operations {
+        let authorizers = manifest
+            .provenance
+            .iter()
+            .filter(|reference| {
+                accepted_records
+                    .port_approved(reference.source_record_id)
+                    .is_ok_and(|approved| approved.authorizes(operation.operation))
+            })
+            .count();
+        if authorizers != 1 {
+            return Err(CatalogError::new(
+                "catalog_source_not_executable",
+                "operation must resolve to exactly one approved source record",
+            ));
+        }
+    }
+
+    let semantic = manifest
+        .operations
+        .iter()
+        .flat_map(|operation| operation.resolved_fact_values.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let origins = manifest
+        .provenance
+        .iter()
+        .flat_map(|reference| reference.contract_facts.iter())
+        .map(|binding| ResolvedContractFactBinding {
+            use_site: binding.use_site.clone(),
+            fact: binding.fact.clone(),
+        })
+        .collect::<Vec<_>>();
+    resolve_fact_bindings(&semantic, &origins, accepted_records, reviewed_policies)?;
+    Ok(())
+}
+
+fn artifact_keys(values: &[crate::ArtifactHash]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}\0{:?}\0{}\0{}",
+                artifact.artifact_id.as_str(),
+                artifact.algorithm,
+                artifact.digest,
+                artifact.path.as_ref().map_or("", AsRef::as_ref)
+            )
+        })
+        .collect()
+}
+
+fn license_identity_matches(identity: &str, license: &LicenseDecision) -> bool {
+    match license {
+        LicenseDecision::Permissive { spdx_id, .. } => identity == spdx_id,
+        LicenseDecision::WrittenGrant { decision_id, .. } => identity == decision_id.as_ref(),
+        LicenseDecision::Rejected { .. } => false,
+    }
+}
+
+fn valid_catalog_id(value: &str) -> bool {
+    (1..=96).contains(&value.len())
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_catalog_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~:/".contains(&byte))
+}
+
+fn valid_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.is_ascii()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+fn valid_json_pointer(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with('/')
+            && !value
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'~' && !matches!(pair[1], b'0' | b'1'))
+            && !value.ends_with('~'))
+}
+
+fn valid_path_template(value: &str) -> bool {
+    value.starts_with('/')
+        && !value.contains(['?', '#', '\\'])
+        && value
+            .split('/')
+            .skip(1)
+            .all(|segment| segment != "." && segment != "..")
+}
+
+fn valid_license_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b' '))
+}
+
+fn validate_manifest_header(value: &str) -> Result<(), CatalogError> {
+    if value != value.to_ascii_lowercase() || !valid_catalog_token(value) || value.contains(':') {
+        return invalid_manifest_primitive("header name");
+    }
+    Ok(())
+}
+
+fn validate_manifest_query_key(value: &str) -> Result<(), CatalogError> {
+    if !valid_catalog_token(value) || value.contains(['&', '=', '?', '#', ':', '/']) {
+        return invalid_manifest_primitive("query key");
+    }
+    Ok(())
+}
+
+fn invalid_manifest_primitive<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new(
+        "catalog_manifest_invalid_primitive",
+        detail,
+    ))
+}
+
+fn credential_incomplete<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new("catalog_credential_incomplete", detail))
+}
+
+fn contract_hash_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new("catalog_contract_hash_mismatch", detail))
+}
+
+fn selected_header_invalid<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new("catalog_selected_header_invalid", detail))
+}
+
+fn error_map_invalid<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new("catalog_error_map_invalid", detail))
+}
+
+fn effect_incomplete<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new(
+        "catalog_operation_effect_incomplete",
+        detail,
+    ))
+}
+
+fn manifest_identity_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new(
+        "catalog_manifest_identity_mismatch",
+        detail,
+    ))
+}
+
+fn manifest_reference_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
+    Err(CatalogError::new(
+        "catalog_manifest_reference_mismatch",
+        detail,
+    ))
 }
 
 fn validate_fact_use_sites(manifest: &ConnectorManifest) -> Result<(), CatalogError> {

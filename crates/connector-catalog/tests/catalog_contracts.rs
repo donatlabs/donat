@@ -206,16 +206,15 @@ fn manifest_provenance_references_match_exact_records() {
         use_site: "effect.request.binding".to_owned(),
         value: donat_value_contract::TypedValue::String("Idempotency-Key".to_owned()),
     }];
+    let mut reviews = SourceReviewRegistry::default();
+    reviews.approve_reviewed_use("review.demo").unwrap();
+    let catalog =
+        AcceptedRecordCatalog::build(vec![record.clone()], &BTreeMap::new(), &reviews).unwrap();
     let (_, origins) =
-        split_resolved_fact_bindings(&values, &[binding], std::slice::from_ref(&record)).unwrap();
-    let ResolvedFactOriginV1::ProviderEvidence {
-        source_record_id,
-        artifact_content_sha256,
-        ..
-    } = &origins[0].origin
-    else {
-        panic!("provider fact must resolve to immutable evidence");
-    };
+        resolve_fact_bindings(&values, &[binding], &catalog, &BTreeMap::new()).unwrap();
+    let (source_record_id, _, artifact_content_sha256, _) = origins[0]
+        .provider_evidence()
+        .expect("provider fact must resolve to immutable evidence");
     assert_eq!(source_record_id, record.record_id.as_str());
     assert_eq!(artifact_content_sha256.len(), 64);
 }
