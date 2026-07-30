@@ -79,7 +79,7 @@ HTTP Connectors.
 
 ### Flow and connector directories
 
-- `flows/` — the nine approved product flows.
+- `flows/` — the ten approved product flows.
 - `connectors/` — mock payment, carrier, tax, notification, and payout HTTP
   modules.
 
@@ -98,7 +98,8 @@ HTTP Connectors.
 
 - Produces command includes for every file named in Tasks 2-10.
 - Produces flow includes for:
-  `checkout-payment`, `partial-fulfilment`, `return-refund`,
+  `checkout-payment`, `authorized-order-cancellation`,
+  `partial-fulfilment`, `return-refund`,
   `subscription-renewal`, `b2b-order-approval`, `vendor-payout`,
   `grooming-booking`, `prescription-review`, and
   `payment-reconciliation`.
@@ -235,13 +236,14 @@ untrusted dynamic role.
 
 - [ ] **Step 1: Author provider-neutral operations**
 
-`mock_payment` declares authorize, capture, void, refund, and reconcile HTTP
-operations. Each mutation has a stable `Idempotency-Key`, timeout, retry
-classes, capacity, and redacted authorization header.
+`mock_payment` declares authorize, capture, void, refund, reconcile, and a
+read-only operation lookup. Each mutation has a stable `Idempotency-Key`,
+immutable provider-retention evidence, timeout, retry classes, capacity, and
+a redacted authorization header.
 
 - [ ] **Step 2: Author tax quote operation**
 
-`mock_tax.quote_order` is read-only/provider-idempotent and accepts destination,
+`mock_tax.quote_order` is read-only and accepts destination,
 currency, and ordered taxable lines.
 
 - [ ] **Step 3: Author the durable checkout Flow**

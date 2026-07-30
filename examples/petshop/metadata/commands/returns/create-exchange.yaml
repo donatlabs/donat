@@ -68,6 +68,7 @@ result:
   return_id: { step: exchanged_return, column: id }
   order_id: { step: exchanged_return, column: order_id }
   status: { step: exchanged_return, column: status }
+  exchange_id: { step: exchange, column: id }
   exchange: { step: exchange }
   items: { step: exchange_items }
   audit: { step: exchange_audit }

@@ -12,6 +12,11 @@ operations:
     version: v1
     method: POST
     path: /v1/email/messages
+    input_contract:
+      message_key: string!
+      recipient: string!
+      template: string!
+      variables: BoundedProviderEvidence!
     body:
       message_key: { input: message_key }
       recipient: { input: recipient }
@@ -19,14 +24,40 @@ operations:
       variables: { input: variables }
     success_statuses: [200, 201, 202]
     response:
-      provider_message_id: { json_pointer: /message_id, type: string! }
-      normalized_status: { json_pointer: /status, type: string! }
+      provider_message_id: { json_pointer: /message_id, type: string!, max_bytes: 256 }
+      normalized_status: { json_pointer: /status, type: string!, max_bytes: 64 }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-notification-email-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 8192
+      maximum_output_canonical_bytes: 8192
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: notification_authentication }
+        - { statuses: [408], class: timeout, code: notification_timeout }
+        - { statuses: [429], class: http_429, code: notification_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: notification_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: notification_rejected }
+      fallback: { class: permanent, code: notification_provider_error }
     timeout: 5s
     retry:
       maximum_attempts: 4
       backoff: 250ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 16
       rate_limit: { permits: 60, per: 1m, burst: 16 }
@@ -40,6 +71,11 @@ operations:
     version: v1
     method: POST
     path: /v1/webhook/messages
+    input_contract:
+      message_key: string!
+      destination: string!
+      event_type: string!
+      payload: BoundedProviderEvidence!
     body:
       message_key: { input: message_key }
       destination: { input: destination }
@@ -47,14 +83,40 @@ operations:
       payload: { input: payload }
     success_statuses: [200, 201, 202]
     response:
-      provider_message_id: { json_pointer: /message_id, type: string! }
-      normalized_status: { json_pointer: /status, type: string! }
+      provider_message_id: { json_pointer: /message_id, type: string!, max_bytes: 256 }
+      normalized_status: { json_pointer: /status, type: string!, max_bytes: 64 }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-notification-webhook-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 8192
+      maximum_output_canonical_bytes: 8192
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: notification_authentication }
+        - { statuses: [408], class: timeout, code: notification_timeout }
+        - { statuses: [429], class: http_429, code: notification_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: notification_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: notification_rejected }
+      fallback: { class: permanent, code: notification_provider_error }
     timeout: 5s
     retry:
       maximum_attempts: 4
       backoff: 250ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 16
       rate_limit: { permits: 60, per: 1m, burst: 16 }

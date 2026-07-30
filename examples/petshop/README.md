@@ -246,12 +246,12 @@ providers directly.
 
 | Domain | Active commands |
 | --- | --- |
-| Checkout | `begin_checkout`, `cancel_order`, `release_expired_checkout` |
+| Checkout | `prepare_checkout_quote`, `begin_checkout`, `cancel_order`, `request_authorized_order_cancellation`, `finalize_authorized_order_cancellation`, `release_expired_checkout` |
 | Payments | `record_payment_outcome`, `authorize_payment`, `capture_payment`, `void_authorization`, `complete_refund`, `record_chargeback`, `reconcile_payment` |
 | Fulfilment | `allocate_inventory`, `mark_order_packed`, `create_shipment`, `record_shipment_result`, `record_delivery` |
-| Returns | `request_return`, `approve_return`, `reject_return`, `receive_return`, `record_return_inspection`, `create_exchange` |
+| Returns | `request_return`, `approve_return`, `reject_return`, `receive_return`, `record_return_inspection`, `finalize_return_refund`, `finalize_return_rejection`, `create_exchange` |
 | Subscriptions | `create_subscription_order`, `record_renewal_outcome`, `pause_subscription`, `cancel_subscription` |
-| B2B | `submit_quote`, `approve_purchase`, `reject_purchase`, `consume_credit` |
+| B2B | `submit_quote`, `approve_purchase`, `reject_purchase`, `consume_credit`, `escalate_purchase_approval`, `finance_approve_purchase`, `finance_reject_purchase`, `finalize_finance_rejection` |
 | Marketplace | `split_vendor_orders`, `record_vendor_acceptance`, `create_vendor_payout`, `record_payout_outcome`, `reconcile_vendor_payout`, `open_vendor_dispute` |
 | Booking | `reserve_grooming_slot`, `confirm_booking`, `reschedule_booking`, `cancel_booking`, `expire_booking_hold`, `record_no_show` |
 | Prescription | `submit_prescription_review`, `approve_prescription`, `reject_prescription`, `expire_prescription` |
@@ -266,17 +266,18 @@ outbox to start or signal that process; the command itself remains synchronous.
 
 | Module | Current intent |
 | --- | --- |
-| `checkout_payment` | Checkout, provider authorization, verified payment outcome, and expiry handling. |
+| `checkout_payment` | Immutable pricing/tax/shipping quote snapshots and synchronous provider authorization with ambiguity lookup. |
+| `authorized_order_cancellation` | Void an authorized payment before releasing reservations and finalizing cancellation. |
 | `partial_fulfilment` | Allocate, pack, label, ship, and capture per fulfilment unit. |
 | `return_refund` | Support approval, return label, receipt, inspection, refund, exchange, or rejection. |
 | `subscription_renewal` | Renewal authorization with dunning timers and a terminal pause. |
 | `b2b_order_approval` | Quote routing, automatic credit use, and approver/finance waits. |
-| `vendor_payout` | Create vendor payouts, submit provider requests, and await settlement. |
+| `vendor_payout` | Create bounded vendor payouts and record synchronous terminal provider outcomes per vendor. |
 | `grooming_booking` | Reserve a grooming slot and await confirmation, cancellation, or hold expiry. |
 | `prescription_review` | Submit a prescription review and await the recorded decision or expiry. |
 | `payment_reconciliation` | Retrieve provider evidence, reconcile it, and await manual resolution when needed. |
 
-All nine active flow modules declare `kind: process` and `version: 1`. The YAML
+All ten active flow modules declare `kind: process` and `version: 1`. The YAML
 remains the target contract, not an assertion that these modules execute today.
 
 ### Connectors
@@ -286,16 +287,19 @@ limits, redaction, and idempotency policy:
 
 | Connector | Operations |
 | --- | --- |
-| `mock_payment` | `authorize`, `capture`, `void`, `refund`, `reconcile` |
+| `mock_payment` | `authorize`, `capture`, `void`, `refund`, `reconcile`, `lookup_operation` |
 | `mock_carrier` | `quote`, `create_label`, `create_return_label`, `track` |
 | `mock_tax` | `quote_order` |
 | `mock_notification` | `send_email`, `send_webhook` |
 | `mock_payout` | `create_payout` |
 
-HTTP delivery is at-least-once at the provider boundary: retries reuse stable
-provider idempotency keys. When a provider cannot offer exactly-once behavior,
-the declarative contract requires reconciliation rather than claiming an
-unavailable guarantee.
+HTTP delivery is at-least-once at the provider boundary. Each mutation
+declares immutable `ProviderIdempotent` evidence: the fixed header binding,
+provider scope, minimum key-retention window, and positive clock-safety
+margin. Retries and worker takeover reuse that stable key. Ambiguous payment
+mutations use the read-only operation lookup and leave money or inventory in a
+reconcilable state when absence of a response cannot prove absence of an
+effect.
 
 ### Rules and decision tables
 
@@ -304,13 +308,14 @@ inspection, booking, reconciliation, checkout, shipment, return,
 subscription, payout, prescription, and fraud, plus typed return-line objects.
 Its active Rules are:
 
-- Arithmetic and inventory: `can_reserve_stock`, `add_int`,
-  `is_single_currency`, `subtract_int`, `add_minor`, `can_release_stock`.
+- Arithmetic, inventory, and bounds: `can_reserve_stock`, `add_int`,
+  `is_single_currency`, `subtract_int`, `add_minor`, `subtract_minor`,
+  `basis_points_amount`, `can_release_stock`, `bounded_fan_out_count`.
 - Payments and reconciliation: `payment_was_authorized`,
   `normalize_payment_outcome_state`, `can_authorize_payment_amount`,
   `can_capture_payment_amount`, `can_void_authorization`,
-  `can_refund_payment_amount`, `can_record_chargeback_amount`,
-  `can_reconcile_payment`, `reconciliation_state_for_decision`,
+  `can_refund_payment_amount`, `approved_refund_matches_provider`,
+  `can_record_chargeback_amount`, `reconciliation_state_for_decision`,
   `payment_reconciliation_supports_decision`.
 - Lifecycle gates: `can_transition_checkout`, `can_transition_payment`,
   `can_transition_shipment`, `can_transition_return`,
@@ -352,6 +357,7 @@ effects:
         approval_id: { step: approval, column: id }
         total_minor: { step: quote, column: total_minor }
         available_credit_minor: { step: quote, column: available_credit_minor }
+        owner_user_id: { step: cart, column: customer_id }
       idempotency_key: { argument: request_id }
 
 # commands/b2b/approve-purchase.yaml (producer: signal intent)
@@ -359,7 +365,7 @@ name: approve_purchase
 effects:
   - signal_process:
       process: b2b_order_approval
-      signal: approval_decision
+      signal: approver_decision
       correlate:
         approval_id: { step: approve, column: id }
       payload:
@@ -377,12 +383,16 @@ start:
     approval_id: { command_result: approval_id }
     total_minor: { command_result: total_minor }
     available_credit_minor: { command_result: available_credit_minor }
+    owner_user_id: { command_result: owner_user_id }
   idempotency_key: { command_argument: request_id }
   process_key: { command_result: approval_id }
 states:
   - id: await_approver
     wait:
-      signal: approval_decision
+      signal: approver_decision
+      role: b2b_approver
+      verification: required
+      persist_before_match: true
       correlate:
         approval_id: { input: approval_id }
       deadline: 2d

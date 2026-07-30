@@ -42,6 +42,7 @@ steps:
         status: { literal: reserved }
       order_by: [id]
       returning: [id, variant_id, quantity]
+      maximum_rows: 64
   - name: release_stock
     update_many:
       table: public.inventory_stock

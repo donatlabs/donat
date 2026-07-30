@@ -1,0 +1,68 @@
+name: request_authorized_order_cancellation
+source: default
+permissions:
+  - role: customer
+  - role: support
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        order_status: { literal: authorized }
+      returning: [id, customer_id, order_status]
+      require_found: true
+  - name: cancellation_is_allowed
+    assert:
+      rule: can_transition_checkout
+      with:
+        current: { step: order, column: order_status }
+        next: { literal: cancellation_requested }
+  - name: authorization
+    select_one:
+      table: public.order_current_authorization
+      by:
+        order_id: { step: order, column: id }
+      returning: [payment_id, authorization_id, currency]
+      require_found: true
+  - name: request_cancellation
+    update:
+      table: public.orders
+      where:
+        id: { step: order, column: id }
+        order_status: { literal: authorized }
+      set:
+        order_status: { literal: cancellation_requested }
+        cancellation_reason: { arg: reason }
+      returning: [id, customer_id, order_status, cancellation_reason]
+      require_affected: true
+result:
+  order_id: { step: request_cancellation, column: id }
+  owner_user_id: { step: request_cancellation, column: customer_id }
+  order_status: { step: request_cancellation, column: order_status }
+  payment_id: { step: authorization, column: payment_id }
+  authorization_id: { step: authorization, column: authorization_id }
+  reason: { step: request_cancellation, column: cancellation_reason }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: order_id }
+  retention: 365d
+effects:
+  - start_process:
+      process: authorized_order_cancellation
+      process_key: { step: request_cancellation, column: id }
+      input:
+        order_id: { step: request_cancellation, column: id }
+        owner_user_id: { step: request_cancellation, column: customer_id }
+        payment_id: { step: authorization, column: payment_id }
+        authorization_id: { step: authorization, column: authorization_id }
+        reason: { step: request_cancellation, column: cancellation_reason }
+      idempotency_key: { argument: request_id }

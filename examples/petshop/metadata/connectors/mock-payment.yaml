@@ -12,6 +12,12 @@ operations:
     version: v1
     method: POST
     path: /v1/payment-authorizations
+    input_contract:
+      order_id: uuid!
+      payment_id: uuid!
+      amount_minor: bigint!
+      currency: string!
+      request_id: string!
     body:
       order_id: { input: order_id }
       payment_id: { input: payment_id }
@@ -20,87 +26,184 @@ operations:
       request_id: { input: request_id }
     success_statuses: [200, 201, 202]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_authorization_id: { json_pointer: /authorization_id, type: string! }
-      provider_reference: { json_pointer: /provider_reference, type: string! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_authorization_id: { json_pointer: /authorization_id, type: string!, max_bytes: 256 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payment-authorization-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 2000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
     timeout: 2s
     retry:
       maximum_attempts: 3
       backoff: 100ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 20, per: 1s, burst: 8 }
       serialize_by: { input: payment_id }
     redaction:
       request_headers: [Authorization]
-      request_body: [payment_method_token]
-      response_body: [provider_reference, raw_payload]
+      response_body: [provider_reference, normalized_payload]
 
   - name: capture
     version: v1
     method: POST
     path: /v1/payment-authorizations/{input.payment_id}/captures
+    input_contract:
+      payment_id: uuid!
+      shipment_id: uuid!
+      amount_minor: bigint!
+      currency: string!
     body:
       payment_id: { input: payment_id }
+      shipment_id: { input: shipment_id }
       amount_minor: { input: amount_minor }
       currency: { input: currency }
     success_statuses: [200, 201, 202]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_capture_id: { json_pointer: /capture_id, type: string! }
-      provider_reference: { json_pointer: /provider_reference, type: string! }
+      payment_id: { json_pointer: /payment_id, type: uuid! }
+      shipment_id: { json_pointer: /shipment_id, type: uuid! }
+      amount_minor: { json_pointer: /amount_minor, type: bigint! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_capture_id: { json_pointer: /capture_id, type: string!, max_bytes: 256 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payment-capture-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 2000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
     timeout: 2s
     retry:
       maximum_attempts: 3
       backoff: 100ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 20, per: 1s, burst: 8 }
       serialize_by: { input: payment_id }
     redaction:
       request_headers: [Authorization]
-      response_body: [provider_reference, raw_payload]
+      response_body: [provider_reference, normalized_payload]
 
   - name: void
     version: v1
     method: POST
     path: /v1/payment-authorizations/{input.payment_id}/voids
+    input_contract:
+      payment_id: uuid!
+      authorization_id: uuid!
+      reason: string!
     body:
       payment_id: { input: payment_id }
+      authorization_id: { input: authorization_id }
       reason: { input: reason }
     success_statuses: [200, 201, 202]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_void_id: { json_pointer: /void_id, type: string! }
-      provider_reference: { json_pointer: /provider_reference, type: string! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_void_id: { json_pointer: /void_id, type: string!, max_bytes: 256 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payment-void-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 2000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
     timeout: 2s
     retry:
       maximum_attempts: 3
       backoff: 100ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 20, per: 1s, burst: 8 }
       serialize_by: { input: payment_id }
     redaction:
       request_headers: [Authorization]
-      response_body: [provider_reference, raw_payload]
+      response_body: [provider_reference, normalized_payload]
 
   - name: refund
     version: v1
     method: POST
     path: /v1/payment-authorizations/{input.payment_id}/refunds
+    input_contract:
+      payment_id: uuid!
+      refund_id: bigint!
+      amount_minor: bigint!
+      currency: string!
+      reason: string!
     body:
       payment_id: { input: payment_id }
       refund_id: { input: refund_id }
@@ -109,50 +212,97 @@ operations:
       reason: { input: reason }
     success_statuses: [200, 201, 202]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_refund_id: { json_pointer: /refund_id, type: string! }
-      provider_reference: { json_pointer: /provider_reference, type: string! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_refund_id: { json_pointer: /refund_id, type: string!, max_bytes: 256 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payment-refund-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 2000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
     timeout: 2s
     retry:
       maximum_attempts: 3
       backoff: 100ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 20, per: 1s, burst: 8 }
       serialize_by: { input: payment_id }
     redaction:
       request_headers: [Authorization]
-      response_body: [provider_reference, raw_payload]
+      response_body: [provider_reference, normalized_payload]
 
   - name: reconcile
     version: v1
     method: POST
     path: /v1/payment-reconciliations
+    input_contract:
+      payment_id: uuid!
+      provider_event_id: string!
+      provider_reference: string!
     body:
       payment_id: { input: payment_id }
       provider_event_id: { input: provider_event_id }
       provider_reference: { input: provider_reference }
-    # Reconciliation is a synchronous comparison operation. Its response is
-    # the complete normalized provider evidence used by the command gate.
     success_statuses: [200]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_reconciliation_id: { json_pointer: /reconciliation_id, type: string! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_reconciliation_id: { json_pointer: /reconciliation_id, type: string!, max_bytes: 256 }
       provider_amount_minor: { json_pointer: /amount_minor, type: bigint! }
-      provider_currency: { json_pointer: /currency, type: string! }
+      provider_currency: { json_pointer: /currency, type: string!, max_bytes: 16 }
       provider_status: { json_pointer: /status, type: PaymentState! }
-      provider_reference: { json_pointer: /provider_reference, type: string! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
     timeout: 5s
     retry:
       maximum_attempts: 3
       backoff: 100ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 4
       rate_limit: { permits: 10, per: 1s, burst: 4 }
@@ -160,4 +310,61 @@ operations:
     redaction:
       request_headers: [Authorization]
       request_body: [provider_reference]
-      response_body: [provider_reference, raw_payload]
+      response_body: [provider_reference, normalized_payload]
+
+  - name: lookup_operation
+    version: v1
+    method: POST
+    path: /v1/payment-operation-lookups
+    input_contract:
+      payment_id: uuid!
+      resource_kind: string!
+      resource_id: string!
+      activity_key: string!
+    body:
+      payment_id: { input: payment_id }
+      resource_kind: { input: resource_kind }
+      resource_id: { input: resource_id }
+      activity_key: { input: activity_key }
+    success_statuses: [200]
+    response:
+      found: { json_pointer: /found, type: bool! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_mutation_id: { json_pointer: /provider_mutation_id, type: string!, max_bytes: 256 }
+      provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
+      outcome: { json_pointer: /outcome, type: PaymentOutcome! }
+      amount_minor: { json_pointer: /amount_minor, type: bigint! }
+      currency: { json_pointer: /currency, type: string!, max_bytes: 16 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_lookup_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 4
+      rate_limit: { permits: 10, per: 1s, burst: 4 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+      response_body: [provider_reference, normalized_payload]

@@ -4,6 +4,10 @@ version: 1
 source: default
 permissions:
   - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { session_variable: x-donat-user-id }
 input:
   - { name: order_line_id, type: uuid! }
   - { name: review_deadline, type: timestamptz! }
@@ -16,6 +20,13 @@ idempotency:
   key: { input: request_id }
   scope:
     - { input: order_line_id }
+signals:
+  - name: prescription_decision_recorded
+    role: veterinary_reviewer
+    correlation:
+      prescription_id: uuid!
+    payload:
+      decision: ApprovalDecision!
 start_at: submit_review
 states:
   - id: submit_review
@@ -48,11 +59,11 @@ states:
       cases:
         - rule: approval_was_approved
           with:
-            decision: { event: decision }
+            decision: { state: await_veterinary_decision, field: decision }
           next: approved
         - rule: approval_was_rejected
           with:
-            decision: { event: decision }
+            decision: { state: await_veterinary_decision, field: decision }
           next: rejected
       default: unexpected_reviewer_decision
 

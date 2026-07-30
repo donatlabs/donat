@@ -11,19 +11,15 @@ steps:
   # `subscription_id` plus this scheduled occurrence is the business key.
   # The future catalog also enforces it with a unique renewal row.
   - name: subscription
-    select_one:
+    update:
       table: public.subscription
-      by:
+      where:
         id: { arg: subscription_id }
         status: { literal: active }
+      set:
+        status: { literal: payment_due }
       returning: [id, customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status]
-      require_found: true
-  - name: payment_due_is_allowed
-    assert:
-      rule: can_transition_subscription
-      with:
-        current: { step: subscription, column: status }
-        next: { literal: payment_due }
+      require_affected: true
   - name: renewal
     insert:
       table: public.subscription_renewal
@@ -62,14 +58,6 @@ steps:
         amount_minor: { step: order, column: total_minor }
         currency: { step: order, column: currency }
       returning: [id, order_id, status, amount_minor, currency]
-  - name: payment_due
-    update:
-      table: public.subscription
-      where:
-        id: { step: subscription, column: id }
-      set:
-        status: { literal: payment_due }
-      returning: [id, status]
 result:
   subscription_id: { step: subscription, column: id }
   renewal_id: { step: renewal, column: id }

@@ -2,7 +2,6 @@ name: approve_purchase
 source: default
 permissions:
   - role: b2b_approver
-  - role: b2b_finance
 arguments:
   - name: approval_id
     type: uuid!
@@ -43,7 +42,7 @@ steps:
         id: { item: id }
       set:
         available_credit_minor:
-          rule: subtract_int
+          rule: subtract_minor
           with:
             left: { current_column: available_credit_minor }
             right: { step: quote, column: total_minor }
@@ -94,7 +93,7 @@ idempotency:
 effects:
   - signal_process:
       process: b2b_order_approval
-      signal: approval_decision
+      signal: approver_decision
       correlate:
         approval_id: { step: approve, column: id }
       payload:

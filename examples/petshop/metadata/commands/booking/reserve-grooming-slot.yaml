@@ -16,6 +16,13 @@ arguments:
   - name: request_id
     type: uuid!
 steps:
+  - name: hold_deadline_is_valid
+    assert:
+      rule: booking_hold_deadline_is_valid
+      with:
+        database_time: { database_time: now }
+        hold_expires_at: { arg: hold_expires_at }
+        starts_at: { arg: starts_at }
   - name: booking
     insert:
       table: public.grooming_booking

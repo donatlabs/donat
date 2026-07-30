@@ -4,6 +4,10 @@ version: 1
 source: default
 permissions:
   - role: b2b_buyer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { input: owner_user_id }
 start:
   command: submit_quote
   input:
@@ -11,6 +15,7 @@ start:
     approval_id: { command_result: approval_id }
     total_minor: { command_result: total_minor }
     available_credit_minor: { command_result: available_credit_minor }
+    owner_user_id: { command_result: owner_user_id }
   idempotency_key: { command_argument: request_id }
   process_key: { command_result: approval_id }
 input:
@@ -18,6 +23,7 @@ input:
   - { name: approval_id, type: uuid! }
   - { name: total_minor, type: bigint! }
   - { name: available_credit_minor, type: bigint! }
+  - { name: owner_user_id, type: bigint! }
 output:
   - { name: quote_id, type: uuid! }
   - { name: approval_id, type: uuid! }
@@ -26,6 +32,19 @@ output:
 start_at: route_approval
 idempotency:
   key: { input: approval_id }
+signals:
+  - name: approver_decision
+    role: b2b_approver
+    correlation:
+      approval_id: uuid!
+    payload:
+      decision: ApprovalDecision!
+  - name: finance_decision
+    role: b2b_finance
+    correlation:
+      approval_id: uuid!
+    payload:
+      decision: ApprovalDecision!
 states:
   - id: route_approval
     when:
@@ -42,7 +61,7 @@ states:
             decision: escalated
             route: finance_review
           next: await_approver
-      default: reject_unroutable_quote
+      default: escalate_unroutable_quote
 
   - id: consume_automatic_credit
     command:
@@ -55,31 +74,53 @@ states:
 
   - id: await_approver
     wait:
-      signal: approval_decision
+      signal: approver_decision
       role: b2b_approver
+      verification: required
+      persist_before_match: true
       correlate:
         approval_id: { input: approval_id }
       deadline: 2d
       next: route_approver_decision
-      on_timeout: await_finance
+      on_timeout: escalate_for_finance
 
   - id: route_approver_decision
     when:
       cases:
         - rule: approval_was_approved
           with:
-            decision: { event: decision }
+            decision: { state: await_approver, field: decision }
           next: manually_approved
         - rule: approval_was_rejected
           with:
-            decision: { event: decision }
+            decision: { state: await_approver, field: decision }
           next: manually_rejected
-      default: reject_unroutable_quote
+      default: escalate_unroutable_quote
+
+  - id: escalate_unroutable_quote
+    command:
+      name: escalate_purchase_approval
+      run_as: b2b_finance
+      arguments:
+        approval_id: { input: approval_id }
+        request_id: { activity_key: escalate_unroutable }
+      next: reject_unroutable_quote
+
+  - id: escalate_for_finance
+    command:
+      name: escalate_purchase_approval
+      run_as: b2b_finance
+      arguments:
+        approval_id: { input: approval_id }
+        request_id: { activity_key: escalate_after_approver_timeout }
+      next: await_finance
 
   - id: await_finance
     wait:
-      signal: approval_decision
+      signal: finance_decision
       role: b2b_finance
+      verification: required
+      persist_before_match: true
       correlate:
         approval_id: { input: approval_id }
       deadline: 2d
@@ -91,17 +132,17 @@ states:
       cases:
         - rule: approval_was_approved
           with:
-            decision: { event: decision }
+            decision: { state: await_finance, field: decision }
           next: finance_approved
         - rule: approval_was_rejected
           with:
-            decision: { event: decision }
+            decision: { state: await_finance, field: decision }
           next: finance_rejected
-      default: reject_unroutable_quote
+      default: reject_after_finance_deadline
 
   - id: reject_after_finance_deadline
     command:
-      name: reject_purchase
+      name: finalize_finance_rejection
       run_as: b2b_finance
       arguments:
         approval_id: { input: approval_id }
@@ -111,7 +152,7 @@ states:
 
   - id: reject_unroutable_quote
     command:
-      name: reject_purchase
+      name: finalize_finance_rejection
       run_as: b2b_finance
       arguments:
         approval_id: { input: approval_id }

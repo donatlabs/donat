@@ -44,29 +44,11 @@ steps:
         status: { literal: reconciled }
       returning: [id, payout_cycle_id, vendor_id, status, provider_payout_id, net_minor, currency]
       require_affected: true
-  - name: cycle_summary
-    select_one:
-      table: public.vendor_payout_cycle_summary
-      by:
-        payout_cycle_id: { step: reconciled_payout, column: payout_cycle_id }
-      returning: [payout_cycle_id, all_settled, payouts]
-      require_found: true
 result:
   payout: { step: reconciled_payout }
   reconciliation: { step: reconciliation }
-  cycle_summary: { step: cycle_summary }
 idempotency:
   key: { argument: reconciliation_id }
   scope:
     - { argument: payout_id }
   retention: 365d
-effects:
-  - signal_process:
-      process: vendor_payout
-      signal: payout_cycle_status_changed
-      correlate:
-        payout_cycle_id: { step: reconciled_payout, column: payout_cycle_id }
-      payload:
-        all_settled: { step: cycle_summary, column: all_settled }
-        payouts: { step: cycle_summary, column: payouts }
-      idempotency_key: { argument: reconciliation_id }

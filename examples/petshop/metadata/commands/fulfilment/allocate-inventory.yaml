@@ -34,6 +34,7 @@ steps:
          location_code, inventory_level_id, available_quantity,
          unit_price_minor, currency]
       require_non_empty: true
+      maximum_rows: 64
   # This is a set-based decision application, not a general command loop. The
   # compiled allocation planner must preserve candidate order while applying
   # the named, finite location-ranking table to every candidate.
@@ -75,6 +76,17 @@ steps:
           [order_id, order_line_id, requested_quantity, backordered_quantity]
       group_order_by: [first_line_sequence, allocation_rank, location_code, allocation_id]
       line_order_by: [line_sequence, location_code, allocation_id]
+  - name: allocation_group_count
+    aggregate:
+      from: { step: allocation_plan, field: groups }
+      values:
+        item_count: { count: true }
+  - name: allocation_fan_out_is_bounded
+    assert:
+      rule: bounded_fan_out_count
+      with:
+        item_count: { step: allocation_group_count, column: item_count }
+        maximum_items: { literal: 64 }
   - name: reserve_allocated_inventory
     update_many:
       table: { schema: public, name: inventory_level }
@@ -126,8 +138,12 @@ result:
   allocations:
     step: allocation_plan
     field: groups
+    as: AllocationGroup
+    maximum_items: 64
   backorders:
     step: backorders
+    as: Backorder
+    maximum_items: 64
   payment_id: { step: current_authorization, column: payment_id }
   authorization_id: { step: current_authorization, column: authorization_id }
   currency: { step: current_authorization, column: currency }

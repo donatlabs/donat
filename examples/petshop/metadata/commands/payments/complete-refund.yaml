@@ -13,15 +13,18 @@ arguments:
     type: string!
   - name: amount_minor
     type: bigint!
+  - name: currency
+    type: string!
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: payment
     select_one:
       table: public.payment
       by:
         id: { arg: payment_id }
-      returning: [id, status, captured_minor, refunded_minor]
+      returning: [id, status, captured_minor, refunded_minor, currency]
+      require_found: true
   - name: payment_row
     select_many:
       table: public.payment
@@ -37,7 +40,16 @@ steps:
         id: { arg: refund_id }
         payment_id: { step: payment, column: id }
         status: { literal: approved }
-      returning: [id, payment_id, amount_minor, status]
+      returning: [id, payment_id, amount_minor, currency, status]
+      require_found: true
+  - name: provider_refund_matches_approval
+    assert:
+      rule: approved_refund_matches_provider
+      with:
+        approved_amount_minor: { step: refund, column: amount_minor }
+        approved_currency: { step: refund, column: currency }
+        provider_amount_minor: { arg: amount_minor }
+        provider_currency: { arg: currency }
   - name: refund_is_bounded
     assert:
       rule: can_refund_payment_amount
@@ -61,10 +73,9 @@ steps:
       where:
         id: { step: refund, column: id }
       set:
-        amount_minor: { arg: amount_minor }
         provider_refund_id: { arg: provider_refund_id }
         status: { literal: refunded }
-      returning: [id, payment_id, amount_minor, status]
+      returning: [id, payment_id, amount_minor, currency, status]
   - name: add_refunded_amount
     update_many:
       table: public.payment

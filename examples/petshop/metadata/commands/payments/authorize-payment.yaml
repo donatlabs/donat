@@ -3,23 +3,28 @@ source: default
 permissions:
   - role: payment_worker
 arguments:
+  - name: order_id
+    type: uuid!
   - name: payment_id
     type: uuid!
   - name: provider_authorization_id
     type: string!
   - name: provider_event_id
     type: string!
+  - name: provider_reference
+    type: string!
   - name: amount_minor
     type: bigint!
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: payment
     select_one:
       table: public.payment
       by:
         id: { arg: payment_id }
-      returning: [id, status, amount_minor, currency]
+        order_id: { arg: order_id }
+      returning: [id, order_id, status, amount_minor, currency]
   - name: authorization_is_allowed
     assert:
       rule: can_authorize_payment_amount
@@ -53,11 +58,32 @@ steps:
         id: { step: payment, column: id }
       set:
         status: { literal: authorized }
-      returning: [id, status]
+        provider_reference: { arg: provider_reference }
+      returning: [id, order_id, status, provider_reference]
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        order_status: { literal: checkout_started }
+      returning: [id, order_status]
+      require_found: true
+  - name: mark_order_authorized
+    update:
+      table: public.orders
+      where:
+        id: { step: order, column: id }
+        order_status: { literal: checkout_started }
+      set:
+        order_status: { literal: authorized }
+      returning: [id, order_status]
+      require_affected: true
 result:
   payment_id: { step: mark_authorized, column: id }
   payment_status: { step: mark_authorized, column: status }
   authorization_id: { step: authorization, column: id }
+  order_id: { step: mark_order_authorized, column: id }
+  order_status: { step: mark_order_authorized, column: order_status }
 idempotency:
   key: { argument: provider_event_id }
   retention: 365d

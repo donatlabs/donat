@@ -91,6 +91,7 @@ result:
   total_minor: { step: quote, column: total_minor }
   currency: { step: quote, column: currency }
   available_credit_minor: { step: quote, column: available_credit_minor }
+  owner_user_id: { step: cart, column: customer_id }
   quoted_lines: { step: quote_lines }
 idempotency:
   key: { argument: request_id }
@@ -107,4 +108,5 @@ effects:
         approval_id: { step: approval, column: id }
         total_minor: { step: quote, column: total_minor }
         available_credit_minor: { step: quote, column: available_credit_minor }
+        owner_user_id: { step: cart, column: customer_id }
       idempotency_key: { argument: request_id }

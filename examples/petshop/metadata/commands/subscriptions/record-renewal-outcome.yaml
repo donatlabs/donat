@@ -14,7 +14,7 @@ arguments:
   - name: provider_reference
     type: string
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
   - name: occurred_at
     type: timestamptz!
 steps:
@@ -47,25 +47,18 @@ steps:
         payload: { arg: payload }
         occurred_at: { arg: occurred_at }
       returning: [id, renewal_id, attempt, outcome, provider_event_id, occurred_at]
-  - name: mark_dunning
+  - name: apply_outcome
     update:
       table: public.subscription_renewal
       where:
         id: { step: renewal, column: id }
       set:
-        status: { literal: dunning }
+        status:
+          rule: renewal_state_for_outcome
+          with:
+            outcome: { arg: outcome }
       returning: [id, status]
-  - name: confirm_renewal
-    update_when:
-      when: { argument_equals: { argument: outcome, value: authorized } }
-      table: public.subscription_renewal
-      where:
-        id: { step: renewal, column: id }
-      set:
-        status: { literal: confirmed }
-        confirmed_at: { arg: occurred_at }
-      returning: [id, status, confirmed_at]
-      require_affected: false
+      require_affected: true
   - name: reactivate_subscription
     update_when:
       when: { argument_equals: { argument: outcome, value: authorized } }
@@ -80,7 +73,7 @@ result:
   renewal_id: { step: renewal, column: id }
   subscription_id: { step: subscription, column: id }
   dunning_attempt: { step: dunning_attempt }
-  renewal: { step: confirm_renewal }
+  renewal: { step: apply_outcome }
   subscription: { step: reactivate_subscription }
 idempotency:
   key: { argument: provider_event_id }

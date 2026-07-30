@@ -12,7 +12,7 @@ arguments:
   - name: provider_event_id
     type: string!
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: payment
     select_one:

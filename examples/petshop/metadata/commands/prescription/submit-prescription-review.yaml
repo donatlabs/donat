@@ -40,6 +40,7 @@ steps:
       returning: [id, prescription_request_id, event_type, request_id]
 result:
   prescription_id: { step: prescription_request, column: id }
+  owner_user_id: { step: prescription_request, column: customer_id }
   order_line_id: { step: prescription_request, column: order_line_id }
   review_deadline: { step: prescription_request, column: review_deadline }
   status: { step: prescription_request, column: status }

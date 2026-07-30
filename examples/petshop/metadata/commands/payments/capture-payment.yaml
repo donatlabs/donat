@@ -7,14 +7,18 @@ arguments:
     type: uuid!
   - name: authorization_id
     type: uuid!
+  - name: shipment_id
+    type: uuid!
   - name: provider_capture_id
     type: string!
   - name: provider_event_id
     type: string!
   - name: amount_minor
     type: bigint!
+  - name: provider_outcome
+    type: PaymentOutcome!
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: payment
     select_one:
@@ -46,6 +50,12 @@ steps:
         authorized_minor: { step: authorization, column: authorized_minor }
         captured_minor: { step: authorization, column: captured_minor }
         requested_amount_minor: { arg: amount_minor }
+  - name: provider_capture_succeeded
+    assert:
+      rule: payment_outcome_is
+      with:
+        actual: { arg: provider_outcome }
+        expected: { literal: captured }
   - name: payment_event
     insert:
       table: public.payment_event
@@ -88,10 +98,12 @@ steps:
         status: { literal: captured }
       returning: [id, status]
 result:
+  shipment_id: { arg: shipment_id }
   payment_id: { step: mark_captured, column: id }
-  payment_status: { step: mark_captured, column: status }
+  status: { step: mark_captured, column: status }
   capture_id: { step: capture, column: id }
   amount_minor: { step: capture, column: amount_minor }
+  requires_reconciliation: { literal: false }
 idempotency:
   key: { argument: provider_event_id }
   retention: 365d

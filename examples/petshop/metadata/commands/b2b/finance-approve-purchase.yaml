@@ -1,4 +1,4 @@
-name: consume_credit
+name: finance_approve_purchase
 source: default
 permissions:
   - role: b2b_finance
@@ -14,12 +14,14 @@ steps:
       by:
         id: { arg: approval_id }
       returning: [id, quote_id, status]
+      require_found: true
   - name: quote
     select_one:
       table: public.quote
       by:
         id: { step: approval, column: quote_id }
       returning: [id, organization_id, total_minor, currency]
+      require_found: true
   - name: organization_credit_row
     select_many:
       table: public.organization
@@ -28,7 +30,7 @@ steps:
       order_by: [id]
       returning: [id]
       require_non_empty: true
-  - name: automatic_approval_is_allowed
+  - name: approval_is_allowed
     assert:
       rule: can_transition_approval
       with:
@@ -73,10 +75,10 @@ steps:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: submitted }
+        status: { literal: escalated }
       set:
         status: { literal: approved }
-        approved_by_role: { literal: b2b_finance }
+        approved_by_user_id: { session_variable: x-donat-user-id }
       returning: [id, quote_id, status]
       require_affected: true
 result:
@@ -90,3 +92,12 @@ idempotency:
   scope:
     - { argument: approval_id }
   retention: 365d
+effects:
+  - signal_process:
+      process: b2b_order_approval
+      signal: finance_decision
+      correlate:
+        approval_id: { step: approve, column: id }
+      payload:
+        decision: { literal: approved }
+      idempotency_key: { argument: request_id }

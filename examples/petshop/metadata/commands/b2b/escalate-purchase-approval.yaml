@@ -1,0 +1,42 @@
+name: escalate_purchase_approval
+source: default
+permissions:
+  - role: b2b_finance
+arguments:
+  - name: approval_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: approval
+    select_one:
+      table: public.purchase_approval
+      by:
+        id: { arg: approval_id }
+      returning: [id, quote_id, status]
+      require_found: true
+  - name: escalation_is_allowed
+    assert:
+      rule: can_transition_approval
+      with:
+        current: { step: approval, column: status }
+        next: { literal: escalated }
+  - name: escalate
+    update:
+      table: public.purchase_approval
+      where:
+        id: { step: approval, column: id }
+        status: { literal: submitted }
+      set:
+        status: { literal: escalated }
+      returning: [id, quote_id, status]
+      require_affected: true
+result:
+  approval_id: { step: escalate, column: id }
+  quote_id: { step: escalate, column: quote_id }
+  approval_status: { step: escalate, column: status }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: approval_id }
+  retention: 365d

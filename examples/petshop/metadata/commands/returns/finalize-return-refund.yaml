@@ -1,0 +1,56 @@
+name: finalize_return_refund
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: refund_id
+    type: bigint!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: completed_refund
+    select_one:
+      table: public.refund
+      by:
+        id: { arg: refund_id }
+        return_request_id: { arg: return_id }
+        status: { literal: refunded }
+      returning: [id, return_request_id, amount_minor, currency, status]
+      require_found: true
+  - name: return_request
+    select_one:
+      table: public.return_request
+      by:
+        id: { step: completed_refund, column: return_request_id }
+        status: { literal: inspected }
+      returning: [id, order_id, status]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_return
+      with:
+        current: { step: return_request, column: status }
+        next: { literal: refunded }
+  - name: refunded_return
+    update:
+      table: public.return_request
+      where:
+        id: { step: return_request, column: id }
+        status: { literal: inspected }
+      set:
+        status: { literal: refunded }
+      returning: [id, order_id, status]
+      require_affected: true
+result:
+  return_id: { step: refunded_return, column: id }
+  status: { step: refunded_return, column: status }
+  refund_id: { step: completed_refund, column: id }
+  refund_amount_minor: { step: completed_refund, column: amount_minor }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: return_id }
+    - { argument: refund_id }
+  retention: 365d

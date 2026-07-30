@@ -5,6 +5,9 @@ source: default
 permissions:
   - role: customer
     owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { session_variable: x-donat-user-id }
 input:
   - { name: order_id, type: uuid! }
   - { name: lines, type: "[ReturnRequestLine!]!" }
@@ -13,18 +16,49 @@ input:
   - { name: request_id, type: uuid! }
 output:
   - { name: return_id, type: uuid! }
-  - { name: status, type: String! }
-  - { name: approval, type: json }
-  - { name: return_label, type: json }
-  - { name: receipt, type: json }
-  - { name: inspection, type: json }
-  - { name: refund, type: json }
-  - { name: exchange, type: json }
-  - { name: audit, type: "[json!]!" }
+  - { name: status, type: ReturnState! }
+  - { name: approved_quantity, type: bigint! }
+  - { name: received_quantity, type: bigint! }
+  - { name: inspected_quantity, type: bigint! }
+  - { name: label_url, type: string }
+  - { name: tracking_number, type: string }
+  - { name: public_reason_code, type: string }
+  - { name: refund_id, type: bigint }
+  - { name: refund_amount_minor, type: bigint }
+  - { name: exchange_id, type: uuid }
 idempotency:
   key: { input: request_id }
   scope:
     - { session_variable: x-donat-user-id }
+signals:
+  - name: return_decision_recorded
+    role: support
+    correlation:
+      return_id: uuid!
+    payload:
+      decision: ReturnDecision!
+      status: ReturnState!
+      approved_quantity: bigint!
+      public_reason_code: string!
+  - name: return_receipt_recorded
+    role: fulfilment
+    correlation:
+      return_id: uuid!
+    payload:
+      status: ReturnState!
+      received_quantity: bigint!
+  - name: return_inspection_recorded
+    role: fulfilment
+    correlation:
+      return_id: uuid!
+    payload:
+      inspection_decision: InspectionDecision!
+      status: ReturnState!
+      inspected_quantity: bigint!
+      payment_id: uuid
+      refund_id: bigint
+      refund_amount_minor: bigint
+      currency: string
 start_at: request_return
 states:
   - id: request_return
@@ -39,11 +73,11 @@ states:
         request_id: { input: request_id }
       next: await_support_decision
 
-  # Support invokes approve_return or reject_return directly. The command's
-  # committed audit result is the signal; the flow never chooses a support role.
   - id: await_support_decision
     wait:
       signal: return_decision_recorded
+      role: support
+      verification: required
       persist_before_match: true
       correlate:
         return_id: { state: request_return, field: return_id }
@@ -56,12 +90,10 @@ states:
       cases:
         - rule: return_decision_was_approved
           with:
-            decision: { event: decision }
+            decision: { state: await_support_decision, field: decision }
           next: request_return_label
       default: rejected_by_support
 
-  # mock_carrier deliberately needs a return-label operation rather than
-  # reusing outbound create_label with an incompatible shipment contract.
   - id: request_return_label
     request:
       connector: mock_carrier
@@ -80,11 +112,13 @@ states:
         backoff: 250ms
         retry_on: [transport, timeout, http_429, http_5xx]
       next: await_warehouse_receipt
-      on_error: return_label_unavailable
+      on_error: return_label_requires_reconciliation
 
   - id: await_warehouse_receipt
     wait:
       signal: return_receipt_recorded
+      role: fulfilment
+      verification: required
       persist_before_match: true
       correlate:
         return_id: { state: request_return, field: return_id }
@@ -95,6 +129,8 @@ states:
   - id: await_inspection
     wait:
       signal: return_inspection_recorded
+      role: fulfilment
+      verification: required
       persist_before_match: true
       correlate:
         return_id: { state: request_return, field: return_id }
@@ -106,7 +142,7 @@ states:
     when:
       decision_table: return_disposition_route
       input:
-        inspection: { event: inspection_decision }
+        inspection: { state: await_inspection, field: inspection_decision }
         replacement_requested: { state: request_return, field: replacement_requested }
       cases:
         - matches: { disposition: refund }
@@ -120,33 +156,105 @@ states:
       connector: mock_payment
       operation: refund
       input:
-        payment_id: { event: payment_id }
-        refund_id: { event: refund_id }
-        amount_minor: { event: refund_amount_minor }
-        currency: { event: currency }
+        payment_id: { state: await_inspection, field: payment_id }
+        refund_id: { state: await_inspection, field: refund_id }
+        amount_minor: { state: await_inspection, field: refund_amount_minor }
+        currency: { state: await_inspection, field: currency }
         reason: { input: reason }
       idempotency_key:
-        stable: { run: id, state: request_refund, item_key: { event: refund_id } }
+        stable: { run: id, state: request_refund }
       timeout: 2s
       retry:
         maximum_attempts: 3
         backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
-      next: record_refund
-      on_error: refund_provider_unavailable
+      next: route_refund_response
+      on_error: lookup_refund
+
+  - id: route_refund_response
+    when:
+      cases:
+        - rule: payment_outcome_is
+          with:
+            actual: { state: request_refund, field: status }
+            expected: { literal: refunded }
+          next: record_refund
+      default: refund_rejected
 
   - id: record_refund
     command:
       name: complete_refund
       run_as: payment_worker
       arguments:
-        payment_id: { event: payment_id }
-        refund_id: { event: refund_id }
+        payment_id: { state: await_inspection, field: payment_id }
+        refund_id: { state: await_inspection, field: refund_id }
         provider_refund_id: { state: request_refund, field: provider_refund_id }
         provider_event_id: { state: request_refund, field: provider_event_id }
-        amount_minor: { event: refund_amount_minor }
+        amount_minor: { state: await_inspection, field: refund_amount_minor }
+        currency: { state: await_inspection, field: currency }
         payload: { state: request_refund, field: normalized_payload }
+      next: finalize_refund
+
+  - id: lookup_refund
+    request:
+      connector: mock_payment
+      operation: lookup_operation
+      input:
+        payment_id: { state: await_inspection, field: payment_id }
+        resource_kind: { literal: refund }
+        resource_id: { state: await_inspection, field: refund_id, as: string }
+        activity_key: { activity_key_for_state: request_refund }
+      timeout: 5s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: route_refund_lookup
+      on_error: refund_requires_reconciliation
+
+  - id: route_refund_lookup
+    when:
+      cases:
+        - rule: payment_lookup_confirms_refund
+          with:
+            found: { state: lookup_refund, field: found }
+            outcome: { state: lookup_refund, field: outcome }
+          next: record_reconciled_refund
+      default: refund_requires_reconciliation
+
+  - id: record_reconciled_refund
+    command:
+      name: complete_refund
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: await_inspection, field: payment_id }
+        refund_id: { state: await_inspection, field: refund_id }
+        provider_refund_id: { state: lookup_refund, field: provider_mutation_id }
+        provider_event_id: { state: lookup_refund, field: provider_event_id }
+        amount_minor: { state: lookup_refund, field: amount_minor }
+        currency: { state: lookup_refund, field: currency }
+        payload: { state: lookup_refund, field: normalized_payload }
+      next: finalize_reconciled_refund
+
+  - id: finalize_refund
+    command:
+      name: finalize_return_refund
+      run_as: fulfilment
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        refund_id: { state: record_refund, field: refund_id }
+        request_id: { activity_key: finalize_refund }
       next: refunded
+
+  - id: finalize_reconciled_refund
+    command:
+      name: finalize_return_refund
+      run_as: fulfilment
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        refund_id: { state: record_reconciled_refund, field: refund_id }
+        request_id: { activity_key: finalize_reconciled_refund }
+      next: reconciled_refund
 
   - id: create_exchange
     command:
@@ -160,92 +268,98 @@ states:
 
   - id: reject_after_inspection
     command:
-      name: reject_return
-      run_as: support
+      name: finalize_return_rejection
+      run_as: fulfilment
       arguments:
         return_id: { state: request_return, field: return_id }
-        reason: { literal: return_inspection_rejected }
-        decision_id: { activity_key: reject_after_inspection }
+        reason_code: { literal: inspection_rejected }
+        request_id: { activity_key: reject_after_inspection }
       next: rejected_after_inspection
 
   - id: refunded
     output:
       values:
         return_id: { state: request_return, field: return_id }
-        status: { literal: refunded }
-        approval: { event: approval }
-        return_label: { state: request_return_label }
-        receipt: { event: receipt }
-        inspection: { event: inspection }
-        refund: { state: record_refund }
-        exchange: { literal: null }
-        audit:
-          - { state: request_return, field: audit }
-          - { event: approval_audit }
-          - { event: receipt_audit }
-          - { event: inspection_audit }
-          - { state: record_refund }
+        status: { state: finalize_refund, field: status }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { state: await_warehouse_receipt, field: received_quantity }
+        inspected_quantity: { state: await_inspection, field: inspected_quantity }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { literal: refund_completed }
+        refund_id: { state: record_refund, field: refund_id }
+        refund_amount_minor: { state: record_refund, field: amount_minor }
+        exchange_id: { literal: null }
+
+  - id: reconciled_refund
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { state: finalize_reconciled_refund, field: status }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { state: await_warehouse_receipt, field: received_quantity }
+        inspected_quantity: { state: await_inspection, field: inspected_quantity }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { literal: refund_reconciled }
+        refund_id: { state: record_reconciled_refund, field: refund_id }
+        refund_amount_minor: { state: record_reconciled_refund, field: amount_minor }
+        exchange_id: { literal: null }
 
   - id: exchanged
     output:
       values:
         return_id: { state: request_return, field: return_id }
         status: { literal: exchanged }
-        approval: { event: approval }
-        return_label: { state: request_return_label }
-        receipt: { event: receipt }
-        inspection: { event: inspection }
-        refund: { literal: null }
-        exchange: { state: create_exchange, field: exchange }
-        audit:
-          - { state: request_return, field: audit }
-          - { event: approval_audit }
-          - { event: receipt_audit }
-          - { event: inspection_audit }
-          - { state: create_exchange, field: audit }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { state: await_warehouse_receipt, field: received_quantity }
+        inspected_quantity: { state: await_inspection, field: inspected_quantity }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { literal: exchange_created }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { state: create_exchange, field: exchange_id }
 
   - id: rejected_by_support
     output:
       values:
         return_id: { state: request_return, field: return_id }
         status: { literal: rejected }
-        approval: { event: approval }
-        return_label: { literal: null }
-        receipt: { literal: null }
-        inspection: { literal: null }
-        refund: { literal: null }
-        exchange: { literal: null }
-        audit:
-          - { state: request_return, field: audit }
-          - { event: approval_audit }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { literal: 0 }
+        inspected_quantity: { literal: 0 }
+        label_url: { literal: null }
+        tracking_number: { literal: null }
+        public_reason_code: { state: await_support_decision, field: public_reason_code }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { literal: null }
 
   - id: rejected_after_inspection
     output:
       values:
         return_id: { state: request_return, field: return_id }
-        status: { literal: rejected }
-        approval: { event: approval }
-        return_label: { state: request_return_label }
-        receipt: { event: receipt }
-        inspection: { event: inspection }
-        refund: { literal: null }
-        exchange: { literal: null }
-        audit:
-          - { state: request_return, field: audit }
-          - { event: approval_audit }
-          - { event: receipt_audit }
-          - { event: inspection_audit }
-          - { state: reject_after_inspection, field: audit }
+        status: { state: reject_after_inspection, field: status }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { state: await_warehouse_receipt, field: received_quantity }
+        inspected_quantity: { state: await_inspection, field: inspected_quantity }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { state: reject_after_inspection, field: public_reason_code }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { literal: null }
 
   - id: approval_timed_out
     fail:
       code: return_approval_timed_out
       message: Support did not decide the return request before its deadline
 
-  - id: return_label_unavailable
+  - id: return_label_requires_reconciliation
     fail:
-      code: return_label_unavailable
-      message: The return label provider could not create a label
+      code: return_label_requires_reconciliation
+      message: The return-label outcome is ambiguous and must be reconciled before retrying
 
   - id: return_not_received
     fail:
@@ -257,7 +371,12 @@ states:
       code: return_inspection_overdue
       message: The received return was not inspected before its deadline
 
-  - id: refund_provider_unavailable
+  - id: refund_requires_reconciliation
     fail:
-      code: refund_provider_unavailable
-      message: The payment provider could not complete the refund
+      code: refund_requires_reconciliation
+      message: The refund outcome is ambiguous and must be reconciled before the return can complete
+
+  - id: refund_rejected
+    fail:
+      code: refund_rejected
+      message: The payment provider rejected the refund and no local refund was recorded

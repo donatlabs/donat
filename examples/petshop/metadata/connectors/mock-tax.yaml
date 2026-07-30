@@ -12,18 +12,43 @@ operations:
     version: v1
     method: POST
     path: /v1/tax-quotes
+    input_contract:
+      checkout_quote_id: uuid!
+      destination_country_code: string!
+      currency: string!
+      taxable_lines: "[TaxableLine!]!"
     body:
-      destination: { input: destination }
+      checkout_quote_id: { input: checkout_quote_id }
+      destination_country_code: { input: destination_country_code }
       currency: { input: currency }
-      taxable_lines:
-        input: taxable_lines
-        ordered: true
+      taxable_lines: { input: taxable_lines }
     success_statuses: [200]
     response:
+      tax_quote_id: { json_pointer: /tax_quote_id, type: string!, max_bytes: 256 }
+      checkout_quote_id: { json_pointer: /checkout_quote_id, type: uuid! }
       tax_minor: { json_pointer: /tax_minor, type: bigint! }
-      tax_code: { json_pointer: /tax_code, type: string! }
+      tax_code: { json_pointer: /tax_code, type: string!, max_bytes: 64 }
+      currency: { json_pointer: /currency, type: string!, max_bytes: 16 }
     effect: read_only
-    provider_idempotent: true
+    bounds:
+      deadline_ms: 2000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 64
+      maximum_aggregate_request_bytes: 65536
+      maximum_aggregate_response_bytes: 8192
+      maximum_output_canonical_bytes: 8192
+      maximum_redirects: 0
+      maximum_json_depth: 10
+      maximum_json_nodes: 1024
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: tax_authentication }
+        - { statuses: [408], class: timeout, code: tax_timeout }
+        - { statuses: [429], class: http_429, code: tax_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: tax_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: tax_quote_rejected }
+      fallback: { class: permanent, code: tax_provider_error }
     timeout: 2s
     retry:
       maximum_attempts: 3
@@ -32,5 +57,6 @@ operations:
     capacity:
       max_in_flight: 16
       rate_limit: { permits: 40, per: 1s, burst: 16 }
+      serialize_by: { input: checkout_quote_id }
     redaction:
       request_headers: [Authorization]

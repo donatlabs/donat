@@ -1,0 +1,122 @@
+name: authorized_order_cancellation
+kind: process
+version: 1
+source: default
+permissions:
+  - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { input: owner_user_id }
+start:
+  command: request_authorized_order_cancellation
+  input:
+    order_id: { command_result: order_id }
+    owner_user_id: { command_result: owner_user_id }
+    payment_id: { command_result: payment_id }
+    authorization_id: { command_result: authorization_id }
+    reason: { command_result: reason }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: order_id }
+input:
+  - { name: order_id, type: uuid! }
+  - { name: owner_user_id, type: bigint! }
+  - { name: payment_id, type: uuid! }
+  - { name: authorization_id, type: uuid! }
+  - { name: reason, type: string! }
+output:
+  - { name: order_id, type: uuid! }
+  - { name: status, type: CheckoutState! }
+start_at: request_void
+states:
+  - id: request_void
+    request:
+      connector: mock_payment
+      operation: void
+      input:
+        payment_id: { input: payment_id }
+        authorization_id: { input: authorization_id }
+        reason: { input: reason }
+      idempotency_key:
+        stable: { run: id, state: request_void }
+      timeout: 2s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: route_void_response
+      on_error: reconcile_void
+  - id: route_void_response
+    when:
+      cases:
+        - rule: payment_outcome_is
+          with:
+            actual: { state: request_void, field: status }
+            expected: { literal: voided }
+          next: record_void
+      default: void_rejected
+  - id: record_void
+    command:
+      name: void_authorization
+      run_as: payment_worker
+      arguments:
+        payment_id: { input: payment_id }
+        authorization_id: { input: authorization_id }
+        provider_void_id: { state: request_void, field: provider_void_id }
+        provider_event_id: { state: request_void, field: provider_event_id }
+        payload: { state: request_void, field: normalized_payload }
+      next: finalize_cancellation
+  - id: reconcile_void
+    request:
+      connector: mock_payment
+      operation: lookup_operation
+      input:
+        payment_id: { input: payment_id }
+        resource_kind: { literal: void }
+        resource_id: { input: authorization_id }
+        activity_key: { activity_key: request_void }
+      timeout: 5s
+      retry:
+        maximum_attempts: 3
+        backoff: 100ms
+        retry_on: [transport, timeout, http_429, http_5xx]
+      next: route_reconciled_void
+      on_error: manual_reconciliation_required
+  - id: route_reconciled_void
+    when:
+      cases:
+        - matches: { found: true, outcome: voided }
+          next: record_reconciled_void
+      default: manual_reconciliation_required
+  - id: record_reconciled_void
+    command:
+      name: void_authorization
+      run_as: payment_worker
+      arguments:
+        payment_id: { input: payment_id }
+        authorization_id: { input: authorization_id }
+        provider_void_id: { state: reconcile_void, field: provider_mutation_id }
+        provider_event_id: { state: reconcile_void, field: provider_event_id }
+        payload: { state: reconcile_void, field: normalized_payload }
+      next: finalize_cancellation
+  - id: finalize_cancellation
+    command:
+      name: finalize_authorized_order_cancellation
+      run_as: payment_worker
+      arguments:
+        order_id: { input: order_id }
+        request_id: { activity_key: finalize_cancellation }
+      next: cancelled
+  - id: cancelled
+    output:
+      values:
+        order_id: { state: finalize_cancellation, field: order_id }
+        status: { state: finalize_cancellation, field: order_status }
+  - id: manual_reconciliation_required
+    fail:
+      code: payment_void_requires_reconciliation
+      message: The void outcome is ambiguous; the order remains cancellation_requested and inventory stays reserved
+  - id: void_rejected
+    fail:
+      code: payment_void_rejected
+      message: The provider rejected the void; the order remains cancellation_requested and inventory stays reserved

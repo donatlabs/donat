@@ -18,7 +18,7 @@ arguments:
   - name: provider_reference
     type: string!
   - name: payload
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: payment
     select_one:
@@ -74,6 +74,5 @@ result:
   reconciliation_status: { step: reconciliation, column: status }
 idempotency:
   key: { argument: provider_event_id }
-  scope:
-    - { argument: reconciliation_decision }
+  scope: command
   retention: 365d

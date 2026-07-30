@@ -54,8 +54,21 @@ steps:
         currency: { item: currency }
       returning: [shipment_id, order_line_id, quantity, line_value_minor]
 result:
-  shipment: { step: shipment }
-  items: { step: shipment_items }
+  shipment_id: { step: shipment, column: id }
+  allocation_id: { step: shipment, column: allocation_id }
+  shipment_key: { step: shipment, column: shipment_key }
+  stock_location_code: { step: shipment, column: stock_location_code }
+  shipped_value_minor: { step: shipment, column: shipped_value_minor }
+  currency: { step: shipment, column: currency }
+  items:
+    step: allocation_lines
+    project:
+      order_line_id: order_line_id
+      variant_id: variant_id
+      quantity: quantity
+      unit_price_minor: unit_price_minor
+      currency: currency
+    maximum_items: 64
 idempotency:
   key: { argument: request_id }
   scope: command

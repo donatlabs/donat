@@ -1,32 +1,27 @@
-name: cancel_order
+name: finalize_authorized_order_cancellation
 source: default
 permissions:
-  - role: customer
-  - role: support
+  - role: payment_worker
 arguments:
   - name: order_id
     type: uuid!
   - name: request_id
-    type: uuid!
+    type: string!
 steps:
   - name: order
     select_one:
       table: public.orders
       by:
         id: { arg: order_id }
-      returning: [id, customer_id, order_status]
-  - name: cancellation_is_allowed
-    assert:
-      rule: can_transition_checkout
-      with:
-        current: { step: order, column: order_status }
-        next: { literal: cancelled }
+        order_status: { literal: cancellation_requested }
+      returning: [id, order_status]
+      require_found: true
   - name: payment
     select_one:
       table: public.payment
       by:
         order_id: { step: order, column: id }
-        status: { literal: pending }
+        status: { literal: voided }
       returning: [id, status]
       require_found: true
   - name: remaining_reservations
@@ -72,17 +67,18 @@ steps:
       table: public.orders
       where:
         id: { step: order, column: id }
+        order_status: { literal: cancellation_requested }
       set:
         order_status: { literal: cancelled }
       returning: [id, order_status]
+      require_affected: true
 result:
   order_id: { step: cancel_order, column: id }
   order_status: { step: cancel_order, column: order_status }
-  released_reservations: { step: release_reservations }
   payment_id: { step: payment, column: id }
+  released_reservations: { step: release_reservations }
 idempotency:
   key: { argument: request_id }
   scope:
     - { argument: order_id }
-    - { session_variable: x-donat-user-id }
-  retention: 30d
+  retention: 365d

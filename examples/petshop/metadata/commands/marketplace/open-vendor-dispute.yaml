@@ -10,7 +10,7 @@ arguments:
   - name: reason
     type: string!
   - name: details
-    type: json!
+    type: BoundedProviderEvidence!
 steps:
   - name: vendor_membership
     select_one:

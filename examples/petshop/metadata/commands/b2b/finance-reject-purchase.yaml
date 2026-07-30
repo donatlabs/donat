@@ -1,7 +1,7 @@
-name: reject_purchase
+name: finance_reject_purchase
 source: default
 permissions:
-  - role: b2b_approver
+  - role: b2b_finance
 arguments:
   - name: approval_id
     type: uuid!
@@ -16,6 +16,7 @@ steps:
       by:
         id: { arg: approval_id }
       returning: [id, quote_id, status]
+      require_found: true
   - name: rejection_is_allowed
     assert:
       rule: can_transition_approval
@@ -27,7 +28,7 @@ steps:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: submitted }
+        status: { literal: escalated }
       set:
         status: { literal: rejected }
         rejected_by_user_id: { session_variable: x-donat-user-id }
@@ -47,7 +48,7 @@ idempotency:
 effects:
   - signal_process:
       process: b2b_order_approval
-      signal: approver_decision
+      signal: finance_decision
       correlate:
         approval_id: { step: reject, column: id }
       payload:

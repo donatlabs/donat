@@ -24,7 +24,12 @@ steps:
       returning: [allocation_id, order_id, stock_location_code, quantity, status, packed_at]
       require_affected: true
 result:
-  allocation: { step: packed_allocation }
+  allocation_id: { step: packed_allocation, column: allocation_id }
+  order_id: { step: packed_allocation, column: order_id }
+  stock_location_code: { step: packed_allocation, column: stock_location_code }
+  quantity: { step: packed_allocation, column: quantity }
+  status: { step: packed_allocation, column: status }
+  packed_at: { step: packed_allocation, column: packed_at }
 idempotency:
   key: { argument: request_id }
   scope: command

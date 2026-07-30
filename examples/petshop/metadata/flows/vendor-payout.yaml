@@ -9,8 +9,8 @@ input:
   - { name: request_id, type: uuid! }
 output:
   - { name: payout_cycle_id, type: uuid! }
-  - { name: payouts, type: "[json!]!" }
-  - { name: reconciliation, type: json }
+  - { name: payouts, type: "[VendorPayoutOutcome!]!" }
+  - { name: failures, type: "[ItemFailure!]!" }
 idempotency:
   key: { input: request_id }
   scope:
@@ -67,29 +67,20 @@ states:
           provider_event_id: { item: provider_event_id }
           outcome: { item: outcome }
           payload: { item: normalized_payload }
-      next: await_cycle_settlement
-
-  - id: await_cycle_settlement
-    wait:
-      signal: payout_cycle_status_changed
-      verification: required
-      persist_before_match: true
-      correlate:
-        payout_cycle_id: { input: payout_cycle_id }
-      match:
-        all_settled: true
-      deadline: 7d
       next: settled
-      on_timeout: reconciliation_timed_out
 
   - id: settled
     output:
       values:
         payout_cycle_id: { input: payout_cycle_id }
-        payouts: { event: payouts }
-        reconciliation: { literal: null }
-
-  - id: reconciliation_timed_out
-    fail:
-      code: payout_reconciliation_timed_out
-      message: Support did not reconcile the payout outcome before its deadline
+        payouts:
+          state: record_payout_outcomes
+          field: ordered_results
+          maximum_items: 64
+        failures:
+          bounded_concat:
+            inputs:
+              - { state: request_payouts, field: failed_items }
+              - { state: record_payout_outcomes, field: failed_items }
+            maximum_lists: 2
+            maximum_items: 64

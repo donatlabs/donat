@@ -9,7 +9,7 @@ input:
   - { name: destination_region, type: string! }
   - { name: allocation_request_id, type: uuid! }
 output:
-  - { name: status, type: String! }
+  - { name: status, type: string! }
   - { name: order_id, type: uuid! }
   - { name: allocations, type: "[AllocationGroup!]!" }
   - { name: backorders, type: "[Backorder!]!" }
@@ -75,6 +75,7 @@ states:
         connector: mock_carrier
         operation: create_label
         input:
+          shipment_id: { item: shipment_id }
           shipment_key: { item: shipment_key }
           origin_location_code: { item: stock_location_code }
           destination: { input: destination_region }
@@ -114,7 +115,12 @@ states:
   # payment command, so no local capture exists without a provider attempt.
   - id: request_payment_captures
     for_each:
-      input: { state: record_label_outcomes, field: successful_items }
+      input:
+        bounded_flatten:
+          from: { state: record_label_outcomes, field: successful_items }
+          field: capture_eligible
+          maximum_lists: 64
+          maximum_items: 64
       item_key: shipment_id
       max_items: 64
       max_concurrency: 4
@@ -124,6 +130,7 @@ states:
         operation: capture
         input:
           payment_id: { state: allocate, field: payment_id }
+          shipment_id: { item: shipment_id }
           amount_minor: { item: shipped_value_minor }
           currency: { item: currency }
         idempotency_key:
@@ -148,9 +155,11 @@ states:
         arguments:
           payment_id: { state: allocate, field: payment_id }
           authorization_id: { state: allocate, field: authorization_id }
+          shipment_id: { item: shipment_id }
           provider_capture_id: { item: provider_capture_id }
           provider_event_id: { item: provider_event_id }
-          amount_minor: { item: shipped_value_minor }
+          amount_minor: { item: amount_minor }
+          provider_outcome: { item: status }
           payload: { item: normalized_payload }
       next: partial_output
 
@@ -161,14 +170,22 @@ states:
         order_id: { input: order_id }
         allocations: { state: allocate, field: allocations }
         backorders: { state: allocate, field: backorders }
-        shipment_outcomes: { state: record_label_outcomes, field: ordered_results }
+        shipment_outcomes:
+          state: record_label_outcomes
+          field: ordered_results
+          project:
+            [shipment_id, allocation_id, outcome, tracking_number,
+             failure_code, requires_reconciliation]
+          maximum_items: 64
         captures: { state: record_payment_captures, field: ordered_results }
         unshipped_allocations:
-          - { state: pack_allocations, field: failed_items }
-          - { state: create_shipment_units, field: failed_items }
-          - { state: request_labels, field: failed_items }
-          - { state: record_label_outcomes, field: failed_items }
-          - { state: request_payment_captures, field: failed_items }
-          - { state: record_payment_captures, field: failed_items }
-        invariant:
-          { literal: unshipped lines remain allocated or packed and are never promoted to shipped }
+          bounded_concat:
+            inputs:
+              - { state: pack_allocations, field: failed_items }
+              - { state: create_shipment_units, field: failed_items }
+              - { state: request_labels, field: failed_items }
+              - { state: record_label_outcomes, field: failed_items }
+              - { state: request_payment_captures, field: failed_items }
+              - { state: record_payment_captures, field: failed_items }
+            maximum_lists: 6
+            maximum_items: 64

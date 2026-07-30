@@ -12,6 +12,12 @@ operations:
     version: v1
     method: POST
     path: /v1/payouts
+    input_contract:
+      payout_id: uuid!
+      payout_key: string!
+      vendor_id: uuid!
+      amount_minor: bigint!
+      currency: string!
     body:
       payout_id: { input: payout_id }
       payout_key: { input: payout_key }
@@ -20,16 +26,44 @@ operations:
       currency: { input: currency }
     success_statuses: [200, 201, 202]
     response:
-      provider_event_id: { json_pointer: /provider_event_id, type: string! }
-      provider_payout_id: { json_pointer: /payout_id, type: string! }
+      payout_id: { json_pointer: /local_payout_id, type: uuid! }
+      vendor_id: { json_pointer: /vendor_id, type: uuid! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_payout_id: { json_pointer: /payout_id, type: string!, max_bytes: 256 }
       outcome: { json_pointer: /outcome, type: PayoutState! }
-      normalized_payload: { json_pointer: /normalized_payload, type: json!, max_bytes: 4096 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payout-create-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payout_authentication }
+        - { statuses: [408], class: timeout, code: payout_timeout }
+        - { statuses: [429], class: http_429, code: payout_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payout_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payout_rejected }
+      fallback: { class: permanent, code: payout_provider_error }
     timeout: 5s
     retry:
       maximum_attempts: 4
       backoff: 250ms
       retry_on: [transport, timeout, http_429, http_5xx]
-    idempotency: { header: Idempotency-Key }
     capacity:
       max_in_flight: 8
       rate_limit: { permits: 30, per: 1m, burst: 8 }

@@ -1,19 +1,21 @@
-name: reject_return
+name: finalize_return_rejection
 source: default
 permissions:
-  - role: support
+  - role: fulfilment
 arguments:
   - name: return_id
     type: uuid!
-  - name: reason
+  - name: reason_code
     type: string!
-  - name: decision_id
+  - name: request_id
     type: uuid!
 steps:
   - name: return_request
     select_one:
       table: { schema: public, name: return_request }
-      by: { id: { arg: return_id } }
+      by:
+        id: { arg: return_id }
+        status: { literal: inspected }
       returning: [id, order_id, status]
       require_found: true
   - name: transition_is_allowed
@@ -28,38 +30,26 @@ steps:
       object:
         return_request_id: { step: return_request, column: id }
         event_type: { literal: rejected }
-        actor_role: { literal: support }
-        request_id: { arg: decision_id }
-        reason: { arg: reason }
-      returning: [id, return_request_id, event_type, request_id, reason]
+        actor_role: { literal: fulfilment }
+        request_id: { arg: request_id }
+        reason: { arg: reason_code }
+      returning: [id, return_request_id, event_type, request_id]
   - name: rejected_return
     update:
       table: { schema: public, name: return_request }
       where:
         id: { step: return_request, column: id }
-        status: { step: return_request, column: status }
-      set: { status: { literal: rejected } }
+        status: { literal: inspected }
+      set:
+        status: { literal: rejected }
       returning: [id, order_id, status]
       require_affected: true
 result:
   return_id: { step: rejected_return, column: id }
-  order_id: { step: rejected_return, column: order_id }
   status: { step: rejected_return, column: status }
-  audit: { step: rejection_audit }
+  public_reason_code: { arg: reason_code }
 idempotency:
-  key: { argument: decision_id }
+  key: { argument: request_id }
   scope:
     - { argument: return_id }
   retention: 365d
-effects:
-  - signal_process:
-      process: return_refund
-      signal: return_decision_recorded
-      correlate:
-        return_id: { step: rejected_return, column: id }
-      payload:
-        decision: { literal: rejected }
-        status: { step: rejected_return, column: status }
-        approved_quantity: { literal: 0 }
-        public_reason_code: { literal: return_rejected }
-      idempotency_key: { argument: decision_id }

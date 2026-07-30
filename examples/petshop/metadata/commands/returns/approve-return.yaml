@@ -61,6 +61,11 @@ steps:
       set: { status: { literal: approved } }
       returning: [id, order_id, status, replacement_requested]
       require_affected: true
+  - name: approved_quantity
+    aggregate:
+      from: { step: approved_items }
+      values:
+        quantity: { sum: { column: approved_quantity } }
 result:
   return_id: { step: approved_return, column: id }
   order_id: { step: approved_return, column: order_id }
@@ -81,6 +86,7 @@ effects:
         return_id: { step: approved_return, column: id }
       payload:
         decision: { literal: approved }
-        approval: { step: approved_return }
-        approval_audit: { step: approval_audit }
+        status: { step: approved_return, column: status }
+        approved_quantity: { step: approved_quantity, column: quantity }
+        public_reason_code: { literal: return_approved }
       idempotency_key: { argument: decision_id }

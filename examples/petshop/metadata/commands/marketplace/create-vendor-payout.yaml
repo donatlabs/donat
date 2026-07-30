@@ -16,6 +16,17 @@ steps:
       order_by: [vendor_id]
       returning: [vendor_id, payout_key, vendor_order_count, gross_minor, commission_minor, net_minor, currency]
       require_non_empty: true
+  - name: payout_candidate_count
+    aggregate:
+      from: { step: payout_candidates }
+      values:
+        item_count: { count: true }
+  - name: payout_fan_out_is_bounded
+    assert:
+      rule: bounded_fan_out_count
+      with:
+        item_count: { step: payout_candidate_count, column: item_count }
+        maximum_items: { literal: 64 }
   - name: payouts
     insert_many:
       table: public.vendor_payout
@@ -33,7 +44,7 @@ steps:
       returning: [id, payout_cycle_id, vendor_id, payout_key, net_minor, currency, status]
 result:
   payout_cycle_id: { arg: payout_cycle_id }
-  payouts: { step: payouts }
+  payouts: { step: payouts, as: VendorPayoutCandidate, maximum_items: 64 }
 idempotency:
   key: { argument: request_id }
   scope:

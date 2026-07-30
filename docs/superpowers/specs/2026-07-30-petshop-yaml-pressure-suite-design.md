@@ -53,6 +53,7 @@ examples/petshop/metadata/
 ├── flows.yaml
 ├── flows/
 │   ├── checkout-payment.yaml
+│   ├── authorized-order-cancellation.yaml
 │   ├── partial-fulfilment.yaml
 │   ├── return-refund.yaml
 │   ├── subscription-renewal.yaml
@@ -129,19 +130,23 @@ atomic cross-relation change or guarded lifecycle transition.
 
 The first YAML catalog includes:
 
-- checkout: `begin_checkout`, `cancel_order`,
-  `release_expired_checkout`;
+- checkout: `prepare_checkout_quote`, `begin_checkout`, `cancel_order`,
+  `request_authorized_order_cancellation`,
+  `finalize_authorized_order_cancellation`, `release_expired_checkout`;
 - payments: `record_payment_outcome`, `authorize_payment`,
   `capture_payment`, `void_authorization`, `complete_refund`,
   `record_chargeback`, `reconcile_payment`;
 - fulfilment: `allocate_inventory`, `mark_order_packed`,
   `create_shipment`, `record_shipment_result`, `record_delivery`;
 - returns: `request_return`, `approve_return`, `reject_return`,
-  `receive_return`, `record_return_inspection`, `create_exchange`;
+  `receive_return`, `record_return_inspection`,
+  `finalize_return_refund`, `finalize_return_rejection`, `create_exchange`;
 - subscriptions: `create_subscription_order`, `record_renewal_outcome`,
   `pause_subscription`, `cancel_subscription`;
 - B2B: `submit_quote`, `approve_purchase`, `reject_purchase`,
-  `consume_credit`;
+  `consume_credit`, `escalate_purchase_approval`,
+  `finance_approve_purchase`, `finance_reject_purchase`,
+  `finalize_finance_rejection`;
 - marketplace: `split_vendor_orders`, `record_vendor_acceptance`,
   `create_vendor_payout`, `record_payout_outcome`,
   `reconcile_vendor_payout`, `open_vendor_dispute`;
@@ -163,11 +168,19 @@ escape hatch.
 
 ### `checkout_payment`
 
-Runs `begin_checkout`, calls the payment connector after commit, waits for a
-verified authorization event or deadline, and applies the normalized outcome.
-Physical goods remain authorized rather than captured until fulfilment.
-Provider failure after retry releases reservations. A late callback remains
-auditable and cannot resurrect an expired order.
+Builds immutable price-list, promotion, shipping, per-line tax-route, and
+provider-tax snapshots before calling the payment connector. It consumes the
+synchronous normalized authorization result and materializes the
+authorization. If the mutation response is ambiguous, a read-only lookup
+reconciles the original activity key; reservations remain held when the lookup
+cannot prove the outcome.
+
+### `authorized_order_cancellation`
+
+Moves an authorized order to `cancellation_requested`, durably voids its
+authorization, and releases reservations only after the void is recorded.
+Ambiguous voids use the same read-only operation lookup and never treat a
+missing response as proof that no provider effect occurred.
 
 ### `partial_fulfilment`
 
@@ -178,9 +191,11 @@ its shipped lines; cancelling the remainder voids any unused authorization.
 
 ### `return_refund`
 
-Waits for approval, obtains a return label, waits for warehouse receipt and
-inspection, then routes to refund, exchange, or rejection. Every terminal path
-retains the inspection decision.
+Waits for typed approval, obtains a return label, waits for typed warehouse
+receipt and inspection signals, then routes to refund, exchange, or rejection.
+Customer status exposes only safe quantities, label/tracking fields, IDs, and
+public reason codes; notes, actors, provider evidence, and audit rows stay
+behind data permissions.
 
 ### `subscription_renewal`
 
@@ -198,9 +213,10 @@ without creating a payable order.
 
 ### `vendor_payout`
 
-Consumes eligible vendor-order balances, calculates commission through a
-decision table, creates one stable payout request per vendor, and waits for
-provider outcomes or manual reconciliation.
+Consumes at most 64 eligible vendor balances, calculates commission through a
+decision table, creates one stable payout request per vendor, and records each
+synchronous terminal provider outcome. Per-item transport failures remain
+typed reconciliation work rather than becoming a stale aggregate signal.
 
 ### `grooming_booking`
 
@@ -264,15 +280,20 @@ carrier, tax, notification, and payout behavior. Manual configuration may
 point generic HTTP operations at a request-capture endpoint.
 
 Every mutation operation declares retry classification, timeout, capacity,
-redaction, and provider idempotency. Process start and command-signal effects
-are generic transactional outbox records, never immediate Process calls.
-Verified inbound events are persisted before flow matching, so
-callback-before-wait and duplicate delivery are safe. Provider payloads are
-normalized before commands consume them.
+redaction, and complete immutable provider-idempotency evidence: fixed key
+binding, provider scope, minimum retention, and positive clock margin.
+Read-only tax and operation-lookup calls retain ordinary bounded retry policy
+without a side-effect classification. Process start and command-signal
+effects are generic transactional outbox records, never immediate Process
+calls. Typed verified signals are persisted before flow matching. Provider
+payloads are normalized into bounded evidence before commands consume them.
 
 ## Public execution contract
 
-Each public flow has one durable run and three views of that same run:
+Each public flow has one durable run and three views of that same run.
+Checkout, authorized cancellation, returns, grooming, prescription, and B2B
+runs capture a non-null owner identity rather than granting role-wide handle
+visibility:
 
 - `start_*` returns the owner-scoped run handle immediately;
 - `execute_*` waits for a bounded interval and returns either terminal output

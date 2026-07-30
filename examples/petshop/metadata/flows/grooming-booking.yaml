@@ -4,6 +4,10 @@ version: 1
 source: default
 permissions:
   - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { session_variable: x-donat-user-id }
 input:
   - { name: service_resource_id, type: uuid! }
   - { name: slot_key, type: string! }
@@ -18,6 +22,12 @@ idempotency:
   key: { input: request_id }
   scope:
     - { input: slot_key }
+signals:
+  - name: booking_transition_recorded
+    correlation:
+      booking_id: uuid!
+    payload:
+      outcome: BookingOutcome!
 start_at: reserve_slot
 states:
   - id: reserve_slot
@@ -35,19 +45,27 @@ states:
   - id: await_customer_confirmation
     wait:
       signal: booking_transition_recorded
+      role: customer
+      verification: required
       persist_before_match: true
       correlate:
         booking_id: { state: reserve_slot, field: booking_id }
-      deadline: 15m
+      deadline: { state: reserve_slot, field: hold_expires_at }
       next: route_hold_transition
       on_timeout: expire_hold
 
   - id: route_hold_transition
     when:
       cases:
-        - matches: { outcome: confirmed }
+        - rule: booking_outcome_is
+          with:
+            actual: { state: await_customer_confirmation, field: outcome }
+            expected: { literal: confirmed }
           next: confirmed
-        - matches: { outcome: cancelled }
+        - rule: booking_outcome_is
+          with:
+            actual: { state: await_customer_confirmation, field: outcome }
+            expected: { literal: cancelled }
           next: cancelled
       default: unexpected_hold_transition
 

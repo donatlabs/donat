@@ -63,7 +63,13 @@ result:
   payment_id: { step: return_context, column: payment_id }
   currency: { step: return_context, column: currency }
   return_from: { step: return_context, column: return_from }
-  items: { step: return_items }
+  items:
+    step: return_items
+    project:
+      return_item_id: id
+      order_line_id: order_line_id
+      requested_quantity: requested_quantity
+    maximum_items: 256
   audit: { step: requested_audit }
 idempotency:
   key: { argument: request_id }
