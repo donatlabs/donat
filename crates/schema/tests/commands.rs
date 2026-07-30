@@ -7,7 +7,10 @@ use donat_ir::{
     ValueScalar, ValueType,
 };
 use donat_metadata::{Columns, CommandStepOperation, Metadata, ScalarType, SourceKind};
-use donat_rules::{RuleCatalog, RuleDefinition, RuleType, compile_catalog};
+use donat_rules::{
+    DecisionRow, DecisionTableDefinition, HitPolicy, RuleCatalog, RuleDefinition, RuleType,
+    compile_catalog,
+};
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
     compile_command_catalog, compile_command_source_catalog, execute_multi_source_introspection,
@@ -1042,10 +1045,15 @@ fn command_planning_resolves_execution_facts_without_raw_metadata() {
         .idempotency
         .as_ref()
         .expect("idempotency is resolved");
-    assert_eq!(
-        idempotency.scope,
-        vec![Scalar::Json(json!("customer-7"))],
-        "declared session scope is resolved before SQLgen"
+    assert!(
+        matches!(
+            idempotency.scope.as_slice(),
+            [CommandExecutionValue::Scalar {
+                value: Scalar::Json(value),
+                pg_type,
+            }] if value == &json!("customer-7") && pg_type == "text"
+        ),
+        "declared session scope is resolved into typed execution values before SQLgen"
     );
     assert_eq!(idempotency.retention_seconds, Some(30 * 24 * 60 * 60));
     let serialized = serde_json::to_value(command).expect("execution IR serializes");
@@ -2361,6 +2369,172 @@ fn rejects_multi_row_step_columns_bound_to_a_scalar_destination() {
 }
 
 #[test]
+fn allocate_many_compiles_to_bounded_typed_ir_with_named_row_sets() {
+    let command = json!({
+        "name": "allocate_test",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [{ "name": "request_id", "type": "uuid!" }],
+        "steps": [
+            {
+                "name": "candidates",
+                "fixed_rows": {
+                    "maximum_rows": 2,
+                    "rows": [
+                        {
+                            "order_id": { "literal": "order-1" },
+                            "order_line_id": { "literal": "line-1" },
+                            "line_sequence": { "literal": 1 },
+                            "variant_id": { "literal": "variant-1" },
+                            "location_code": { "literal": "A" },
+                            "inventory_level_id": { "literal": "stock-1" },
+                            "requested_quantity": { "literal": 3 },
+                            "available_quantity": { "literal": 2 },
+                            "unit_price_minor": { "literal": 100 },
+                            "currency": { "literal": "USD" },
+                            "allocation_rank": { "literal": 1 }
+                        },
+                        {
+                            "order_id": { "literal": "order-1" },
+                            "order_line_id": { "literal": "line-1" },
+                            "line_sequence": { "literal": 1 },
+                            "variant_id": { "literal": "variant-1" },
+                            "location_code": { "literal": "B" },
+                            "inventory_level_id": { "literal": "stock-2" },
+                            "requested_quantity": { "literal": 3 },
+                            "available_quantity": { "literal": 2 },
+                            "unit_price_minor": { "literal": 100 },
+                            "currency": { "literal": "USD" },
+                            "allocation_rank": { "literal": 2 }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "allocation",
+                "allocate_many": {
+                    "from": { "step": "candidates" },
+                    "request_id": { "arg": "request_id" },
+                    "group_key": ["location_code"],
+                    "exact_quantity_columns": {
+                        "requested": "requested_quantity",
+                        "available": "available_quantity",
+                        "allocated": "allocated_quantity",
+                        "backordered": "backordered_quantity"
+                    },
+                    "allocation_id": "deterministic",
+                    "returning": {
+                        "groups": ["allocation_id", "order_id", "first_line_sequence", "allocation_rank", "location_code", "currency", "items"],
+                        "lines": ["allocation_id", "order_id", "order_line_id", "line_sequence", "variant_id", "location_code", "inventory_level_id", "requested_quantity", "allocated_quantity", "unit_price_minor", "currency"],
+                        "backorders": ["order_id", "order_line_id", "requested_quantity", "backordered_quantity"]
+                    },
+                    "group_order_by": ["first_line_sequence", "allocation_rank", "location_code", "allocation_id"],
+                    "line_order_by": ["line_sequence", "location_code", "allocation_id"]
+                }
+            }
+        ],
+        "result": {
+            "allocations": {
+                "step": "allocation",
+                "field": "groups",
+                "as": "AllocationGroup",
+                "maximum_items": 2
+            }
+        }
+    });
+    let metadata = metadata(vec![command]);
+    let catalogs = HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]);
+    let commands = command_catalog(&metadata, &catalogs);
+    let plan = plan_runtime(
+        &metadata,
+        &catalogs,
+        commands,
+        "customer",
+        r#"mutation {
+            allocate_test(request_id: "550e8400-e29b-41d4-a716-446655440000") {
+                allocations { allocation_id order_id location_code }
+            }
+        }"#,
+    )
+    .expect("the deterministic allocation grammar compiles and plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("allocation command must plan as a mutation");
+    };
+    let [MutationRoot::Command { command, .. }] = roots.as_slice() else {
+        panic!("expected one allocation command root");
+    };
+    let CommandExecutionStep::AllocateMany {
+        group_key,
+        groups,
+        lines,
+        backorders,
+        maximum_rows,
+        ..
+    } = &command.steps[1]
+    else {
+        panic!("the second step must be typed allocation IR");
+    };
+    assert_eq!(group_key[0].name, "location_code");
+    assert_eq!(*maximum_rows, 256);
+    assert!(groups.iter().any(|column| column.name == "items"));
+    assert!(
+        lines
+            .iter()
+            .any(|column| column.name == "allocated_quantity")
+    );
+    assert!(
+        backorders
+            .iter()
+            .any(|column| column.name == "backordered_quantity")
+    );
+    assert!(matches!(
+        &command.result[0].value,
+        CommandResultValue::ProjectedRows {
+            cte,
+            many: true,
+            maximum_items: 2,
+            ..
+        } if cte.ends_with("_groups")
+    ));
+
+    let introspection = introspect_runtime(
+        &metadata,
+        &catalogs,
+        command_catalog(&metadata, &catalogs),
+        "customer",
+        r#"
+          {
+            result: __type(name: "AllocateTestResult") {
+              fields {
+                name
+                type { kind name ofType { kind name ofType { kind name } } }
+              }
+            }
+            group: __type(name: "AllocationGroup") {
+              fields { name }
+            }
+          }
+        "#,
+    );
+    assert_eq!(
+        introspection["result"]["fields"][0]["type"]["ofType"]["kind"],
+        "LIST"
+    );
+    assert_eq!(
+        introspection["group"]["fields"],
+        json!([
+            { "name": "allocation_id" },
+            { "name": "order_id" },
+            { "name": "first_line_sequence" },
+            { "name": "allocation_rank" },
+            { "name": "location_code" },
+            { "name": "currency" },
+            { "name": "items" }
+        ])
+    );
+}
+
+#[test]
 fn rejects_wrong_scalar_and_rule_binding_types() {
     let mut scalar_mismatch = valid_command();
     scalar_mismatch["steps"][0]["insert"]["object"]["quantity"] = json!({ "arg": "status" });
@@ -3339,4 +3513,279 @@ fn command_descriptor_rejects_incompatible_session_variable_uses() {
     assert!(error.message.contains("x-donat-shared-id"));
     assert!(error.message.contains("customer"));
     assert!(error.message.contains("incompatible"));
+}
+
+fn petshop_decision_rules() -> RuleCatalog {
+    compile_catalog(
+        &[
+            RuleDefinition {
+                name: "positive_quantity".to_owned(),
+                bindings: BTreeMap::from([("quantity".to_owned(), RuleType::Int)]),
+                result: RuleType::Bool,
+                expression: "quantity > 0".to_owned(),
+            },
+            RuleDefinition {
+                name: "double_quantity".to_owned(),
+                bindings: BTreeMap::from([("quantity".to_owned(), RuleType::Int)]),
+                result: RuleType::Int,
+                expression: "quantity * 2".to_owned(),
+            },
+        ],
+        &[DecisionTableDefinition {
+            name: "quantity_route".to_owned(),
+            revision: "fixture".to_owned(),
+            inputs: BTreeMap::from([("quantity".to_owned(), RuleType::Int)]),
+            output: BTreeMap::from([
+                ("route".to_owned(), RuleType::String),
+                ("multiplier".to_owned(), RuleType::Int),
+            ]),
+            hit_policy: HitPolicy::First,
+            rows: vec![
+                DecisionRow {
+                    id: "bulk".to_owned(),
+                    description: None,
+                    when: BTreeMap::from([("quantity".to_owned(), "quantity >= 10".to_owned())]),
+                    output: json!({ "route": "bulk", "multiplier": 2 }),
+                },
+                DecisionRow {
+                    id: "ordinary".to_owned(),
+                    description: None,
+                    when: BTreeMap::from([("quantity".to_owned(), "true".to_owned())]),
+                    output: json!({ "route": "ordinary", "multiplier": 1 }),
+                },
+            ],
+            test_cases: vec![],
+        }],
+    )
+    .expect("Petshop decision fixture compiles")
+}
+
+fn compile_petshop_command(command: Json) -> Result<(), PlanError> {
+    let metadata = metadata(vec![command]);
+    compile_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_owned(), catalog(RelationKind::Table))]),
+        &petshop_decision_rules(),
+        true,
+    )
+    .map(|_| ())
+}
+
+fn pure_petshop_command(steps: Vec<Json>, result: Json) -> Json {
+    json!({
+        "name": "petshop_compiler_contract",
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "arguments": [
+            { "name": "quantity", "type": "Int!" },
+            { "name": "status", "type": "String!" },
+            { "name": "enabled", "type": "Boolean!" },
+            { "name": "request_id", "type": "uuid!" }
+        ],
+        "steps": steps,
+        "result": result
+    })
+}
+
+#[test]
+fn petshop_project_rejects_forward_step_reference() {
+    let command = pure_petshop_command(
+        vec![
+            json!({
+                "name": "projected",
+                "project": {
+                    "values": {
+                        "status": { "step": "later", "column": "status" }
+                    }
+                }
+            }),
+            json!({
+                "name": "later",
+                "project": {
+                    "values": {
+                        "status": { "arg": "status" }
+                    }
+                }
+            }),
+        ],
+        json!({}),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("a pure projection cannot read a later command step");
+    assert_eq!(error.path, "commands[0].steps[0]");
+    assert_eq!(
+        error.message,
+        "step reference 'later' must reference an earlier step"
+    );
+}
+
+#[test]
+fn petshop_project_many_rejects_scalar_input_cardinality() {
+    let command = pure_petshop_command(
+        vec![
+            json!({
+                "name": "one",
+                "project": {
+                    "values": {
+                        "quantity": { "arg": "quantity" }
+                    }
+                }
+            }),
+            json!({
+                "name": "many",
+                "project_many": {
+                    "from": { "step": "one" },
+                    "maximum_rows": 16,
+                    "values": {
+                        "quantity": { "item": "quantity" }
+                    }
+                }
+            }),
+        ],
+        json!({}),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("project_many requires a prior bounded row set");
+    assert_eq!(error.path, "commands[0].steps[1]");
+    assert_eq!(
+        error.message,
+        "project_many input must be a prior row-set step"
+    );
+}
+
+#[test]
+fn petshop_decision_rejects_input_type_mismatch() {
+    let command = pure_petshop_command(
+        vec![json!({
+            "name": "route",
+            "decision": {
+                "decision_table": "quantity_route",
+                "input": {
+                    "quantity": { "arg": "status" }
+                },
+                "returning": ["route"]
+            }
+        })],
+        json!({}),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("decision inputs retain the compiled table's exact types");
+    assert_eq!(error.path, "commands[0].steps[0]");
+    assert_eq!(
+        error.message,
+        "String is not assignable to decision input 'quantity' (Int)"
+    );
+}
+
+#[test]
+fn petshop_result_rejects_undeclared_projected_output() {
+    let command = pure_petshop_command(
+        vec![json!({
+            "name": "projected",
+            "project": {
+                "values": {
+                    "public_status": { "arg": "status" }
+                }
+            }
+        })],
+        json!({
+            "leaked": {
+                "step": "projected",
+                "project": {
+                    "status": "private_status"
+                },
+                "maximum_items": 1
+            }
+        }),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("a result projection cannot expose a field absent from its producer");
+    assert_eq!(error.path, "commands[0]");
+    assert_eq!(
+        error.message,
+        "step 'projected' does not expose result field 'private_status'"
+    );
+}
+
+#[test]
+fn petshop_conditional_write_rejects_invalid_condition() {
+    let command = pure_petshop_command(
+        vec![json!({
+            "name": "write",
+            "update_when": {
+                "when": {
+                    "argument_equals": {
+                        "argument": "missing",
+                        "value": true
+                    }
+                },
+                "table": { "schema": "public", "name": "orders" },
+                "where": { "id": { "arg": "request_id" } },
+                "set": { "status": { "arg": "status" } },
+                "returning": ["id"]
+            }
+        })],
+        json!({}),
+    );
+
+    let error =
+        compile_petshop_command(command).expect_err("conditional gates name declared arguments");
+    assert_eq!(error.path, "commands[0].steps[0]");
+    assert_eq!(
+        error.message,
+        "unknown argument 'missing' in command condition"
+    );
+}
+
+#[test]
+fn petshop_decision_rejects_non_finite_result_literal() {
+    let command = pure_petshop_command(
+        vec![json!({
+            "name": "projected",
+            "project": {
+                "values": {
+                    "amount": {
+                        "rule": "double_quantity",
+                        "with": {
+                            "quantity": { "literal": "NaN" }
+                        }
+                    }
+                }
+            }
+        })],
+        json!({}),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("non-finite numeric spellings cannot enter resolved decision data");
+    assert_eq!(error.path, "commands[0].steps[0]");
+    assert_eq!(error.message, "invalid literal for Int");
+}
+
+#[test]
+fn petshop_fixed_rows_rejects_bound_overflow() {
+    let command = pure_petshop_command(
+        vec![json!({
+            "name": "rows",
+            "fixed_rows": {
+                "maximum_rows": 257,
+                "rows": [{
+                    "quantity": { "arg": "quantity" }
+                }]
+            }
+        })],
+        json!({}),
+    );
+
+    let error = compile_petshop_command(command)
+        .expect_err("pure row-set bounds remain within the fixed deployment limit");
+    assert_eq!(error.path, "commands[0].steps[0]");
+    assert_eq!(
+        error.message,
+        "fixed_rows maximum_rows must be between 1 and 256"
+    );
 }

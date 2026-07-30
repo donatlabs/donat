@@ -8,10 +8,15 @@ use std::collections::BTreeMap;
 use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
 use donat_metadata::{
-    Columns, Command, CommandAggregate, CommandEffect, CommandIdempotencyKey,
-    CommandIdempotencyScope, CommandStep, CommandStepOperation, CommandValue,
+    Columns, Command, CommandAggregate, CommandCondition as MetadataCommandCondition,
+    CommandEffect, CommandIdempotencyKey, CommandIdempotencyScope, CommandIdempotencyScopeSpec,
+    CommandResultValue as MetadataCommandResultValue, CommandStep, CommandStepOperation,
+    CommandValue,
 };
-use donat_rules::{RuleType, SqlBinding, SqlBindings, SqlExpression, lower_postgres_expression};
+use donat_rules::{
+    PostgresDecisionHitPolicy, RuleType, SqlBinding, SqlBindings, SqlExpression,
+    lower_postgres_decision, lower_postgres_expression,
+};
 use graphql_parser::query::{Field as GqlField, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -25,6 +30,7 @@ struct ResolvedCommandStep {
     cte: String,
     columns: BTreeMap<String, CommandColumn>,
     returning: Vec<CommandColumn>,
+    field_rows: BTreeMap<String, Vec<CommandColumn>>,
     many: bool,
     kind: ResolvedCommandStepKind,
 }
@@ -39,12 +45,35 @@ struct CommandCurrentContext {
     alias: &'static str,
 }
 
+#[derive(Clone)]
+struct ResolvedCommandRowSet {
+    cte: String,
+    columns: BTreeMap<String, CommandColumn>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResolvedCommandStepKind {
     Scalar,
     SelectMany,
     Aggregate,
     UpdateMany,
+    ProjectMany,
+    FixedRows,
+    DecisionMany,
+    Allocation,
+}
+
+impl ResolvedCommandStepKind {
+    fn is_row_set(self) -> bool {
+        matches!(
+            self,
+            Self::SelectMany
+                | Self::UpdateMany
+                | Self::ProjectMany
+                | Self::FixedRows
+                | Self::DecisionMany
+        )
+    }
 }
 
 impl<'a> Planner<'a> {
@@ -253,7 +282,9 @@ impl<'a> Planner<'a> {
                 Ok(CommandResultField {
                     name: field.name.clone(),
                     value: self.resolve_command_result_value(
+                        command,
                         &field.value,
+                        &arguments,
                         &resolved_steps,
                         path,
                     )?,
@@ -261,8 +292,13 @@ impl<'a> Planner<'a> {
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
 
-        let idempotency =
-            self.resolve_command_idempotency(definition, &arguments, session, path)?;
+        let idempotency = self.resolve_command_idempotency(
+            definition,
+            &arguments,
+            &resolved_steps,
+            session,
+            path,
+        )?;
         let effects = definition
             .effects
             .iter()
@@ -308,6 +344,7 @@ impl<'a> Planner<'a> {
                 .map(|column| (column.name.clone(), column))
                 .collect(),
             returning: columns.to_vec(),
+            field_rows: BTreeMap::new(),
             many,
             kind,
         };
@@ -337,6 +374,7 @@ impl<'a> Planner<'a> {
                         cte,
                         columns: BTreeMap::new(),
                         returning: Vec::new(),
+                        field_rows: BTreeMap::new(),
                         many: false,
                         kind: ResolvedCommandStepKind::Scalar,
                     },
@@ -441,6 +479,204 @@ impl<'a> Planner<'a> {
                     output(cte, &returning, false, ResolvedCommandStepKind::Aggregate),
                 ))
             }
+            CommandStepOperation::Project { project } => {
+                let values = self.resolve_command_named_values(
+                    command,
+                    &project.values,
+                    arguments,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
+                let returning = values
+                    .iter()
+                    .map(|value| value.column.clone())
+                    .collect::<Vec<_>>();
+                Ok((
+                    CommandExecutionStep::Project {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        values,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
+                ))
+            }
+            CommandStepOperation::ProjectMany { project_many } => {
+                let input =
+                    self.resolve_any_command_row_set(&project_many.from, previous_steps, path)?;
+                let item = CommandItemContext {
+                    fields: input.columns.clone(),
+                    alias: "_cmd_input",
+                };
+                let values = self.resolve_command_named_values(
+                    command,
+                    &project_many.values,
+                    arguments,
+                    previous_steps,
+                    Some(&item),
+                    path,
+                )?;
+                let returning = values
+                    .iter()
+                    .map(|value| value.column.clone())
+                    .collect::<Vec<_>>();
+                Ok((
+                    CommandExecutionStep::ProjectMany {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        input_cte: input.cte.clone(),
+                        maximum_rows: project_many.maximum_rows,
+                        values,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, true, ResolvedCommandStepKind::ProjectMany),
+                ))
+            }
+            CommandStepOperation::FixedRows { fixed_rows } => {
+                let first = fixed_rows
+                    .rows
+                    .first()
+                    .expect("the static compiler rejects empty fixed_rows");
+                let first_values = self.resolve_command_named_values(
+                    command,
+                    first,
+                    arguments,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
+                let columns = first_values
+                    .iter()
+                    .map(|value| value.column.clone())
+                    .collect::<Vec<_>>();
+                let mut rows = vec![first_values.into_iter().map(|value| value.value).collect()];
+                for row in fixed_rows.rows.iter().skip(1) {
+                    rows.push(self.resolve_fixed_row(
+                        command,
+                        row,
+                        &columns,
+                        arguments,
+                        previous_steps,
+                        path,
+                    )?);
+                }
+                Ok((
+                    CommandExecutionStep::FixedRows {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        maximum_rows: fixed_rows.maximum_rows,
+                        columns: columns.clone(),
+                        rows,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &columns, true, ResolvedCommandStepKind::FixedRows),
+                ))
+            }
+            CommandStepOperation::Decision { decision } => {
+                let (resolved_decision, input, returning) = self.resolve_command_decision(
+                    command,
+                    &decision.decision_table,
+                    &decision.input,
+                    &decision.returning,
+                    arguments,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
+                Ok((
+                    CommandExecutionStep::Decision {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        decision: resolved_decision,
+                        input,
+                        returning: returning.clone(),
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
+                ))
+            }
+            CommandStepOperation::DecisionMany { decision_many } => {
+                let row_set =
+                    self.resolve_any_command_row_set(&decision_many.from, previous_steps, path)?;
+                let item = CommandItemContext {
+                    fields: row_set.columns.clone(),
+                    alias: "_cmd_input",
+                };
+                let (resolved_decision, input, returning) = self.resolve_command_decision(
+                    command,
+                    &decision_many.decision_table,
+                    &decision_many.input,
+                    &decision_many.returning,
+                    arguments,
+                    previous_steps,
+                    Some(&item),
+                    path,
+                )?;
+                let order_by = decision_many
+                    .order_by
+                    .iter()
+                    .map(|name| {
+                        returning
+                            .iter()
+                            .find(|column| column.name == *name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                PlanError::validation(
+                                    path,
+                                    "decision_many order field was not resolved",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((
+                    CommandExecutionStep::DecisionMany {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        input_cte: row_set.cte.clone(),
+                        decision: resolved_decision,
+                        input,
+                        returning: returning.clone(),
+                        order_by,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, true, ResolvedCommandStepKind::DecisionMany),
+                ))
+            }
+            CommandStepOperation::AssertWhen { assert_when } => {
+                let condition =
+                    resolve_command_condition(&assert_when.when, arguments, command, path)?;
+                let rule = self.resolve_command_rule(
+                    command,
+                    &assert_when.rule,
+                    &assert_when.bindings,
+                    arguments,
+                    previous_steps,
+                    None,
+                    None,
+                    path,
+                    error_path.to_owned(),
+                    assert_when
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "conditional command assertion rejected".to_owned()),
+                )?;
+                Ok((
+                    CommandExecutionStep::AssertWhen {
+                        name: step.name.clone(),
+                        condition,
+                        rule,
+                    },
+                    ResolvedCommandStep {
+                        cte,
+                        columns: BTreeMap::new(),
+                        returning: Vec::new(),
+                        field_rows: BTreeMap::new(),
+                        many: false,
+                        kind: ResolvedCommandStepKind::Scalar,
+                    },
+                ))
+            }
             CommandStepOperation::Insert { insert } => {
                 let context = self.command_table_context(&insert.table, session, path)?;
                 let permission = self
@@ -488,6 +724,56 @@ impl<'a> Planner<'a> {
                     output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
                 ))
             }
+            CommandStepOperation::InsertWhen { insert_when } => {
+                let condition =
+                    resolve_command_condition(&insert_when.when, arguments, command, path)?;
+                let context = self.command_table_context(&insert_when.table, session, path)?;
+                let permission = self
+                    .resolve_role_perm(
+                        &context.entry.insert_permissions,
+                        &session.role,
+                        |permission| !permission.backend_only || session.backend_request,
+                    )
+                    .ok_or_else(|| {
+                        PlanError::validation(path, "command insert permission is missing")
+                    })?;
+                let mut object = self.resolve_command_assignments(
+                    command,
+                    &insert_when.object,
+                    &insert_when.table,
+                    arguments,
+                    previous_steps,
+                    None,
+                    None,
+                    path,
+                )?;
+                self.apply_command_presets(
+                    &mut object,
+                    &permission.set,
+                    &insert_when.table,
+                    session,
+                    path,
+                )?;
+                let returning =
+                    self.command_columns(&insert_when.table, &insert_when.returning, path)?;
+                let check = self.parse_check_exp(&permission.check, &context, session, path)?;
+                Ok((
+                    CommandExecutionStep::InsertWhen {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        condition,
+                        table: Table {
+                            schema: context.info.schema.clone(),
+                            name: context.info.name.clone(),
+                        },
+                        object,
+                        returning: returning.clone(),
+                        check,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
+                ))
+            }
             CommandStepOperation::InsertMany { insert_many } => {
                 let context = self.command_table_context(&insert_many.table, session, path)?;
                 let permission = self
@@ -499,20 +785,38 @@ impl<'a> Planner<'a> {
                     .ok_or_else(|| {
                         PlanError::validation(path, "command insert permission is missing")
                     })?;
-                let CommandValue::Argument { arg } = &insert_many.for_each else {
-                    return Err(PlanError::validation(
-                        path,
-                        "insert_many for_each must resolve a declared argument before SQLgen",
-                    ));
+                let (items, input_rows, item_fields) = match &insert_many.for_each {
+                    CommandValue::Argument { arg } => (
+                        Some(command_argument(arguments, arg, path)?),
+                        None,
+                        self.command_item_fields(
+                            command,
+                            &insert_many.object,
+                            &insert_many.table,
+                            path,
+                        )?,
+                    ),
+                    CommandValue::Step { where_nonzero, .. } => {
+                        let input = self.resolve_any_command_row_set(
+                            &insert_many.for_each,
+                            previous_steps,
+                            path,
+                        )?;
+                        (
+                            None,
+                            Some((input.cte, where_nonzero.clone())),
+                            input.columns,
+                        )
+                    }
+                    _ => {
+                        return Err(PlanError::validation(
+                            path,
+                            "insert_many for_each did not resolve to a bounded row set",
+                        ));
+                    }
                 };
-                let items = command_argument(arguments, arg, path)?;
                 let item = CommandItemContext {
-                    fields: self.command_item_fields(
-                        command,
-                        &insert_many.object,
-                        &insert_many.table,
-                        path,
-                    )?,
+                    fields: item_fields,
                     alias: "_cmd_item",
                 };
                 let mut object = self.resolve_command_assignments(
@@ -535,20 +839,38 @@ impl<'a> Planner<'a> {
                 let returning =
                     self.command_columns(&insert_many.table, &insert_many.returning, path)?;
                 let check = self.parse_check_exp(&permission.check, &context, session, path)?;
-                let resolved = CommandExecutionStep::InsertMany {
-                    name: step.name.clone(),
-                    cte: cte.clone(),
-                    table: Table {
-                        schema: context.info.schema.clone(),
-                        name: context.info.name.clone(),
+                let table = Table {
+                    schema: context.info.schema.clone(),
+                    name: context.info.name.clone(),
+                };
+                let item_fields = item.fields.into_values().collect();
+                let resolved = match (items, input_rows) {
+                    (Some(items), None) => CommandExecutionStep::InsertMany {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        table,
+                        items,
+                        item_fields,
+                        object,
+                        returning: returning.clone(),
+                        allow_empty: insert_many.allow_empty,
+                        check,
+                        error_path: error_path.to_owned(),
                     },
-                    items,
-                    item_fields: item.fields.into_values().collect(),
-                    object,
-                    returning: returning.clone(),
-                    allow_empty: insert_many.allow_empty,
-                    check,
-                    error_path: error_path.to_owned(),
+                    (None, Some((input_cte, where_nonzero))) => CommandExecutionStep::InsertRows {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        table,
+                        input_cte,
+                        where_nonzero,
+                        item_fields,
+                        object,
+                        returning: returning.clone(),
+                        allow_empty: insert_many.allow_empty,
+                        check,
+                        error_path: error_path.to_owned(),
+                    },
+                    _ => unreachable!("insert_many source resolution is closed"),
                 };
                 Ok((
                     resolved,
@@ -616,13 +938,73 @@ impl<'a> Planner<'a> {
                     output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
                 ))
             }
-            CommandStepOperation::UpdateMany { update_many } => {
-                let input = self.resolve_command_row_set(
-                    &update_many.for_each,
+            CommandStepOperation::UpdateWhen { update_when } => {
+                let condition =
+                    resolve_command_condition(&update_when.when, arguments, command, path)?;
+                let context = self.command_table_context(&update_when.table, session, path)?;
+                let permission = self
+                    .resolve_role_perm(&context.entry.update_permissions, &session.role, |_| true)
+                    .ok_or_else(|| {
+                        PlanError::validation(path, "command update permission is missing")
+                    })?;
+                let predicate = self.resolve_command_assignments(
+                    command,
+                    &update_when.predicate,
+                    &update_when.table,
+                    arguments,
                     previous_steps,
-                    ResolvedCommandStepKind::SelectMany,
+                    None,
+                    None,
                     path,
                 )?;
+                let mut set = self.resolve_command_assignments(
+                    command,
+                    &update_when.set,
+                    &update_when.table,
+                    arguments,
+                    previous_steps,
+                    None,
+                    None,
+                    path,
+                )?;
+                self.apply_command_presets(
+                    &mut set,
+                    &permission.set,
+                    &update_when.table,
+                    session,
+                    path,
+                )?;
+                let returning =
+                    self.command_columns(&update_when.table, &update_when.returning, path)?;
+                let filter =
+                    self.command_permission_filter(&permission.filter, &context, session, path)?;
+                let check = match &permission.check {
+                    Some(check) => self.parse_check_exp(check, &context, session, path)?,
+                    None => None,
+                };
+                Ok((
+                    CommandExecutionStep::UpdateWhen {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        condition,
+                        table: Table {
+                            schema: context.info.schema.clone(),
+                            name: context.info.name.clone(),
+                        },
+                        predicate,
+                        set,
+                        returning: returning.clone(),
+                        require_affected: update_when.require_affected,
+                        filter,
+                        check,
+                        error_path: error_path.to_owned(),
+                    },
+                    output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
+                ))
+            }
+            CommandStepOperation::UpdateMany { update_many } => {
+                let input =
+                    self.resolve_any_command_row_set(&update_many.for_each, previous_steps, path)?;
                 let context = self.command_table_context(&update_many.table, session, path)?;
                 let permission = self
                     .resolve_role_perm(&context.entry.update_permissions, &session.role, |_| true)
@@ -755,6 +1137,147 @@ impl<'a> Planner<'a> {
                     output(cte, &returning, false, ResolvedCommandStepKind::Scalar),
                 ))
             }
+            CommandStepOperation::AllocateMany { allocate_many } => {
+                let input =
+                    self.resolve_any_command_row_set(&allocate_many.from, previous_steps, path)?;
+                let required = |name: &str| {
+                    input.columns.get(name).cloned().ok_or_else(|| {
+                        PlanError::validation(
+                            path,
+                            format!("allocate_many input is missing required field '{name}'"),
+                        )
+                    })
+                };
+                let requested = required(&allocate_many.exact_quantity_columns.requested)?;
+                let available = required(&allocate_many.exact_quantity_columns.available)?;
+                let allocated = CommandColumn {
+                    name: allocate_many.exact_quantity_columns.allocated.clone(),
+                    pg_type: requested.pg_type.clone(),
+                    nullable: false,
+                };
+                let backordered = CommandColumn {
+                    name: allocate_many.exact_quantity_columns.backordered.clone(),
+                    pg_type: requested.pg_type.clone(),
+                    nullable: false,
+                };
+                let group_key = allocate_many
+                    .group_key
+                    .iter()
+                    .map(|name| required(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                required("order_line_id")?;
+                let request_column = resolved_value_column(
+                    command,
+                    "_cmd_request_id",
+                    &allocate_many.request_id,
+                    previous_steps,
+                    None,
+                    path,
+                )?;
+                let request_id = self.resolve_command_value(
+                    command,
+                    &allocate_many.request_id,
+                    &request_column,
+                    arguments,
+                    previous_steps,
+                    None,
+                    None,
+                    path,
+                )?;
+                let output_column = |name: &str| -> Result<CommandColumn, PlanError> {
+                    match name {
+                        "allocation_id" => Ok(CommandColumn {
+                            name: name.to_owned(),
+                            pg_type: "uuid".to_owned(),
+                            nullable: false,
+                        }),
+                        "first_line_sequence" => {
+                            let mut column = required("line_sequence")?;
+                            column.name = name.to_owned();
+                            Ok(column)
+                        }
+                        "items" => Ok(CommandColumn {
+                            name: name.to_owned(),
+                            pg_type: "jsonb".to_owned(),
+                            nullable: false,
+                        }),
+                        name if name == allocated.name => Ok(allocated.clone()),
+                        name if name == backordered.name => Ok(backordered.clone()),
+                        name => required(name),
+                    }
+                };
+                let groups = allocate_many
+                    .returning
+                    .groups
+                    .iter()
+                    .map(|name| output_column(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lines = allocate_many
+                    .returning
+                    .lines
+                    .iter()
+                    .map(|name| output_column(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let backorders = allocate_many
+                    .returning
+                    .backorders
+                    .iter()
+                    .map(|name| output_column(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let order_columns = |names: &[String], columns: &[CommandColumn]| {
+                    names
+                        .iter()
+                        .map(|name| {
+                            columns
+                                .iter()
+                                .find(|column| column.name == *name)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    PlanError::validation(
+                                        path,
+                                        format!(
+                                            "allocate_many order field '{name}' is not returned"
+                                        ),
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let group_order_by = order_columns(&allocate_many.group_order_by, &groups)?;
+                let line_order_by = order_columns(&allocate_many.line_order_by, &lines)?;
+                let mut field_rows = BTreeMap::new();
+                field_rows.insert("groups".to_owned(), groups.clone());
+                field_rows.insert("lines".to_owned(), lines.clone());
+                field_rows.insert("backorders".to_owned(), backorders.clone());
+                Ok((
+                    CommandExecutionStep::AllocateMany {
+                        name: step.name.clone(),
+                        cte: cte.clone(),
+                        input_cte: input.cte,
+                        request_id,
+                        group_key,
+                        requested,
+                        available,
+                        allocated,
+                        backordered,
+                        groups,
+                        lines,
+                        backorders,
+                        group_order_by,
+                        line_order_by,
+                        maximum_rows: 256,
+                        error_path: error_path.to_owned(),
+                    },
+                    ResolvedCommandStep {
+                        cte,
+                        columns: BTreeMap::new(),
+                        returning: Vec::new(),
+                        field_rows,
+                        many: false,
+                        kind: ResolvedCommandStepKind::Allocation,
+                    },
+                ))
+            }
         }
     }
 
@@ -798,7 +1321,13 @@ impl<'a> Planner<'a> {
         expected_kind: ResolvedCommandStepKind,
         path: &str,
     ) -> Result<&'b ResolvedCommandStep, PlanError> {
-        let CommandValue::Step { step, column: None } = value else {
+        let CommandValue::Step {
+            step,
+            column: None,
+            field: None,
+            where_nonzero: None,
+        } = value
+        else {
             return Err(PlanError::validation(
                 path,
                 "command row-set input did not resolve to a complete prior step",
@@ -818,6 +1347,221 @@ impl<'a> Planner<'a> {
             columns: resolved.returning.clone(),
         };
         Ok(resolved)
+    }
+
+    fn resolve_any_command_row_set(
+        &self,
+        value: &CommandValue,
+        previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        path: &str,
+    ) -> Result<ResolvedCommandRowSet, PlanError> {
+        let CommandValue::Step {
+            step,
+            column: None,
+            field,
+            where_nonzero: _,
+        } = value
+        else {
+            return Err(PlanError::validation(
+                path,
+                "command row-set input did not resolve to a complete prior step",
+            ));
+        };
+        let resolved = previous_steps.get(step).ok_or_else(|| {
+            PlanError::validation(path, "command row-set input was not resolved before use")
+        })?;
+        if let Some(field) = field {
+            let returning = resolved.field_rows.get(field).cloned().ok_or_else(|| {
+                PlanError::validation(path, "command row-set field was not resolved before use")
+            })?;
+            return Ok(ResolvedCommandRowSet {
+                cte: format!("{}_{}", resolved.cte, field),
+                columns: returning
+                    .iter()
+                    .cloned()
+                    .map(|column| (column.name.clone(), column))
+                    .collect(),
+            });
+        }
+        if !resolved.kind.is_row_set() {
+            return Err(PlanError::validation(
+                path,
+                "command row-set input has an invalid resolved producer",
+            ));
+        }
+        Ok(ResolvedCommandRowSet {
+            cte: resolved.cte.clone(),
+            columns: resolved.columns.clone(),
+        })
+    }
+
+    fn resolve_command_named_values(
+        &self,
+        command: &CompiledCommand,
+        values: &BTreeMap<String, CommandValue>,
+        arguments: &BTreeMap<String, Scalar>,
+        previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        item: Option<&CommandItemContext>,
+        path: &str,
+    ) -> Result<Vec<CommandNamedValue>, PlanError> {
+        values
+            .iter()
+            .map(|(name, value)| {
+                let column =
+                    resolved_value_column(command, name, value, previous_steps, item, path)?;
+                let value = self.resolve_command_value(
+                    command,
+                    value,
+                    &column,
+                    arguments,
+                    previous_steps,
+                    item,
+                    None,
+                    path,
+                )?;
+                Ok(CommandNamedValue {
+                    name: name.clone(),
+                    column,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn resolve_fixed_row(
+        &self,
+        command: &CompiledCommand,
+        row: &BTreeMap<String, CommandValue>,
+        columns: &[CommandColumn],
+        arguments: &BTreeMap<String, Scalar>,
+        previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        path: &str,
+    ) -> Result<Vec<CommandExecutionValue>, PlanError> {
+        columns
+            .iter()
+            .map(|column| {
+                self.resolve_command_value(
+                    command,
+                    row.get(&column.name)
+                        .expect("the static compiler checks fixed row fields"),
+                    column,
+                    arguments,
+                    previous_steps,
+                    None,
+                    None,
+                    path,
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_command_decision(
+        &self,
+        command: &CompiledCommand,
+        table_name: &str,
+        inputs: &BTreeMap<String, CommandValue>,
+        returning_names: &[String],
+        arguments: &BTreeMap<String, Scalar>,
+        previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        item: Option<&CommandItemContext>,
+        path: &str,
+    ) -> Result<(CommandDecision, Vec<CommandNamedValue>, Vec<CommandColumn>), PlanError> {
+        let table = command.rules().decision_table(table_name).ok_or_else(|| {
+            PlanError::validation(path, format!("unknown compiled decision '{table_name}'"))
+        })?;
+        let input = table
+            .input_types()
+            .map(|(name, type_)| {
+                let column = CommandColumn {
+                    name: name.clone(),
+                    pg_type: command_rule_pg_type(type_).to_owned(),
+                    nullable: matches!(type_, RuleType::Nullable(_)),
+                };
+                let value = self.resolve_command_value(
+                    command,
+                    inputs
+                        .get(name)
+                        .expect("the static compiler checks decision inputs"),
+                    &column,
+                    arguments,
+                    previous_steps,
+                    item,
+                    None,
+                    path,
+                )?;
+                Ok(CommandNamedValue {
+                    name: name.clone(),
+                    column,
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let decision_bindings = SqlBindings::new(table.input_types().map(|(name, type_)| {
+            (
+                name.clone(),
+                SqlBinding::expression(SqlExpression::column(
+                    "_cmd_decision_input",
+                    name,
+                    type_.clone(),
+                )),
+            )
+        }));
+        let program = lower_postgres_decision(table, &decision_bindings)
+            .map_err(|error| PlanError::validation(path, error.to_string()))?;
+        let returning = returning_names
+            .iter()
+            .map(|name| {
+                if let Some(output) = table.output_field(name) {
+                    return Ok(CommandColumn {
+                        name: name.clone(),
+                        pg_type: command_rule_pg_type(&output.type_).to_owned(),
+                        nullable: matches!(output.type_, RuleType::Nullable(_)),
+                    });
+                }
+                item.and_then(|item| item.fields.get(name))
+                    .cloned()
+                    .ok_or_else(|| {
+                        PlanError::validation(
+                            path,
+                            format!("decision returning field '{name}' was not resolved"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        Ok((
+            CommandDecision {
+                name: program.name,
+                revision: program.revision,
+                hit_policy: match program.hit_policy {
+                    PostgresDecisionHitPolicy::First => CommandDecisionHitPolicy::First,
+                    PostgresDecisionHitPolicy::Unique => CommandDecisionHitPolicy::Unique,
+                },
+                rows: program
+                    .rows
+                    .into_iter()
+                    .map(|row| CommandDecisionRow {
+                        id: row.id,
+                        condition_sql: row.condition_sql,
+                        output: row
+                            .output
+                            .into_iter()
+                            .map(|(name, output)| CommandDecisionOutput {
+                                column: CommandColumn {
+                                    name: name.clone(),
+                                    pg_type: command_rule_pg_type(&output.type_).to_owned(),
+                                    nullable: matches!(output.type_, RuleType::Nullable(_)),
+                                },
+                                name,
+                                sql: output.sql,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
+            input,
+            returning,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -880,6 +1624,8 @@ impl<'a> Planner<'a> {
             CommandValue::Step {
                 step,
                 column: Some(column),
+                field: None,
+                where_nonzero: None,
             } => {
                 let step = previous_steps.get(step).ok_or_else(|| {
                     PlanError::validation(path, "command step value was not resolved before use")
@@ -941,9 +1687,18 @@ impl<'a> Planner<'a> {
                     pg_type: target.pg_type.clone(),
                 })
             }
-            CommandValue::Step { column: None, .. } | CommandValue::SessionVariable { .. } => Err(
-                PlanError::validation(path, "command value cannot lower to a scalar target"),
-            ),
+            CommandValue::DatabaseTime { database_time } if database_time == "now" => {
+                Ok(CommandExecutionValue::DatabaseTime {
+                    function: CommandDatabaseTime::Now,
+                    pg_type: target.pg_type.clone(),
+                })
+            }
+            CommandValue::Step { .. }
+            | CommandValue::SessionVariable { .. }
+            | CommandValue::DatabaseTime { .. } => Err(PlanError::validation(
+                path,
+                "command value cannot lower to a scalar target",
+            )),
         }
     }
 
@@ -1041,6 +1796,8 @@ impl<'a> Planner<'a> {
             CommandValue::Step {
                 step,
                 column: Some(column),
+                field: None,
+                where_nonzero: None,
             } => {
                 let step = previous_steps.get(step).ok_or_else(|| {
                     PlanError::validation(path, "command rule references an unresolved step")
@@ -1112,17 +1869,28 @@ impl<'a> Planner<'a> {
                 path,
                 "session variables are not legal compiled Rule bindings",
             )),
+            CommandValue::Step { .. } | CommandValue::DatabaseTime { .. } => Err(
+                PlanError::validation(path, "value is not legal in a compiled Rule binding"),
+            ),
         }
     }
 
     fn resolve_command_result_value(
         &self,
-        value: &CommandValue,
+        command: &CompiledCommand,
+        value: &MetadataCommandResultValue,
+        arguments: &BTreeMap<String, Scalar>,
         steps: &BTreeMap<String, ResolvedCommandStep>,
         path: &str,
     ) -> Result<CommandResultValue, PlanError> {
         match value {
-            CommandValue::Step { step, column: None } => {
+            MetadataCommandResultValue::Step {
+                step,
+                column: None,
+                field: None,
+                maximum_items: None,
+                ..
+            } => {
                 let step = steps.get(step).ok_or_else(|| {
                     PlanError::validation(path, "command result references an unresolved step")
                 })?;
@@ -1132,9 +1900,11 @@ impl<'a> Planner<'a> {
                     columns: step.returning.clone(),
                 })
             }
-            CommandValue::Step {
+            MetadataCommandResultValue::Step {
                 step,
                 column: Some(column),
+                field: None,
+                ..
             } => {
                 let step = steps.get(step).ok_or_else(|| {
                     PlanError::validation(path, "command result references an unresolved step")
@@ -1150,11 +1920,121 @@ impl<'a> Planner<'a> {
                     column,
                 })
             }
-            CommandValue::Literal { literal } => Ok(CommandResultValue::Scalar {
+            MetadataCommandResultValue::Step {
+                step,
+                column: None,
+                field: Some(field),
+                maximum_items,
+                ..
+            } => {
+                let step = steps.get(step).ok_or_else(|| {
+                    PlanError::validation(path, "command result references an unresolved step")
+                })?;
+                let columns = step.field_rows.get(field).cloned().ok_or_else(|| {
+                    PlanError::validation(
+                        path,
+                        "command result references an unresolved row-set field",
+                    )
+                })?;
+                Ok(CommandResultValue::ProjectedRows {
+                    cte: format!("{}_{}", step.cte, field),
+                    many: true,
+                    columns: columns
+                        .into_iter()
+                        .map(|source| CommandResultProjection {
+                            name: source.name.clone(),
+                            source,
+                        })
+                        .collect(),
+                    maximum_items: maximum_items.unwrap_or(256),
+                })
+            }
+            MetadataCommandResultValue::Step {
+                step,
+                column: None,
+                field: None,
+                maximum_items: Some(maximum_items),
+                ..
+            } => {
+                let step = steps.get(step).ok_or_else(|| {
+                    PlanError::validation(path, "command result references an unresolved step")
+                })?;
+                Ok(CommandResultValue::ProjectedRows {
+                    cte: step.cte.clone(),
+                    many: step.many,
+                    columns: step
+                        .returning
+                        .iter()
+                        .cloned()
+                        .map(|source| CommandResultProjection {
+                            name: source.name.clone(),
+                            source,
+                        })
+                        .collect(),
+                    maximum_items: *maximum_items,
+                })
+            }
+            MetadataCommandResultValue::ProjectedStep {
+                step,
+                project,
+                maximum_items,
+            } => {
+                let step = steps.get(step).ok_or_else(|| {
+                    PlanError::validation(path, "command result references an unresolved step")
+                })?;
+                let columns = project
+                    .iter()
+                    .map(|(alias, source)| {
+                        let source = step.columns.get(source).cloned().ok_or_else(|| {
+                            PlanError::validation(
+                                path,
+                                "projected command result references an unresolved field",
+                            )
+                        })?;
+                        Ok(CommandResultProjection {
+                            name: alias.clone(),
+                            source,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?;
+                Ok(CommandResultValue::ProjectedRows {
+                    cte: step.cte.clone(),
+                    many: step.many,
+                    columns,
+                    maximum_items: *maximum_items,
+                })
+            }
+            MetadataCommandResultValue::Argument { arg } => Ok(CommandResultValue::Scalar {
+                value: command_argument(arguments, arg, path)?,
+                pg_type: command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
+            }),
+            MetadataCommandResultValue::Literal { literal } => Ok(CommandResultValue::Scalar {
                 value: Scalar::Json(literal.clone()),
                 pg_type: command_result_literal_type(literal).to_owned(),
             }),
-            _ => Err(PlanError::validation(
+            MetadataCommandResultValue::Rule { rule, bindings } => {
+                let compiled = command.rules().rule(rule).ok_or_else(|| {
+                    PlanError::validation(path, format!("unknown compiled rule '{rule}'"))
+                })?;
+                let expression = self.lower_command_rule_expression(
+                    command, rule, bindings, arguments, steps, None, None, path,
+                )?;
+                Ok(CommandResultValue::Rule {
+                    sql: expression.into_sql(),
+                    pg_type: command_rule_pg_type(&compiled.result).to_owned(),
+                })
+            }
+            MetadataCommandResultValue::Array(values) => Ok(CommandResultValue::Array {
+                value: Scalar::Json(Json::Array(values.clone())),
+                maximum_items: u32::try_from(values.len()).unwrap_or(u32::MAX),
+            }),
+            MetadataCommandResultValue::SessionVariable { .. }
+            | MetadataCommandResultValue::CurrentColumn { .. }
+            | MetadataCommandResultValue::Step {
+                column: Some(_),
+                field: Some(_),
+                ..
+            } => Err(PlanError::validation(
                 path,
                 "command result did not lower to a declared result producer",
             )),
@@ -1165,6 +2045,7 @@ impl<'a> Planner<'a> {
         &self,
         command: &Command,
         arguments: &BTreeMap<String, Scalar>,
+        steps: &BTreeMap<String, ResolvedCommandStep>,
         session: &Session,
         path: &str,
     ) -> Result<Option<CommandIdempotency>, PlanError> {
@@ -1173,28 +2054,51 @@ impl<'a> Planner<'a> {
         };
         let CommandIdempotencyKey::Argument { argument } = &idempotency.key;
         let key = command_argument(arguments, argument, path)?;
-        let scope = idempotency
-            .scope
-            .iter()
-            .map(|part| match part {
-                CommandIdempotencyScope::Argument { argument } => {
-                    command_argument(arguments, argument, path)
-                }
-                CommandIdempotencyScope::SessionVariable { session_variable } => {
-                    let value = session.var(session_variable).ok_or_else(|| {
-                        PlanError::new(
-                            path,
-                            "not-found",
-                            format!(
-                                "missing session variable: \"{}\"",
-                                session_variable.to_ascii_lowercase()
-                            ),
-                        )
-                    })?;
-                    Ok(Scalar::Json(Json::String(value.to_owned())))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let scope = match &idempotency.scope {
+            CommandIdempotencyScopeSpec::Command(_) => Vec::new(),
+            CommandIdempotencyScopeSpec::Values(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    CommandIdempotencyScope::Argument { argument } => {
+                        Ok(CommandExecutionValue::Scalar {
+                            value: command_argument(arguments, argument, path)?,
+                            pg_type: command_argument_pg_type(command, argument, path)?.to_owned(),
+                        })
+                    }
+                    CommandIdempotencyScope::SessionVariable { session_variable } => {
+                        let value = session.var(session_variable).ok_or_else(|| {
+                            PlanError::new(
+                                path,
+                                "not-found",
+                                format!(
+                                    "missing session variable: \"{}\"",
+                                    session_variable.to_ascii_lowercase()
+                                ),
+                            )
+                        })?;
+                        Ok(CommandExecutionValue::Scalar {
+                            value: Scalar::Json(Json::String(value.to_owned())),
+                            pg_type: "text".to_owned(),
+                        })
+                    }
+                    CommandIdempotencyScope::Step { step, column } => {
+                        let step = steps.get(step).ok_or_else(|| {
+                            PlanError::validation(path, "idempotency scope step was not resolved")
+                        })?;
+                        let column = step.columns.get(column).cloned().ok_or_else(|| {
+                            PlanError::validation(
+                                path,
+                                "idempotency scope step field was not resolved",
+                            )
+                        })?;
+                        Ok(CommandExecutionValue::StepColumn {
+                            cte: step.cte.clone(),
+                            column,
+                        })
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         let input = Scalar::Json(Json::Object(
             arguments
                 .iter()
@@ -1503,6 +2407,30 @@ impl<'a> Planner<'a> {
                     )?;
                     require_select(insert_many.returning.iter().collect())?;
                 }
+                CommandStepOperation::InsertWhen { insert_when } => {
+                    let permission = self
+                        .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
+                            !permission.backend_only || session.backend_request
+                        })
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks insert permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_command_columns(
+                        &permission.columns,
+                        insert_when.object.keys(),
+                        "insert",
+                        &session.role,
+                        info,
+                        &step_path,
+                    )?;
+                    require_select(insert_when.returning.iter().collect())?;
+                }
                 CommandStepOperation::Update { update } => {
                     let permission = self
                         .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
@@ -1562,6 +2490,34 @@ impl<'a> Planner<'a> {
                     }
                     require_select(read_columns)?;
                 }
+                CommandStepOperation::UpdateWhen { update_when } => {
+                    let permission = self
+                        .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+                        .ok_or_else(|| {
+                            PlanError::validation(
+                                &step_path,
+                                format!(
+                                    "role '{}' lacks update permission on table '{}.{}'",
+                                    session.role, info.schema, info.name
+                                ),
+                            )
+                        })?;
+                    require_command_columns(
+                        &permission.columns,
+                        update_when.set.keys(),
+                        "update",
+                        &session.role,
+                        info,
+                        &step_path,
+                    )?;
+                    require_select(
+                        update_when
+                            .predicate
+                            .keys()
+                            .chain(update_when.returning.iter())
+                            .collect(),
+                    )?;
+                }
                 CommandStepOperation::Delete { delete } => {
                     self.resolve_role_perm(&entry.delete_permissions, &session.role, |_| true)
                         .ok_or_else(|| {
@@ -1581,7 +2537,15 @@ impl<'a> Planner<'a> {
                             .collect(),
                     )?;
                 }
-                CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => {
+                CommandStepOperation::Aggregate { .. }
+                | CommandStepOperation::Assert { .. }
+                | CommandStepOperation::AssertWhen { .. }
+                | CommandStepOperation::Decision { .. }
+                | CommandStepOperation::DecisionMany { .. }
+                | CommandStepOperation::Project { .. }
+                | CommandStepOperation::ProjectMany { .. }
+                | CommandStepOperation::FixedRows { .. }
+                | CommandStepOperation::AllocateMany { .. } => {
                     unreachable!("table-free steps were skipped")
                 }
             }
@@ -1660,14 +2624,27 @@ impl<'a> Planner<'a> {
                     .get(&selected.name)
                     .ok_or_else(|| field_not_found(path, &selected.name, &result_type))?;
                 match result {
-                    CommandValue::Step { step, column: None } => {
+                    MetadataCommandResultValue::Step {
+                        step,
+                        column: None,
+                        field: None,
+                        as_,
+                        ..
+                    } => {
                         let step = command
                             .steps
                             .iter()
                             .find(|candidate| candidate.name == *step)
                             .expect("the static compiler retains result steps");
                         let selections = self.plan_command_row_selection(
-                            command, step, selected, fragments, vars, path,
+                            command,
+                            step,
+                            None,
+                            as_.as_deref(),
+                            selected,
+                            fragments,
+                            vars,
+                            path,
                         )?;
                         if command_step_is_many(step) {
                             Ok(CommandResultSelection::List {
@@ -1683,10 +2660,93 @@ impl<'a> Planner<'a> {
                             })
                         }
                     }
-                    CommandValue::Step {
+                    MetadataCommandResultValue::ProjectedStep { step, project, .. } => {
+                        let step = command
+                            .steps
+                            .iter()
+                            .find(|candidate| candidate.name == *step)
+                            .expect("the static compiler retains result steps");
+                        let selections = self.plan_command_row_selection(
+                            command,
+                            step,
+                            Some(project),
+                            None,
+                            selected,
+                            fragments,
+                            vars,
+                            path,
+                        )?;
+                        if command_step_is_many(step) {
+                            Ok(CommandResultSelection::List {
+                                alias,
+                                field: selected.name.clone(),
+                                selections,
+                            })
+                        } else {
+                            Ok(CommandResultSelection::Object {
+                                alias,
+                                field: selected.name.clone(),
+                                selections,
+                            })
+                        }
+                    }
+                    MetadataCommandResultValue::Step {
+                        step,
+                        column: None,
+                        field: Some(row_field),
+                        as_,
+                        ..
+                    } => {
+                        let step = command
+                            .steps
+                            .iter()
+                            .find(|candidate| candidate.name == *step)
+                            .expect("the static compiler retains result steps");
+                        let CommandStepOperation::AllocateMany { allocate_many } = &step.operation
+                        else {
+                            return Err(PlanError::validation(
+                                path,
+                                "only allocate_many exposes named row-set fields",
+                            ));
+                        };
+                        let returning = match row_field.as_str() {
+                            "groups" => &allocate_many.returning.groups,
+                            "lines" => &allocate_many.returning.lines,
+                            "backorders" => &allocate_many.returning.backorders,
+                            _ => {
+                                return Err(PlanError::validation(
+                                    path,
+                                    "allocate_many result references an unknown row-set field",
+                                ));
+                            }
+                        };
+                        let projection = returning
+                            .iter()
+                            .map(|name| (name.clone(), name.clone()))
+                            .collect::<BTreeMap<_, _>>();
+                        let selections = self.plan_command_row_selection(
+                            command,
+                            step,
+                            Some(&projection),
+                            as_.as_deref(),
+                            selected,
+                            fragments,
+                            vars,
+                            path,
+                        )?;
+                        Ok(CommandResultSelection::List {
+                            alias,
+                            field: selected.name.clone(),
+                            selections,
+                        })
+                    }
+                    MetadataCommandResultValue::Step {
                         column: Some(..), ..
                     }
-                    | CommandValue::Literal { .. } => {
+                    | MetadataCommandResultValue::Literal { .. }
+                    | MetadataCommandResultValue::Argument { .. }
+                    | MetadataCommandResultValue::Rule { .. }
+                    | MetadataCommandResultValue::Array(_) => {
                         if !selected.selection_set.items.is_empty() {
                             return Err(PlanError::validation(
                                 path,
@@ -1698,7 +2758,10 @@ impl<'a> Planner<'a> {
                             field: selected.name.clone(),
                         })
                     }
-                    _ => unreachable!("the static command compiler limits result values"),
+                    MetadataCommandResultValue::SessionVariable { .. }
+                    | MetadataCommandResultValue::CurrentColumn { .. } => {
+                        unreachable!("the static command compiler limits result values")
+                    }
                 }
             })
             .collect()
@@ -1709,16 +2772,20 @@ impl<'a> Planner<'a> {
         &self,
         command: &Command,
         step: &CommandStep,
+        projection: Option<&BTreeMap<String, String>>,
+        type_override: Option<&str>,
         field: &GqlField<'static, String>,
         fragments: &Fragments,
         vars: &JsonMap<String, Json>,
         path: &str,
     ) -> Result<Vec<CommandResultSelection>, PlanError> {
-        let row_type = format!(
-            "{}{}Row",
-            command_pascal_case(&command.name),
-            command_pascal_case(&step.name)
-        );
+        let row_type = type_override.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "{}{}Row",
+                command_pascal_case(&command.name),
+                command_pascal_case(&step.name)
+            )
+        });
         let fields = flatten(&field.selection_set, fragments, vars, Some(&row_type))?;
         if fields.is_empty() {
             return Err(PlanError::validation(
@@ -1739,7 +2806,9 @@ impl<'a> Planner<'a> {
                         value: row_type.clone(),
                     });
                 }
-                if !command_step_exposes(step, &selected.name) {
+                if projection.is_some_and(|projection| !projection.contains_key(&selected.name))
+                    || projection.is_none() && !command_step_exposes(step, &selected.name)
+                {
                     return Err(field_not_found(path, &selected.name, &row_type));
                 }
                 if !selected.selection_set.items.is_empty() {
@@ -2596,6 +3665,148 @@ fn command_argument(
     })
 }
 
+fn resolved_value_column(
+    command: &CompiledCommand,
+    name: &str,
+    value: &CommandValue,
+    previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+    item: Option<&CommandItemContext>,
+    path: &str,
+) -> Result<CommandColumn, PlanError> {
+    let (pg_type, nullable) = match value {
+        CommandValue::Argument { arg } => (
+            command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
+            command_argument_nullable(command.definition(), arg, path)?,
+        ),
+        CommandValue::Literal { literal } => (
+            command_result_literal_type(literal).to_owned(),
+            literal.is_null(),
+        ),
+        CommandValue::Step {
+            step,
+            column: Some(column),
+            field: None,
+            where_nonzero: None,
+        } => {
+            let column = previous_steps
+                .get(step)
+                .and_then(|step| step.columns.get(column))
+                .ok_or_else(|| {
+                    PlanError::validation(path, "projected step column was not resolved")
+                })?;
+            (column.pg_type.clone(), column.nullable)
+        }
+        CommandValue::Item { item: field } => {
+            let column = item
+                .and_then(|item| item.fields.get(field))
+                .ok_or_else(|| PlanError::validation(path, "projected item was not resolved"))?;
+            (column.pg_type.clone(), column.nullable)
+        }
+        CommandValue::Rule { rule, .. } => {
+            let compiled = command.rules().rule(rule).ok_or_else(|| {
+                PlanError::validation(path, format!("unknown compiled rule '{rule}'"))
+            })?;
+            (
+                command_rule_pg_type(&compiled.result).to_owned(),
+                matches!(compiled.result, RuleType::Nullable(_)),
+            )
+        }
+        CommandValue::DatabaseTime { database_time } if database_time == "now" => {
+            ("timestamptz".to_owned(), false)
+        }
+        _ => {
+            return Err(PlanError::validation(
+                path,
+                "projection value did not resolve to one scalar",
+            ));
+        }
+    };
+    Ok(CommandColumn {
+        name: name.to_owned(),
+        pg_type,
+        nullable,
+    })
+}
+
+fn command_argument_definition<'a>(
+    command: &'a Command,
+    name: &str,
+    path: &str,
+) -> Result<&'a donat_metadata::CommandArgument, PlanError> {
+    command
+        .arguments
+        .iter()
+        .find(|argument| argument.name == name)
+        .ok_or_else(|| PlanError::validation(path, format!("unknown command argument '{name}'")))
+}
+
+fn command_argument_pg_type<'a>(
+    command: &'a Command,
+    name: &str,
+    path: &str,
+) -> Result<&'a str, PlanError> {
+    let type_ = command_argument_definition(command, name, path)?
+        .type_
+        .trim_end_matches('!');
+    if type_.starts_with('[') {
+        return Ok("jsonb");
+    }
+    Ok(match type_ {
+        "Boolean" | "bool" => "bool",
+        "String" | "string" | "ID" => "text",
+        "Int" | "int" => "int4",
+        "Float" | "float" | "decimal" => "numeric",
+        "uuid" => "uuid",
+        "date" => "date",
+        "timestamp" => "timestamp",
+        "timestamptz" => "timestamptz",
+        "json" | "jsonb" => "jsonb",
+        _ => "jsonb",
+    })
+}
+
+fn command_argument_nullable(command: &Command, name: &str, path: &str) -> Result<bool, PlanError> {
+    Ok(!command_argument_definition(command, name, path)?
+        .type_
+        .ends_with('!'))
+}
+
+fn command_rule_pg_type(type_: &RuleType) -> &'static str {
+    match type_ {
+        RuleType::Bool => "bool",
+        RuleType::String | RuleType::Enum { .. } => "text",
+        RuleType::Int => "int8",
+        RuleType::Decimal => "numeric",
+        RuleType::Uuid => "uuid",
+        RuleType::Date => "date",
+        RuleType::Timestamp => "timestamptz",
+        RuleType::List(_) | RuleType::Object { .. } => "jsonb",
+        RuleType::Nullable(inner) => command_rule_pg_type(inner),
+    }
+}
+
+fn resolve_command_condition(
+    condition: &MetadataCommandCondition,
+    arguments: &BTreeMap<String, Scalar>,
+    command: &CompiledCommand,
+    path: &str,
+) -> Result<CommandCondition, PlanError> {
+    match condition {
+        MetadataCommandCondition::ArgumentEquals { argument_equals } => {
+            Ok(CommandCondition::ArgumentEquals {
+                argument: command_argument(arguments, &argument_equals.argument, path)?,
+                expected: Scalar::Json(argument_equals.value.clone()),
+                pg_type: command_argument_pg_type(
+                    command.definition(),
+                    &argument_equals.argument,
+                    path,
+                )?
+                .to_owned(),
+            })
+        }
+    }
+}
+
 fn command_result_literal_type(value: &Json) -> &'static str {
     match value {
         Json::Bool(_) => "bool",
@@ -2630,7 +3841,7 @@ fn resolve_command_aggregate(
             output: count_output(),
         }),
         CommandAggregate::Sum { sum } => {
-            let input = input_column(&sum.column)?;
+            let input = input_column(command_aggregate_selector(sum, path)?)?;
             let pg_type = match input.pg_type.as_str() {
                 "int2" | "int4" | "serial" => "int8",
                 "int8" | "bigint" | "bigserial" => "numeric",
@@ -2654,7 +3865,7 @@ fn resolve_command_aggregate(
             })
         }
         CommandAggregate::Min { min } => {
-            let input = input_column(&min.column)?;
+            let input = input_column(command_aggregate_selector(min, path)?)?;
             Ok(CommandAggregateIr::Min {
                 output: CommandColumn {
                     name: name.to_owned(),
@@ -2665,7 +3876,7 @@ fn resolve_command_aggregate(
             })
         }
         CommandAggregate::Max { max } => {
-            let input = input_column(&max.column)?;
+            let input = input_column(command_aggregate_selector(max, path)?)?;
             Ok(CommandAggregateIr::Max {
                 output: CommandColumn {
                     name: name.to_owned(),
@@ -2678,10 +3889,21 @@ fn resolve_command_aggregate(
         CommandAggregate::CountDistinct { count_distinct } => {
             Ok(CommandAggregateIr::CountDistinct {
                 output: count_output(),
-                input: input_column(&count_distinct.column)?,
+                input: input_column(command_aggregate_selector(count_distinct, path)?)?,
             })
         }
     }
+}
+
+fn command_aggregate_selector<'a>(
+    aggregate: &'a donat_metadata::ColumnCommandAggregate,
+    path: &str,
+) -> Result<&'a str, PlanError> {
+    aggregate
+        .column
+        .as_deref()
+        .or(aggregate.field.as_deref())
+        .ok_or_else(|| PlanError::validation(path, "aggregate selector was not resolved"))
 }
 
 fn direct_command_item(value: &CommandValue) -> Option<&str> {
@@ -2730,8 +3952,18 @@ fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTa
         CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
         CommandStepOperation::Update { update } => Some(&update.table),
         CommandStepOperation::UpdateMany { update_many } => Some(&update_many.table),
+        CommandStepOperation::UpdateWhen { update_when } => Some(&update_when.table),
+        CommandStepOperation::InsertWhen { insert_when } => Some(&insert_when.table),
         CommandStepOperation::Delete { delete } => Some(&delete.table),
-        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => None,
+        CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::Assert { .. }
+        | CommandStepOperation::AssertWhen { .. }
+        | CommandStepOperation::Decision { .. }
+        | CommandStepOperation::DecisionMany { .. }
+        | CommandStepOperation::Project { .. }
+        | CommandStepOperation::ProjectMany { .. }
+        | CommandStepOperation::FixedRows { .. }
+        | CommandStepOperation::AllocateMany { .. } => None,
     }
 }
 
@@ -2743,8 +3975,18 @@ fn command_step_returning(step: &CommandStep) -> &[String] {
         CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
         CommandStepOperation::Update { update } => &update.returning,
         CommandStepOperation::UpdateMany { update_many } => &update_many.returning,
+        CommandStepOperation::UpdateWhen { update_when } => &update_when.returning,
+        CommandStepOperation::InsertWhen { insert_when } => &insert_when.returning,
+        CommandStepOperation::Decision { decision } => &decision.returning,
+        CommandStepOperation::DecisionMany { decision_many } => &decision_many.returning,
         CommandStepOperation::Delete { delete } => &delete.returning,
-        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => &[],
+        CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::Assert { .. }
+        | CommandStepOperation::AssertWhen { .. }
+        | CommandStepOperation::Project { .. }
+        | CommandStepOperation::ProjectMany { .. }
+        | CommandStepOperation::FixedRows { .. }
+        | CommandStepOperation::AllocateMany { .. } => &[],
     }
 }
 
@@ -2754,12 +3996,23 @@ fn command_step_is_many(step: &CommandStep) -> bool {
         CommandStepOperation::SelectMany { .. }
             | CommandStepOperation::InsertMany { .. }
             | CommandStepOperation::UpdateMany { .. }
+            | CommandStepOperation::ProjectMany { .. }
+            | CommandStepOperation::FixedRows { .. }
+            | CommandStepOperation::DecisionMany { .. }
     )
 }
 
 fn command_step_exposes(step: &CommandStep, field: &str) -> bool {
     match &step.operation {
         CommandStepOperation::Aggregate { aggregate } => aggregate.values.contains_key(field),
+        CommandStepOperation::Project { project } => project.values.contains_key(field),
+        CommandStepOperation::ProjectMany { project_many } => {
+            project_many.values.contains_key(field)
+        }
+        CommandStepOperation::FixedRows { fixed_rows } => fixed_rows
+            .rows
+            .first()
+            .is_some_and(|row| row.contains_key(field)),
         _ => command_step_returning(step)
             .iter()
             .any(|column| column == field),

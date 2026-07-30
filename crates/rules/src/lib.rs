@@ -22,8 +22,9 @@ pub use eval::{
 };
 pub use parser::parse_expression;
 pub use postgres::{
-    SqlBinding, SqlBindings, SqlExpression, lower_postgres, lower_postgres_expression,
-    lower_postgres_value,
+    PostgresDecisionHitPolicy, PostgresDecisionOutput, PostgresDecisionProgram,
+    PostgresDecisionRow, SqlBinding, SqlBindings, SqlExpression, lower_postgres,
+    lower_postgres_decision, lower_postgres_expression, lower_postgres_value,
 };
 pub use types::{
     CanonicalRoot, CanonicalValue, CompiledDecisionRow, CompiledDecisionTable, CompiledRule,

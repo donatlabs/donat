@@ -84,6 +84,7 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         commands: load_section(dir, "commands.yaml")?,
         rules: load_section(dir, "rules.yaml")?,
         connectors: load_section(dir, "connectors.yaml")?,
+        processes: load_section(dir, "flows.yaml")?,
     })
 }
 

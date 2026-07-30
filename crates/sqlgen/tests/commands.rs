@@ -70,6 +70,274 @@ fn order_row_result(cte: &str) -> CommandResultValue {
     }
 }
 
+fn decision(
+    name: &str,
+    hit_policy: CommandDecisionHitPolicy,
+    rows: &[(&str, &str, i64)],
+) -> CommandDecision {
+    CommandDecision {
+        name: name.to_owned(),
+        revision: format!("{name}-v1"),
+        hit_policy,
+        rows: rows
+            .iter()
+            .map(|(id, condition_sql, rank)| CommandDecisionRow {
+                id: (*id).to_owned(),
+                condition_sql: (*condition_sql).to_owned(),
+                output: vec![CommandDecisionOutput {
+                    name: "rank".to_owned(),
+                    sql: format!("{rank}::numeric"),
+                    column: column("rank", "numeric"),
+                }],
+            })
+            .collect(),
+    }
+}
+
+fn decision_root(
+    command_name: &str,
+    hit_policy: CommandDecisionHitPolicy,
+    rows: &[(&str, &str, i64)],
+) -> MutationRoot {
+    root(CommandMutation {
+        identity: command_identity(command_name),
+        name: command_name.to_owned(),
+        steps: vec![CommandExecutionStep::Decision {
+            name: "route".to_owned(),
+            cte: "_cmd_step_0".to_owned(),
+            decision: decision("route_table", hit_policy, rows),
+            input: vec![CommandNamedValue {
+                name: "amount".to_owned(),
+                column: column("amount", "numeric"),
+                value: value(json!(50), "numeric"),
+            }],
+            returning: vec![column("rank", "numeric")],
+            error_path: format!("$.selectionSet.{command_name}"),
+        }],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "rank".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_0".to_owned(),
+                column: column("rank", "numeric"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "rank".to_owned(),
+            field: "rank".to_owned(),
+        }],
+    })
+}
+
+fn allocation_root(command_name: &str, maximum_rows: u32) -> MutationRoot {
+    let candidate_columns = vec![
+        column("order_id", "uuid"),
+        column("order_line_id", "uuid"),
+        column("line_sequence", "int4"),
+        column("variant_id", "uuid"),
+        column("location_code", "text"),
+        column("inventory_level_id", "uuid"),
+        column("requested_quantity", "int4"),
+        column("available_quantity", "int4"),
+        column("unit_price_minor", "int8"),
+        column("currency", "text"),
+        column("allocation_rank", "int4"),
+    ];
+    let allocation_id = column("allocation_id", "uuid");
+    let allocated = column("allocated_quantity", "int4");
+    let backordered = column("backordered_quantity", "int4");
+    let group_columns = vec![
+        allocation_id.clone(),
+        column("order_id", "uuid"),
+        column("first_line_sequence", "int4"),
+        column("allocation_rank", "int4"),
+        column("location_code", "text"),
+        column("currency", "text"),
+        column("items", "jsonb"),
+    ];
+    let line_columns = vec![
+        allocation_id.clone(),
+        column("order_id", "uuid"),
+        column("order_line_id", "uuid"),
+        column("line_sequence", "int4"),
+        column("variant_id", "uuid"),
+        column("location_code", "text"),
+        column("inventory_level_id", "uuid"),
+        column("requested_quantity", "int4"),
+        allocated.clone(),
+        column("unit_price_minor", "int8"),
+        column("currency", "text"),
+    ];
+    let backorder_columns = vec![
+        column("order_id", "uuid"),
+        column("order_line_id", "uuid"),
+        column("requested_quantity", "int4"),
+        backordered.clone(),
+    ];
+    let order_id = "00000000-0000-0000-0000-000000000010";
+    let line_1 = "00000000-0000-0000-0000-000000000011";
+    let line_2 = "00000000-0000-0000-0000-000000000012";
+    let variant_1 = "00000000-0000-0000-0000-000000000021";
+    let variant_2 = "00000000-0000-0000-0000-000000000022";
+    let inventory_a_1 = "00000000-0000-0000-0000-000000000031";
+    let inventory_b_1 = "00000000-0000-0000-0000-000000000032";
+    let inventory_a_2 = "00000000-0000-0000-0000-000000000033";
+    let inventory_b_2 = "00000000-0000-0000-0000-000000000034";
+    let candidate = |line: &str,
+                     sequence: i32,
+                     variant: &str,
+                     location: &str,
+                     inventory: &str,
+                     requested: i32,
+                     available: i32,
+                     rank: i32| {
+        vec![
+            value(json!(order_id), "uuid"),
+            value(json!(line), "uuid"),
+            value(json!(sequence), "int4"),
+            value(json!(variant), "uuid"),
+            value(json!(location), "text"),
+            value(json!(inventory), "uuid"),
+            value(json!(requested), "int4"),
+            value(json!(available), "int4"),
+            value(json!(100), "int8"),
+            value(json!("USD"), "text"),
+            value(json!(rank), "int4"),
+        ]
+    };
+    let project = |columns: &[CommandColumn]| {
+        columns
+            .iter()
+            .cloned()
+            .map(|source| CommandResultProjection {
+                name: source.name.clone(),
+                source,
+            })
+            .collect()
+    };
+    root(CommandMutation {
+        identity: command_identity(command_name),
+        name: command_name.to_owned(),
+        steps: vec![
+            CommandExecutionStep::FixedRows {
+                name: "candidates".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                maximum_rows: 4,
+                columns: candidate_columns,
+                rows: vec![
+                    candidate(line_1, 1, variant_1, "A", inventory_a_1, 5, 3, 1),
+                    candidate(line_1, 1, variant_1, "B", inventory_b_1, 5, 4, 2),
+                    candidate(line_2, 2, variant_2, "A", inventory_a_2, 2, 0, 1),
+                    candidate(line_2, 2, variant_2, "B", inventory_b_2, 2, 1, 2),
+                ],
+                error_path: format!("$.selectionSet.{command_name}"),
+            },
+            CommandExecutionStep::AllocateMany {
+                name: "allocation".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                input_cte: "_cmd_step_0".to_owned(),
+                request_id: value(json!("00000000-0000-0000-0000-000000000099"), "uuid"),
+                group_key: vec![column("location_code", "text")],
+                requested: column("requested_quantity", "int4"),
+                available: column("available_quantity", "int4"),
+                allocated: allocated.clone(),
+                backordered: backordered,
+                groups: group_columns.clone(),
+                lines: line_columns.clone(),
+                backorders: backorder_columns.clone(),
+                group_order_by: vec![
+                    column("first_line_sequence", "int4"),
+                    column("allocation_rank", "int4"),
+                    column("location_code", "text"),
+                    allocation_id.clone(),
+                ],
+                line_order_by: vec![
+                    column("line_sequence", "int4"),
+                    column("location_code", "text"),
+                    allocation_id,
+                ],
+                maximum_rows,
+                error_path: format!("$.selectionSet.{command_name}"),
+            },
+        ],
+        guards: vec![],
+        result: vec![
+            CommandResultField {
+                name: "groups".to_owned(),
+                value: CommandResultValue::ProjectedRows {
+                    cte: "_cmd_step_1_groups".to_owned(),
+                    many: true,
+                    columns: project(&group_columns),
+                    maximum_items: 4,
+                },
+            },
+            CommandResultField {
+                name: "lines".to_owned(),
+                value: CommandResultValue::ProjectedRows {
+                    cte: "_cmd_step_1_lines".to_owned(),
+                    many: true,
+                    columns: project(&line_columns),
+                    maximum_items: 4,
+                },
+            },
+            CommandResultField {
+                name: "backorders".to_owned(),
+                value: CommandResultValue::ProjectedRows {
+                    cte: "_cmd_step_1_backorders".to_owned(),
+                    many: true,
+                    columns: project(&backorder_columns),
+                    maximum_items: 4,
+                },
+            },
+        ],
+        idempotency: Some(CommandIdempotency {
+            key: Scalar::Json(json!("allocation-request")),
+            scope: vec![value(json!(order_id), "uuid")],
+            input: Scalar::Json(json!({"order_id": order_id})),
+            retention_seconds: Some(60),
+            error_path: format!("$.selectionSet.{command_name}"),
+        }),
+        effects: vec![],
+        selection: vec![
+            CommandResultSelection::List {
+                alias: "groups".to_owned(),
+                field: "groups".to_owned(),
+                selections: group_columns
+                    .iter()
+                    .map(|column| CommandResultSelection::Scalar {
+                        alias: column.name.clone(),
+                        field: column.name.clone(),
+                    })
+                    .collect(),
+            },
+            CommandResultSelection::List {
+                alias: "lines".to_owned(),
+                field: "lines".to_owned(),
+                selections: line_columns
+                    .iter()
+                    .map(|column| CommandResultSelection::Scalar {
+                        alias: column.name.clone(),
+                        field: column.name.clone(),
+                    })
+                    .collect(),
+            },
+            CommandResultSelection::List {
+                alias: "backorders".to_owned(),
+                field: "backorders".to_owned(),
+                selections: backorder_columns
+                    .iter()
+                    .map(|column| CommandResultSelection::Scalar {
+                        alias: column.name.clone(),
+                        field: column.name.clone(),
+                    })
+                    .collect(),
+            },
+        ],
+    })
+}
+
 fn postgres_client() -> Client {
     let pg_url = std::env::var("PG_URL")
         .unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_owned());
@@ -221,7 +489,7 @@ fn idempotent_insert_root_with_id(
         }],
         idempotency: Some(CommandIdempotency {
             key: Scalar::Json(json!("request-1")),
-            scope: vec![Scalar::Json(json!("tenant-1"))],
+            scope: vec![value(json!("tenant-1"), "text")],
             input: Scalar::Json(json!({ "status": status })),
             retention_seconds: Some(60),
             error_path: "$.selectionSet.create_order".to_owned(),
@@ -387,7 +655,7 @@ fn relational_batch_root(
         ],
         idempotency: idempotency.then(|| CommandIdempotency {
             key: Scalar::Json(json!(format!("request-{cart_id}"))),
-            scope: vec![Scalar::Json(json!("tenant-7"))],
+            scope: vec![value(json!("tenant-7"), "text")],
             input: Scalar::Json(json!({ "cart_id": cart_id })),
             retention_seconds: Some(60),
             error_path: format!("$.selectionSet.{command_name}"),
@@ -457,7 +725,7 @@ fn command_renderer_lowers_guard_and_session_scoped_idempotency() {
             result: vec![],
             idempotency: Some(CommandIdempotency {
                 key: Scalar::Json(json!("550e8400-e29b-41d4-a716-446655440002")),
-                scope: vec![Scalar::Json(json!("customer-7"))],
+                scope: vec![value(json!("customer-7"), "text")],
                 input: Scalar::Json(json!({
                     "request_id": "550e8400-e29b-41d4-a716-446655440002"
                 })),
@@ -2122,4 +2390,358 @@ fn relational_batch_executes_once_replays_row_sets_and_rolls_back_all_cardinalit
             "DROP TABLE \"public\".\"{pricing_table}\", \"public\".\"{stock_table}\""
         ))
         .expect("remove relational command execution fixture");
+}
+
+#[test]
+fn command_decisions_execute_first_and_unique_policies_and_reject_bad_cardinality() {
+    let _catalog_lock = command_catalog_test_lock();
+    let mut client = postgres_client();
+    install_command_catalog_client(&mut client);
+
+    let first_sql = donat_sqlgen::mutation_to_sql(&decision_root(
+        "decision_first",
+        CommandDecisionHitPolicy::First,
+        &[("first", "TRUE", 1), ("second", "TRUE", 2)],
+    ));
+    let first: Json = client
+        .query_one(&first_sql, &[])
+        .expect("first policy selects the first declared matching row")
+        .get(0);
+    assert_eq!(first, json!({"rank": 1}));
+
+    let unique_sql = donat_sqlgen::mutation_to_sql(&decision_root(
+        "decision_unique",
+        CommandDecisionHitPolicy::Unique,
+        &[("only", "TRUE", 7), ("miss", "FALSE", 9)],
+    ));
+    let unique: Json = client
+        .query_one(&unique_sql, &[])
+        .expect("unique policy selects its sole matching row")
+        .get(0);
+    assert_eq!(unique, json!({"rank": 7}));
+
+    for (name, rows, expected_message) in [
+        (
+            "decision_no_match",
+            vec![("miss", "FALSE", 1)],
+            "had no matching row",
+        ),
+        (
+            "decision_multiple",
+            vec![("one", "TRUE", 1), ("two", "TRUE", 2)],
+            "matched multiple rows",
+        ),
+    ] {
+        let sql = donat_sqlgen::mutation_to_sql(&decision_root(
+            name,
+            CommandDecisionHitPolicy::Unique,
+            &rows,
+        ));
+        let error = client
+            .query_one(&sql, &[])
+            .expect_err("invalid decision cardinality must reject the command");
+        let database_error = error
+            .as_db_error()
+            .expect("decision rejection is structured");
+        assert_eq!(database_error.code().code(), "P0D01");
+        assert!(
+            database_error.message().contains(expected_message),
+            "unexpected decision rejection: {database_error:?}"
+        );
+    }
+}
+
+#[test]
+fn command_renderer_executes_pure_forms_typed_results_and_false_conditional_gates() {
+    let _catalog_lock = command_catalog_test_lock();
+    let suffix = std::process::id();
+    let table_name = format!("command_conditional_{suffix}");
+    let mut client = postgres_client();
+    install_command_catalog_client(&mut client);
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"public\".\"{table_name}\" (id int4 PRIMARY KEY, created_at timestamptz NOT NULL)"
+        ))
+        .expect("create conditional command fixture");
+
+    let condition = CommandCondition::ArgumentEquals {
+        argument: Scalar::Json(json!(false)),
+        expected: Scalar::Json(json!(true)),
+        pg_type: "boolean".to_owned(),
+    };
+    let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        identity: command_identity("pure_and_conditional"),
+        name: "pure_and_conditional".to_owned(),
+        steps: vec![
+            CommandExecutionStep::FixedRows {
+                name: "fixed".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                maximum_rows: 2,
+                columns: vec![column("id", "int4"), column("quantity", "int4")],
+                rows: vec![
+                    vec![value(json!(1), "int4"), value(json!(2), "int4")],
+                    vec![value(json!(2), "int4"), value(json!(3), "int4")],
+                ],
+                error_path: "$.selectionSet.pure_and_conditional".to_owned(),
+            },
+            CommandExecutionStep::ProjectMany {
+                name: "projected".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                input_cte: "_cmd_step_0".to_owned(),
+                maximum_rows: 2,
+                values: vec![
+                    CommandNamedValue {
+                        name: "line_id".to_owned(),
+                        column: column("line_id", "int4"),
+                        value: CommandExecutionValue::Item {
+                            field: "id".to_owned(),
+                            pg_type: "int4".to_owned(),
+                        },
+                    },
+                    CommandNamedValue {
+                        name: "quantity".to_owned(),
+                        column: column("quantity", "int4"),
+                        value: CommandExecutionValue::Item {
+                            field: "quantity".to_owned(),
+                            pg_type: "int4".to_owned(),
+                        },
+                    },
+                ],
+                error_path: "$.selectionSet.pure_and_conditional".to_owned(),
+            },
+            CommandExecutionStep::AssertWhen {
+                name: "skipped_assert".to_owned(),
+                condition: condition.clone(),
+                rule: CommandRule {
+                    sql: "FALSE".to_owned(),
+                    pg_type: "bool".to_owned(),
+                    error_path: "$.selectionSet.pure_and_conditional".to_owned(),
+                    message: "false conditional assertion ran".to_owned(),
+                },
+            },
+            CommandExecutionStep::InsertWhen {
+                name: "skipped_insert".to_owned(),
+                cte: "_cmd_step_3".to_owned(),
+                condition,
+                table: table(&table_name),
+                object: vec![
+                    assignment("id", "int4", json!(1)),
+                    CommandAssignment {
+                        column: column("created_at", "timestamptz"),
+                        value: CommandExecutionValue::DatabaseTime {
+                            function: CommandDatabaseTime::Now,
+                            pg_type: "timestamptz".to_owned(),
+                        },
+                    },
+                ],
+                returning: vec![column("id", "int4")],
+                check: None,
+                error_path: "$.selectionSet.pure_and_conditional".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![
+            CommandResultField {
+                name: "items".to_owned(),
+                value: CommandResultValue::ProjectedRows {
+                    cte: "_cmd_step_1".to_owned(),
+                    many: true,
+                    columns: vec![
+                        CommandResultProjection {
+                            name: "id".to_owned(),
+                            source: column("line_id", "int4"),
+                        },
+                        CommandResultProjection {
+                            name: "count".to_owned(),
+                            source: column("quantity", "int4"),
+                        },
+                    ],
+                    maximum_items: 2,
+                },
+            },
+            CommandResultField {
+                name: "rule_value".to_owned(),
+                value: CommandResultValue::Rule {
+                    sql: "'typed'::text".to_owned(),
+                    pg_type: "text".to_owned(),
+                },
+            },
+            CommandResultField {
+                name: "literal_array".to_owned(),
+                value: CommandResultValue::Array {
+                    value: Scalar::Json(json!(["a", "b"])),
+                    maximum_items: 2,
+                },
+            },
+        ],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![
+            CommandResultSelection::List {
+                alias: "items".to_owned(),
+                field: "items".to_owned(),
+                selections: vec![
+                    CommandResultSelection::Scalar {
+                        alias: "id".to_owned(),
+                        field: "id".to_owned(),
+                    },
+                    CommandResultSelection::Scalar {
+                        alias: "count".to_owned(),
+                        field: "count".to_owned(),
+                    },
+                ],
+            },
+            CommandResultSelection::Scalar {
+                alias: "rule_value".to_owned(),
+                field: "rule_value".to_owned(),
+            },
+            CommandResultSelection::Scalar {
+                alias: "literal_array".to_owned(),
+                field: "literal_array".to_owned(),
+            },
+        ],
+    }));
+
+    assert!(
+        sql.contains("_cmd_condition_gate_3")
+            && sql.contains("AS MATERIALIZED")
+            && sql.contains("statement_timestamp()"),
+        "conditional writes and database time must remain inside materialized SQL gates: {sql}"
+    );
+    let result: Json = client
+        .query_one(&sql, &[])
+        .expect("pure forms execute while false conditional operations are skipped")
+        .get(0);
+    assert_eq!(
+        result,
+        json!({
+            "items": [{"id": 1, "count": 2}, {"id": 2, "count": 3}],
+            "rule_value": "typed",
+            "literal_array": ["a", "b"]
+        })
+    );
+    let rows: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM \"public\".\"{table_name}\""),
+            &[],
+        )
+        .expect("inspect skipped conditional insert")
+        .get(0);
+    assert_eq!(rows, 0, "a false conditional gate must prevent the write");
+
+    client
+        .batch_execute(&format!("DROP TABLE \"public\".\"{table_name}\""))
+        .expect("remove conditional command fixture");
+}
+
+#[test]
+fn allocation_renderer_conserves_quantities_orders_outputs_and_replays_row_sets() {
+    let _catalog_lock = command_catalog_test_lock();
+    let mut client = postgres_client();
+    install_command_catalog_client(&mut client);
+    let command_name = format!("allocation_runtime_{}", std::process::id());
+    let root = allocation_root(&command_name, 4);
+    let sql = donat_sqlgen::mutation_to_sql(&root);
+
+    assert!(
+        sql.starts_with("WITH ") && !sql.contains(';'),
+        "allocation must remain one Postgres statement: {sql}"
+    );
+    for required in [
+        "_cmd_step_1_ranked",
+        "_cmd_step_1_groups",
+        "_cmd_step_1_lines",
+        "_cmd_step_1_backorders",
+        "duplicate candidates",
+        "duplicate allocation ids",
+        "quantity conservation",
+        "row_number() OVER",
+    ] {
+        assert!(
+            sql.contains(required),
+            "allocation SQL is missing {required}: {sql}"
+        );
+    }
+
+    let first: Json = client
+        .query_one(&sql, &[])
+        .expect("bounded allocation executes")
+        .get(0);
+    let replay: Json = client
+        .query_one(&sql, &[])
+        .expect("exact allocation retry replays its canonical row sets")
+        .get(0);
+    assert_eq!(replay, first, "idempotent allocation replay must be exact");
+
+    let lines = first["lines"]
+        .as_array()
+        .expect("allocation lines are a JSON list");
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["allocated_quantity"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [3, 2, 1],
+        "candidate order determines the exact split"
+    );
+    let groups = first["groups"]
+        .as_array()
+        .expect("allocation groups are a JSON list");
+    assert_eq!(groups.len(), 2);
+    assert_ne!(
+        groups[0]["allocation_id"], groups[1]["allocation_id"],
+        "each typed group key receives one stable deterministic allocation id"
+    );
+    let backorders = first["backorders"]
+        .as_array()
+        .expect("backorders are explicit for every requested line");
+    assert_eq!(
+        backorders
+            .iter()
+            .map(|row| row["backordered_quantity"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    for backorder in backorders {
+        let line_id = &backorder["order_line_id"];
+        let requested = backorder["requested_quantity"].as_i64().unwrap();
+        let allocated: i64 = lines
+            .iter()
+            .filter(|line| &line["order_line_id"] == line_id)
+            .map(|line| line["allocated_quantity"].as_i64().unwrap())
+            .sum();
+        assert_eq!(
+            allocated + backorder["backordered_quantity"].as_i64().unwrap(),
+            requested,
+            "every line must conserve requested quantity"
+        );
+    }
+
+    let overflow =
+        donat_sqlgen::mutation_to_sql(&allocation_root(&format!("{command_name}_overflow"), 3));
+    let error = client
+        .query_one(&overflow, &[])
+        .expect_err("allocation input beyond its fixed bound must reject");
+    let database_error = error.as_db_error().expect("bound rejection is structured");
+    assert_eq!(database_error.code().code(), "P0D01");
+    assert!(database_error.message().contains("row bound"));
+
+    let MutationRoot::Command { mut command, alias } =
+        allocation_root(&format!("{command_name}_duplicate"), 4)
+    else {
+        unreachable!("allocation helper returns a command")
+    };
+    let CommandExecutionStep::FixedRows { rows, .. } = &mut command.steps[0] else {
+        unreachable!("allocation helper starts with fixed candidates")
+    };
+    rows[1] = rows[0].clone();
+    let duplicate_sql = donat_sqlgen::mutation_to_sql(&MutationRoot::Command { alias, command });
+    let error = client
+        .query_one(&duplicate_sql, &[])
+        .expect_err("duplicate allocation candidates must reject");
+    let database_error = error
+        .as_db_error()
+        .expect("duplicate rejection is structured");
+    assert_eq!(database_error.code().code(), "P0D01");
+    assert!(database_error.message().contains("duplicate candidates"));
 }

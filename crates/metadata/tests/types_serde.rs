@@ -6,10 +6,11 @@
 use std::path::Path;
 
 use donat_metadata::{
-    ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandStepOperation,
-    CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger, DatabaseUrl, InsertPermission,
-    Metadata, PermissionEntry, QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata,
-    SelectPermission, SourceKind, TableConfiguration, action_visible_to_role, load_metadata_dir,
+    ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandResultValue,
+    CommandStepOperation, CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger,
+    DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable, RemoteSchema,
+    RestEndpoint, RulesMetadata, SelectPermission, SourceKind, TableConfiguration,
+    action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -827,7 +828,7 @@ fn commands_deserialize_all_step_and_value_forms() {
     ));
     assert!(matches!(
         command.result.get("order_id"),
-        Some(CommandValue::Step { .. })
+        Some(CommandResultValue::Step { .. })
     ));
     assert_eq!(
         command

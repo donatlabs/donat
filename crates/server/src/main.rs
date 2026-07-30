@@ -283,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
             commands: vec![],
             rules: Default::default(),
             connectors: vec![],
+            processes: vec![],
         },
     };
     ensure_default_source(&mut metadata);

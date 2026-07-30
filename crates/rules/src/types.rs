@@ -296,6 +296,16 @@ pub struct CompiledDecisionTable {
 }
 
 impl CompiledDecisionTable {
+    /// Return the declared type of one decision input binding.
+    pub fn input_type(&self, name: &str) -> Option<&RuleType> {
+        self.inputs.get(name)
+    }
+
+    /// Iterate the closed input contract in deterministic name order.
+    pub fn input_types(&self) -> impl Iterator<Item = (&String, &RuleType)> {
+        self.inputs.iter()
+    }
+
     /// Return the declared type of one decision output data field.
     pub fn output_field(&self, name: &str) -> Option<&DecisionOutputField> {
         self.output_fields.get(name)

@@ -56,12 +56,18 @@ pub struct Metadata {
     /// environment are never written back into this structure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connectors: Vec<ConnectorInstance>,
+    /// Durable process declarations from the optional `flows.yaml` section.
+    /// Loading them is parse-only until the process compiler and journal
+    /// runtime validate and execute the closed grammar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<Process>,
 }
 
 /// One named deployment instance of a connector module compiled into the
 /// serving binary. The metadata can select only an instance and a module name;
 /// it cannot provide code, a package, or another runtime implementation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectorInstance {
     pub name: String,
     pub module: String,
@@ -178,6 +184,8 @@ pub struct HttpConnectorOperation {
     pub path: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: BTreeMap<String, ConnectorInputBinding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_contract: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<ConnectorStaticHeader>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,6 +194,20 @@ pub struct HttpConnectorOperation {
     pub success_statuses: Vec<u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub response: BTreeMap<String, ConnectorResponseBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ConnectorEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<ConnectorBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_map: Option<ConnectorErrorMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ConnectorRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<ConnectorRedaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_contract: Option<ConnectorSuccessContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<ConnectorIdempotency>,
     #[serde(
@@ -218,6 +240,168 @@ pub struct ConnectorResponseBinding {
     pub json_pointer: String,
     #[serde(rename = "type")]
     pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_items: Option<u32>,
+}
+
+/// Whether an operation is transport-only or carries provider side effects.
+/// Side-effecting operations must retain the complete fixed provider
+/// idempotency contract before a future process compiler may admit them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ConnectorEffect {
+    ReadOnly(ConnectorReadOnlyEffect),
+    ProviderIdempotent {
+        provider_idempotent: ProviderIdempotentEffect,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorReadOnlyEffect {
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdempotentEffect {
+    pub side_effect_steps: Vec<ProviderIdempotentStep>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdempotentStep {
+    pub step: String,
+    pub fixed_binding: ProviderIdempotencyBinding,
+    pub scope: String,
+    pub minimum_retention_ms: u64,
+    pub clock_safety_margin_ms: u64,
+    pub evidence: ProviderIdempotencyEvidence,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdempotencyBinding {
+    pub header: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdempotencyEvidence {
+    pub source_record_id: String,
+    pub fact_ids: Vec<String>,
+}
+
+/// Complete finite transport and canonical-output limits for one operation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorBounds {
+    pub deadline_ms: u64,
+    pub maximum_calls: u32,
+    pub maximum_pages: u32,
+    pub maximum_items: u32,
+    pub maximum_aggregate_request_bytes: u64,
+    pub maximum_aggregate_response_bytes: u64,
+    pub maximum_output_canonical_bytes: u64,
+    pub maximum_redirects: u32,
+    pub maximum_json_depth: u32,
+    pub maximum_json_nodes: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorErrorMap {
+    pub rules: Vec<ConnectorErrorRule>,
+    pub fallback: ConnectorError,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorErrorRule {
+    pub statuses: Vec<u16>,
+    #[serde(rename = "class")]
+    pub class_: ConnectorErrorClass,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorError {
+    #[serde(rename = "class")]
+    pub class_: ConnectorErrorClass,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorErrorClass {
+    Authentication,
+    Transport,
+    Timeout,
+    #[serde(rename = "http_429")]
+    Http429,
+    #[serde(rename = "http_5xx")]
+    Http5xx,
+    Validation,
+    Permanent,
+    Invariant,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRetry {
+    pub maximum_attempts: u32,
+    pub backoff: String,
+    pub retry_on: Vec<ConnectorErrorClass>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRedaction {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_body: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_body: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ConnectorSuccessContract {
+    Status {
+        status: String,
+    },
+    Lookup {
+        discriminator: String,
+        cases: BTreeMap<String, ConnectorSuccessCase>,
+        unproven_absence: ConnectorUnprovenAbsence,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorSuccessCase {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exactly_one_non_empty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorUnprovenAbsence {
+    pub error: ConnectorError,
 }
 
 /// A provider idempotency header selected by metadata. The header name is
@@ -270,6 +454,7 @@ pub struct ConnectorSerializeBy {
 /// complete declaration without validating source, catalog, rule, process, or
 /// permission references; those checks need the compiled catalog.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Command {
     pub name: String,
     pub source: String,
@@ -292,6 +477,7 @@ pub struct Command {
 /// A classic explicit role allowed to invoke a command. This is an additional
 /// gate; later validation still requires the role's table permissions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandPermission {
     pub role: String,
 }
@@ -309,7 +495,7 @@ impl CommandResult {
         self.fields.is_empty()
     }
 
-    pub fn get(&self, name: &str) -> Option<&CommandValue> {
+    pub fn get(&self, name: &str) -> Option<&CommandResultValue> {
         self.fields
             .iter()
             .find(|field| field.name == name)
@@ -325,7 +511,7 @@ impl CommandResult {
 #[derive(Debug, Clone)]
 pub struct CommandResultField {
     pub name: String,
-    pub value: CommandValue,
+    pub value: CommandResultValue,
 }
 
 impl<'de> Deserialize<'de> for CommandResult {
@@ -371,9 +557,53 @@ impl Serialize for CommandResult {
     }
 }
 
+/// A command result may expose an ordinary scalar command reference, a
+/// bounded projected row set, or an explicitly declared literal array. It is
+/// separate from [`CommandValue`] because output aliases and bounds are
+/// result-contract concerns rather than inputs to command operations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CommandResultValue {
+    ProjectedStep {
+        step: String,
+        project: BTreeMap<String, String>,
+        maximum_items: u32,
+    },
+    Step {
+        step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum_items: Option<u32>,
+    },
+    Argument {
+        arg: String,
+    },
+    Literal {
+        literal: serde_json::Value,
+    },
+    Rule {
+        rule: String,
+        #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+        bindings: BTreeMap<String, CommandValue>,
+    },
+    SessionVariable {
+        session_variable: String,
+    },
+    CurrentColumn {
+        current_column: String,
+    },
+    Array(Vec<serde_json::Value>),
+}
+
 /// A typed command argument. The canonical metadata form is an ordered list;
 /// the accepted mapping shorthand normalizes to this list during loading.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandArgument {
     pub name: String,
     #[serde(rename = "type")]
@@ -409,6 +639,7 @@ where
 
 /// A named boolean rule evaluated before the command steps execute.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandGuard {
     pub rule: String,
     #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -430,18 +661,64 @@ pub struct CommandStep {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum CommandStepOperation {
-    SelectOne { select_one: SelectOneCommandStep },
-    SelectMany { select_many: SelectManyCommandStep },
-    Insert { insert: InsertCommandStep },
-    InsertMany { insert_many: InsertManyCommandStep },
-    Update { update: UpdateCommandStep },
-    UpdateMany { update_many: UpdateManyCommandStep },
-    Delete { delete: DeleteCommandStep },
-    Aggregate { aggregate: AggregateCommandStep },
-    Assert { assert: AssertCommandStep },
+    SelectOne {
+        select_one: SelectOneCommandStep,
+    },
+    SelectMany {
+        select_many: SelectManyCommandStep,
+    },
+    Insert {
+        insert: InsertCommandStep,
+    },
+    InsertMany {
+        insert_many: InsertManyCommandStep,
+    },
+    Update {
+        update: UpdateCommandStep,
+    },
+    UpdateMany {
+        update_many: UpdateManyCommandStep,
+    },
+    Delete {
+        delete: DeleteCommandStep,
+    },
+    Aggregate {
+        aggregate: AggregateCommandStep,
+    },
+    Assert {
+        assert: AssertCommandStep,
+    },
+    Decision {
+        decision: DecisionCommandStep,
+    },
+    DecisionMany {
+        decision_many: DecisionManyCommandStep,
+    },
+    Project {
+        project: ProjectCommandStep,
+    },
+    ProjectMany {
+        project_many: ProjectManyCommandStep,
+    },
+    FixedRows {
+        fixed_rows: FixedRowsCommandStep,
+    },
+    AllocateMany {
+        allocate_many: AllocateManyCommandStep,
+    },
+    AssertWhen {
+        assert_when: ConditionalAssertCommandStep,
+    },
+    UpdateWhen {
+        update_when: ConditionalUpdateCommandStep,
+    },
+    InsertWhen {
+        insert_when: ConditionalInsertCommandStep,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectOneCommandStep {
     pub table: QualifiedTable,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -467,9 +744,12 @@ pub struct SelectManyCommandStep {
     pub returning: Vec<String>,
     #[serde(default)]
     pub require_non_empty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_rows: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InsertCommandStep {
     pub table: QualifiedTable,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -479,6 +759,7 @@ pub struct InsertCommandStep {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InsertManyCommandStep {
     pub table: QualifiedTable,
     pub for_each: CommandValue,
@@ -488,9 +769,12 @@ pub struct InsertManyCommandStep {
     pub returning: Vec<String>,
     #[serde(default)]
     pub allow_empty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_items: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateCommandStep {
     pub table: QualifiedTable,
     #[serde(rename = "where", default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -522,6 +806,7 @@ pub struct UpdateManyCommandStep {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteCommandStep {
     pub table: QualifiedTable,
     #[serde(rename = "where", default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -533,12 +818,140 @@ pub struct DeleteCommandStep {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssertCommandStep {
     pub rule: String,
     #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, CommandValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionCommandStep {
+    pub decision_table: String,
+    pub input: BTreeMap<String, CommandValue>,
+    pub returning: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionManyCommandStep {
+    pub decision_table: String,
+    pub from: CommandValue,
+    pub input: BTreeMap<String, CommandValue>,
+    pub returning: Vec<String>,
+    pub order_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCommandStep {
+    pub values: BTreeMap<String, CommandValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectManyCommandStep {
+    pub from: CommandValue,
+    pub maximum_rows: u32,
+    pub values: BTreeMap<String, CommandValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedRowsCommandStep {
+    pub maximum_rows: u32,
+    pub rows: Vec<BTreeMap<String, CommandValue>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocateManyCommandStep {
+    pub from: CommandValue,
+    pub request_id: CommandValue,
+    pub group_key: Vec<String>,
+    pub exact_quantity_columns: ExactQuantityColumns,
+    pub allocation_id: AllocationIdStrategy,
+    pub returning: AllocationReturning,
+    pub group_order_by: Vec<String>,
+    pub line_order_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactQuantityColumns {
+    pub requested: String,
+    pub available: String,
+    pub allocated: String,
+    pub backordered: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationIdStrategy {
+    Deterministic,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocationReturning {
+    pub groups: Vec<String>,
+    pub lines: Vec<String>,
+    pub backorders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalAssertCommandStep {
+    pub when: CommandCondition,
+    pub rule: String,
+    #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalUpdateCommandStep {
+    pub when: CommandCondition,
+    pub table: QualifiedTable,
+    #[serde(rename = "where", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub predicate: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_affected: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalInsertCommandStep {
+    pub when: CommandCondition,
+    pub table: QualifiedTable,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object: BTreeMap<String, CommandValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returning: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CommandCondition {
+    ArgumentEquals {
+        argument_equals: ArgumentEqualsCondition,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArgumentEqualsCondition {
+    pub argument: String,
+    pub value: serde_json::Value,
 }
 
 /// A closed Rule invocation bound to a relational update check. It has no
@@ -584,14 +997,24 @@ pub enum CommandAggregate {
     },
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CountCommandAggregate {
+    Enabled(bool),
+    Options(CountCommandAggregateOptions),
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CountCommandAggregate {}
+pub struct CountCommandAggregateOptions {}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnCommandAggregate {
-    pub column: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 fn deserialize_non_empty_command_value_map<'de, D>(
@@ -641,6 +1064,10 @@ pub enum CommandValue {
         step: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        where_nonzero: Option<String>,
     },
     Literal {
         literal: serde_json::Value,
@@ -656,15 +1083,19 @@ pub enum CommandValue {
     CurrentColumn {
         current_column: String,
     },
+    DatabaseTime {
+        database_time: String,
+    },
 }
 
 /// Optional replay protection for a command. Its scope is deliberately typed
 /// so a later validator can reject non-deterministic declarations.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandIdempotency {
     pub key: CommandIdempotencyKey,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scope: Vec<CommandIdempotencyScope>,
+    #[serde(default, skip_serializing_if = "CommandIdempotencyScopeSpec::is_empty")]
+    pub scope: CommandIdempotencyScopeSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<String>,
 }
@@ -683,6 +1114,32 @@ pub enum CommandIdempotencyKey {
 pub enum CommandIdempotencyScope {
     Argument { argument: String },
     SessionVariable { session_variable: String },
+    Step { step: String, column: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandIdempotencyScopeSpec {
+    Command(CommandIdempotencyCommandScope),
+    Values(Vec<CommandIdempotencyScope>),
+}
+
+impl CommandIdempotencyScopeSpec {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Values(values) if values.is_empty())
+    }
+}
+
+impl Default for CommandIdempotencyScopeSpec {
+    fn default() -> Self {
+        Self::Values(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandIdempotencyCommandScope {
+    Command,
 }
 
 /// A durable hand-off requested by a command. It is only metadata in this
@@ -695,8 +1152,11 @@ pub enum CommandEffect {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartProcessEffect {
     pub process: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_key: Option<CommandValue>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub input: BTreeMap<String, CommandValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,6 +1164,7 @@ pub struct StartProcessEffect {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignalProcessEffect {
     pub process: String,
     pub signal: String,
@@ -713,6 +1174,416 @@ pub struct SignalProcessEffect {
     pub payload: BTreeMap<String, CommandValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<CommandIdempotencyKey>,
+}
+
+/// A source-local durable process definition. The metadata layer retains only
+/// the finite executable grammar; reference, type, and transition validation
+/// belongs to the future process compiler.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Process {
+    pub name: String,
+    pub kind: ProcessKind,
+    pub version: u32,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<ProcessPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<ProcessOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<ProcessStart>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<ProcessField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<ProcessField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<ProcessIdempotency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<ProcessSignal>,
+    pub start_at: String,
+    pub states: Vec<ProcessState>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessKind {
+    Process,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessPermission {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_variable: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessOwner {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub capture: ProcessValue,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStart {
+    pub command: String,
+    pub input: BTreeMap<String, ProcessCommandResultReference>,
+    pub idempotency_key: ProcessCommandArgumentReference,
+    pub process_key: ProcessCommandResultReference,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCommandResultReference {
+    pub command_result: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCommandArgumentReference {
+    pub command_argument: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdempotency {
+    pub key: ProcessIdempotencyValue,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<ProcessIdempotencyValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessIdempotencyValue {
+    Input { input: String },
+    SessionVariable { session_variable: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSignal {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub correlation: BTreeMap<String, String>,
+    pub payload: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProcessState {
+    pub id: String,
+    #[serde(flatten)]
+    pub operation: ProcessStateOperation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessStateOperation {
+    Command { command: ProcessCommandState },
+    Request { request: ProcessRequestState },
+    When { when: ProcessWhenState },
+    Wait { wait: ProcessWaitState },
+    ForEach { for_each: Box<ProcessForEachState> },
+    Output { output: ProcessOutputState },
+    Fail { fail: ProcessFailState },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCommandState {
+    pub name: String,
+    pub run_as: String,
+    pub arguments: BTreeMap<String, ProcessValue>,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCommandActivity {
+    pub name: String,
+    pub run_as: String,
+    pub arguments: BTreeMap<String, ProcessValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRequestState {
+    pub connector: String,
+    pub operation: String,
+    pub input: BTreeMap<String, ProcessValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<ProcessRequestIdempotencyKey>,
+    pub timeout: ProcessTimeout,
+    pub retry: ProcessRetry,
+    pub next: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<ProcessErrorRoutes>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRequestActivity {
+    pub connector: String,
+    pub operation: String,
+    pub input: BTreeMap<String, ProcessValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<ProcessRequestIdempotencyKey>,
+    pub timeout: ProcessTimeout,
+    pub retry: ProcessRetry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<ProcessErrorRoutes>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRequestIdempotencyKey {
+    pub stable: ProcessStableActivityKey,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStableActivityKey {
+    pub run: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTimeout {
+    pub schedule_to_start: String,
+    pub start_to_close: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRetry {
+    pub retry_on: Vec<ProcessErrorKind>,
+    pub max_attempts: u32,
+    pub initial_interval: String,
+    pub max_interval: String,
+    pub jitter: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessErrorKind {
+    Authentication,
+    Transport,
+    Timeout,
+    #[serde(rename = "http_429")]
+    Http429,
+    #[serde(rename = "http_5xx")]
+    Http5xx,
+    Validation,
+    Permanent,
+    Invariant,
+    RetryExhausted,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessErrorRoutes {
+    pub routes: Vec<ProcessErrorRoute>,
+    pub fallback: ProcessErrorFallback,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessErrorRoute {
+    pub kinds: Vec<ProcessErrorKind>,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessErrorFallback {
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWhenState {
+    pub cases: Vec<ProcessWhenCase>,
+    pub default: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_table: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input: BTreeMap<String, ProcessValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWhenCase {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(rename = "with", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, ProcessValue>,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessWaitState {
+    Signal(ProcessSignalWait),
+    Timer(ProcessTimerWait),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSignalWait {
+    pub signal: String,
+    pub role: String,
+    pub verification: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persist_before_match: bool,
+    pub correlate: BTreeMap<String, ProcessValue>,
+    pub deadline: ProcessDeadline,
+    pub next: String,
+    pub on_timeout: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTimerWait {
+    pub timer: ProcessTimer,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ProcessDeadline {
+    Value(ProcessValue),
+    Duration(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTimer {
+    pub decision_table: String,
+    #[serde(rename = "with")]
+    pub bindings: BTreeMap<String, ProcessValue>,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessForEachState {
+    Command {
+        input: ProcessValue,
+        item_key: String,
+        max_items: u32,
+        max_concurrency: u32,
+        completion: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        preserve_input: bool,
+        command: ProcessCommandActivity,
+        next: String,
+    },
+    Request {
+        input: ProcessValue,
+        item_key: String,
+        max_items: u32,
+        max_concurrency: u32,
+        completion: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        preserve_input: bool,
+        request: ProcessRequestActivity,
+        next: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessOutputState {
+    pub values: BTreeMap<String, ProcessValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessFailState {
+    pub code: String,
+    pub message: String,
+}
+
+/// Closed recursive value references available to process states. Bounded
+/// collection transforms carry their maxima in the declaration; no generic
+/// expression, loop, or executable code can be embedded here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessValue {
+    Input {
+        input: String,
+    },
+    State {
+        state: String,
+        field: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<Vec<String>>,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_: Option<String>,
+    },
+    Item {
+        item: String,
+    },
+    Literal {
+        literal: serde_json::Value,
+    },
+    ActivityKey {
+        activity_key: String,
+    },
+    ActivityKeyForState {
+        activity_key_for_state: String,
+    },
+    Run {
+        run: String,
+    },
+    WorkflowTime {
+        workflow_time: String,
+    },
+    SessionVariable {
+        session_variable: String,
+    },
+    BoundedConcat {
+        bounded_concat: ProcessBoundedConcat,
+    },
+    BoundedFlatten {
+        bounded_flatten: Box<ProcessBoundedFlatten>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBoundedConcat {
+    pub inputs: Vec<ProcessValue>,
+    pub maximum_lists: u32,
+    pub maximum_items: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBoundedFlatten {
+    pub from: Box<ProcessValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<BTreeMap<String, String>>,
+    pub maximum_lists: u32,
+    pub maximum_items: u32,
 }
 
 /// The single `rules.yaml` metadata wrapper. Rules and decision tables share
@@ -951,6 +1822,10 @@ impl Default for CronRetryConf {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 fn default_retry_interval_seconds() -> u64 {
     10

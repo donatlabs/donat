@@ -8,11 +8,13 @@ use std::borrow::Cow;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
+use donat_ir::{TypeRef, ValueScalar, ValueType};
 use donat_metadata::{
-    Columns, Command, CommandAggregate, CommandStep, CommandStepOperation, CommandValue, Metadata,
+    Columns, CommandResultValue as MetadataCommandResultValue, CommandStepOperation, Metadata,
 };
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
+use crate::commands::CompiledCommand;
 use crate::naming::{command_pascal_case, root_names, table_base_name};
 use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 
@@ -247,241 +249,218 @@ fn command_type_scalars(
     scalars.insert(type_.to_string());
 }
 
-fn command_step_table(step: &CommandStep) -> Option<&donat_metadata::QualifiedTable> {
-    match &step.operation {
-        CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
-        CommandStepOperation::SelectMany { select_many } => Some(&select_many.table),
-        CommandStepOperation::Insert { insert } => Some(&insert.table),
-        CommandStepOperation::InsertMany { insert_many } => Some(&insert_many.table),
-        CommandStepOperation::Update { update } => Some(&update.table),
-        CommandStepOperation::UpdateMany { update_many } => Some(&update_many.table),
-        CommandStepOperation::Delete { delete } => Some(&delete.table),
-        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => None,
-    }
-}
-
-fn command_step_returning(step: &CommandStep) -> &[String] {
-    match &step.operation {
-        CommandStepOperation::SelectOne { select_one } => &select_one.returning,
-        CommandStepOperation::SelectMany { select_many } => &select_many.returning,
-        CommandStepOperation::Insert { insert } => &insert.returning,
-        CommandStepOperation::InsertMany { insert_many } => &insert_many.returning,
-        CommandStepOperation::Update { update } => &update.returning,
-        CommandStepOperation::UpdateMany { update_many } => &update_many.returning,
-        CommandStepOperation::Delete { delete } => &delete.returning,
-        CommandStepOperation::Aggregate { .. } | CommandStepOperation::Assert { .. } => &[],
-    }
-}
-
-fn command_step_is_many(step: &CommandStep) -> bool {
-    matches!(
-        step.operation,
-        CommandStepOperation::SelectMany { .. }
-            | CommandStepOperation::InsertMany { .. }
-            | CommandStepOperation::UpdateMany { .. }
-    )
-}
-
-fn command_step_may_be_absent(step: &CommandStep) -> bool {
-    match &step.operation {
-        CommandStepOperation::SelectOne { select_one } => !select_one.require_found,
-        CommandStepOperation::Update { update } => !update.require_affected,
-        CommandStepOperation::Delete { delete } => !delete.require_affected,
-        CommandStepOperation::Assert { .. }
-        | CommandStepOperation::SelectMany { .. }
-        | CommandStepOperation::Aggregate { .. }
-        | CommandStepOperation::UpdateMany { .. }
-        | CommandStepOperation::Insert { .. }
-        | CommandStepOperation::InsertMany { .. } => false,
-    }
-}
-
-fn command_scalar_type(literal: &Json) -> Json {
-    let scalar = match literal {
-        Json::Bool(_) => "Boolean",
-        Json::Number(number) if number.is_i64() || number.is_u64() => "Int",
-        Json::Number(_) => "Float",
-        Json::String(_) => "String",
-        Json::Null | Json::Array(_) | Json::Object(_) => "String",
-    };
-    named("SCALAR", scalar)
-}
-
-struct CommandOutputColumn {
-    name: String,
-    pg_type: String,
-    nullable: bool,
-}
-
-fn command_step_output_columns(
-    planner: &Planner,
-    command: &Command,
-    step: &CommandStep,
-) -> Vec<CommandOutputColumn> {
-    if let CommandStepOperation::Aggregate { aggregate } = &step.operation {
-        let CommandValue::Step {
-            step: input_step,
-            column: None,
-        } = &aggregate.from
-        else {
-            unreachable!("the static compiler accepts only aggregate row-set sources");
-        };
-        let input_step = command
-            .steps
-            .iter()
-            .find(|step| step.name == *input_step)
-            .expect("the static compiler retains the aggregate input step");
-        let table = command_step_table(input_step)
-            .expect("the static compiler accepts select_many aggregate inputs");
-        let info = planner
-            .catalog_table(table)
-            .expect("the static compiler retains the aggregate input catalog relation");
-        return aggregate
-            .values
-            .iter()
-            .map(|(name, aggregate)| {
-                let (pg_type, nullable) = match aggregate {
-                    CommandAggregate::Count { .. } | CommandAggregate::CountDistinct { .. } => {
-                        ("int8".to_owned(), false)
-                    }
-                    CommandAggregate::Sum { sum } => {
-                        let input = info
-                            .column(&sum.column)
-                            .expect("the static compiler retains aggregate input columns");
-                        let output = match input.pg_type.as_str() {
-                            "int2" | "int4" | "serial" => "int8",
-                            "int8" | "bigint" | "bigserial" => "numeric",
-                            "float4" => "float4",
-                            "float8" => "float8",
-                            "numeric" | "decimal" => "numeric",
-                            _ => {
-                                unreachable!("the static compiler accepts only numeric sum columns")
-                            }
-                        };
-                        (output.to_owned(), true)
-                    }
-                    CommandAggregate::Min { min } | CommandAggregate::Max { max: min } => {
-                        let input = info
-                            .column(&min.column)
-                            .expect("the static compiler retains aggregate input columns");
-                        (input.pg_type.clone(), true)
-                    }
-                };
-                CommandOutputColumn {
-                    name: name.clone(),
-                    pg_type,
-                    nullable,
-                }
-            })
-            .collect();
-    }
-
-    let table = command_step_table(step).expect("result steps cannot reference assert");
-    let info = planner
-        .catalog_table(table)
-        .expect("the static command compiler retains catalog-backed command steps");
-    command_step_returning(step)
-        .iter()
-        .map(|name| {
-            let column = info
-                .column(name)
-                .expect("the static command compiler retains returned columns");
-            CommandOutputColumn {
-                name: name.clone(),
-                pg_type: column.pg_type.clone(),
-                nullable: column.nullable,
-            }
-        })
-        .collect()
-}
-
 fn command_result_type(
-    planner: &Planner,
-    command: &Command,
-    value: &CommandValue,
+    command: &CompiledCommand,
+    name: &str,
+    value: &MetadataCommandResultValue,
     types: &mut Vec<Json>,
     scalars: &mut std::collections::BTreeSet<String>,
     generated: &mut std::collections::BTreeSet<String>,
 ) -> Json {
-    let CommandValue::Step { step, column } = value else {
-        if let CommandValue::Literal { literal } = value {
-            let ty = command_scalar_type(literal);
-            if let Some(name) = ty["name"].as_str() {
-                scalars.insert(name.to_string());
-            }
-            return ty;
+    let contract = &command.descriptor().result.roots[name].type_ref;
+    let field_order = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: Some(field),
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .and_then(|step| match &step.operation {
+                CommandStepOperation::AllocateMany { allocate_many } => match field.as_str() {
+                    "groups" => Some(allocate_many.returning.groups.clone()),
+                    "lines" => Some(allocate_many.returning.lines.clone()),
+                    "backorders" => Some(allocate_many.returning.backorders.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }),
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: None,
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .map(|step| match &step.operation {
+                CommandStepOperation::SelectOne { select_one } => select_one.returning.clone(),
+                CommandStepOperation::SelectMany { select_many } => select_many.returning.clone(),
+                CommandStepOperation::Insert { insert } => insert.returning.clone(),
+                CommandStepOperation::InsertMany { insert_many } => insert_many.returning.clone(),
+                CommandStepOperation::Update { update } => update.returning.clone(),
+                CommandStepOperation::UpdateMany { update_many } => update_many.returning.clone(),
+                CommandStepOperation::UpdateWhen { update_when } => update_when.returning.clone(),
+                CommandStepOperation::InsertWhen { insert_when } => insert_when.returning.clone(),
+                CommandStepOperation::Decision { decision } => decision.returning.clone(),
+                CommandStepOperation::DecisionMany { decision_many } => {
+                    decision_many.returning.clone()
+                }
+                CommandStepOperation::Delete { delete } => delete.returning.clone(),
+                CommandStepOperation::Aggregate { aggregate } => {
+                    aggregate.values.keys().cloned().collect()
+                }
+                CommandStepOperation::Project { project } => {
+                    project.values.keys().cloned().collect()
+                }
+                CommandStepOperation::ProjectMany { project_many } => {
+                    project_many.values.keys().cloned().collect()
+                }
+                CommandStepOperation::FixedRows { fixed_rows } => fixed_rows
+                    .rows
+                    .first()
+                    .map(|row| row.keys().cloned().collect())
+                    .unwrap_or_default(),
+                CommandStepOperation::Assert { .. }
+                | CommandStepOperation::AssertWhen { .. }
+                | CommandStepOperation::AllocateMany { .. } => Vec::new(),
+            }),
+        MetadataCommandResultValue::ProjectedStep { project, .. } => {
+            Some(project.keys().cloned().collect())
         }
-        unreachable!("the static command compiler limits result values to steps and literals")
+        _ => None,
     };
-    let step = command
-        .steps
-        .iter()
-        .find(|candidate| candidate.name == *step)
-        .expect("the static command compiler retains only declared steps");
-    let output_columns = command_step_output_columns(planner, command, step);
-    if let Some(column) = column {
-        let column = output_columns
-            .iter()
-            .find(|candidate| candidate.name == *column)
-            .expect("the static command compiler retains returned columns");
-        let scalar = scalar_name(&column.pg_type).to_string();
-        scalars.insert(scalar.clone());
-        let field_type = if column.nullable || command_step_may_be_absent(step) {
-            named("SCALAR", &scalar)
-        } else {
-            non_null(named("SCALAR", &scalar))
-        };
-        return if command_step_is_many(step) {
-            non_null(list_of(field_type))
-        } else {
-            field_type
-        };
-    }
+    let row_name = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            as_,
+            column,
+            field,
+            ..
+        } if column.is_none() => as_.clone().unwrap_or_else(|| match field {
+            Some(field) => format!(
+                "{}{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step),
+                command_pascal_case(field),
+            ),
+            None => format!(
+                "{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step)
+            ),
+        }),
+        MetadataCommandResultValue::ProjectedStep { step, .. } => format!(
+            "{}{}Row",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(step)
+        ),
+        _ => format!(
+            "{}{}Value",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(name)
+        ),
+    };
+    command_contract_reference(
+        contract,
+        &row_name,
+        field_order.as_deref(),
+        types,
+        scalars,
+        generated,
+    )
+}
 
-    let row_name = format!(
-        "{}{}Row",
-        command_pascal_case(&command.name),
-        command_pascal_case(&step.name)
-    );
-    if generated.insert(row_name.clone()) {
-        let fields = output_columns
-            .iter()
-            .map(|column| {
-                let scalar = scalar_name(&column.pg_type).to_string();
-                scalars.insert(scalar.clone());
-                field(
-                    &column.name,
-                    vec![],
-                    if column.nullable {
-                        named("SCALAR", &scalar)
-                    } else {
-                        non_null(named("SCALAR", &scalar))
-                    },
-                )
-            })
-            .collect();
-        types.push(object_type(&row_name, fields));
-    }
-    let row = named("OBJECT", &row_name);
-    if command_step_is_many(step) {
-        non_null(list_of(non_null(row)))
-    } else if command_step_may_be_absent(step) {
-        row
+fn command_contract_reference(
+    contract: &TypeRef,
+    object_name: &str,
+    field_order: Option<&[String]>,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let inner = match &contract.value_type {
+        ValueType::Scalar { scalar } => {
+            let name = match scalar {
+                ValueScalar::Boolean => "Boolean".to_owned(),
+                ValueScalar::String => "String".to_owned(),
+                ValueScalar::Int32 => "Int".to_owned(),
+                ValueScalar::Int64 => "int8".to_owned(),
+                ValueScalar::UInt64 => "uint8".to_owned(),
+                ValueScalar::Decimal => "Float".to_owned(),
+                ValueScalar::Uuid => "uuid".to_owned(),
+                ValueScalar::Date => "date".to_owned(),
+                ValueScalar::Timestamp => "timestamp".to_owned(),
+                ValueScalar::TimestampTz => "timestamptz".to_owned(),
+                ValueScalar::Json => "json".to_owned(),
+                ValueScalar::Custom { name } => name.clone(),
+            };
+            scalars.insert(name.clone());
+            named("SCALAR", &name)
+        }
+        ValueType::Enum { name, values } => {
+            if generated.insert(name.clone()) {
+                types.push(enum_type(
+                    name,
+                    &values.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            named("ENUM", name)
+        }
+        ValueType::Object { fields } => {
+            if generated.insert(object_name.to_owned()) {
+                let ordered_fields = field_order
+                    .map(|order| {
+                        order
+                            .iter()
+                            .filter_map(|name| fields.get_key_value(name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| fields.iter().collect());
+                let output_fields = ordered_fields
+                    .into_iter()
+                    .map(|(name, field_contract)| {
+                        field(
+                            name,
+                            vec![],
+                            command_contract_reference(
+                                &field_contract.type_ref,
+                                &format!("{object_name}{}", command_pascal_case(name)),
+                                None,
+                                types,
+                                scalars,
+                                generated,
+                            ),
+                        )
+                    })
+                    .collect();
+                types.push(object_type(object_name, output_fields));
+            }
+            named("OBJECT", object_name)
+        }
+        ValueType::List { element } => list_of(command_contract_reference(
+            element,
+            object_name,
+            field_order,
+            types,
+            scalars,
+            generated,
+        )),
+        ValueType::Ref { name } => named("OBJECT", name),
+    };
+    if contract.nullable {
+        inner
     } else {
-        non_null(row)
+        non_null(inner)
     }
 }
 
 fn add_command_schema(
     planner: &Planner,
-    command: &Command,
+    command: &CompiledCommand,
     types: &mut Vec<Json>,
     scalars: &mut std::collections::BTreeSet<String>,
     emitted_row_types: &mut std::collections::BTreeSet<String>,
     emitted_input_types: &mut std::collections::BTreeSet<String>,
 ) -> Json {
-    let result_name = format!("{}Result", command_pascal_case(&command.name));
-    let result_fields = command
+    let definition = command.definition();
+    let result_name = format!("{}Result", command_pascal_case(&definition.name));
+    let result_fields = definition
         .result
         .fields
         .iter()
@@ -490,8 +469,8 @@ fn add_command_schema(
                 &field_definition.name,
                 vec![],
                 command_result_type(
-                    planner,
                     command,
+                    &field_definition.name,
                     &field_definition.value,
                     types,
                     scalars,
@@ -501,7 +480,7 @@ fn add_command_schema(
         })
         .collect();
     types.push(object_type(&result_name, result_fields));
-    let arguments = command
+    let arguments = definition
         .arguments
         .iter()
         .map(|argument| {
@@ -518,7 +497,7 @@ fn add_command_schema(
             )
         })
         .collect();
-    field(&command.name, arguments, named("OBJECT", &result_name))
+    field(&definition.name, arguments, named("OBJECT", &result_name))
 }
 
 const ORDER_BY_VALUES: &[&str] = &[
@@ -907,7 +886,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             let mut emitted_command_row_types = std::collections::BTreeSet::new();
             mutation_fields.push(add_command_schema(
                 planner,
-                command.definition(),
+                command,
                 &mut types,
                 &mut scalars,
                 &mut emitted_command_row_types,

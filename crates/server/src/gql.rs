@@ -2422,7 +2422,10 @@ mod tests {
                 result: vec![],
                 idempotency: Some(donat_ir::CommandIdempotency {
                     key: donat_ir::Scalar::Json(json!(KEY)),
-                    scope: vec![donat_ir::Scalar::Json(json!(SESSION_SCOPE))],
+                    scope: vec![donat_ir::CommandExecutionValue::Scalar {
+                        value: donat_ir::Scalar::Json(json!(SESSION_SCOPE)),
+                        pg_type: "text".to_owned(),
+                    }],
                     input: donat_ir::Scalar::Json(json!({ "status": INPUT })),
                     retention_seconds: None,
                     error_path: "$.selectionSet.submit".to_owned(),

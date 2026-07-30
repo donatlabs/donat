@@ -968,6 +968,26 @@ fn rules_expose_no_dynamic_capability_selection_api() {
 }
 
 #[test]
+fn compiled_decision_exposes_read_only_input_types_for_typed_consumers() {
+    let catalog = compile_catalog(&[], &[approval_table(HitPolicy::First)])
+        .expect("decision fixture compiles");
+    let table = catalog
+        .decision_table("invoice_approval")
+        .expect("compiled decision exists");
+
+    assert_eq!(table.input_type("amount"), Some(&RuleType::Int));
+    assert!(table.input_type("unknown").is_none());
+    assert_eq!(
+        table
+            .input_types()
+            .map(|(name, type_)| (name.as_str(), type_))
+            .collect::<Vec<_>>(),
+        vec![("amount", &RuleType::Int)],
+        "typed consumers receive a deterministic read-only view"
+    );
+}
+
+#[test]
 fn unique_decision_tables_reject_zero_and_multiple_matches() {
     let mut zero_match = approval_table(HitPolicy::Unique);
     zero_match.rows.pop();

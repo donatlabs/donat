@@ -499,6 +499,46 @@ pub enum CommandExecutionStep {
         values: Vec<CommandAggregateIr>,
         error_path: String,
     },
+    Project {
+        name: String,
+        cte: String,
+        values: Vec<CommandNamedValue>,
+        error_path: String,
+    },
+    ProjectMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        maximum_rows: u32,
+        values: Vec<CommandNamedValue>,
+        error_path: String,
+    },
+    FixedRows {
+        name: String,
+        cte: String,
+        maximum_rows: u32,
+        columns: Vec<CommandColumn>,
+        rows: Vec<Vec<CommandExecutionValue>>,
+        error_path: String,
+    },
+    Decision {
+        name: String,
+        cte: String,
+        decision: CommandDecision,
+        input: Vec<CommandNamedValue>,
+        returning: Vec<CommandColumn>,
+        error_path: String,
+    },
+    DecisionMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        decision: CommandDecision,
+        input: Vec<CommandNamedValue>,
+        returning: Vec<CommandColumn>,
+        order_by: Vec<CommandColumn>,
+        error_path: String,
+    },
     Insert {
         name: String,
         cte: String,
@@ -520,9 +560,35 @@ pub enum CommandExecutionStep {
         check: Option<BoolExp>,
         error_path: String,
     },
+    InsertRows {
+        name: String,
+        cte: String,
+        table: Table,
+        input_cte: String,
+        where_nonzero: Option<String>,
+        item_fields: Vec<CommandColumn>,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        allow_empty: bool,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
     Update {
         name: String,
         cte: String,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        set: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    UpdateWhen {
+        name: String,
+        cte: String,
+        condition: CommandCondition,
         table: Table,
         predicate: Vec<CommandAssignment>,
         set: Vec<CommandAssignment>,
@@ -559,6 +625,95 @@ pub enum CommandExecutionStep {
     Assert {
         name: String,
         rule: CommandRule,
+    },
+    AssertWhen {
+        name: String,
+        condition: CommandCondition,
+        rule: CommandRule,
+    },
+    InsertWhen {
+        name: String,
+        cte: String,
+        condition: CommandCondition,
+        table: Table,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    AllocateMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        request_id: CommandExecutionValue,
+        group_key: Vec<CommandColumn>,
+        requested: CommandColumn,
+        available: CommandColumn,
+        allocated: CommandColumn,
+        backordered: CommandColumn,
+        groups: Vec<CommandColumn>,
+        lines: Vec<CommandColumn>,
+        backorders: Vec<CommandColumn>,
+        group_order_by: Vec<CommandColumn>,
+        line_order_by: Vec<CommandColumn>,
+        maximum_rows: u32,
+        error_path: String,
+    },
+}
+
+/// One named field produced by a pure projection or supplied to a resolved
+/// decision. Names and values are both deployment-validated; SQLgen receives
+/// no raw command value grammar.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandNamedValue {
+    pub name: String,
+    pub column: CommandColumn,
+    pub value: CommandExecutionValue,
+}
+
+/// Immutable identity and output contract of one compiled decision table.
+/// The definition revision prevents request planning from silently crossing a
+/// deployment while Task 4 adds the renderer-owned canonical row program.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecision {
+    pub name: String,
+    pub revision: String,
+    pub hit_policy: CommandDecisionHitPolicy,
+    pub rows: Vec<CommandDecisionRow>,
+}
+
+/// Closed decision hit policy copied from the Rules-owned lowered program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandDecisionHitPolicy {
+    First,
+    Unique,
+}
+
+/// One already-lowered decision row. SQLgen receives no raw decision
+/// metadata, checked expression, or Rule catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecisionRow {
+    pub id: String,
+    pub condition_sql: String,
+    pub output: Vec<CommandDecisionOutput>,
+}
+
+/// One typed business output literal lowered by `donat-rules`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecisionOutput {
+    pub name: String,
+    pub sql: String,
+    pub column: CommandColumn,
+}
+
+/// A condition is retained as typed data so SQLgen can materialize a gate.
+/// The request planner must never branch in Rust on this value.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandCondition {
+    ArgumentEquals {
+        argument: Scalar,
+        expected: Scalar,
+        pg_type: String,
     },
 }
 
@@ -621,6 +776,12 @@ pub enum CommandExecutionValue {
         cte: String,
         columns: Vec<CommandColumn>,
     },
+    StepFieldRows {
+        cte: String,
+        field: String,
+        columns: Vec<CommandColumn>,
+        where_nonzero: Option<String>,
+    },
     Item {
         field: String,
         pg_type: String,
@@ -632,6 +793,16 @@ pub enum CommandExecutionValue {
         sql: String,
         pg_type: String,
     },
+    DatabaseTime {
+        function: CommandDatabaseTime,
+        pg_type: String,
+    },
+}
+
+/// Closed database-clock functions available to commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandDatabaseTime {
+    Now,
 }
 
 /// A Rule expression lowered from the immutable Rules catalog with closed SQL
@@ -669,6 +840,27 @@ pub enum CommandResultValue {
         value: Scalar,
         pg_type: String,
     },
+    Rule {
+        sql: String,
+        pg_type: String,
+    },
+    ProjectedRows {
+        cte: String,
+        many: bool,
+        columns: Vec<CommandResultProjection>,
+        maximum_items: u32,
+    },
+    Array {
+        value: Scalar,
+        maximum_items: u32,
+    },
+}
+
+/// One declared result-object field projected from a concrete step column.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandResultProjection {
+    pub name: String,
+    pub source: CommandColumn,
 }
 
 /// Inputs that are already resolved before SQLgen computes an idempotency
@@ -676,7 +868,7 @@ pub enum CommandResultValue {
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandIdempotency {
     pub key: Scalar,
-    pub scope: Vec<Scalar>,
+    pub scope: Vec<CommandExecutionValue>,
     pub input: Scalar,
     pub retention_seconds: Option<u64>,
     pub error_path: String,

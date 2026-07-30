@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use crate::types::access_result_type;
 use crate::{
-    BinaryOp, CompiledRule, Expr, ExprKind, Function, Literal, LoweredRuleValue, RuleError,
-    RuleType, UnaryOp,
+    BinaryOp, CompiledDecisionTable, CompiledRule, Expr, ExprKind, Function, HitPolicy, Literal,
+    LoweredRuleValue, RuleArtifact, RuleError, RuleType, UnaryOp,
 };
 
 /// A closed SQL context for one compiled rule. Values are either safe literals
@@ -56,6 +56,42 @@ impl SqlBinding {
 pub struct SqlExpression {
     sql: String,
     type_: RuleType,
+}
+
+/// The two executable decision-selection policies after Rules has lowered a
+/// compiled table. SQLgen consumes this closed value and never observes raw
+/// decision metadata, conditions, or the private checked expression tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresDecisionHitPolicy {
+    First,
+    Unique,
+}
+
+/// A Rules-owned, already-lowered decision program safe to place in command
+/// IR. Row declaration order is retained for `first` policy selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDecisionProgram {
+    pub name: String,
+    pub revision: String,
+    pub hit_policy: PostgresDecisionHitPolicy,
+    pub rows: Vec<PostgresDecisionRow>,
+}
+
+/// One private compiled decision row after lowering. The public form contains
+/// only its stable identifier, a typed boolean SQL expression, and typed SQL
+/// literals for its declared business outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDecisionRow {
+    pub id: String,
+    pub condition_sql: String,
+    pub output: BTreeMap<String, PostgresDecisionOutput>,
+}
+
+/// One typed output literal lowered entirely inside Rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDecisionOutput {
+    pub sql: String,
+    pub type_: RuleType,
 }
 
 impl SqlExpression {
@@ -208,6 +244,126 @@ pub fn lower_postgres(rule: &CompiledRule, bindings: &SqlBindings) -> Result<Str
         });
     }
     Ok(expression.into_sql())
+}
+
+/// Lower a compiled decision table to a closed Postgres row program.
+///
+/// The compiled rows, checked conditions, hit policy, and source output JSON
+/// remain private to `donat-rules`. Callers provide only typed bindings
+/// constructed through [`SqlExpression`], and receive SQL that is already
+/// escaped and type-checked for placement in source-local command IR.
+pub fn lower_postgres_decision(
+    table: &CompiledDecisionTable,
+    bindings: &SqlBindings,
+) -> Result<PostgresDecisionProgram, RuleError> {
+    let first_condition = table
+        .rows
+        .first()
+        .and_then(|row| row.conditions.values().next())
+        .ok_or_else(|| RuleError::InternalInvariant {
+            rule: table.name.clone(),
+        })?;
+    let binding_rule = decision_condition_rule(table, first_condition.clone());
+    for name in bindings.names() {
+        if !table.inputs.contains_key(name) {
+            return Err(RuleError::UnexpectedBinding { name: name.clone() });
+        }
+    }
+    for name in table.inputs.keys() {
+        if bindings.get(name).is_none() {
+            return Err(RuleError::MissingBinding { name: name.clone() });
+        }
+        // Validate even a binding referenced only by a literal `true`
+        // condition. This keeps the public lowering boundary exactly typed.
+        lower_binding(&binding_rule, bindings, name)?;
+    }
+
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            let conditions = row
+                .conditions
+                .values()
+                .map(|condition| {
+                    let rule = decision_condition_rule(table, condition.clone());
+                    lower_postgres(&rule, bindings)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let condition_sql = if conditions.is_empty() {
+                "TRUE".to_owned()
+            } else {
+                conditions
+                    .into_iter()
+                    .map(|condition| format!("({condition}) IS TRUE"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            };
+            let object = row
+                .output
+                .as_object()
+                .ok_or_else(|| RuleError::InternalInvariant {
+                    rule: table.name.clone(),
+                })?;
+            let output = table
+                .output
+                .iter()
+                .map(|(name, type_)| {
+                    let value = object
+                        .get(name)
+                        .ok_or_else(|| RuleError::InternalInvariant {
+                            rule: table.name.clone(),
+                        })?;
+                    Ok((
+                        name.clone(),
+                        PostgresDecisionOutput {
+                            sql: lower_value_literal(&table.name, name, type_, value)?,
+                            type_: type_.clone(),
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, RuleError>>()?;
+            Ok(PostgresDecisionRow {
+                id: row.id.clone(),
+                condition_sql,
+                output,
+            })
+        })
+        .collect::<Result<Vec<_>, RuleError>>()?;
+    let hit_policy = match table.hit_policy {
+        HitPolicy::First => PostgresDecisionHitPolicy::First,
+        HitPolicy::Unique => PostgresDecisionHitPolicy::Unique,
+        HitPolicy::Unsupported(_) => {
+            return Err(RuleError::InternalInvariant {
+                rule: table.name.clone(),
+            });
+        }
+    };
+    Ok(PostgresDecisionProgram {
+        name: table.name.clone(),
+        revision: table.revision.0.clone(),
+        hit_policy,
+        rows,
+    })
+}
+
+fn decision_condition_rule(
+    table: &CompiledDecisionTable,
+    expression: crate::types::CheckedExpr,
+) -> CompiledRule {
+    CompiledRule {
+        name: table.name.clone(),
+        bindings: table.inputs.clone(),
+        result: RuleType::Bool,
+        artifact: RuleArtifact {
+            profile_version: crate::PROFILE_VERSION,
+            original_source: String::new(),
+            canonical_ast_sha256: table.revision.0.clone(),
+            source_sha256: String::new(),
+        },
+        expression,
+        declared_types: table.declared_types.clone(),
+    }
 }
 
 struct LoweredExpression {

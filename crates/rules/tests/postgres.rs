@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use donat_rules::{
-    RuleDefinition, RuleError, RuleType, SqlBinding, SqlBindings, SqlExpression, compile_catalog,
+    DecisionRow, DecisionTableDefinition, HitPolicy, PostgresDecisionHitPolicy, RuleDefinition,
+    RuleError, RuleType, SqlBinding, SqlBindings, SqlExpression, compile_catalog,
     compile_catalog_with_declared_types, evaluate_bool, evaluate_value, lower_postgres,
-    lower_postgres_value,
+    lower_postgres_decision, lower_postgres_value,
 };
 use postgres::{Client, NoTls, error::SqlState};
 use serde_json::{Value, json};
@@ -64,6 +65,129 @@ fn has_raw_boolean_operator(sql: &str) -> bool {
     // profile boolean lowering, by contrast, would retain this parenthesized
     // binary shape instead of the required `CASE` expression.
     sql.contains(") AND (") || sql.contains(") OR (")
+}
+
+#[test]
+fn decision_lowerer_keeps_rows_private_and_emits_a_closed_first_hit_program() {
+    let catalog = compile_catalog(
+        &[],
+        &[DecisionTableDefinition {
+            name: "shipping_route".to_owned(),
+            revision: "shipping-v1".to_owned(),
+            inputs: map([("amount", RuleType::Int), ("region", RuleType::String)]),
+            output: map([("rank", RuleType::Int), ("route", RuleType::String)]),
+            hit_policy: HitPolicy::First,
+            rows: vec![
+                DecisionRow {
+                    id: "priority".to_owned(),
+                    description: None,
+                    when: map([
+                        ("amount", "amount > 100".to_owned()),
+                        ("region", "region == 'west'".to_owned()),
+                    ]),
+                    output: json!({"rank": 1, "route": "priority"}),
+                },
+                DecisionRow {
+                    id: "default".to_owned(),
+                    description: None,
+                    when: map([("amount", "true".to_owned()), ("region", "true".to_owned())]),
+                    output: json!({"rank": 2, "route": "standard"}),
+                },
+            ],
+            test_cases: vec![],
+        }],
+    )
+    .expect("the decision fixture compiles");
+    let table = catalog
+        .decision_table("shipping_route")
+        .expect("the compiled decision exists");
+    let lowered = lower_postgres_decision(
+        table,
+        &SqlBindings::new([
+            (
+                "amount".to_owned(),
+                SqlBinding::expression(SqlExpression::column(
+                    "_cmd_input",
+                    "amount",
+                    RuleType::Int,
+                )),
+            ),
+            (
+                "region".to_owned(),
+                SqlBinding::expression(SqlExpression::column(
+                    "_cmd_input",
+                    "region",
+                    RuleType::String,
+                )),
+            ),
+        ]),
+    )
+    .expect("a compiled decision lowers without exposing its private AST");
+
+    assert_eq!(lowered.name, "shipping_route");
+    assert_eq!(lowered.revision, table.revision.0);
+    assert_eq!(lowered.hit_policy, PostgresDecisionHitPolicy::First);
+    assert_eq!(
+        lowered
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["priority", "default"]
+    );
+    assert!(
+        lowered.rows[0]
+            .condition_sql
+            .contains("\"_cmd_input\".\"amount\""),
+        "decision input identifiers must be escaped inside Rules: {}",
+        lowered.rows[0].condition_sql
+    );
+    assert_eq!(lowered.rows[0].output["rank"].type_, RuleType::Int);
+    assert!(lowered.rows[0].output["rank"].sql.contains("1"));
+    assert_eq!(lowered.rows[0].output["route"].type_, RuleType::String);
+    assert!(lowered.rows[0].output["route"].sql.contains("priority"));
+}
+
+#[test]
+fn decision_lowerer_retains_unique_policy_and_rejects_incomplete_bindings() {
+    let catalog = compile_catalog(
+        &[],
+        &[DecisionTableDefinition {
+            name: "unique_route".to_owned(),
+            revision: "unique-v1".to_owned(),
+            inputs: map([("amount", RuleType::Int)]),
+            output: map([("route", RuleType::String)]),
+            hit_policy: HitPolicy::Unique,
+            rows: vec![DecisionRow {
+                id: "only".to_owned(),
+                description: None,
+                when: map([("amount", "amount > 0".to_owned())]),
+                output: json!({"route": "accepted"}),
+            }],
+            test_cases: vec![],
+        }],
+    )
+    .expect("the unique decision fixture compiles");
+    let table = catalog
+        .decision_table("unique_route")
+        .expect("the compiled decision exists");
+
+    let missing = lower_postgres_decision(table, &SqlBindings::default())
+        .expect_err("every typed decision input must have a closed SQL binding");
+    assert!(matches!(
+        missing,
+        RuleError::MissingBinding { ref name } if name == "amount"
+    ));
+
+    let lowered = lower_postgres_decision(
+        table,
+        &SqlBindings::new([(
+            "amount".to_owned(),
+            SqlBinding::expression(SqlExpression::column("_cmd_input", "amount", RuleType::Int)),
+        )]),
+    )
+    .expect("the complete unique decision binding lowers");
+    assert_eq!(lowered.hit_policy, PostgresDecisionHitPolicy::Unique);
 }
 
 #[test]
