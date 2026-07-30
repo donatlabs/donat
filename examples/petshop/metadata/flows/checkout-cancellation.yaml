@@ -1,0 +1,204 @@
+name: checkout_cancellation
+kind: process
+version: 1
+source: default
+permissions:
+  - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: bigint!
+  capture: { input: owner_user_id }
+start:
+  command: cancel_order
+  input:
+    order_id: { command_result: order_id }
+    owner_user_id: { command_result: owner_user_id }
+    payment_id: { command_result: payment_id }
+    authorization_activity_key: { command_result: authorization_activity_key }
+    reason: { command_result: reason }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: order_id }
+input:
+  - { name: order_id, type: uuid! }
+  - { name: owner_user_id, type: bigint! }
+  - { name: payment_id, type: uuid! }
+  - { name: authorization_activity_key, type: string! }
+  - { name: reason, type: string! }
+output:
+  - { name: order_id, type: uuid! }
+  - { name: status, type: CheckoutState! }
+start_at: reconcile_authorization
+states:
+  # The cancellation claim already prevents authorize_payment from committing.
+  # This read-only lookup proves whether the earlier provider request committed.
+  - id: reconcile_authorization
+    request:
+      connector: mock_payment
+      operation: lookup_operation
+      input:
+        payment_id: { input: payment_id }
+        resource_kind: { literal: authorization }
+        resource_id: { input: order_id }
+        activity_key: { input: authorization_activity_key }
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: route_authorization_lookup
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: authorization_outcome_ambiguous }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: authorization_outcome_ambiguous }
+        fallback: { next: authorization_outcome_ambiguous }
+
+  - id: route_authorization_lookup
+    when:
+      cases:
+        - matches: { found: true, outcome: authorized }
+          next: materialize_void_claim
+        - matches: { found: false, terminal_absence_proven: true }
+          next: finalize_absent_authorization
+      default: authorization_outcome_ambiguous
+
+  - id: materialize_void_claim
+    command:
+      name: materialize_cancellation_authorization
+      run_as: payment_worker
+      arguments:
+        order_id: { input: order_id }
+        payment_id: { input: payment_id }
+        provider_authorization_id: { state: reconcile_authorization, field: provider_mutation_id }
+        provider_event_id: { state: reconcile_authorization, field: provider_event_id }
+        amount_minor: { state: reconcile_authorization, field: amount_minor }
+        provider_reference: { state: reconcile_authorization, field: provider_reference }
+        payload: { state: reconcile_authorization, field: normalized_payload }
+      next: request_void
+
+  - id: request_void
+    request:
+      connector: mock_payment
+      operation: void
+      input:
+        payment_id: { input: payment_id }
+        authorization_id: { state: materialize_void_claim, field: authorization_id }
+        reason: { input: reason }
+      idempotency_key:
+        stable: { run: id, state: request_void }
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: route_void_response
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: reconcile_void }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_void }
+        fallback: { next: reconcile_void }
+
+  - id: route_void_response
+    when:
+      cases:
+        - matches: { status: voided }
+          next: record_void
+      default: authorization_outcome_ambiguous
+
+  - id: reconcile_void
+    request:
+      connector: mock_payment
+      operation: lookup_operation
+      input:
+        payment_id: { input: payment_id }
+        resource_kind: { literal: void }
+        resource_id: { state: materialize_void_claim, field: authorization_id }
+        activity_key: { activity_key: request_void }
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: route_reconciled_void
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: authorization_outcome_ambiguous }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: authorization_outcome_ambiguous }
+        fallback: { next: authorization_outcome_ambiguous }
+
+  - id: route_reconciled_void
+    when:
+      cases:
+        - matches: { found: true, outcome: voided }
+          next: record_reconciled_void
+      default: authorization_outcome_ambiguous
+
+  - id: record_void
+    command:
+      name: void_authorization
+      run_as: payment_worker
+      arguments:
+        payment_id: { input: payment_id }
+        authorization_id: { state: materialize_void_claim, field: authorization_id }
+        provider_void_id: { state: request_void, field: provider_void_id }
+        provider_event_id: { state: request_void, field: provider_event_id }
+        payload: { state: request_void, field: normalized_payload }
+      next: finalize_voided_authorization
+
+  - id: record_reconciled_void
+    command:
+      name: void_authorization
+      run_as: payment_worker
+      arguments:
+        payment_id: { input: payment_id }
+        authorization_id: { state: materialize_void_claim, field: authorization_id }
+        provider_void_id: { state: reconcile_void, field: provider_mutation_id }
+        provider_event_id: { state: reconcile_void, field: provider_event_id }
+        payload: { state: reconcile_void, field: normalized_payload }
+      next: finalize_voided_authorization
+
+  - id: finalize_voided_authorization
+    command:
+      name: finalize_authorized_order_cancellation
+      run_as: payment_worker
+      arguments:
+        order_id: { input: order_id }
+        request_id: { activity_key: finalize_voided_authorization }
+      next: cancelled_after_void
+
+  - id: finalize_absent_authorization
+    command:
+      name: finalize_pending_order_cancellation
+      run_as: payment_worker
+      arguments:
+        order_id: { input: order_id }
+        request_id: { activity_key: finalize_absent_authorization }
+      next: cancelled_without_authorization
+
+  - id: cancelled_after_void
+    output:
+      values:
+        order_id: { state: finalize_voided_authorization, field: order_id }
+        status: { state: finalize_voided_authorization, field: order_status }
+
+  - id: cancelled_without_authorization
+    output:
+      values:
+        order_id: { state: finalize_absent_authorization, field: order_id }
+        status: { state: finalize_absent_authorization, field: order_status }
+
+  - id: authorization_outcome_ambiguous
+    fail:
+      code: authorization_requires_reconciliation
+      message: Authorization absence is not proven; cancellation remains claimed and inventory stays reserved

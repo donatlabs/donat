@@ -34,6 +34,9 @@ operations:
             scope: petshop-mock-notification-email-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 5000
       maximum_calls: 1
@@ -93,6 +96,9 @@ operations:
             scope: petshop-mock-notification-webhook-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 5000
       maximum_calls: 1

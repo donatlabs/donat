@@ -1,12 +1,10 @@
-name: finalize_finance_rejection
+name: open_approver_review
 source: default
 permissions:
   - role: b2b_finance
 arguments:
   - name: approval_id
     type: uuid!
-  - name: reason
-    type: string!
   - name: request_id
     type: uuid!
 steps:
@@ -15,32 +13,29 @@ steps:
       table: public.purchase_approval
       by:
         id: { arg: approval_id }
-        status: { literal: awaiting_finance }
+        status: { literal: submitted }
       returning: [id, quote_id, status]
       require_found: true
-  - name: rejection_is_allowed
+  - name: review_is_allowed
     assert:
       rule: can_transition_approval
       with:
         current: { step: approval, column: status }
-        next: { literal: rejected }
-  - name: reject
+        next: { literal: awaiting_approver }
+  - name: open_review
     update:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: awaiting_finance }
+        status: { literal: submitted }
       set:
-        status: { literal: rejected }
-        rejected_by_role: { literal: b2b_finance }
-        rejection_reason: { arg: reason }
-      returning: [id, quote_id, status, rejection_reason]
+        status: { literal: awaiting_approver }
+      returning: [id, quote_id, status]
       require_affected: true
 result:
-  approval_id: { step: reject, column: id }
-  quote_id: { step: reject, column: quote_id }
-  approval_status: { step: reject, column: status }
-  rejection_reason: { step: reject, column: rejection_reason }
+  approval_id: { step: open_review, column: id }
+  quote_id: { step: open_review, column: quote_id }
+  approval_status: { step: open_review, column: status }
 idempotency:
   key: { argument: request_id }
   scope:

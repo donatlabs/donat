@@ -32,23 +32,28 @@ steps:
       by:
         id: { arg: authorization_id }
         payment_id: { step: payment, column: id }
-      returning: [id, payment_id, authorized_minor, captured_minor, status]
-  - name: authorization_row
-    select_many:
-      table: public.payment_authorization
+      returning: [id, payment_id, authorized_minor, captured_minor, capture_reserved_minor, status]
+  - name: capture_claim
+    select_one:
+      table: public.payment_capture_claim
       by:
-        id: { arg: authorization_id }
         payment_id: { step: payment, column: id }
-      order_by: [id]
-      returning: [id]
-      require_non_empty: true
+        authorization_id: { step: authorization, column: id }
+        shipment_id: { arg: shipment_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: reserved }
+      returning:
+        [id, payment_id, authorization_id, shipment_id, amount_minor,
+         currency, status]
+      require_found: true
   - name: capture_is_bounded
     assert:
-      rule: can_capture_payment_amount
+      rule: can_complete_claimed_capture
       with:
         authorization_state: { step: authorization, column: status }
         authorized_minor: { step: authorization, column: authorized_minor }
         captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
         requested_amount_minor: { arg: amount_minor }
   - name: provider_capture_succeeded
     assert:
@@ -76,19 +81,38 @@ steps:
         status: { literal: captured }
       returning: [id, payment_id, authorization_id, amount_minor, status]
   - name: add_captured_amount
-    update_many:
+    update:
       table: public.payment_authorization
-      for_each: { step: authorization_row }
-      by:
-        id: { item: id }
+      where:
+        id: { step: authorization, column: id }
+        status: { literal: authorized }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
       set:
         captured_minor:
           rule: add_minor
           with:
-            left: { current_column: captured_minor }
-            right: { arg: amount_minor }
-      returning: [id, captured_minor]
-      require_each: true
+            left: { step: authorization, column: captured_minor }
+            right: { step: capture_claim, column: amount_minor }
+        capture_reserved_minor:
+          rule: subtract_minor
+          with:
+            left: { step: authorization, column: capture_reserved_minor }
+            right: { step: capture_claim, column: amount_minor }
+      returning: [id, captured_minor, capture_reserved_minor]
+      require_affected: true
+  - name: complete_capture_claim
+    update:
+      table: public.payment_capture_claim
+      where:
+        id: { step: capture_claim, column: id }
+        status: { literal: reserved }
+      set:
+        status: { literal: captured }
+        provider_capture_id: { arg: provider_capture_id }
+      returning:
+        [id, shipment_id, amount_minor, status, provider_capture_id]
+      require_affected: true
   - name: mark_captured
     update:
       table: public.payment

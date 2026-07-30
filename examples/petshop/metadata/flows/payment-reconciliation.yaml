@@ -43,13 +43,21 @@ states:
         provider_reference: { input: expected_provider_reference }
       idempotency_key:
         stable: { run: id, state: request_reconciliation }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_reconciliation
-      on_error: provider_unavailable
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: provider_unavailable }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: provider_unavailable }
+        fallback: { next: provider_unavailable }
 
   - id: route_reconciliation
     when:

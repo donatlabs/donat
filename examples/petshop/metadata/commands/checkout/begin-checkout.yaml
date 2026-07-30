@@ -17,6 +17,8 @@ arguments:
     type: string!
   - name: request_id
     type: uuid!
+  - name: authorization_activity_key
+    type: string!
 steps:
   - name: quote
     select_one:
@@ -171,7 +173,8 @@ steps:
         status: { literal: pending }
         amount_minor: { step: order, column: total_minor }
         currency: { step: order, column: currency }
-      returning: [id, order_id, status, amount_minor, currency]
+        authorization_activity_key: { arg: authorization_activity_key }
+      returning: [id, order_id, status, amount_minor, currency, authorization_activity_key]
   - name: close_cart
     update:
       table: public.cart
@@ -199,6 +202,7 @@ steps:
 result:
   order_id: { step: order, column: id }
   payment_id: { step: payment, column: id }
+  authorization_activity_key: { step: payment, column: authorization_activity_key }
   total_minor: { step: order, column: total_minor }
   currency: { step: order, column: currency }
   pricing_snapshot: { step: order_adjustments }

@@ -14,7 +14,7 @@ types:
   - name: CheckoutState
     enum: [cart_open, checkout_started, authorized, cancellation_requested, cancelled, expired]
   - name: PaymentState
-    enum: [pending, authorized, captured, voided, refunded, failed, chargeback]
+    enum: [pending, cancellation_requested, authorized, void_in_progress, captured, voided, refunded, failed, chargeback]
   - name: ShipmentState
     enum: [unallocated, allocated, packed, shipped, delivered, cancelled]
   - name: ReturnState
@@ -22,9 +22,15 @@ types:
   - name: SubscriptionState
     enum: [active, payment_due, paused, cancelled]
   - name: ApprovalState
-    enum: [submitted, approved, rejected, escalated]
+    enum: [submitted, awaiting_approver, awaiting_finance, approved, rejected]
   - name: PayoutState
     enum: [pending, paid, failed, reconciled]
+  - name: ProviderPayoutOutcome
+    enum: [paid, failed]
+  - name: ProviderLookupResolution
+    enum: [mutation_found, terminal_absence]
+  - name: CarrierLabelTerminalOutcome
+    enum: [label_created, label_not_created]
   - name: RenewalState
     enum: [payment_due, dunning, confirmed]
   - name: BookingState
@@ -115,6 +121,25 @@ types:
       amount_minor: bigint!
       status: PaymentState!
       requires_reconciliation: bool!
+  - name: PaymentCaptureClaimInput
+    object:
+      shipment_id: uuid!
+      amount_minor: bigint!
+      currency: string!
+  - name: CaptureLookupCaptured
+    object:
+      shipment_id: uuid!
+      provider_capture_id: string!
+      provider_event_id: string!
+      amount_minor: bigint!
+      outcome: PaymentOutcome!
+      normalized_payload: BoundedProviderEvidence!
+  - name: CaptureLookupAbsence
+    object:
+      shipment_id: uuid!
+      provider_absence_id: string!
+      amount_minor: bigint!
+      normalized_payload: BoundedProviderEvidence!
   - name: ItemFailure
     object:
       item_key: string!
@@ -189,6 +214,10 @@ rules:
     parameters: { outcome: PaymentOutcome! }
     result: bool!
     expression: "outcome == PaymentOutcome::authorized"
+  - name: payment_was_declined
+    parameters: { outcome: PaymentOutcome! }
+    result: bool!
+    expression: "outcome == PaymentOutcome::declined || outcome == PaymentOutcome::failed"
   - name: payment_outcome_is
     parameters: { actual: PaymentOutcome!, expected: PaymentOutcome! }
     result: bool!
@@ -205,10 +234,30 @@ rules:
     parameters: { authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint!, requested_amount_minor: bigint! }
     result: bool!
     expression: "authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && requested_amount_minor > 0 && captured_minor + requested_amount_minor <= authorized_minor"
-  - name: can_void_authorization
-    parameters: { payment_state: PaymentState!, authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint! }
+  - name: can_reserve_capture_amount
+    parameters: { authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint!, requested_amount_minor: bigint! }
     result: bool!
-    expression: "payment_state == PaymentState::authorized && authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && captured_minor < authorized_minor"
+    expression: "authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && capture_reserved_minor >= 0 && requested_amount_minor >= 0 && captured_minor + capture_reserved_minor + requested_amount_minor <= authorized_minor"
+  - name: can_complete_claimed_capture
+    parameters: { authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor >= 0 && capture_reserved_minor >= requested_amount_minor && requested_amount_minor > 0 && captured_minor + requested_amount_minor <= authorized_minor"
+  - name: can_release_capture_claim
+    parameters: { authorization_state: PaymentState!, capture_reserved_minor: bigint!, claim_amount_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == PaymentState::authorized && claim_amount_minor > 0 && requested_amount_minor == claim_amount_minor && capture_reserved_minor >= claim_amount_minor"
+  - name: can_void_authorization
+    parameters: { payment_state: PaymentState!, authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint! }
+    result: bool!
+    expression: "payment_state == PaymentState::void_in_progress && authorization_state == PaymentState::void_in_progress && authorized_minor > 0 && captured_minor == 0 && capture_reserved_minor == 0"
+  - name: can_claim_authorization_void
+    parameters: { payment_state: PaymentState!, authorization_state: PaymentState!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint! }
+    result: bool!
+    expression: "payment_state == PaymentState::authorized && authorization_state == PaymentState::authorized && authorized_minor > 0 && captured_minor == 0 && capture_reserved_minor == 0"
+  - name: can_materialize_cancellation_authorization
+    parameters: { payment_state: PaymentState!, payment_amount_minor: bigint!, provider_amount_minor: bigint! }
+    result: bool!
+    expression: "payment_state == PaymentState::cancellation_requested && payment_amount_minor > 0 && payment_amount_minor == provider_amount_minor"
   - name: can_refund_payment_amount
     parameters: { payment_state: PaymentState!, captured_minor: bigint!, refunded_minor: bigint!, requested_amount_minor: bigint! }
     result: bool!
@@ -224,11 +273,11 @@ rules:
   - name: can_transition_checkout
     parameters: { current: CheckoutState!, next: CheckoutState! }
     result: bool!
-    expression: "(current == CheckoutState::cart_open && next == CheckoutState::checkout_started) || (current == CheckoutState::checkout_started && (next == CheckoutState::authorized || next == CheckoutState::cancelled || next == CheckoutState::expired)) || (current == CheckoutState::authorized && next == CheckoutState::cancellation_requested) || (current == CheckoutState::cancellation_requested && next == CheckoutState::cancelled)"
+    expression: "(current == CheckoutState::cart_open && next == CheckoutState::checkout_started) || (current == CheckoutState::checkout_started && (next == CheckoutState::authorized || next == CheckoutState::cancellation_requested || next == CheckoutState::expired)) || (current == CheckoutState::authorized && next == CheckoutState::cancellation_requested) || (current == CheckoutState::cancellation_requested && next == CheckoutState::cancelled)"
   - name: can_transition_payment
     parameters: { current: PaymentState!, next: PaymentState! }
     result: bool!
-    expression: "(current == PaymentState::pending && (next == PaymentState::authorized || next == PaymentState::failed)) || (current == PaymentState::authorized && (next == PaymentState::captured || next == PaymentState::voided || next == PaymentState::failed)) || (current == PaymentState::captured && (next == PaymentState::refunded || next == PaymentState::chargeback))"
+    expression: "(current == PaymentState::pending && (next == PaymentState::cancellation_requested || next == PaymentState::authorized || next == PaymentState::failed)) || (current == PaymentState::cancellation_requested && (next == PaymentState::void_in_progress || next == PaymentState::failed)) || (current == PaymentState::authorized && (next == PaymentState::void_in_progress || next == PaymentState::captured || next == PaymentState::failed)) || (current == PaymentState::void_in_progress && next == PaymentState::voided) || (current == PaymentState::captured && (next == PaymentState::refunded || next == PaymentState::chargeback))"
   - name: can_transition_shipment
     parameters: { current: ShipmentState!, next: ShipmentState! }
     result: bool!
@@ -284,7 +333,7 @@ rules:
   - name: can_transition_approval
     parameters: { current: ApprovalState!, next: ApprovalState! }
     result: bool!
-    expression: "(current == ApprovalState::submitted && (next == ApprovalState::approved || next == ApprovalState::rejected || next == ApprovalState::escalated)) || (current == ApprovalState::escalated && (next == ApprovalState::approved || next == ApprovalState::rejected))"
+    expression: "(current == ApprovalState::submitted && (next == ApprovalState::awaiting_approver || next == ApprovalState::approved || next == ApprovalState::rejected)) || (current == ApprovalState::awaiting_approver && (next == ApprovalState::awaiting_finance || next == ApprovalState::approved || next == ApprovalState::rejected)) || (current == ApprovalState::awaiting_finance && (next == ApprovalState::approved || next == ApprovalState::rejected))"
   - name: approval_was_approved
     parameters: { decision: ApprovalDecision! }
     result: bool!
@@ -302,9 +351,13 @@ rules:
     result: bool!
     expression: "(current == PayoutState::pending && (next == PayoutState::paid || next == PayoutState::failed)) || (current == PayoutState::failed && next == PayoutState::reconciled)"
   - name: can_record_provider_payout_outcome
-    parameters: { current: PayoutState!, next: PayoutState! }
+    parameters: { current: PayoutState!, next: ProviderPayoutOutcome! }
     result: bool!
-    expression: "current == PayoutState::pending && (next == PayoutState::paid || next == PayoutState::failed)"
+    expression: "current == PayoutState::pending && (next == ProviderPayoutOutcome::paid || next == ProviderPayoutOutcome::failed)"
+  - name: payout_state_for_provider_outcome
+    parameters: { outcome: ProviderPayoutOutcome! }
+    result: PayoutState!
+    expression: "outcome == ProviderPayoutOutcome::paid ? PayoutState::paid : PayoutState::failed"
   - name: renewal_state_for_outcome
     parameters: { outcome: PaymentOutcome! }
     result: RenewalState!

@@ -1,0 +1,105 @@
+record_version: 1
+record_id: source.petshop.mock-providers.v1
+subject:
+  kind: provider_artifact
+  value:
+    provider: donat-owned-petshop-mock-providers
+    evidence:
+      - source:
+          kind: repository_file
+          value:
+            repository: https://github.com/donatlabs/donat
+            commit: 74045c5b247cb38d920e241c3772e3754a4247c2
+            path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+        accessed_on: 2026-07-30
+        content_sha256: 70d5f0db878760c038b9678e159f9f4b642d7f001329cd793335f36150c3f4d7
+        terms:
+          kind: reviewed_use
+          value:
+            decision_id: review.petshop.mock-providers.v1
+            evidence_url: https://github.com/donatlabs/donat
+        facts:
+          - fact_id: fact.mock-providers.fixed-idempotency-header
+            location:
+              kind: json_pointer
+              value:
+                path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+                pointer: /idempotency/fixed_binding
+            normalized_value: { kind: string, value: Idempotency-Key }
+          - fact_id: fact.mock-providers.operation-scoped-key
+            location:
+              kind: json_pointer
+              value:
+                path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+                pointer: /idempotency/scope
+            normalized_value: { kind: string, value: one-stable-key-per-operation-resource }
+          - fact_id: fact.mock-providers.retention-604800000
+            location:
+              kind: json_pointer
+              value:
+                path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+                pointer: /idempotency/minimum_retention_ms
+            normalized_value: { kind: u64, value: '604800000' }
+          - fact_id: fact.mock-providers.clock-margin-300000
+            location:
+              kind: json_pointer
+              value:
+                path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+                pointer: /idempotency/clock_safety_margin_ms
+            normalized_value: { kind: u64, value: '300000' }
+          - fact_id: fact.mock-providers.maximum-execution-horizon-120000
+            location:
+              kind: json_pointer
+              value:
+                path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+                pointer: /idempotency/maximum_execution_horizon_ms
+            normalized_value: { kind: u64, value: '120000' }
+reacquisition:
+  kind: provider_repository_review
+  value: null
+artifact_hashes:
+  - artifact_id: artifact.petshop.mock-provider-contract.v1
+    algorithm: { kind: sha256, value: null }
+    digest: 70d5f0db878760c038b9678e159f9f4b642d7f001329cd793335f36150c3f4d7
+    path: examples/petshop/provider-evidence/mock-provider-contract-v1.json
+license:
+  kind: permissive
+  value:
+    spdx_id: Apache-2.0
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+notice:
+  id: notice.petshop.mock-providers
+  license_file_path: LICENSE
+  license_file_sha256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+  required_copyright_lines: []
+  notice_bundle_destination: THIRD_PARTY_NOTICES.md
+entrypoints: [examples/petshop/provider-evidence/mock-provider-contract-v1.json]
+dependencies: []
+embedded_material: []
+provider_contracts:
+  - contract_id: contract.petshop.mock-provider-idempotency.v1
+    facts:
+      - kind: provider_evidence
+        value: { source_record_id: source.petshop.mock-providers.v1, fact_id: fact.mock-providers.fixed-idempotency-header }
+      - kind: provider_evidence
+        value: { source_record_id: source.petshop.mock-providers.v1, fact_id: fact.mock-providers.operation-scoped-key }
+      - kind: provider_evidence
+        value: { source_record_id: source.petshop.mock-providers.v1, fact_id: fact.mock-providers.retention-604800000 }
+      - kind: provider_evidence
+        value: { source_record_id: source.petshop.mock-providers.v1, fact_id: fact.mock-providers.clock-margin-300000 }
+      - kind: provider_evidence
+        value: { source_record_id: source.petshop.mock-providers.v1, fact_id: fact.mock-providers.maximum-execution-horizon-120000 }
+compatibility: { kind: tier_a, value: null }
+admission:
+  kind: evidence_accepted
+  value:
+    contracts: [contract.petshop.mock-provider-idempotency.v1]
+safety_findings:
+  findings: []
+reviewer: reviewer.petshop.mock-providers
+approval_date: 2026-07-30
+proposed_manifest: null
+proposed_destinations: [examples/petshop/provider-evidence/mock-providers-v1.yaml]
+red_tests: [petshop_mock_provider_evidence_is_exact]

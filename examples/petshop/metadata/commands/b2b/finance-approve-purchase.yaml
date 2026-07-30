@@ -13,6 +13,7 @@ steps:
       table: public.purchase_approval
       by:
         id: { arg: approval_id }
+        status: { literal: awaiting_finance }
       returning: [id, quote_id, status]
       require_found: true
   - name: quote
@@ -75,7 +76,7 @@ steps:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: escalated }
+        status: { literal: awaiting_finance }
       set:
         status: { literal: approved }
         approved_by_user_id: { session_variable: x-donat-user-id }

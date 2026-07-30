@@ -26,7 +26,7 @@ steps:
       by:
         id: { arg: authorization_id }
         payment_id: { step: payment, column: id }
-      returning: [id, authorized_minor, captured_minor, status]
+      returning: [id, authorized_minor, captured_minor, capture_reserved_minor, status]
   - name: void_is_allowed
     assert:
       rule: can_void_authorization
@@ -35,6 +35,7 @@ steps:
         authorization_state: { step: authorization, column: status }
         authorized_minor: { step: authorization, column: authorized_minor }
         captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
   - name: payment_event
     insert:
       table: public.payment_event

@@ -15,6 +15,7 @@ steps:
       table: public.purchase_approval
       by:
         id: { arg: approval_id }
+        status: { literal: awaiting_approver }
       returning: [id, quote_id, status]
   - name: rejection_is_allowed
     assert:
@@ -27,7 +28,7 @@ steps:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: submitted }
+        status: { literal: awaiting_approver }
       set:
         status: { literal: rejected }
         rejected_by_user_id: { session_variable: x-donat-user-id }

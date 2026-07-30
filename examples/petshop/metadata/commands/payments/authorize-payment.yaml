@@ -24,6 +24,7 @@ steps:
       by:
         id: { arg: payment_id }
         order_id: { arg: order_id }
+        status: { literal: pending }
       returning: [id, order_id, status, amount_minor, currency]
   - name: authorization_is_allowed
     assert:
@@ -49,17 +50,20 @@ steps:
         provider_authorization_id: { arg: provider_authorization_id }
         authorized_minor: { arg: amount_minor }
         captured_minor: { literal: 0 }
+        capture_reserved_minor: { literal: 0 }
         status: { literal: authorized }
-      returning: [id, payment_id, authorized_minor, captured_minor, status]
+      returning: [id, payment_id, authorized_minor, captured_minor, capture_reserved_minor, status]
   - name: mark_authorized
     update:
       table: public.payment
       where:
         id: { step: payment, column: id }
+        status: { literal: pending }
       set:
         status: { literal: authorized }
         provider_reference: { arg: provider_reference }
       returning: [id, order_id, status, provider_reference]
+      require_affected: true
   - name: order
     select_one:
       table: public.orders

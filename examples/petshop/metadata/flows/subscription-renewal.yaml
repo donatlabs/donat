@@ -40,13 +40,21 @@ states:
         request_id: { activity_key: authorize_initial }
       idempotency_key:
         stable: { run: id, state: authorize_initial }
-      timeout: 2s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_initial_outcome
-      on_error: reconcile_initial
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: reconcile_initial }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_initial }
+        fallback: { next: reconcile_initial }
   - id: reconcile_initial
     request:
       connector: mock_payment
@@ -56,13 +64,21 @@ states:
         resource_kind: { literal: authorization }
         resource_id: { state: create_renewal_order, field: renewal_id }
         activity_key: { activity_key: authorize_initial }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_reconciled_initial
-      on_error: provider_outcome_ambiguous
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: provider_outcome_ambiguous }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: provider_outcome_ambiguous }
+        fallback: { next: provider_outcome_ambiguous }
   - id: route_reconciled_initial
     when:
       cases:
@@ -181,13 +197,21 @@ states:
         request_id: { activity_key: authorize_first_retry }
       idempotency_key:
         stable: { run: id, state: authorize_first_retry }
-      timeout: 2s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_first_retry
-      on_error: reconcile_first_retry
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: reconcile_first_retry }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_first_retry }
+        fallback: { next: reconcile_first_retry }
   - id: reconcile_first_retry
     request:
       connector: mock_payment
@@ -197,13 +221,21 @@ states:
         resource_kind: { literal: authorization }
         resource_id: { state: create_renewal_order, field: renewal_id }
         activity_key: { activity_key: authorize_first_retry }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_reconciled_first_retry
-      on_error: provider_outcome_ambiguous
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: provider_outcome_ambiguous }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: provider_outcome_ambiguous }
+        fallback: { next: provider_outcome_ambiguous }
   - id: route_first_retry
     when:
       cases:
@@ -322,13 +354,21 @@ states:
         request_id: { activity_key: authorize_second_retry }
       idempotency_key:
         stable: { run: id, state: authorize_second_retry }
-      timeout: 2s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_second_retry
-      on_error: reconcile_second_retry
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: reconcile_second_retry }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_second_retry }
+        fallback: { next: reconcile_second_retry }
   - id: reconcile_second_retry
     request:
       connector: mock_payment
@@ -338,13 +378,21 @@ states:
         resource_kind: { literal: authorization }
         resource_id: { state: create_renewal_order, field: renewal_id }
         activity_key: { activity_key: authorize_second_retry }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_reconciled_second_retry
-      on_error: provider_outcome_ambiguous
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: provider_outcome_ambiguous }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: provider_outcome_ambiguous }
+        fallback: { next: provider_outcome_ambiguous }
   - id: route_second_retry
     when:
       cases:

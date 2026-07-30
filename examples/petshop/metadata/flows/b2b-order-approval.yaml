@@ -60,8 +60,8 @@ states:
         - matches:
             decision: escalated
             route: finance_review
-          next: await_approver
-      default: escalate_unroutable_quote
+          next: open_approver_review
+      default: reject_unroutable_quote
 
   - id: consume_automatic_credit
     command:
@@ -72,12 +72,23 @@ states:
         request_id: { run: id }
       next: automatically_approved
 
+  # Process command DML and the next-state transition commit in one transaction.
+  # The awaiting_approver row value therefore becomes visible only when this
+  # instance is already receptive at await_approver.
+  - id: open_approver_review
+    command:
+      name: open_approver_review
+      run_as: b2b_finance
+      arguments:
+        approval_id: { input: approval_id }
+        request_id: { activity_key: open_approver_review }
+      next: await_approver
+
   - id: await_approver
     wait:
       signal: approver_decision
       role: b2b_approver
       verification: required
-      persist_before_match: true
       correlate:
         approval_id: { input: approval_id }
       deadline: 2d
@@ -95,17 +106,9 @@ states:
           with:
             decision: { state: await_approver, field: decision }
           next: manually_rejected
-      default: escalate_unroutable_quote
+      default: escalate_for_finance
 
-  - id: escalate_unroutable_quote
-    command:
-      name: escalate_purchase_approval
-      run_as: b2b_finance
-      arguments:
-        approval_id: { input: approval_id }
-        request_id: { activity_key: escalate_unroutable }
-      next: reject_unroutable_quote
-
+  # The same atomic command-transition boundary opens finance signaling.
   - id: escalate_for_finance
     command:
       name: escalate_purchase_approval
@@ -120,7 +123,6 @@ states:
       signal: finance_decision
       role: b2b_finance
       verification: required
-      persist_before_match: true
       correlate:
         approval_id: { input: approval_id }
       deadline: 2d
@@ -152,7 +154,7 @@ states:
 
   - id: reject_unroutable_quote
     command:
-      name: finalize_finance_rejection
+      name: finalize_unroutable_rejection
       run_as: b2b_finance
       arguments:
         approval_id: { input: approval_id }

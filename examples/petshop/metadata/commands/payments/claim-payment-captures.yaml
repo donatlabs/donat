@@ -1,0 +1,89 @@
+name: claim_payment_captures
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: authorization_id
+    type: uuid!
+  - name: claims
+    type: "[PaymentCaptureClaimInput!]!"
+  - name: request_id
+    type: uuid!
+steps:
+  - name: claim_totals
+    aggregate:
+      from: { arg: claims }
+      values:
+        item_count: { count: true }
+        amount_minor: { sum: { field: amount_minor } }
+  - name: claims_are_bounded
+    assert:
+      rule: bounded_fan_out_count
+      with:
+        item_count: { step: claim_totals, column: item_count }
+        maximum_items: { literal: 64 }
+  - name: authorization
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { arg: payment_id }
+        status: { literal: authorized }
+      returning:
+        [id, payment_id, authorized_minor, captured_minor,
+         capture_reserved_minor, status]
+      require_found: true
+  - name: claim_is_allowed
+    assert:
+      rule: can_reserve_capture_amount
+      with:
+        authorization_state: { step: authorization, column: status }
+        authorized_minor: { step: authorization, column: authorized_minor }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+        requested_amount_minor: { step: claim_totals, column: amount_minor }
+  # This guarded update is the serialization point shared with cancellation.
+  # A void claim requires capture_reserved_minor == 0 on this same row.
+  - name: reserve_capture_amount
+    update:
+      table: public.payment_authorization
+      where:
+        id: { step: authorization, column: id }
+        status: { literal: authorized }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+      set:
+        capture_reserved_minor:
+          rule: add_minor
+          with:
+            left: { step: authorization, column: capture_reserved_minor }
+            right: { step: claim_totals, column: amount_minor }
+      returning:
+        [id, payment_id, captured_minor, capture_reserved_minor, status]
+      require_affected: true
+  - name: capture_claims
+    insert_many:
+      table: public.payment_capture_claim
+      for_each: { arg: claims }
+      maximum_items: 64
+      object:
+        payment_id: { step: reserve_capture_amount, column: payment_id }
+        authorization_id: { step: reserve_capture_amount, column: id }
+        shipment_id: { item: shipment_id }
+        amount_minor: { item: amount_minor }
+        currency: { item: currency }
+        status: { literal: reserved }
+      returning:
+        [id, payment_id, authorization_id, shipment_id, amount_minor,
+         currency, status]
+result:
+  payment_id: { step: reserve_capture_amount, column: payment_id }
+  authorization_id: { step: reserve_capture_amount, column: id }
+  capture_claims: { step: capture_claims, maximum_items: 64 }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: authorization_id }
+  retention: 365d

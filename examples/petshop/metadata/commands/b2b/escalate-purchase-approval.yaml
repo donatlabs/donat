@@ -13,6 +13,7 @@ steps:
       table: public.purchase_approval
       by:
         id: { arg: approval_id }
+        status: { literal: awaiting_approver }
       returning: [id, quote_id, status]
       require_found: true
   - name: escalation_is_allowed
@@ -20,15 +21,15 @@ steps:
       rule: can_transition_approval
       with:
         current: { step: approval, column: status }
-        next: { literal: escalated }
+        next: { literal: awaiting_finance }
   - name: escalate
     update:
       table: public.purchase_approval
       where:
         id: { step: approval, column: id }
-        status: { literal: submitted }
+        status: { literal: awaiting_approver }
       set:
-        status: { literal: escalated }
+        status: { literal: awaiting_finance }
       returning: [id, quote_id, status]
       require_affected: true
 result:

@@ -39,6 +39,9 @@ operations:
             scope: petshop-mock-payment-authorization-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 2000
       maximum_calls: 1
@@ -85,7 +88,7 @@ operations:
       shipment_id: { input: shipment_id }
       amount_minor: { input: amount_minor }
       currency: { input: currency }
-    success_statuses: [200, 201, 202]
+    success_statuses: [200, 201]
     response:
       payment_id: { json_pointer: /payment_id, type: uuid! }
       shipment_id: { json_pointer: /shipment_id, type: uuid! }
@@ -95,6 +98,8 @@ operations:
       provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
       normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    success_contract:
+      status: captured
     effect:
       provider_idempotent:
         side_effect_steps:
@@ -103,6 +108,9 @@ operations:
             scope: petshop-mock-payment-capture-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 2000
       maximum_calls: 1
@@ -147,13 +155,15 @@ operations:
       payment_id: { input: payment_id }
       authorization_id: { input: authorization_id }
       reason: { input: reason }
-    success_statuses: [200, 201, 202]
+    success_statuses: [200, 201]
     response:
       provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
       provider_void_id: { json_pointer: /void_id, type: string!, max_bytes: 256 }
       provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
       normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    success_contract:
+      status: voided
     effect:
       provider_idempotent:
         side_effect_steps:
@@ -162,6 +172,9 @@ operations:
             scope: petshop-mock-payment-void-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 2000
       maximum_calls: 1
@@ -210,13 +223,15 @@ operations:
       amount_minor: { input: amount_minor }
       currency: { input: currency }
       reason: { input: reason }
-    success_statuses: [200, 201, 202]
+    success_statuses: [200, 201]
     response:
       provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
       provider_refund_id: { json_pointer: /refund_id, type: string!, max_bytes: 256 }
       provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }
       status: { json_pointer: /status, type: PaymentOutcome! }
       normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    success_contract:
+      status: refunded
     effect:
       provider_idempotent:
         side_effect_steps:
@@ -225,6 +240,9 @@ operations:
             scope: petshop-mock-payment-refund-v1
             minimum_retention_ms: 604800000
             clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
     bounds:
       deadline_ms: 2000
       maximum_calls: 1
@@ -312,6 +330,76 @@ operations:
       request_body: [provider_reference]
       response_body: [provider_reference, normalized_payload]
 
+  - name: lookup_capture
+    version: v1
+    method: POST
+    path: /v1/payment-capture-lookups
+    input_contract:
+      payment_id: uuid!
+      shipment_id: uuid!
+      amount_minor: bigint!
+      activity_key: string!
+    body:
+      payment_id: { input: payment_id }
+      shipment_id: { input: shipment_id }
+      amount_minor: { input: amount_minor }
+      activity_key: { input: activity_key }
+    success_statuses: [200]
+    response:
+      resolution: { json_pointer: /resolution, type: ProviderLookupResolution! }
+      captured:
+        json_pointer: /captured
+        type: "[CaptureLookupCaptured!]!"
+        maximum_items: 1
+      terminal_absences:
+        json_pointer: /terminal_absences
+        type: "[CaptureLookupAbsence!]!"
+        maximum_items: 1
+    success_contract:
+      discriminator: resolution
+      cases:
+        mutation_found:
+          exactly_one_non_empty: captured
+          empty: terminal_absences
+          captured_outcome: captured
+        terminal_absence:
+          exactly_one_non_empty: terminal_absences
+          empty: captured
+      unproven_absence:
+        error: { class: invariant, code: payment_capture_outcome_ambiguous }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payment_authentication }
+        - { statuses: [408], class: timeout, code: payment_timeout }
+        - { statuses: [425], class: invariant, code: payment_capture_outcome_ambiguous }
+        - { statuses: [429], class: http_429, code: payment_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payment_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payment_lookup_rejected }
+      fallback: { class: permanent, code: payment_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 4
+      rate_limit: { permits: 10, per: 1s, burst: 4 }
+      serialize_by: { input: payment_id }
+    redaction:
+      request_headers: [Authorization]
+
   - name: lookup_operation
     version: v1
     method: POST
@@ -329,6 +417,7 @@ operations:
     success_statuses: [200]
     response:
       found: { json_pointer: /found, type: bool! }
+      terminal_absence_proven: { json_pointer: /terminal_absence_proven, type: bool! }
       provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
       provider_mutation_id: { json_pointer: /provider_mutation_id, type: string!, max_bytes: 256 }
       provider_reference: { json_pointer: /provider_reference, type: string!, max_bytes: 256 }

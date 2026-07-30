@@ -106,13 +106,21 @@ states:
         return_items: { state: request_return, field: items }
       idempotency_key:
         stable: { run: id, state: request_return_label }
-      timeout: 10s
+      timeout:
+        schedule_to_start: 10s
+        start_to_close: 12s
       retry:
-        maximum_attempts: 4
-        backoff: 250ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 4
+        initial_interval: 250ms
+        max_interval: 2s
+        jitter: deterministic_full
       next: await_warehouse_receipt
-      on_error: return_label_requires_reconciliation
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: return_label_requires_reconciliation }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: return_label_requires_reconciliation }
+        fallback: { next: return_label_requires_reconciliation }
 
   - id: await_warehouse_receipt
     wait:
@@ -163,13 +171,21 @@ states:
         reason: { input: reason }
       idempotency_key:
         stable: { run: id, state: request_refund }
-      timeout: 2s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_refund_response
-      on_error: lookup_refund
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: lookup_refund }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: lookup_refund }
+        fallback: { next: lookup_refund }
 
   - id: route_refund_response
     when:
@@ -204,13 +220,21 @@ states:
         resource_kind: { literal: refund }
         resource_id: { state: await_inspection, field: refund_id, as: string }
         activity_key: { activity_key_for_state: request_refund }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_refund_lookup
-      on_error: refund_requires_reconciliation
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: refund_requires_reconciliation }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: refund_requires_reconciliation }
+        fallback: { next: refund_requires_reconciliation }
 
   - id: route_refund_lookup
     when:

@@ -1,0 +1,106 @@
+name: finalize_declined_checkout
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - { name: order_id, type: uuid! }
+  - { name: payment_id, type: uuid! }
+  - { name: provider_event_id, type: string! }
+  - { name: outcome, type: PaymentOutcome! }
+  - { name: provider_reference, type: string! }
+  - { name: payload, type: BoundedProviderEvidence! }
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        order_status: { literal: checkout_started }
+      returning: [id, order_status]
+      require_found: true
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+        order_id: { step: order, column: id }
+        status: { literal: pending }
+      returning: [id, status]
+      require_found: true
+  - name: outcome_is_terminal_non_authorization
+    assert:
+      rule: payment_was_declined
+      with: { outcome: { arg: outcome } }
+  - name: event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: authorization_declined }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: reservations
+    select_many:
+      table: public.inventory_reservation
+      by:
+        order_id: { step: order, column: id }
+        status: { literal: reserved }
+      order_by: [id]
+      returning: [id, variant_id, quantity]
+      maximum_rows: 64
+  - name: release_stock
+    update_many:
+      table: public.inventory_stock
+      for_each: { step: reservations }
+      by: { variant_id: { item: variant_id } }
+      set:
+        reserved:
+          rule: subtract_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_release_stock
+        with:
+          reserved: { current_column: reserved }
+          releasing: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+  - name: release_reservations
+    update_many:
+      table: public.inventory_reservation
+      for_each: { step: reservations }
+      by: { id: { item: id } }
+      set: { status: { literal: released } }
+      returning: [id, status]
+      require_each: true
+  - name: fail_payment
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+        status: { literal: pending }
+      set:
+        status: { literal: failed }
+        provider_reference: { arg: provider_reference }
+      returning: [id, status]
+      require_affected: true
+  - name: cancel_order
+    update:
+      table: public.orders
+      where:
+        id: { step: order, column: id }
+        order_status: { literal: checkout_started }
+      set: { order_status: { literal: cancelled } }
+      returning: [id, order_status]
+      require_affected: true
+result:
+  order_id: { step: cancel_order, column: id }
+  payment_id: { step: fail_payment, column: id }
+  payment_status: { step: fail_payment, column: status }
+  released_reservations: { step: release_reservations }
+idempotency:
+  key: { argument: provider_event_id }
+  scope: command
+  retention: 365d

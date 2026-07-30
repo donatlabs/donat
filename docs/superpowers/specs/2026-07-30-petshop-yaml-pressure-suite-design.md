@@ -53,6 +53,7 @@ examples/petshop/metadata/
 ├── flows.yaml
 ├── flows/
 │   ├── checkout-payment.yaml
+│   ├── checkout-cancellation.yaml
 │   ├── authorized-order-cancellation.yaml
 │   ├── partial-fulfilment.yaml
 │   ├── return-refund.yaml
@@ -131,11 +132,15 @@ atomic cross-relation change or guarded lifecycle transition.
 The first YAML catalog includes:
 
 - checkout: `prepare_checkout_quote`, `begin_checkout`, `cancel_order`,
+  `finalize_declined_checkout`,
+  `materialize_cancellation_authorization`,
+  `finalize_pending_order_cancellation`,
   `request_authorized_order_cancellation`,
   `finalize_authorized_order_cancellation`, `release_expired_checkout`;
 - payments: `record_payment_outcome`, `authorize_payment`,
-  `capture_payment`, `void_authorization`, `complete_refund`,
-  `record_chargeback`, `reconcile_payment`;
+  `claim_payment_captures`, `release_absent_capture_claim`, `capture_payment`,
+  `void_authorization`, `complete_refund`, `record_chargeback`,
+  `reconcile_payment`;
 - fulfilment: `allocate_inventory`, `mark_order_packed`,
   `create_shipment`, `record_shipment_result`, `record_delivery`;
 - returns: `request_return`, `approve_return`, `reject_return`,
@@ -143,10 +148,10 @@ The first YAML catalog includes:
   `finalize_return_refund`, `finalize_return_rejection`, `create_exchange`;
 - subscriptions: `create_subscription_order`, `record_renewal_outcome`,
   `pause_subscription`, `cancel_subscription`;
-- B2B: `submit_quote`, `approve_purchase`, `reject_purchase`,
+- B2B: `submit_quote`, `open_approver_review`, `approve_purchase`, `reject_purchase`,
   `consume_credit`, `escalate_purchase_approval`,
   `finance_approve_purchase`, `finance_reject_purchase`,
-  `finalize_finance_rejection`;
+  `finalize_finance_rejection`, `finalize_unroutable_rejection`;
 - marketplace: `split_vendor_orders`, `record_vendor_acceptance`,
   `create_vendor_payout`, `record_payout_outcome`,
   `reconcile_vendor_payout`, `open_vendor_dispute`;
@@ -177,17 +182,30 @@ cannot prove the outcome.
 
 ### `authorized_order_cancellation`
 
-Moves an authorized order to `cancellation_requested`, durably voids its
-authorization, and releases reservations only after the void is recorded.
+Atomically claims a zero-captured, zero-reserved authorization on the same row
+used by capture reservation, moves the order to `cancellation_requested`,
+durably voids the authorization, and releases reservations only after the void is recorded.
 Ambiguous voids use the same read-only operation lookup and never treat a
 missing response as proof that no provider effect occurred.
+
+### `checkout_cancellation`
+
+Claims `pending -> cancellation_requested` before authorization can commit.
+It looks up the original provider key and releases inventory only after
+terminal absence is proven; a discovered authorization is materialized as
+`void_in_progress`, voided, and then finalized.
 
 ### `partial_fulfilment`
 
 Allocates lines to locations, creates one shipment unit per allocation group,
 calls the carrier with a stable item key, and records partial success without
 marking unshipped lines complete. Each shipment captures at most the value of
-its shipped lines; cancelling the remainder voids any unused authorization.
+its shipped lines. Capture reserves its amount on the authorization before
+provider I/O, so cancellation and capture have one guarded-row winner.
+Ambiguous labels and captures enter active read-only lookup states. A closed
+capture lookup either records the provider capture, proves terminal absence
+and releases exactly the affected shipment claim, or leaves an unproven
+outcome in bounded manual reconciliation.
 
 ### `return_refund`
 
@@ -208,15 +226,18 @@ renewal or pauses the subscription.
 `submit_quote` commits the quote, approval, and a `start_process` outbox intent
 in one transaction. The Process mirrors that start contract, routes by amount,
 organization policy, and available credit, and may complete automatically,
-wait for one or more named approver roles, escalate on a deadline, or reject
-without creating a payable order.
+atomically open `awaiting_approver` immediately before the approver wait,
+atomically open `awaiting_finance` immediately before the finance wait, or
+reject without creating a payable order. Human commands accept only the exact
+receptive domain stage.
 
 ### `vendor_payout`
 
 Consumes at most 64 eligible vendor balances, calculates commission through a
 decision table, creates one stable payout request per vendor, and records each
-synchronous terminal provider outcome. Per-item transport failures remain
-typed reconciliation work rather than becoming a stale aggregate signal.
+synchronous terminal (`paid` or `failed`) provider outcome. Per-item transport
+failures enter a read-only payout lookup before remaining typed reconciliation
+work.
 
 ### `grooming_booking`
 
@@ -280,12 +301,17 @@ carrier, tax, notification, and payout behavior. Manual configuration may
 point generic HTTP operations at a request-capture endpoint.
 
 Every mutation operation declares retry classification, timeout, capacity,
-redaction, and complete immutable provider-idempotency evidence: fixed key
-binding, provider scope, minimum retention, and positive clock margin.
+redaction, and immutable provider-idempotency evidence sourced from the
+Donat-owned mock-provider record: fixed key binding, provider scope, minimum
+retention, and positive clock margin. The Process compiler derives each of
+the 24 activity send horizons from its timeout/retry declaration and checks
+that horizon against provider retention minus the clock margin; the provider
+evidence does not supply the horizon.
 Read-only tax and operation-lookup calls retain ordinary bounded retry policy
 without a side-effect classification. Process start and command-signal
 effects are generic transactional outbox records, never immediate Process
-calls. Typed verified signals are persisted before flow matching. Provider
+calls. Typed verified signals are accepted only while the process is in the
+matching receptive wait; B2B domain stages open atomically with that wait. Provider
 payloads are normalized into bounded evidence before commands consume them.
 
 ## Public execution contract

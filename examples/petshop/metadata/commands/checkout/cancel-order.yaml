@@ -14,75 +14,67 @@ steps:
       table: public.orders
       by:
         id: { arg: order_id }
+        order_status: { literal: checkout_started }
       returning: [id, customer_id, order_status]
+      require_found: true
   - name: cancellation_is_allowed
     assert:
       rule: can_transition_checkout
       with:
         current: { step: order, column: order_status }
-        next: { literal: cancelled }
+        next: { literal: cancellation_requested }
   - name: payment
     select_one:
       table: public.payment
       by:
         order_id: { step: order, column: id }
         status: { literal: pending }
-      returning: [id, status]
+      returning: [id, status, authorization_activity_key]
       require_found: true
-  - name: remaining_reservations
-    select_many:
-      table: public.inventory_reservation
-      by:
-        order_id: { step: order, column: id }
-        status: { literal: reserved }
-      order_by: [id]
-      returning: [id, variant_id, quantity]
-      maximum_rows: 64
-  - name: release_stock
-    update_many:
-      table: public.inventory_stock
-      for_each: { step: remaining_reservations }
-      by:
-        variant_id: { item: variant_id }
+  # This guarded payment update wins or loses against authorize_payment's
+  # guarded pending -> authorized update. It does not release inventory.
+  - name: claim_pending_cancellation
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+        status: { literal: pending }
       set:
-        reserved:
-          rule: subtract_int
-          with:
-            left: { current_column: reserved }
-            right: { item: quantity }
-      check:
-        rule: can_release_stock
-        with:
-          reserved: { current_column: reserved }
-          releasing: { item: quantity }
-      returning: [variant_id, reserved]
-      require_each: true
-  - name: release_reservations
-    update_many:
-      table: public.inventory_reservation
-      for_each: { step: remaining_reservations }
-      by:
-        id: { item: id }
-      set:
-        status: { literal: released }
-      returning: [id, status]
-      require_each: true
-  - name: cancel_order
+        status: { literal: cancellation_requested }
+      returning: [id, order_id, status, authorization_activity_key]
+      require_affected: true
+  - name: request_cancellation
     update:
       table: public.orders
       where:
         id: { step: order, column: id }
+        order_status: { literal: checkout_started }
       set:
-        order_status: { literal: cancelled }
-      returning: [id, order_status]
+        order_status: { literal: cancellation_requested }
+        cancellation_reason: { literal: checkout_cancelled }
+      returning: [id, customer_id, order_status, cancellation_reason]
+      require_affected: true
 result:
-  order_id: { step: cancel_order, column: id }
-  order_status: { step: cancel_order, column: order_status }
-  released_reservations: { step: release_reservations }
-  payment_id: { step: payment, column: id }
+  order_id: { step: request_cancellation, column: id }
+  owner_user_id: { step: request_cancellation, column: customer_id }
+  order_status: { step: request_cancellation, column: order_status }
+  payment_id: { step: claim_pending_cancellation, column: id }
+  authorization_activity_key: { step: claim_pending_cancellation, column: authorization_activity_key }
+  reason: { step: request_cancellation, column: cancellation_reason }
 idempotency:
   key: { argument: request_id }
   scope:
     - { argument: order_id }
     - { session_variable: x-donat-user-id }
-  retention: 30d
+  retention: 365d
+effects:
+  - start_process:
+      process: checkout_cancellation
+      process_key: { step: request_cancellation, column: id }
+      input:
+        order_id: { step: request_cancellation, column: id }
+        owner_user_id: { step: request_cancellation, column: customer_id }
+        payment_id: { step: claim_pending_cancellation, column: id }
+        authorization_activity_key: { step: claim_pending_cancellation, column: authorization_activity_key }
+        reason: { step: request_cancellation, column: cancellation_reason }
+      idempotency_key: { argument: request_id }

@@ -1,0 +1,98 @@
+name: release_absent_capture_claim
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - { name: payment_id, type: uuid! }
+  - { name: authorization_id, type: uuid! }
+  - { name: shipment_id, type: uuid! }
+  - { name: provider_absence_id, type: string! }
+  - { name: amount_minor, type: bigint! }
+  - { name: payload, type: BoundedProviderEvidence! }
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, currency]
+      require_found: true
+  - name: authorization
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { step: payment, column: id }
+        status: { literal: authorized }
+      returning:
+        [id, payment_id, captured_minor, capture_reserved_minor, status]
+      require_found: true
+  - name: capture_claim
+    select_one:
+      table: public.payment_capture_claim
+      by:
+        payment_id: { step: payment, column: id }
+        authorization_id: { step: authorization, column: id }
+        shipment_id: { arg: shipment_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: reserved }
+      returning:
+        [id, payment_id, authorization_id, shipment_id, amount_minor,
+         currency, status]
+      require_found: true
+  - name: release_is_exact
+    assert:
+      rule: can_release_capture_claim
+      with:
+        authorization_state: { step: authorization, column: status }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+        claim_amount_minor: { step: capture_claim, column: amount_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: release_authorization_reservation
+    update:
+      table: public.payment_authorization
+      where:
+        id: { step: authorization, column: id }
+        status: { literal: authorized }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+      set:
+        capture_reserved_minor:
+          rule: subtract_minor
+          with:
+            left: { step: authorization, column: capture_reserved_minor }
+            right: { step: capture_claim, column: amount_minor }
+      returning: [id, payment_id, capture_reserved_minor, status]
+      require_affected: true
+  - name: release_claim
+    update:
+      table: public.payment_capture_claim
+      where:
+        id: { step: capture_claim, column: id }
+        status: { literal: reserved }
+      set:
+        status: { literal: terminal_absence }
+        provider_absence_id: { arg: provider_absence_id }
+      returning:
+        [id, payment_id, shipment_id, amount_minor, status,
+         provider_absence_id]
+      require_affected: true
+  - name: absence_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: capture_terminal_absence }
+        provider_event_id: { arg: provider_absence_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+result:
+  shipment_id: { step: release_claim, column: shipment_id }
+  payment_id: { step: release_claim, column: payment_id }
+  capture_id: { literal: null }
+  amount_minor: { step: release_claim, column: amount_minor }
+  status: { step: payment, column: status }
+  requires_reconciliation: { literal: false }
+idempotency:
+  key: { argument: provider_absence_id }
+  scope: command
+  retention: 365d

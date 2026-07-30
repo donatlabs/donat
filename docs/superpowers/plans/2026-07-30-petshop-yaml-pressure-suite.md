@@ -98,7 +98,8 @@ HTTP Connectors.
 
 - Produces command includes for every file named in Tasks 2-10.
 - Produces flow includes for:
-  `checkout-payment`, `authorized-order-cancellation`,
+  `checkout-payment`, `checkout-cancellation`,
+  `authorized-order-cancellation`,
   `partial-fulfilment`, `return-refund`,
   `subscription-renewal`, `b2b-order-approval`, `vendor-payout`,
   `grooming-booking`, `prescription-review`, and
@@ -200,9 +201,12 @@ cart closure, and ordered result. Bind customer ownership only from
 
 - [ ] **Step 2: Author cancellation and expiry**
 
-Both Commands release only remaining reservations. Customer cancellation is
-owner-scoped; support cancellation is the same Command permission, not a
-second implementation. Expiry uses fixed `payment_worker`.
+Expiry releases only remaining reservations. Customer/support cancellation is
+one owner-aware durable lifecycle: it first claims the payment row, then
+releases only after provider authorization absence is proven or a discovered
+authorization is voided. Authorized cancellation and capture contend on the
+same zero-captured/zero-reserved authorization row. Expiry uses fixed
+`payment_worker`.
 
 - [ ] **Step 3: Author the payment lifecycle**
 
@@ -236,10 +240,14 @@ untrusted dynamic role.
 
 - [ ] **Step 1: Author provider-neutral operations**
 
-`mock_payment` declares authorize, capture, void, refund, reconcile, and a
-read-only operation lookup. Each mutation has a stable `Idempotency-Key`,
-immutable provider-retention evidence, timeout, retry classes, capacity, and
-a redacted authorization header.
+`mock_payment` declares authorize, capture, void, refund, reconcile, a
+capture-specific read-only lookup, and a general read-only operation lookup.
+Each mutation has a stable `Idempotency-Key`,
+immutable Donat-owned source-record facts for binding, scope, retention,
+and clock margin, plus exact activity timeout, retry/error routing, capacity,
+and a redacted authorization header. The Process compiler derives each
+`maximum_send_horizon_ms` from that activity policy and checks it against the
+provider retention window minus the clock margin.
 
 - [ ] **Step 2: Author tax quote operation**
 
@@ -248,10 +256,12 @@ currency, and ordered taxable lines.
 
 - [ ] **Step 3: Author the durable checkout Flow**
 
-Use `command -> request -> wait -> when -> command -> output/fail`. Persist
-callback input before matching. On deadline or retry exhaustion, run
-`release_expired_checkout`. Business decline is an output; exhausted transport
-is a typed failure after compensation.
+Use `command -> request -> when -> command -> output/fail`. Authorization is a
+synchronous terminal response with read-only lookup on ambiguous transport.
+Pending cancellation first claims the payment row, then proves terminal
+provider absence or materializes and voids the authorization before releasing
+inventory. Business decline is an output; an unproven provider outcome is a
+typed reconciliation failure that retains inventory.
 
 ---
 

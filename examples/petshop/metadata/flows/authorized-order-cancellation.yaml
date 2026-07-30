@@ -39,13 +39,21 @@ states:
         reason: { input: reason }
       idempotency_key:
         stable: { run: id, state: request_void }
-      timeout: 2s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 5s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_void_response
-      on_error: reconcile_void
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: reconcile_void }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_void }
+        fallback: { next: reconcile_void }
   - id: route_void_response
     when:
       cases:
@@ -75,13 +83,21 @@ states:
         resource_kind: { literal: void }
         resource_id: { input: authorization_id }
         activity_key: { activity_key: request_void }
-      timeout: 5s
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
       retry:
-        maximum_attempts: 3
-        backoff: 100ms
         retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
       next: route_reconciled_void
-      on_error: manual_reconciliation_required
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: manual_reconciliation_required }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: manual_reconciliation_required }
+        fallback: { next: manual_reconciliation_required }
   - id: route_reconciled_void
     when:
       cases:

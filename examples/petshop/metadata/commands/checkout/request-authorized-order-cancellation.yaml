@@ -32,6 +32,62 @@ steps:
         order_id: { step: order, column: id }
       returning: [payment_id, authorization_id, currency]
       require_found: true
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { step: authorization, column: payment_id }
+        status: { literal: authorized }
+      returning: [id, status]
+      require_found: true
+  - name: authorization_row
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { step: authorization, column: authorization_id }
+        payment_id: { step: payment, column: id }
+        status: { literal: authorized }
+        captured_minor: { literal: 0 }
+        capture_reserved_minor: { literal: 0 }
+      returning:
+        [id, payment_id, authorized_minor, captured_minor,
+         capture_reserved_minor, status]
+      require_found: true
+  - name: void_claim_is_allowed
+    assert:
+      rule: can_claim_authorization_void
+      with:
+        payment_state: { step: payment, column: status }
+        authorization_state: { step: authorization_row, column: status }
+        authorized_minor: { step: authorization_row, column: authorized_minor }
+        captured_minor: { step: authorization_row, column: captured_minor }
+        capture_reserved_minor: { step: authorization_row, column: capture_reserved_minor }
+  # Capture reservation and cancellation both guard this exact row. Only one
+  # can change the zero-captured/zero-reserved authorization.
+  - name: claim_authorization_for_void
+    update:
+      table: public.payment_authorization
+      where:
+        id: { step: authorization_row, column: id }
+        status: { literal: authorized }
+        captured_minor: { literal: 0 }
+        capture_reserved_minor: { literal: 0 }
+      set:
+        status: { literal: void_in_progress }
+      returning:
+        [id, payment_id, authorized_minor, captured_minor,
+         capture_reserved_minor, status]
+      require_affected: true
+  - name: claim_payment_for_void
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+        status: { literal: authorized }
+      set:
+        status: { literal: void_in_progress }
+      returning: [id, status]
+      require_affected: true
   - name: request_cancellation
     update:
       table: public.orders
@@ -48,7 +104,7 @@ result:
   owner_user_id: { step: request_cancellation, column: customer_id }
   order_status: { step: request_cancellation, column: order_status }
   payment_id: { step: authorization, column: payment_id }
-  authorization_id: { step: authorization, column: authorization_id }
+  authorization_id: { step: claim_authorization_for_void, column: id }
   reason: { step: request_cancellation, column: cancellation_reason }
 idempotency:
   key: { argument: request_id }
@@ -62,7 +118,7 @@ effects:
       input:
         order_id: { step: request_cancellation, column: id }
         owner_user_id: { step: request_cancellation, column: customer_id }
-        payment_id: { step: authorization, column: payment_id }
-        authorization_id: { step: authorization, column: authorization_id }
+        payment_id: { step: claim_payment_for_void, column: id }
+        authorization_id: { step: claim_authorization_for_void, column: id }
         reason: { step: request_cancellation, column: cancellation_reason }
       idempotency_key: { argument: request_id }

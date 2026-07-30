@@ -6,11 +6,11 @@ arguments:
   - name: payout_id
     type: uuid!
   - name: provider_payout_id
-    type: string!
+    type: string
   - name: provider_event_id
     type: string!
   - name: outcome
-    type: PayoutState!
+    type: ProviderPayoutOutcome!
   - name: payload
     type: BoundedProviderEvidence!
 steps:
@@ -34,7 +34,10 @@ steps:
         payout_id: { step: payout, column: id }
         provider_event_id: { arg: provider_event_id }
         provider_payout_id: { arg: provider_payout_id }
-        outcome: { arg: outcome }
+        outcome:
+          rule: payout_state_for_provider_outcome
+          with:
+            outcome: { arg: outcome }
         payload: { arg: payload }
       returning: [id, payout_id, provider_event_id, outcome]
   - name: apply_outcome
@@ -44,7 +47,10 @@ steps:
         id: { step: payout, column: id }
         status: { step: payout, column: status }
       set:
-        status: { arg: outcome }
+        status:
+          rule: payout_state_for_provider_outcome
+          with:
+            outcome: { arg: outcome }
         provider_payout_id: { arg: provider_payout_id }
       returning: [id, payout_cycle_id, vendor_id, status, provider_payout_id, net_minor, currency]
       require_affected: true
