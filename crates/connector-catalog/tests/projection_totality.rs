@@ -1,29 +1,89 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
-use donat_connector_catalog::canonical_projection_owner_manifest;
+use donat_connector_catalog::{
+    CANONICAL_PROJECTION_SCHEMA_DECLARATIONS, canonical_projection_owner_manifest,
+};
 use syn::{
-    Attribute, Fields, GenericArgument, Item, LitStr, PathArguments, Type, TypeArray, TypeGroup,
-    TypeParen, TypePath, TypeReference, TypeSlice, TypeTuple,
+    Attribute, Fields, FnArg, GenericArgument, Item, LitStr, PathArguments, Type, TypePath,
+    Visibility,
 };
 
 #[derive(Clone)]
-enum Definition {
+struct Field {
+    rust_name: Option<String>,
+    wire_name: Option<String>,
+    ty: Type,
+}
+
+#[derive(Clone)]
+struct Variant {
+    rust_name: String,
+    wire_name: String,
+    fields: Vec<Field>,
+}
+
+#[derive(Clone)]
+enum Shape {
     Struct(Vec<Field>),
     Enum(Vec<Variant>),
 }
 
 #[derive(Clone)]
-struct Field {
-    name: Option<String>,
-    wire_name: Option<String>,
-    dependencies: Vec<String>,
+struct Definition {
+    public: bool,
+    shape: Shape,
+}
+
+#[derive(Default)]
+struct Schema {
+    definitions: BTreeMap<String, Definition>,
+    extension_fields: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Segment {
+    Field(String),
+    RustVariant(String),
+    WireVariant(String),
 }
 
 #[derive(Clone)]
-struct Variant {
-    name: String,
-    wire_name: String,
-    fields: Vec<Field>,
+enum Cursor {
+    Definition(String),
+    Variant {
+        definition: String,
+        variant: Variant,
+    },
+    Value(Type),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Member {
+    definition: String,
+    member: String,
+}
+
+impl Member {
+    fn field(definition: &str, field: &str) -> Self {
+        Self {
+            definition: definition.to_owned(),
+            member: field.to_owned(),
+        }
+    }
+
+    fn variant(definition: &str, variant: &str) -> Self {
+        Self {
+            definition: definition.to_owned(),
+            member: format!("::{variant}"),
+        }
+    }
+
+    fn variant_field(definition: &str, variant: &str, field: &str) -> Self {
+        Self {
+            definition: definition.to_owned(),
+            member: format!("::{variant}.{field}"),
+        }
+    }
 }
 
 fn serde_rename(attributes: &[Attribute]) -> Option<String> {
@@ -34,8 +94,7 @@ fn serde_rename(attributes: &[Attribute]) -> Option<String> {
         }
         let _ = attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
-                let value = meta.value()?;
-                rename = Some(value.parse::<LitStr>()?.value());
+                rename = Some(meta.value()?.parse::<LitStr>()?.value());
             }
             Ok(())
         });
@@ -47,10 +106,10 @@ fn snake_case(value: &str) -> String {
     let characters = value.chars().collect::<Vec<_>>();
     let mut output = String::new();
     for (index, character) in characters.iter().copied().enumerate() {
-        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let previous = index.checked_sub(1).and_then(|value| characters.get(value));
         let next = characters.get(index + 1);
         if character.is_ascii_uppercase()
-            && index > 0
+            && index != 0
             && (previous.is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
                 || next.is_some_and(|value| value.is_ascii_lowercase()))
         {
@@ -61,112 +120,174 @@ fn snake_case(value: &str) -> String {
     output
 }
 
-fn type_dependencies(value: &Type, output: &mut Vec<String>) {
-    match value {
-        Type::Array(TypeArray { elem, .. })
-        | Type::Group(TypeGroup { elem, .. })
-        | Type::Paren(TypeParen { elem, .. })
-        | Type::Reference(TypeReference { elem, .. })
-        | Type::Slice(TypeSlice { elem, .. }) => type_dependencies(elem, output),
-        Type::Path(TypePath { path, .. }) => {
-            for segment in &path.segments {
-                output.push(segment.ident.to_string());
-                if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
-                    for argument in &arguments.args {
-                        if let GenericArgument::Type(value) = argument {
-                            type_dependencies(value, output);
-                        }
-                    }
-                }
-            }
-        }
-        Type::Tuple(TypeTuple { elems, .. }) => {
-            for value in elems {
-                type_dependencies(value, output);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn field(name: Option<String>, attributes: &[Attribute], value: &Type) -> Field {
-    let mut dependencies = Vec::new();
-    type_dependencies(value, &mut dependencies);
-    let wire_name = serde_rename(attributes).or_else(|| name.clone());
+fn parse_field(rust_name: Option<String>, attributes: &[Attribute], ty: Type) -> Field {
     Field {
-        name,
-        wire_name,
-        dependencies,
+        wire_name: serde_rename(attributes).or_else(|| rust_name.clone()),
+        rust_name,
+        ty,
     }
 }
 
-fn collect_definitions(source: &str, definitions: &mut BTreeMap<String, Definition>) {
+fn collect_schema(source: &str) -> Schema {
     let file = syn::parse_file(source).unwrap();
-    for item in file.items {
+    let mut schema = Schema::default();
+    for item in &file.items {
         match item {
             Item::Struct(value) => {
-                let fields = match value.fields {
+                let fields = match &value.fields {
                     Fields::Named(fields) => fields
                         .named
-                        .into_iter()
-                        .map(|value| {
-                            field(
-                                value.ident.map(|name| name.to_string()),
-                                &value.attrs,
-                                &value.ty,
+                        .iter()
+                        .map(|field| {
+                            parse_field(
+                                field.ident.as_ref().map(ToString::to_string),
+                                &field.attrs,
+                                field.ty.clone(),
                             )
                         })
                         .collect(),
                     Fields::Unnamed(fields) => fields
                         .unnamed
-                        .into_iter()
-                        .map(|value| field(None, &value.attrs, &value.ty))
+                        .iter()
+                        .map(|field| parse_field(None, &field.attrs, field.ty.clone()))
                         .collect(),
                     Fields::Unit => Vec::new(),
                 };
-                definitions.insert(value.ident.to_string(), Definition::Struct(fields));
+                schema.definitions.insert(
+                    value.ident.to_string(),
+                    Definition {
+                        public: matches!(value.vis, Visibility::Public(_)),
+                        shape: Shape::Struct(fields),
+                    },
+                );
             }
             Item::Enum(value) => {
                 let variants = value
                     .variants
-                    .into_iter()
+                    .iter()
                     .map(|variant| {
-                        let name = variant.ident.to_string();
+                        let rust_name = variant.ident.to_string();
                         Variant {
                             wire_name: serde_rename(&variant.attrs)
-                                .unwrap_or_else(|| snake_case(&name)),
-                            name,
-                            fields: match variant.fields {
+                                .unwrap_or_else(|| snake_case(&rust_name)),
+                            rust_name,
+                            fields: match &variant.fields {
                                 Fields::Named(fields) => fields
                                     .named
-                                    .into_iter()
-                                    .map(|value| {
-                                        field(
-                                            value.ident.map(|name| name.to_string()),
-                                            &value.attrs,
-                                            &value.ty,
+                                    .iter()
+                                    .map(|field| {
+                                        parse_field(
+                                            field.ident.as_ref().map(ToString::to_string),
+                                            &field.attrs,
+                                            field.ty.clone(),
                                         )
                                     })
                                     .collect(),
                                 Fields::Unnamed(fields) => fields
                                     .unnamed
-                                    .into_iter()
-                                    .map(|value| field(None, &value.attrs, &value.ty))
+                                    .iter()
+                                    .map(|field| parse_field(None, &field.attrs, field.ty.clone()))
                                     .collect(),
                                 Fields::Unit => Vec::new(),
                             },
                         }
                     })
                     .collect();
-                definitions.insert(value.ident.to_string(), Definition::Enum(variants));
+                schema.definitions.insert(
+                    value.ident.to_string(),
+                    Definition {
+                        public: matches!(value.vis, Visibility::Public(_)),
+                        shape: Shape::Enum(variants),
+                    },
+                );
             }
             _ => {}
         }
     }
+    schema
 }
 
-fn implementation_inventory() -> BTreeSet<String> {
-    let mut definitions = BTreeMap::new();
+fn merge_schema(target: &mut Schema, source: Schema) {
+    target.definitions.extend(source.definitions);
+    for (owner, fields) in source.extension_fields {
+        target
+            .extension_fields
+            .entry(owner)
+            .or_default()
+            .extend(fields);
+    }
+}
+
+fn type_name(value: &Type) -> Option<String> {
+    match value {
+        Type::Path(TypePath { path, .. }) => {
+            let segment = path.segments.last()?;
+            match &segment.arguments {
+                PathArguments::None => Some(segment.ident.to_string()),
+                PathArguments::AngleBracketed(arguments) => arguments
+                    .args
+                    .iter()
+                    .filter_map(|argument| match argument {
+                        GenericArgument::Type(value) => Some(value),
+                        _ => None,
+                    })
+                    .next_back()
+                    .and_then(type_name),
+                PathArguments::Parenthesized(_) => None,
+            }
+        }
+        Type::Array(value) => type_name(&value.elem),
+        Type::Group(value) => type_name(&value.elem),
+        Type::Paren(value) => type_name(&value.elem),
+        Type::Reference(value) => type_name(&value.elem),
+        Type::Slice(value) => type_name(&value.elem),
+        Type::Tuple(_) => None,
+        _ => None,
+    }
+}
+
+fn collect_builder_extensions(schema: &mut Schema, source: &str) {
+    let file = syn::parse_file(source).unwrap();
+    for item in file.items {
+        let Item::Fn(function) = item else {
+            continue;
+        };
+        if !matches!(function.vis, Visibility::Public(_)) {
+            continue;
+        }
+        let arguments = function
+            .sig
+            .inputs
+            .iter()
+            .filter_map(|argument| match argument {
+                FnArg::Typed(argument) => {
+                    let syn::Pat::Ident(name) = argument.pat.as_ref() else {
+                        return None;
+                    };
+                    Some((name.ident.to_string(), argument.ty.as_ref()))
+                }
+                FnArg::Receiver(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for (_, owner_type) in &arguments {
+            let Some(owner) = type_name(owner_type) else {
+                continue;
+            };
+            for (name, sibling_type) in &arguments {
+                if type_name(sibling_type).as_deref() != Some(owner.as_str()) {
+                    schema
+                        .extension_fields
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(name.clone());
+                }
+            }
+        }
+    }
+}
+
+fn normalized_schema() -> Schema {
+    let mut schema = Schema::default();
     for source in [
         include_str!("../src/source.rs"),
         include_str!("../src/model.rs"),
@@ -174,582 +295,588 @@ fn implementation_inventory() -> BTreeSet<String> {
         include_str!("../../connector-abi/src/lib.rs"),
         include_str!("../../connector-abi/src/envelope.rs"),
     ] {
-        collect_definitions(source, &mut definitions);
+        merge_schema(&mut schema, collect_schema(source));
     }
+    collect_builder_extensions(&mut schema, include_str!("../src/canonical.rs"));
+    schema
+}
 
-    let mut inventory = BTreeSet::new();
-    let mut pending = VecDeque::from([
-        "ConnectorSourceRecord".to_owned(),
-        "ConnectorManifest".to_owned(),
-        "ValueContractCatalog".to_owned(),
-        "TypedValue".to_owned(),
-        "ConnectorErrorClass".to_owned(),
-    ]);
-    let mut visited = BTreeSet::new();
-    while let Some(owner) = pending.pop_front() {
-        if !visited.insert(owner.clone()) {
-            continue;
-        }
-        if matches!(
-            owner.as_str(),
-            "TypedValueMaterialV1" | "TypedValueMaterial" | "StaticSafeMessage"
-        ) {
-            continue;
-        }
-        if owner == "TypedValue" {
-            inventory.extend(
-                [
-                    "TypedValue::Null",
-                    "TypedValue::Boolean",
-                    "TypedValue::Boolean.value",
-                    "TypedValue::String",
-                    "TypedValue::String.value",
-                    "TypedValue::I64",
-                    "TypedValue::I64.value",
-                    "TypedValue::U64",
-                    "TypedValue::U64.value",
-                    "TypedValue::Decimal",
-                    "TypedValue::Decimal.value",
-                    "TypedValue::List",
-                    "TypedValue::List.value",
-                    "TypedValue::Object",
-                    "TypedValue::Object.value",
-                    "TypedValue::InlineBytes",
-                    "TypedValue::InlineBytes.bytes",
-                    "TypedValue::InlineBytes.media_type",
-                    "TypedValue::InlineBytes.file_name",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
-            continue;
-        }
-        let Some(definition) = definitions.get(&owner) else {
-            continue;
-        };
-        match definition {
-            Definition::Struct(fields) => {
-                for field in fields {
-                    if let Some(name) = &field.name {
-                        inventory.insert(format!("{owner}.{name}"));
-                    }
-                    pending.extend(field.dependencies.iter().cloned());
-                }
-            }
-            Definition::Enum(variants) => {
-                for variant in variants {
-                    inventory.insert(format!("{owner}::{}", variant.name));
-                    for field in &variant.fields {
-                        if let Some(name) = &field.name {
-                            inventory.insert(format!("{owner}::{}.{name}", variant.name));
-                        }
-                        pending.extend(field.dependencies.iter().cloned());
-                    }
-                }
-            }
+fn material_schema() -> Schema {
+    let mut schema = normalized_schema();
+    merge_schema(
+        &mut schema,
+        collect_schema(CANONICAL_PROJECTION_SCHEMA_DECLARATIONS),
+    );
+    schema
+}
+
+fn owner_root(value: &str) -> &str {
+    value
+        .split(['.', ':', '{'])
+        .next()
+        .expect("owner expression always has a root")
+}
+
+fn immediate_member(value: &str) -> Option<String> {
+    let root = owner_root(value);
+    let suffix = value.strip_prefix(root)?;
+    if let Some(suffix) = suffix.strip_prefix("::") {
+        return Some(
+            suffix
+                .split(['.', ':'])
+                .next()
+                .unwrap()
+                .trim_end_matches("[]")
+                .to_owned(),
+        );
+    }
+    suffix.strip_prefix('.').map(|suffix| {
+        suffix
+            .split(['.', ':'])
+            .next()
+            .unwrap()
+            .trim_end_matches("[]")
+            .to_owned()
+    })
+}
+
+fn structural_roots(schema: &Schema, expressions: &[&str]) -> BTreeMap<String, String> {
+    let mut requirements = BTreeMap::<String, BTreeSet<String>>::new();
+    for expression in expressions {
+        let root = owner_root(expression);
+        if !schema.definitions.contains_key(root)
+            && let Some(member) = immediate_member(expression)
+        {
+            requirements
+                .entry(root.to_owned())
+                .or_default()
+                .insert(member);
         }
     }
-    inventory.insert("NpmIntegrity.algorithm".to_owned());
-    inventory.insert("ValueContractCatalog.value_language_epoch".to_owned());
-    inventory
+    requirements
         .into_iter()
-        .map(|owner| {
-            owner
-                .replace("ValueContractField.", "Field.")
-                .replace("ValueObjectContract.", "NamedObject.")
+        .map(|(logical, expected)| {
+            let candidates = schema
+                .definitions
+                .iter()
+                .filter_map(|(name, definition)| {
+                    let actual = match &definition.shape {
+                        Shape::Struct(fields) => fields
+                            .iter()
+                            .filter_map(|field| field.rust_name.clone())
+                            .collect::<BTreeSet<_>>(),
+                        Shape::Enum(variants) => variants
+                            .iter()
+                            .map(|variant| variant.rust_name.clone())
+                            .collect::<BTreeSet<_>>(),
+                    };
+                    (actual == expected).then_some(name.clone())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "logical owner {logical} does not resolve by its complete structure: {candidates:?}"
+            );
+            (logical, candidates[0].clone())
         })
         .collect()
 }
 
-fn recursively_expanded_inventory() -> BTreeSet<String> {
-    let mut definitions = BTreeMap::new();
-    for source in [
-        include_str!("../src/source.rs"),
-        include_str!("../src/model.rs"),
-        include_str!("../../value-contract/src/lib.rs"),
-        include_str!("../../connector-abi/src/lib.rs"),
-        include_str!("../../connector-abi/src/envelope.rs"),
-    ] {
-        collect_definitions(source, &mut definitions);
+fn tokenize(value: &str) -> (String, Vec<Segment>) {
+    let bytes = value.as_bytes();
+    let root_end = value.find(['.', ':', '{']).unwrap_or(value.len());
+    let root = value[..root_end].to_owned();
+    let mut segments = Vec::new();
+    let mut index = root_end;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"[]") {
+            index += 2;
+            continue;
+        }
+        if bytes[index..].starts_with(b"::") {
+            index += 2;
+            let end = value[index..]
+                .find(['.', ':', '{', '['])
+                .map_or(value.len(), |offset| index + offset);
+            segments.push(Segment::RustVariant(value[index..end].to_owned()));
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'{' {
+            let end = value[index..].find('}').unwrap() + index;
+            let selector = &value[index + 1..end];
+            segments.push(Segment::WireVariant(
+                selector.strip_prefix("kind=").unwrap().to_owned(),
+            ));
+            index = end + 1;
+            continue;
+        }
+        if bytes[index] == b'.' {
+            index += 1;
+            let end = value[index..]
+                .find(['.', ':', '{', '['])
+                .map_or(value.len(), |offset| index + offset);
+            segments.push(Segment::Field(value[index..end].to_owned()));
+            index = end;
+            continue;
+        }
+        panic!("unparsed schema expression suffix: {}", &value[index..]);
+    }
+    (root, segments)
+}
+
+fn transparent_definition(schema: &Schema, mut cursor: Cursor) -> Cursor {
+    loop {
+        let Cursor::Definition(name) = &cursor else {
+            return cursor;
+        };
+        let Some(Definition {
+            shape: Shape::Struct(fields),
+            ..
+        }) = schema.definitions.get(name)
+        else {
+            return cursor;
+        };
+        if fields.len() != 1 || fields[0].rust_name.is_some() {
+            return cursor;
+        }
+        cursor = Cursor::Value(fields[0].ty.clone());
+    }
+}
+
+fn value_definition(schema: &Schema, value: &Type) -> Option<String> {
+    let name = type_name(value)?;
+    schema.definitions.contains_key(&name).then_some(name)
+}
+
+fn select_variant(
+    schema: &Schema,
+    definition: &str,
+    selector: &Segment,
+) -> Option<(String, Variant)> {
+    fn visit(
+        schema: &Schema,
+        definition: &str,
+        selector: &Segment,
+        visited: &mut BTreeSet<String>,
+    ) -> Vec<(String, Variant)> {
+        if !visited.insert(definition.to_owned()) {
+            return Vec::new();
+        }
+        let Some(definition_shape) = schema.definitions.get(definition) else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        match &definition_shape.shape {
+            Shape::Enum(variants) => {
+                matches.extend(
+                    variants
+                        .iter()
+                        .filter(|variant| match selector {
+                            Segment::RustVariant(name) => variant.rust_name == *name,
+                            Segment::WireVariant(name) => variant.wire_name == *name,
+                            Segment::Field(_) => false,
+                        })
+                        .cloned()
+                        .map(|variant| (definition.to_owned(), variant)),
+                );
+                for variant in variants {
+                    if variant.fields.len() == 1
+                        && variant.fields[0].rust_name.is_none()
+                        && let Some(payload) = value_definition(schema, &variant.fields[0].ty)
+                    {
+                        matches.extend(visit(schema, &payload, selector, visited));
+                    }
+                }
+            }
+            Shape::Struct(fields) => {
+                for field in fields {
+                    if let Some(payload) = value_definition(schema, &field.ty) {
+                        matches.extend(visit(schema, &payload, selector, visited));
+                    }
+                }
+            }
+        }
+        matches
     }
 
-    fn expand(
-        definitions: &BTreeMap<String, Definition>,
-        owner: &str,
-        prefix: &str,
-        depth: usize,
-        output: &mut BTreeSet<String>,
-    ) {
-        if depth > 8
-            || matches!(
-                owner,
-                "TypedValue"
-                    | "TypedValueMaterial"
-                    | "TypedValueMaterialV1"
-                    | "BoundedInlineBytes"
-                    | "CanonicalNumber"
-            )
-        {
-            return;
+    let matches = visit(schema, definition, selector, &mut BTreeSet::new());
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn resolve_expression(
+    schema: &Schema,
+    structural: &BTreeMap<String, String>,
+    expression: &str,
+) -> Result<(Member, BTreeSet<Member>), String> {
+    let (logical_root, segments) = tokenize(expression);
+    let root = structural
+        .get(&logical_root)
+        .cloned()
+        .unwrap_or(logical_root);
+    let mut cursor = Cursor::Definition(root);
+    let mut terminal = None;
+    let mut traversed = BTreeSet::new();
+    let mut index = 0;
+    while index < segments.len() {
+        cursor = transparent_definition(schema, cursor);
+        if let Cursor::Value(value) = &cursor {
+            let Some(definition) = value_definition(schema, value) else {
+                return Err(format!(
+                    "{expression}: primitive value has trailing segment {:?}",
+                    segments[index]
+                ));
+            };
+            cursor = Cursor::Definition(definition);
+            continue;
         }
-        let Some(definition) = definitions.get(owner) else {
-            return;
-        };
-        match definition {
-            Definition::Struct(fields) => {
-                for field in fields {
-                    let Some(name) = &field.name else {
-                        continue;
-                    };
-                    for separator in [".", "[]."] {
-                        let child_prefix = format!("{prefix}{separator}{name}");
-                        output.insert(child_prefix.clone());
-                        for dependency in &field.dependencies {
-                            if definitions.contains_key(dependency) {
-                                expand(definitions, dependency, &child_prefix, depth + 1, output);
-                            }
-                        }
-                    }
+        match (&cursor, &segments[index]) {
+            (Cursor::Definition(definition), selector @ Segment::RustVariant(_))
+            | (Cursor::Definition(definition), selector @ Segment::WireVariant(_)) => {
+                let (owner, variant) = select_variant(schema, definition, selector)
+                    .ok_or_else(|| format!("{expression}: unknown variant {selector:?}"))?;
+                let member = Member::variant(&owner, &variant.rust_name);
+                traversed.insert(member.clone());
+                terminal = Some(member);
+                cursor = Cursor::Variant {
+                    definition: owner,
+                    variant,
+                };
+                index += 1;
+            }
+            (Cursor::Definition(definition), Segment::Field(name)) => {
+                let Some(owner) = schema.definitions.get(definition) else {
+                    return Err(format!("{expression}: unknown definition {definition}"));
+                };
+                let Shape::Struct(fields) = &owner.shape else {
+                    return Err(format!("{expression}: enum field requires a branch"));
+                };
+                if let Some(field) = fields
+                    .iter()
+                    .find(|field| field.wire_name.as_deref() == Some(name))
+                {
+                    let field_name = field.rust_name.as_deref().unwrap_or(name);
+                    let member = Member::field(definition, field_name);
+                    traversed.insert(member.clone());
+                    terminal = Some(member);
+                    cursor = Cursor::Value(field.ty.clone());
+                    index += 1;
+                } else if schema
+                    .extension_fields
+                    .get(definition)
+                    .is_some_and(|fields| fields.contains(name))
+                {
+                    let member = Member::field(definition, name);
+                    traversed.insert(member.clone());
+                    terminal = Some(member);
+                    index += 1;
+                } else {
+                    return Err(format!("{expression}: unknown field {definition}.{name}"));
                 }
             }
-            Definition::Enum(variants) => {
-                for variant in variants {
-                    let variant_prefix = format!("{prefix}::{}", variant.name);
-                    output.insert(variant_prefix.clone());
-                    for field in &variant.fields {
-                        if let Some(name) = &field.name {
-                            let child_prefix = format!("{variant_prefix}.{name}");
-                            output.insert(child_prefix.clone());
-                            for dependency in &field.dependencies {
-                                if definitions.contains_key(dependency) {
-                                    expand(
-                                        definitions,
-                                        dependency,
-                                        &child_prefix,
-                                        depth + 1,
-                                        output,
-                                    );
-                                }
-                            }
-                        } else {
-                            for dependency in &field.dependencies {
-                                if definitions.contains_key(dependency) {
-                                    expand(
-                                        definitions,
-                                        dependency,
-                                        &variant_prefix,
-                                        depth + 1,
-                                        output,
-                                    );
-                                }
-                            }
-                        }
-                    }
+            (
+                Cursor::Variant {
+                    definition,
+                    variant,
+                },
+                Segment::Field(name),
+            ) if name == "kind" => {
+                let member = Member::variant(definition, &variant.rust_name);
+                traversed.insert(member.clone());
+                terminal = Some(member);
+                index += 1;
+            }
+            (
+                Cursor::Variant {
+                    definition,
+                    variant,
+                },
+                Segment::Field(name),
+            ) if name == "value" => {
+                if index + 1 == segments.len() {
+                    let member = Member::variant_field(definition, &variant.rust_name, "value");
+                    traversed.insert(member.clone());
+                    terminal = Some(member);
+                    index += 1;
+                } else if variant.fields.len() == 1 && variant.fields[0].rust_name.is_none() {
+                    traversed.insert(Member::variant_field(
+                        definition,
+                        &variant.rust_name,
+                        "value",
+                    ));
+                    cursor = Cursor::Value(variant.fields[0].ty.clone());
+                    index += 1;
+                } else {
+                    index += 1;
                 }
             }
+            (
+                Cursor::Variant {
+                    definition,
+                    variant,
+                },
+                Segment::Field(name),
+            ) => {
+                if let Some(field) = variant
+                    .fields
+                    .iter()
+                    .find(|field| field.wire_name.as_deref() == Some(name))
+                {
+                    let member = Member::variant_field(
+                        definition,
+                        &variant.rust_name,
+                        field.rust_name.as_deref().unwrap_or(name),
+                    );
+                    traversed.insert(member.clone());
+                    terminal = Some(member);
+                    cursor = Cursor::Value(field.ty.clone());
+                    index += 1;
+                } else if variant.fields.len() == 1 && variant.fields[0].rust_name.is_none() {
+                    cursor = Cursor::Value(variant.fields[0].ty.clone());
+                } else {
+                    return Err(format!(
+                        "{expression}: unknown branch field {definition}::{}.{name}",
+                        variant.rust_name
+                    ));
+                }
+            }
+            (_, segment) => {
+                return Err(format!("{expression}: cannot resolve segment {segment:?}"));
+            }
+        }
+    }
+    terminal
+        .map(|terminal| (terminal, traversed))
+        .ok_or_else(|| format!("{expression}: expression has no material member"))
+}
+
+fn declared_members(
+    schema: &Schema,
+    definitions: &BTreeSet<String>,
+    tagged_values: bool,
+) -> BTreeSet<Member> {
+    fn serializes_as_variant_value(schema: &Schema, ty: &Type) -> bool {
+        match ty {
+            Type::Tuple(tuple) => !tuple.elems.is_empty(),
+            Type::Path(TypePath { path, .. }) => {
+                let Some(segment) = path.segments.last() else {
+                    return false;
+                };
+                if matches!(
+                    segment.ident.to_string().as_str(),
+                    "Vec" | "BTreeMap" | "BTreeSet" | "Option"
+                ) {
+                    return true;
+                }
+                let name = segment.ident.to_string();
+                match schema
+                    .definitions
+                    .get(&name)
+                    .map(|definition| &definition.shape)
+                {
+                    Some(Shape::Struct(fields))
+                        if fields.len() == 1 && fields[0].rust_name.is_none() =>
+                    {
+                        serializes_as_variant_value(schema, &fields[0].ty)
+                    }
+                    Some(_) => false,
+                    None => true,
+                }
+            }
+            Type::Array(_) | Type::Slice(_) => true,
+            Type::Group(value) => serializes_as_variant_value(schema, &value.elem),
+            Type::Paren(value) => serializes_as_variant_value(schema, &value.elem),
+            Type::Reference(value) => serializes_as_variant_value(schema, &value.elem),
+            _ => true,
         }
     }
 
     let mut output = BTreeSet::new();
-    for root in definitions.keys() {
-        expand(&definitions, root, root, 0, &mut output);
-    }
-    output
-        .into_iter()
-        .map(|owner| {
-            owner
-                .replace("ValueContractField.", "Field.")
-                .replace("ValueObjectContract.", "NamedObject.")
-        })
-        .collect()
-}
-
-fn manifest_inventory() -> BTreeSet<String> {
-    canonical_projection_owner_manifest()
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let columns = line.split('|').collect::<Vec<_>>();
-            (columns[3] == "normalized").then(|| columns[0].to_owned())
-        })
-        .collect()
-}
-
-fn canonical_material_inventory() -> BTreeMap<String, BTreeSet<String>> {
-    let mut definitions = BTreeMap::new();
-    collect_definitions(include_str!("../src/canonical.rs"), &mut definitions);
-    collect_definitions(include_str!("../src/source.rs"), &mut definitions);
-    collect_definitions(include_str!("../src/model.rs"), &mut definitions);
-    let mut inline_payloads = BTreeSet::new();
-    for definition in definitions.values() {
-        if let Definition::Enum(variants) = definition {
-            for variant in variants {
-                if variant.fields.len() == 1 && variant.fields[0].name.is_none() {
-                    for dependency in &variant.fields[0].dependencies {
-                        if definitions.contains_key(dependency) {
-                            inline_payloads.insert(dependency.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn visit(
-        definitions: &BTreeMap<String, Definition>,
-        inline_payloads: &BTreeSet<String>,
-        definition_name: &str,
-        owner_name: &str,
-        identity_name: &str,
-        depth: usize,
-        visited: &mut BTreeSet<(String, String, String)>,
-        output: &mut BTreeMap<String, BTreeSet<String>>,
-    ) {
-        if depth > 8 {
-            return;
-        }
-        if !visited.insert((
-            definition_name.to_owned(),
-            owner_name.to_owned(),
-            identity_name.to_owned(),
-        )) {
-            return;
-        }
-        let Some(definition) = definitions.get(definition_name) else {
-            return;
+    for name in definitions {
+        let Some(definition) = schema.definitions.get(name) else {
+            continue;
         };
-        match definition {
-            Definition::Struct(fields) => {
-                if fields.len() == 1 && fields[0].name.is_none() {
-                    for dependency in &fields[0].dependencies {
-                        if definitions.contains_key(dependency) {
-                            visit(
-                                definitions,
-                                inline_payloads,
-                                dependency,
-                                owner_name,
-                                identity_name,
-                                depth + 1,
-                                visited,
-                                output,
-                            );
-                        }
-                    }
-                    return;
-                }
-                for field in fields {
-                    let Some(name) = &field.wire_name else {
-                        continue;
-                    };
-                    output
-                        .entry(format!("{identity_name}.{name}"))
-                        .or_default()
-                        .insert(format!("{owner_name}.{name}"));
-                    for dependency in &field.dependencies {
-                        if definitions.contains_key(dependency)
-                            && !inline_payloads.contains(dependency)
-                        {
-                            visit(
-                                definitions,
-                                inline_payloads,
-                                dependency,
-                                dependency,
-                                dependency,
-                                depth + 1,
-                                visited,
-                                output,
-                            );
-                            for nested_owner in [
-                                format!("{owner_name}.{name}"),
-                                format!("{owner_name}.{name}[]"),
-                            ] {
-                                visit(
-                                    definitions,
-                                    inline_payloads,
-                                    dependency,
-                                    &nested_owner,
-                                    dependency,
-                                    depth + 1,
-                                    visited,
-                                    output,
-                                );
-                            }
-                        }
-                    }
-                }
+        match &definition.shape {
+            Shape::Struct(fields) => {
+                output.extend(fields.iter().filter_map(|field| {
+                    field
+                        .rust_name
+                        .as_deref()
+                        .map(|field| Member::field(name, field))
+                }));
             }
-            Definition::Enum(variants) => {
+            Shape::Enum(variants) => {
                 for variant in variants {
-                    let variant_owner = format!("{owner_name}{{kind={}}}", variant.wire_name);
-                    output
-                        .entry(format!(
-                            "{identity_name}{{kind={}}}.kind",
-                            variant.wire_name
-                        ))
-                        .or_default()
-                        .insert(format!("{variant_owner}.kind"));
+                    let flattened_enum = variant.fields.len() == 1
+                        && variant.fields[0].rust_name.is_none()
+                        && matches!(
+                            &variant.fields[0].ty,
+                            Type::Path(TypePath { path, .. })
+                                if path.segments.last().is_some_and(|segment| {
+                                    matches!(segment.arguments, PathArguments::None)
+                                        && schema.definitions.get(&segment.ident.to_string()).is_some_and(
+                                            |definition| matches!(definition.shape, Shape::Enum(_))
+                                        )
+                                })
+                        );
+                    if flattened_enum {
+                        continue;
+                    }
+                    output.insert(Member::variant(name, &variant.rust_name));
                     for field in &variant.fields {
-                        if let Some(name) = &field.wire_name {
-                            output
-                                .entry(format!(
-                                    "{identity_name}{{kind={}}}.value.{name}",
-                                    variant.wire_name
-                                ))
-                                .or_default()
-                                .insert(format!("{variant_owner}.value.{name}"));
-                            for dependency in &field.dependencies {
-                                if definitions.contains_key(dependency)
-                                    && !inline_payloads.contains(dependency)
-                                {
-                                    visit(
-                                        definitions,
-                                        inline_payloads,
-                                        dependency,
-                                        dependency,
-                                        dependency,
-                                        depth + 1,
-                                        visited,
-                                        output,
-                                    );
-                                    visit(
-                                        definitions,
-                                        inline_payloads,
-                                        dependency,
-                                        &format!("{variant_owner}.value.{name}"),
-                                        dependency,
-                                        depth + 1,
-                                        visited,
-                                        output,
-                                    );
-                                }
-                            }
-                        } else {
-                            if matches!(definition_name, "TypedValueMaterial" | "ValueTypeMaterial")
-                            {
-                                output
-                                    .entry(format!(
-                                        "{identity_name}{{kind={}}}.value",
-                                        variant.wire_name
-                                    ))
-                                    .or_default()
-                                    .insert(format!("{variant_owner}.value"));
-                            }
-                            for dependency in &field.dependencies {
-                                let Some(payload) = definitions.get(dependency) else {
-                                    continue;
-                                };
-                                match payload {
-                                    Definition::Struct(fields) => {
-                                        if fields.len() == 1 && fields[0].name.is_none() {
-                                            visit(
-                                                definitions,
-                                                inline_payloads,
-                                                dependency,
-                                                &variant_owner,
-                                                dependency,
-                                                depth + 1,
-                                                visited,
-                                                output,
-                                            );
-                                            continue;
-                                        }
-                                        for field in fields {
-                                            let Some(name) = &field.wire_name else {
-                                                continue;
-                                            };
-                                            output
-                                                .entry(format!("{dependency}.{name}"))
-                                                .or_default()
-                                                .insert(format!("{variant_owner}.value.{name}"));
-                                            for dependency in &field.dependencies {
-                                                if definitions.contains_key(dependency)
-                                                    && !inline_payloads.contains(dependency)
-                                                {
-                                                    visit(
-                                                        definitions,
-                                                        inline_payloads,
-                                                        dependency,
-                                                        dependency,
-                                                        dependency,
-                                                        depth + 1,
-                                                        visited,
-                                                        output,
-                                                    );
-                                                    visit(
-                                                        definitions,
-                                                        inline_payloads,
-                                                        dependency,
-                                                        &format!("{variant_owner}.value.{name}"),
-                                                        dependency,
-                                                        depth + 1,
-                                                        visited,
-                                                        output,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Definition::Enum(_) => visit(
-                                        definitions,
-                                        inline_payloads,
-                                        dependency,
-                                        owner_name,
-                                        identity_name,
-                                        depth + 1,
-                                        visited,
-                                        output,
-                                    ),
-                                }
-                            }
+                        if let Some(field) = &field.rust_name {
+                            output.insert(Member::variant_field(name, &variant.rust_name, field));
+                        } else if (tagged_values
+                            && !matches!(&field.ty, Type::Tuple(tuple) if tuple.elems.is_empty()))
+                            || serializes_as_variant_value(schema, &field.ty)
+                        {
+                            output.insert(Member::variant_field(name, &variant.rust_name, "value"));
                         }
                     }
                 }
             }
         }
     }
-
-    let mut output = BTreeMap::new();
-    let mut visited = BTreeSet::new();
-    for root in [
-        "SourceRecordMaterialV1",
-        "SemanticMaterialV1",
-        "ProvenanceMaterialV1",
-        "ValueContractMaterialV1",
-    ] {
-        visit(
-            &definitions,
-            &inline_payloads,
-            root,
-            root,
-            root,
-            0,
-            &mut visited,
-            &mut output,
-        );
-    }
     output
 }
 
-fn canonical_manifest_inventory() -> BTreeSet<String> {
+struct MappingRow<'a> {
+    owner: &'a str,
+    domain: &'a str,
+    path: &'a str,
+    owner_class: &'a str,
+}
+
+fn mapping_rows() -> Vec<MappingRow<'static>> {
     canonical_projection_owner_manifest()
         .lines()
         .skip(1)
-        .map(|line| line.split('|').nth(2).unwrap().to_owned())
+        .map(|line| {
+            let columns = line.split('|').collect::<Vec<_>>();
+            MappingRow {
+                owner: columns[0],
+                domain: columns[1],
+                path: columns[2],
+                owner_class: columns[3],
+            }
+        })
         .collect()
 }
 
 #[test]
-fn normalized_owner_inventory_is_generated_from_the_real_rust_schema() {
-    let implementation = implementation_inventory();
-    let expanded = recursively_expanded_inventory();
-    let manifest = manifest_inventory();
-    let missing = implementation.difference(&manifest).collect::<Vec<_>>();
-    let stale = manifest
-        .difference(&implementation)
-        .filter(|owner| !expanded.contains(*owner))
+fn schema_generated_owner_to_path_mapping_is_exact_and_bidirectional() {
+    let rows = mapping_rows();
+    let normalized = normalized_schema();
+    let material = material_schema();
+    let owner_expressions = rows
+        .iter()
+        .filter(|row| row.owner_class == "normalized")
+        .map(|row| row.owner)
+        .collect::<Vec<_>>();
+    let material_expressions = rows.iter().map(|row| row.path).collect::<Vec<_>>();
+    let normalized_roots = structural_roots(&normalized, &owner_expressions);
+    let material_roots = structural_roots(&material, &material_expressions);
+
+    let mut exact_pairs = BTreeSet::new();
+    let mut normalized_members = BTreeSet::new();
+    let mut material_members = BTreeSet::new();
+    for row in &rows {
+        let (_material_member, material_trace) =
+            resolve_expression(&material, &material_roots, row.path)
+                .unwrap_or_else(|error| panic!("{error}"));
+        material_members.extend(material_trace);
+        if row.owner_class == "normalized" {
+            let (_normalized_member, normalized_trace) =
+                resolve_expression(&normalized, &normalized_roots, row.owner)
+                    .unwrap_or_else(|error| panic!("{error}"));
+            normalized_members.extend(normalized_trace);
+            assert!(exact_pairs.insert((row.owner, row.domain, row.path)));
+        }
+    }
+
+    let normalized_definitions = normalized_members
+        .iter()
+        .map(|member| member.definition.clone())
+        .collect::<BTreeSet<_>>();
+    let material_definitions = material_members
+        .iter()
+        .map(|member| member.definition.clone())
+        .collect::<BTreeSet<_>>();
+    let declared_normalized = declared_members(&normalized, &normalized_definitions, false);
+    let mut declared_normalized = declared_normalized;
+    declared_normalized.extend(
+        normalized_members
+            .iter()
+            .filter(|member| {
+                normalized
+                    .extension_fields
+                    .get(&member.definition)
+                    .is_some_and(|fields| fields.contains(&member.member))
+            })
+            .cloned(),
+    );
+    let missing_normalized = declared_normalized
+        .difference(&normalized_members)
+        .collect::<Vec<_>>();
+    let stale_normalized = normalized_members
+        .difference(&declared_normalized)
         .collect::<Vec<_>>();
     assert!(
-        missing.is_empty() && stale.is_empty(),
-        "missing from ADR: {missing:#?}\nstale in ADR: {stale:#?}"
+        missing_normalized.is_empty() && stale_normalized.is_empty(),
+        "normalized declaration members and mapped owners diverged\nmissing: {missing_normalized:#?}\nstale: {stale_normalized:#?}"
+    );
+
+    let declared_material = declared_members(&material, &material_definitions, true);
+    let missing_material = declared_material
+        .difference(&material_members)
+        .collect::<Vec<_>>();
+    let stale_material = material_members
+        .difference(&declared_material)
+        .collect::<Vec<_>>();
+    assert!(
+        missing_material.is_empty() && stale_material.is_empty(),
+        "generated material declarations and mapped paths diverged\nmissing: {missing_material:#?}\nstale: {stale_material:#?}"
     );
 }
 
 #[test]
-fn canonical_member_inventory_is_generated_from_the_material_declarations() {
-    let implementation = canonical_material_inventory();
-    let manifest = canonical_manifest_inventory();
-    let missing = implementation
-        .iter()
-        .filter(|(member, paths)| {
-            if manifest.contains(*member)
-                || !paths.is_disjoint(&manifest)
-                || paths.iter().any(|path| {
-                    manifest.iter().any(|candidate| {
-                        candidate.starts_with(&format!("{path}."))
-                            || candidate.starts_with(&format!("{path}[]"))
-                    })
-                })
-            {
-                return false;
-            }
-            let adapters = paths
-                .iter()
-                .flat_map(|path| {
-                    [
-                        path.replace("ImmutableRepositoryMaterialV1", "ImmutableRepository"),
-                        path.replace("NpmIntegrityMaterialV1", "NpmIntegrity"),
-                        path.replace("ValueScalarMaterial{", "ValueScalarMaterialV1{"),
-                        path.replace("ValueTypeMaterial{", "ValueTypeMaterialV1{"),
-                        path.replace(
-                            "ResolvedFactOriginMaterialV1.origin{",
-                            "ResolvedFactOriginMaterialV1{",
-                        ),
-                        path.replace("ResolvedFactOriginV1{", "ResolvedFactOriginMaterialV1{"),
-                    ]
-                })
-                .collect::<BTreeSet<_>>();
-            if !adapters.is_disjoint(&manifest) {
-                return false;
-            }
-            match member.as_str() {
-                "HttpsMaterialV1{kind=https}.kind" => {
-                    !manifest.contains("SemanticOriginMaterialV1.scheme")
-                }
-                "NpmIntegrityAlgorithmMaterialV1{kind=sha512}.kind" => {
-                    !manifest.contains("NpmIntegrity.algorithm")
-                }
-                "ProvenanceConnectorIdentity.id" => {
-                    !manifest.contains("SemanticMaterialV1.connector.id")
-                }
-                "ProvenanceConnectorIdentity.version" => {
-                    !manifest.contains("SemanticMaterialV1.connector.version")
-                }
-                "ProvenanceMaterialV1.artifacts" => !manifest
-                    .iter()
-                    .any(|path| path.starts_with("ArtifactDecisionMaterialV1.")),
-                "ProvenanceMaterialV1.sources" => !manifest
-                    .iter()
-                    .any(|path| path.starts_with("SourceIdentityMaterialV1.")),
-                _ => true,
-            }
-        })
-        .collect::<Vec<_>>();
+fn projection_schema_macro_is_the_only_material_declaration_source() {
+    let implementation = include_str!("../src/canonical.rs");
+    assert!(implementation.contains("macro_rules! projection_schema"));
+    let generated = collect_schema(CANONICAL_PROJECTION_SCHEMA_DECLARATIONS);
     assert!(
-        missing.is_empty(),
-        "canonical material members missing from ADR: {missing:#?}"
+        generated
+            .definitions
+            .values()
+            .any(|definition| definition.public),
+        "projection schema emitted no public hash-domain root"
     );
-    let implementation_paths = implementation
-        .values()
-        .flatten()
-        .chain(implementation.keys())
-        .flat_map(|path| {
-            [
-                path.clone(),
-                path.replace("ImmutableRepositoryMaterialV1", "ImmutableRepository"),
-                path.replace("NpmIntegrityMaterialV1", "NpmIntegrity"),
-                path.replace("ValueScalarMaterial{", "ValueScalarMaterialV1{"),
-                path.replace("ValueTypeMaterial{", "ValueTypeMaterialV1{"),
-                path.replace(
-                    "ResolvedFactOriginMaterialV1.origin{",
-                    "ResolvedFactOriginMaterialV1{",
-                ),
-                path.replace("ResolvedFactOriginV1{", "ResolvedFactOriginMaterialV1{"),
-            ]
-        })
-        .collect::<BTreeSet<_>>();
-    let stale = manifest
-        .iter()
-        .filter(|candidate| {
-            !implementation_paths.iter().any(|path| {
-                path == *candidate
-                    || candidate.starts_with(&format!("{path}."))
-                    || candidate.starts_with(&format!("{path}[]"))
-            })
-        })
-        .collect::<Vec<_>>();
+
+    let prefix = implementation
+        .split("projection_schema! {")
+        .next()
+        .expect("projection schema invocation exists");
+    let suffix = implementation
+        .split_once("\nfn deserialize_value_contract_material")
+        .expect("projection declarations precede their decoders")
+        .1;
     assert!(
-        stale.is_empty(),
-        "ADR canonical paths absent from the material declarations: {stale:#?}"
+        !prefix.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("struct ")
+                || line.starts_with("pub struct ")
+                || line.starts_with("enum "))
+                && (line.contains("Material") || line.contains("Projection"))
+        }),
+        "closed material declaration escaped the schema"
+    );
+    assert!(
+        !suffix.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("struct ") || line.starts_with("pub struct "))
+                && line.contains("MaterialV1")
+        }),
+        "closed material declaration escaped the schema"
     );
 }

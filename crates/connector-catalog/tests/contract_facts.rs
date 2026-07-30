@@ -40,24 +40,24 @@ fn resolve_policy(
 #[test]
 fn contract_fact_origins_are_closed_and_non_substitutable() {
     let record = load("provider-contract-record.yaml");
-    let fact = &record.provider_contracts[0].facts[0];
+    let fact = &record.provider_contracts()[0].facts()[0];
     assert!(matches!(fact, ContractFact::ProviderEvidence { .. }));
 }
 
 #[test]
 fn provider_contract_reference_requires_matching_record_and_facts() {
     let record = load("provider-contract-record.yaml");
-    let SourceSubject::ProviderArtifact(provider) = record.subject else {
+    let SourceSubject::ProviderArtifact(provider) = record.subject() else {
         panic!("fixture must be provider evidence");
     };
-    assert_eq!(provider.evidence[0].facts.len(), 1);
+    assert_eq!(provider.evidence()[0].facts().len(), 1);
 }
 
 #[test]
 fn donat_policy_cannot_satisfy_required_provider_evidence() {
     let record = load("provider-contract-record.yaml");
     assert!(!matches!(
-        record.provider_contracts[0].facts[0],
+        record.provider_contracts()[0].facts()[0],
         ContractFact::DonatPolicy { .. }
     ));
 }
@@ -66,7 +66,7 @@ fn donat_policy_cannot_satisfy_required_provider_evidence() {
 fn provider_evidence_acceptance_is_closed_and_non_executable() {
     let record = load("provider-contract-record.yaml");
     assert!(matches!(
-        record.admission,
+        record.admission(),
         donat_connector_catalog::AdmissionState::EvidenceAccepted { .. }
     ));
 }
@@ -74,11 +74,11 @@ fn provider_evidence_acceptance_is_closed_and_non_executable() {
 #[test]
 fn resolved_fact_use_sites_are_unique_and_equal_across_domains() {
     let values = vec![ResolvedFactValue {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
     let origins = vec![ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
             value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
@@ -96,11 +96,11 @@ fn resolved_fact_use_sites_are_unique_and_equal_across_domains() {
 
     let duplicate = vec![
         ResolvedFactValue {
-            use_site: "effect.request.binding".to_owned(),
+            use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
             value: TypedValue::String("first".to_owned()),
         },
         ResolvedFactValue {
-            use_site: "effect.request.binding".to_owned(),
+            use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
             value: TypedValue::String("second".to_owned()),
         },
     ];
@@ -116,11 +116,11 @@ fn resolved_fact_use_sites_are_unique_and_equal_across_domains() {
 #[test]
 fn origin_only_mutation_preserves_semantic_hash() {
     let values = vec![ResolvedFactValue {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
     let origin = |policy| ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::parse(policy).unwrap(),
             value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
@@ -155,7 +155,7 @@ fn origin_only_mutation_preserves_semantic_hash() {
 #[test]
 fn value_only_mutation_is_rejected_before_origin_material_exists() {
     let origin = ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
             value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")
@@ -164,7 +164,7 @@ fn value_only_mutation_is_rejected_before_origin_material_exists() {
     };
     let values = |value: &str| {
         vec![ResolvedFactValue {
-            use_site: "effect.request.binding".to_owned(),
+            use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
             value: TypedValue::String(value.to_owned()),
         }]
     };
@@ -185,11 +185,11 @@ fn value_only_mutation_is_rejected_before_origin_material_exists() {
 #[test]
 fn contract_fact_semantic_and_provenance_hashes_are_separate() {
     let values = vec![ResolvedFactValue {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         value: TypedValue::String("Idempotency-Key".to_owned()),
     }];
     let origins = vec![ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id: DonatPolicyId::literal("policy.idempotency.header"),
             value: donat_connector_catalog::TypedValueMaterialV1::string("Idempotency-Key")

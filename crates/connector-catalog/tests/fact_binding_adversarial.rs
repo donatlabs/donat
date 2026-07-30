@@ -25,7 +25,7 @@ fn catalog() -> AcceptedRecordCatalog {
 
 fn provider_origin() -> ResolvedContractFactBinding {
     ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.scope".to_owned(),
         fact: ContractFact::ProviderEvidence {
             source_record_id: SourceRecordId::literal("source.demo.provider.v1"),
             fact_id: donat_connector_catalog::ProviderFactId::literal("fact.idempotency"),
@@ -35,7 +35,7 @@ fn provider_origin() -> ResolvedContractFactBinding {
 
 fn semantic(value: &str) -> Vec<ResolvedFactValue> {
     vec![ResolvedFactValue {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.scope".to_owned(),
         value: TypedValue::String(value.to_owned()),
     }]
 }
@@ -89,15 +89,19 @@ fn reviewed_policy_registry_value_is_exact_and_non_substitutable() {
     let catalog = catalog();
     let policy_id = DonatPolicyId::literal("policy.idempotency.header");
     let policy_origin = ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned(),
         fact: ContractFact::DonatPolicy {
             policy_id,
             value: TypedValueMaterialV1::string("Idempotency-Key").unwrap(),
         },
     };
     let policies = BTreeMap::from([(policy_id, TypedValue::String("Idempotency-Key".to_owned()))]);
+    let policy_semantic = vec![ResolvedFactValue {
+        use_site: policy_origin.use_site.clone(),
+        value: TypedValue::String("Idempotency-Key".to_owned()),
+    }];
     resolve_fact_bindings(
-        &semantic("Idempotency-Key"),
+        &policy_semantic,
         std::slice::from_ref(&policy_origin),
         &catalog,
         &policies,
@@ -106,7 +110,7 @@ fn reviewed_policy_registry_value_is_exact_and_non_substitutable() {
 
     assert_eq!(
         resolve_fact_bindings(
-            &semantic("Idempotency-Key"),
+            &policy_semantic,
             &[policy_origin],
             &catalog,
             &BTreeMap::new(),
@@ -114,5 +118,53 @@ fn reviewed_policy_registry_value_is_exact_and_non_substitutable() {
         .unwrap_err()
         .code(),
         "catalog_fact_origin_unresolved"
+    );
+}
+
+#[test]
+fn required_provider_and_policy_domains_reject_equal_value_substitution() {
+    let catalog = catalog();
+    let policy_id = DonatPolicyId::literal("policy.same.value");
+    let policy = BTreeMap::from([(policy_id, TypedValue::String("Idempotency-Key".to_owned()))]);
+    let policy_at_provider_site = ResolvedContractFactBinding {
+        use_site: "operation.get.step.request.idempotency.scope".to_owned(),
+        fact: ContractFact::DonatPolicy {
+            policy_id,
+            value: TypedValueMaterialV1::string("Idempotency-Key").unwrap(),
+        },
+    };
+    let provider_value = vec![ResolvedFactValue {
+        use_site: policy_at_provider_site.use_site.clone(),
+        value: TypedValue::String("Idempotency-Key".to_owned()),
+    }];
+    assert_eq!(
+        resolve_fact_bindings(
+            &provider_value,
+            &[policy_at_provider_site],
+            &catalog,
+            &policy,
+        )
+        .unwrap_err()
+        .code(),
+        "catalog_fact_binding_mismatch"
+    );
+
+    let mut provider_at_policy_site = provider_origin();
+    provider_at_policy_site.use_site =
+        "operation.get.step.request.idempotency.clock_safety_margin_ms".to_owned();
+    let policy_value = vec![ResolvedFactValue {
+        use_site: provider_at_policy_site.use_site.clone(),
+        value: TypedValue::String("Idempotency-Key".to_owned()),
+    }];
+    assert_eq!(
+        resolve_fact_bindings(
+            &policy_value,
+            &[provider_at_policy_site],
+            &catalog,
+            &BTreeMap::new(),
+        )
+        .unwrap_err()
+        .code(),
+        "catalog_fact_binding_mismatch"
     );
 }

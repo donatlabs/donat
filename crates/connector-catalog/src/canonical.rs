@@ -58,6 +58,18 @@ fn domain_hash_bytes(domain: CatalogHashDomain, canonical_bytes: &[u8]) -> [u8; 
     hash.finalize().into()
 }
 
+macro_rules! projection_schema {
+    ($($declaration:item)*) => {
+        $($declaration)*
+
+        /// The exact declaration descriptor that generated every closed
+        /// canonical material type.
+        pub const CANONICAL_PROJECTION_SCHEMA_DECLARATIONS: &str =
+            stringify!($($declaration)*);
+    };
+}
+
+projection_schema! {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
@@ -78,8 +90,8 @@ struct ExactNpmMaterialV1 {
     name: String,
     version: String,
     tarball_url: String,
-    integrity: NpmIntegrityMaterialV1,
-    repository: ImmutableRepositoryMaterialV1,
+    integrity: NpmIntegrity,
+    repository: ImmutableRepository,
     npm_git_head: String,
     package_repository: String,
     signature: NpmSignatureMaterialV1,
@@ -92,7 +104,7 @@ struct ExactNpmMaterialV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NpmIntegrityMaterialV1 {
+struct NpmIntegrity {
     algorithm: NpmIntegrityAlgorithmMaterialV1,
     digest: String,
 }
@@ -110,7 +122,7 @@ enum NpmIntegrityAlgorithmMaterialV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ImmutableRepositoryMaterialV1 {
+struct ImmutableRepository {
     url: String,
     commit: String,
     tree: String,
@@ -466,6 +478,31 @@ struct SafetyFindingMaterialV1 {
 /// let _: SourceRecordMaterialV1 = serde_json::from_str("{}").unwrap();
 /// ```
 pub struct SourceRecordMaterialV1 {
+    record_version: u32,
+    record_id: String,
+    subject: SourceSubjectMaterialV1,
+    reacquisition: ReacquisitionMaterialV1,
+    artifact_hashes: Vec<ArtifactHashMaterialV1>,
+    license: LicenseDecisionMaterialV1,
+    notice: NoticeMaterialV1,
+    entrypoints: Vec<String>,
+    dependencies: Vec<DependencyDecisionMaterialV1>,
+    embedded_material: Vec<EmbeddedDecisionMaterialV1>,
+    provider_contracts: Vec<ProviderContractMaterialV1>,
+    compatibility: CompatibilityMaterialV1,
+    admission: AdmissionMaterialV1,
+    safety_findings: SafetyFindingsMaterialV1,
+    reviewer: String,
+    approval_date: String,
+    proposed_manifest: Option<String>,
+    proposed_destinations: Vec<String>,
+    red_tests: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceRecordMaterialDto {
     record_version: u32,
     record_id: String,
     subject: SourceSubjectMaterialV1,
@@ -1104,7 +1141,7 @@ struct ResolvedContractFactBindingDto {
     fact: ContractFact,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticConnectorMaterialV1 {
     api_identity: String,
@@ -1125,6 +1162,19 @@ pub struct SemanticConnectorMaterialV1 {
 /// use donat_connector_catalog::SemanticOperationMaterialV1;
 /// ```
 pub struct SemanticMaterialV1 {
+    canonical_schema_epoch: u32,
+    connector: SemanticConnectorMaterialV1,
+    credentials: Vec<SemanticCredentialMaterialV1>,
+    operations: Vec<SemanticOperationMaterialV1>,
+    origins: Vec<SemanticOriginMaterialV1>,
+    triggers: Vec<SemanticTriggerMaterialV1>,
+    value_language_epoch: u32,
+}
+
+#[cfg(test)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticMaterialDto {
     canonical_schema_epoch: u32,
     connector: SemanticConnectorMaterialV1,
     credentials: Vec<SemanticCredentialMaterialV1>,
@@ -1195,7 +1245,7 @@ struct ProviderEvidenceOriginFactMaterialV1 {
     location: ExactFactLocationMaterialV1,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceConnectorIdentity {
     id: String,
@@ -1206,6 +1256,26 @@ pub struct ProvenanceConnectorIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceMaterialV1 {
+    artifacts: Vec<ArtifactDecisionMaterialV1>,
+    canonical_schema_epoch: u32,
+    classifier_epoch: u32,
+    connector: ProvenanceConnectorIdentity,
+    dependencies: Vec<DependencyDecisionMaterialV1>,
+    donat_policy_ids: Vec<String>,
+    embedded_material: Vec<EmbeddedDecisionMaterialV1>,
+    files: Vec<FileDecisionMaterialV1>,
+    generator_epoch: u32,
+    licenses: Vec<LicenseDecisionMaterialV1>,
+    manifest_references: Vec<ManifestProvenanceMaterialV1>,
+    notices: Vec<NoticeMaterialV1>,
+    provider_evidence: Vec<ProviderEvidenceOriginMaterialV1>,
+    sources: Vec<SourceIdentityMaterialV1>,
+}
+
+#[cfg(test)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceMaterialDto {
     artifacts: Vec<ArtifactDecisionMaterialV1>,
     canonical_schema_epoch: u32,
     classifier_epoch: u32,
@@ -1361,6 +1431,7 @@ enum ResolvedFactOriginV1 {
     DonatPolicy {
         policy_id: String,
     },
+}
 }
 
 fn deserialize_value_contract_material<'de, D>(
@@ -2491,7 +2562,7 @@ impl ResolvedFactOriginMaterialV1 {
                     }
                 },
             )),
-            ResolvedFactOriginV1::DonatPolicy { .. } => None,
+            ResolvedFactOriginV1::DonatPolicy { policy_id: _ } => None,
         }
     }
 }
@@ -2547,6 +2618,18 @@ pub fn resolve_fact_bindings(
         let fact = origin_by_use_site
             .get(use_site)
             .expect("equal key sets were checked");
+        let required_domain = required_fact_domain(use_site).ok_or_else(|| {
+            CatalogError::new(
+                "catalog_fact_binding_mismatch",
+                "fact use site has no closed normalized origin requirement",
+            )
+        })?;
+        if !required_domain.accepts(fact) {
+            return Err(CatalogError::new(
+                "catalog_fact_binding_mismatch",
+                "fact origin domain differs from the normalized use-site requirement",
+            ));
+        }
         let expected = typed_value_material(value);
         let origin = match fact {
             ContractFact::ProviderEvidence {
@@ -2649,6 +2732,49 @@ pub fn resolve_fact_bindings(
         });
     }
     Ok((semantic, provenance))
+}
+
+#[derive(Clone, Copy)]
+enum RequiredFactDomain {
+    ProviderEvidence,
+    DonatPolicy,
+}
+
+impl RequiredFactDomain {
+    const fn accepts(self, fact: &ContractFact) -> bool {
+        matches!(
+            (self, fact),
+            (
+                Self::ProviderEvidence,
+                ContractFact::ProviderEvidence {
+                    source_record_id: _,
+                    fact_id: _,
+                }
+            ) | (
+                Self::DonatPolicy,
+                ContractFact::DonatPolicy {
+                    policy_id: _,
+                    value: _,
+                },
+            )
+        )
+    }
+}
+
+fn required_fact_domain(use_site: &str) -> Option<RequiredFactDomain> {
+    let is_operation_step = use_site.starts_with("operation.") && use_site.contains(".step.");
+    if !is_operation_step {
+        return None;
+    }
+    if use_site.ends_with(".idempotency.scope")
+        || use_site.ends_with(".idempotency.minimum_retention_ms")
+    {
+        Some(RequiredFactDomain::ProviderEvidence)
+    } else if use_site.ends_with(".idempotency.clock_safety_margin_ms") {
+        Some(RequiredFactDomain::DonatPolicy)
+    } else {
+        None
+    }
 }
 
 pub fn source_record_material(
@@ -2760,12 +2886,16 @@ fn source_subject_material(
                 name: name.clone(),
                 version: version.as_str().to_owned(),
                 tarball_url: tarball_url.to_string(),
-                integrity: NpmIntegrityMaterialV1 {
-                    algorithm: NpmIntegrityAlgorithmMaterialV1::Sha512(()),
+                integrity: NpmIntegrity {
+                    algorithm: match integrity.algorithm() {
+                        crate::source::NpmIntegrityAlgorithm::Sha512 => {
+                            NpmIntegrityAlgorithmMaterialV1::Sha512(())
+                        }
+                    },
                     digest: base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .encode(integrity.as_bytes()),
                 },
-                repository: ImmutableRepositoryMaterialV1 {
+                repository: ImmutableRepository {
                     url: repository.url.to_string(),
                     commit: repository.commit.to_string(),
                     tree: repository.tree.to_string(),
@@ -2789,6 +2919,7 @@ fn source_subject_material(
             evidence.sort_by(|left, right| {
                 provider_evidence_source_key(&left.source)
                     .cmp(&provider_evidence_source_key(&right.source))
+                    .then_with(|| left.content_sha256.cmp(&right.content_sha256))
             });
             SourceSubjectMaterialV1::ProviderArtifact(ProviderArtifactMaterialV1 {
                 provider: provider.clone(),
@@ -3231,7 +3362,10 @@ fn contract_fact_material_key(value: &ContractFactMaterialV1) -> String {
             source_record_id,
             fact_id,
         } => format!("provider:{source_record_id}:{fact_id}"),
-        ContractFactMaterialV1::DonatPolicy { policy_id, .. } => {
+        ContractFactMaterialV1::DonatPolicy {
+            policy_id,
+            value: _,
+        } => {
             format!("policy:{policy_id}")
         }
     }
@@ -3697,6 +3831,11 @@ fn semantic_step_material(value: &crate::CompiledStepSpec) -> SemanticStepMateri
         left.canonical_lowercase_header_name
             .cmp(&right.canonical_lowercase_header_name)
     });
+    let mut success_statuses = success_statuses
+        .iter()
+        .map(status_range_material)
+        .collect::<Vec<_>>();
+    success_statuses.sort_by_key(|status| (status.minimum, status.maximum));
     SemanticStepMaterialV1 {
         step: step.as_str().to_owned(),
         method: method.clone(),
@@ -3710,7 +3849,7 @@ fn semantic_step_material(value: &crate::CompiledStepSpec) -> SemanticStepMateri
             }
         }),
         request: request_shape_material(request),
-        success_statuses: success_statuses.iter().map(status_range_material).collect(),
+        success_statuses,
         response: response_shape_material(response),
         selected_response_headers,
         bounds: StepBoundsMaterialV1 {
@@ -3831,27 +3970,27 @@ fn operation_effect_material(value: &crate::OperationEffect) -> OperationEffectM
     match value {
         crate::OperationEffect::ReadOnly => OperationEffectMaterialV1::ReadOnly(()),
         crate::OperationEffect::ProviderIdempotent { side_effect_steps } => {
-            OperationEffectMaterialV1::ProviderIdempotent {
-                side_effect_steps: side_effect_steps
-                    .iter()
-                    .map(|step| ProviderIdempotentStepMaterialV1 {
-                        step: step.step.as_str().to_owned(),
-                        fixed_binding: match &step.fixed_binding {
-                            crate::FixedIdempotencyBinding::Header { name } => {
-                                FixedIdempotencyBindingMaterialV1::Header { name: name.clone() }
+            let mut side_effect_steps = side_effect_steps
+                .iter()
+                .map(|step| ProviderIdempotentStepMaterialV1 {
+                    step: step.step.as_str().to_owned(),
+                    fixed_binding: match &step.fixed_binding {
+                        crate::FixedIdempotencyBinding::Header { name } => {
+                            FixedIdempotencyBindingMaterialV1::Header { name: name.clone() }
+                        }
+                        crate::FixedIdempotencyBinding::BodyField { pointer } => {
+                            FixedIdempotencyBindingMaterialV1::BodyField {
+                                pointer: pointer.clone(),
                             }
-                            crate::FixedIdempotencyBinding::BodyField { pointer } => {
-                                FixedIdempotencyBindingMaterialV1::BodyField {
-                                    pointer: pointer.clone(),
-                                }
-                            }
-                        },
-                        scope: step.scope.clone(),
-                        minimum_retention_ms: step.minimum_retention_ms.get().to_string(),
-                        clock_safety_margin_ms: step.clock_safety_margin_ms.get().to_string(),
-                    })
-                    .collect(),
-            }
+                        }
+                    },
+                    scope: step.scope.clone(),
+                    minimum_retention_ms: step.minimum_retention_ms.get().to_string(),
+                    clock_safety_margin_ms: step.clock_safety_margin_ms.get().to_string(),
+                })
+                .collect::<Vec<_>>();
+            side_effect_steps.sort_by(|left, right| left.step.cmp(&right.step));
+            OperationEffectMaterialV1::ProviderIdempotent { side_effect_steps }
         }
     }
 }
@@ -4123,16 +4262,74 @@ fn semantic_trigger_material(
 
 fn semantic_trigger_key(value: &SemanticTriggerMaterialV1) -> (&'static str, &str) {
     match value {
-        SemanticTriggerMaterialV1::Poll { trigger, .. } => ("poll", trigger),
-        SemanticTriggerMaterialV1::Webhook { trigger, .. } => ("webhook", trigger),
+        SemanticTriggerMaterialV1::Poll {
+            connector: _,
+            connector_version: _,
+            trigger,
+            trigger_version: _,
+            event_version: _,
+            runtime_abi_epoch: _,
+            checkpoint: _,
+            processor: _,
+            event_type: _,
+            per_poll_event_limit: _,
+            bounds: _,
+        } => ("poll", trigger),
+        SemanticTriggerMaterialV1::Webhook {
+            connector: _,
+            connector_version: _,
+            trigger,
+            trigger_version: _,
+            event_version: _,
+            runtime_abi_epoch: _,
+            authenticator: _,
+            codec: _,
+            normalizer: _,
+            selected_headers: _,
+            raw_body_max_bytes: _,
+            timestamp_window_ms: _,
+            event_id: _,
+            event_type: _,
+            output: _,
+            redaction: _,
+            subscription_operations: _,
+        } => ("webhook", trigger),
     }
 }
 
+/// Builds provenance from one checked compilation proof.
+///
+/// The checked proof already borrows the exact accepted-record and reviewed
+/// policy contexts used by compilation. Neither contradictory contexts nor a
+/// caller-selected semantic hash are accepted by this API.
+///
+/// ```compile_fail
+/// use std::collections::BTreeMap;
+/// use donat_connector_catalog::{
+///     provenance_material, AcceptedRecordCatalog, CheckedConnectorManifest,
+///     DonatPolicyId,
+/// };
+/// use donat_value_contract::TypedValue;
+///
+/// fn forge(
+///     checked: &CheckedConnectorManifest<'_>,
+///     other_catalog: &AcceptedRecordCatalog,
+///     other_policies: &BTreeMap<DonatPolicyId, TypedValue>,
+/// ) {
+///     let claimed_semantic_hash = [0xff; 32];
+///     let _ = provenance_material(
+///         checked,
+///         other_catalog,
+///         other_policies,
+///         claimed_semantic_hash,
+///         1,
+///         1,
+///         1,
+///     );
+/// }
+/// ```
 pub fn provenance_material(
     checked: &crate::CheckedConnectorManifest<'_>,
-    accepted_records: &AcceptedRecordCatalog,
-    reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
-    semantic_hash: AbiHash256,
     canonical_schema_epoch: u32,
     classifier_epoch: u32,
     generator_epoch: u32,
@@ -4144,10 +4341,9 @@ pub fn provenance_material(
         ));
     }
     let manifest = checked.manifest();
-    let records = accepted_records
-        .records()
-        .map(|record| (record.record_id, record))
-        .collect::<BTreeMap<_, _>>();
+    let accepted_records = checked.accepted_records();
+    let reviewed_policies = checked.reviewed_policies();
+    let semantic_hash = semantic_sha256(&semantic_material(checked, canonical_schema_epoch)?)?;
     let referenced_ids = manifest
         .provenance
         .iter()
@@ -4159,12 +4355,14 @@ pub fn provenance_material(
     let referenced_records = referenced_ids
         .iter()
         .map(|record_id| {
-            records.get(record_id).copied().ok_or_else(|| {
-                CatalogError::new(
-                    "catalog_projection_input_mismatch",
-                    "provenance source record is absent from the accepted catalog",
-                )
-            })
+            accepted_records
+                .capability_record(*record_id)
+                .ok_or_else(|| {
+                    CatalogError::new(
+                        "catalog_projection_input_mismatch",
+                        "provenance source record has no checked capability",
+                    )
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -4262,8 +4460,14 @@ pub fn provenance_material(
     let mut donat_policy_ids = fact_origins
         .iter()
         .filter_map(|binding| match &binding.fact {
-            ContractFact::DonatPolicy { policy_id, .. } => Some(policy_id.as_str().to_owned()),
-            ContractFact::ProviderEvidence { .. } => None,
+            ContractFact::DonatPolicy {
+                policy_id,
+                value: _,
+            } => Some(policy_id.as_str().to_owned()),
+            ContractFact::ProviderEvidence {
+                source_record_id: _,
+                fact_id: _,
+            } => None,
         })
         .collect::<Vec<_>>();
     donat_policy_ids.sort();
@@ -4324,7 +4528,9 @@ fn provider_evidence_origin_material(
         })
         .collect::<Vec<_>>();
     evidence.sort_by(|left, right| {
-        provider_evidence_source_key(&left.source).cmp(&provider_evidence_source_key(&right.source))
+        provider_evidence_source_key(&left.source)
+            .cmp(&provider_evidence_source_key(&right.source))
+            .then_with(|| left.content_sha256.cmp(&right.content_sha256))
     });
     Ok(ProviderEvidenceOriginMaterialV1 {
         source_record_id: source_record_id.as_str().to_owned(),
@@ -4668,6 +4874,306 @@ pub fn validate_canonical_owner_manifest() -> Result<OwnerManifestValidation, Ca
     validate_canonical_owner_manifest_text(canonical_projection_owner_manifest())
 }
 
+#[cfg(test)]
+mod projection_schema_mutations {
+    use std::path::Path;
+
+    use serde::de::DeserializeOwned;
+
+    use super::*;
+
+    #[derive(Clone)]
+    enum PathSegment {
+        Field(String),
+        Element(usize),
+    }
+
+    fn full_vector(label: &str) -> &'static str {
+        let document = include_str!(
+            "../../../knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities.md"
+        );
+        let marker = format!("\n{label}:\n{{");
+        let start = document.rfind(&marker).unwrap() + marker.len() - 1;
+        let end = document[start..].find('\n').unwrap() + start;
+        &document[start..end]
+    }
+
+    fn decode_exact<T>(bytes: &[u8]) -> Result<T, CatalogError>
+    where
+        T: DeserializeOwned + Serialize,
+    {
+        let canonical = canonicalize_raw(bytes)?;
+        let decoded = serde_json::from_slice::<T>(&canonical)
+            .map_err(|error| CatalogError::new("catalog_jcs_schema_mismatch", error.to_string()))?;
+        if canonical_material_bytes(&decoded)? != canonical {
+            return Err(CatalogError::new(
+                "catalog_jcs_schema_mismatch",
+                "projection omitted or changed a declared member",
+            ));
+        }
+        Ok(decoded)
+    }
+
+    fn source_material(value: SourceRecordMaterialDto) -> SourceRecordMaterialV1 {
+        let SourceRecordMaterialDto {
+            record_version,
+            record_id,
+            subject,
+            reacquisition,
+            artifact_hashes,
+            license,
+            notice,
+            entrypoints,
+            dependencies,
+            embedded_material,
+            provider_contracts,
+            compatibility,
+            admission,
+            safety_findings,
+            reviewer,
+            approval_date,
+            proposed_manifest,
+            proposed_destinations,
+            red_tests,
+        } = value;
+        SourceRecordMaterialV1 {
+            record_version,
+            record_id,
+            subject,
+            reacquisition,
+            artifact_hashes,
+            license,
+            notice,
+            entrypoints,
+            dependencies,
+            embedded_material,
+            provider_contracts,
+            compatibility,
+            admission,
+            safety_findings,
+            reviewer,
+            approval_date,
+            proposed_manifest,
+            proposed_destinations,
+            red_tests,
+        }
+    }
+
+    fn semantic_material(value: SemanticMaterialDto) -> SemanticMaterialV1 {
+        let SemanticMaterialDto {
+            canonical_schema_epoch,
+            connector,
+            credentials,
+            operations,
+            origins,
+            triggers,
+            value_language_epoch,
+        } = value;
+        SemanticMaterialV1 {
+            canonical_schema_epoch,
+            connector,
+            credentials,
+            operations,
+            origins,
+            triggers,
+            value_language_epoch,
+        }
+    }
+
+    fn provenance_material(value: ProvenanceMaterialDto) -> ProvenanceMaterialV1 {
+        let ProvenanceMaterialDto {
+            artifacts,
+            canonical_schema_epoch,
+            classifier_epoch,
+            connector,
+            dependencies,
+            donat_policy_ids,
+            embedded_material,
+            files,
+            generator_epoch,
+            licenses,
+            manifest_references,
+            notices,
+            provider_evidence,
+            sources,
+        } = value;
+        ProvenanceMaterialV1 {
+            artifacts,
+            canonical_schema_epoch,
+            classifier_epoch,
+            connector,
+            dependencies,
+            donat_policy_ids,
+            embedded_material,
+            files,
+            generator_epoch,
+            licenses,
+            manifest_references,
+            notices,
+            provider_evidence,
+            sources,
+        }
+    }
+
+    fn value_at_mut<'value>(
+        mut value: &'value mut serde_json::Value,
+        path: &[PathSegment],
+    ) -> &'value mut serde_json::Value {
+        for segment in path {
+            value = match segment {
+                PathSegment::Field(name) => value
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut(name))
+                    .unwrap(),
+                PathSegment::Element(index) => value
+                    .as_array_mut()
+                    .and_then(|values| values.get_mut(*index))
+                    .unwrap(),
+            };
+        }
+        value
+    }
+
+    fn replacement(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Null => serde_json::Value::Bool(true),
+            serde_json::Value::Bool(value) => serde_json::Value::Bool(!value),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_u64() {
+                    serde_json::json!(value.saturating_add(1))
+                } else if let Some(value) = value.as_i64() {
+                    serde_json::json!(value.saturating_add(1))
+                } else {
+                    serde_json::Value::String("number-mutation".to_owned())
+                }
+            }
+            serde_json::Value::String(value) => {
+                serde_json::Value::String(format!("{value}.mutation"))
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::Value::Null,
+        }
+    }
+
+    fn generated_mutations(value: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        fn walk(
+            baseline: &serde_json::Value,
+            current: &serde_json::Value,
+            path: &mut Vec<PathSegment>,
+            label: &mut Vec<String>,
+            output: &mut Vec<(String, serde_json::Value)>,
+        ) {
+            match current {
+                serde_json::Value::Object(object) => {
+                    for (name, child) in object {
+                        let mut changed = baseline.clone();
+                        value_at_mut(&mut changed, path)
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(name);
+                        output.push((format!("remove:{}", label.join(".")) + "." + name, changed));
+                        path.push(PathSegment::Field(name.clone()));
+                        label.push(name.clone());
+                        walk(baseline, child, path, label, output);
+                        label.pop();
+                        path.pop();
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, child) in values.iter().enumerate() {
+                        let mut changed = baseline.clone();
+                        value_at_mut(&mut changed, path)
+                            .as_array_mut()
+                            .unwrap()
+                            .remove(index);
+                        output.push((format!("remove:{}[{index}]", label.join(".")), changed));
+                        path.push(PathSegment::Element(index));
+                        label.push(format!("[{index}]"));
+                        walk(baseline, child, path, label, output);
+                        label.pop();
+                        path.pop();
+                    }
+                }
+                _ => {
+                    let mut changed = baseline.clone();
+                    *value_at_mut(&mut changed, path) = replacement(current);
+                    output.push((format!("replace:{}", label.join(".")), changed));
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        walk(value, value, &mut Vec::new(), &mut Vec::new(), &mut output);
+        output
+    }
+
+    fn assert_mutation_hashes(
+        bytes: &[u8],
+        hash: impl Fn(&[u8]) -> Result<[u8; 32], CatalogError>,
+    ) {
+        let baseline = hash(bytes).unwrap();
+        let document = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
+        let mutations = generated_mutations(&document);
+        assert!(!mutations.is_empty());
+        for (label, mutation) in mutations {
+            let bytes = serde_json::to_vec(&mutation).unwrap();
+            if let Ok(changed) = hash(&bytes) {
+                assert_ne!(baseline, changed, "mutation was hash-inert: {label}");
+            }
+        }
+    }
+
+    fn source_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
+        let material = source_material(decode_exact(bytes)?);
+        Ok(*record_sha256(&material)?.as_bytes())
+    }
+
+    fn semantic_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
+        let material = semantic_material(decode_exact(bytes)?);
+        Ok(*semantic_sha256(&material)?.as_bytes())
+    }
+
+    fn provenance_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
+        let material = provenance_material(decode_exact(bytes)?);
+        Ok(*provenance_sha256(&material)?.as_bytes())
+    }
+
+    fn contract_hash(bytes: &[u8]) -> Result<[u8; 32], CatalogError> {
+        let material = decode_value_contract_material(bytes)?;
+        let rebuilt = canonical_material_bytes(&material)?;
+        if canonicalize_raw(bytes)? != rebuilt {
+            return Err(CatalogError::new(
+                "catalog_jcs_schema_mismatch",
+                "value-contract projection omitted or changed a declared member",
+            ));
+        }
+        Ok(*value_contract_sha256(&material)?.as_bytes())
+    }
+
+    #[test]
+    fn generated_material_member_and_branch_mutations_change_bytes_and_hashes() {
+        let fixture_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut built_sources = 0usize;
+        for entry in std::fs::read_dir(fixture_directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                continue;
+            }
+            let Ok(record) = crate::load_record(&path) else {
+                continue;
+            };
+            let material = source_record_material(&record).unwrap();
+            let bytes = canonical_material_bytes(&material).unwrap();
+            assert_mutation_hashes(&bytes, source_hash);
+            built_sources += 1;
+        }
+        assert_ne!(built_sources, 0);
+
+        assert_mutation_hashes(full_vector("semantic").as_bytes(), semantic_hash);
+        assert_mutation_hashes(full_vector("provenance").as_bytes(), provenance_hash);
+        assert_mutation_hashes(full_vector("value-contract").as_bytes(), contract_hash);
+    }
+}
+
 fn validate_canonical_owner_manifest_text(
     manifest: &str,
 ) -> Result<OwnerManifestValidation, CatalogError> {
@@ -4804,7 +5310,7 @@ pub fn canonicalize_raw(bytes: &[u8]) -> Result<Vec<u8>, CatalogError> {
     let number_cursor = Cell::new(0);
 
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = JValueSeed {
+    let mut value = JValueSeed {
         source,
         number_tokens: &number_tokens,
         number_cursor: &number_cursor,
@@ -4818,6 +5324,7 @@ pub fn canonicalize_raw(bytes: &[u8]) -> Result<Vec<u8>, CatalogError> {
             "raw number token cursor did not consume the complete input",
         ));
     }
+    value.canonicalize_numbers()?;
     let mut output = Vec::new();
     value.write_canonical(&mut output);
     Ok(output)
@@ -5124,6 +5631,24 @@ enum JValue {
 }
 
 impl JValue {
+    fn canonicalize_numbers(&mut self) -> Result<(), CatalogError> {
+        match self {
+            Self::Number(value) => *value = canonical_number(value)?,
+            Self::Array(values) => {
+                for value in values {
+                    value.canonicalize_numbers()?;
+                }
+            }
+            Self::Object(values) => {
+                for (_, value) in values {
+                    value.canonicalize_numbers()?;
+                }
+            }
+            Self::Null | Self::Bool(_) | Self::String(_) => {}
+        }
+        Ok(())
+    }
+
     fn write_canonical(&self, output: &mut Vec<u8>) {
         match self {
             Self::Null => output.extend_from_slice(b"null"),
@@ -5210,7 +5735,7 @@ impl JValueVisitor<'_> {
             .source
             .get(range.clone())
             .ok_or_else(|| E::custom("raw number token range is outside the input"))?;
-        canonical_number(raw).map_err(E::custom)
+        Ok(raw.to_owned())
     }
 }
 

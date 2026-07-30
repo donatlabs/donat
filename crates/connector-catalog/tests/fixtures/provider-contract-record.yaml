@@ -12,7 +12,7 @@ subject:
             commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             path: openapi.json
         accessed_on: 2026-07-29
-        content_sha256: 1111111111111111111111111111111111111111111111111111111111111111
+        content_sha256: '1111111111111111111111111111111111111111111111111111111111111111'
         terms:
           kind: reviewed_use
           value:
@@ -36,7 +36,7 @@ artifact_hashes:
     algorithm:
       kind: sha256
       value: null
-    digest: 1111111111111111111111111111111111111111111111111111111111111111
+    digest: '1111111111111111111111111111111111111111111111111111111111111111'
     path: openapi.json
 license:
   kind: permissive
@@ -44,11 +44,11 @@ license:
     spdx_id: MIT
     selected_dual_license_branch: null
     license_file_path: LICENSE
-    license_file_sha256: 2222222222222222222222222222222222222222222222222222222222222222
+    license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
 notice:
   id: notice.demo
   license_file_path: LICENSE
-  license_file_sha256: 2222222222222222222222222222222222222222222222222222222222222222
+  license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
   required_copyright_lines: [Copyright Demo]
   notice_bundle_destination: THIRD_PARTY_NOTICES.md
 entrypoints: [openapi.json]

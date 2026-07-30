@@ -255,28 +255,39 @@ fn valid_identifiers(value: &str, numeric_leading_zero_rejects: bool) -> bool {
     })
 }
 
+/// A source record admitted by the strict byte loader.
+///
+/// Raw normative fields are read-only outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ConnectorSourceRecord;
+///
+/// fn forge(record: &mut ConnectorSourceRecord) {
+///     record.record_version = 0;
+/// }
+/// ```
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorSourceRecord {
-    pub record_version: u32,
-    pub record_id: SourceRecordId,
-    pub subject: SourceSubject,
-    pub reacquisition: ReacquisitionPlan,
-    pub artifact_hashes: Vec<ArtifactHash>,
-    pub license: LicenseDecision,
-    pub notice: NoticeIdentity,
-    pub entrypoints: Vec<SourcePath>,
-    pub dependencies: Vec<DependencyDecision>,
-    pub embedded_material: Vec<EmbeddedMaterialDecision>,
-    pub provider_contracts: Vec<ProviderContractReference>,
-    pub compatibility: CompatibilityDecision,
-    pub admission: AdmissionState,
-    pub safety_findings: SafetyFindings,
-    pub reviewer: ReviewIdentity,
-    pub approval_date: Date,
-    pub proposed_manifest: Option<RepoPath>,
-    pub proposed_destinations: Vec<RepoPath>,
-    pub red_tests: Vec<TestId>,
+    pub(crate) record_version: u32,
+    pub(crate) record_id: SourceRecordId,
+    pub(crate) subject: SourceSubject,
+    pub(crate) reacquisition: ReacquisitionPlan,
+    pub(crate) artifact_hashes: Vec<ArtifactHash>,
+    pub(crate) license: LicenseDecision,
+    pub(crate) notice: NoticeIdentity,
+    pub(crate) entrypoints: Vec<SourcePath>,
+    pub(crate) dependencies: Vec<DependencyDecision>,
+    pub(crate) embedded_material: Vec<EmbeddedMaterialDecision>,
+    pub(crate) provider_contracts: Vec<ProviderContractReference>,
+    pub(crate) compatibility: CompatibilityDecision,
+    pub(crate) admission: AdmissionState,
+    pub(crate) safety_findings: SafetyFindings,
+    pub(crate) reviewer: ReviewIdentity,
+    pub(crate) approval_date: Date,
+    pub(crate) proposed_manifest: Option<RepoPath>,
+    pub(crate) proposed_destinations: Vec<RepoPath>,
+    pub(crate) red_tests: Vec<TestId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -309,25 +320,42 @@ pub enum ReacquisitionPlan {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Exact npm source identity admitted by the strict byte loader.
+///
+/// Nested identity fields are read-only outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ExactNpmPackage;
+///
+/// fn forge(package: &mut ExactNpmPackage) {
+///     package.name = "other-package".to_owned();
+/// }
+/// ```
 pub struct ExactNpmPackage {
-    pub name: String,
-    pub version: ExactSemver,
-    pub tarball_url: ExactHttpsUrl,
-    pub integrity: NpmIntegrity,
-    pub repository: ImmutableRepository,
-    pub npm_git_head: GitCommit,
-    pub package_repository: RepositoryUrl,
-    pub signature: NpmSignatureDecision,
-    pub provenance: NpmProvenanceDecision,
-    pub tag_commit: Option<GitCommit>,
-    pub provenance_commit: Option<GitCommit>,
-    pub maintainers: Vec<NpmMaintainerIdentity>,
-    pub repository_owner: RepositoryOwnerDecision,
+    pub(crate) name: String,
+    pub(crate) version: ExactSemver,
+    pub(crate) tarball_url: ExactHttpsUrl,
+    pub(crate) integrity: NpmIntegrity,
+    pub(crate) repository: ImmutableRepository,
+    pub(crate) npm_git_head: GitCommit,
+    pub(crate) package_repository: RepositoryUrl,
+    pub(crate) signature: NpmSignatureDecision,
+    pub(crate) provenance: NpmProvenanceDecision,
+    pub(crate) tag_commit: Option<GitCommit>,
+    pub(crate) provenance_commit: Option<GitCommit>,
+    pub(crate) maintainers: Vec<NpmMaintainerIdentity>,
+    pub(crate) repository_owner: RepositoryOwnerDecision,
 }
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct NpmIntegrity {
+    algorithm: NpmIntegrityAlgorithm,
     digest: [u8; 64],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum NpmIntegrityAlgorithm {
+    Sha512,
 }
 
 impl NpmIntegrity {
@@ -359,11 +387,18 @@ impl NpmIntegrity {
                 "npm SRI spelling is not canonical",
             ));
         }
-        Ok(Self { digest })
+        Ok(Self {
+            algorithm: NpmIntegrityAlgorithm::Sha512,
+            digest,
+        })
     }
 
     pub const fn as_bytes(&self) -> &[u8; 64] {
         &self.digest
+    }
+
+    pub(crate) const fn algorithm(&self) -> NpmIntegrityAlgorithm {
+        self.algorithm
     }
 
     pub fn sri(&self) -> String {
@@ -405,9 +440,9 @@ impl<'de> Deserialize<'de> for NpmIntegrity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImmutableRepository {
-    pub url: RepositoryUrl,
-    pub commit: GitCommit,
-    pub tree: GitTree,
+    pub(crate) url: RepositoryUrl,
+    pub(crate) commit: GitCommit,
+    pub(crate) tree: GitTree,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -418,16 +453,15 @@ pub struct ImmutableRepository {
     rename_all = "snake_case"
 )]
 pub enum NpmSignatureDecision {
+    #[non_exhaustive]
     Verified {
         signatures: Vec<VerifiedNpmSignature>,
         registry_metadata_sha256: Hash256,
     },
-    VerifiedAbsent {
-        registry_metadata_sha256: Hash256,
-    },
-    Rejected {
-        finding: FindingId,
-    },
+    #[non_exhaustive]
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    #[non_exhaustive]
+    Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -438,16 +472,15 @@ pub enum NpmSignatureDecision {
     rename_all = "snake_case"
 )]
 pub enum NpmProvenanceDecision {
+    #[non_exhaustive]
     Verified {
         statement_sha256: Hash256,
         source_commit: GitCommit,
     },
-    VerifiedAbsent {
-        registry_metadata_sha256: Hash256,
-    },
-    Rejected {
-        finding: FindingId,
-    },
+    #[non_exhaustive]
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    #[non_exhaustive]
+    Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -458,40 +491,50 @@ pub enum NpmProvenanceDecision {
     rename_all = "snake_case"
 )]
 pub enum RepositoryOwnerDecision {
+    #[non_exhaustive]
     Consistent {
         package_owner: NpmOwnerIdentity,
         repository_owner: RepositoryOwnerIdentity,
     },
-    ReviewedMismatch {
-        decision_id: ReviewDecisionId,
-    },
-    Rejected {
-        finding: FindingId,
-    },
+    #[non_exhaustive]
+    ReviewedMismatch { decision_id: ReviewDecisionId },
+    #[non_exhaustive]
+    Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedNpmSignature {
-    pub key_id: String,
-    pub signature_sha256: Hash256,
+    pub(crate) key_id: String,
+    pub(crate) signature_sha256: Hash256,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Exact provider evidence admitted by the strict byte loader.
+///
+/// Provider identity and evidence members are read-only outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ExactProviderArtifact;
+///
+/// fn forge(provider: &mut ExactProviderArtifact) {
+///     provider.provider = "other-provider".to_owned();
+/// }
+/// ```
 pub struct ExactProviderArtifact {
-    pub provider: String,
-    pub evidence: Vec<ProviderEvidenceArtifact>,
+    pub(crate) provider: String,
+    pub(crate) evidence: Vec<ProviderEvidenceArtifact>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEvidenceArtifact {
-    pub source: ImmutableProviderEvidenceSource,
-    pub accessed_on: Date,
-    pub content_sha256: Hash256,
-    pub terms: EvidenceTermsDisposition,
-    pub facts: Vec<ProviderFact>,
+    pub(crate) source: ImmutableProviderEvidenceSource,
+    pub(crate) accessed_on: Date,
+    pub(crate) content_sha256: Hash256,
+    pub(crate) terms: EvidenceTermsDisposition,
+    pub(crate) facts: Vec<ProviderFact>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -502,11 +545,13 @@ pub struct ProviderEvidenceArtifact {
     rename_all = "snake_case"
 )]
 pub enum ImmutableProviderEvidenceSource {
+    #[non_exhaustive]
     RepositoryFile {
         repository: RepositoryUrl,
         commit: GitCommit,
         path: SourcePath,
     },
+    #[non_exhaustive]
     VersionedArtifact {
         url: ExactHttpsUrl,
         provider_revision: NonEmptyString,
@@ -521,26 +566,27 @@ pub enum ImmutableProviderEvidenceSource {
     rename_all = "snake_case"
 )]
 pub enum EvidenceTermsDisposition {
+    #[non_exhaustive]
     Permissive {
         license: LicenseDecision,
         evidence_url: ExactHttpsUrl,
     },
+    #[non_exhaustive]
     ReviewedUse {
         decision_id: ReviewDecisionId,
         evidence_url: ExactHttpsUrl,
     },
-    Rejected {
-        finding: FindingId,
-    },
+    #[non_exhaustive]
+    Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderFact {
-    pub fact_id: ProviderFactId,
-    pub location: ExactFactLocation,
+    pub(crate) fact_id: ProviderFactId,
+    pub(crate) location: ExactFactLocation,
     #[serde(deserialize_with = "deserialize_typed_value_material")]
-    pub normalized_value: TypedValueMaterialV1,
+    pub(crate) normalized_value: TypedValueMaterialV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -551,7 +597,9 @@ pub struct ProviderFact {
     rename_all = "snake_case"
 )]
 pub enum ExactFactLocation {
+    #[non_exhaustive]
     JsonPointer { path: SourcePath, pointer: String },
+    #[non_exhaustive]
     DocumentSection { path: SourcePath, section: String },
 }
 
@@ -740,14 +788,13 @@ impl TypedValueMaterialV1 {
                     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .decode(binary)
                         .map_err(|_| material_schema_error())?;
-                    if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded) != *binary
-                        || file_name
-                            .as_ref()
-                            .is_some_and(|value| validate_unicode_scalar_string(value).is_err())
-                        || media_type.as_ref().is_some_and(|value| !value.is_ascii())
+                    if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&decoded) != *binary
                     {
                         return Err(material_schema_error());
                     }
+                    let media_type = media_type.as_deref().ok_or_else(material_schema_error)?;
+                    BoundedInlineBytes::try_new(decoded, media_type, file_name.as_deref(), 131_072)
+                        .map_err(|_| material_schema_error())?;
                 }
             }
         }
@@ -812,22 +859,22 @@ pub enum ContractFact {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderContractReference {
-    pub contract_id: ProviderContractId,
-    pub facts: Vec<ContractFact>,
+    pub(crate) contract_id: ProviderContractId,
+    pub(crate) facts: Vec<ContractFact>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DonatOwnedSource {
-    pub repository_commit: GitCommit,
-    pub files: Vec<RepoFileHash>,
+    pub(crate) repository_commit: GitCommit,
+    pub(crate) files: Vec<RepoFileHash>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoFileHash {
-    pub path: RepoPath,
-    pub sha256: Hash256,
+    pub(crate) path: RepoPath,
+    pub(crate) sha256: Hash256,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -851,17 +898,27 @@ pub enum CompatibilityDecision {
     content = "value",
     rename_all = "snake_case"
 )]
+/// Read-only admission decision produced by strict source validation.
+///
+/// Variant payloads cannot be forged outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::AdmissionState;
+///
+/// let _ = AdmissionState::InventoryOnly {
+///     findings: Vec::new(),
+/// };
+/// ```
 pub enum AdmissionState {
-    InventoryOnly {
-        findings: Vec<FindingId>,
-    },
+    #[non_exhaustive]
+    InventoryOnly { findings: Vec<FindingId> },
+    #[non_exhaustive]
     ApprovedForPort {
         #[serde(with = "operation_ids")]
         operations: Vec<OperationId>,
     },
-    EvidenceAccepted {
-        contracts: Vec<ProviderContractId>,
-    },
+    #[non_exhaustive]
+    EvidenceAccepted { contracts: Vec<ProviderContractId> },
 }
 
 impl fmt::Debug for AdmissionState {
@@ -920,11 +977,22 @@ mod operation_ids {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Exact artifact identity admitted by the strict byte loader or checked builder.
+///
+/// Digest and path members are read-only outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::ArtifactHash;
+///
+/// fn forge(artifact: &mut ArtifactHash) {
+///     artifact.digest = "not-a-hash".to_owned();
+/// }
+/// ```
 pub struct ArtifactHash {
-    pub artifact_id: ArtifactId,
-    pub algorithm: HashAlgorithm,
-    pub digest: String,
-    pub path: Option<SourcePath>,
+    pub(crate) artifact_id: ArtifactId,
+    pub(crate) algorithm: HashAlgorithm,
+    pub(crate) digest: String,
+    pub(crate) path: Option<SourcePath>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -946,37 +1014,49 @@ pub enum HashAlgorithm {
     content = "value",
     rename_all = "snake_case"
 )]
+/// Read-only legal disposition produced by strict source validation.
+///
+/// Variant payloads cannot be forged outside this crate.
+///
+/// ```compile_fail
+/// use donat_connector_catalog::{FindingId, LicenseDecision};
+///
+/// let _ = LicenseDecision::Rejected {
+///     finding: FindingId::literal("finding.unreviewed"),
+/// };
+/// ```
 pub enum LicenseDecision {
+    #[non_exhaustive]
     Permissive {
         spdx_id: String,
         selected_dual_license_branch: Option<String>,
         license_file_path: SourcePath,
         license_file_sha256: Hash256,
     },
+    #[non_exhaustive]
     WrittenGrant {
         decision_id: ReviewDecisionId,
         grant_sha256: Hash256,
     },
-    Rejected {
-        finding: FindingId,
-    },
+    #[non_exhaustive]
+    Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoticeIdentity {
-    pub id: NoticeId,
-    pub license_file_path: SourcePath,
-    pub license_file_sha256: Hash256,
-    pub required_copyright_lines: Vec<String>,
-    pub notice_bundle_destination: RepoPath,
+    pub(crate) id: NoticeId,
+    pub(crate) license_file_path: SourcePath,
+    pub(crate) license_file_sha256: Hash256,
+    pub(crate) required_copyright_lines: Vec<String>,
+    pub(crate) notice_bundle_destination: RepoPath,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyDecision {
-    pub dependency: String,
-    pub disposition: DependencyDisposition,
+    pub(crate) dependency: String,
+    pub(crate) disposition: DependencyDisposition,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -987,20 +1067,25 @@ pub struct DependencyDecision {
     rename_all = "snake_case"
 )]
 pub enum DependencyDisposition {
+    #[non_exhaustive]
     Shipped { license: LicenseDecision },
+    #[non_exhaustive]
     BuildOnly { license: LicenseDecision },
+    #[non_exhaustive]
     TypeOnlyReplaced { replacement: String },
+    #[non_exhaustive]
     BehaviorOnly { reason: FindingId },
+    #[non_exhaustive]
     Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddedMaterialDecision {
-    pub material_id: String,
-    pub path: SourcePath,
-    pub sha256: Hash256,
-    pub disposition: EmbeddedMaterialDisposition,
+    pub(crate) material_id: String,
+    pub(crate) path: SourcePath,
+    pub(crate) sha256: Hash256,
+    pub(crate) disposition: EmbeddedMaterialDisposition,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1011,24 +1096,372 @@ pub struct EmbeddedMaterialDecision {
     rename_all = "snake_case"
 )]
 pub enum EmbeddedMaterialDisposition {
+    #[non_exhaustive]
     Shipped { license: LicenseDecision },
+    #[non_exhaustive]
     BehaviorOnly { reason: FindingId },
+    #[non_exhaustive]
     Rejected { finding: FindingId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyFindings {
-    pub findings: Vec<SafetyFinding>,
+    pub(crate) findings: Vec<SafetyFinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyFinding {
-    pub finding_id: FindingId,
-    pub kind: String,
-    pub location: Option<SourcePath>,
-    pub message: String,
+    pub(crate) finding_id: FindingId,
+    pub(crate) kind: String,
+    pub(crate) location: Option<SourcePath>,
+    pub(crate) message: String,
+}
+
+impl ConnectorSourceRecord {
+    pub const fn record_version(&self) -> u32 {
+        self.record_version
+    }
+
+    pub const fn record_id(&self) -> SourceRecordId {
+        self.record_id
+    }
+
+    pub const fn subject(&self) -> &SourceSubject {
+        &self.subject
+    }
+
+    pub const fn reacquisition(&self) -> ReacquisitionPlan {
+        self.reacquisition
+    }
+
+    pub fn artifact_hashes(&self) -> &[ArtifactHash] {
+        &self.artifact_hashes
+    }
+
+    pub const fn license(&self) -> &LicenseDecision {
+        &self.license
+    }
+
+    pub const fn notice(&self) -> &NoticeIdentity {
+        &self.notice
+    }
+
+    pub fn entrypoints(&self) -> &[SourcePath] {
+        &self.entrypoints
+    }
+
+    pub fn dependencies(&self) -> &[DependencyDecision] {
+        &self.dependencies
+    }
+
+    pub fn embedded_material(&self) -> &[EmbeddedMaterialDecision] {
+        &self.embedded_material
+    }
+
+    pub fn provider_contracts(&self) -> &[ProviderContractReference] {
+        &self.provider_contracts
+    }
+
+    pub const fn compatibility(&self) -> CompatibilityDecision {
+        self.compatibility
+    }
+
+    pub const fn admission(&self) -> &AdmissionState {
+        &self.admission
+    }
+
+    pub const fn safety_findings(&self) -> &SafetyFindings {
+        &self.safety_findings
+    }
+
+    pub const fn reviewer(&self) -> &ReviewIdentity {
+        &self.reviewer
+    }
+
+    pub const fn approval_date(&self) -> &Date {
+        &self.approval_date
+    }
+
+    pub const fn proposed_manifest(&self) -> Option<&RepoPath> {
+        self.proposed_manifest.as_ref()
+    }
+
+    pub fn proposed_destinations(&self) -> &[RepoPath] {
+        &self.proposed_destinations
+    }
+
+    pub fn red_tests(&self) -> &[TestId] {
+        &self.red_tests
+    }
+}
+
+impl ExactNpmPackage {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn version(&self) -> &ExactSemver {
+        &self.version
+    }
+
+    pub const fn tarball_url(&self) -> &ExactHttpsUrl {
+        &self.tarball_url
+    }
+
+    pub const fn integrity(&self) -> &NpmIntegrity {
+        &self.integrity
+    }
+
+    pub const fn repository(&self) -> &ImmutableRepository {
+        &self.repository
+    }
+
+    pub const fn npm_git_head(&self) -> &GitCommit {
+        &self.npm_git_head
+    }
+
+    pub const fn package_repository(&self) -> &RepositoryUrl {
+        &self.package_repository
+    }
+
+    pub const fn signature(&self) -> &NpmSignatureDecision {
+        &self.signature
+    }
+
+    pub const fn provenance(&self) -> &NpmProvenanceDecision {
+        &self.provenance
+    }
+
+    pub const fn tag_commit(&self) -> Option<&GitCommit> {
+        self.tag_commit.as_ref()
+    }
+
+    pub const fn provenance_commit(&self) -> Option<&GitCommit> {
+        self.provenance_commit.as_ref()
+    }
+
+    pub fn maintainers(&self) -> &[NpmMaintainerIdentity] {
+        &self.maintainers
+    }
+
+    pub const fn repository_owner(&self) -> &RepositoryOwnerDecision {
+        &self.repository_owner
+    }
+}
+
+impl ImmutableRepository {
+    pub const fn url(&self) -> &RepositoryUrl {
+        &self.url
+    }
+
+    pub const fn commit(&self) -> &GitCommit {
+        &self.commit
+    }
+
+    pub const fn tree(&self) -> &GitTree {
+        &self.tree
+    }
+}
+
+impl VerifiedNpmSignature {
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub const fn signature_sha256(&self) -> &Hash256 {
+        &self.signature_sha256
+    }
+}
+
+impl ExactProviderArtifact {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn evidence(&self) -> &[ProviderEvidenceArtifact] {
+        &self.evidence
+    }
+}
+
+impl ProviderEvidenceArtifact {
+    pub const fn source(&self) -> &ImmutableProviderEvidenceSource {
+        &self.source
+    }
+
+    pub const fn accessed_on(&self) -> &Date {
+        &self.accessed_on
+    }
+
+    pub const fn content_sha256(&self) -> &Hash256 {
+        &self.content_sha256
+    }
+
+    pub const fn terms(&self) -> &EvidenceTermsDisposition {
+        &self.terms
+    }
+
+    pub fn facts(&self) -> &[ProviderFact] {
+        &self.facts
+    }
+}
+
+impl ProviderFact {
+    pub const fn fact_id(&self) -> ProviderFactId {
+        self.fact_id
+    }
+
+    pub const fn location(&self) -> &ExactFactLocation {
+        &self.location
+    }
+
+    pub const fn normalized_value(&self) -> &TypedValueMaterialV1 {
+        &self.normalized_value
+    }
+}
+
+impl ProviderContractReference {
+    pub const fn contract_id(&self) -> ProviderContractId {
+        self.contract_id
+    }
+
+    pub fn facts(&self) -> &[ContractFact] {
+        &self.facts
+    }
+}
+
+impl DonatOwnedSource {
+    pub const fn repository_commit(&self) -> &GitCommit {
+        &self.repository_commit
+    }
+
+    pub fn files(&self) -> &[RepoFileHash] {
+        &self.files
+    }
+}
+
+impl RepoFileHash {
+    pub const fn path(&self) -> &RepoPath {
+        &self.path
+    }
+
+    pub const fn sha256(&self) -> &Hash256 {
+        &self.sha256
+    }
+}
+
+impl ArtifactHash {
+    pub fn try_new(
+        artifact_id: &str,
+        algorithm: HashAlgorithm,
+        digest: &str,
+        path: Option<&str>,
+    ) -> Result<Self, CatalogError> {
+        let width = match algorithm {
+            HashAlgorithm::Sha256 => 64,
+            HashAlgorithm::Sha512 => 128,
+        };
+        if !valid_hash(digest, width) {
+            return invalid_primitive("artifact digest");
+        }
+        Ok(Self {
+            artifact_id: ArtifactId::parse(artifact_id)?,
+            algorithm,
+            digest: digest.to_owned(),
+            path: path.map(SourcePath::parse).transpose()?,
+        })
+    }
+
+    pub const fn artifact_id(&self) -> &ArtifactId {
+        &self.artifact_id
+    }
+
+    pub const fn algorithm(&self) -> HashAlgorithm {
+        self.algorithm
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub const fn path(&self) -> Option<&SourcePath> {
+        self.path.as_ref()
+    }
+}
+
+impl NoticeIdentity {
+    pub const fn id(&self) -> NoticeId {
+        self.id
+    }
+
+    pub const fn license_file_path(&self) -> &SourcePath {
+        &self.license_file_path
+    }
+
+    pub const fn license_file_sha256(&self) -> &Hash256 {
+        &self.license_file_sha256
+    }
+
+    pub fn required_copyright_lines(&self) -> &[String] {
+        &self.required_copyright_lines
+    }
+
+    pub const fn notice_bundle_destination(&self) -> &RepoPath {
+        &self.notice_bundle_destination
+    }
+}
+
+impl DependencyDecision {
+    pub fn dependency(&self) -> &str {
+        &self.dependency
+    }
+
+    pub const fn disposition(&self) -> &DependencyDisposition {
+        &self.disposition
+    }
+}
+
+impl EmbeddedMaterialDecision {
+    pub fn material_id(&self) -> &str {
+        &self.material_id
+    }
+
+    pub const fn path(&self) -> &SourcePath {
+        &self.path
+    }
+
+    pub const fn sha256(&self) -> &Hash256 {
+        &self.sha256
+    }
+
+    pub const fn disposition(&self) -> &EmbeddedMaterialDisposition {
+        &self.disposition
+    }
+}
+
+impl SafetyFindings {
+    pub fn findings(&self) -> &[SafetyFinding] {
+        &self.findings
+    }
+}
+
+impl SafetyFinding {
+    pub const fn finding_id(&self) -> &FindingId {
+        &self.finding_id
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub const fn location(&self) -> Option<&SourcePath> {
+        self.location.as_ref()
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1208,8 +1641,16 @@ impl AcceptedRecordCatalog {
         Ok(EvidenceAcceptedRecord { record, contracts })
     }
 
-    pub fn records(&self) -> impl ExactSizeIterator<Item = &ConnectorSourceRecord> {
-        self.records.values()
+    pub(crate) fn capability_record(
+        &self,
+        record_id: SourceRecordId,
+    ) -> Option<&ConnectorSourceRecord> {
+        let record = self.records.get(&record_id)?;
+        matches!(
+            record.admission,
+            AdmissionState::ApprovedForPort { .. } | AdmissionState::EvidenceAccepted { .. }
+        )
+        .then_some(record)
     }
 }
 
@@ -1240,6 +1681,10 @@ pub fn load_record_bytes(bytes: &[u8]) -> Result<ConnectorSourceRecord, CatalogE
 
 fn same_yaml_shape(left: &serde_yaml::Value, right: &serde_yaml::Value) -> bool {
     match (left, right) {
+        (serde_yaml::Value::Null, serde_yaml::Value::Null)
+        | (serde_yaml::Value::Bool(_), serde_yaml::Value::Bool(_))
+        | (serde_yaml::Value::Number(_), serde_yaml::Value::Number(_))
+        | (serde_yaml::Value::String(_), serde_yaml::Value::String(_)) => true,
         (serde_yaml::Value::Mapping(left), serde_yaml::Value::Mapping(right)) => {
             left.len() == right.len()
                 && left.iter().all(|(key, left_value)| {
@@ -1261,7 +1706,7 @@ fn same_yaml_shape(left: &serde_yaml::Value, right: &serde_yaml::Value) -> bool 
         (serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_), _)
         | (_, serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)) => false,
         (serde_yaml::Value::Tagged(_), _) | (_, serde_yaml::Value::Tagged(_)) => false,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -1307,12 +1752,18 @@ fn validate_record(record: &ConnectorSourceRecord) -> Result<(), CatalogError> {
 fn map_source_decode_error(error: serde_yaml::Error) -> CatalogError {
     let detail = error.to_string();
     for code in [
+        "source_record_duplicate",
         "source_record_invalid_primitive",
         "source_record_npm_integrity_invalid",
+        "source_record_evidence_mismatch",
+        "source_record_incomplete",
     ] {
         if detail.contains(code) {
             return CatalogError::new(code, detail);
         }
+    }
+    if detail.contains("duplicate field") || detail.contains("duplicate entry with key") {
+        return CatalogError::new("source_record_duplicate", detail);
     }
     CatalogError::new("source_record_incomplete", detail)
 }
@@ -1331,38 +1782,18 @@ fn validate_required_structure(record: &ConnectorSourceRecord) -> Result<(), Cat
     }
     match &record.subject {
         SourceSubject::ExactNpm(package) => {
-            if package.name.is_empty()
-                || package.maintainers.is_empty()
-                || record.artifact_hashes.is_empty()
-            {
+            if package.name.is_empty() || package.maintainers.is_empty() {
                 return source_error(
                     "source_record_incomplete",
-                    "exact npm identity and artifact inventory must be nonempty",
+                    "exact npm identity and maintainer inventory must be nonempty",
                 );
             }
         }
         SourceSubject::ProviderArtifact(provider) => {
-            if provider.provider.is_empty()
-                || provider.evidence.is_empty()
-                || record.artifact_hashes.is_empty()
-            {
+            if provider.provider.is_empty() {
                 return source_error(
                     "source_record_incomplete",
-                    "provider evidence and artifact inventory must be nonempty",
-                );
-            }
-            if provider
-                .evidence
-                .iter()
-                .any(|evidence| evidence.facts.is_empty())
-                || record
-                    .provider_contracts
-                    .iter()
-                    .any(|contract| contract.facts.is_empty())
-            {
-                return source_error(
-                    "source_record_incomplete",
-                    "provider fact and contract collections must be nonempty",
+                    "provider identity must be nonempty",
                 );
             }
         }
@@ -1804,10 +2235,23 @@ fn validate_npm_identity(
     record: &ConnectorSourceRecord,
     package: &ExactNpmPackage,
 ) -> Result<(), CatalogError> {
-    let expected_suffix = format!("/{}-{}.tgz", package.name, package.version.as_str());
+    if record.artifact_hashes.is_empty() {
+        return evidence_mismatch("npm artifact inventory is empty");
+    }
+    let package_file_name = package.name.rsplit('/').next().ok_or_else(|| {
+        CatalogError::new(
+            "source_record_npm_identity_mismatch",
+            "npm package name has no canonical tarball basename",
+        )
+    })?;
+    let tarball_file_name = format!("{package_file_name}-{}.tgz", package.version.as_str());
+    let expected_tarball_url = format!(
+        "https://registry.npmjs.org/{}/-/{}",
+        package.name, tarball_file_name
+    );
     if package.package_repository != package.repository.url
         || package.npm_git_head != package.repository.commit
-        || !package.tarball_url.ends_with(&expected_suffix)
+        || package.tarball_url.as_str() != expected_tarball_url
     {
         return npm_identity_mismatch("npm repository/package mapping");
     }
@@ -1840,15 +2284,15 @@ fn validate_npm_identity(
     {
         return npm_identity_mismatch("npm registry metadata decisions disagree");
     }
-    let matching_integrity = record
-        .artifact_hashes
-        .iter()
-        .filter(|artifact| artifact.algorithm == HashAlgorithm::Sha512)
-        .filter_map(|artifact| decode_hex_64(&artifact.digest).map(|digest| (artifact, digest)))
-        .filter(|(_, digest)| digest == package.integrity.as_bytes())
-        .count();
-    if matching_integrity != 1 {
-        return npm_identity_mismatch("npm SRI must match one SHA-512 artifact");
+    let [artifact] = record.artifact_hashes.as_slice() else {
+        return npm_identity_mismatch("npm tarball artifact inventory must be exact");
+    };
+    let matches_integrity = artifact.algorithm == HashAlgorithm::Sha512
+        && artifact.path.as_deref() == Some(tarball_file_name.as_str())
+        && decode_hex_64(&artifact.digest)
+            .is_some_and(|digest| &digest == package.integrity.as_bytes());
+    if !matches_integrity {
+        return npm_identity_mismatch("npm SRI must match the canonical tarball artifact");
     }
     Ok(())
 }
@@ -1857,6 +2301,22 @@ fn validate_provider_joins(
     record: &ConnectorSourceRecord,
     provider: &ExactProviderArtifact,
 ) -> Result<(), CatalogError> {
+    if provider.evidence.is_empty()
+        || record.artifact_hashes.is_empty()
+        || record.provider_contracts.is_empty()
+        || provider
+            .evidence
+            .iter()
+            .any(|evidence| evidence.facts.is_empty())
+        || record
+            .provider_contracts
+            .iter()
+            .any(|contract| contract.facts.is_empty())
+    {
+        return evidence_mismatch(
+            "provider evidence, artifacts, facts, and contracts must be nonempty",
+        );
+    }
     let repository_sources = provider
         .evidence
         .iter()
@@ -1879,48 +2339,64 @@ fn validate_provider_joins(
     }
 
     let mut inventory_facts = BTreeSet::new();
+    let mut joined_artifacts = BTreeSet::new();
     for evidence in &provider.evidence {
         let source_path = match &evidence.source {
-            ImmutableProviderEvidenceSource::RepositoryFile { path, .. } => Some(path.as_str()),
-            ImmutableProviderEvidenceSource::VersionedArtifact { .. } => None,
+            ImmutableProviderEvidenceSource::RepositoryFile { path, .. } => {
+                path.as_str().to_owned()
+            }
+            ImmutableProviderEvidenceSource::VersionedArtifact { url, .. } => {
+                versioned_artifact_path(url)?
+            }
         };
         let artifact_matches = record
             .artifact_hashes
             .iter()
+            .enumerate()
             .filter(|artifact| {
-                artifact.algorithm == HashAlgorithm::Sha256
-                    && artifact.digest == evidence.content_sha256.as_str()
-                    && source_path.is_none_or(|path| artifact.path.as_deref() == Some(path))
+                artifact.1.algorithm == HashAlgorithm::Sha256
+                    && artifact.1.digest == evidence.content_sha256.as_str()
+                    && artifact.1.path.as_deref() == Some(source_path.as_str())
             })
-            .count();
-        if artifact_matches != 1 {
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [artifact_index] = artifact_matches.as_slice() else {
             return evidence_mismatch("provider evidence artifact/content/path join");
+        };
+        if !joined_artifacts.insert(*artifact_index) {
+            return evidence_mismatch("provider evidence reuses an artifact");
         }
         for fact in &evidence.facts {
             let fact_path = match &fact.location {
                 ExactFactLocation::JsonPointer { path, .. }
                 | ExactFactLocation::DocumentSection { path, .. } => path,
             };
-            if source_path.is_some_and(|path| fact_path.as_str() != path) {
+            if fact_path.as_str() != source_path {
                 return evidence_mismatch("provider fact path does not match evidence");
             }
-            inventory_facts.insert(fact.fact_id);
+            if !inventory_facts.insert(fact.fact_id) {
+                return duplicate("provider fact");
+            }
         }
+    }
+    if joined_artifacts.len() != record.artifact_hashes.len() {
+        return evidence_mismatch("provider artifact inventory contains unrelated entries");
     }
 
     let mut referenced_facts = BTreeSet::new();
     for contract in &record.provider_contracts {
         for fact in &contract.facts {
-            if let ContractFact::ProviderEvidence {
+            let ContractFact::ProviderEvidence {
                 source_record_id,
                 fact_id,
             } = fact
-            {
-                if source_record_id != &record.record_id || !inventory_facts.contains(fact_id) {
-                    return evidence_mismatch("provider contract fact reference");
-                }
-                referenced_facts.insert(*fact_id);
+            else {
+                return evidence_mismatch("provider contracts require provider evidence facts");
+            };
+            if source_record_id != &record.record_id || !inventory_facts.contains(fact_id) {
+                return evidence_mismatch("provider contract fact reference");
             }
+            referenced_facts.insert(*fact_id);
         }
     }
     if referenced_facts != inventory_facts {
@@ -1931,10 +2407,22 @@ fn validate_provider_joins(
 
 fn validate_record_admission(record: &ConnectorSourceRecord) -> Result<(), CatalogError> {
     match &record.admission {
-        AdmissionState::InventoryOnly { findings } if findings.is_empty() => {
-            admission_mismatch("inventory-only findings")
+        AdmissionState::InventoryOnly { findings } => {
+            let admitted = findings
+                .iter()
+                .map(FindingId::as_str)
+                .collect::<BTreeSet<_>>();
+            let actual = record
+                .safety_findings
+                .findings
+                .iter()
+                .map(|finding| finding.finding_id.as_str())
+                .collect::<BTreeSet<_>>();
+            if findings.is_empty() || admitted.len() != findings.len() || admitted != actual {
+                return admission_mismatch("inventory-only safety finding closure");
+            }
+            Ok(())
         }
-        AdmissionState::InventoryOnly { .. } => Ok(()),
         AdmissionState::ApprovedForPort { operations } => {
             if operations.is_empty()
                 || matches!(record.subject, SourceSubject::ProviderArtifact(_))
@@ -1947,6 +2435,7 @@ fn validate_record_admission(record: &ConnectorSourceRecord) -> Result<(), Catal
             {
                 return admission_mismatch("approved operation closure");
             }
+            validate_executable_source_state(record)?;
             Ok(())
         }
         AdmissionState::EvidenceAccepted { contracts } => {
@@ -1962,9 +2451,60 @@ fn validate_record_admission(record: &ConnectorSourceRecord) -> Result<(), Catal
             if contracts.is_empty() || admitted.len() != contracts.len() || admitted != declared {
                 return admission_mismatch("accepted provider contract closure");
             }
+            validate_executable_source_state(record)?;
             Ok(())
         }
     }
+}
+
+fn validate_executable_source_state(record: &ConnectorSourceRecord) -> Result<(), CatalogError> {
+    if record.compatibility == CompatibilityDecision::Rejected
+        || !record.safety_findings.findings.is_empty()
+        || record.dependencies.iter().any(|dependency| {
+            matches!(
+                dependency.disposition,
+                DependencyDisposition::Rejected { .. }
+            )
+        })
+        || record.embedded_material.iter().any(|material| {
+            matches!(
+                material.disposition,
+                EmbeddedMaterialDisposition::Rejected { .. }
+            )
+        })
+    {
+        return admission_mismatch("rejected or unresolved executable source state");
+    }
+    if let SourceSubject::ExactNpm(package) = &record.subject
+        && (matches!(package.signature, NpmSignatureDecision::Rejected { .. })
+            || matches!(package.provenance, NpmProvenanceDecision::Rejected { .. })
+            || matches!(
+                package.repository_owner,
+                RepositoryOwnerDecision::Rejected { .. }
+            ))
+    {
+        return admission_mismatch("rejected npm executable source state");
+    }
+    Ok(())
+}
+
+fn versioned_artifact_path(url: &ExactHttpsUrl) -> Result<String, CatalogError> {
+    let parsed = url::Url::parse(url.as_str()).map_err(|_| {
+        CatalogError::new("source_record_evidence_mismatch", "invalid evidence URL")
+    })?;
+    let path = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .ok_or_else(|| {
+            CatalogError::new(
+                "source_record_evidence_mismatch",
+                "versioned evidence URL has no immutable artifact path",
+            )
+        })?;
+    if !valid_path(path) {
+        return evidence_mismatch("versioned evidence artifact path");
+    }
+    Ok(path.to_owned())
 }
 
 fn validate_license_primitives(license: &LicenseDecision) -> Result<(), CatalogError> {
@@ -2117,10 +2657,27 @@ fn valid_id(value: &str) -> bool {
 }
 
 fn valid_npm_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.is_ascii()
-        && !value.bytes().any(|byte| byte.is_ascii_whitespace())
-        && !value.contains("..")
+    fn valid_segment(value: &str) -> bool {
+        !value.is_empty()
+            && !value.starts_with(['.', '_'])
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            })
+    }
+
+    if value.is_empty() || value.len() > 214 || !value.is_ascii() {
+        return false;
+    }
+    if let Some(scoped) = value.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return false;
+        };
+        !name.contains('/') && valid_segment(scope) && valid_segment(name)
+    } else {
+        !value.contains('/') && valid_segment(value)
+    }
 }
 
 fn valid_json_pointer(value: &str) -> bool {

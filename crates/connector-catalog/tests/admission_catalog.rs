@@ -86,7 +86,7 @@ fn approved_operation_closure_must_match_in_both_directions() {
     ] {
         let error = AcceptedRecordCatalog::build(
             vec![record.clone()],
-            &BTreeMap::from([(record.record_id, closure)]),
+            &BTreeMap::from([(record.record_id(), closure)]),
             &SourceReviewRegistry::default(),
         )
         .unwrap_err();
@@ -119,6 +119,61 @@ fn unrelated_or_empty_evidence_admission_never_builds_a_capability() {
     let unrelated = source.replace("contracts: [contract.demo]", "contracts: [contract.other]");
     assert_eq!(
         load_record_bytes(unrelated.as_bytes()).unwrap_err().code(),
+        "source_record_admission_mismatch"
+    );
+}
+
+#[test]
+fn inventory_only_findings_are_the_exact_safety_finding_closure() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/serpapi-npm-record.yaml"),
+    )
+    .unwrap();
+    let bytes = source.replace(
+        "findings:\n    - finding_id: finding.awaiting.port\n      kind: port.pending\n      location: null\n      message: Port implementation has not been approved.",
+        "findings: []",
+    );
+    assert_eq!(
+        load_record_bytes(bytes.as_bytes()).unwrap_err().code(),
+        "source_record_admission_mismatch"
+    );
+}
+
+#[test]
+fn rejected_source_states_cannot_mint_checked_capabilities() {
+    let npm = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/serpapi-npm-record.yaml"),
+    )
+    .unwrap()
+    .replacen(
+        r#"signature:
+      kind: verified
+      value:
+        signatures:
+          - key_id: npm.key.1
+            signature_sha256: 415263748596a7b8c9daebfc0d1e2f405162738495a6b7c8d9eafb0c1d2e3f50
+        registry_metadata_sha256: 8192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90
+"#,
+        "signature:\n      kind: rejected\n      value:\n        finding: finding.npm.signature.rejected\n",
+        1,
+    )
+    .replacen(
+        "kind: inventory_only\n  value:\n    findings:\n      - finding.awaiting.port",
+        "kind: approved_for_port\n  value:\n    operations: [get]",
+        1,
+    );
+    assert_eq!(
+        load_record_bytes(npm.as_bytes()).unwrap_err().code(),
+        "source_record_admission_mismatch"
+    );
+
+    let provider = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-contract-record.yaml"),
+    )
+    .unwrap()
+    .replacen("kind: tier_a", "kind: rejected", 1);
+    assert_eq!(
+        load_record_bytes(provider.as_bytes()).unwrap_err().code(),
         "source_record_admission_mismatch"
     );
 }

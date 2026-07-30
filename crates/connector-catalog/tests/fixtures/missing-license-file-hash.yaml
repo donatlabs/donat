@@ -6,7 +6,7 @@ subject:
     repository_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     files:
       - path: crates/server/src/connectors/http.rs
-        sha256: 1111111111111111111111111111111111111111111111111111111111111111
+        sha256: '1111111111111111111111111111111111111111111111111111111111111111'
 reacquisition:
   kind: donat_owned_no_network
   value: null
@@ -20,7 +20,7 @@ license:
 notice:
   id: notice.donat
   license_file_path: LICENSE
-  license_file_sha256: 2222222222222222222222222222222222222222222222222222222222222222
+  license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
   required_copyright_lines: []
   notice_bundle_destination: THIRD_PARTY_NOTICES.md
 entrypoints: [crates/server/src/connectors/http.rs]

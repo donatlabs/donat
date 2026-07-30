@@ -6,7 +6,7 @@ use donat_connector_abi::{
     CredentialFieldId, CredentialSpecId, NormalizerId, OperationId, OriginId, ProcessorFamilyId,
     StaticErrorCode, StaticSafeMessage, TriggerId, catalog_construction,
 };
-use donat_value_contract::{CanonicalNumber, TypedValue, ValueContractCatalog};
+use donat_value_contract::{CanonicalNumber, TypedValue, ValueContractCatalog, ValueContractError};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -752,23 +752,34 @@ impl ConnectorManifest {
 ///
 /// Construction is intentionally private so runtime code cannot mistake a
 /// parsed or hand-built manifest for an executable one.
-pub struct CheckedConnectorManifest<'manifest> {
-    manifest: &'manifest ConnectorManifest,
+pub struct CheckedConnectorManifest<'checked> {
+    manifest: &'checked ConnectorManifest,
+    accepted_records: &'checked AcceptedRecordCatalog,
+    reviewed_policies: &'checked BTreeMap<DonatPolicyId, TypedValue>,
 }
 
 impl CheckedConnectorManifest<'_> {
     pub const fn manifest(&self) -> &ConnectorManifest {
         self.manifest
     }
+
+    pub(crate) const fn accepted_records(&self) -> &AcceptedRecordCatalog {
+        self.accepted_records
+    }
+
+    pub(crate) const fn reviewed_policies(&self) -> &BTreeMap<DonatPolicyId, TypedValue> {
+        self.reviewed_policies
+    }
 }
 
-pub fn compile_connector_manifest<'manifest>(
-    manifest: &'manifest ConnectorManifest,
-    accepted_records: &AcceptedRecordCatalog,
-    reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
-) -> Result<CheckedConnectorManifest<'manifest>, CatalogError> {
+pub fn compile_connector_manifest<'checked>(
+    manifest: &'checked ConnectorManifest,
+    accepted_records: &'checked AcceptedRecordCatalog,
+    reviewed_policies: &'checked BTreeMap<DonatPolicyId, TypedValue>,
+) -> Result<CheckedConnectorManifest<'checked>, CatalogError> {
     validate_manifest_structure(manifest)?;
     validate_manifest_primitives(manifest)?;
+    validate_manifest_step_identity(manifest)?;
     validate_manifest_credentials(manifest)?;
     validate_manifest_contracts(manifest)?;
     validate_manifest_selected_headers(manifest)?;
@@ -776,7 +787,26 @@ pub fn compile_connector_manifest<'manifest>(
     validate_manifest_effects(manifest)?;
     validate_manifest_identity(manifest)?;
     validate_manifest_provenance(manifest, accepted_records, reviewed_policies)?;
-    Ok(CheckedConnectorManifest { manifest })
+    Ok(CheckedConnectorManifest {
+        manifest,
+        accepted_records,
+        reviewed_policies,
+    })
+}
+
+fn validate_manifest_step_identity(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
+    for operation in &manifest.operations {
+        let mut steps = BTreeSet::new();
+        for step in &operation.steps {
+            if !steps.insert(step.step) {
+                return Err(CatalogError::new(
+                    "catalog_operation_duplicate_step",
+                    step.step.as_str(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_manifest_structure(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
@@ -1249,6 +1279,16 @@ fn validate_request_binding_closure(
 
 fn validate_manifest_contracts(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
     for operation in &manifest.operations {
+        for contract in [&operation.input, &operation.output] {
+            match contract.validate(&TypedValue::Object(BTreeMap::new())) {
+                Ok(()) | Err(ValueContractError::InvalidValue(_)) => {}
+                Err(error) => {
+                    return contract_hash_mismatch(format!(
+                        "invalid value-contract definition: {error}"
+                    ));
+                }
+            }
+        }
         if operation.input_contract_sha256 == [0; 32] || operation.output_contract_sha256 == [0; 32]
         {
             return contract_hash_mismatch("zero value-contract hash");
@@ -1349,12 +1389,17 @@ fn validate_manifest_error_maps(manifest: &ConnectorManifest) -> Result<(), Cata
 fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), CatalogError> {
     for operation in &manifest.operations {
         match &operation.effect {
-            OperationEffect::ReadOnly => {}
+            OperationEffect::ReadOnly => {
+                if !operation.resolved_fact_values.is_empty() {
+                    return effect_incomplete("read-only operation declares side-effect facts");
+                }
+            }
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 if side_effect_steps.len() != operation.steps.len() {
                     return effect_incomplete("every side-effecting step needs exact evidence");
                 }
                 let mut steps = BTreeSet::new();
+                let mut required_use_sites = BTreeSet::new();
                 for side_effect in side_effect_steps {
                     let Some(step) = operation
                         .steps
@@ -1386,6 +1431,11 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
                         operation.operation.as_str(),
                         step.step.as_str()
                     );
+                    required_use_sites.extend([
+                        scope_site.clone(),
+                        retention_site.clone(),
+                        margin_site.clone(),
+                    ]);
                     if !matches!(
                         exact_fact_value(operation, &scope_site),
                         Some(TypedValue::String(value)) if value == &side_effect.scope
@@ -1402,6 +1452,18 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
                             "idempotency behavior differs from its exact admitted fact bindings",
                         );
                     }
+                }
+                let declared_use_sites = operation
+                    .resolved_fact_values
+                    .iter()
+                    .map(|binding| binding.use_site.clone())
+                    .collect::<BTreeSet<_>>();
+                if declared_use_sites.len() != operation.resolved_fact_values.len()
+                    || declared_use_sites != required_use_sites
+                {
+                    return effect_incomplete(
+                        "idempotency fact requirements are not an exact use-site closure",
+                    );
                 }
             }
         }
@@ -1517,21 +1579,29 @@ fn validate_manifest_provenance(
     accepted_records: &AcceptedRecordCatalog,
     reviewed_policies: &BTreeMap<DonatPolicyId, TypedValue>,
 ) -> Result<(), CatalogError> {
-    let records = accepted_records
-        .records()
-        .map(|record| (record.record_id, record))
-        .collect::<BTreeMap<_, _>>();
-    let mut references = BTreeSet::new();
+    let reference_ids = manifest
+        .provenance
+        .iter()
+        .map(|reference| reference.source_record_id)
+        .collect::<BTreeSet<_>>();
+    if reference_ids.len() != manifest.provenance.len() {
+        return manifest_reference_mismatch("duplicate provenance source record");
+    }
     for reference in &manifest.provenance {
-        if !references.insert(reference.source_record_id) {
-            return manifest_reference_mismatch("duplicate provenance source record");
-        }
-        let record = records.get(&reference.source_record_id).ok_or_else(|| {
-            CatalogError::new(
-                "catalog_manifest_reference_mismatch",
-                "provenance source record is unresolved",
-            )
-        })?;
+        let record = accepted_records
+            .capability_record(reference.source_record_id)
+            .ok_or_else(|| {
+                CatalogError::new(
+                    "catalog_manifest_reference_mismatch",
+                    "provenance source record has no exact checked capability",
+                )
+            })?;
+        let port_capability = accepted_records
+            .port_approved(reference.source_record_id)
+            .ok();
+        let evidence_capability = accepted_records
+            .evidence_accepted(reference.source_record_id)
+            .ok();
         let reference_artifacts = artifact_keys(&reference.artifact_hashes);
         if reference_artifacts.len() != reference.artifact_hashes.len()
             || reference_artifacts != artifact_keys(&record.artifact_hashes)
@@ -1540,6 +1610,40 @@ fn validate_manifest_provenance(
         {
             return manifest_reference_mismatch(
                 "provenance artifacts, license, or notice differ from source record",
+            );
+        }
+        for binding in &reference.contract_facts {
+            match &binding.fact {
+                ContractFact::ProviderEvidence {
+                    source_record_id, ..
+                } => {
+                    if !reference_ids.contains(source_record_id) {
+                        return Err(CatalogError::new(
+                            "catalog_fact_origin_unresolved",
+                            "provider fact source is absent from manifest provenance",
+                        ));
+                    }
+                    if *source_record_id != reference.source_record_id
+                        || evidence_capability.is_none()
+                    {
+                        return Err(CatalogError::new(
+                            "catalog_fact_binding_mismatch",
+                            "provider fact is foreign to its containing provenance capability",
+                        ));
+                    }
+                }
+                ContractFact::DonatPolicy { .. } if port_capability.is_none() => {
+                    return Err(CatalogError::new(
+                        "catalog_fact_binding_mismatch",
+                        "policy fact is not owned by an executable provenance capability",
+                    ));
+                }
+                ContractFact::DonatPolicy { .. } => {}
+            }
+        }
+        if evidence_capability.is_some() && reference.contract_facts.is_empty() {
+            return manifest_reference_mismatch(
+                "evidence provenance capability has no exact fact binding",
             );
         }
     }
@@ -1695,7 +1799,7 @@ fn credential_incomplete<T>(detail: &'static str) -> Result<T, CatalogError> {
     Err(CatalogError::new("catalog_credential_incomplete", detail))
 }
 
-fn contract_hash_mismatch<T>(detail: &'static str) -> Result<T, CatalogError> {
+fn contract_hash_mismatch<T>(detail: impl Into<String>) -> Result<T, CatalogError> {
     Err(CatalogError::new("catalog_contract_hash_mismatch", detail))
 }
 

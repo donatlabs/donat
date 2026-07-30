@@ -199,11 +199,11 @@ fn manifest_provenance_references_match_exact_records() {
     )
     .unwrap();
     let binding = ResolvedContractFactBinding {
-        use_site: "effect.request.binding".to_owned(),
-        fact: record.provider_contracts[0].facts[0].clone(),
+        use_site: "operation.get.step.request.idempotency.scope".to_owned(),
+        fact: record.provider_contracts()[0].facts()[0].clone(),
     };
     let values = [ResolvedFactValue {
-        use_site: "effect.request.binding".to_owned(),
+        use_site: "operation.get.step.request.idempotency.scope".to_owned(),
         value: donat_value_contract::TypedValue::String("Idempotency-Key".to_owned()),
     }];
     let mut reviews = SourceReviewRegistry::default();
@@ -215,6 +215,6 @@ fn manifest_provenance_references_match_exact_records() {
     let (source_record_id, _, artifact_content_sha256, _) = origins[0]
         .provider_evidence()
         .expect("provider fact must resolve to immutable evidence");
-    assert_eq!(source_record_id, record.record_id.as_str());
+    assert_eq!(source_record_id, record.record_id().as_str());
     assert_eq!(artifact_content_sha256.len(), 64);
 }

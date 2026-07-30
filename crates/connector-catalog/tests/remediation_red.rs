@@ -97,7 +97,12 @@ fn raw_number_cursor_ignores_strings_and_covers_nested_values() {
         .unwrap(),
         br#"{"a":0,"z":[1,{"escaped":"\"9007199254740993\"","n":1e-7,"s":"1.0"}]}"#
     );
-    for malformed in [b"1x".as_slice(), b"1e+"] {
+    for malformed in [
+        b"1x".as_slice(),
+        b"1e+",
+        b"9007199254740993x",
+        b"[9007199254740993,]",
+    ] {
         assert_eq!(
             canonicalize_raw(malformed).unwrap_err().code(),
             "catalog_jcs_schema_mismatch"
@@ -117,4 +122,27 @@ fn checked_in_donat_http_source_identity_is_exact() {
         .status()
         .expect("repository source-identity checker must exist");
     assert!(status.success(), "checked-in source identity must verify");
+}
+
+#[test]
+fn source_identity_checker_pins_the_complete_legal_and_notice_disposition() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("catalog crate is nested below workspace root");
+    let checker =
+        std::fs::read_to_string(workspace.join("scripts/check_connector_source_identity.py"))
+            .unwrap();
+    for (field, value) in [
+        ("spdx_id", "Apache-2.0"),
+        ("selected_dual_license_branch", "null"),
+        ("notice_id", "notice.donat.http.v1"),
+        ("required_copyright_lines", "[]"),
+        ("notice_bundle_destination", "THIRD_PARTY_NOTICES.md"),
+    ] {
+        assert!(
+            checker.contains(&format!("\"{field}\": \"{value}\"")),
+            "checker must pin {field}={value}"
+        );
+    }
 }

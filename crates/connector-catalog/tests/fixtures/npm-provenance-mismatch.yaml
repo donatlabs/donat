@@ -77,7 +77,11 @@ admission:
     findings:
       - finding.awaiting.port
 safety_findings:
-  findings: []
+  findings:
+    - finding_id: finding.awaiting.port
+      kind: port.pending
+      location: null
+      message: Port implementation has not been approved.
 reviewer: reviewer.demo
 approval_date: 2026-07-29
 proposed_manifest: connector-catalog/manifests/serpapi.yaml

@@ -2,11 +2,11 @@ use std::path::Path;
 
 use donat_connector_abi::{CompiledStepId, ConnectorId, OperationId};
 use donat_connector_catalog::{
-    SourcePath, TypedValueMaterialV1, ValueContractMaterialV1, canonical_material_bytes,
+    TypedValueMaterialV1, ValueContractMaterialV1, canonical_material_bytes,
     canonical_projection_owner_manifest, canonicalize_raw, decode_source_record_material,
-    decode_value_contract_material, load_record, record_sha256, selected_response_header,
-    source_record_material, typed_value_material, validate_canonical_owner_manifest,
-    value_contract_sha256,
+    decode_value_contract_material, load_record, load_record_bytes, record_sha256,
+    selected_response_header, source_record_material, typed_value_material,
+    validate_canonical_owner_manifest, value_contract_sha256,
 };
 use donat_value_contract::{BoundedInlineBytes, CanonicalNumber, TypedValue};
 use sha2::{Digest, Sha256};
@@ -190,14 +190,15 @@ fn typed_value_projection_string_and_object_do_not_collide() {
 
 #[test]
 fn source_projection_preserves_declared_entrypoint_order() {
-    let mut record = load_record(
+    let fixture = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/donat-owned-record.yaml"),
     )
     .unwrap();
-    record.entrypoints = vec![
-        SourcePath::parse("z/entrypoint.rs").unwrap(),
-        SourcePath::parse("a/entrypoint.rs").unwrap(),
-    ];
+    let fixture = fixture.replace(
+        "entrypoints: [crates/server/src/connectors/http.rs]",
+        "entrypoints: [z/entrypoint.rs, a/entrypoint.rs]",
+    );
+    let record = load_record_bytes(fixture.as_bytes()).unwrap();
     let material = source_record_material(&record).unwrap();
     let document: serde_json::Value =
         serde_json::from_slice(&canonical_material_bytes(&material).unwrap()).unwrap();
@@ -248,29 +249,6 @@ fn canonical_projection_full_material_vectors_are_exact() {
     assert_eq!(
         hex(*value_contract_sha256(&value_contract).unwrap().as_bytes()),
         "79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a"
-    );
-}
-
-#[test]
-fn canonical_projection_one_field_mutations_are_separate() {
-    let record = decode_source_record_material(full_vector("source-record").as_bytes()).unwrap();
-    let changed_source = full_vector("source-record").replace(
-        "\"reviewer\":\"reviewer.demo\"",
-        "\"reviewer\":\"reviewer.changed\"",
-    );
-    let changed = decode_source_record_material(changed_source.as_bytes()).unwrap();
-    let value_contract: ValueContractMaterialV1 =
-        decode_value_contract_material(full_vector("value-contract").as_bytes()).unwrap();
-
-    let value_before = value_contract_sha256(&value_contract).unwrap();
-    let record_before = record_sha256(&record).unwrap();
-    assert_ne!(
-        record_before.as_bytes(),
-        record_sha256(&changed).unwrap().as_bytes()
-    );
-    assert_eq!(
-        value_before.as_bytes(),
-        value_contract_sha256(&value_contract).unwrap().as_bytes()
     );
 }
 

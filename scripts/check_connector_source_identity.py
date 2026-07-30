@@ -27,6 +27,11 @@ EXPECTED = {
     "source_sha256": "8111711926cbd522bc175305225daf31e7c6add4b3499265c45bd16872e265b8",
     "license_path": "LICENSE",
     "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "spdx_id": "Apache-2.0",
+    "selected_dual_license_branch": "null",
+    "notice_id": "notice.donat.http.v1",
+    "required_copyright_lines": "[]",
+    "notice_bundle_destination": "THIRD_PARTY_NOTICES.md",
 }
 
 
@@ -77,6 +82,25 @@ def main() -> None:
         "repository_commit": commit,
         "source_path": source_path,
         "source_sha256": source_hash,
+        "spdx_id": one(r"^\s{4}spdx_id:\s*(\S+)\s*$", text, "spdx_id"),
+        "selected_dual_license_branch": one(
+            r"^\s{4}selected_dual_license_branch:\s*(\S+)\s*$",
+            text,
+            "selected_dual_license_branch",
+        ),
+        "notice_id": one(
+            r"^notice:\s*$\n^\s{2}id:\s*(\S+)\s*$", text, "notice_id"
+        ),
+        "required_copyright_lines": one(
+            r"^\s{2}required_copyright_lines:\s*(\[[^\r\n]*\])\s*$",
+            text,
+            "required_copyright_lines",
+        ),
+        "notice_bundle_destination": one(
+            r"^\s{2}notice_bundle_destination:\s*(\S+)\s*$",
+            text,
+            "notice_bundle_destination",
+        ),
     }
     for field, expected in EXPECTED.items():
         if field in actual and actual[field] != expected:

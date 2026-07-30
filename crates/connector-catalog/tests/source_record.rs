@@ -39,10 +39,10 @@ fn source_record_variants_are_closed() {
 #[test]
 fn exact_npm_version_uses_exact_semver() {
     let record = load_record(fixture("serpapi-npm-record.yaml")).unwrap();
-    let SourceSubject::ExactNpm(package) = record.subject else {
+    let SourceSubject::ExactNpm(package) = record.subject() else {
         panic!("fixture must be exact npm");
     };
-    assert_eq!(package.version.as_str(), "0.1.10");
+    assert_eq!(package.version().as_str(), "0.1.10");
 }
 
 #[test]
@@ -67,27 +67,27 @@ fn serpapi_npm_record_round_trips_without_information_loss() {
     let record = load_record(fixture("serpapi-npm-record.yaml")).unwrap();
     let encoded = canonical_yaml(&record).unwrap();
     assert_eq!(load_record_bytes(&encoded).unwrap(), record);
-    assert_eq!(record.compatibility, CompatibilityDecision::TierA);
+    assert_eq!(record.compatibility(), CompatibilityDecision::TierA);
     assert!(matches!(
-        record.admission,
+        record.admission(),
         AdmissionState::InventoryOnly { .. }
     ));
-    let SourceSubject::ExactNpm(package) = &record.subject else {
+    let SourceSubject::ExactNpm(package) = record.subject() else {
         panic!("fixture must be exact npm");
     };
     assert!(matches!(
-        package.signature,
+        package.signature(),
         NpmSignatureDecision::Verified { .. }
     ));
     assert!(matches!(
-        package.provenance,
+        package.provenance(),
         NpmProvenanceDecision::VerifiedAbsent { .. }
     ));
-    assert!(package.tag_commit.is_some());
-    assert!(package.provenance_commit.is_none());
-    assert_eq!(package.maintainers.len(), 2);
+    assert!(package.tag_commit().is_some());
+    assert!(package.provenance_commit().is_none());
+    assert_eq!(package.maintainers().len(), 2);
     assert!(matches!(
-        package.repository_owner,
+        package.repository_owner(),
         RepositoryOwnerDecision::Consistent { .. }
     ));
 }
@@ -152,29 +152,30 @@ fn npm_integrity_and_repository_mapping_are_exact() {
 #[test]
 fn npm_signature_provenance_tag_maintainer_and_owner_state_is_exact() {
     let record = load_record(fixture("serpapi-npm-record.yaml")).unwrap();
-    let SourceSubject::ExactNpm(package) = record.subject else {
+    let SourceSubject::ExactNpm(package) = record.subject() else {
         panic!("fixture must be exact npm");
     };
     let NpmSignatureDecision::Verified {
         signatures,
         registry_metadata_sha256,
-    } = package.signature
+        ..
+    } = package.signature()
     else {
         panic!("fixture must retain verified signature evidence");
     };
     assert!(!signatures.is_empty());
     assert_eq!(registry_metadata_sha256.len(), 64);
     assert!(matches!(
-        package.provenance,
+        package.provenance(),
         NpmProvenanceDecision::VerifiedAbsent { .. }
     ));
     assert_ne!(
-        package.tag_commit.as_deref(),
-        Some(package.npm_git_head.as_str())
+        package.tag_commit().map(|commit| commit.as_str()),
+        Some(package.npm_git_head().as_str())
     );
-    assert_eq!(package.maintainers.len(), 2);
+    assert_eq!(package.maintainers().len(), 2);
     assert!(matches!(
-        package.repository_owner,
+        package.repository_owner(),
         RepositoryOwnerDecision::Consistent { .. }
     ));
 }
@@ -185,16 +186,16 @@ fn reacquisition_plan_matches_source_subject() {
     let provider = load_record(fixture("provider-contract-record.yaml")).unwrap();
     let owned = load_record(fixture("donat-owned-record.yaml")).unwrap();
     assert!(matches!(
-        npm.reacquisition,
+        npm.reacquisition(),
         ReacquisitionPlan::ExactNpmReview
     ));
     assert!(matches!(
-        provider.reacquisition,
+        provider.reacquisition(),
         ReacquisitionPlan::ProviderRepositoryReview
             | ReacquisitionPlan::ProviderVersionedArtifactReview
     ));
     assert!(matches!(
-        owned.reacquisition,
+        owned.reacquisition(),
         ReacquisitionPlan::DonatOwnedNoNetwork
     ));
 }
@@ -202,8 +203,8 @@ fn reacquisition_plan_matches_source_subject() {
 #[test]
 fn dependency_and_embedded_dispositions_are_closed() {
     let record = load_record(fixture("serpapi-npm-record.yaml")).unwrap();
-    for dependency in record.dependencies {
-        match dependency.disposition {
+    for dependency in record.dependencies() {
+        match dependency.disposition() {
             DependencyDisposition::Shipped { .. }
             | DependencyDisposition::BuildOnly { .. }
             | DependencyDisposition::TypeOnlyReplaced { .. }
