@@ -475,19 +475,18 @@ impl ConnectorRegistry {
                                 instance: instance.name.clone(),
                                 message,
                             }
-                        })?
-                            && executable_specs
-                                .insert(spec.operation, Arc::new(spec))
-                                .is_some()
-                            {
-                                return Err(ConnectorRegistryError::InvalidConfiguration {
-                                    instance: instance.name.clone(),
-                                    message: format!(
-                                        "executable catalog operation `{}` is declared more than once",
-                                        operation.name
-                                    ),
-                                });
-                            }
+                        })? && executable_specs
+                            .insert(spec.operation, Arc::new(spec))
+                            .is_some()
+                        {
+                            return Err(ConnectorRegistryError::InvalidConfiguration {
+                                instance: instance.name.clone(),
+                                message: format!(
+                                    "executable catalog operation `{}` is declared more than once",
+                                    operation.name
+                                ),
+                            });
+                        }
                         let compiled = CompiledHttpOperation {
                             configuration_fingerprint: http_configuration_fingerprint(
                                 HTTP_DEFINITION,

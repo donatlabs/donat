@@ -840,12 +840,18 @@ fn a_payout_cycle_pays_each_accepted_vendor_order() {
 
     let output = await_terminal(&mut client, "vendor_payout");
     assert_eq!(
-        output.pointer("/failures").and_then(Json::as_array).map(Vec::len),
+        output
+            .pointer("/failures")
+            .and_then(Json::as_array)
+            .map(Vec::len),
         Some(0),
         "every candidate was paid: {output}"
     );
     assert_eq!(
-        output.pointer("/payouts").and_then(Json::as_array).map(Vec::len),
+        output
+            .pointer("/payouts")
+            .and_then(Json::as_array)
+            .map(Vec::len),
         Some(1),
         "the cycle paid its one candidate: {output}"
     );
@@ -859,7 +865,10 @@ fn a_payout_cycle_pays_each_accepted_vendor_order() {
             .expect("read the payout row");
         (row.get(0), row.get(1))
     };
-    assert_eq!(status_text, "paid", "the payout row records the provider outcome");
+    assert_eq!(
+        status_text, "paid",
+        "the payout row records the provider outcome"
+    );
     assert_eq!(
         net_minor, 2250,
         "the vendor is paid gross (2499) minus its 10% commission (249)"
@@ -1178,7 +1187,9 @@ fn a_returned_line_is_approved_received_inspected_and_refunded() {
         "the return Process refunds the inspected line: {output}"
     );
     assert_eq!(
-        output.pointer("/refund_amount_minor").and_then(Json::as_i64),
+        output
+            .pointer("/refund_amount_minor")
+            .and_then(Json::as_i64),
         Some(refund_amount_minor),
         "the refund is exactly the inspected amount, never the order total: {output}"
     );
@@ -1323,7 +1334,11 @@ fn a_reviewer_approves_a_prescription_and_the_process_releases_the_line() {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    await_receptive_wait(&mut client, "prescription_review", "await_veterinary_decision");
+    await_receptive_wait(
+        &mut client,
+        "prescription_review",
+        "await_veterinary_decision",
+    );
 
     let (status, body) = suite.post(
         "/v1/graphql",
