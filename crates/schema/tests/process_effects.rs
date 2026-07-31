@@ -2,14 +2,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use donat_catalog::Catalog;
 use donat_ir::{
-    ProcessStartPolicy, TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
+    CommandExecutionValue, ProcessStartPolicy, ResolvedCommandEffect, Scalar, TypeRef,
+    ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
 };
 use donat_metadata::Metadata;
 use donat_rules::compile_catalog;
 use donat_schema::{
-    CompiledMultiSourceSchema, FinalizedCommandEffect, ProcessEffectContract,
-    ProcessEffectContractCatalog, ProcessEffectContractSource, ProcessSignalEffectContract,
-    compile_command_catalog, finalize_command_effects,
+    CompiledMultiSourceSchema, FinalizedCommandEffect, MultiSourcePlan, MultiSourcePlanner,
+    ProcessEffectContract, ProcessEffectContractCatalog, ProcessEffectContractSource,
+    ProcessSignalEffectContract, Session, compile_command_catalog, finalize_command_effects,
 };
 use serde_json::json;
 
@@ -329,4 +330,88 @@ fn serving_schema_consumes_the_exact_finalized_effect_snapshot() {
         error.message,
         "finalized command effects do not match the process contract snapshot"
     );
+}
+
+#[test]
+fn request_planner_lowers_finalized_effects_to_closed_source_local_ir() {
+    let metadata = command_metadata();
+    let catalogs = HashMap::from([("default".to_owned(), Catalog::default())]);
+    let rules = compile_catalog(&[], &[]).expect("empty Rules catalog compiles");
+    let contracts = effect_contracts();
+    let commands = compile_command_catalog(&metadata, &catalogs, &rules, true)
+        .expect("pre-process Commands compile");
+    let finalized =
+        finalize_command_effects(commands, &contracts).expect("process effects finalize");
+    let schema = CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+        &metadata, &catalogs, &rules, &finalized, &contracts, true,
+    )
+    .expect("serving schema retains the finalized effect snapshot");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &schema)
+        .expect("request planner binds the immutable serving snapshot");
+    let document = graphql_parser::parse_query::<String>(
+        r#"
+        mutation {
+          kickoff(
+            request_id: "550e8400-e29b-41d4-a716-446655440001"
+            order_id: "550e8400-e29b-41d4-a716-446655440002"
+            decision: "approved"
+          ) {
+            order_id
+          }
+        }
+        "#,
+    )
+    .expect("effect-bearing command query parses")
+    .into_static();
+    let plan = planner
+        .plan(
+            &document,
+            None,
+            &serde_json::Map::new(),
+            &Session {
+                role: "customer".to_owned(),
+                vars: HashMap::new(),
+                backend_request: false,
+            },
+        )
+        .expect("effect-bearing command plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("expected a mutation plan");
+    };
+    let donat_ir::MutationRoot::Command { command, .. } = &roots[0] else {
+        panic!("expected a command root");
+    };
+
+    assert_eq!(command.effects.len(), 2);
+    let ResolvedCommandEffect::StartProcess(start) = &command.effects[0] else {
+        panic!("first effect must be a resolved start");
+    };
+    assert_eq!(start.source, "default");
+    assert_eq!(start.process_name, "checkout");
+    assert_eq!(start.process_revision, "checkout-r4");
+    assert_eq!(start.start_policy, ProcessStartPolicy::RejectRetired);
+    assert_eq!(start.effect_position, 0);
+    assert!(matches!(
+        start.input.get("order_id"),
+        Some(CommandExecutionValue::Scalar {
+            value: Scalar::Json(value),
+            pg_type,
+        }) if value == "550e8400-e29b-41d4-a716-446655440002" && pg_type == "uuid"
+    ));
+
+    let ResolvedCommandEffect::SignalProcess(signal) = &command.effects[1] else {
+        panic!("second effect must be a resolved signal");
+    };
+    assert_eq!(signal.source, "default");
+    assert_eq!(signal.process_name, "approval");
+    assert_eq!(signal.process_revision, "approval-r1");
+    assert_eq!(signal.signal_name, "approval_decision");
+    assert_eq!(signal.effect_position, 1);
+    assert!(matches!(
+        signal.payload.get("decision"),
+        Some(CommandExecutionValue::Scalar {
+            value: Scalar::Json(value),
+            pg_type,
+        }) if value == "approved" && pg_type == "text"
+    ));
 }

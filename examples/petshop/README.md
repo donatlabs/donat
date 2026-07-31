@@ -351,8 +351,9 @@ The following abbreviated form shows the intended hand-off. The quote Command
 commits its domain change and a start intent; the approving Command commits its
 domain change and a signal intent; the durable Process consumes that signal
 while waiting. Both effects are transactional-outbox intent, not immediate
-Process calls. This is declarative contract documentation, not a runnable
-request today.
+Process calls. Command execution already persists these revision-pinned intents
+atomically and replays without duplicating them; the Process worker consumes
+them once the worker runtime is enabled.
 
 ```yaml
 # commands/b2b/submit-quote.yaml (producer: start intent)

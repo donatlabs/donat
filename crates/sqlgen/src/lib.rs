@@ -1005,9 +1005,37 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
         "commands have only a Postgres renderer"
     );
     assert!(
-        command.effects.is_empty(),
-        "command effects must be rejected before SQL generation until the process outbox renderer exists"
+        command.effects.is_empty() || command.idempotency.is_some(),
+        "command effects require one durable command execution generation"
     );
+    for (index, effect) in command.effects.iter().enumerate() {
+        let (source, position, invocation) = match effect {
+            ResolvedCommandEffect::StartProcess(effect) => (
+                &effect.source,
+                effect.effect_position,
+                effect.command_invocation_id,
+            ),
+            ResolvedCommandEffect::SignalProcess(effect) => (
+                &effect.source,
+                effect.effect_position,
+                effect.command_invocation_id,
+            ),
+        };
+        assert_eq!(
+            source, &command.identity.source,
+            "resolved command effect crossed its source boundary"
+        );
+        assert_eq!(
+            usize::try_from(position).ok(),
+            Some(index),
+            "resolved command effect positions must be canonical and contiguous"
+        );
+        assert_eq!(
+            invocation,
+            CommandInvocationIdSource::CurrentExecution,
+            "resolved command effects may reference only the current execution"
+        );
+    }
 
     if let Some(error_path) = command.steps.iter().find_map(|step| match step {
         CommandExecutionStep::InsertMany {
@@ -1033,8 +1061,42 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
     }
 
     let mut ctes = Vec::new();
+    let mut effect_policy_gate = "TRUE".to_owned();
+    for effect in &command.effects {
+        let ResolvedCommandEffect::StartProcess(effect) = effect else {
+            continue;
+        };
+        if effect.start_policy != ProcessStartPolicy::RejectRetired {
+            continue;
+        }
+        let cte = format!("_cmd_effect_policy_gate_{}", effect.effect_position);
+        let path = command
+            .idempotency
+            .as_ref()
+            .expect("effect-bearing command has idempotency")
+            .error_path
+            .as_str();
+        ctes.push(format!(
+            "{cte} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN ({schema}.{raise_error}('validation-failed', {path}, {message}) IS NULL) ELSE FALSE END)",
+            cte = quote_ident(&cte),
+            ok = quote_ident("ok"),
+            precondition = effect_policy_gate,
+            schema = quote_ident("donat"),
+            raise_error = quote_ident("raise_graphql_error"),
+            path = quote_lit(path),
+            message = quote_lit(&format!(
+                "process '{}.{}' does not accept new starts",
+                effect.source, effect.process_name
+            )),
+        ));
+        effect_policy_gate = format!("({effect_policy_gate}) AND {}", command_gate_exists(&cte));
+    }
     let guard_cte = "_cmd_guard_gate";
-    ctes.push(command_rule_gate_cte(guard_cte, &command.guards, "TRUE"));
+    ctes.push(command_rule_gate_cte(
+        guard_cte,
+        &command.guards,
+        &effect_policy_gate,
+    ));
     let guard_gate = command_gate_exists(guard_cte);
     let (execution_gate, invocation) = match &command.idempotency {
         Some(idempotency) => {
@@ -1242,6 +1304,9 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 store_first = quote_ident("_cmd_store_first"),
                 store_replay = quote_ident("_cmd_store_replay"),
             ));
+            for effect in &command.effects {
+                ctes.push(command_effect_cte(ctx, effect));
+            }
             format!(
                 "(SELECT {result} FROM {invocation})",
                 result = quote_ident("result"),
@@ -1276,13 +1341,109 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
         ),
         &command.selection,
     );
-    format!("WITH {} SELECT {projected} AS root", ctes.join(", "))
+    if invocation.is_some() {
+        format!(
+            "WITH {} SELECT {projected} AS root, (SELECT {invocation_id} FROM {invocation}) AS {invocation_id}, COALESCE((SELECT {claim_state} = 'replay' FROM {claim}), FALSE) AS {replayed}",
+            ctes.join(", "),
+            invocation_id = quote_ident("invocation_id"),
+            invocation = quote_ident("_cmd_invocation"),
+            claim_state = quote_ident("claim_state"),
+            claim = quote_ident("_cmd_claim"),
+            replayed = quote_ident("replayed"),
+        )
+    } else {
+        format!("WITH {} SELECT {projected} AS root", ctes.join(", "))
+    }
 }
 
 struct CommandInvocationSql {
     input_hash: String,
     error_path: String,
     expires_at: String,
+}
+
+fn command_effect_cte(ctx: &mut Ctx, effect: &ResolvedCommandEffect) -> String {
+    match effect {
+        ResolvedCommandEffect::StartProcess(effect) => {
+            let input = command_effect_object(ctx, &effect.input);
+            let idempotency_key = command_effect_key(ctx, &effect.semantic_idempotency_key);
+            format!(
+                "{cte} AS (INSERT INTO {schema}.{table} ({source_name}, {process_name}, {revision}, {input_json}, {command_invocation_id}, {effect_position}, {idempotency_key_col}, {status}) SELECT {source}, {process}, {process_revision}, {input}, {store}.{invocation_id}, {position}, {idempotency_key}, 'pending' FROM {store} RETURNING {id})",
+                cte = quote_ident(&format!("_cmd_effect_{}", effect.effect_position)),
+                schema = quote_ident("donat"),
+                table = quote_ident("process_start_requests"),
+                source_name = quote_ident("source_name"),
+                process_name = quote_ident("process_name"),
+                revision = quote_ident("revision"),
+                input_json = quote_ident("input_json"),
+                command_invocation_id = quote_ident("command_invocation_id"),
+                effect_position = quote_ident("effect_position"),
+                idempotency_key_col = quote_ident("idempotency_key"),
+                status = quote_ident("status"),
+                source = quote_lit(&effect.source),
+                process = quote_lit(&effect.process_name),
+                process_revision = quote_lit(&effect.process_revision),
+                input = input,
+                store = quote_ident("_cmd_store_first"),
+                invocation_id = quote_ident("invocation_id"),
+                position = effect.effect_position,
+                idempotency_key = idempotency_key,
+                id = quote_ident("id"),
+            )
+        }
+        ResolvedCommandEffect::SignalProcess(effect) => {
+            let correlation = command_effect_object(ctx, &effect.correlation);
+            let payload = command_effect_object(ctx, &effect.payload);
+            let idempotency_key = command_effect_key(ctx, &effect.semantic_idempotency_key);
+            format!(
+                "{cte} AS (INSERT INTO {schema}.{table} ({source_name}, {process_name}, {process_revision_col}, {signal_name}, {correlation_json}, {payload_json}, {command_invocation_id}, {effect_position}, {idempotency_key_col}, {status}) SELECT {source}, {process}, {process_revision}, {signal}, {correlation}, {payload}, {store}.{invocation_id}, {position}, {idempotency_key}, 'pending' FROM {store} RETURNING {id})",
+                cte = quote_ident(&format!("_cmd_effect_{}", effect.effect_position)),
+                schema = quote_ident("donat"),
+                table = quote_ident("process_signal_requests"),
+                source_name = quote_ident("source_name"),
+                process_name = quote_ident("process_name"),
+                process_revision_col = quote_ident("process_revision"),
+                signal_name = quote_ident("signal_name"),
+                correlation_json = quote_ident("correlation_json"),
+                payload_json = quote_ident("payload_json"),
+                command_invocation_id = quote_ident("command_invocation_id"),
+                effect_position = quote_ident("effect_position"),
+                idempotency_key_col = quote_ident("idempotency_key"),
+                status = quote_ident("status"),
+                source = quote_lit(&effect.source),
+                process = quote_lit(&effect.process_name),
+                process_revision = quote_lit(&effect.process_revision),
+                signal = quote_lit(&effect.signal_name),
+                correlation = correlation,
+                payload = payload,
+                store = quote_ident("_cmd_store_first"),
+                invocation_id = quote_ident("invocation_id"),
+                position = effect.effect_position,
+                idempotency_key = idempotency_key,
+                id = quote_ident("id"),
+            )
+        }
+    }
+}
+
+fn command_effect_object(
+    ctx: &mut Ctx,
+    fields: &std::collections::BTreeMap<String, CommandExecutionValue>,
+) -> String {
+    let fields = fields
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                format!("to_jsonb({})", command_value_sql(ctx, value)),
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("({})::jsonb", json_object(&ctx.dialect, &fields))
+}
+
+fn command_effect_key(ctx: &mut Ctx, value: &CommandExecutionValue) -> String {
+    format!("(to_jsonb({}) #>> '{{}}')", command_value_sql(ctx, value))
 }
 
 /// Materialize one boolean gate before any dependent command DML. A false Rule

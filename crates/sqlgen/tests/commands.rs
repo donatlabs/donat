@@ -796,19 +796,278 @@ fn command_v6_writer_generates_and_replays_one_durable_invocation_uuid() {
     );
 }
 
-#[test]
-#[should_panic(expected = "command effects must be rejected before SQL generation")]
-fn command_renderer_defensively_refuses_effect_bearing_ir() {
-    let _ = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+fn effectful_command_root(start_policy: ProcessStartPolicy) -> MutationRoot {
+    root(CommandMutation {
         identity: command_identity("create_order"),
         name: "create_order".to_owned(),
         steps: vec![],
         guards: vec![],
-        result: vec![],
-        idempotency: None,
-        effects: vec![CommandEffectKind::StartProcess],
+        result: vec![CommandResultField {
+            name: "order_id".to_owned(),
+            value: CommandResultValue::Scalar {
+                value: Scalar::Json(json!("550e8400-e29b-41d4-a716-446655440010")),
+                pg_type: "uuid".to_owned(),
+            },
+        }],
+        idempotency: Some(CommandIdempotency {
+            key: Scalar::Json(json!("request-1")),
+            scope: vec![value(json!("tenant-1"), "text")],
+            input: Scalar::Json(json!({ "request_id": "request-1" })),
+            retention_seconds: Some(60),
+            error_path: "$.selectionSet.create_order".to_owned(),
+        }),
+        effects: vec![
+            ResolvedCommandEffect::StartProcess(ResolvedStartProcessEffect {
+                source: "default".to_owned(),
+                process_name: "checkout".to_owned(),
+                process_revision: "checkout-r1".to_owned(),
+                start_policy,
+                input: std::collections::BTreeMap::from([(
+                    "order_id".to_owned(),
+                    value(json!("550e8400-e29b-41d4-a716-446655440010"), "uuid"),
+                )]),
+                semantic_idempotency_key: value(json!("request-1"), "text"),
+                command_invocation_id: CommandInvocationIdSource::CurrentExecution,
+                effect_position: 0,
+            }),
+            ResolvedCommandEffect::SignalProcess(ResolvedSignalProcessEffect {
+                source: "default".to_owned(),
+                process_name: "approval".to_owned(),
+                process_revision: "approval-r2".to_owned(),
+                signal_name: "approval_decision".to_owned(),
+                correlation: std::collections::BTreeMap::from([(
+                    "order_id".to_owned(),
+                    value(json!("550e8400-e29b-41d4-a716-446655440010"), "uuid"),
+                )]),
+                payload: std::collections::BTreeMap::from([(
+                    "decision".to_owned(),
+                    value(json!("approved"), "text"),
+                )]),
+                semantic_idempotency_key: value(json!("request-1"), "text"),
+                command_invocation_id: CommandInvocationIdSource::CurrentExecution,
+                effect_position: 1,
+            }),
+        ],
         selection: vec![],
-    }));
+    })
+}
+
+#[test]
+fn command_effect_positions_share_generation_in_one_statement() {
+    let sql = donat_sqlgen::mutation_to_sql(&effectful_command_root(ProcessStartPolicy::Enabled));
+
+    assert!(sql.starts_with("WITH ") && !sql.contains(';'), "{sql}");
+    assert!(
+        sql.contains("\"donat\".\"process_start_requests\"")
+            && sql.contains("\"donat\".\"process_signal_requests\"")
+            && sql
+                .matches("\"_cmd_store_first\".\"invocation_id\"")
+                .count()
+                >= 2,
+        "both outboxes must copy the one current execution generation: {sql}"
+    );
+    assert!(
+        sql.contains("'checkout-r1'")
+            && sql.contains("'approval-r2'")
+            && sql.contains("\"effect_position\""),
+        "outboxes must pin their finalized revision and canonical position: {sql}"
+    );
+}
+
+#[test]
+fn command_retired_start_gate_precedes_claim_and_domain_work() {
+    let sql =
+        donat_sqlgen::mutation_to_sql(&effectful_command_root(ProcessStartPolicy::RejectRetired));
+    let retired_gate = sql
+        .find("_cmd_effect_policy_gate_0")
+        .expect("retired start has a materialized gate");
+    let claim = sql.find("_cmd_claim").expect("idempotency claim exists");
+    let result = sql.find("_cmd_result").expect("command result exists");
+
+    assert!(retired_gate < claim && retired_gate < result, "{sql}");
+    assert!(
+        sql.contains("default.checkout")
+            && sql.contains("does not accept new starts")
+            && sql.contains("$.selectionSet.create_order"),
+        "retired rejection keeps the exact command error envelope: {sql}"
+    );
+}
+
+fn insert_process_revision(tx: &mut Transaction<'_>, process: &str, revision: &str) {
+    tx.execute(
+        "INSERT INTO donat.process_definition_versions \
+         (source_name, process_name, revision, canonical_definition, \
+          dependency_descriptors, runtime_abi, status) \
+         VALUES ('default', $1, $2, '{}'::jsonb, '{}'::jsonb, 1, 'active')",
+        &[&process, &revision],
+    )
+    .expect("effect target revision is deployed");
+}
+
+#[test]
+fn command_effects_commit_atomically_and_exact_replay_writes_no_second_outbox() {
+    let _guard = command_catalog_test_lock();
+    let mut client = postgres_client();
+    let mut tx = client.transaction().expect("effect transaction starts");
+    install_command_catalog(&mut tx);
+    insert_process_revision(&mut tx, "checkout", "checkout-r1");
+    insert_process_revision(&mut tx, "approval", "approval-r2");
+    let sql = donat_sqlgen::mutation_to_sql(&effectful_command_root(ProcessStartPolicy::Enabled));
+
+    let first = tx
+        .query_one(&sql, &[])
+        .expect("first command generation and both effects commit");
+    assert!(!first.get::<_, bool>("replayed"));
+    let first_generation: uuid::Uuid = first.get("invocation_id");
+
+    let start = tx
+        .query_one(
+            "SELECT revision, input_json, command_invocation_id, effect_position, \
+                    idempotency_key, status \
+             FROM donat.process_start_requests \
+             WHERE source_name = 'default' AND process_name = 'checkout'",
+            &[],
+        )
+        .expect("one start outbox row is durable");
+    assert_eq!(start.get::<_, String>("revision"), "checkout-r1");
+    assert_eq!(
+        start.get::<_, Json>("input_json"),
+        json!({ "order_id": "550e8400-e29b-41d4-a716-446655440010" })
+    );
+    assert_eq!(
+        start.get::<_, uuid::Uuid>("command_invocation_id"),
+        first_generation
+    );
+    assert_eq!(start.get::<_, i32>("effect_position"), 0);
+    assert_eq!(start.get::<_, String>("idempotency_key"), "request-1");
+    assert_eq!(start.get::<_, String>("status"), "pending");
+
+    let signal = tx
+        .query_one(
+            "SELECT process_revision, signal_name, correlation_json, payload_json, \
+                    command_invocation_id, effect_position, idempotency_key, status \
+             FROM donat.process_signal_requests \
+             WHERE source_name = 'default' AND process_name = 'approval'",
+            &[],
+        )
+        .expect("one signal outbox row is durable");
+    assert_eq!(signal.get::<_, String>("process_revision"), "approval-r2");
+    assert_eq!(signal.get::<_, String>("signal_name"), "approval_decision");
+    assert_eq!(
+        signal.get::<_, Json>("correlation_json"),
+        json!({ "order_id": "550e8400-e29b-41d4-a716-446655440010" })
+    );
+    assert_eq!(
+        signal.get::<_, Json>("payload_json"),
+        json!({ "decision": "approved" })
+    );
+    assert_eq!(
+        signal.get::<_, uuid::Uuid>("command_invocation_id"),
+        first_generation
+    );
+    assert_eq!(signal.get::<_, i32>("effect_position"), 1);
+    assert_eq!(signal.get::<_, String>("idempotency_key"), "request-1");
+    assert_eq!(signal.get::<_, String>("status"), "pending");
+
+    let replay = tx
+        .query_one(&sql, &[])
+        .expect("exact command replay returns its canonical result");
+    assert!(replay.get::<_, bool>("replayed"));
+    assert_eq!(
+        replay.get::<_, uuid::Uuid>("invocation_id"),
+        first_generation,
+        "exact replay must retain the execution generation"
+    );
+    let counts = tx
+        .query_one(
+            "SELECT \
+                (SELECT count(*) FROM donat.process_start_requests \
+                 WHERE source_name = 'default' AND process_name = 'checkout'), \
+                (SELECT count(*) FROM donat.process_signal_requests \
+                 WHERE source_name = 'default' AND process_name = 'approval')",
+            &[],
+        )
+        .expect("effect counts remain inspectable");
+    assert_eq!(counts.get::<_, i64>(0), 1);
+    assert_eq!(counts.get::<_, i64>(1), 1);
+
+    tx.rollback().expect("effect test state rolls back");
+}
+
+#[test]
+fn command_effect_failure_and_retired_policy_leave_no_partial_command_state() {
+    let _guard = command_catalog_test_lock();
+    let mut client = postgres_client();
+    let mut tx = client.transaction().expect("effect transaction starts");
+    install_command_catalog(&mut tx);
+    insert_process_revision(&mut tx, "checkout", "checkout-r1");
+    let enabled_sql =
+        donat_sqlgen::mutation_to_sql(&effectful_command_root(ProcessStartPolicy::Enabled));
+
+    tx.batch_execute("SAVEPOINT missing_signal_revision")
+        .expect("effect failure savepoint creates");
+    let error = tx
+        .query_one(&enabled_sql, &[])
+        .expect_err("a missing pinned signal revision must abort the whole statement");
+    assert_eq!(
+        error
+            .as_db_error()
+            .expect("foreign-key failure is structured")
+            .code()
+            .code(),
+        "23503"
+    );
+    tx.batch_execute("ROLLBACK TO SAVEPOINT missing_signal_revision")
+        .expect("effect failure rolls back to an inspectable transaction");
+    assert_no_effect_command_state(&mut tx);
+
+    let retired_sql =
+        donat_sqlgen::mutation_to_sql(&effectful_command_root(ProcessStartPolicy::RejectRetired));
+    tx.batch_execute("SAVEPOINT retired_start")
+        .expect("retired start savepoint creates");
+    let error = tx
+        .query_one(&retired_sql, &[])
+        .expect_err("retired Process rejects before command execution");
+    let db = error
+        .as_db_error()
+        .expect("retired Process rejection is structured");
+    assert_eq!(db.code().code(), "P0D01");
+    let payload: Json = serde_json::from_str(db.message()).expect("GraphQL envelope is JSON");
+    assert_eq!(
+        payload,
+        json!({
+            "kind": "donat.graphql-error.v1",
+            "code": "validation-failed",
+            "path": "$.selectionSet.create_order",
+            "message": "process 'default.checkout' does not accept new starts"
+        })
+    );
+    tx.batch_execute("ROLLBACK TO SAVEPOINT retired_start")
+        .expect("retired rejection rolls back to an inspectable transaction");
+    assert_no_effect_command_state(&mut tx);
+
+    tx.rollback().expect("effect failure test state rolls back");
+}
+
+fn assert_no_effect_command_state(tx: &mut Transaction<'_>) {
+    let counts = tx
+        .query_one(
+            "SELECT \
+                (SELECT count(*) FROM donat.command_invocation_claims \
+                 WHERE command_name = 'create_order' AND key = 'request-1'), \
+                (SELECT count(*) FROM donat.command_invocations \
+                 WHERE command_name = 'create_order' AND key = 'request-1'), \
+                (SELECT count(*) FROM donat.process_start_requests \
+                 WHERE source_name = 'default' AND process_name = 'checkout'), \
+                (SELECT count(*) FROM donat.process_signal_requests \
+                 WHERE source_name = 'default' AND process_name = 'approval')",
+            &[],
+        )
+        .expect("command and effect state remains inspectable");
+    assert_eq!(counts.get::<_, i64>(0), 0, "claim must roll back");
+    assert_eq!(counts.get::<_, i64>(1), 0, "journal must roll back");
+    assert_eq!(counts.get::<_, i64>(2), 0, "start outbox must roll back");
+    assert_eq!(counts.get::<_, i64>(3), 0, "signal outbox must roll back");
 }
 
 #[test]

@@ -16,6 +16,7 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::commands::{CompiledCommand, CompiledSourceCommandCatalog};
 use crate::naming::{column_db_name, column_graphql_name, root_names, table_base_name};
+use crate::process_effects::{FinalizedCompiledCommand, FinalizedSourceCommandCatalog};
 
 /// Per-request session: an explicit role + X-Donat-*/X-Hasura-* variables
 /// (keys lower-cased). There is no admin role — every access goes through an
@@ -250,6 +251,7 @@ pub struct Planner<'a> {
     tables: &'a [TableEntry],
     functions: &'a [donat_metadata::FunctionEntry],
     commands: Option<&'a CompiledSourceCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
     source_kind: SourceKind,
     /// Used only while compiling the role-independent composite schema. It
     /// contributes command type information for GraphQL validation, while the
@@ -264,6 +266,7 @@ pub struct Planner<'a> {
 /// was compiled against, and its roots are supported only by Postgres.
 struct CommandPlannerConfig<'a> {
     commands: Option<&'a CompiledSourceCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
     source_kind: SourceKind,
     expose_all_commands: bool,
 }
@@ -306,6 +309,7 @@ impl<'a> Planner<'a> {
             &[],
             CommandPlannerConfig {
                 commands: None,
+                finalized_commands: None,
                 source_kind: SourceKind::Postgres,
                 expose_all_commands: false,
             },
@@ -331,7 +335,9 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         index: Arc<PlannerIndex>,
     ) -> Self {
-        Self::for_source_with_index_and_commands(metadata, source, catalog, index, None, false)
+        Self::for_source_with_index_and_commands(
+            metadata, source, catalog, index, None, None, false,
+        )
     }
 
     pub(crate) fn for_source_with_index_and_commands(
@@ -340,6 +346,7 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         index: Arc<PlannerIndex>,
         commands: Option<&'a CompiledSourceCommandCatalog>,
+        finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
         expose_all_commands: bool,
     ) -> Self {
         Self::from_parts(
@@ -349,6 +356,7 @@ impl<'a> Planner<'a> {
             source.functions.as_slice(),
             CommandPlannerConfig {
                 commands,
+                finalized_commands,
                 source_kind: source.kind,
                 expose_all_commands,
             },
@@ -459,6 +467,7 @@ impl<'a> Planner<'a> {
             tables,
             functions,
             commands: command_config.commands,
+            finalized_commands: command_config.finalized_commands,
             source_kind: command_config.source_kind,
             expose_all_commands: command_config.expose_all_commands,
             index,
@@ -512,6 +521,14 @@ impl<'a> Planner<'a> {
             return None;
         }
         self.commands.and_then(|commands| commands.command(name))
+    }
+
+    pub(crate) fn finalized_command_named(&self, name: &str) -> Option<&FinalizedCompiledCommand> {
+        if self.source_kind != SourceKind::Postgres {
+            return None;
+        }
+        self.finalized_commands
+            .and_then(|commands| commands.command(name))
     }
 
     pub(crate) fn command_definitions(&self) -> impl Iterator<Item = &CompiledCommand> {

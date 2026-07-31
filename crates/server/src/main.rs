@@ -15,6 +15,7 @@ mod connector_webhook;
 // The binary has its own module tree for its historic entry point while the
 // integration tests use the library facade. Connector activity dispatch lands
 // in Task 3, so the binary currently uses only registry construction here.
+mod commands;
 #[allow(dead_code)]
 mod connectors;
 mod cron;

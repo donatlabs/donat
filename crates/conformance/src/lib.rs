@@ -2305,6 +2305,13 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.processes.is_empty() {
+            std::fs::write(
+                dir.join("flows.yaml"),
+                serde_yaml::to_string(&md.processes).expect("serialize processes"),
+            )
+            .unwrap();
+        }
         if !md.rules.is_empty() {
             std::fs::write(
                 dir.join("rules.yaml"),
@@ -3446,6 +3453,7 @@ mod tests {
             "mcp_tools",
             "migrate",
             "petshop",
+            "processes",
             "remote_schemas",
             "rest_endpoints",
             "roles_inheritance",
@@ -3637,6 +3645,51 @@ mod tests {
         std::fs::remove_dir_all(with_connectors_dir).expect("remove connector metadata directory");
         std::fs::remove_dir_all(without_connectors_dir)
             .expect("remove empty connector metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_process_section() {
+        let mut with_processes = empty_metadata();
+        with_processes.processes = serde_json::from_value(json!([{
+            "name": "checkout",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "output": [{ "name": "status", "type": "string!" }],
+            "start_at": "done",
+            "states": [{
+                "id": "done",
+                "output": {
+                    "values": { "status": { "literal": "ready" } }
+                }
+            }]
+        }]))
+        .expect("process metadata deserializes");
+
+        let with_processes_dir =
+            Running::write_metadata_snapshot("processes_section", &with_processes);
+        let flows = std::fs::read_to_string(with_processes_dir.join("flows.yaml"))
+            .expect("nonempty process section is serialized");
+        assert!(flows.contains("checkout"));
+        assert_eq!(
+            donat_metadata::load_metadata_dir(&with_processes_dir)
+                .expect("serialized process metadata reloads")
+                .processes[0]
+                .name,
+            "checkout"
+        );
+
+        let without_processes_dir =
+            Running::write_metadata_snapshot("empty_processes_section", &empty_metadata());
+        assert!(
+            !without_processes_dir.join("flows.yaml").exists(),
+            "an empty process list must not create flows.yaml"
+        );
+
+        std::fs::remove_dir_all(with_processes_dir).expect("remove process metadata directory");
+        std::fs::remove_dir_all(without_processes_dir)
+            .expect("remove empty process metadata directory");
     }
 
     fn tempdir(tag: &str) -> PathBuf {

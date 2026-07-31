@@ -69,6 +69,7 @@ struct RoleSchemas {
 /// snapshot. It owns no references into that snapshot.
 pub struct CompiledMultiSourceSchema {
     command_catalog: Arc<CompiledCommandCatalog>,
+    finalized_command_catalog: Option<Arc<FinalizedCommandCatalog>>,
     source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
     relay_query_owners: HashMap<String, String>,
@@ -140,6 +141,22 @@ impl CompiledMultiSourceSchema {
         command_catalog: Arc<CompiledCommandCatalog>,
         infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
+        Self::compile_with_catalogs(
+            metadata,
+            catalogs,
+            command_catalog,
+            None,
+            infer_function_permissions,
+        )
+    }
+
+    fn compile_with_catalogs(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        command_catalog: Arc<CompiledCommandCatalog>,
+        finalized_command_catalog: Option<Arc<FinalizedCommandCatalog>>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
         for command in &metadata.commands {
             if command_catalog
                 .source(&command.source)
@@ -162,6 +179,7 @@ impl CompiledMultiSourceSchema {
             catalogs,
             &source_indexes,
             Some(command_catalog.as_ref()),
+            finalized_command_catalog.as_deref(),
             false,
             infer_function_permissions,
         )?;
@@ -227,6 +245,7 @@ impl CompiledMultiSourceSchema {
 
         Ok(Self {
             command_catalog,
+            finalized_command_catalog,
             source_indexes,
             query_owners,
             relay_query_owners,
@@ -262,10 +281,11 @@ impl CompiledMultiSourceSchema {
             commands,
             process_effects,
         )?;
-        Self::compile_with_command_catalog(
+        Self::compile_with_catalogs(
             metadata,
             catalogs,
             Arc::new(command_catalog),
+            Some(Arc::new(commands.clone())),
             infer_function_permissions,
         )
     }
@@ -310,6 +330,9 @@ impl CompiledMultiSourceSchema {
             catalog,
             source_index.clone(),
             self.command_catalog.source(&source.name),
+            self.finalized_command_catalog
+                .as_deref()
+                .and_then(|commands| commands.source(&source.name)),
             false,
         );
         planner.infer_function_permissions = self.infer_function_permissions;
@@ -349,6 +372,7 @@ impl<'a> MultiSourcePlanner<'a> {
             catalogs,
             &compiled.source_indexes,
             Some(compiled.command_catalog.as_ref()),
+            compiled.finalized_command_catalog.as_deref(),
             false,
             compiled.infer_function_permissions,
         )?;
@@ -555,6 +579,7 @@ fn build_children<'a>(
     catalogs: &'a HashMap<String, Catalog>,
     source_indexes: &[Arc<PlannerIndex>],
     commands: Option<&'a CompiledCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedCommandCatalog>,
     expose_all_commands: bool,
     infer_function_permissions: bool,
 ) -> Result<Vec<ChildPlanner<'a>>, PlanError> {
@@ -583,6 +608,7 @@ fn build_children<'a>(
                 catalog,
                 index.clone(),
                 commands.and_then(|commands| commands.source(&source.name)),
+                finalized_commands.and_then(|commands| commands.source(&source.name)),
                 expose_all_commands,
             );
             planner.infer_function_permissions = infer_function_permissions;
@@ -833,6 +859,7 @@ fn build_role_independent_schema(
             source,
             catalog,
             index.clone(),
+            None,
             None,
             false,
         ));

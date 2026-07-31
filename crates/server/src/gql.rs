@@ -128,26 +128,6 @@ fn assemble_multi_source_response(
     Json::Object(ordered)
 }
 
-/// Effects have no Task 5 outbox renderer. Reject them before opening a
-/// transaction or asking SQLgen for a command statement, so no journal or
-/// domain-data CTE can run without its declared durable side effect.
-fn command_execution_rejection(roots: &[donat_ir::MutationRoot]) -> Option<Json> {
-    roots
-        .iter()
-        .any(|root| {
-            matches!(
-                root,
-                donat_ir::MutationRoot::Command { command, .. } if !command.effects.is_empty()
-            )
-        })
-        .then(|| {
-            error_json(
-                "unexpected",
-                "command effects are not executable until the durable process outbox renderer is installed",
-            )
-        })
-}
-
 /// A planner should never put a command on a non-Postgres source, but this
 /// transport-side guard keeps manually constructed or future IR from reaching
 /// a backend renderer that has no command semantics.
@@ -862,9 +842,6 @@ async fn execute_parsed_full(
             roots,
             response,
         } => {
-            if let Some(error) = command_execution_rejection(&roots) {
-                return ok(error);
-            }
             let Some(source) = source else {
                 drop(engine);
                 let data = assemble_multi_source_response(&response, std::iter::empty());
@@ -1002,13 +979,21 @@ async fn execute_parsed_full(
                         // the update/delete permission filter) yields a SQL
                         // NULL in column 0 — decode as Option so it becomes a
                         // JSON null, not a decode error.
-                        let value = row
-                            .try_get::<_, Option<Json>>(0)
-                            .map(|o| o.unwrap_or(Json::Null))
-                            .or_else(|_| {
-                                row.try_get::<_, Option<String>>(0)
-                                    .map(|o| o.map(Json::String).unwrap_or(Json::Null))
-                            });
+                        let value = match root {
+                            donat_ir::MutationRoot::Command { command, .. }
+                                if command.idempotency.is_some() =>
+                            {
+                                crate::commands::decode_command_execution_result(&row)
+                                    .map(|result| result.result_json)
+                            }
+                            _ => row
+                                .try_get::<_, Option<Json>>(0)
+                                .map(|o| o.unwrap_or(Json::Null))
+                                .or_else(|_| {
+                                    row.try_get::<_, Option<String>>(0)
+                                        .map(|o| o.map(Json::String).unwrap_or(Json::Null))
+                                }),
+                        };
                         match value {
                             Ok(v) => {
                                 data.insert(alias, v);
@@ -1974,37 +1959,6 @@ mod tests {
         assert!(!ct_eq(b"secret", b"secrey"));
         assert!(!ct_eq(b"secret", b"secre"));
         assert!(ct_eq(b"", b""));
-    }
-
-    #[test]
-    fn effect_bearing_command_roots_fail_closed_before_sql_generation() {
-        let roots = vec![donat_ir::MutationRoot::Command {
-            alias: "submitted".to_string(),
-            command: donat_ir::CommandMutation {
-                identity: donat_ir::CommandIdentity {
-                    source: "default".to_string(),
-                    name: "create_order".to_string(),
-                    role: "customer".to_string(),
-                },
-                name: "create_order".to_string(),
-                steps: vec![],
-                guards: vec![],
-                result: vec![],
-                idempotency: None,
-                effects: vec![donat_ir::CommandEffectKind::StartProcess],
-                selection: vec![],
-            },
-        }];
-
-        let error = command_execution_rejection(&roots)
-            .expect("effects stop before any command SQL can be generated");
-        assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
-        assert!(
-            error["errors"][0]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("effects are not executable")),
-            "unexpected error: {error:#}"
-        );
     }
 
     #[test]

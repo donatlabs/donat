@@ -248,7 +248,7 @@ pub struct ConnectorResponseBinding {
 
 /// Whether an operation is transport-only or carries provider side effects.
 /// Side-effecting operations must retain the complete fixed provider
-/// idempotency contract before a future process compiler may admit them.
+/// idempotency contract before the Process compiler may admit them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ConnectorEffect {
@@ -1159,8 +1159,9 @@ pub enum CommandIdempotencyCommandScope {
     Command,
 }
 
-/// A durable hand-off requested by a command. It is only metadata in this
-/// slice; no process rows, runtime calls, or mutation behavior are created.
+/// A durable hand-off requested by a command. Compilation pins its Process
+/// contract; command execution writes the corresponding source-local outbox
+/// row atomically with domain data and the command invocation journal.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum CommandEffect {
@@ -1195,7 +1196,7 @@ pub struct SignalProcessEffect {
 
 /// A source-local durable process definition. The metadata layer retains only
 /// the finite executable grammar; reference, type, and transition validation
-/// belongs to the future process compiler.
+/// belongs to the Process compiler.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Process {

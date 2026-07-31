@@ -9,7 +9,7 @@ use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
 use donat_metadata::{
     Columns, Command, CommandAggregate, CommandCondition as MetadataCommandCondition,
-    CommandEffect, CommandIdempotencyKey, CommandIdempotencyScope, CommandIdempotencyScopeSpec,
+    CommandIdempotencyKey, CommandIdempotencyScope, CommandIdempotencyScopeSpec,
     CommandResultValue as MetadataCommandResultValue, CommandStep, CommandStepOperation,
     CommandValue,
 };
@@ -25,6 +25,7 @@ use crate::plan::{
     Fragments, MutationKind, PlanError, Planner, Session, TableCtx, field_not_found, flatten,
     is_session_var_name, unexpected_arg, value_to_json,
 };
+use crate::process_effects::FinalizedCommandEffect;
 
 struct ResolvedCommandStep {
     cte: String,
@@ -217,16 +218,35 @@ impl<'a> Planner<'a> {
         }
         Some((|| {
             self.validate_command_runtime_permissions(command.definition(), session, path)?;
+            let finalized_effects = match self.finalized_command_named(&field.name) {
+                Some(finalized) => finalized.effects.as_slice(),
+                None if command.definition().effects.is_empty() => &[],
+                None => {
+                    return Err(PlanError::new(
+                        path,
+                        "unexpected",
+                        "command Process effects are absent from the immutable serving snapshot",
+                    ));
+                }
+            };
             let arguments = self.parse_command_arguments(command, field, vars, path)?;
             let selection =
                 self.plan_command_selection(command.definition(), field, fragments, vars, path)?;
-            self.resolve_command_execution(command, arguments, selection, session, path)
+            self.resolve_command_execution(
+                command,
+                finalized_effects,
+                arguments,
+                selection,
+                session,
+                path,
+            )
         })())
     }
 
     fn resolve_command_execution(
         &self,
         command: &CompiledCommand,
+        finalized_effects: &[FinalizedCommandEffect],
         arguments: BTreeMap<String, Scalar>,
         selection: Vec<CommandResultSelection>,
         session: &Session,
@@ -302,14 +322,14 @@ impl<'a> Planner<'a> {
 
         let idempotency =
             self.resolve_command_idempotency(command, &arguments, &resolved_steps, session, path)?;
-        let effects = definition
-            .effects
-            .iter()
-            .map(|effect| match effect {
-                CommandEffect::StartProcess { .. } => CommandEffectKind::StartProcess,
-                CommandEffect::SignalProcess { .. } => CommandEffectKind::SignalProcess,
-            })
-            .collect();
+        let effects = self.resolve_finalized_command_effects(
+            command,
+            finalized_effects,
+            &arguments,
+            &resolved_steps,
+            session,
+            path,
+        )?;
 
         Ok(CommandMutation {
             identity: CommandIdentity {
@@ -325,6 +345,170 @@ impl<'a> Planner<'a> {
             effects,
             selection,
         })
+    }
+
+    fn resolve_finalized_command_effects(
+        &self,
+        command: &CompiledCommand,
+        effects: &[FinalizedCommandEffect],
+        arguments: &BTreeMap<String, Scalar>,
+        resolved_steps: &BTreeMap<String, ResolvedCommandStep>,
+        session: &Session,
+        path: &str,
+    ) -> Result<Vec<ResolvedCommandEffect>, PlanError> {
+        if effects.len() != command.definition().effects.len() {
+            return Err(PlanError::new(
+                path,
+                "unexpected",
+                "finalized command effect count changed after serving snapshot publication",
+            ));
+        }
+        effects
+            .iter()
+            .enumerate()
+            .map(|(index, effect)| {
+                let effect_path = format!("{path}.effects[{index}]");
+                match effect {
+                    FinalizedCommandEffect::Start(effect) => {
+                        self.validate_resolved_effect_identity(
+                            command,
+                            &effect.source,
+                            effect.effect_position,
+                            index,
+                            &effect_path,
+                        )?;
+                        Ok(ResolvedCommandEffect::StartProcess(
+                            ResolvedStartProcessEffect {
+                                source: effect.source.clone(),
+                                process_name: effect.process_name.clone(),
+                                process_revision: effect.process_revision.clone(),
+                                start_policy: effect.start_policy,
+                                input: self.resolve_effect_values(
+                                    command,
+                                    &effect.input,
+                                    arguments,
+                                    resolved_steps,
+                                    session,
+                                    &format!("{effect_path}.input"),
+                                )?,
+                                semantic_idempotency_key: resolve_effect_idempotency_key(
+                                    command,
+                                    &effect.semantic_idempotency_key,
+                                    arguments,
+                                    &effect_path,
+                                )?,
+                                command_invocation_id: CommandInvocationIdSource::CurrentExecution,
+                                effect_position: effect.effect_position,
+                            },
+                        ))
+                    }
+                    FinalizedCommandEffect::Signal(effect) => {
+                        self.validate_resolved_effect_identity(
+                            command,
+                            &effect.source,
+                            effect.effect_position,
+                            index,
+                            &effect_path,
+                        )?;
+                        Ok(ResolvedCommandEffect::SignalProcess(
+                            ResolvedSignalProcessEffect {
+                                source: effect.source.clone(),
+                                process_name: effect.process_name.clone(),
+                                process_revision: effect.process_revision.clone(),
+                                signal_name: effect.signal_name.clone(),
+                                correlation: self.resolve_effect_values(
+                                    command,
+                                    &effect.correlation,
+                                    arguments,
+                                    resolved_steps,
+                                    session,
+                                    &format!("{effect_path}.correlate"),
+                                )?,
+                                payload: self.resolve_effect_values(
+                                    command,
+                                    &effect.payload,
+                                    arguments,
+                                    resolved_steps,
+                                    session,
+                                    &format!("{effect_path}.payload"),
+                                )?,
+                                semantic_idempotency_key: resolve_effect_idempotency_key(
+                                    command,
+                                    &effect.semantic_idempotency_key,
+                                    arguments,
+                                    &effect_path,
+                                )?,
+                                command_invocation_id: CommandInvocationIdSource::CurrentExecution,
+                                effect_position: effect.effect_position,
+                            },
+                        ))
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn resolve_effect_values(
+        &self,
+        command: &CompiledCommand,
+        values: &BTreeMap<String, CommandValue>,
+        arguments: &BTreeMap<String, Scalar>,
+        resolved_steps: &BTreeMap<String, ResolvedCommandStep>,
+        session: &Session,
+        path: &str,
+    ) -> Result<BTreeMap<String, CommandExecutionValue>, PlanError> {
+        values
+            .iter()
+            .map(|(name, value)| {
+                let value_path = format!("{path}.{name}");
+                let target = resolved_value_column(
+                    command,
+                    name,
+                    value,
+                    resolved_steps,
+                    None,
+                    None,
+                    &value_path,
+                )?;
+                let resolved = self.resolve_command_value(
+                    command,
+                    value,
+                    &target,
+                    arguments,
+                    resolved_steps,
+                    None,
+                    None,
+                    Some(session),
+                    &value_path,
+                )?;
+                Ok((name.clone(), resolved))
+            })
+            .collect()
+    }
+
+    fn validate_resolved_effect_identity(
+        &self,
+        command: &CompiledCommand,
+        source: &str,
+        effect_position: u32,
+        expected_position: usize,
+        path: &str,
+    ) -> Result<(), PlanError> {
+        if source != command.source() {
+            return Err(PlanError::new(
+                path,
+                "unexpected",
+                "finalized command effect crossed its source boundary",
+            ));
+        }
+        if usize::try_from(effect_position).ok() != Some(expected_position) {
+            return Err(PlanError::new(
+                path,
+                "unexpected",
+                "finalized command effect position changed after compilation",
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_command_argument_rows(
@@ -4118,6 +4302,19 @@ fn command_argument_nullable(command: &Command, name: &str, path: &str) -> Resul
     Ok(!command_argument_definition(command, name, path)?
         .type_
         .ends_with('!'))
+}
+
+fn resolve_effect_idempotency_key(
+    command: &CompiledCommand,
+    key: &CommandIdempotencyKey,
+    arguments: &BTreeMap<String, Scalar>,
+    path: &str,
+) -> Result<CommandExecutionValue, PlanError> {
+    let CommandIdempotencyKey::Argument { argument } = key;
+    Ok(CommandExecutionValue::Scalar {
+        value: command_argument(arguments, argument, path)?,
+        pg_type: command_argument_pg_type(command.definition(), argument, path)?.to_owned(),
+    })
 }
 
 fn session_contract_pg_type(contract: &TypeRef) -> Result<String, PlanError> {

@@ -986,7 +986,7 @@ fn command_legacy_unqualified_retry_fails_closed_before_domain_write() {
 }
 
 #[test]
-fn command_idempotency_replays_a_wider_projection_from_the_complete_canonical_result() {
+fn command_invocation_generation_is_stable_and_replays_a_wider_projection() {
     let suite = Suite::new("command_idempotency_replay")
         .initial_metadata(command_metadata())
         .with_migrations()
@@ -1000,15 +1000,16 @@ fn command_idempotency_replays_a_wider_projection_from_the_complete_canonical_re
 
     let mut client = postgres::Client::connect(suite.db_url(), NoTls)
         .expect("connect to inspect the canonical command result");
-    let stored_result: String = client
+    let stored = client
         .query_one(
-            "SELECT result::text \
+            "SELECT result::text, invocation_id::text \
              FROM donat.command_invocations \
              WHERE command_name = $1 AND key = $2",
             &[&"create_order", &"550e8400-e29b-41d4-a716-446655440021"],
         )
-        .expect("load the persisted canonical command result")
-        .get(0);
+        .expect("load the persisted canonical command result and generation");
+    let stored_result: String = stored.get(0);
+    let first_generation: String = stored.get(1);
     let stored_result: serde_json::Value =
         serde_json::from_str(&stored_result).expect("canonical result is valid JSON");
     assert_eq!(
@@ -1023,6 +1024,23 @@ fn command_idempotency_replays_a_wider_projection_from_the_complete_canonical_re
     suite.check_query_f(
         "commands/idempotency_replay.yaml",
         donat_conformance::Transport::Http,
+    );
+    let replayed = client
+        .query_one(
+            "SELECT count(*), min(invocation_id::text), max(invocation_id::text) \
+             FROM donat.command_invocations \
+             WHERE command_name = $1 AND key = $2",
+            &[&"create_order", &"550e8400-e29b-41d4-a716-446655440021"],
+        )
+        .expect("inspect the generation after exact replay");
+    assert_eq!(replayed.get::<_, i64>(0), 1);
+    assert_eq!(
+        replayed.get::<_, Option<String>>(1).as_deref(),
+        Some(first_generation.as_str())
+    );
+    assert_eq!(
+        replayed.get::<_, Option<String>>(2).as_deref(),
+        Some(first_generation.as_str())
     );
 }
 

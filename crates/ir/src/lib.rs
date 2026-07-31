@@ -9,6 +9,8 @@
 
 mod value_contract;
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 pub use donat_value_contract::{
@@ -443,7 +445,7 @@ pub struct CommandMutation {
     pub guards: Vec<CommandRule>,
     pub result: Vec<CommandResultField>,
     pub idempotency: Option<CommandIdempotency>,
-    pub effects: Vec<CommandEffectKind>,
+    pub effects: Vec<ResolvedCommandEffect>,
     pub selection: Vec<CommandResultSelection>,
 }
 
@@ -889,12 +891,44 @@ pub struct CommandIdempotency {
     pub error_path: String,
 }
 
-/// Effects remain a typed, non-executable boundary until the process runtime
-/// owns their compatibility validation and durable outbox CTEs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum CommandEffectKind {
-    StartProcess,
-    SignalProcess,
+/// One Process hand-off after the source-local Process revision and every
+/// request value have been resolved. SQLgen receives no raw effect metadata.
+#[derive(Debug, Clone, Serialize)]
+pub enum ResolvedCommandEffect {
+    StartProcess(ResolvedStartProcessEffect),
+    SignalProcess(ResolvedSignalProcessEffect),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedStartProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub start_policy: ProcessStartPolicy,
+    pub input: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedSignalProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub signal_name: String,
+    pub correlation: BTreeMap<String, CommandExecutionValue>,
+    pub payload: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+/// Closed reference to the generation elected by this command statement.
+/// Metadata can never choose or supply an arbitrary UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandInvocationIdSource {
+    CurrentExecution,
 }
 
 /// Client projection of a declared command result. Commands do not expose
