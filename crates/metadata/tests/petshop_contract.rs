@@ -271,8 +271,7 @@ fn petshop_contract_loads_complete_active_grammar() {
     let success_contracts = operations
         .iter()
         .filter_map(|operation| operation.get("success_contract"))
-        .map(mapping_key_set)
-        .flatten()
+        .flat_map(mapping_key_set)
         .collect::<BTreeSet<_>>();
     assert_eq!(
         success_contracts,

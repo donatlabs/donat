@@ -1209,9 +1209,13 @@ async fn non_business_database_error_aborts_the_entire_process_transition() {
         .consume_one_transition()
         .await
         .expect_err("a unique violation is not a catchable business rejection");
+    // The transition is retried forever, so the abort also has to say which
+    // schema object refused it — a SQLSTATE alone cannot tell one constraint
+    // from another in a command that writes several tables.
     assert_eq!(
         error.to_string(),
-        "Process command database execution failed with SQLSTATE 23505"
+        "Process command database execution failed with SQLSTATE 23505 \
+         on process_test_ledger.process_test_ledger_entity_id_key"
     );
     let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
         .await

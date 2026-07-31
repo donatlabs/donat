@@ -304,6 +304,155 @@ struct SourcePublicProbeFamily {
     changed: serde_json::Value,
 }
 
+fn permissive_license_value(spdx: &str, path: &str, sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "permissive",
+        "value": {
+            "spdx_id": spdx,
+            "selected_dual_license_branch": null,
+            "license_file_path": path,
+            "license_file_sha256": sha
+        }
+    })
+}
+
+/// The collections case extended with one *flipper* element per disposition
+/// variant, present on both sides of the pair.
+///
+/// Covering a disposition enum takes two elements, never one. A `kind` route
+/// differs only when an element changes variant; a payload route (`license`,
+/// `reason`, `finding`) differs only when an element stays in its variant and
+/// changes what it carries. The case's original elements are the stayers, so
+/// the flippers have to be added — and added to *both* sides, because a
+/// keyed mount pairs elements by key and drops anything that matches nothing.
+fn disposition_baseline(collections: &serde_json::Value) -> serde_json::Value {
+    let permissive = permissive_license_value(
+        "MIT",
+        "LICENSE",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    );
+    let mut baseline = collections.clone();
+    let dependencies = baseline["dependencies"].as_array_mut().unwrap();
+    dependencies.push(serde_json::json!({
+        "dependency": "dependency.flip.shipped",
+        "disposition": {"kind": "shipped", "value": {"license": permissive.clone()}}
+    }));
+    dependencies.push(serde_json::json!({
+        "dependency": "dependency.flip.build",
+        "disposition": {"kind": "build_only", "value": {"license": permissive.clone()}}
+    }));
+    let embedded = baseline["embedded_material"].as_array_mut().unwrap();
+    embedded.push(serde_json::json!({
+        "material_id": "embedded.flip.shipped",
+        "path": "embedded/flip-shipped.json",
+        "sha256": "1010101010101010101010101010101010101010101010101010101010101010",
+        "disposition": {"kind": "shipped", "value": {"license": permissive}}
+    }));
+    embedded.push(serde_json::json!({
+        "material_id": "embedded.flip.rejected",
+        "path": "embedded/flip-rejected.json",
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "disposition": {"kind": "rejected", "value": {"finding": "finding.embedded.flip"}}
+    }));
+    embedded.push(serde_json::json!({
+        "material_id": "embedded.renamed",
+        "path": "embedded/renamed.json",
+        "sha256": "1212121212121212121212121212121212121212121212121212121212121212",
+        "disposition": {"kind": "behavior_only", "value": {"reason": "finding.embedded.renamed"}}
+    }));
+    baseline
+}
+
+/// The other side of that pair: stayers change payload, flippers change
+/// variant, and exactly one element is renamed.
+///
+/// The rename is what moves the element's own identity — `material_id`, `path`
+/// and `sha256`. It has to be the only unmatched element on either side: a
+/// keyed mount pairs one leftover against one leftover, and two would pair
+/// against nothing.
+fn moved_collections(baseline: &serde_json::Value) -> serde_json::Value {
+    let apache = permissive_license_value(
+        "Apache-2.0",
+        "LICENSE-APACHE",
+        "7777777777777777777777777777777777777777777777777777777777777777",
+    );
+    let mit = permissive_license_value(
+        "MIT",
+        "LICENSE",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    );
+
+    let mut moved = baseline.clone();
+    // Stayers: same key, same variant, different payload.
+    moved["dependencies"][0]["disposition"]["value"]["license"] = apache.clone();
+    moved["dependencies"][1]["disposition"]["value"]["license"] = mit.clone();
+    moved["dependencies"][2]["disposition"]["value"]["replacement"] =
+        serde_json::json!("donat.value.contract.moved");
+    moved["dependencies"][3]["disposition"]["value"]["reason"] =
+        serde_json::json!("finding.behavior.only.moved");
+    moved["dependencies"][4]["disposition"]["value"]["finding"] =
+        serde_json::json!("finding.dependency.rejected.moved");
+    // Flippers: same key, different variant.
+    moved["dependencies"][5]["disposition"] = serde_json::json!({
+        "kind": "behavior_only",
+        "value": {"reason": "finding.dependency.flip.shipped"}
+    });
+    moved["dependencies"][6]["disposition"] = serde_json::json!({
+        "kind": "rejected",
+        "value": {"finding": "finding.dependency.flip.build"}
+    });
+
+    moved["embedded_material"][0]["disposition"]["value"]["license"] = apache;
+    moved["embedded_material"][1]["disposition"]["value"]["reason"] =
+        serde_json::json!("finding.embedded.behavior.moved");
+    moved["embedded_material"][2]["disposition"]["value"]["finding"] =
+        serde_json::json!("finding.embedded.rejected.moved");
+    moved["embedded_material"][3]["disposition"] = serde_json::json!({
+        "kind": "behavior_only",
+        "value": {"reason": "finding.embedded.flip.shipped"}
+    });
+    moved["embedded_material"][4]["disposition"] = serde_json::json!({
+        "kind": "shipped",
+        "value": {"license": mit}
+    });
+    // The one rename.
+    moved["embedded_material"][5]["material_id"] = serde_json::json!("embedded.renamed.moved");
+    moved["embedded_material"][5]["path"] = serde_json::json!("embedded/renamed-moved.json");
+    moved["embedded_material"][5]["sha256"] =
+        serde_json::json!("1313131313131313131313131313131313131313131313131313131313131313");
+    moved["embedded_material"][5]["disposition"] = serde_json::json!({
+        "kind": "rejected",
+        "value": {"finding": "finding.embedded.renamed.moved"}
+    });
+
+    // The contract facts of this case are all `donat_policy`; moving one
+    // policy's id and value is what the DonatPolicy routes read, and flipping
+    // one to provider evidence is what its `kind` route reads.
+    moved["provider_contracts"][0]["facts"][0]["value"]["policy_id"] =
+        serde_json::json!("policy.null.moved");
+    moved["provider_contracts"][0]["facts"][1]["value"]["value"] =
+        serde_json::json!({"kind": "boolean", "value": false});
+
+    moved
+}
+
+/// The collections record carrying exactly one contract with exactly one
+/// `donat_policy` fact.
+fn single_policy_fact(collections: &serde_json::Value) -> serde_json::Value {
+    let mut record = collections.clone();
+    record["provider_contracts"] = serde_json::json!([{
+        "contract_id": "contract.policy.single",
+        "facts": [{
+            "kind": "donat_policy",
+            "value": {
+                "policy_id": "policy.single",
+                "value": {"kind": "string", "value": "single-policy-value"}
+            }
+        }]
+    }]);
+    record
+}
+
 fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     let mut cases = positive_source_projection_cases()
         .into_iter()
@@ -311,6 +460,8 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     let npm = cases.remove("npm-verified").unwrap();
     let provider = cases.remove("provider-repository-reviewed-use").unwrap();
     let donat = cases.remove("donat-owned").unwrap();
+    let (cross_npm, cross_provider, cross_donat) = (npm.clone(), provider.clone(), donat.clone());
+    let collections = cases.remove("npm-collections-and-typed-values").unwrap();
 
     let mut npm_fields = npm.clone();
     npm_fields["record_id"] = serde_json::json!("source.serpapi.npm.probe");
@@ -492,7 +643,19 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         SourcePublicProbeFamily {
             group: "npm-collections-and-typed-values",
             baseline: npm.clone(),
-            changed: cases.remove("npm-collections-and-typed-values").unwrap(),
+            changed: collections.clone(),
+        },
+        // Collection mounts are keyed by a member of the element, not by
+        // index, so the pair above moves nothing inside `dependencies` or
+        // `embedded_material`: its baseline carries different keys entirely
+        // and no element matches. This pair keeps the keys fixed and moves
+        // what each element says — some elements change disposition variant,
+        // others stay in their variant and change its payload — which is the
+        // only way a per-variant route sees a delta.
+        SourcePublicProbeFamily {
+            group: "npm-collections-disposition-moves",
+            baseline: disposition_baseline(&collections),
+            changed: moved_collections(&disposition_baseline(&collections)),
         },
         SourcePublicProbeFamily {
             group: "npm-absent-mismatch-written-grant",
@@ -520,6 +683,42 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
             group: "provider-versioned-document-section",
             baseline: provider,
             changed: cases.remove("provider-versioned-document-section").unwrap(),
+        },
+        // A variant discriminant is not movable inside its own variant: the
+        // only way `SourceSubjectMaterialV1::ExactNpm.kind` differs between two
+        // documents is if one of them is not an npm record. Pairing the three
+        // checked-in record shapes against each other is what moves every
+        // discriminant route that a same-shape pair cannot reach — subject,
+        // admission, reacquisition, and the collections each shape carries.
+        SourcePublicProbeFamily {
+            group: "cross-shape-npm-to-donat-owned",
+            baseline: cross_npm.clone(),
+            changed: cross_donat.clone(),
+        },
+        SourcePublicProbeFamily {
+            group: "cross-shape-npm-to-provider-artifact",
+            baseline: cross_npm,
+            changed: cross_provider.clone(),
+        },
+        SourcePublicProbeFamily {
+            group: "cross-shape-provider-artifact-to-donat-owned",
+            baseline: cross_provider.clone(),
+            changed: cross_donat,
+        },
+        // A contract fact is keyed by its own kind, so a fact can never change
+        // variant while keeping its key — and no single record can hold both
+        // variants, because a `donat_policy` fact in a provider record is
+        // rejected as an evidence mismatch. The only pair that moves
+        // `ContractFactMaterialV1::DonatPolicy.kind` is therefore one whose
+        // sides are different record shapes: the policy-carrying collections
+        // record against the evidence-carrying provider record.
+        // A keyed mount pairs one leftover against one leftover and drops any
+        // larger remainder, so this side is trimmed to a single policy fact
+        // against the provider record's single evidence fact.
+        SourcePublicProbeFamily {
+            group: "cross-shape-policy-facts-to-evidence-facts",
+            baseline: single_policy_fact(&collections),
+            changed: cross_provider,
         },
     ]
 }
@@ -1316,6 +1515,32 @@ fn public_projection_probe_recipes() -> Vec<PublicProjectionProbeRecipe> {
     recipes
 }
 
+/// Every accepted probe the generated routes declare, by mutation case.
+fn accepted_membership_ids(case: CanonicalMutationCase) -> BTreeSet<CanonicalPublicInputProbeId> {
+    CANONICAL_PROJECTION_ROUTES
+        .iter()
+        .flat_map(|route| route.probe_memberships)
+        .filter(|membership| {
+            membership.disposition == CanonicalProjectionProbeDisposition::Accepted
+                && membership.probe.case == case
+        })
+        .map(|membership| membership.probe)
+        .collect()
+}
+
+/// Accepted probes are covered by two mechanisms, and each owns the cases it
+/// can express.
+///
+/// A `PublicProjectionProbeRecipe` names one baseline and one changed
+/// `PublicProjectionProbeInput`, and that input is either a value contract or
+/// a typed value. A source record is not expressible as one — it is a whole
+/// loaded document — so source-record probes are covered by
+/// [`source_public_probe_family_pairs`] instead, asserted by
+/// [`source_public_probes_are_covered_by_a_family_pair_delta`].
+///
+/// This case therefore holds the recipe mechanism to its own cases exactly:
+/// every value-contract and typed-value probe the routes declare has a recipe,
+/// and no recipe names a probe no route declares.
 #[test]
 fn public_probe_recipe_ids_are_the_exact_generated_membership_set() {
     let mut recipe_ids = BTreeSet::new();
@@ -1326,15 +1551,37 @@ fn public_probe_recipe_ids_are_the_exact_generated_membership_set() {
             recipe.probe
         );
     }
-    let membership_ids = CANONICAL_PROJECTION_ROUTES
-        .iter()
-        .flat_map(|route| route.probe_memberships)
-        .filter(|membership| {
-            membership.disposition == CanonicalProjectionProbeDisposition::Accepted
-        })
-        .map(|membership| membership.probe)
+    let membership_ids = accepted_membership_ids(CanonicalMutationCase::ValueContract)
+        .into_iter()
+        .chain(accepted_membership_ids(CanonicalMutationCase::TypedValue))
         .collect::<BTreeSet<_>>();
     assert_eq!(recipe_ids, membership_ids);
+}
+
+/// The source-record half of the same closure: every accepted source-record
+/// probe is exercised by a family pair that actually moves its route.
+#[test]
+fn source_public_probes_are_covered_by_a_family_pair_delta() {
+    let covered = source_public_probe_family_route_deltas()
+        .values()
+        .flat_map(BTreeSet::iter)
+        .map(|route| {
+            CanonicalPublicInputProbeId::new(
+                CanonicalMutationCase::SourceRecord,
+                route.material_owner,
+                route.material_field,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let uncovered = accepted_membership_ids(CanonicalMutationCase::SourceRecord)
+        .difference(&covered)
+        .map(|probe| format!("{}.{}", probe.owner, probe.group))
+        .collect::<Vec<_>>();
+    assert!(
+        uncovered.is_empty(),
+        "accepted source-record probes with no family pair that moves them:\n  {}",
+        uncovered.join("\n  ")
+    );
 }
 
 #[test]

@@ -113,7 +113,7 @@ fn registry_returns_catalog_owned_operation_only_for_its_bound_source() {
             scalar: ValueScalar::Int64
         }
     ));
-    assert_eq!(spec.output.roots["approved"].required, true);
+    assert!(spec.output.roots["approved"].required);
     assert!(
         registry
             .operation_spec("secondary", "mock_tax", operation)

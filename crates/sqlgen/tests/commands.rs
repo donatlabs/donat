@@ -244,7 +244,7 @@ fn allocation_root(command_name: &str, maximum_rows: u32) -> MutationRoot {
                 requested: column("requested_quantity", "int4"),
                 available: column("available_quantity", "int4"),
                 allocated: allocated.clone(),
-                backordered: backordered,
+                backordered,
                 groups: group_columns.clone(),
                 lines: line_columns.clone(),
                 backorders: backorder_columns.clone(),

@@ -176,7 +176,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
             {
                 assert_eq!(pinned_source, source_name);
                 let registry_spec = connectors
-                    .operation_spec_handle(source_name, instance, operation_id.clone())
+                    .operation_spec_handle(source_name, instance, *operation_id)
                     .expect("pinned Process operation remains in the deployment registry");
                 assert!(
                     Arc::ptr_eq(&registry_spec, &pinned.spec),

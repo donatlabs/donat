@@ -475,8 +475,8 @@ impl ConnectorRegistry {
                                 instance: instance.name.clone(),
                                 message,
                             }
-                        })? {
-                            if executable_specs
+                        })?
+                            && executable_specs
                                 .insert(spec.operation, Arc::new(spec))
                                 .is_some()
                             {
@@ -488,7 +488,6 @@ impl ConnectorRegistry {
                                     ),
                                 });
                             }
-                        }
                         let compiled = CompiledHttpOperation {
                             configuration_fingerprint: http_configuration_fingerprint(
                                 HTTP_DEFINITION,

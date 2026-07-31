@@ -2580,15 +2580,14 @@ fn collect_required_session_variables(
             }
         }
 
-        if let Some(idempotency) = &command.idempotency {
-            if let CommandIdempotencyScopeSpec::Values(scopes) = &idempotency.scope {
+        if let Some(idempotency) = &command.idempotency
+            && let CommandIdempotencyScopeSpec::Values(scopes) = &idempotency.scope {
                 for scope in scopes {
                     if let CommandIdempotencyScope::SessionVariable { session_variable } = scope {
                         insert_unconstrained_session_contract(&mut required, session_variable);
                     }
                 }
             }
-        }
         for effect in &command.effects {
             let values = match effect {
                 CommandEffect::StartProcess { start_process } => {
@@ -4276,7 +4275,7 @@ fn validate_step(
             validate_row_bound(project_many.maximum_rows, "project_many", path)?;
             let input = prior_row_set_output(&project_many.from, context, "project_many", path)?;
             let current_context = ValueContext {
-                current: Some(&input.fields),
+                current: Some(input.fields),
                 current_scope: Some(CurrentScope::BoundedRow),
                 ..*context
             };
@@ -4331,7 +4330,7 @@ fn validate_step(
         CommandStepOperation::DecisionMany { decision_many } => {
             let input = prior_row_set_output(&decision_many.from, context, "decision_many", path)?;
             let current_context = ValueContext {
-                current: Some(&input.fields),
+                current: Some(input.fields),
                 current_scope: Some(CurrentScope::BoundedRow),
                 ..*context
             };
