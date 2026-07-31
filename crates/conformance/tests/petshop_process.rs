@@ -17,6 +17,7 @@ use serde_json::{Value as Json, json};
 const CUSTOMER: &str = "customer-1";
 const TAX_QUOTE_PATH: &str = "/v1/tax-quotes";
 const AUTHORIZE_PATH: &str = "/v1/payment-authorizations";
+const VOID_PATH: &str = "/v1/payment-authorizations/*";
 
 fn petshop_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -92,6 +93,35 @@ fn script_providers(stub: &ProviderStub) {
             "normalized_payload": { "gateway": "mock", "captured": false }
         })),
     );
+}
+
+fn void_response() -> ScriptedResponse {
+    ScriptedResponse::ok(json!({
+        "provider_event_id": "evt_petshop_void_1",
+        "void_id": "void_petshop_1",
+        "provider_reference": "ref_petshop_1",
+        "status": "voided",
+        "normalized_payload": { "gateway": "mock", "voided": true }
+    }))
+}
+
+fn request_cancellation(
+    suite: &donat_conformance::Running,
+    order_id: &str,
+    request_id: &str,
+) -> (u16, Json) {
+    suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ request_authorized_order_cancellation(order_id: \"{order_id}\", reason: \"changed mind\", request_id: \"{request_id}\") {{ order_id }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    )
 }
 
 fn start_checkout(
@@ -262,5 +292,63 @@ fn a_shopper_checks_out_and_the_process_authorizes_the_order() {
         authorize.header("authorization"),
         Some("petshop-test-payment"),
         "the fixed-origin request carries its resolved credential"
+    );
+}
+
+/// The cancellation module runs on the order the checkout module just created:
+/// it voids the authorization at the provider and finalizes the cancellation.
+#[test]
+fn a_shopper_cancels_an_authorized_order_and_the_process_voids_the_payment() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    stub.set_default(VOID_PATH, void_response());
+    let suite = start_store(&stub, "petshop_order_cancellation");
+    let cart_id = seed_cart(suite.db_url());
+
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440910");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    await_terminal(&mut client, "checkout_payment");
+
+    let order_id: String = client
+        .query_one(
+            "SELECT id::text FROM orders WHERE customer_id = $1",
+            &[&CUSTOMER],
+        )
+        .expect("the checkout Process committed one order")
+        .get(0);
+
+    let (status, body) =
+        request_cancellation(&suite, &order_id, "550e8400-e29b-41d4-a716-446655440911");
+    assert_eq!(status, 200, "cancellation mutation status: {body}");
+
+    let output = await_terminal(&mut client, "authorized_order_cancellation");
+    assert_eq!(
+        output.pointer("/order_id").and_then(Json::as_str),
+        Some(order_id.as_str()),
+        "the cancellation Process reports the order it cancelled"
+    );
+
+    let voided = client
+        .query_one(
+            "
+            SELECT count(*)
+            FROM payment
+            WHERE order_id::text = $1 AND status = 'voided'
+            ",
+            &[&order_id],
+        )
+        .expect("the cancellation Process voided the authorization in domain state");
+    assert_eq!(voided.get::<_, i64>(0), 1, "the payment is voided");
+
+    let calls = stub.calls();
+    assert!(
+        calls.iter().any(|call| call.path.contains("/voids")),
+        "the provider received the void: {:?}",
+        calls
+            .iter()
+            .map(|call| call.path.clone())
+            .collect::<Vec<_>>()
     );
 }
