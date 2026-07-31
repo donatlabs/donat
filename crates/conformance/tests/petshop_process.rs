@@ -692,6 +692,180 @@ fn fulfilment_allocates_ships_and_captures_the_shipped_value() {
     );
 }
 
+/// Reconciliation compares the provider's answer against what the store
+/// recorded. An answer that agrees on every compared fact is matched
+/// automatically; anything else would park on a support decision instead.
+#[test]
+fn a_reconciliation_matches_a_payment_the_provider_confirms() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    let suite = start_store(&stub, "petshop_payment_reconciliation");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+
+    let cart_id = seed_cart(suite.db_url());
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440a00");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    let checkout = await_terminal(&mut client, "checkout_payment");
+    let payment_id = checkout
+        .pointer("/payment_id")
+        .and_then(Json::as_str)
+        .expect("checkout published its payment")
+        .to_owned();
+
+    let (amount_minor, currency, provider_reference): (i64, String, String) = {
+        let row = client
+            .query_one(
+                "SELECT amount_minor::bigint, currency, provider_reference
+                 FROM payment WHERE id::text = $1",
+                &[&payment_id],
+            )
+            .expect("read the recorded payment");
+        (row.get(0), row.get(1), row.get(2))
+    };
+
+    // The provider agrees with the store on every compared fact.
+    stub.set_default(
+        "/v1/payment-reconciliations",
+        ScriptedResponse::ok(json!({
+            "provider_event_id": "$request:/provider_event_id",
+            "reconciliation_id": "recon_petshop_1",
+            "amount_minor": amount_minor,
+            "currency": currency,
+            "status": "authorized",
+            "provider_reference": provider_reference,
+            "normalized_payload": { "gateway": "mock", "reconciled": true }
+        })),
+    );
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_payment_reconciliation(payment_id: \"{payment_id}\", provider_event_id: \"evt_petshop_reconcile_1\", expected_status: authorized, request_id: \"550e8400-e29b-41d4-a716-446655440a01\") {{ payment_id }} }}"
+            )
+        }),
+        &[(
+            "X-Donat-Role".to_owned(),
+            "reconciliation_worker".to_owned(),
+        )],
+    );
+    assert_eq!(status, 200, "start_payment_reconciliation status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_payment_reconciliation reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "payment_reconciliation");
+    assert_eq!(
+        output
+            .pointer("/reconciliation_status")
+            .and_then(Json::as_str),
+        Some("matched"),
+        "an agreeing provider answer is matched without support: {output}"
+    );
+    assert!(
+        output
+            .pointer("/reconciliation_id")
+            .and_then(Json::as_str)
+            .is_some(),
+        "the match publishes the durable reconciliation it recorded: {output}"
+    );
+}
+
+/// One marketplace payout cycle: the Process selects the cycle's candidates,
+/// pays each vendor through the provider, and records the outcome against the
+/// payout row. The candidate view pins this cycle id.
+const PAYOUT_CYCLE: &str = "00000000-0000-0000-0000-000000000001";
+const PAYOUT_PATH: &str = "/v1/payouts";
+
+#[test]
+fn a_payout_cycle_pays_each_accepted_vendor_order() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    stub.set_default(
+        PAYOUT_PATH,
+        ScriptedResponse::ok(json!({
+            "local_payout_id": "$request:/payout_id",
+            "vendor_id": "$request:/vendor_id",
+            "provider_event_id": "evt_petshop_payout_1",
+            "payout_id": "payout_petshop_1",
+            "outcome": "paid",
+            "normalized_payload": { "rail": "mock", "paid": true }
+        })),
+    );
+    let suite = start_store(&stub, "petshop_vendor_payout");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+
+    let cart_id = seed_cart(suite.db_url());
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440990");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    await_terminal(&mut client, "checkout_payment");
+
+    // One accepted vendor order is what makes this cycle have anything to pay.
+    client
+        .execute(
+            "INSERT INTO vendor_order
+                 (order_id, order_line_id, vendor_id, offer_id, line_sequence,
+                  product_category, gross_minor, currency, commission_tier,
+                  commission_bps, status)
+             SELECT order_line.order_id, order_line.id,
+                    '00000000-0000-0000-0000-0000000000a1'::uuid,
+                    '00000000-0000-0000-0000-0000000000b1'::uuid,
+                    1, 'services', order_line.line_subtotal_minor, order_line.currency,
+                    'standard', 1000, 'accepted'
+             FROM order_line",
+            &[],
+        )
+        .expect("seed one accepted vendor order");
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_vendor_payout(payout_cycle_id: \"{PAYOUT_CYCLE}\", request_id: \"550e8400-e29b-41d4-a716-446655440991\") {{ payout_cycle_id }} }}"
+            )
+        }),
+        &[(
+            "X-Donat-Role".to_owned(),
+            "marketplace_worker".to_owned(),
+        )],
+    );
+    assert_eq!(status, 200, "start_vendor_payout status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_vendor_payout reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "vendor_payout");
+    assert_eq!(
+        output.pointer("/failures").and_then(Json::as_array).map(Vec::len),
+        Some(0),
+        "every candidate was paid: {output}"
+    );
+    assert_eq!(
+        output.pointer("/payouts").and_then(Json::as_array).map(Vec::len),
+        Some(1),
+        "the cycle paid its one candidate: {output}"
+    );
+
+    let (status_text, net_minor): (String, i64) = {
+        let row = client
+            .query_one(
+                "SELECT status, net_minor FROM vendor_payout WHERE payout_cycle_id::text = $1",
+                &[&PAYOUT_CYCLE],
+            )
+            .expect("read the payout row");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(status_text, "paid", "the payout row records the provider outcome");
+    assert_eq!(
+        net_minor, 2250,
+        "the vendor is paid gross (2499) minus its 10% commission (249)"
+    );
+}
+
 /// A B2B quote above the automatic-credit ceiling: the decision table routes it
 /// to approver review, the Process opens that review and parks, and the
 /// approver's verified decision consumes the organization's credit.
