@@ -274,10 +274,16 @@ pub fn spawn() -> ProviderStub {
     stub
 }
 
-/// A registration key ending in `*` matches every path with that prefix.
+/// A registration key containing one `*` matches every path with that prefix
+/// and suffix. Operation templates put a runtime identifier in the middle of a
+/// path (`/v1/payment-authorizations/{payment_id}/voids`), so a trailing
+/// wildcard alone cannot tell one operation from its siblings.
 fn prefix_matches(key: &str, path: &str) -> bool {
-    key.strip_suffix('*')
-        .is_some_and(|prefix| path.starts_with(prefix))
+    key.split_once('*').is_some_and(|(prefix, suffix)| {
+        path.len() >= prefix.len() + suffix.len()
+            && path.starts_with(prefix)
+            && path.ends_with(suffix)
+    })
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<ProviderCall> {

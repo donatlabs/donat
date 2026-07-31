@@ -226,7 +226,7 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
             Err(error) => {
                 tracing::error!(
                     source = %runtime.source_name,
-                    error = %error,
+                    error = format_args!("{error:#}"),
                     "Process start consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
@@ -238,7 +238,7 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
             Err(error) => {
                 tracing::error!(
                     source = %runtime.source_name,
-                    error = %error,
+                    error = format_args!("{error:#}"),
                     "Process signal consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
@@ -377,7 +377,7 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
             Err(error) => {
                 tracing::error!(
                     source = %runtime.source_name,
-                    error = %error,
+                    error = format_args!("{error:#}"),
                     "Process transition consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
@@ -493,7 +493,7 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
             Err(error) => {
                 tracing::error!(
                     source = %runtime.source_name,
-                    error = %error,
+                    error = format_args!("{error:#}"),
                     "Process activity consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;

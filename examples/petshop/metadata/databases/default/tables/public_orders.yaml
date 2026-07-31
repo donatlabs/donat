@@ -39,9 +39,13 @@ select_permissions:
         - total_minor
         - currency
         - created_at
+      # Fulfilment owns an order from the moment its payment is committed:
+      # allocation and shipment run against an authorized order, and capture
+      # only follows a shipped label. Restricting this to `paid` predated the
+      # authorize-then-capture flow and hid every fulfilable order.
       filter:
         order_status:
-          _eq: paid
+          _in: [authorized, paid, fulfilled]
   - role: support
     permission:
       columns: "*"

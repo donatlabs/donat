@@ -94,6 +94,23 @@ types:
       discount_minor: bigint!
       taxable_minor: bigint!
       currency: string!
+  # One planned line as the allocation planner emits it. A group carries the
+  # planner's own line rows, which are wider than the carrier-facing
+  # `AllocationItem`: they still name the stock they came from, because the
+  # reservation and shipment steps are driven from the same rows.
+  - name: AllocationPlanItem
+    object:
+      allocation_id: uuid!
+      order_id: uuid!
+      order_line_id: uuid!
+      line_sequence: int!
+      variant_id: bigint!
+      location_code: string!
+      inventory_level_id: uuid!
+      requested_quantity: int!
+      quantity: int!
+      unit_price_minor: bigint!
+      currency: string!
   - name: AllocationGroup
     object:
       allocation_id: uuid!
@@ -102,7 +119,7 @@ types:
       allocation_rank: int!
       location_code: string!
       currency: string!
-      items: "[AllocationItem!]!"
+      items: "[AllocationPlanItem!]!"
   - name: Backorder
     object:
       id: uuid!

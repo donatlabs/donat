@@ -1204,9 +1204,20 @@ impl HttpConnector {
                 request_fingerprint: String::new(),
             });
         }
+        // The declared response is the activity's output schema, so every
+        // declared field appears in the output. A provider that omits an
+        // optional field yields an explicit null rather than a missing key:
+        // downstream bindings read declared fields by name, and a key that
+        // exists only when the provider felt like sending it would make an
+        // optional field unreadable exactly when it is absent.
         let mut output = JsonMap::new();
         for field in &operation.response_pointers {
             match value.pointer(&field.pointer) {
+                Some(value) if field.required && value.is_null() => {
+                    return Err(validation_failure(
+                        "connector provider response did not satisfy the declared contract",
+                    ));
+                }
                 Some(value) => {
                     output.insert(field.output_name.clone(), value.clone());
                 }
@@ -1215,7 +1226,9 @@ impl HttpConnector {
                         "connector provider response did not satisfy the declared contract",
                     ));
                 }
-                None => {}
+                None => {
+                    output.insert(field.output_name.clone(), JsonValue::Null);
+                }
             }
         }
         Ok(ConnectorSuccess {
@@ -1509,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declarative_optional_response_binding_does_not_require_an_absent_provider_field() {
+    async fn declarative_optional_response_binding_publishes_an_absent_provider_field_as_null() {
         async fn response() -> Json<JsonValue> {
             Json(json!({ "id": "ship_123" }))
         }
@@ -1544,7 +1557,33 @@ mod tests {
             .await
             .expect("an optional provider field may be absent");
 
-        assert_eq!(result.output, json!({}));
+        assert_eq!(
+            result.output,
+            json!({ "tracking_url": null }),
+            "the declared output keeps every declared field, so a downstream \
+             binding can read an optional field that the provider omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_required_response_binding_rejects_an_explicit_provider_null() {
+        async fn response() -> Json<JsonValue> {
+            Json(json!({ "shipment_id": null }))
+        }
+
+        let server = LocalServer::start(Router::new().route("/shipment", post(response))).await;
+        let operation = HttpOperation::builder("read", HttpMethod::Post, "/shipment")
+            .success_statuses([StatusCode::OK])
+            .response_pointer("shipment_id", "/shipment_id", true)
+            .build()
+            .expect("response declaration is valid");
+
+        let failure = local_connector(&server.base_url)
+            .execute(&operation, json!({}), context())
+            .await
+            .expect_err("a declared non-null field is not satisfied by an explicit null");
+
+        assert_eq!(failure.class, ConnectorErrorClass::Validation);
     }
 
     #[tokio::test]

@@ -18,8 +18,10 @@ const CUSTOMER: &str = "customer-1";
 const REVIEWER: &str = "veterinarian-1";
 const TAX_QUOTE_PATH: &str = "/v1/tax-quotes";
 const AUTHORIZE_PATH: &str = "/v1/payment-authorizations";
-const VOID_PATH: &str = "/v1/payment-authorizations/*";
+const VOID_PATH: &str = "/v1/payment-authorizations/*/voids";
 const LOOKUP_PATH: &str = "/v1/payment-operation-lookups";
+const LABEL_PATH: &str = "/v1/shipments/*/labels";
+const CAPTURE_PATH: &str = "/v1/payment-authorizations/*/captures";
 
 fn petshop_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -213,7 +215,42 @@ fn process_diagnostics(client: &mut postgres::Client) -> String {
             &[],
         )
         .unwrap_or_default();
+    let fanout = client
+        .query(
+            "SELECT state_name, ordinal, status, coalesce(failure_json::text, 'null')
+             FROM donat.process_fanout_items WHERE source_name = 'default'
+             ORDER BY state_name, ordinal",
+            &[],
+        )
+        .unwrap_or_default();
+    let stuck_events = client
+        .query(
+            "SELECT kind, status, attempts, left(payload_json::text, 400)
+             FROM donat.process_events
+             WHERE source_name = 'default' AND status <> 'consumed'
+             ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default();
     let mut report = String::new();
+    for item in fanout {
+        report.push_str(&format!(
+            "fanout {}[{}] status={} failure={}; ",
+            item.get::<_, String>(0),
+            item.get::<_, i32>(1),
+            item.get::<_, String>(2),
+            item.get::<_, String>(3)
+        ));
+    }
+    for event in stuck_events {
+        report.push_str(&format!(
+            "event {} status={} attempts={} payload={}; ",
+            event.get::<_, String>(0),
+            event.get::<_, String>(1),
+            event.get::<_, i32>(2),
+            event.get::<_, String>(3)
+        ));
+    }
     for signal in signals {
         report.push_str(&format!(
             "signal {}.{} status={} correlate={}; ",
@@ -471,6 +508,111 @@ fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
     );
 }
 
+/// The carrier and the payment provider answering a shipped allocation.
+fn script_fulfilment_providers(stub: &ProviderStub) {
+    stub.set_default(
+        LABEL_PATH,
+        ScriptedResponse::ok(json!({
+            "shipment_id": "$request:/shipment_id",
+            "shipment_key": "$request:/shipment_key",
+            "carrier_shipment_reference": "carrier_ref_petshop_1",
+            "tracking_number": "TRACK-PETSHOP-1",
+            "label_url": "https://carrier.example/labels/petshop-1.pdf",
+            "event_id": "evt_petshop_label_1",
+            "outcome": "label_created"
+        })),
+    );
+    stub.set_default(
+        CAPTURE_PATH,
+        ScriptedResponse::ok(json!({
+            "payment_id": "$request:/payment_id",
+            "shipment_id": "$request:/shipment_id",
+            "amount_minor": "$request:/amount_minor",
+            "provider_event_id": "evt_petshop_capture_1",
+            "capture_id": "cap_petshop_1",
+            "provider_reference": "ref_petshop_1",
+            "status": "captured",
+            "normalized_payload": { "gateway": "mock", "captured": true }
+        })),
+    );
+}
+
+/// Fulfilment allocates the authorized order, packs it, ships it through the
+/// carrier, and captures exactly the shipped value — the whole bounded fan-out
+/// driven from one entry-point Command.
+#[test]
+fn fulfilment_allocates_ships_and_captures_the_shipped_value() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    script_fulfilment_providers(&stub);
+    let suite = start_store(&stub, "petshop_partial_fulfilment");
+    let cart_id = seed_cart(suite.db_url());
+
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440950");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    let checkout = await_terminal(&mut client, "checkout_payment");
+    let order_id = checkout
+        .pointer("/order_id")
+        .and_then(Json::as_str)
+        .expect("checkout published its order")
+        .to_owned();
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_order_fulfilment(order_id: \"{order_id}\", destination_region: \"northeast\", allocation_request_id: \"550e8400-e29b-41d4-a716-446655440951\") {{ order_id order_status }} }}"
+            )
+        }),
+        &[("X-Donat-Role".to_owned(), "fulfilment".to_owned())],
+    );
+    assert_eq!(status, 200, "start_order_fulfilment status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_order_fulfilment reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "partial_fulfilment");
+    assert_eq!(
+        output.pointer("/status").and_then(Json::as_str),
+        Some("partial"),
+        "the fulfilment Process publishes its bounded outcome: {output}"
+    );
+    assert_eq!(
+        output
+            .pointer("/unshipped_allocations")
+            .and_then(Json::as_array)
+            .map(Vec::len),
+        Some(0),
+        "every allocation shipped: {output}"
+    );
+    assert_eq!(
+        output
+            .pointer("/shipment_outcomes/0/outcome")
+            .and_then(Json::as_str),
+        Some("label_created"),
+        "the carrier label is recorded against the shipment: {output}"
+    );
+
+    let (shipped_value, captured): (i64, i64) = {
+        let row = client
+            .query_one(
+                "SELECT (SELECT coalesce(sum(shipped_value_minor), 0)::bigint FROM shipment WHERE status = 'shipped'),
+                        (SELECT coalesce(sum(amount_minor), 0)::bigint FROM payment_capture)",
+                &[],
+            )
+            .expect("read the shipped and captured totals");
+        (row.get(0), row.get(1))
+    };
+    assert!(shipped_value > 0, "the shipment carries a value to capture");
+    assert_eq!(
+        captured, shipped_value,
+        "capture takes exactly the shipped value, never the order total"
+    );
+}
+
 /// A shopper cancels while the payment is still pending. The claim beats the
 /// in-flight authorization, and the cancellation Process asks the provider to
 /// prove the authorization never committed before it releases the reservation.
@@ -546,7 +688,7 @@ fn a_shopper_cancels_a_pending_checkout_and_the_process_proves_no_authorization(
     let voids = stub
         .calls()
         .into_iter()
-        .filter(|call| call.path.starts_with("/v1/payment-authorizations/"))
+        .filter(|call| call.path.ends_with("/voids"))
         .count();
     assert_eq!(
         voids, 0,
