@@ -3419,9 +3419,73 @@ enum CommandRejection {
     },
 }
 
+/// The table and CTE of every command step that writes rows before `index`.
+///
+/// A command is one statement, so a row a later step references was created in
+/// a data-modifying CTE and is not visible to a table read in the same
+/// statement. A permission check that traverses a relationship to such a row
+/// must therefore resolve it against that CTE, exactly as the nested-insert
+/// path already does for GraphQL mutations.
+fn command_written_tables(command: &CommandMutation, index: usize) -> Vec<(&Table, &str)> {
+    command.steps[..index]
+        .iter()
+        .filter_map(|step| match step {
+            CommandExecutionStep::Insert { cte, table, .. }
+            | CommandExecutionStep::InsertMany { cte, table, .. }
+            | CommandExecutionStep::InsertRows { cte, table, .. }
+            | CommandExecutionStep::InsertWhen { cte, table, .. }
+            | CommandExecutionStep::Update { cte, table, .. }
+            | CommandExecutionStep::UpdateWhen { cte, table, .. } => Some((table, cte.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build one override per relationship in `check` whose target row this
+/// statement is still creating. Matching on the expression's own join keeps the
+/// override exact.
+fn command_relationship_ctes(
+    check: &BoolExp,
+    written: &[(&Table, &str)],
+) -> Vec<RelationshipCteOverride> {
+    let mut overrides = Vec::new();
+    collect_command_relationship_ctes(check, written, &mut overrides);
+    overrides
+}
+
+fn collect_command_relationship_ctes(
+    exp: &BoolExp,
+    written: &[(&Table, &str)],
+    overrides: &mut Vec<RelationshipCteOverride>,
+) {
+    match exp {
+        BoolExp::And(exps) | BoolExp::Or(exps) => {
+            for exp in exps {
+                collect_command_relationship_ctes(exp, written, overrides);
+            }
+        }
+        BoolExp::Not(exp) => collect_command_relationship_ctes(exp, written, overrides),
+        BoolExp::Relationship {
+            table,
+            join,
+            predicate,
+        } => {
+            if let Some((_, cte)) = written.iter().find(|(written, _)| *written == table) {
+                overrides.push(RelationshipCteOverride {
+                    table: table.clone(),
+                    join: join.clone(),
+                    cte: (*cte).to_owned(),
+                });
+            }
+            collect_command_relationship_ctes(predicate, written, overrides);
+        }
+        _ => {}
+    }
+}
+
 fn command_rejection_checks(ctx: &mut Ctx, command: &CommandMutation) -> Vec<CommandRejection> {
     let mut checks = Vec::new();
-    for step in &command.steps {
+    for (index, step) in command.steps.iter().enumerate() {
         match step {
             CommandExecutionStep::Assert { .. } => {}
             CommandExecutionStep::SelectOne {
@@ -3472,11 +3536,13 @@ fn command_rejection_checks(ctx: &mut Ctx, command: &CommandMutation) -> Vec<Com
                 ..
             } => {
                 if let Some(check) = check {
+                    let overrides =
+                        command_relationship_ctes(check, &command_written_tables(command, index));
                     checks.push(CommandRejection::Permission {
                         condition: format!(
                             "(SELECT count(*) FROM {} WHERE ({}) IS NOT TRUE) > 0",
                             quote_ident(cte),
-                            ctx.bool_exp(check, cte, cte),
+                            ctx.bool_exp_with_relationship_ctes(check, cte, cte, &overrides),
                         ),
                         path: error_path.clone(),
                     });
