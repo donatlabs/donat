@@ -471,22 +471,11 @@ fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
     let mut client =
         postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
 
-    // Wait until the hold exists and the Process parks on its signal.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let booking_id: String = loop {
-        let row = client
-            .query_opt("SELECT id::text FROM grooming_booking LIMIT 1", &[])
-            .expect("poll for the reserved hold");
-        if let Some(row) = row {
-            break row.get(0);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the booking Process never reserved its hold: {}",
-            process_diagnostics(&mut client)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let booking_id = await_row_id(
+        &mut client,
+        "grooming_booking",
+        "the booking Process never reserved its hold",
+    );
 
     let (status, body) = suite.post(
         "/v1/graphql",
@@ -537,6 +526,31 @@ fn script_fulfilment_providers(stub: &ProviderStub) {
             "normalized_payload": { "gateway": "mock", "captured": true }
         })),
     );
+}
+
+/// Block until a Process has committed the row a later step needs, and answer
+/// its id.
+///
+/// Every wait in this file shares one budget. These polls used to carry their
+/// own, shorter one, which held under a single suite and expired under a full
+/// workspace run where the engine competes with every other suite for the
+/// machine.
+fn await_row_id(client: &mut postgres::Client, table: &str, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let row = client
+            .query_opt(&format!("SELECT id::text FROM {table} LIMIT 1"), &[])
+            .unwrap_or_else(|error| panic!("poll {table}: {error}"));
+        if let Some(row) = row {
+            return row.get(0);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {}",
+            process_diagnostics(client)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Block until a Process wait is receptive.
@@ -1318,21 +1332,11 @@ fn a_reviewer_approves_a_prescription_and_the_process_releases_the_line() {
     );
     assert_eq!(status, 200, "start_prescription_review status: {body}");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let prescription_id: String = loop {
-        let row = client
-            .query_opt("SELECT id::text FROM prescription_request LIMIT 1", &[])
-            .expect("poll for the submitted review");
-        if let Some(row) = row {
-            break row.get(0);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the prescription Process never submitted its review: {}",
-            process_diagnostics(&mut client)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let prescription_id = await_row_id(
+        &mut client,
+        "prescription_request",
+        "the prescription Process never submitted its review",
+    );
 
     await_receptive_wait(
         &mut client,

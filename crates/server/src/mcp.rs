@@ -2330,7 +2330,10 @@ fn mcp_role_allowed(
     role: &str,
 ) -> bool {
     permissions.iter().any(|allowed| {
-        allowed == role || expand_role(inherited_roles, role).iter().any(|parent| parent == allowed)
+        allowed == role
+            || expand_role(inherited_roles, role)
+                .iter()
+                .any(|parent| parent == allowed)
     })
 }
 
@@ -2639,7 +2642,12 @@ async fn call_configured_tool(
     let (saved, table_operation, inherited_roles) = {
         let engine = state.engine.read().await;
         let metadata = &engine.metadata;
-        let saved = metadata.mcp.tools.iter().find(|tool| tool.name == name).cloned();
+        let saved = metadata
+            .mcp
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .cloned();
         let table_operation = metadata
             .mcp
             .table_tools
@@ -2707,10 +2715,10 @@ async fn call_configured_tool(
         return match operation.operation {
             donat_metadata::McpTableOperationKind::Query => {
                 let mut result = crud_tool(state, session, headers, &args, build_query_gql).await;
-                if result.get("isError") == Some(&Json::Bool(false)) {
-                    if let Some(rows) = result.get_mut("structuredContent").map(Json::take) {
-                        result["structuredContent"] = json!({ "rows": rows });
-                    }
+                if result.get("isError") == Some(&Json::Bool(false))
+                    && let Some(rows) = result.get_mut("structuredContent").map(Json::take)
+                {
+                    result["structuredContent"] = json!({ "rows": rows });
                 }
                 result
             }
@@ -2835,7 +2843,10 @@ fn action_type_selection(
     ancestors: &mut std::collections::HashSet<String>,
 ) -> Option<String> {
     let name = type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
-    let object = custom_types.objects.iter().find(|object| object.name == name)?;
+    let object = custom_types
+        .objects
+        .iter()
+        .find(|object| object.name == name)?;
 
     // A finite generated selection cannot fully expand recursive custom
     // objects. At the cycle boundary select scalar fields (or __typename) so
@@ -2870,10 +2881,11 @@ fn action_scalar_field_selection(
         .fields
         .iter()
         .filter(|field| {
-            let name = field
-                .type_
-                .trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
-            !custom_types.objects.iter().any(|object| object.name == name)
+            let name = field.type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
+            !custom_types
+                .objects
+                .iter()
+                .any(|object| object.name == name)
         })
         .map(|field| field.name.as_str())
         .collect::<Vec<_>>();
@@ -9356,18 +9368,15 @@ mod tests {
         assert!(query.get("required").is_none());
         assert!(query["properties"].get("columns").is_some());
 
-        let insert =
-            table_tool_input_schema(donat_metadata::McpTableOperationKind::Insert, false);
+        let insert = table_tool_input_schema(donat_metadata::McpTableOperationKind::Insert, false);
         assert_eq!(insert["required"], json!(["objects"]));
         assert!(insert["properties"].get("table").is_none());
 
-        let update =
-            table_tool_input_schema(donat_metadata::McpTableOperationKind::Update, false);
+        let update = table_tool_input_schema(donat_metadata::McpTableOperationKind::Update, false);
         assert_eq!(update["required"], json!(["where", "set"]));
         assert_eq!(update["properties"]["where"]["minProperties"], json!(1));
 
-        let delete =
-            table_tool_input_schema(donat_metadata::McpTableOperationKind::Delete, false);
+        let delete = table_tool_input_schema(donat_metadata::McpTableOperationKind::Delete, false);
         assert_eq!(delete["required"], json!(["where"]));
         assert_eq!(delete["properties"]["where"]["minProperties"], json!(1));
     }

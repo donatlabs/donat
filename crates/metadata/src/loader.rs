@@ -142,7 +142,10 @@ fn validate_mcp(mcp: &crate::types::McpMetadata) -> Result<(), String> {
             ));
         }
         if tool.permissions.is_empty() {
-            return Err(format!("tool '{}' must declare at least one role", tool.name));
+            return Err(format!(
+                "tool '{}' must declare at least one role",
+                tool.name
+            ));
         }
     }
     for table_tool in &mcp.table_tools {
@@ -189,7 +192,10 @@ fn validate_mcp_references(metadata: &Metadata) -> Result<(), String> {
             }
         }
         if let Some(action_name) = &tool.source.action {
-            let Some(action) = metadata.actions.iter().find(|action| action.name == *action_name)
+            let Some(action) = metadata
+                .actions
+                .iter()
+                .find(|action| action.name == *action_name)
             else {
                 return Err(format!(
                     "tool '{}' references unknown action '{}'",
@@ -209,10 +215,14 @@ fn validate_mcp_references(metadata: &Metadata) -> Result<(), String> {
         }
     }
     for table_tool in &metadata.mcp.table_tools {
-        let tracked = metadata.sources.iter().flat_map(|source| &source.tables).any(|entry| {
-            entry.table.schema() == table_tool.table.schema()
-                && entry.table.name() == table_tool.table.name()
-        });
+        let tracked = metadata
+            .sources
+            .iter()
+            .flat_map(|source| &source.tables)
+            .any(|entry| {
+                entry.table.schema() == table_tool.table.schema()
+                    && entry.table.name() == table_tool.table.name()
+            });
         if !tracked {
             return Err(format!(
                 "MCP table tool references untracked table '{}.{}'",
@@ -230,16 +240,21 @@ fn action_output_has_relationships(
     ancestors: &mut HashSet<String>,
 ) -> bool {
     let name = type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
-    let Some(object) = custom_types.objects.iter().find(|object| object.name == name) else {
+    let Some(object) = custom_types
+        .objects
+        .iter()
+        .find(|object| object.name == name)
+    else {
         return false;
     };
     if !ancestors.insert(object.name.clone()) {
         return false;
     }
     let has_relationship = !object.relationships.is_empty()
-        || object.fields.iter().any(|field| {
-            action_output_has_relationships(custom_types, &field.type_, ancestors)
-        });
+        || object
+            .fields
+            .iter()
+            .any(|field| action_output_has_relationships(custom_types, &field.type_, ancestors));
     ancestors.remove(&object.name);
     has_relationship
 }
