@@ -19,6 +19,12 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/013-petshop-first-executable-requirements]]
 - [[decisions/014-command-relational-batches]]
 - [[decisions/015-petshop-modular-pressure-suite]]
+- [[decisions/016-bounded-command-aggregate-types]]
+- [[decisions/017-bounded-command-current-row-namespace]]
+- [[decisions/018-bounded-command-argument-rows]]
+- [[decisions/019-command-only-table-permissions]]
+- [[decisions/020-command-unconditional-unique-identity]]
+- [[decisions/021-pinned-source-local-process-start-consumption]]
 
 ## Reference governance
 

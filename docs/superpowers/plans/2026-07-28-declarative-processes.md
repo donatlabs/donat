@@ -2137,11 +2137,15 @@ function or route.
 - `process_start_crash_before_commit_retries`
 - `process_start_crash_after_commit_does_not_duplicate`
 - `process_start_refuses_missing_deployed_revision`
+- `process_start_rejects_invalid_typed_input_without_consuming`
+- `process_start_preserves_exact_numeric_input`
 - `process_workers_are_source_local`
+- `process_runtime_rejects_non_postgres_source`
+- `process_runtime_rejects_cross_source_deployed_catalog`
 - Conformance `process_start_worker_is_durable`
 - Fixture directory `fixtures/processes/start_worker/`
 
-- [ ] **Step 1: Add the failing native conformance case**
+- [x] **Step 1: Add the failing native conformance case**
 
   Deploy A without a serving worker, persist a valid pending A request through
   the harness using the exact Task-8 row shape, then deploy B and start the
@@ -2151,13 +2155,13 @@ function or route.
   generations with one semantic key and prove one instance. Inject failures
   before/after commit and restart the binary.
 
-- [ ] **Step 2: Add failing runtime/Postgres tests**
+- [x] **Step 2: Add failing runtime/Postgres tests**
 
   Use two source pools with identical UUID/name/key values. Assert every SQL
   predicate starts with source and a missing deployed revision stops the claim
   with invariant audit rather than current-catalog fallback.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
   ~~~bash
   cargo test -p donat-server --test process_start
@@ -2167,7 +2171,7 @@ function or route.
 
   Expected: no process runtime or start consumer exists.
 
-- [ ] **Step 4: Implement start consumption and lifecycle wiring**
+- [x] **Step 4: Implement start consumption and lifecycle wiring**
 
   Build each runtime with the exact free constructor above, then spawn one
   loop per process-owning Postgres source from the published Engine snapshot.
@@ -2176,7 +2180,7 @@ function or route.
   Tokio polling is wake-up only. Use the exact short transaction and return
   values above. Shutdown cleanly with the existing server cancellation path.
 
-- [ ] **Step 5: Run GREEN**
+- [x] **Step 5: Run GREEN**
 
   ~~~bash
   cargo test -p donat-server --test process_start
@@ -2188,7 +2192,7 @@ function or route.
 
   Expected: committed starts are consumed once by the pinned source/revision.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ~~~bash
   git add crates/server/src/processes crates/server/src/state.rs \

@@ -565,7 +565,9 @@ async fn main() -> anyhow::Result<()> {
     // Background delivery of table event triggers. The per-table Postgres
     // triggers that capture events are created by `migrate --metadata-dir`.
     events::spawn(state.clone());
-
+    // Durable Process workers retain the exact Engine snapshot published by
+    // sync_sources; polling only wakes source-local journal transactions.
+    processes::spawn(state.clone()).await?;
     // Liveness/version are not data APIs — always mounted.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
