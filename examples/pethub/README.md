@@ -43,6 +43,34 @@ existing compiled role, and grant it a narrower set of actions. This is the
 same split Hasura users build by hand with `user_project_roles` tables and
 `_exists` predicates; here the engine derives the predicates instead.
 
+## Onboarding a tenant runs no migration
+
+Signing up a merchant must never wait on a deploy, a DDL run, or a person.
+Under `binding: row_key` that is not a feature to build — it is what the
+binding *is*. `register_merchant` writes rows: a tenant, two seeded IAM roles,
+their grants, the founder's membership, and a usage counter. One statement, no
+DDL, and the store is `active` when the command returns.
+
+The same choice makes schema evolution automatic in the other direction: one
+`donat migrate` and every tenant has the new column at once. Under
+schema-per-tenant or database-per-tenant that becomes a fan-out over N targets
+plus a partial-failure story — half the tenants migrated, half not, and one
+compiled schema that assumes a single shape.
+
+Two rules follow, and they are worth writing down before anything is built:
+
+1. **A tenant is never half-created.** If the store ever needs seed rows to
+   function, they are seeded by `register_merchant` itself, in the same
+   statement. Petshop needs none today — pricing routes are decision tables in
+   metadata, and prices live on variants the merchant creates — so a freshly
+   registered store is empty, not broken.
+2. **If the binding ever changes, provisioning moves to a control plane, not
+   into the request path.** The serving engine still runs no DDL. A separate
+   provisioner watches the tenant registry, applies the platform's migrations,
+   and flips the row to `active`; until then the tenant is not in the
+   registry's `serving:` list and requests are refused cleanly instead of
+   reaching a half-built schema.
+
 ## What is in wave 1
 
 Merchant signup and store creation, staff invitations, per-tenant IAM roles

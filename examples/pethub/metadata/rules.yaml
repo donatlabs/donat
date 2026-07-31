@@ -9,8 +9,14 @@ types:
   - name: AssignableRole
     enum: [merchant_owner, staff, fulfilment, support]
 
+  # `provisioning` exists for the bindings that need per-tenant DDL, not for
+  # this one. Under `row_key` a tenant is rows, so register_merchant returns a
+  # store that is already `active` and no request ever observes an
+  # intermediate state. Under `schema` or `source` a tenant is born
+  # `provisioning`, and the registry's `serving: [active]` list is what keeps
+  # it unreachable until its database is ready.
   - name: TenantStatus
-    enum: [active, suspended, closed]
+    enum: [provisioning, active, suspended, closed]
 
 rules:
   # --- Entitlements -------------------------------------------------------

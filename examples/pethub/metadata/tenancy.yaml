@@ -31,8 +31,23 @@ tenancy:
   # point: forgetting the 158th table must be impossible, not merely unlikely.
   key: tenant_id
 
-  # The tenant registry itself. `status` gates every request: a suspended or
-  # closed tenant is refused before planning, not filtered afterwards.
+  # The tenant registry itself. `status` gates every request: a tenant that is
+  # not serving is refused before planning, not filtered afterwards.
+  #
+  # Onboarding a tenant must never require a deploy, a migration, or a human.
+  # Under `row_key` that is free: a tenant is rows, register_merchant writes
+  # them in one statement, and the store is `active` when the command returns.
+  # Nothing runs DDL, so the rule that the serving engine never runs DDL is not
+  # even approached.
+  #
+  # Under `schema` or `source` the same guarantee costs a control plane. The
+  # serving engine still must not run DDL, so a separate provisioner — its own
+  # process, not the request path — watches this registry, applies the same
+  # migrations the platform ships, and flips the row to `active`. Requests
+  # arriving in between see a tenant that is not in `serving:` and are refused
+  # with a clear status rather than reaching a half-built schema. That keeps
+  # onboarding automatic without inventing a runtime admin API, which is the
+  # thing this engine deliberately does not have.
   registry:
     table: { schema: public, name: tenant }
     key: id
