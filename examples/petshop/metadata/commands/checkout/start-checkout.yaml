@@ -1,0 +1,40 @@
+# The customer-facing entry point for checkout. It writes no domain row: the
+# checkout_payment Process owns quoting, tax, and order creation. This command
+# only proves that the caller owns an open cart before a durable Process can be
+# created for it, so a wrong cart is rejected at the API boundary instead of
+# becoming an audited Process failure.
+name: start_checkout
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: cart_id
+    type: bigint!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: cart
+    select_one:
+      table: public.cart_checkout_context
+      by:
+        cart_id: { arg: cart_id }
+        customer_id: { session_variable: x-donat-user-id }
+        status: { literal: cart_open }
+      returning: [cart_id, customer_id]
+      require_found: true
+result:
+  cart_id: { step: cart, column: cart_id }
+  owner_user_id: { step: cart, column: customer_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: cart_id }
+    - { session_variable: x-donat-user-id }
+  retention: 365d
+effects:
+  - start_process:
+      process: checkout_payment
+      input:
+        cart_id: { step: cart, column: cart_id }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

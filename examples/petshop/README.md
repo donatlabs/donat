@@ -264,19 +264,22 @@ persists its state, signal inbox, activity attempts, and timers, so it can
 recover after a crash. A command effect is consumed from the transactional
 outbox to start or signal that process; the command itself remains synchronous.
 
-| Module | Current intent |
-| --- | --- |
-| `checkout_payment` | Immutable pricing/tax/shipping quote snapshots and synchronous provider authorization with ambiguity lookup. |
-| `checkout_cancellation` | Claim a pending authorization race, prove provider absence or materialize/void the authorization, then release reservations. |
-| `authorized_order_cancellation` | Void an authorized payment before releasing reservations and finalizing cancellation. |
-| `partial_fulfilment` | Allocate, pack, label, ship, and capture per fulfilment unit. |
-| `return_refund` | Support approval, return label, receipt, inspection, refund, exchange, or rejection. |
-| `subscription_renewal` | Renewal authorization with dunning timers and a terminal pause. |
-| `b2b_order_approval` | Quote routing, automatic credit use, and approver/finance waits. |
-| `vendor_payout` | Create bounded vendor payouts and record synchronous terminal provider outcomes per vendor. |
-| `grooming_booking` | Reserve a grooming slot and await confirmation, cancellation, or hold expiry. |
-| `prescription_review` | Submit a prescription review and await the recorded decision or expiry. |
-| `payment_reconciliation` | Retrieve provider evidence, reconcile it, and await manual resolution when needed. |
+Every process is reachable: exactly one Command declares the `start_process`
+effect that creates it, and that Command is the module's public entry point.
+
+| Module | Entry-point Command | Current intent |
+| --- | --- | --- |
+| `checkout_payment` | `start_checkout` | Immutable pricing/tax/shipping quote snapshots and synchronous provider authorization with ambiguity lookup. |
+| `checkout_cancellation` | `cancel_order` | Claim a pending authorization race, prove provider absence or materialize/void the authorization, then release reservations. |
+| `authorized_order_cancellation` | `request_authorized_order_cancellation` | Void an authorized payment before releasing reservations and finalizing cancellation. |
+| `partial_fulfilment` | `start_order_fulfilment` | Allocate, pack, label, ship, and capture per fulfilment unit. |
+| `return_refund` | `start_return` | Support approval, return label, receipt, inspection, refund, exchange, or rejection. |
+| `subscription_renewal` | `start_subscription_renewal` | Renewal authorization with dunning timers and a terminal pause. |
+| `b2b_order_approval` | `submit_quote` | Quote routing, automatic credit use, and approver/finance waits. |
+| `vendor_payout` | `start_vendor_payout` | Create bounded vendor payouts and record synchronous terminal provider outcomes per vendor. |
+| `grooming_booking` | `start_grooming_booking` | Reserve a grooming slot and await confirmation, cancellation, or hold expiry. |
+| `prescription_review` | `start_prescription_review` | Submit a prescription review and await the recorded decision or expiry. |
+| `payment_reconciliation` | `start_payment_reconciliation` | Retrieve provider evidence, reconcile it, and await manual resolution when needed. |
 
 All eleven active flow modules declare `kind: process` and `version: 1`. The YAML
 remains the target contract, not an assertion that these modules execute today.

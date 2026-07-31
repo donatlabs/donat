@@ -690,6 +690,13 @@
     - role: booking_worker
       permission: {columns: "*", check: {}}
 
+- table: {schema: public, name: payment_reconciliation_candidate}
+  select_permissions:
+    - role: reconciliation_worker
+      permission:
+        columns: "*"
+        filter: {}
+
 - table: {schema: public, name: customer_prescription_order_line}
   select_permissions:
     - role: customer

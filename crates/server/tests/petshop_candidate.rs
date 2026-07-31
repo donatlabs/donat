@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,7 +104,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
     )
     .expect("real Petshop Commands, Processes, effects, and schema compile together");
 
-    assert_eq!(metadata.commands.len(), 65);
+    assert_eq!(metadata.commands.len(), 73);
     assert_eq!(candidate.process_catalog.len(), 11);
     assert_eq!(
         candidate
@@ -123,7 +123,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
         .flat_map(|source| source.commands.values())
         .flat_map(|command| &command.effects)
         .collect::<Vec<_>>();
-    assert_eq!(finalized_effects.len(), 17);
+    assert_eq!(finalized_effects.len(), 25);
     for effect in finalized_effects {
         let (source, process_name, revision) = match effect {
             FinalizedCommandEffect::Start(effect) => (
@@ -143,6 +143,30 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
             .and_then(|source| source.process(process_name))
             .expect("every finalized effect resolves source-locally");
         assert_eq!(revision, process.revision_fingerprint);
+    }
+
+    // Every declared Process must be reachable from the public API. A flow with
+    // no Command that starts it is metadata nobody can execute.
+    let started: BTreeSet<(&str, &str)> = candidate
+        .finalized_command_catalog
+        .sources
+        .values()
+        .flat_map(|source| source.commands.values())
+        .flat_map(|command| &command.effects)
+        .filter_map(|effect| match effect {
+            FinalizedCommandEffect::Start(effect) => {
+                Some((effect.source.as_str(), effect.process_name.as_str()))
+            }
+            FinalizedCommandEffect::Signal(_) => None,
+        })
+        .collect();
+    for (source_name, source) in candidate.process_catalog.sources() {
+        for (process_name, _) in source.iter() {
+            assert!(
+                started.contains(&(source_name, process_name)),
+                "Process '{source_name}.{process_name}' has no Command that starts it"
+            );
+        }
     }
 
     for (source_name, source) in candidate.process_catalog.sources() {

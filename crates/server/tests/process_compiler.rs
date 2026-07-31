@@ -1342,7 +1342,7 @@ fn all_petshop_processes_compile_and_publish_effect_contracts() {
             .iter()
             .map(|command| command.effects.len())
             .sum::<usize>(),
-        17,
+        25,
         "every Petshop start/signal effect has a compiled target contract"
     );
 }

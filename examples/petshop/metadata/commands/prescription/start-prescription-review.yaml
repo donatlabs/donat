@@ -1,0 +1,40 @@
+# Customer-facing entry point for prescription review. The Process submits the
+# review under the caller's own session; this command proves the caller owns
+# the referenced order line before a durable Process is created for it.
+name: start_prescription_review
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: order_line_id
+    type: uuid!
+  - name: review_deadline
+    type: timestamptz!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: line
+    select_one:
+      table: public.customer_prescription_order_line
+      by:
+        order_line_id: { arg: order_line_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning: [order_line_id, customer_id]
+      require_found: true
+result:
+  order_line_id: { step: line, column: order_line_id }
+  owner_user_id: { step: line, column: customer_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: order_line_id }
+    - { session_variable: x-donat-user-id }
+  retention: 365d
+effects:
+  - start_process:
+      process: prescription_review
+      input:
+        order_line_id: { step: line, column: order_line_id }
+        review_deadline: { arg: review_deadline }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

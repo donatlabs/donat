@@ -230,6 +230,10 @@ rules:
     parameters: { state: string! }
     result: PaymentState!
     expression: "state == \"pending\" ? PaymentState::pending : state == \"cancellation_requested\" ? PaymentState::cancellation_requested : state == \"authorized\" ? PaymentState::authorized : state == \"void_in_progress\" ? PaymentState::void_in_progress : state == \"captured\" ? PaymentState::captured : state == \"voided\" ? PaymentState::voided : state == \"refunded\" ? PaymentState::refunded : state == \"chargeback\" ? PaymentState::chargeback : PaymentState::failed"
+  - name: recorded_payment_state_matches
+    parameters: { recorded_state: string!, expected_state: PaymentState! }
+    result: bool!
+    expression: "(expected_state == PaymentState::pending && recorded_state == \"pending\") || (expected_state == PaymentState::cancellation_requested && recorded_state == \"cancellation_requested\") || (expected_state == PaymentState::authorized && recorded_state == \"authorized\") || (expected_state == PaymentState::void_in_progress && recorded_state == \"void_in_progress\") || (expected_state == PaymentState::captured && recorded_state == \"captured\") || (expected_state == PaymentState::voided && recorded_state == \"voided\") || (expected_state == PaymentState::refunded && recorded_state == \"refunded\") || (expected_state == PaymentState::chargeback && recorded_state == \"chargeback\") || (expected_state == PaymentState::failed && recorded_state == \"failed\")"
   - name: can_authorize_payment_amount
     parameters: { current_state: string!, payment_amount_minor: bigint!, requested_amount_minor: bigint! }
     result: bool!
