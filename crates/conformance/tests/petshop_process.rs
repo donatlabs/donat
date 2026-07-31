@@ -692,6 +692,114 @@ fn fulfilment_allocates_ships_and_captures_the_shipped_value() {
     );
 }
 
+/// A B2B quote above the automatic-credit ceiling: the decision table routes it
+/// to approver review, the Process opens that review and parks, and the
+/// approver's verified decision consumes the organization's credit.
+#[test]
+fn a_large_b2b_quote_is_routed_to_an_approver_who_consumes_the_credit() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    let suite = start_store(&stub, "petshop_b2b_order_approval");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+
+    let organization_id: String = client
+        .query_one(
+            "INSERT INTO organization (currency, available_credit_minor)
+             VALUES ('USD', 100000) RETURNING id::text",
+            &[],
+        )
+        .expect("seed one organization with credit")
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO organization_membership (organization_id, user_id)
+             SELECT id, $2 FROM organization WHERE id::text = $1",
+            &[&organization_id, &CUSTOMER],
+        )
+        .expect("seed the buyer's membership");
+    let cart_id: i64 = client
+        .query_one(
+            "INSERT INTO cart (customer_id) VALUES ($1) RETURNING id",
+            &[&CUSTOMER],
+        )
+        .expect("seed one open cart")
+        .get(0);
+    // Five units clear the automatic-credit ceiling, so the quote must be
+    // routed to a human approver rather than consuming credit on its own.
+    client
+        .execute(
+            "INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES ($1, 2, 5)",
+            &[&cart_id],
+        )
+        .expect("seed one cart line above the automatic ceiling");
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ submit_quote(organization_id: \"{organization_id}\", cart_id: {cart_id}, request_id: \"550e8400-e29b-41d4-a716-446655440980\") {{ quote_id approval_id total_minor }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "b2b_buyer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "submit_quote status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "submit_quote reported errors: {body}"
+    );
+    let approval_id = body
+        .pointer("/data/submit_quote/approval_id")
+        .and_then(Json::as_str)
+        .expect("the quote command answers with its approval")
+        .to_owned();
+
+    await_receptive_wait(&mut client, "b2b_order_approval", "await_approver");
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ approve_purchase(approval_id: \"{approval_id}\", request_id: \"550e8400-e29b-41d4-a716-446655440981\") {{ approval_id approval_status }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "b2b_approver".to_owned()),
+            ("X-Donat-User-Id".to_owned(), "approver-1".to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "approve_purchase status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "approve_purchase reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "b2b_order_approval");
+    assert_eq!(
+        output.pointer("/approval_status").and_then(Json::as_str),
+        Some("approved"),
+        "the approver's decision approves the quote: {output}"
+    );
+
+    let (available, consumed): (i64, i64) = {
+        let row = client
+            .query_one(
+                "SELECT available_credit_minor, consumed_credit_minor
+                 FROM organization WHERE id::text = $1",
+                &[&organization_id],
+            )
+            .expect("read the organization's credit");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(
+        (available, consumed),
+        (100000 - 12495, 12495),
+        "approving the quote moves exactly its total out of available credit"
+    );
+}
+
 /// A scheduled renewal cycle: the Process opens the renewal order and payment,
 /// authorizes it with the provider, and records the renewal outcome. The
 /// dunning ladder exists for declines; a first-attempt authorization skips it.
