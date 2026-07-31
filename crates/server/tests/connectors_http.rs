@@ -688,7 +688,9 @@ async fn host_resolution_precedes_request_template_preparation() {
         .build()
         .expect("static operation is valid");
     let failure = public_connector(
-        Arc::new(SequenceResolver::new([Err(ResolveError::new("unresolved"))])),
+        Arc::new(SequenceResolver::new([Err(ResolveError::new(
+            "unresolved",
+        ))])),
         transport.clone(),
     )
     .execute(&operation, json!({}), context())
