@@ -3,11 +3,12 @@
 #   docker compose up
 #
 # Uses the project's deploy model: schema is migrated out-of-band by a
-# one-shot `donat migrate`, the metadata is checked against the migrated
-# database by `donat validate`, and only then does the engine serve. All
-# three use the same prebuilt public image (ghcr.io/donatlabs/donat,
-# pushed by .github/workflows/release.yml on each release tag) — no local
-# build. The engine itself never runs DDL.
+# one-shot `donat migrate`, the durable Process definitions are deployed by a
+# second one-shot `migrate` that also reads the metadata, the metadata is
+# checked against the migrated database by `donat validate`, and only then
+# does the engine serve. All of them use the same prebuilt public image
+# (ghcr.io/donatlabs/donat, pushed by .github/workflows/release.yml on each
+# release tag) — no local build. The engine itself never runs DDL.
 #
 # Then open http://localhost:8080/v1/graphql (see README.md for queries per
 # role).
@@ -33,17 +34,108 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: apply versioned V{n}__*.sql migrations, then exit.
+  # The five external services the connectors are declared against, answered
+  # locally so the example runs without an account anywhere. Point the five
+  # *_BASE_URL values below at real providers and nothing else changes.
+  mock-providers:
+    image: python:3.12-slim
+    command: ["python", "/srv/providers.py"]
+    volumes:
+      - ./mock-providers:/srv:ro
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/')"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply the engine's own schema — the `donat.*` tables that hold
+  # the durable Process journals, command claims and cron state. They ship in
+  # the repository's top-level `migrations/`, not in the image, so a
+  # deployment mounts them the same way this example does.
   migrate:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["migrate", "--migrations-dir", "/migrations"]
+    command: ["migrate", "--migrations-dir", "/engine-migrations"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
-      - ./migrations:/migrations:ro
+      - ../../migrations:/engine-migrations:ro
+    restart: "no"
+
+  # One-shot: apply the store's own DDL.
+  #
+  # `donat migrate` tracks what it applied in one `refinery_schema_history`
+  # keyed by version number, and both sets start at V1 — so the store's schema
+  # cannot go through the same migrator as the engine's without colliding.
+  # The engine's migrator owns the engine's schema; an application's DDL is the
+  # application's business, applied here in numeric order (V2 before V10, which
+  # a plain shell glob gets wrong).
+  app-schema:
+    image: postgres:16
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        for file in $$(ls /app-migrations/V*.sql | sort -V); do
+          echo "applying $${file}"
+          psql -v ON_ERROR_STOP=1 -q -f "$${file}"
+        done
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: petshop
+    volumes:
+      - ./migrations:/app-migrations:ro
+    restart: "no"
+
+  # One-shot: deploy the durable Process definitions for the `default` source.
+  #
+  # A Process revision is pinned in the database, and the engine refuses to
+  # serve a metadata Process that is not deployed as active — without this
+  # step it boots into "revision ... is not deployed as active" and retries
+  # forever. This step reads the metadata, so every connector's configuration
+  # has to resolve here too.
+  deploy:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command:
+      - "migrate"
+      - "--migrations-dir"
+      - "/engine-migrations"
+      - "--metadata-dir"
+      - "/metadata"
+      - "--source"
+      - "default"
+    depends_on:
+      app-schema:
+        condition: service_completed_successfully
+    environment: &connector-env
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      # Every connector instance resolves its endpoint and credential from the
+      # environment. Metadata never carries a secret, and an unset variable
+      # fails the deploy rather than the first request that needs it.
+      PETSHOP_PAYMENT_BASE_URL: http://mock-providers:8099
+      PETSHOP_PAYMENT_API_TOKEN: petshop-payment-token
+      PETSHOP_TAX_BASE_URL: http://mock-providers:8099
+      PETSHOP_TAX_API_TOKEN: petshop-tax-token
+      DONAT_MOCK_CARRIER_BASE_URL: http://mock-providers:8099
+      DONAT_MOCK_CARRIER_TOKEN: petshop-carrier-token
+      PETSHOP_NOTIFICATION_BASE_URL: http://mock-providers:8099
+      PETSHOP_NOTIFICATION_API_TOKEN: petshop-notification-token
+      PETSHOP_PAYOUT_BASE_URL: http://mock-providers:8099
+      PETSHOP_PAYOUT_API_TOKEN: petshop-payout-token
+    volumes:
+      - ../../migrations:/engine-migrations:ro
+      - ./metadata:/metadata:ro
     restart: "no"
 
   # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
@@ -51,10 +143,9 @@ services:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["validate", "--metadata-dir", "/metadata"]
     depends_on:
-      migrate:
+      deploy:
         condition: service_completed_successfully
-    environment:
-      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+    environment: *connector-env
     volumes:
       - ./metadata:/metadata:ro
     restart: "no"
@@ -66,8 +157,10 @@ services:
     depends_on:
       validate:
         condition: service_completed_successfully
+      mock-providers:
+        condition: service_healthy
     environment:
-      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      <<: *connector-env
       DONAT_METADATA_DIR: /metadata
       DONAT_PORT: "8080"
       # The secret marks a request as trusted: it may then assert any role

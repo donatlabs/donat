@@ -14,14 +14,25 @@ All services use the same prebuilt public engine image
 (`ghcr.io/donatlabs/donat`, published by the release workflow) and follow
 the project's deploy model:
 
-1. **`migrate`** — `donat migrate` applies the versioned DDL in
-   [`migrations/`](migrations) (one `V{n}__create_<table>.sql` per table) via
-   refinery, tracked in `refinery_schema_history`. This is the only thing that
-   runs DDL.
-2. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
+1. **`migrate`** — `donat migrate` applies the engine's own schema from the
+   repository's top-level [`migrations/`](../../migrations) via refinery,
+   tracked in `refinery_schema_history`: the `donat.*` tables holding durable
+   Process journals, command claims and cron state. They ship in the
+   repository, not in the image, so a real deployment mounts them the same way.
+2. **`app-schema`** — applies this store's own DDL in
+   [`migrations/`](migrations), in numeric order. It does not go through
+   `donat migrate`: that migrator keys one `refinery_schema_history` by version
+   number, and both sets start at `V1`. The engine's migrator owns the engine's
+   schema; an application's DDL is the application's business.
+3. **`deploy`** — `donat migrate --metadata-dir … --source default` deploys the
+   durable **Process** definitions. A Process revision is pinned in the
+   database and the engine refuses to serve one that is not deployed as active,
+   so without this step the engine boots into `revision … is not deployed as
+   active` and retries forever.
+4. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
    introspects the migrated database, and exits non-zero if anything tracked
    is missing, so a bad deploy fails before the server boots.
-3. **`engine`** — serves the data plane over three transports, all sharing the
+5. **`engine`** — serves the data plane over three transports, all sharing the
    same per-role permissions and auth: GraphQL at
    <http://localhost:8080/v1/graphql>, RESTified endpoints under
    <http://localhost:8080/api/rest/> (see [REST endpoints](#rest-endpoints)),
@@ -35,6 +46,29 @@ the project's deploy model:
    `DONAT_GRAPHQL_ENABLED_APIS` (comma-separated `graphql`/`rest`/`mcp`), e.g.
    `DONAT_GRAPHQL_ENABLED_APIS=graphql` to expose GraphQL only (REST and MCP
    then return `404`).
+
+A sixth service, **`mock-providers`**, answers the five external services the
+connectors are declared against — payment, tax, carrier, payout and
+notification — so the example runs end to end without an account anywhere. It
+is a fixture, not a simulator: see
+[`mock-providers/providers.py`](mock-providers/providers.py). Point the five
+`*_BASE_URL` variables in the compose file at real providers and nothing else
+changes; the metadata never carries an endpoint or a secret.
+
+Because the compose file sets `DONAT_GRAPHQL_ADMIN_SECRET`, a request is
+trusted — and may therefore assert a role — only when it presents that secret.
+Without it the request falls back to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
+(`anonymous`) and `X-Donat-Role` is ignored, so every example below sends both
+headers. The secret is not an admin role: a trusted request still has to name
+one, and every access still goes through that role's permissions.
+
+```
+curl -s localhost:8080/v1/graphql \
+  -H 'content-type: application/json' \
+  -H 'X-Donat-Admin-Secret: petshop-secret' \
+  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: customer-1' \
+  -d '{"query":"mutation { start_checkout(cart_id: 1, request_id: \"…\") { cart_id } }"}'
+```
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
