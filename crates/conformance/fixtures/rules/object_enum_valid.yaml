@@ -1,0 +1,13 @@
+types:
+  - name: OrderStatus
+    enum: [draft, submitted]
+  - name: CreateOrderLine
+    object:
+      sku: string!
+      status: OrderStatus!
+rules:
+  - name: order_status_literal_is_nominal
+    parameters:
+      lines: "[CreateOrderLine!]!"
+    result: bool!
+    expression: "OrderStatus::draft == OrderStatus::draft"

@@ -14,13 +14,18 @@ All services use the same prebuilt public engine image
 (`ghcr.io/donatlabs/donat`, published by the release workflow) and follow
 the project's deploy model:
 
-1. **`migrate`** — `donat migrate` applies the versioned DDL in
-   [`migrations/`](migrations) (one `V{n}__create_<table>.sql` per table) via
-   refinery, tracked in `refinery_schema_history`. This is the only thing that
-   runs DDL.
-2. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
-   introspects the migrated database, and exits non-zero if anything tracked
-   is missing, so a bad deploy fails before the server boots.
+1. **`migrate`** — `donat migrate` applies two independently versioned sets of
+   DDL through one `refinery_schema_history`: the engine's own schema from the
+   repository's top-level [`migrations/`](../../migrations) — the `donat.*`
+   tables holding durable Process journals, command claims and cron state,
+   which ship in the repository rather than in the image — and this store's own
+   [`migrations/`](migrations). They can share a history because both are
+   versioned by timestamp; two sets of counters would both start at `V1`.
+2. **`deploy`** — `donat migrate --metadata-dir … --source default` deploys the
+   durable **Process** definitions. A Process revision is pinned in the
+   database and the engine refuses to serve one that is not deployed as active,
+   so without this step the engine boots into `revision … is not deployed as
+   active` and retries forever.
 3. **`engine`** — serves the data plane over three transports, all sharing the
    same per-role permissions and auth: GraphQL at
    <http://localhost:8080/v1/graphql>, RESTified endpoints under
@@ -35,6 +40,29 @@ the project's deploy model:
    `DONAT_GRAPHQL_ENABLED_APIS` (comma-separated `graphql`/`rest`/`mcp`), e.g.
    `DONAT_GRAPHQL_ENABLED_APIS=graphql` to expose GraphQL only (REST and MCP
    then return `404`).
+
+A fourth service, **`mock-providers`**, answers the five external services the
+connectors are declared against — payment, tax, carrier, payout and
+notification — so the example runs end to end without an account anywhere. It
+is a fixture, not a simulator: see
+[`mock-providers/providers.py`](mock-providers/providers.py). Point the five
+`*_BASE_URL` variables in the compose file at real providers and nothing else
+changes; the metadata never carries an endpoint or a secret.
+
+Because the compose file sets `DONAT_GRAPHQL_ADMIN_SECRET`, a request is
+trusted — and may therefore assert a role — only when it presents that secret.
+Without it the request falls back to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
+(`anonymous`) and `X-Donat-Role` is ignored, so every example below sends both
+headers. The secret is not an admin role: a trusted request still has to name
+one, and every access still goes through that role's permissions.
+
+```
+curl -s localhost:8080/v1/graphql \
+  -H 'content-type: application/json' \
+  -H 'X-Donat-Admin-Secret: petshop-secret' \
+  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: customer-1' \
+  -d '{"query":"mutation { start_checkout(cart_id: 1, request_id: \"…\") { cart_id } }"}'
+```
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
@@ -229,6 +257,193 @@ curl -s localhost:8080/mcp \
 
 `list_tables` reports only what the role may touch — as `staff` it lists every
 table with its allowed operations; as `anonymous` it shows just the catalogue.
+
+## Active declarative YAML contract
+
+The YAML under [`metadata/`](metadata) is an active **pressure-suite
+contract**, intentionally ahead of the current runtime and generated schema.
+It is not currently runnable and is not conformance-green; in particular, this
+section does not claim that Rust support exists. It documents the declarative
+surface under review so that implementation can follow a stable user contract.
+
+### Commands
+
+Commands are synchronous database transactions. They perform domain writes and
+may atomically persist `effects.start_process` or `effects.signal_process`
+intent with those writes in one generic transactional outbox. They do not call
+providers directly.
+
+| Domain | Active commands |
+| --- | --- |
+| Checkout | `prepare_checkout_quote`, `begin_checkout`, `finalize_declined_checkout`, `cancel_order`, `materialize_cancellation_authorization`, `finalize_pending_order_cancellation`, `request_authorized_order_cancellation`, `finalize_authorized_order_cancellation`, `release_expired_checkout` |
+| Payments | `record_payment_outcome`, `authorize_payment`, `claim_payment_captures`, `release_absent_capture_claim`, `capture_payment`, `void_authorization`, `complete_refund`, `record_chargeback`, `reconcile_payment` |
+| Fulfilment | `allocate_inventory`, `mark_order_packed`, `create_shipment`, `record_shipment_result`, `record_delivery` |
+| Returns | `request_return`, `approve_return`, `reject_return`, `receive_return`, `record_return_inspection`, `finalize_return_refund`, `finalize_return_rejection`, `create_exchange` |
+| Subscriptions | `create_subscription_order`, `record_renewal_outcome`, `pause_subscription`, `cancel_subscription` |
+| B2B | `submit_quote`, `open_approver_review`, `approve_purchase`, `reject_purchase`, `consume_credit`, `escalate_purchase_approval`, `finance_approve_purchase`, `finance_reject_purchase`, `finalize_finance_rejection`, `finalize_unroutable_rejection` |
+| Marketplace | `split_vendor_orders`, `record_vendor_acceptance`, `create_vendor_payout`, `record_payout_outcome`, `reconcile_vendor_payout`, `open_vendor_dispute` |
+| Booking | `reserve_grooming_slot`, `confirm_booking`, `reschedule_booking`, `cancel_booking`, `expire_booking_hold`, `record_no_show` |
+| Prescription | `submit_prescription_review`, `approve_prescription`, `reject_prescription`, `expire_prescription` |
+| Operations | `route_fraud_review`, `resolve_fraud_review`, `resolve_payment_reconciliation`, `record_notification_delivery` |
+
+### Processes and flows
+
+Only a definition declaring `kind: process` is durable. A durable process
+persists its state, signal inbox, activity attempts, and timers, so it can
+recover after a crash. A command effect is consumed from the transactional
+outbox to start or signal that process; the command itself remains synchronous.
+
+Every process is reachable: exactly one Command declares the `start_process`
+effect that creates it, and that Command is the module's public entry point.
+
+| Module | Entry-point Command | Current intent |
+| --- | --- | --- |
+| `checkout_payment` | `start_checkout` | Immutable pricing/tax/shipping quote snapshots and synchronous provider authorization with ambiguity lookup. |
+| `checkout_cancellation` | `cancel_order` | Claim a pending authorization race, prove provider absence or materialize/void the authorization, then release reservations. |
+| `authorized_order_cancellation` | `request_authorized_order_cancellation` | Void an authorized payment before releasing reservations and finalizing cancellation. |
+| `partial_fulfilment` | `start_order_fulfilment` | Allocate, pack, label, ship, and capture per fulfilment unit. |
+| `return_refund` | `start_return` | Support approval, return label, receipt, inspection, refund, exchange, or rejection. |
+| `subscription_renewal` | `start_subscription_renewal` | Renewal authorization with dunning timers and a terminal pause. |
+| `b2b_order_approval` | `submit_quote` | Quote routing, automatic credit use, and approver/finance waits. |
+| `vendor_payout` | `start_vendor_payout` | Create bounded vendor payouts and record synchronous terminal provider outcomes per vendor. |
+| `grooming_booking` | `start_grooming_booking` | Reserve a grooming slot and await confirmation, cancellation, or hold expiry. |
+| `prescription_review` | `start_prescription_review` | Submit a prescription review and await the recorded decision or expiry. |
+| `payment_reconciliation` | `start_payment_reconciliation` | Retrieve provider evidence, reconcile it, and await manual resolution when needed. |
+
+All eleven active flow modules declare `kind: process` and `version: 1`. The YAML
+remains the target contract, not an assertion that these modules execute today.
+
+### Connectors
+
+All active connectors are HTTP declarations with bounded retries, capacity
+limits, redaction, and idempotency policy:
+
+| Connector | Operations |
+| --- | --- |
+| `mock_payment` | `authorize`, `capture`, `lookup_capture`, `void`, `refund`, `reconcile`, `lookup_operation` |
+| `mock_carrier` | `quote`, `create_label`, `create_return_label`, `lookup_label`, `track` |
+| `mock_tax` | `quote_order` |
+| `mock_notification` | `send_email`, `send_webhook` |
+| `mock_payout` | `create_payout`, `lookup_payout` |
+
+HTTP delivery is at-least-once at the provider boundary. Each mutation
+declares `ProviderIdempotent` evidence for its fixed header binding, provider
+scope, minimum key-retention window, and positive clock-safety margin. Every
+side-effect step cites immutable Donat-owned facts in
+[`provider-evidence/mock-providers-v1.yaml`](provider-evidence/mock-providers-v1.yaml).
+The Process compiler derives each activity's `maximum_send_horizon_ms` from
+its timeout and retry policy and checks it against provider retention minus
+the safety margin; the horizon is not provider-supplied evidence.
+Retries and worker takeover reuse the stable key. Ambiguous payment, carrier
+label, capture, and payout mutations enter explicit read-only lookup states;
+money or inventory stays claimed when lookup cannot prove the terminal effect
+or its absence. A provider-proven terminal capture absence releases exactly
+that shipment's capture claim; an unproven or failed lookup remains a bounded
+manual-reconciliation failure.
+
+### Rules and decision tables
+
+`metadata/rules.yaml` defines typed enums/states for payment, approval,
+inspection, booking, reconciliation, checkout, shipment, return,
+subscription, payout, prescription, and fraud, plus typed return-line objects.
+Its active Rules are:
+
+- Arithmetic, inventory, and bounds: `can_reserve_stock`, `add_int`,
+  `is_single_currency`, `subtract_int`, `add_minor`, `subtract_minor`,
+  `basis_points_amount`, `can_release_stock`, `bounded_fan_out_count`.
+- Payments and reconciliation: `payment_was_authorized`,
+  `normalize_payment_outcome_state`, `can_authorize_payment_amount`,
+  `can_reserve_capture_amount`, `can_complete_claimed_capture`,
+  `can_claim_authorization_void`, `can_void_authorization`,
+  `can_refund_payment_amount`, `approved_refund_matches_provider`,
+  `can_record_chargeback_amount`, `reconciliation_state_for_decision`,
+  `payment_reconciliation_supports_decision`.
+- Lifecycle gates: `can_transition_checkout`, `can_transition_payment`,
+  `can_transition_shipment`, `can_transition_return`,
+  `can_transition_subscription`, `can_transition_approval`,
+  `can_transition_payout`, `can_record_provider_payout_outcome`,
+  `can_transition_booking`, `can_transition_prescription`,
+  `can_transition_fraud`, `fraud_state_for_route`,
+  `can_transition_reconciliation`.
+- Returns and B2B: `return_approval_matches_request`,
+  `return_approved_quantity_is_bounded`, `return_receipt_matches_approval`,
+  `return_received_quantity_is_bounded`, `return_inspection_matches_receipt`,
+  `return_inspected_quantity_is_bounded`, `return_refund_amount_is_bounded`,
+  `return_is_exchange_eligible`, `return_decision_was_approved`,
+  `approval_was_approved`, `approval_was_rejected`, `can_consume_credit`.
+
+The first-match decision tables are `price_list_route`, `promotion_route`,
+`tax_route`, `shipping_service_route`, `inventory_location_route`,
+`b2b_approval_route`, `marketplace_commission_route`,
+`return_disposition_route`, `dunning_schedule`, and `fraud_route`.
+
+### B2B producer/consumer example
+
+The following abbreviated form shows the intended hand-off. The quote Command
+commits its domain change and a start intent; the approving Command commits its
+domain change and a signal intent; the durable Process consumes that signal
+while waiting. Both effects are transactional-outbox intent, not immediate
+Process calls. Command execution already persists these revision-pinned intents
+atomically and replays without duplicating them; the Process worker consumes
+them once the worker runtime is enabled.
+
+```yaml
+# commands/b2b/submit-quote.yaml (producer: start intent)
+name: submit_quote
+effects:
+  - start_process:
+      process: b2b_order_approval
+      process_key: { step: approval, column: id }
+      input:
+        quote_id: { step: quote, column: id }
+        approval_id: { step: approval, column: id }
+        total_minor: { step: quote, column: total_minor }
+        available_credit_minor: { step: quote, column: available_credit_minor }
+        owner_user_id: { step: cart, column: customer_id }
+      idempotency_key: { argument: request_id }
+
+# commands/b2b/approve-purchase.yaml (producer: signal intent)
+name: approve_purchase
+effects:
+  - signal_process:
+      process: b2b_order_approval
+      signal: approver_decision
+      correlate:
+        approval_id: { step: approve, column: id }
+      payload:
+        decision: { literal: approved }
+      idempotency_key: { argument: request_id }
+
+# flows/b2b-order-approval.yaml (consumer)
+name: b2b_order_approval
+kind: process
+version: 1
+start:
+  command: submit_quote
+  input:
+    quote_id: { command_result: quote_id }
+    approval_id: { command_result: approval_id }
+    total_minor: { command_result: total_minor }
+    available_credit_minor: { command_result: available_credit_minor }
+    owner_user_id: { command_result: owner_user_id }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: approval_id }
+states:
+  - id: open_approver_review
+    command:
+      name: open_approver_review
+      run_as: b2b_finance
+      next: await_approver
+  - id: await_approver
+    wait:
+      signal: approver_decision
+      role: b2b_approver
+      verification: required
+      correlate:
+        approval_id: { input: approval_id }
+      deadline: 2d
+      next: route_approver_decision
+```
 
 ## Reset
 

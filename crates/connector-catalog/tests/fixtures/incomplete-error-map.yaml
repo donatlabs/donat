@@ -1,0 +1,7 @@
+error_map:
+  rules: []
+  fallback:
+    transport:
+      class: invariant
+      code: connector_invariant
+      safe_message: connector invariant

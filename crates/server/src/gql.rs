@@ -15,6 +15,14 @@ use donat_schema::{
 
 use crate::state::{AppState, Engine, QueryError, SharedState, SourceRuntime};
 
+struct ParsedRequest<'a> {
+    body: &'a Json,
+    headers: &'a HeaderMap,
+    doc: &'a graphql_parser::query::Document<'static, String>,
+    variables: JsonMap<String, Json>,
+    operation_name: Option<&'a str>,
+}
+
 fn trace_perf_phase(phase: &'static str, started: std::time::Instant) {
     tracing::trace!(
         target: "donat::perf",
@@ -118,6 +126,44 @@ fn assemble_multi_source_response(
         }
     }
     Json::Object(ordered)
+}
+
+/// A planner should never put a command on a non-Postgres source, but this
+/// transport-side guard keeps manually constructed or future IR from reaching
+/// a backend renderer that has no command semantics.
+fn command_backend_rejection(roots: &[donat_ir::MutationRoot], backend: &str) -> Option<Json> {
+    roots
+        .iter()
+        .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }))
+        .then(|| {
+            error_json(
+                "unexpected",
+                format!("commands require a Postgres source and cannot execute on {backend}"),
+            )
+        })
+}
+
+/// The full SQL text of a command contains resolved input and idempotency
+/// values. Keep command execution observable without putting those values in
+/// the `donat::sql` log target.
+fn trace_mutation_sql(root: &donat_ir::MutationRoot, sql: &str) {
+    match root {
+        donat_ir::MutationRoot::Command { command, .. } => {
+            tracing::trace!(
+                target: "donat::sql",
+                command = %command.name,
+                statement = "command",
+                "executing command mutation"
+            );
+        }
+        donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::Insert { .. }
+        | donat_ir::MutationRoot::Update { .. }
+        | donat_ir::MutationRoot::Delete { .. }
+        | donat_ir::MutationRoot::Typename { .. } => {
+            tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+        }
+    }
 }
 
 /// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
@@ -227,10 +273,7 @@ pub fn session_from_headers(
     };
     // No admin role: a trusted request must name an explicit role (an
     // unauthorized-role fallback applies only to the untrusted branch above).
-    match donat_role
-        .or(hasura_role)
-        .or_else(|| unauthorized_role.map(str::to_string))
-    {
+    match donat_role.or(hasura_role) {
         Some(role) => {
             vars.insert("x-donat-role".to_string(), role.clone());
             vars.insert("x-hasura-role".to_string(), role.clone());
@@ -514,12 +557,14 @@ pub async fn execute_full(
     execute_parsed_full(
         state,
         session,
-        body,
         relay,
-        headers,
-        &doc,
-        variables,
-        operation_name,
+        ParsedRequest {
+            body,
+            headers,
+            doc: &doc,
+            variables,
+            operation_name,
+        },
     )
     .await
 }
@@ -550,12 +595,14 @@ pub(crate) async fn execute_preparsed_full(
     execute_parsed_full(
         state,
         session,
-        body,
         relay,
-        headers,
-        doc,
-        variables,
-        operation_name,
+        ParsedRequest {
+            body,
+            headers,
+            doc,
+            variables,
+            operation_name,
+        },
     )
     .await
 }
@@ -563,13 +610,16 @@ pub(crate) async fn execute_preparsed_full(
 async fn execute_parsed_full(
     state: &SharedState,
     session: &Session,
-    body: &Json,
     relay: bool,
-    headers: &axum::http::HeaderMap,
-    doc: &graphql_parser::query::Document<'static, String>,
-    variables: JsonMap<String, Json>,
-    operation_name: Option<&str>,
+    request: ParsedRequest<'_>,
 ) -> (axum::http::StatusCode, Json) {
+    let ParsedRequest {
+        body,
+        headers,
+        doc,
+        variables,
+        operation_name,
+    } = request;
     let routing_started = std::time::Instant::now();
     let engine = state.engine_snapshot().await;
     // Remote schema routing: operations aimed entirely at a permitted
@@ -631,11 +681,11 @@ async fn execute_parsed_full(
                 remote_body["variables"] = Json::Object(remote_variables);
                 let (status, mut resp) =
                     crate::remote::forward(state, &target, &remote_body, headers).await;
-                if let Some(ns) = &target.namespace {
-                    if resp.get("errors").is_none() {
-                        let data = resp.get("data").cloned().unwrap_or(Json::Null);
-                        resp["data"] = json!({ ns: data });
-                    }
+                if let Some(ns) = &target.namespace
+                    && resp.get("errors").is_none()
+                {
+                    let data = resp.get("data").cloned().unwrap_or(Json::Null);
+                    resp["data"] = json!({ ns: data });
                 }
                 (status, resp)
             }
@@ -656,10 +706,12 @@ async fn execute_parsed_full(
             engine,
             session,
             &ctx,
-            doc,
-            &variables,
-            operation_name,
-            headers,
+            crate::action::ActionRequest {
+                doc,
+                variables: &variables,
+                operation_name,
+                headers,
+            },
         )
         .await;
     }
@@ -803,6 +855,9 @@ async fn execute_parsed_full(
             };
             let pool = match runtime {
                 SourceRuntime::Sqlite { pool, settings, .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "SQLite") {
+                        return ok(error);
+                    }
                     drop(engine);
                     return match state
                         .execute_sqlite_mutations_at(pool, settings, &roots)
@@ -820,6 +875,9 @@ async fn execute_parsed_full(
                     settings,
                     ..
                 } => {
+                    if let Some(error) = command_backend_rejection(&roots, "MySQL") {
+                        return ok(error);
+                    }
                     let Some(catalog) = engine.catalogs.get(&source) else {
                         return ok(error_json(
                             "unexpected",
@@ -834,6 +892,7 @@ async fn execute_parsed_full(
                                 donat_ir::MutationRoot::Update { update, .. } => &update.table,
                                 donat_ir::MutationRoot::Delete { delete, .. } => &delete.table,
                                 donat_ir::MutationRoot::FunctionCall { .. }
+                                | donat_ir::MutationRoot::Command { .. }
                                 | donat_ir::MutationRoot::Typename { .. } => return None,
                             };
                             let key = format!("{}.{}", table.schema, table.name);
@@ -857,6 +916,9 @@ async fn execute_parsed_full(
                     };
                 }
                 SourceRuntime::Clickhouse { .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "ClickHouse") {
+                        return ok(error);
+                    }
                     return ok(error_json(
                         "unexpected",
                         format!("mutations are not supported for source '{source}'"),
@@ -866,7 +928,10 @@ async fn execute_parsed_full(
             };
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
-            let fields: Vec<(String, String)> = roots
+            let has_command_root = roots
+                .iter()
+                .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }));
+            let fields: Vec<(&donat_ir::MutationRoot, String, String)> = roots
                 .iter()
                 .map(|root| {
                     let alias = match root {
@@ -874,9 +939,11 @@ async fn execute_parsed_full(
                         | donat_ir::MutationRoot::Insert { alias, .. }
                         | donat_ir::MutationRoot::Update { alias, .. }
                         | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Command { alias, .. }
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
                     (
+                        root,
                         alias,
                         donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics),
                     )
@@ -894,11 +961,17 @@ async fn execute_parsed_full(
             };
             let tx = match client.transaction().await {
                 Ok(tx) => tx,
-                Err(e) => return ok(db_error_json(&e)),
+                Err(e) => {
+                    return ok(if has_command_root {
+                        command_db_error_json(&e)
+                    } else {
+                        db_error_json(&e)
+                    });
+                }
             };
             let mut data = serde_json::Map::new();
-            for (alias, sql) in fields {
-                tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+            for (root, alias, sql) in fields {
+                trace_mutation_sql(root, &sql);
                 match tx.query_one(&sql, &[]).await {
                     Ok(row) => {
                         // Typename roots produce text, everything else json.
@@ -906,13 +979,21 @@ async fn execute_parsed_full(
                         // the update/delete permission filter) yields a SQL
                         // NULL in column 0 — decode as Option so it becomes a
                         // JSON null, not a decode error.
-                        let value = row
-                            .try_get::<_, Option<Json>>(0)
-                            .map(|o| o.unwrap_or(Json::Null))
-                            .or_else(|_| {
-                                row.try_get::<_, Option<String>>(0)
-                                    .map(|o| o.map(Json::String).unwrap_or(Json::Null))
-                            });
+                        let value = match root {
+                            donat_ir::MutationRoot::Command { command, .. }
+                                if command.idempotency.is_some() =>
+                            {
+                                crate::commands::decode_command_execution_result(&row)
+                                    .map(|result| result.result_json)
+                            }
+                            _ => row
+                                .try_get::<_, Option<Json>>(0)
+                                .map(|o| o.unwrap_or(Json::Null))
+                                .or_else(|_| {
+                                    row.try_get::<_, Option<String>>(0)
+                                        .map(|o| o.map(Json::String).unwrap_or(Json::Null))
+                                }),
+                        };
                         match value {
                             Ok(v) => {
                                 data.insert(alias, v);
@@ -925,11 +1006,21 @@ async fn execute_parsed_full(
                             }
                         }
                     }
-                    Err(e) => return ok(db_error_json(&e)),
+                    Err(e) => {
+                        return ok(if matches!(root, donat_ir::MutationRoot::Command { .. }) {
+                            command_db_error_json(&e)
+                        } else {
+                            db_error_json(&e)
+                        });
+                    }
                 }
             }
             if let Err(e) = tx.commit().await {
-                return ok(db_error_json(&e));
+                return ok(if has_command_root {
+                    command_db_error_json(&e)
+                } else {
+                    db_error_json(&e)
+                });
             }
             let data = assemble_multi_source_response(&response, [Json::Object(data)]);
             ok(json!({ "data": data }))
@@ -1005,18 +1096,18 @@ pub(crate) async fn execute_select_internal(
         .try_get::<_, Json>(0)
         .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
     for root in &roots {
-        if let donat_ir::RootField::Select { alias, query } = root {
-            if let Some(node) = data.get_mut(alias.as_str()) {
-                resolve_remote_joins(
-                    state,
-                    engine,
-                    session,
-                    &query.fields,
-                    node,
-                    &format!("$.selectionSet.{alias}"),
-                )
-                .await?;
-            }
+        if let donat_ir::RootField::Select { alias, query } = root
+            && let Some(node) = data.get_mut(alias.as_str())
+        {
+            resolve_remote_joins(
+                state,
+                engine,
+                session,
+                &query.fields,
+                node,
+                &format!("$.selectionSet.{alias}"),
+            )
+            .await?;
         }
     }
     Ok(data)
@@ -1425,7 +1516,7 @@ fn restore_remote_join_error_paths(errors: &Json, root_field: &str) -> Json {
             && let Some(start) = path.find("__donat_rr_")
         {
             let end = path[start..]
-                .find(|character: char| character == '.' || character == '[')
+                .find(['.', '['])
                 .map(|offset| start + offset)
                 .unwrap_or(path.len());
             if let Some(extensions) = error.get_mut("extensions").and_then(Json::as_object_mut) {
@@ -1691,26 +1782,91 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Clickhouse(msg) => error_json("data-exception", msg),
     }
 }
+
+fn command_business_rejection_json(rejection: &crate::commands::CommandBusinessRejection) -> Json {
+    json!({
+        "errors": [{
+            "extensions": {
+                "path": rejection.path,
+                "code": rejection.code,
+            },
+            "message": rejection.message,
+        }]
+    })
+}
+
+fn permission_error_json(message: &str) -> Option<Json> {
+    let Json::Object(payload) = serde_json::from_str::<Json>(message).ok()? else {
+        return None;
+    };
+    let (Some(path), Some(message)) = (
+        payload.get("path").and_then(Json::as_str),
+        payload.get("message").and_then(Json::as_str),
+    ) else {
+        return None;
+    };
+    Some(json!({
+        "errors": [{
+            "extensions": { "path": path, "code": "permission-error" },
+            "message": message,
+        }]
+    }))
+}
+
+/// Command statements can carry only the dedicated, validated business-error
+/// envelope or the established permission-check envelope. Every other driver
+/// error is deliberately opaque: command SQL embeds request values and a
+/// PostgreSQL primary message can disclose them alongside relation details.
+fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
+    let Some(db) = e.as_db_error() else {
+        return error_json("data-exception", "command database error");
+    };
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
+            .unwrap_or_else(|| error_json("data-exception", "command database error"));
+    }
+    if db.code().code() == "23514"
+        && let Some(body) = permission_error_json(db.message())
+    {
+        return body;
+    }
+    // The response stays opaque, but an operator still needs the cause. The
+    // log is the only place it may appear, so record it there rather than
+    // leaving a bare "command database error" with nothing behind it.
+    //
+    // This is the primary message, never `detail()`. A primary message can
+    // still quote one offending literal ("invalid input syntax for type
+    // integer: \"abc\""), which is why it is not returned to the caller;
+    // `detail()` goes further and prints whole key tuples, so it stays out of
+    // the log as well.
+    tracing::warn!(
+        sqlstate = db.code().code(),
+        message = db.message(),
+        constraint = db.constraint().unwrap_or_default(),
+        table = db.table().unwrap_or_default(),
+        "command statement failed"
+    );
+    error_json("data-exception", "command database error")
+}
+
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
     };
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
+            .unwrap_or_else(|| error_json("data-exception", "database error"));
+    }
     // Our check_violation() raises 23514 with a JSON payload carrying the
     // GraphQL error path.
-    if db.code().code() == "23514" {
-        if let Ok(payload) = serde_json::from_str::<Json>(db.message()) {
-            if let (Some(path), Some(message)) = (
-                payload.get("path").and_then(Json::as_str),
-                payload.get("message").and_then(Json::as_str),
-            ) {
-                return json!({
-                    "errors": [{
-                        "extensions": { "path": path, "code": "permission-error" },
-                        "message": message,
-                    }]
-                });
-            }
-        }
+    if db.code().code() == "23514"
+        && let Some(body) = permission_error_json(db.message())
+    {
+        return body;
     }
     let (code, message) = match db.code().code() {
         "23514" => ("permission-error", db.message().to_string()),
@@ -1782,10 +1938,13 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use tokio_postgres::NoTls;
 
     #[test]
     fn query_depth_guard() {
@@ -1806,6 +1965,37 @@ mod tests {
         assert!(!ct_eq(b"secret", b"secrey"));
         assert!(!ct_eq(b"secret", b"secre"));
         assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn command_roots_fail_closed_before_non_postgres_execution() {
+        let roots = vec![donat_ir::MutationRoot::Command {
+            alias: "submitted".to_string(),
+            command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_string(),
+                    name: "create_order".to_string(),
+                    role: "customer".to_string(),
+                },
+                name: "create_order".to_string(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: None,
+                effects: vec![],
+                selection: vec![],
+            },
+        }];
+
+        let error = command_backend_rejection(&roots, "SQLite")
+            .expect("a command must never reach a non-Postgres executor");
+        assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
+        assert!(
+            error["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("require a Postgres source")),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -2155,6 +2345,250 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceCapture {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn command_mutation_trace_omits_rendered_sql_and_idempotency_values() {
+        const KEY: &str = "trace-idempotency-key-sentinel";
+        const SESSION_SCOPE: &str = "trace-session-scope-sentinel";
+        const INPUT: &str = "trace-input-sentinel";
+
+        let root = donat_ir::MutationRoot::Command {
+            alias: "submit".to_owned(),
+            command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_owned(),
+                    name: "create_order".to_owned(),
+                    role: "customer".to_owned(),
+                },
+                name: "create_order".to_owned(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: Some(donat_ir::CommandIdempotency {
+                    key: donat_ir::Scalar::Json(json!(KEY)),
+                    scope: vec![donat_ir::CommandExecutionValue::Scalar {
+                        value: donat_ir::Scalar::Json(json!(SESSION_SCOPE)),
+                        pg_type: "text".to_owned(),
+                    }],
+                    input: donat_ir::Scalar::Json(json!({ "status": INPUT })),
+                    retention_seconds: None,
+                    error_path: "$.selectionSet.submit".to_owned(),
+                }),
+                effects: vec![],
+                selection: vec![],
+            },
+        };
+        let sql = donat_sqlgen::mutation_to_sql(&root);
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                sql.contains(sentinel),
+                "the SQL fixture must contain the sensitive sentinel {sentinel:?}"
+            );
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceCapture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            trace_mutation_sql(&root, &sql);
+        });
+
+        let trace = String::from_utf8(bytes.lock().expect("trace capture lock").clone())
+            .expect("trace output is utf-8");
+        assert!(
+            trace.contains("executing command mutation") && trace.contains("command=create_order"),
+            "command execution must retain a safe trace event: {trace}"
+        );
+        assert!(
+            !trace.contains(&sql),
+            "command trace must not contain the rendered SQL: {trace}"
+        );
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                !trace.contains(sentinel),
+                "command trace leaked {sentinel:?}: {trace}"
+            );
+        }
+    }
+
+    async fn database_error_from(sql: &str) -> tokio_postgres::Error {
+        let url = std::env::var("PG_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_string()
+        });
+        let (client, connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("isolated Postgres is available");
+        let connection = tokio::spawn(connection);
+        let error = client
+            .batch_execute(sql)
+            .await
+            .expect_err("the SQL must raise a database error");
+        connection.abort();
+        error
+    }
+
+    #[tokio::test]
+    async fn graphql_error_payloads_use_the_reserved_envelope_and_preserve_permission_checks() {
+        let structured = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed","path":"$.selectionSet.create_order","message":"customer is not allowed to order"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
+        assert_eq!(
+            command_db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
+
+        let permission = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23514',
+                   MESSAGE = '{"path":"$.selectionSet.insert_author.args.objects","message":"check constraint of an insert/update permission has failed"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+        assert_eq!(
+            command_db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+
+        let malformed = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed"} private Postgres detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        let malformed_body = db_error_json(&malformed);
+        assert_eq!(
+            malformed_body,
+            error_json("data-exception", "database error")
+        );
+        assert_eq!(
+            command_db_error_json(&malformed),
+            error_json("data-exception", "command database error")
+        );
+        assert!(
+            !malformed_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "a malformed reserved envelope must not expose PostgreSQL text"
+        );
+
+        let unrecognized = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"untrusted-error","code":"validation-failed","path":"$.selectionSet.create_order","message":"private Postgres detail"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        let unrecognized_body = db_error_json(&unrecognized);
+        assert_eq!(
+            unrecognized_body,
+            error_json("data-exception", "database error")
+        );
+        assert_eq!(
+            command_db_error_json(&unrecognized),
+            error_json("data-exception", "command database error")
+        );
+        assert!(
+            !unrecognized_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "an unrecognized reserved envelope must not expose PostgreSQL text"
+        );
+
+        let ordinary_unique = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23505',
+                   MESSAGE = 'private ordinary CRUD constraint detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&ordinary_unique),
+            error_json(
+                "constraint-violation",
+                "Uniqueness violation. private ordinary CRUD constraint detail",
+            ),
+            "ordinary CRUD errors retain their established database contract"
+        );
+        assert_eq!(
+            command_db_error_json(&ordinary_unique),
+            error_json("data-exception", "command database error"),
+            "the same PostgreSQL primary message is opaque for a command root"
+        );
+    }
+
     #[test]
     fn internal_action_select_reuses_the_compiled_default_source() {
         use std::collections::{BTreeMap, HashMap};
@@ -2188,14 +2622,17 @@ mod tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
+                        pg_typmod: -1,
                         native_type: None,
                         nullable: false,
                         has_default: false,
                     }],
                     primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
                     foreign_keys: vec![],
                 },
             )]),
@@ -2241,6 +2678,7 @@ mod tests {
     fn shared_state(engine: Arc<Engine>) -> SharedState {
         Arc::new(AppState {
             engine: tokio::sync::RwLock::new(engine),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "postgres://unused".to_string(),
             admin_secret: None,
             unauthorized_role: None,
@@ -2253,6 +2691,174 @@ mod tests {
             subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
             subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
         })
+    }
+
+    #[tokio::test]
+    async fn public_actions_execute_for_an_explicit_role_and_restricted_actions_stay_hidden() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::Json(json!("called")) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [
+                {
+                    "name": "public_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": []
+                },
+                {
+                    "name": "restricted_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": [{ "role": "owner" }]
+                }
+            ]
+        }))
+        .expect("action metadata deserializes");
+        let state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        let customer = Session {
+            role: "customer".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let (_, public) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { public_action }"
+            }),
+        )
+        .await;
+        assert_eq!(public, json!({ "data": { "public_action": "called" } }));
+
+        let (_, restricted) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { restricted_action }"
+            }),
+        )
+        .await;
+        assert_eq!(
+            restricted["errors"][0]["message"],
+            json!("field \"restricted_action\" not found in type: 'query_root'")
+        );
+
+        let no_role = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
+            .expect_err("a public action never supplies a missing classic role");
+        assert_eq!(
+            no_role["errors"][0]["message"],
+            json!("x-donat-role header is required (this engine has no admin role)")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trusted_request_without_role_is_denied_before_public_action_even_with_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!("called"))
+                    },
+                ),
+            )
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [{
+                "name": "public_action",
+                "definition": {
+                    "type": "query",
+                    "handler": format!("http://{address}/"),
+                    "output_type": "String"
+                },
+                "permissions": []
+            }]
+        }))
+        .expect("action metadata deserializes");
+        let mut state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        Arc::get_mut(&mut state)
+            .expect("state is not shared before test setup")
+            .unauthorized_role = Some("anonymous".to_string());
+
+        let roleless_headers = HeaderMap::new();
+        let roleless = resolve_session(&state, &roleless_headers).await;
+        if let Ok(session) = &roleless {
+            let (status, response) = execute_full(
+                &state,
+                session,
+                &json!({ "query": "query { public_action }" }),
+                false,
+                &roleless_headers,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a trusted request without an explicit role must be denied before a public Action webhook can run"
+        );
+        let (status, response) = roleless.expect_err("a trusted request without a role is denied");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            response,
+            json!({
+                "errors": [{
+                    "extensions": { "path": "$", "code": "access-denied" },
+                    "message": "x-donat-role header is required (this engine has no admin role)"
+                }]
+            })
+        );
+
+        let customer_headers = headers(&[("x-donat-role", "customer")]);
+        let customer = resolve_session(&state, &customer_headers)
+            .await
+            .expect("an explicit role resolves even when a fallback is configured");
+        let (status, response) = execute_full(
+            &state,
+            &customer,
+            &json!({ "query": "query { public_action }" }),
+            false,
+            &customer_headers,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     fn empty_metadata() -> donat_metadata::Metadata {
@@ -2678,14 +3284,17 @@ mod tests {
                         TableInfo {
                             schema: "main".to_string(),
                             name: table.to_string(),
+                            relation_kind: donat_catalog::RelationKind::Table,
                             columns: vec![ColumnInfo {
                                 name: "id".to_string(),
                                 pg_type: "int4".to_string(),
+                                pg_typmod: -1,
                                 native_type: None,
                                 nullable: false,
                                 has_default: false,
                             }],
                             primary_key: vec!["id".to_string()],
+                            unique_keys: vec![],
                             foreign_keys: vec![],
                         },
                     )
@@ -3032,14 +3641,17 @@ mod tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "user".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
+                        pg_typmod: -1,
                         native_type: None,
                         nullable: false,
                         has_default: false,
                     }],
                     primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
                     foreign_keys: vec![],
                 },
             )]),
@@ -3080,10 +3692,12 @@ mod tests {
             request_snapshot,
             &session,
             &ctx,
-            &doc,
-            &JsonMap::new(),
-            None,
-            &HeaderMap::new(),
+            crate::action::ActionRequest {
+                doc: &doc,
+                variables: &JsonMap::new(),
+                operation_name: None,
+                headers: &HeaderMap::new(),
+            },
         )
         .await;
 

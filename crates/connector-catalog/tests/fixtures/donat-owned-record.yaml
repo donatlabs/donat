@@ -1,0 +1,44 @@
+record_version: 1
+record_id: source.donat.http.v1
+subject:
+  kind: donat_owned
+  value:
+    repository_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    files:
+      - path: crates/server/src/connectors/http.rs
+        sha256: '1111111111111111111111111111111111111111111111111111111111111111'
+reacquisition:
+  kind: donat_owned_no_network
+  value: null
+artifact_hashes: []
+license:
+  kind: permissive
+  value:
+    spdx_id: Apache-2.0
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+notice:
+  id: notice.donat
+  license_file_path: LICENSE
+  license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+  required_copyright_lines: []
+  notice_bundle_destination: THIRD_PARTY_NOTICES.md
+entrypoints: [crates/server/src/connectors/http.rs]
+dependencies: []
+embedded_material: []
+provider_contracts: []
+compatibility:
+  kind: tier_a
+  value: null
+admission:
+  kind: approved_for_port
+  value:
+    operations: [get]
+safety_findings:
+  findings: []
+reviewer: reviewer.donat
+approval_date: 2026-07-29
+proposed_manifest: connector-catalog/manifests/http.yaml
+proposed_destinations: [connector-catalog/sources/records/http.yaml]
+red_tests: [http_exact_source_compiles]

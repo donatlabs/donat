@@ -2,19 +2,318 @@
 //! snapshot (metadata + per-source catalogs) that metadata operations
 //! mutate at runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
-use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
-use donat_schema::{CompiledMultiSourceSchema, PlanError};
+use donat_metadata::{
+    ConnectorBaseUrl, ConnectorConfig, ConnectorInstance, DatabaseUrl, Metadata,
+    RuleTypeDeclaration, Source, SourceKind,
+};
+use donat_rules::{
+    DecisionRow as RuleDecisionRow, DecisionTableDefinition as RuleDecisionTableDefinition,
+    DecisionTableTestCase as RuleDecisionTableTestCase,
+    DecisionTestExpectation as RuleDecisionTestExpectation, ExpressionContext, ExpressionOwner,
+    HitPolicy, RuleCatalog, RuleDefinition, RuleType,
+};
+use donat_schema::{
+    CompiledCommandCatalog, CompiledMultiSourceSchema, FinalizedCommandCatalog, PlanError,
+    ProcessEffectContractCatalog, compile_command_catalog, finalize_command_effects,
+};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
 const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
+
+/// A deploy-time connector configuration error. This intentionally remains
+/// separate from the future activity `ConnectorErrorClass`: a connector that
+/// cannot be configured never reaches activity execution or retry routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorConfigError {
+    pub path: String,
+    pub message: String,
+}
+
+impl ConnectorConfigError {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for ConnectorConfigError {}
+
+/// A pre-listen connector failure. It exposes static metadata paths or the
+/// missing environment variable name, never a resolved environment value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorStartupError {
+    Static(ConnectorConfigError),
+    MissingEnvironment { instance: String, variable: String },
+}
+
+impl std::fmt::Display for ConnectorStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(error) => error.fmt(formatter),
+            Self::MissingEnvironment { instance, variable } => write!(
+                formatter,
+                "connector instance `{instance}` requires environment variable `{variable}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorStartupError {}
+
+/// Validate the connector declarations that are knowable from deploy-time
+/// metadata. This is deliberately not a registry or protocol validator: Task
+/// 2 owns compiled module definitions and Task 3 owns request templates.
+pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigError> {
+    let mut errors = Vec::new();
+    let mut instance_names = HashSet::new();
+
+    for (index, connector) in metadata.connectors.iter().enumerate() {
+        let path = format!("connectors.yaml[{index}]");
+        if !instance_names.insert(connector.name.as_str()) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                format!("duplicate connector instance name `{}`", connector.name),
+            ));
+        }
+        if connector.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                "connector instance name is required",
+            ));
+        }
+
+        if !matches!(connector.module.as_str(), "http" | "stripe") {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.module"),
+                format!("unknown connector module `{}`", connector.module),
+            ));
+        }
+
+        validate_connector_config(connector, &path, &mut errors);
+        validate_connector_operations(connector, &path, &mut errors);
+    }
+
+    errors
+}
+
+/// Resolve the names declared by [`validate_connector_metadata`] immediately
+/// before the listener is bound. Values are inspected only for availability
+/// and discarded in place, so no resolved credential can be added to metadata,
+/// logs, or an activity error.
+pub fn validate_connector_startup(metadata: &Metadata) -> Result<(), ConnectorStartupError> {
+    if let Some(error) = validate_connector_metadata(metadata).into_iter().next() {
+        return Err(ConnectorStartupError::Static(error));
+    }
+
+    for connector in &metadata.connectors {
+        for (_, variable) in connector_environment_variables(&connector.config) {
+            let available = std::env::var_os(variable)
+                .is_some_and(|value| !value.as_encoded_bytes().is_empty());
+            if !available {
+                return Err(ConnectorStartupError::MissingEnvironment {
+                    instance: connector.name.clone(),
+                    variable: variable.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_config(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    let config = &connector.config;
+    if config.endpoint_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.endpoint_identity"),
+            "endpoint_identity is required and must be a non-secret label",
+        ));
+    }
+    if config.credential_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.credential_identity"),
+            "credential_identity is required and must be a non-secret label",
+        ));
+    }
+
+    match connector.module.as_str() {
+        "http" => {
+            if config.base_url.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    "base_url is required for the http connector",
+                ));
+            }
+            if let Err(error) = crate::connectors::http::validate_http_config_metadata(config) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    error.to_string(),
+                ));
+            }
+        }
+        "stripe" => {
+            if config.secret_key.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.secret_key"),
+                    "secret_key is required for the stripe connector",
+                ));
+            }
+            if config.webhook_secret.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.webhook_secret"),
+                    "webhook_secret is required for the stripe connector",
+                ));
+            }
+            if config.api_version.as_deref().is_none_or(str::is_empty) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.api_version"),
+                    "api_version is required for the stripe connector",
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    for (field, variable) in connector_environment_variables(config) {
+        if !valid_environment_variable_name(variable) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.config.{field}"),
+                format!("value_from_env `{variable}` is not a valid environment variable name"),
+            ));
+        }
+    }
+}
+
+fn validate_connector_operations(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    if connector.module == "http" {
+        if let Err(error) = crate::connectors::http::validate_http_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
+    if connector.module == "stripe" {
+        if let Err(error) = crate::connectors::stripe::validate_stripe_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
+    for (index, operation) in connector.operations.iter().enumerate() {
+        let operation_path = format!("{path}.operations[{index}]");
+        if operation.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.name"),
+                "connector operation name is required",
+            ));
+        }
+        let Some(capacity) = operation.capacity.as_ref() else {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity"),
+                "capacity is required for every connector operation",
+            ));
+            continue;
+        };
+        if capacity.max_in_flight == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.max_in_flight"),
+                "max_in_flight must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.permits == 0 || capacity.rate_limit.burst == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit"),
+                "rate_limit permits and burst must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.per.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit.per"),
+                "rate_limit per is required",
+            ));
+        }
+        if capacity
+            .serialize_by
+            .as_ref()
+            .is_some_and(|serialize_by| serialize_by.input.is_empty())
+        {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.serialize_by.input"),
+                "serialize_by input is required when configured",
+            ));
+        }
+    }
+}
+
+fn connector_environment_variables(config: &ConnectorConfig) -> impl Iterator<Item = (&str, &str)> {
+    let base_url = match config.base_url.as_ref() {
+        Some(ConnectorBaseUrl::FromEnv(reference)) => {
+            Some(("base_url", reference.value_from_env.as_str()))
+        }
+        _ => None,
+    };
+    base_url
+        .into_iter()
+        .chain(
+            config
+                .headers
+                .iter()
+                .map(|header| ("headers.value_from_env", header.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .secret_key
+                .iter()
+                .map(|reference| ("secret_key", reference.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .webhook_secret
+                .iter()
+                .map(|reference| ("webhook_secret", reference.value_from_env.as_str())),
+        )
+}
+
+fn valid_environment_variable_name(variable: &str) -> bool {
+    let mut chars = variable.chars();
+    matches!(chars.next(), Some(character) if character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
 
 fn trace_perf_phase(backend: &'static str, phase: &'static str, started: std::time::Instant) {
     tracing::trace!(
@@ -72,11 +371,16 @@ where
 
 pub struct AppState {
     pub engine: RwLock<EngineSnapshot>,
+    /// Fully validated, immutable deployment connector registry. It is built
+    /// before the HTTP listener is bound and has no runtime mutation surface.
+    #[allow(dead_code)] // Task 3 owns the first activity-dispatch consumer.
+    pub connectors: Arc<crate::connectors::ConnectorRegistry>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
     pub default_url: String,
     pub admin_secret: Option<String>,
-    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: fallback role only for untrusted
+    /// requests whose supplied identity cannot be accepted.
     pub unauthorized_role: Option<String>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,
@@ -285,6 +589,12 @@ impl SqlitePool {
 }
 
 impl SourceRuntime {
+    /// Construct the standard bounded Postgres runtime used by serving and
+    /// integration tests.
+    pub fn postgres(url: &str) -> anyhow::Result<Self> {
+        stage_postgres_runtime(url, RuntimePoolSettings::default(), None)
+    }
+
     fn kind(&self) -> SourceKind {
         match self {
             Self::Postgres { .. } => SourceKind::Postgres,
@@ -297,8 +607,20 @@ impl SourceRuntime {
 
 pub struct Engine {
     pub metadata: Metadata,
+    /// Typed, deploy-time-only rules for this immutable engine snapshot.
+    /// Request handlers never parse source text or mutate this catalog.
+    #[allow(dead_code)] // Commands and processes consume this in later slices.
+    pub rule_catalog: Arc<RuleCatalog>,
     /// Catalog snapshot per source name.
     pub catalogs: HashMap<String, Catalog>,
+    /// Pre-Process command descriptors retained for deployment verification.
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    /// The only command catalog accepted by request and Process execution.
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    /// Current metadata Process definitions compiled before journal access.
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    /// Database-verified active plus live-retired executable revisions.
+    pub deployed_process_catalog: Arc<crate::processes::DeployedProcessCatalog>,
     pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
     pub runtimes: HashMap<String, SourceRuntime>,
     /// Normalized documents admitted by the allowlist. This is compiled with
@@ -311,14 +633,108 @@ pub struct Engine {
     pub(crate) remote_permission_schemas: crate::remote::CompiledRemoteSchemas,
 }
 
+/// Stages 1-7 of Process candidate construction. The value contains only
+/// immutable, deploy-time compiler output: no database client, journal,
+/// worker, connector executor, or resolved credential can enter it.
+pub struct PureEngineCandidate {
+    rule_catalog: Arc<RuleCatalog>,
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    pub process_effects: Arc<ProcessEffectContractCatalog>,
+    pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+}
+
+impl PureEngineCandidate {
+    pub fn rule_catalog(&self) -> &RuleCatalog {
+        self.rule_catalog.as_ref()
+    }
+
+    pub fn rule_catalog_handle(&self) -> Arc<RuleCatalog> {
+        self.rule_catalog.clone()
+    }
+}
+
+/// Compile one all-or-nothing serving candidate in dependency order without
+/// touching a database or publishing mutable state.
+pub fn compile_pure_engine_candidate(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    connectors: &crate::connectors::ConnectorRegistry,
+    infer_function_permissions: bool,
+) -> Result<PureEngineCandidate, PlanError> {
+    let rule_catalog = Arc::new(compile_rule_catalog(metadata)?);
+    let command_catalog = Arc::new(compile_command_catalog(
+        metadata,
+        catalogs,
+        rule_catalog.as_ref(),
+        infer_function_permissions,
+    )?);
+    let dependencies = crate::processes::ServerProcessDependencies::new(
+        metadata,
+        command_catalog.as_ref(),
+        rule_catalog.as_ref(),
+        connectors,
+    );
+    let process_catalog = Arc::new(crate::processes::compile_process_catalog(
+        metadata,
+        &dependencies,
+    )?);
+    let process_effects = Arc::new(crate::processes::build_process_effect_contract_catalog(
+        process_catalog.as_ref(),
+    )?);
+    let finalized_command_catalog = Arc::new(finalize_command_effects(
+        command_catalog.as_ref().clone(),
+        process_effects.as_ref(),
+    )?);
+    let compiled = Some(Arc::new(
+        CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+            metadata,
+            catalogs,
+            rule_catalog.as_ref(),
+            finalized_command_catalog.as_ref(),
+            process_effects.as_ref(),
+            infer_function_permissions,
+        )?,
+    ));
+
+    Ok(PureEngineCandidate {
+        rule_catalog,
+        command_catalog,
+        finalized_command_catalog,
+        process_catalog,
+        process_effects,
+        compiled,
+    })
+}
+
 impl Engine {
+    #[allow(dead_code)] // Existing test helpers construct unconnected engines.
     pub fn bootstrap(metadata: Metadata) -> Self {
+        Self::with_rule_catalog(metadata, RuleCatalog::default())
+    }
+
+    /// Build the initial, unconnected engine snapshot only after all
+    /// deploy-time rule metadata has compiled. The serving binary uses this
+    /// before opening a listener; test helpers may use [`Self::bootstrap`]
+    /// when they intentionally exercise a later candidate failure.
+    pub fn bootstrap_checked(metadata: Metadata) -> Result<Self, PlanError> {
+        let rule_catalog = compile_rule_catalog(&metadata)?;
+        Ok(Self::with_rule_catalog(metadata, rule_catalog))
+    }
+
+    fn with_rule_catalog(metadata: Metadata, rule_catalog: RuleCatalog) -> Self {
         let allowed_queries = compile_allowed_queries(&metadata);
         let rest_queries = crate::rest::compile_saved_queries(&metadata);
         let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
         Self {
             metadata,
+            rule_catalog: Arc::new(rule_catalog),
             catalogs: HashMap::new(),
+            command_catalog: Arc::new(CompiledCommandCatalog::default()),
+            finalized_command_catalog: Arc::new(FinalizedCommandCatalog::default()),
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
             compiled: None,
             runtimes: HashMap::new(),
             allowed_queries,
@@ -334,6 +750,7 @@ impl Engine {
         infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
         normalize_metadata_sources(&mut metadata);
+        let rule_catalog = Arc::new(compile_rule_catalog(&metadata)?);
         for source in &metadata.sources {
             let runtime = runtimes.get(&source.name).ok_or_else(|| {
                 PlanError::new(
@@ -355,9 +772,20 @@ impl Engine {
                 ));
             }
         }
-        let compiled = Arc::new(CompiledMultiSourceSchema::compile(
+        let command_catalog = Arc::new(compile_command_catalog(
             &metadata,
             &catalogs,
+            &rule_catalog,
+            infer_function_permissions,
+        )?);
+        let finalized_command_catalog = Arc::new(finalize_command_effects(
+            command_catalog.as_ref().clone(),
+            &ProcessEffectContractCatalog::default(),
+        )?);
+        let compiled = Arc::new(CompiledMultiSourceSchema::compile_with_command_catalog(
+            &metadata,
+            &catalogs,
+            command_catalog.clone(),
             infer_function_permissions,
         )?);
         let allowed_queries = compile_allowed_queries(&metadata);
@@ -365,7 +793,12 @@ impl Engine {
         let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
         Ok(Self {
             metadata,
+            rule_catalog,
             catalogs,
+            command_catalog,
+            finalized_command_catalog,
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
             compiled: Some(compiled),
             runtimes,
             allowed_queries,
@@ -373,6 +806,496 @@ impl Engine {
             remote_permission_schemas,
         })
     }
+
+    fn from_pure_candidate(
+        metadata: Metadata,
+        catalogs: HashMap<String, Catalog>,
+        runtimes: HashMap<String, SourceRuntime>,
+        candidate: PureEngineCandidate,
+        deployed_process_catalog: crate::processes::DeployedProcessCatalog,
+    ) -> Self {
+        let allowed_queries = compile_allowed_queries(&metadata);
+        let rest_queries = crate::rest::compile_saved_queries(&metadata);
+        let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
+        Self {
+            metadata,
+            rule_catalog: candidate.rule_catalog,
+            catalogs,
+            command_catalog: candidate.command_catalog,
+            finalized_command_catalog: candidate.finalized_command_catalog,
+            process_catalog: candidate.process_catalog,
+            deployed_process_catalog: Arc::new(deployed_process_catalog),
+            compiled: candidate.compiled,
+            runtimes,
+            allowed_queries,
+            rest_queries,
+            remote_permission_schemas,
+        }
+    }
+}
+
+/// Translate the YAML metadata shape into the strict rules crate model and
+/// compile it before a candidate snapshot can publish.
+///
+/// The adapter resolves named declarations before compiling executable source.
+/// Unknown names are never silently widened to strings or JSON values.
+pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, PlanError> {
+    let declared_types = resolve_declared_rule_types(&metadata.rules.types)?;
+    let rules_and_contexts = metadata
+        .rules
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.rules[{index}]");
+            Ok((
+                RuleDefinition {
+                    name: definition.name.clone(),
+                    bindings: compile_rule_types(&definition.parameters, &declared_types, &path)?,
+                    result: parse_rule_type_ref(
+                        &definition.result,
+                        &declared_types,
+                        &format!("{path}.result"),
+                    )?,
+                    expression: definition.expression.clone(),
+                },
+                ExpressionContext {
+                    metadata_path: format!("{path}.expression"),
+                    expression_owner: ExpressionOwner::Rule {
+                        name: definition.name.clone(),
+                    },
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let (rules, rule_contexts): (Vec<_>, Vec<_>) = rules_and_contexts.into_iter().unzip();
+    let tables_and_contexts = metadata
+        .rules
+        .decision_tables
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.decision_tables[{index}]");
+            let condition_contexts = definition
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(row_index, row)| {
+                    row.when
+                        .keys()
+                        .map(|input_name| {
+                            (
+                                input_name.clone(),
+                                ExpressionContext {
+                                    metadata_path: format!(
+                                        "{path}.rows[{row_index}].when.{input_name}"
+                                    ),
+                                    expression_owner: ExpressionOwner::DecisionCondition {
+                                        table_name: definition.name.clone(),
+                                        row_id: row.id.clone(),
+                                        input_name: input_name.clone(),
+                                    },
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                RuleDecisionTableDefinition {
+                    name: definition.name.clone(),
+                    // The rules crate derives this deploy-time revision from
+                    // the complete canonical compiled definition; the legacy
+                    // field remains for its source-model compatibility only.
+                    revision: definition.name.clone(),
+                    inputs: compile_rule_types(
+                        &definition.inputs,
+                        &declared_types,
+                        &format!("{path}.inputs"),
+                    )?,
+                    output: compile_rule_types(
+                        &definition.output,
+                        &declared_types,
+                        &format!("{path}.output"),
+                    )?,
+                    hit_policy: HitPolicy::from_metadata(&definition.hit_policy),
+                    rows: definition
+                        .rows
+                        .iter()
+                        .map(|row| RuleDecisionRow {
+                            id: row.id.clone(),
+                            description: row.description.clone(),
+                            when: row.when.clone(),
+                            output: row.output.clone(),
+                        })
+                        .collect(),
+                    test_cases: definition
+                        .test_cases
+                        .iter()
+                        .map(|case| RuleDecisionTableTestCase {
+                            name: case.name.clone(),
+                            input: case.input.clone(),
+                            expect: RuleDecisionTestExpectation {
+                                output: case.expect.output.clone(),
+                                matched_row_id: case.expect.matched_row_id.clone(),
+                            },
+                        })
+                        .collect(),
+                },
+                condition_contexts,
+            ))
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let (tables, decision_condition_contexts): (Vec<_>, Vec<_>) =
+        tables_and_contexts.into_iter().unzip();
+
+    let declaration_order = metadata
+        .rules
+        .types
+        .iter()
+        .map(|declaration| declaration.name.clone())
+        .collect::<Vec<_>>();
+    let catalog =
+        donat_rules::compile_catalog_with_declared_types_and_contexts_and_declaration_order(
+            &declared_types,
+            &declaration_order,
+            &rules,
+            &tables,
+            &rule_contexts,
+            &decision_condition_contexts,
+        )
+        .map_err(|error| {
+            if let Some(diagnostic) = error.diagnostic() {
+                PlanError::validation(
+                    &diagnostic.context.metadata_path,
+                    format!(
+                        "declarative rule validation failed for {} at bytes {}..{}: {}",
+                        render_expression_owner(&diagnostic.context.expression_owner),
+                        diagnostic.span.start,
+                        diagnostic.span.end,
+                        diagnostic.message
+                    ),
+                )
+            } else {
+                PlanError::validation(
+                    "rules.yaml",
+                    format!("declarative rule validation failed: {error}"),
+                )
+            }
+        })?;
+
+    for rule in &rules {
+        let compiled = catalog
+            .rule(&rule.name)
+            .expect("validated rule remains in the compiled catalog");
+        tracing::debug!(
+            rule = %compiled.name,
+            profile_version = compiled.artifact.profile_version,
+            source_sha256 = %compiled.artifact.source_sha256,
+            canonical_ast_sha256 = %compiled.artifact.canonical_ast_sha256,
+            "declarative rule profile artifact compiled"
+        );
+    }
+    for table in &tables {
+        let compiled = catalog
+            .decision_table(&table.name)
+            .expect("validated decision remains in the compiled catalog");
+        tracing::debug!(
+            table = %compiled.name,
+            revision = %compiled.revision.0,
+            "declarative decision revision compiled"
+        );
+    }
+    Ok(catalog)
+}
+
+fn render_expression_owner(owner: &ExpressionOwner) -> String {
+    match owner {
+        ExpressionOwner::Rule { name } => format!("rule `{name}`"),
+        ExpressionOwner::DecisionCondition {
+            table_name,
+            row_id,
+            input_name,
+        } => format!("decision table `{table_name}` row `{row_id}` condition `{input_name}`"),
+    }
+}
+
+fn compile_rule_types(
+    types: &BTreeMap<String, String>,
+    declared: &BTreeMap<String, RuleType>,
+    path: &str,
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    types
+        .iter()
+        .map(|(name, type_)| {
+            parse_rule_type_ref(type_, declared, &format!("{path}.{name}"))
+                .map(|type_| (name.clone(), type_))
+        })
+        .collect()
+}
+
+fn parse_rule_type_ref(
+    source: &str,
+    declared: &BTreeMap<String, RuleType>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    if source.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(parse_rule_type_ref(inner, declared, path)?))
+    } else {
+        match scalar_rule_type(source) {
+            Some(type_) => type_,
+            None => declared.get(source).cloned().ok_or_else(|| {
+                PlanError::validation(path, format!("unsupported rule type `{source}`"))
+            })?,
+        }
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
+}
+
+#[derive(Debug, Clone)]
+enum TypeResolution {
+    Visiting,
+    Resolved(RuleType),
+}
+
+fn resolve_declared_rule_types(
+    declarations: &[RuleTypeDeclaration],
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    let mut positions = BTreeMap::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let path = format!("rules.yaml.types[{index}]");
+        if declaration.name.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "declared rule type name cannot be empty",
+            ));
+        }
+        if is_scalar_rule_type_name(&declaration.name) {
+            return Err(PlanError::validation(
+                &path,
+                format!(
+                    "declared rule type `{}` collides with scalar profile type",
+                    declaration.name
+                ),
+            ));
+        }
+        if positions.insert(declaration.name.clone(), index).is_some() {
+            return Err(PlanError::validation(
+                &path,
+                format!("duplicate declared rule type `{}`", declaration.name),
+            ));
+        }
+        let body_count = usize::from(declaration.object.is_some())
+            + usize::from(declaration.enum_values.is_some())
+            + usize::from(declaration.opaque_json.is_some());
+        if body_count != 1 {
+            return Err(PlanError::validation(
+                &path,
+                "a declared rule type requires exactly one of object, enum, or opaque_json",
+            ));
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+    for name in positions.keys() {
+        resolve_declared_rule_type(name, declarations, &positions, &mut resolved)?;
+    }
+    resolved
+        .into_iter()
+        .map(|(name, resolution)| match resolution {
+            TypeResolution::Resolved(type_) => Ok((name, type_)),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                "declared rule type resolution did not finish",
+            )),
+        })
+        .collect()
+}
+
+fn resolve_declared_rule_type(
+    name: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+) -> Result<RuleType, PlanError> {
+    if let Some(resolution) = resolved.get(name) {
+        return match resolution {
+            TypeResolution::Resolved(type_) => Ok(type_.clone()),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                format!("declared rule type cycle includes `{name}`"),
+            )),
+        };
+    }
+    let index = *positions.get(name).ok_or_else(|| {
+        PlanError::validation(
+            "rules.yaml.types",
+            format!("unknown declared rule type `{name}`"),
+        )
+    })?;
+    let declaration = &declarations[index];
+    let path = format!("rules.yaml.types[{index}]");
+    resolved.insert(name.to_owned(), TypeResolution::Visiting);
+
+    let type_ = if let Some(symbols) = &declaration.enum_values {
+        if symbols.is_empty() || symbols.iter().any(String::is_empty) {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires non-empty symbols",
+            ));
+        }
+        let unique = symbols.iter().collect::<HashSet<_>>();
+        if unique.len() != symbols.len() {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires unique symbols",
+            ));
+        }
+        RuleType::Enum {
+            name: declaration.name.clone(),
+            symbols: symbols.clone(),
+        }
+    } else if let Some(fields) = &declaration.object {
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "an object declaration requires at least one field",
+            ));
+        }
+        let fields = fields
+            .iter()
+            .map(|(field, source)| {
+                if field.is_empty() {
+                    return Err(PlanError::validation(
+                        &format!("{path}.object"),
+                        "an object field name cannot be empty",
+                    ));
+                }
+                resolve_declared_type_ref(
+                    source,
+                    declarations,
+                    positions,
+                    resolved,
+                    &format!("{path}.object.{field}"),
+                )
+                .map(|type_| (field.clone(), type_))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        RuleType::Object {
+            name: declaration.name.clone(),
+            fields,
+        }
+    } else if let Some(opaque) = &declaration.opaque_json {
+        if opaque.maximum_bytes == 0 || opaque.maximum_depth == 0 || opaque.maximum_nodes == 0 {
+            return Err(PlanError::validation(
+                &format!("{path}.opaque_json"),
+                "an opaque JSON declaration requires non-zero bounds",
+            ));
+        }
+        RuleType::OpaqueJson {
+            name: declaration.name.clone(),
+            maximum_bytes: opaque.maximum_bytes,
+            maximum_depth: opaque.maximum_depth,
+            maximum_nodes: opaque.maximum_nodes,
+        }
+    } else {
+        return Err(PlanError::validation(
+            &path,
+            "a declared rule type requires exactly one of object, enum, or opaque_json",
+        ));
+    };
+    resolved.insert(name.to_owned(), TypeResolution::Resolved(type_.clone()));
+    Ok(type_)
+}
+
+fn resolve_declared_type_ref(
+    source: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    if source.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(resolve_declared_type_ref(
+            inner,
+            declarations,
+            positions,
+            resolved,
+            path,
+        )?))
+    } else if let Some(scalar) = scalar_rule_type(source) {
+        scalar
+    } else if positions.contains_key(source) {
+        resolve_declared_rule_type(source, declarations, positions, resolved)?
+    } else {
+        return Err(PlanError::validation(
+            path,
+            format!("unknown declared rule type `{source}`"),
+        ));
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
+}
+
+fn scalar_rule_type(source: &str) -> Option<RuleType> {
+    match source {
+        "bool" => Some(RuleType::Bool),
+        "string" => Some(RuleType::String),
+        "int" => Some(RuleType::Int),
+        "bigint" => Some(RuleType::Int64),
+        "decimal" => Some(RuleType::Decimal),
+        "uuid" => Some(RuleType::Uuid),
+        "date" => Some(RuleType::Date),
+        "timestamp" | "timestamptz" => Some(RuleType::Timestamp),
+        _ => None,
+    }
+}
+
+fn is_scalar_rule_type_name(source: &str) -> bool {
+    scalar_rule_type(source).is_some()
 }
 
 fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {
@@ -533,10 +1456,10 @@ fn resolve_source_url(source: &Source, default_url: &str) -> String {
             }
         };
     }
-    if source.kind == SourceKind::Clickhouse {
-        if let Some(url) = resolve_hasura_clickhouse_template(source) {
-            return url;
-        }
+    if source.kind == SourceKind::Clickhouse
+        && let Some(url) = resolve_hasura_clickhouse_template(source)
+    {
+        return url;
     }
     default_url.to_string()
 }
@@ -784,6 +1707,7 @@ impl AppState {
                     | donat_ir::MutationRoot::Insert { alias, .. }
                     | donat_ir::MutationRoot::Update { alias, .. }
                     | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
                 (alias, donat_sqlgen::sqlite_mutation_plan(m))
@@ -929,6 +1853,7 @@ impl AppState {
                         (alias.clone(), pk_of(&delete.table))
                     }
                     donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
                 };
                 (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
@@ -1091,9 +2016,8 @@ impl AppState {
         .map_err(MysqlMutationError::Other)?
     }
 
-    /// Reconcile pools and catalogs with the current metadata sources,
-    /// pruning metadata that refers to dropped objects (run_sql untracks
-    /// dropped tables/functions, like Donat).
+    /// Refresh source catalogs and rebuild one pure immutable candidate.
+    /// Runtime DDL and administrative metadata-mutation APIs do not exist.
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
         let metadata = self.engine_snapshot().await.metadata.clone();
         self.sync_candidate(metadata).await
@@ -1135,7 +2059,6 @@ impl AppState {
                         unreachable!("PostgreSQL staging returned a non-PostgreSQL runtime")
                     };
                     let client = pool.get().await?;
-                    ensure_check_violation_helper(&client).await?;
                     (donat_catalog::introspect(&client).await?, runtime)
                 }
                 SourceKind::Sqlite => {
@@ -1244,12 +2167,28 @@ impl AppState {
                 });
             }
         }
-        let candidate = Engine::compiled(
+        let pure = compile_pure_engine_candidate(
+            &metadata,
+            &new_catalogs,
+            self.connectors.as_ref(),
+            self.infer_function_permissions,
+        )?;
+        let deployed_process_catalog = crate::processes::validate_serving_catalogs(
+            &new_runtimes,
+            &metadata,
+            pure.rule_catalog(),
+            pure.process_catalog.as_ref(),
+            pure.command_catalog.as_ref(),
+            self.connectors.as_ref(),
+        )
+        .await?;
+        let candidate = Engine::from_pure_candidate(
             metadata,
             new_catalogs,
             new_runtimes,
-            self.infer_function_permissions,
-        )?;
+            pure,
+            deployed_process_catalog,
+        );
         self.publish_candidate(Ok(candidate)).await?;
         Ok(())
     }
@@ -1357,7 +2296,8 @@ mod snapshot_tests {
 
     use super::{
         AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, compile_allowed_queries,
-        run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime, stage_postgres_runtime,
+        compile_rule_catalog, run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime,
+        stage_postgres_runtime,
     };
 
     fn candidate(
@@ -1397,14 +2337,17 @@ mod snapshot_tests {
                 TableInfo {
                     schema: "public".to_string(),
                     name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
                     columns: vec![ColumnInfo {
                         name: "id".to_string(),
                         pg_type: "int8".to_string(),
+                        pg_typmod: -1,
                         native_type: None,
                         nullable: false,
                         has_default: false,
                     }],
                     primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
                     foreign_keys: vec![],
                 },
             )]),
@@ -1427,6 +2370,7 @@ mod snapshot_tests {
     fn state(engine: Engine) -> AppState {
         AppState {
             engine: RwLock::new(Arc::new(engine)),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "sqlite::memory:".to_string(),
             admin_secret: None,
             unauthorized_role: None,
@@ -1513,6 +2457,104 @@ mod snapshot_tests {
             .err()
             .expect("a runtime with the wrong backend kind is rejected");
         assert!(mismatched.message.contains("metadata requires Sqlite"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_rules_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.rules = serde_json::from_value(json!({
+            "rules": [
+                {"name": "duplicate", "result": "bool!", "expression": "true"},
+                {"name": "duplicate", "result": "bool!", "expression": "false"}
+            ]
+        }))
+        .expect("rules metadata deserializes");
+
+        let Err(error) = Engine::bootstrap_checked(metadata.clone()) else {
+            panic!("invalid rules are rejected before the server listens");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with duplicate rules is rejected before publishing");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_commands_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.commands = serde_json::from_value(json!([
+            {
+                "name": "create_item",
+                "source": "default",
+                "permissions": [{ "role": "user" }],
+                "arguments": [],
+                "steps": [],
+                "result": {}
+            }
+        ]))
+        .expect("command metadata deserializes");
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with a non-Postgres command source is rejected before publishing");
+        };
+        assert_eq!(error.path, "commands[0]");
+        assert!(error.message.contains("requires a Postgres source"));
+    }
+
+    #[tokio::test]
+    async fn failed_out_of_range_command_literal_preserves_the_published_snapshot() {
+        let (mut metadata, catalogs, _) = candidate("item", "/tmp/item.sqlite");
+        metadata.sources[0].kind = SourceKind::Postgres;
+        let runtimes = HashMap::from([(
+            "default".to_string(),
+            stage_postgres_runtime(
+                "postgres://unused/command-literal",
+                RuntimePoolSettings::default(),
+                None,
+            )
+            .expect("unconnected Postgres runtime stages"),
+        )]);
+        let engine = Engine::compiled(metadata.clone(), catalogs.clone(), runtimes.clone(), true)
+            .expect("published snapshot without commands compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+
+        metadata.commands = serde_json::from_value(json!([{
+            "name": "create_item",
+            "source": "default",
+            "permissions": [{ "role": "user" }],
+            "steps": [{
+                "name": "item",
+                "insert": {
+                    "table": { "schema": "public", "name": "item" },
+                    "object": { "id": { "literal": "9223372036854775808" } },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "id": { "step": "item", "column": "id" } }
+        }]))
+        .expect("invalid command metadata deserializes");
+
+        let error = state
+            .publish_candidate(Engine::compiled(metadata, catalogs, runtimes, true))
+            .await
+            .expect_err("out-of-range int8 command literal rejects candidate");
+        assert_eq!(error.path, "commands[0].steps[0]");
+        assert!(error.message.contains("int8"));
+        assert!(error.message.contains("out of range"));
+
+        let current = state.engine_snapshot().await;
+        assert!(Arc::ptr_eq(
+            &old_compiled,
+            current
+                .compiled
+                .as_ref()
+                .expect("unchanged compiled snapshot"),
+        ));
     }
 
     #[test]
@@ -1783,6 +2825,105 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn compiles_closed_opaque_json_rule_type_from_metadata() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "types": [{
+                    "name": "BoundedProviderEvidence",
+                    "opaque_json": {
+                        "maximum_bytes": 4096,
+                        "maximum_depth": 8,
+                        "maximum_nodes": 128
+                    }
+                }],
+                "rules": [{
+                    "name": "retain_evidence",
+                    "parameters": {
+                        "evidence": "BoundedProviderEvidence!"
+                    },
+                    "result": "BoundedProviderEvidence!",
+                    "expression": "evidence"
+                }]
+            }
+        }))
+        .expect("opaque JSON metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("opaque JSON declaration compiles at boot");
+        assert!(catalog.rule("retain_evidence").is_some());
+    }
+
+    #[test]
+    fn compiles_every_active_petshop_builtin_rule_scalar() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "rules": [
+                    {
+                        "name": "round_trip_bool",
+                        "parameters": { "value": "bool!" },
+                        "result": "bool!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_string",
+                        "parameters": { "value": "string!" },
+                        "result": "string!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_int",
+                        "parameters": { "value": "int!" },
+                        "result": "int!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_bigint",
+                        "parameters": { "value": "bigint!" },
+                        "result": "bigint!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_uuid",
+                        "parameters": { "value": "uuid!" },
+                        "result": "uuid!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_timestamptz",
+                        "parameters": { "value": "timestamptz!" },
+                        "result": "timestamptz!",
+                        "expression": "value"
+                    }
+                ]
+            }
+        }))
+        .expect("active Petshop scalar metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("every active Petshop scalar compiles");
+        let bigint: donat_rules::RuleType = serde_json::from_value(json!("Int64"))
+            .expect("the closed bigint rule type deserializes");
+        for (rule, expected) in [
+            ("round_trip_bool", donat_rules::RuleType::Bool),
+            ("round_trip_string", donat_rules::RuleType::String),
+            ("round_trip_int", donat_rules::RuleType::Int),
+            ("round_trip_bigint", bigint),
+            ("round_trip_uuid", donat_rules::RuleType::Uuid),
+            ("round_trip_timestamptz", donat_rules::RuleType::Timestamp),
+        ] {
+            assert_eq!(
+                catalog.rule(rule).expect("compiled scalar rule").result,
+                expected,
+                "{rule} maps to its closed Rule scalar"
+            );
+        }
+    }
+
+    #[test]
     fn over_depth_allowlist_query_is_skipped_before_parsing() {
         let query = format!(
             "{}{}",
@@ -2009,27 +3150,6 @@ mod clickhouse_transport_tests {
         );
         server.abort();
     }
-}
-
-/// The helper raised by generated mutation SQL on permission-check
-/// violations (SQLSTATE 23514 with a JSON payload).
-pub async fn ensure_check_violation_helper(
-    client: &deadpool_postgres::Client,
-) -> anyhow::Result<()> {
-    client
-        .batch_execute(
-            r#"
-            CREATE SCHEMA IF NOT EXISTS donat;
-            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
-            RETURNS json AS $$
-            BEGIN
-                RAISE EXCEPTION USING message = msg, errcode = '23514';
-            END;
-            $$ LANGUAGE plpgsql;
-            "#,
-        )
-        .await?;
-    Ok(())
 }
 
 /// Make sure the metadata has at least one (default) source so that

@@ -16,3 +16,5 @@ donat-catalog = { path = "../catalog" }
 donat-schema = { path = "../schema" }
 graphql-parser = { workspace = true }
 insta = { workspace = true }
+postgres = { workspace = true }
+uuid = { workspace = true }

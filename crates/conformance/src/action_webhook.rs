@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value as Json, json};
 
+type ParsedRequest = (String, Json, Vec<(String, String)>);
+
 /// Shared handle to the running engine, so callback endpoints (which run a
 /// GraphQL query back against the engine) can reach it once it has spawned.
 #[derive(Clone, Default)]
@@ -27,13 +29,15 @@ pub struct EngineHandle {
 struct EngineInfo {
     base_url: String,
     admin_secret: Option<String>,
+    role: Option<String>,
 }
 
 impl EngineHandle {
-    pub fn set(&self, base_url: &str, admin_secret: Option<String>) {
+    pub fn set(&self, base_url: &str, admin_secret: Option<String>, role: Option<String>) {
         *self.inner.lock().unwrap() = Some(EngineInfo {
             base_url: base_url.to_string(),
             admin_secret,
+            role,
         });
     }
 
@@ -69,7 +73,7 @@ pub fn spawn() -> (String, EngineHandle) {
 }
 
 /// Parse one HTTP request: returns (path, parsed-json-body, raw-headers).
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Json, Vec<(String, String)>)> {
+fn read_request(stream: &mut std::net::TcpStream) -> Option<ParsedRequest> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     // Read until we have the full header block.
@@ -212,9 +216,8 @@ fn handled_with_engine(path: &str, input: &Json, engine: &EngineHandle) -> Optio
     }
 }
 
-/// POST a GraphQL query to the running engine (trusted by the admin secret;
-/// with no role header it runs as the unauthorized-role fallback). Returns the
-/// parsed response body.
+/// POST a GraphQL query to the running engine under the suite's explicit
+/// classic role. Returns the parsed response body.
 fn engine_gql(engine: &EngineHandle, query: &str, variables: Json) -> Option<Json> {
     let info = engine.get()?;
     let client = reqwest::blocking::Client::new();
@@ -223,6 +226,9 @@ fn engine_gql(engine: &EngineHandle, query: &str, variables: Json) -> Option<Jso
         .json(&json!({ "query": query, "variables": variables }));
     if let Some(secret) = &info.admin_secret {
         req = req.header("X-Donat-Admin-Secret", secret);
+    }
+    if let Some(role) = &info.role {
+        req = req.header("X-Donat-Role", role);
     }
     let resp = req.send().ok()?;
     resp.json::<Json>().ok()

@@ -1,11 +1,38 @@
 use std::path::Path;
 
-use donat_metadata::{Columns, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir};
+use donat_metadata::{
+    Columns, CommandStepOperation, DatabaseUrl, QualifiedTable, SourceKind, load_metadata_dir,
+};
 
 fn fixture_dir() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/metadata"
+    ))
+}
+
+fn rules_fixture_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rules"))
+}
+
+fn rules_types_only_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rules-types-only"
+    ))
+}
+
+fn commands_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/commands"
+    ))
+}
+
+fn connectors_fixture_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/connectors"
     ))
 }
 
@@ -94,4 +121,86 @@ fn loads_actions_and_custom_types() {
     assert_eq!(md.custom_types.objects.len(), 1);
     assert_eq!(md.custom_types.objects[0].name, "OutObject");
     assert_eq!(md.custom_types.scalars[0].name, "myCustomScalar");
+}
+
+#[test]
+fn loads_rules_wrapper_with_quoted_include() {
+    let md = load_metadata_dir(rules_fixture_dir()).expect("rules metadata should load");
+
+    assert_eq!(md.rules.rules.len(), 1);
+    assert_eq!(md.rules.rules[0].name, "order_request_is_well_formed");
+    assert_eq!(md.rules.rules[0].parameters["lines"], "[CreateOrderLine!]!");
+    assert_eq!(md.rules.rules[0].expression, "size(lines) > 0");
+    assert_eq!(md.rules.decision_tables.len(), 1);
+    assert_eq!(md.rules.decision_tables[0].name, "invoice_approval");
+    assert_eq!(md.rules.decision_tables[0].rows[0].id, "default");
+    assert_eq!(
+        md.rules.decision_tables[0].test_cases[0]
+            .expect
+            .matched_row_id,
+        "default"
+    );
+}
+
+#[test]
+fn loads_types_only_rules_wrapper() {
+    let md = load_metadata_dir(rules_types_only_fixture_dir())
+        .expect("types-only rules metadata should load");
+
+    assert_eq!(md.rules.types.len(), 1);
+    assert_eq!(md.rules.types[0].name, "OrderStatus");
+    assert_eq!(
+        md.rules.types[0].enum_values.as_deref(),
+        Some(&["draft".to_owned(), "submitted".to_owned()][..])
+    );
+    assert!(md.rules.rules.is_empty());
+    assert!(md.rules.decision_tables.is_empty());
+    assert!(!md.rules.is_empty());
+}
+
+#[test]
+fn loads_commands_section_with_quoted_include() {
+    let md = load_metadata_dir(commands_fixture_dir()).expect("commands metadata should load");
+
+    assert_eq!(md.commands.len(), 2);
+    let command = &md.commands[0];
+    assert_eq!(command.name, "create_order");
+    assert_eq!(command.source, "default");
+    assert_eq!(command.permissions[0].role, "customer");
+    assert_eq!(command.steps.len(), 2);
+    assert_eq!(command.effects.len(), 1);
+
+    let relational_batch = &md.commands[1];
+    assert_eq!(relational_batch.name, "reserve_cart_stock");
+    assert!(matches!(
+        &relational_batch.steps[0].operation,
+        CommandStepOperation::SelectMany { .. }
+    ));
+    assert!(matches!(
+        &relational_batch.steps[1].operation,
+        CommandStepOperation::Aggregate { .. }
+    ));
+    assert!(matches!(
+        &relational_batch.steps[2].operation,
+        CommandStepOperation::UpdateMany { .. }
+    ));
+}
+
+#[test]
+fn loads_connectors_section_with_quoted_include() {
+    let md = load_metadata_dir(connectors_fixture_dir()).expect("connector metadata should load");
+
+    assert_eq!(md.connectors.len(), 1);
+    let connector = &md.connectors[0];
+    assert_eq!(connector.name, "logistics_api");
+    assert_eq!(connector.module, "http");
+    assert_eq!(connector.operations[0].name, "create_shipment");
+    assert_eq!(
+        connector.operations[0]
+            .capacity
+            .as_ref()
+            .expect("operation capacity")
+            .max_in_flight,
+        8
+    );
 }

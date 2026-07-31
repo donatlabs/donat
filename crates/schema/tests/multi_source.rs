@@ -66,6 +66,7 @@ fn col(name: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: "int4".to_string(),
+        pg_typmod: -1,
         native_type: None,
         nullable: false,
         has_default: false,
@@ -79,8 +80,10 @@ fn catalog(schema: &str, table: &str, columns: &[&str]) -> Catalog {
             TableInfo {
                 schema: schema.to_string(),
                 name: table.to_string(),
+                relation_kind: donat_catalog::RelationKind::Table,
                 columns: columns.iter().map(|name| col(name)).collect(),
                 primary_key: vec!["id".to_string()],
+                unique_keys: vec![],
                 foreign_keys: vec![],
             },
         )]),
@@ -844,10 +847,12 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
         TableInfo {
             schema: "public".to_string(),
             name: "other".to_string(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 ColumnInfo {
                     name: "id".to_string(),
                     pg_type: "uuid".to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: false,
                     has_default: false,
@@ -855,12 +860,14 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
                 ColumnInfo {
                     name: "body".to_string(),
                     pg_type: "text".to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: false,
                     has_default: false,
                 },
             ],
             primary_key: vec!["id".to_string()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );

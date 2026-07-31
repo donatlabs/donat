@@ -1,6 +1,6 @@
 //! Query planning: one GraphQL operation -> Vec<RootField> (IR).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use donat_catalog::{Catalog, TableInfo};
@@ -14,7 +14,9 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
+use crate::commands::{CompiledCommand, CompiledSourceCommandCatalog};
 use crate::naming::{column_db_name, column_graphql_name, root_names, table_base_name};
+use crate::process_effects::{FinalizedCompiledCommand, FinalizedSourceCommandCatalog};
 
 /// Per-request session: an explicit role + X-Donat-*/X-Hasura-* variables
 /// (keys lower-cased). There is no admin role — every access goes through an
@@ -142,10 +144,8 @@ impl<'a> TableCtx<'a> {
         }
         let mut max = 0u64;
         for p in &self.perms {
-            match p.limit {
-                None => return None,
-                Some(l) => max = max.max(l),
-            }
+            let l = p.limit?;
+            max = max.max(l);
         }
         Some(max)
     }
@@ -245,11 +245,30 @@ pub struct Planner<'a> {
     /// Relay mode (/v1beta1/relay): `<t>_connection` roots, global ids.
     pub relay: bool,
     inherited_roles: &'a [donat_metadata::InheritedRole],
+    metadata: &'a Metadata,
     remote_schemas: &'a [donat_metadata::RemoteSchema],
     catalog: &'a Catalog,
     tables: &'a [TableEntry],
     functions: &'a [donat_metadata::FunctionEntry],
+    commands: Option<&'a CompiledSourceCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
+    source_kind: SourceKind,
+    /// Used only while compiling the role-independent composite schema. It
+    /// contributes command type information for GraphQL validation, while the
+    /// cached role schemas and request planner still enforce explicit roles.
+    pub(crate) expose_all_commands: bool,
     index: Arc<PlannerIndex>,
+}
+
+/// Command catalog and source constraints carried by a planner.
+///
+/// Commands are source-local: a catalog may be present only for the source it
+/// was compiled against, and its roots are supported only by Postgres.
+struct CommandPlannerConfig<'a> {
+    commands: Option<&'a CompiledSourceCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
+    source_kind: SourceKind,
+    expose_all_commands: bool,
 }
 
 impl std::ops::Deref for Planner<'_> {
@@ -288,6 +307,12 @@ impl<'a> Planner<'a> {
             catalog,
             &[],
             &[],
+            CommandPlannerConfig {
+                commands: None,
+                finalized_commands: None,
+                source_kind: SourceKind::Postgres,
+                expose_all_commands: false,
+            },
             Self::compile_index_parts(&[], &[], donat_backend::capabilities::postgres()),
         )
     }
@@ -310,11 +335,31 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         index: Arc<PlannerIndex>,
     ) -> Self {
+        Self::for_source_with_index_and_commands(
+            metadata, source, catalog, index, None, None, false,
+        )
+    }
+
+    pub(crate) fn for_source_with_index_and_commands(
+        metadata: &'a Metadata,
+        source: &'a Source,
+        catalog: &'a Catalog,
+        index: Arc<PlannerIndex>,
+        commands: Option<&'a CompiledSourceCommandCatalog>,
+        finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
+        expose_all_commands: bool,
+    ) -> Self {
         Self::from_parts(
             metadata,
             catalog,
             source.tables.as_slice(),
             source.functions.as_slice(),
+            CommandPlannerConfig {
+                commands,
+                finalized_commands,
+                source_kind: source.kind,
+                expose_all_commands,
+            },
             index,
         )
     }
@@ -409,16 +454,22 @@ impl<'a> Planner<'a> {
         catalog: &'a Catalog,
         tables: &'a [TableEntry],
         functions: &'a [donat_metadata::FunctionEntry],
+        command_config: CommandPlannerConfig<'a>,
         index: Arc<PlannerIndex>,
     ) -> Self {
         Planner {
             infer_function_permissions: true,
             relay: false,
             inherited_roles: &metadata.inherited_roles,
+            metadata,
             remote_schemas: &metadata.remote_schemas,
             catalog,
             tables,
             functions,
+            commands: command_config.commands,
+            finalized_commands: command_config.finalized_commands,
+            source_kind: command_config.source_kind,
+            expose_all_commands: command_config.expose_all_commands,
             index,
         }
     }
@@ -432,6 +483,24 @@ impl<'a> Planner<'a> {
     /// All mutation roots owned by this source. Read-only backends expose no
     /// mutation ownership even though their metadata may contain table CRUD.
     pub fn mutation_root_names(&self) -> impl Iterator<Item = &str> {
+        self.standard_mutation_root_names().chain(
+            (self.source_kind == SourceKind::Postgres)
+                .then_some(())
+                .into_iter()
+                .flat_map(|_| {
+                    self.commands.into_iter().flat_map(|commands| {
+                        commands
+                            .commands()
+                            .map(|command| command.definition().name.as_str())
+                    })
+                }),
+        )
+    }
+
+    /// Non-command mutation roots owned by this source. Composite routing
+    /// keeps these source-global; command roots are resolved per role because
+    /// their visibility is itself part of the generated role schema.
+    pub(crate) fn standard_mutation_root_names(&self) -> impl Iterator<Item = &str> {
         let table_roots = self
             .capabilities
             .mutations
@@ -445,6 +514,32 @@ impl<'a> Planner<'a> {
             .into_iter()
             .flat_map(|_| self.mutation_function_roots.keys().map(String::as_str));
         table_roots.chain(function_roots)
+    }
+
+    pub(crate) fn command_named(&self, name: &str) -> Option<&CompiledCommand> {
+        if self.source_kind != SourceKind::Postgres {
+            return None;
+        }
+        self.commands.and_then(|commands| commands.command(name))
+    }
+
+    pub(crate) fn finalized_command_named(&self, name: &str) -> Option<&FinalizedCompiledCommand> {
+        if self.source_kind != SourceKind::Postgres {
+            return None;
+        }
+        self.finalized_commands
+            .and_then(|commands| commands.command(name))
+    }
+
+    pub(crate) fn command_definitions(&self) -> impl Iterator<Item = &CompiledCommand> {
+        (self.source_kind == SourceKind::Postgres)
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| {
+                self.commands
+                    .into_iter()
+                    .flat_map(CompiledSourceCommandCatalog::commands)
+            })
     }
 
     pub(crate) fn relay_root_names(&self) -> impl Iterator<Item = String> + '_ {
@@ -477,16 +572,110 @@ impl<'a> Planner<'a> {
     /// The select permissions a (possibly inherited) role has on a table:
     /// a direct permission overrides the inherited combination.
     fn role_select_perms(&self, entry: &'a TableEntry, role: &str) -> Vec<&'a SelectPermission> {
-        if let Some(p) = entry.select_permissions.iter().find(|p| p.role == role) {
-            return vec![&p.permission];
+        self.role_select_perms_from(&entry.select_permissions, role, &mut HashSet::new())
+    }
+
+    fn role_select_perms_from<'x>(
+        &self,
+        list: &'x [donat_metadata::PermissionEntry<SelectPermission>],
+        role: &str,
+        visiting: &mut HashSet<String>,
+    ) -> Vec<&'x SelectPermission> {
+        if let Some(permission) = list.iter().find(|permission| permission.role == role) {
+            return vec![&permission.permission];
         }
-        let mut out = vec![];
-        for parent in self.expand_role(role) {
-            if let Some(p) = entry.select_permissions.iter().find(|p| p.role == parent) {
-                out.push(&p.permission);
+        if !visiting.insert(role.to_owned()) {
+            return Vec::new();
+        }
+        let mut permissions = Vec::new();
+        if let Some(inherited) = self
+            .inherited_roles
+            .iter()
+            .find(|inherited| inherited.role_name == role)
+        {
+            for parent in &inherited.role_set {
+                permissions.extend(self.role_select_perms_from(list, parent, visiting));
             }
         }
-        out
+        visiting.remove(role);
+        permissions
+    }
+
+    fn permission_declared_for_role<T>(
+        &self,
+        list: &[donat_metadata::PermissionEntry<T>],
+        role: &str,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if list.iter().any(|permission| permission.role == role) {
+            return true;
+        }
+        if !visiting.insert(role.to_owned()) {
+            return false;
+        }
+        let declared = self
+            .inherited_roles
+            .iter()
+            .find(|inherited| inherited.role_name == role)
+            .is_some_and(|inherited| {
+                inherited
+                    .role_set
+                    .iter()
+                    .any(|parent| self.permission_declared_for_role(list, parent, visiting))
+            });
+        visiting.remove(role);
+        declared
+    }
+
+    pub(crate) fn command_table_ctx_by_name(
+        &self,
+        table: &QualifiedTable,
+        role: &str,
+    ) -> Option<TableCtx<'a>> {
+        let idx = *self
+            .by_table
+            .get(&format!("{}.{}", table.schema(), table.name()))?;
+        let entry = &self.tables[idx];
+        let info = self
+            .catalog
+            .table(entry.table.schema(), entry.table.name())?;
+        let command_declared = self.permission_declared_for_role(
+            &entry.command_select_permissions,
+            role,
+            &mut HashSet::new(),
+        );
+        let perms = if command_declared {
+            self.role_select_perms_from(
+                &entry.command_select_permissions,
+                role,
+                &mut HashSet::new(),
+            )
+        } else {
+            self.role_select_perms(entry, role)
+        };
+        if perms.is_empty() {
+            return None;
+        }
+        Some(TableCtx {
+            entry,
+            info,
+            perms,
+            type_name: table_base_name(entry),
+        })
+    }
+
+    pub(crate) fn resolve_command_role_perm<'x, T: serde::Serialize>(
+        &self,
+        command_list: &'x [donat_metadata::PermissionEntry<T>],
+        ordinary_list: &'x [donat_metadata::PermissionEntry<T>],
+        role: &str,
+        applies: impl Fn(&T) -> bool,
+    ) -> Option<&'x T> {
+        if self.permission_declared_for_role(command_list, role, &mut HashSet::new()) {
+            self.resolve_role_perm(command_list, role, applies)
+        } else {
+            self.resolve_role_perm(ordinary_list, role, applies)
+        }
     }
 
     /// Resolve a non-select (mutation/function) permission for a role:
@@ -570,12 +759,9 @@ impl<'a> Planner<'a> {
         if !self.function_allowed(fentry, &session.role) {
             return None;
         }
-        let Some(finfo) = self
+        let finfo = self
             .catalog
-            .function(fentry.function.schema(), fentry.function.name())
-        else {
-            return None;
-        };
+            .function(fentry.function.schema(), fentry.function.name())?;
         let Some((rschema, rname)) = &finfo.returns_table else {
             return None;
         };
@@ -750,6 +936,14 @@ impl<'a> Planner<'a> {
         self.tables
     }
 
+    pub(crate) fn metadata(&self) -> &'a Metadata {
+        self.metadata
+    }
+
+    pub(crate) fn catalog_table(&self, table: &QualifiedTable) -> Option<&'a TableInfo> {
+        self.catalog.table(table.schema(), table.name())
+    }
+
     pub(crate) fn entry_for(&self, table: &QualifiedTable) -> Option<&'a TableEntry> {
         let idx = *self
             .by_table
@@ -887,10 +1081,10 @@ impl<'a> Planner<'a> {
         // Effective variables: provided ones + defaults from the definition.
         let mut vars = variables.clone();
         for vd in var_definitions {
-            if !vars.contains_key(&vd.name) {
-                if let Some(default) = &vd.default_value {
-                    vars.insert(vd.name.clone(), value_to_json(default, &vars, "$")?);
-                }
+            if !vars.contains_key(&vd.name)
+                && let Some(default) = &vd.default_value
+            {
+                vars.insert(vd.name.clone(), value_to_json(default, &vars, "$")?);
             }
         }
 
@@ -932,13 +1126,12 @@ impl<'a> Planner<'a> {
                     format!("field '{}' not found in type: 'query_root'", field.name),
                 )
             };
-            if self.relay {
-                if let Some(root) =
+            if self.relay
+                && let Some(root) =
                     self.plan_relay_root(field, fragments, variables, session, &path)?
-                {
-                    out.push(root);
-                    continue;
-                }
+            {
+                out.push(root);
+                continue;
             }
             let Some(&(kind, source)) = self.roots.get(&field.name) else {
                 return Err(not_found());
@@ -1068,15 +1261,15 @@ impl<'a> Planner<'a> {
 
         let mut args = vec![];
         for (i, arg) in finfo.args.iter().enumerate() {
-            if let (Some(name), Some(sess_arg)) = (&arg.name, session_argument) {
-                if name == sess_arg {
-                    args.push(FunctionArgValue {
-                        name: arg.name.clone(),
-                        value: Scalar::Json(Json::String(session_json(session))),
-                        pg_type: arg.pg_type.clone(),
-                    });
-                    continue;
-                }
+            if let (Some(name), Some(sess_arg)) = (&arg.name, session_argument)
+                && name == sess_arg
+            {
+                args.push(FunctionArgValue {
+                    name: arg.name.clone(),
+                    value: Scalar::Json(Json::String(session_json(session))),
+                    pg_type: arg.pg_type.clone(),
+                });
+                continue;
             }
             let value = arg.name.as_ref().and_then(|n| user_args.get(n)).cloned();
             match value {
@@ -1224,13 +1417,13 @@ impl<'a> Planner<'a> {
         // merges into LIMIT; on aggregates it only caps `nodes` (the
         // aggregate itself is computed over the full filtered set).
         let mut nodes_limit = None;
-        if kind != RootKind::ByPk {
-            if let Some(perm_limit) = ctx.select_perm_limit() {
-                if kind == RootKind::Aggregate {
-                    nodes_limit = Some(perm_limit);
-                } else {
-                    limit = Some(limit.map_or(perm_limit, |l: u64| l.min(perm_limit)));
-                }
+        if kind != RootKind::ByPk
+            && let Some(perm_limit) = ctx.select_perm_limit()
+        {
+            if kind == RootKind::Aggregate {
+                nodes_limit = Some(perm_limit);
+            } else {
+                limit = Some(limit.map_or(perm_limit, |l: u64| l.min(perm_limit)));
             }
         }
 
@@ -1356,29 +1549,26 @@ impl<'a> Planner<'a> {
                     });
                     continue;
                 }
-                if let Some(base) = field.name.strip_suffix("_connection") {
-                    if let Some(rel) = ctx
+                if let Some(base) = field.name.strip_suffix("_connection")
+                    && let Some(rel) = ctx
                         .entry
                         .array_relationships
                         .iter()
                         .find(|r| r.name == base)
-                    {
-                        let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
-                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                        else {
-                            return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
-                        };
-                        let conn = self.build_connection(
-                            &remote, field, fragments, vars, session, &fpath, join,
-                        )?;
-                        out.push(OutputField {
-                            alias,
-                            value: FieldValue::NestedConnection {
-                                conn: Box::new(conn),
-                            },
-                        });
-                        continue;
-                    }
+                {
+                    let (remote_table, join) = self.array_rel_target(ctx, rel, &fpath)?;
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
+                        return Err(field_not_found(&fpath, &field.name, &ctx.type_name));
+                    };
+                    let conn = self
+                        .build_connection(&remote, field, fragments, vars, session, &fpath, join)?;
+                    out.push(OutputField {
+                        alias,
+                        value: FieldValue::NestedConnection {
+                            conn: Box::new(conn),
+                        },
+                    });
+                    continue;
                 }
             }
 
@@ -1531,16 +1721,16 @@ impl<'a> Planner<'a> {
                 // Hidden columns carry the joining values.
                 for col in &rel.donat_fields {
                     let hidden = format!("__rr__{col}");
-                    if !out.iter().any(|f: &OutputField| f.alias == hidden) {
-                        if let Some(info) = ctx.info.column(col) {
-                            out.push(OutputField {
-                                alias: hidden,
-                                value: FieldValue::Column {
-                                    column: info.name.clone(),
-                                    pg_type: info.sql_type().to_string(),
-                                },
-                            });
-                        }
+                    if !out.iter().any(|f: &OutputField| f.alias == hidden)
+                        && let Some(info) = ctx.info.column(col)
+                    {
+                        out.push(OutputField {
+                            alias: hidden,
+                            value: FieldValue::Column {
+                                column: info.name.clone(),
+                                pg_type: info.sql_type().to_string(),
+                            },
+                        });
                     }
                 }
                 // Build `query($v0: T!) { <root>(arg: $v0, lit: x) {sel} }`.
@@ -1861,86 +2051,83 @@ impl<'a> Planner<'a> {
                 }
 
                 // Aggregate over an array relationship?
-                if let Some(base) = key.strip_suffix("_aggregate") {
-                    if let Some(rel) = ctx
+                if let Some(base) = key.strip_suffix("_aggregate")
+                    && let Some(rel) = ctx
                         .entry
                         .array_relationships
                         .iter()
                         .filter(|_| self.capabilities.relationships)
                         .find(|r| r.name == base)
-                    {
-                        let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
-                        let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role)
-                        else {
-                            return Err(field_not_found(path, key, &ctx.type_name));
-                        };
-                        let predicate = self
-                            .permission_predicate(&remote, session, path)?
-                            .map(Box::new);
-                        let Json::Object(inner) = dir_value else {
-                            return Err(PlanError::validation(path, "expected an order_by object"));
-                        };
-                        let remote_ir_table = Table {
-                            schema: remote.info.schema.clone(),
-                            name: remote.info.name.clone(),
-                        };
-                        for (agg, agg_value) in inner {
-                            if agg == "count" {
-                                let (direction, nulls) = parse_order_direction(agg_value, path)?;
+                {
+                    let (remote_table, join) = self.array_rel_target(ctx, rel, path)?;
+                    let Some(remote) = self.table_ctx_by_name(&remote_table, &session.role) else {
+                        return Err(field_not_found(path, key, &ctx.type_name));
+                    };
+                    let predicate = self
+                        .permission_predicate(&remote, session, path)?
+                        .map(Box::new);
+                    let Json::Object(inner) = dir_value else {
+                        return Err(PlanError::validation(path, "expected an order_by object"));
+                    };
+                    let remote_ir_table = Table {
+                        schema: remote.info.schema.clone(),
+                        name: remote.info.name.clone(),
+                    };
+                    for (agg, agg_value) in inner {
+                        if agg == "count" {
+                            let (direction, nulls) = parse_order_direction(agg_value, path)?;
+                            out.push(OrderBy {
+                                target: OrderByTarget::RelationshipAggregate {
+                                    table: remote_ir_table.clone(),
+                                    join: join.clone(),
+                                    function: "count".into(),
+                                    column: None,
+                                    predicate: predicate.clone(),
+                                },
+                                direction,
+                                nulls,
+                            });
+                        } else {
+                            // The function name is rendered into SQL
+                            // verbatim by sqlgen, so it must be one of the
+                            // fixed column-aggregate ops — never arbitrary
+                            // input.
+                            if !AGGREGATE_COLUMN_OPS.contains(&agg.as_str()) {
+                                return Err(field_not_found(
+                                    path,
+                                    agg,
+                                    &format!("{}_aggregate_order_by", remote.type_name),
+                                ));
+                            }
+                            let Json::Object(cols) = agg_value else {
+                                return Err(PlanError::validation(
+                                    path,
+                                    "expected an order_by object",
+                                ));
+                            };
+                            for (col, dir_value) in cols {
+                                let Some(db_col) = remote
+                                    .column_db_name(col)
+                                    .filter(|c| remote.column_allowed(c))
+                                else {
+                                    return Err(field_not_found(path, col, &remote.type_name));
+                                };
+                                let (direction, nulls) = parse_order_direction(dir_value, path)?;
                                 out.push(OrderBy {
                                     target: OrderByTarget::RelationshipAggregate {
                                         table: remote_ir_table.clone(),
                                         join: join.clone(),
-                                        function: "count".into(),
-                                        column: None,
+                                        function: agg.clone(),
+                                        column: Some(db_col),
                                         predicate: predicate.clone(),
                                     },
                                     direction,
                                     nulls,
                                 });
-                            } else {
-                                // The function name is rendered into SQL
-                                // verbatim by sqlgen, so it must be one of the
-                                // fixed column-aggregate ops — never arbitrary
-                                // input.
-                                if !AGGREGATE_COLUMN_OPS.contains(&agg.as_str()) {
-                                    return Err(field_not_found(
-                                        path,
-                                        agg,
-                                        &format!("{}_aggregate_order_by", remote.type_name),
-                                    ));
-                                }
-                                let Json::Object(cols) = agg_value else {
-                                    return Err(PlanError::validation(
-                                        path,
-                                        "expected an order_by object",
-                                    ));
-                                };
-                                for (col, dir_value) in cols {
-                                    let Some(db_col) = remote
-                                        .column_db_name(col)
-                                        .filter(|c| remote.column_allowed(c))
-                                    else {
-                                        return Err(field_not_found(path, col, &remote.type_name));
-                                    };
-                                    let (direction, nulls) =
-                                        parse_order_direction(dir_value, path)?;
-                                    out.push(OrderBy {
-                                        target: OrderByTarget::RelationshipAggregate {
-                                            table: remote_ir_table.clone(),
-                                            join: join.clone(),
-                                            function: agg.clone(),
-                                            column: Some(db_col),
-                                            predicate: predicate.clone(),
-                                        },
-                                        direction,
-                                        nulls,
-                                    });
-                                }
                             }
                         }
-                        continue;
                     }
+                    continue;
                 }
 
                 if let Some(rel) = ctx
@@ -2173,27 +2360,6 @@ impl<'a> Planner<'a> {
             path,
             format!("relationship '{}' has no using clause", rel.name),
         ))
-    }
-}
-
-#[cfg(test)]
-mod capability_source_tests {
-    use super::*;
-
-    #[test]
-    fn planner_uses_named_default_source_capabilities() {
-        let metadata: Metadata = serde_json::from_value(serde_json::json!({
-            "version": 3,
-            "sources": [
-                { "name": "primary", "kind": "postgres", "configuration": {}, "tables": [] },
-                { "name": "default", "kind": "clickhouse", "configuration": {}, "tables": [] }
-            ]
-        }))
-        .unwrap();
-        let catalog = Catalog::default();
-        let planner = Planner::new(&metadata, &catalog);
-        assert!(!planner.capabilities.mutations);
-        assert!(!planner.capabilities.relay);
     }
 }
 
@@ -2753,16 +2919,16 @@ pub(crate) fn flatten_into<'s>(
                     )
                 })?;
                 let graphql_parser::query::TypeCondition::On(on) = &fragment.type_condition;
-                if let Some(tn) = type_name {
-                    if on != tn {
-                        return Err(PlanError::validation(
-                            "$",
-                            format!(
-                                "fragment \"{}\" is defined on '{on}', not '{tn}'",
-                                spread.fragment_name
-                            ),
-                        ));
-                    }
+                if let Some(tn) = type_name
+                    && on != tn
+                {
+                    return Err(PlanError::validation(
+                        "$",
+                        format!(
+                            "fragment \"{}\" is defined on '{on}', not '{tn}'",
+                            spread.fragment_name
+                        ),
+                    ));
                 }
                 flatten_into(&fragment.selection_set, fragments, vars, type_name, out)?;
             }
@@ -2772,10 +2938,9 @@ pub(crate) fn flatten_into<'s>(
                 }
                 if let (Some(graphql_parser::query::TypeCondition::On(on)), Some(tn)) =
                     (&inline.type_condition, type_name)
+                    && on != tn
                 {
-                    if on != tn {
-                        continue;
-                    }
+                    continue;
                 }
                 flatten_into(&inline.selection_set, fragments, vars, type_name, out)?;
             }
@@ -2804,4 +2969,25 @@ fn directives_include(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod capability_source_tests {
+    use super::*;
+
+    #[test]
+    fn planner_uses_named_default_source_capabilities() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "sources": [
+                { "name": "primary", "kind": "postgres", "configuration": {}, "tables": [] },
+                { "name": "default", "kind": "clickhouse", "configuration": {}, "tables": [] }
+            ]
+        }))
+        .unwrap();
+        let catalog = Catalog::default();
+        let planner = Planner::new(&metadata, &catalog);
+        assert!(!planner.capabilities.mutations);
+        assert!(!planner.capabilities.relay);
+    }
 }

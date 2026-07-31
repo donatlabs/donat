@@ -1,0 +1,37 @@
+# Fulfilment entry point. Allocation, shipment creation, and capture belong to
+# the Process; this command proves the order exists before one is created.
+name: start_order_fulfilment
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: destination_region
+    type: string!
+  - name: allocation_request_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+      returning: [id, order_status]
+      require_found: true
+result:
+  order_id: { step: order, column: id }
+  order_status: { step: order, column: order_status }
+idempotency:
+  key: { argument: allocation_request_id }
+  scope:
+    - { argument: order_id }
+  retention: 365d
+effects:
+  - start_process:
+      process: partial_fulfilment
+      input:
+        order_id: { step: order, column: id }
+        destination_region: { arg: destination_region }
+        allocation_request_id: { arg: allocation_request_id }
+      idempotency_key: { argument: allocation_request_id }

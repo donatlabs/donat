@@ -1,0 +1,64 @@
+name: route_fraud_review
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: payment_outcome
+    type: PaymentOutcome!
+  - name: fraud_score
+    type: int!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status]
+      require_found: true
+  # The finite fraud_route table is applied to one immutable payment candidate;
+  # it cannot choose a relation, role, connector, or executable expression.
+  - name: route
+    decision:
+      decision_table: fraud_route
+      input:
+        payment_outcome: { arg: payment_outcome }
+        score: { arg: fraud_score }
+      returning: [hold, route]
+  - name: fraud_review
+    insert:
+      table: public.payment_fraud_review
+      object:
+        payment_id: { step: payment, column: id }
+        provider_event_id: { arg: provider_event_id }
+        fraud_score: { arg: fraud_score }
+        route: { step: route, column: route }
+        status:
+          rule: fraud_state_for_route
+          with:
+            hold: { step: route, column: hold }
+      returning: [id, payment_id, provider_event_id, fraud_score, route, status]
+  # This is append-only decision evidence. Resolution writes a distinct audit
+  # record rather than changing the routing rationale selected at ingress.
+  - name: decision_audit
+    insert:
+      table: public.payment_fraud_decision
+      object:
+        fraud_review_id: { step: fraud_review, column: id }
+        decision: { literal: routed }
+        decision_route: { step: fraud_review, column: route }
+        provider_event_id: { step: fraud_review, column: provider_event_id }
+      returning: [id, fraud_review_id, decision, decision_route, provider_event_id]
+result:
+  fraud_reviews: { step: fraud_review }
+  decision_audit: { step: decision_audit }
+idempotency:
+  key: { argument: provider_event_id }
+  scope:
+    - { argument: payment_id }
+  retention: 365d

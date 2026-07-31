@@ -11,8 +11,8 @@
 //!     the PK is auto-increment and the insert omitted it) or by supplied PK;
 //!   - update: UPDATE ... WHERE <pred>, then re-SELECT WHERE <pred>;
 //!   - delete: SELECT WHERE <pred> first, then DELETE ... WHERE <pred>.
-//! Any violated permission CHECK rolls the whole transaction back and surfaces
-//! the same `permission-error` body as Postgres/SQLite.
+//!     Any violated permission CHECK rolls the whole transaction back and surfaces
+//!     the same `permission-error` body as Postgres/SQLite.
 //!
 //! The test is skipped (passes trivially) when no MySQL server is reachable so
 //! the crate's suite stays green in environments without the container.
@@ -129,6 +129,7 @@ fn session() -> Session {
 fn app_state(db_url: &str) -> Arc<AppState> {
     Arc::new(AppState {
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata(db_url)))),
+        connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,

@@ -1,0 +1,44 @@
+name: pause_subscription
+source: default
+permissions:
+  - role: customer
+  - role: subscription_worker
+arguments:
+  - name: subscription_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: subscription
+    select_one:
+      table: public.subscription
+      by:
+        id: { arg: subscription_id }
+      returning: [id, customer_id, status]
+      require_found: true
+  - name: pause_is_allowed
+    assert:
+      rule: can_transition_subscription
+      with:
+        current: { step: subscription, column: status }
+        next: { literal: paused }
+  - name: pause_subscription
+    update:
+      table: public.subscription
+      where:
+        id: { step: subscription, column: id }
+      set:
+        status: { literal: paused }
+        pause_reason: { arg: reason }
+      returning: [id, status, pause_reason]
+result:
+  subscription_id: { step: pause_subscription, column: id }
+  subscription_status: { step: pause_subscription, column: status }
+  pause_reason: { step: pause_subscription, column: pause_reason }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: subscription_id }
+  retention: 365d

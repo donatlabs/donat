@@ -1,0 +1,22 @@
+name: logistics_api
+module: http
+config:
+  endpoint_identity: logistics_prod_eu_2026_07
+  credential_identity: logistics_primary
+  base_url: https://logistics.example.test
+  headers:
+    - name: Authorization
+      value_from_env: LOGISTICS_TOKEN
+operations:
+  - name: create_shipment
+    version: v1
+    method: POST
+    path: /v1/shipments/{input.order_id}
+    body:
+      order_id: { input: order_id }
+    success_statuses: [200, 201]
+    idempotency: { header: Idempotency-Key }
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 20, per: 1s, burst: 8 }
+      serialize_by: { input: order_id }

@@ -131,6 +131,7 @@ fn col(name: &str, pg_type: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        pg_typmod: -1,
         native_type: None,
         nullable: false,
         has_default: false,
@@ -144,6 +145,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("name", "text"),
@@ -152,6 +154,7 @@ fn catalog() -> Catalog {
                 col("system_meta", "jsonb"),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -160,8 +163,10 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "profile".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![col("author_id", "int4"), col("bio", "text")],
             primary_key: vec!["author_id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "profile_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
@@ -175,6 +180,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("title", "text"),
@@ -182,6 +188,7 @@ fn catalog() -> Catalog {
                 col("published", "bool"),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
@@ -850,6 +857,46 @@ fn is_null_parses_bool_operand() {
             ..
         }
     ));
+}
+
+fn permission_is_null(session_value: &str) -> Result<SelectQuery, PlanError> {
+    let mut metadata = metadata();
+    metadata.sources[0].tables[2].select_permissions.push(
+        serde_json::from_value(json!({
+            "role": "null_filter",
+            "permission": {
+                "columns": ["id", "title"],
+                "filter": {
+                    "title": { "_is_null": "X-Donat-Is-Null" }
+                }
+            }
+        }))
+        .expect("permission fixture deserializes"),
+    );
+    let catalog = catalog();
+    Planner::new(&metadata, &catalog).plan_v1_select(
+        &json!({ "table": "article", "columns": ["id"] }),
+        &session("null_filter", &[("x-donat-is-null", session_value)]),
+    )
+}
+
+#[test]
+fn is_null_permission_session_string_is_strict_boolean() {
+    for (value, expected) in [("TRUE", true), ("false", false)] {
+        let query = permission_is_null(value)
+            .unwrap_or_else(|error| panic!("`{value}` must parse: {error:?}"));
+        assert!(matches!(
+            query.predicate,
+            Some(BoolExp::Compare {
+                op: CompareOp::IsNull(actual),
+                ..
+            }) if actual == expected
+        ));
+    }
+
+    let error = permission_is_null("yes").expect_err("non-boolean session text must fail closed");
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.message, "expected a boolean");
 }
 
 #[test]

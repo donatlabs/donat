@@ -1,0 +1,24 @@
+description: A role with ordinary table-mutation permission cannot invoke a command it was not granted.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: viewer
+query:
+  query: |
+    mutation ForbiddenCommand {
+      create_order(
+        id: "550e8400-e29b-41d4-a716-446655440040"
+        customer_id: "550e8400-e29b-41d4-a716-446655440001"
+        status: "draft"
+        quantity: 1
+        request_id: "550e8400-e29b-41d4-a716-446655440041"
+      ) {
+        order_id
+      }
+    }
+response:
+  errors:
+    - extensions:
+        path: $.selectionSet.create_order
+        code: validation-failed
+      message: "field 'create_order' not found in type: 'mutation_root'"

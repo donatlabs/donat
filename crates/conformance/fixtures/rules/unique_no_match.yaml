@@ -1,0 +1,21 @@
+decision_tables:
+  - name: approval_route
+    inputs:
+      amount: int!
+    output:
+      route: string!
+    hit_policy: unique
+    rows:
+      - id: positive
+        when:
+          amount: "amount > 0"
+        output:
+          route: automatic
+    test_cases:
+      - name: rejects_zero_matches
+        input:
+          amount: 0
+        expect:
+          output:
+            route: automatic
+          matched_row_id: positive

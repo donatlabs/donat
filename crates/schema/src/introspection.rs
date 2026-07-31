@@ -8,10 +8,14 @@ use std::borrow::Cow;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_backend::capabilities::JsonOps;
-use donat_metadata::Columns;
+use donat_ir::{TypeRef, ValueScalar, ValueType};
+use donat_metadata::{
+    Columns, CommandResultValue as MetadataCommandResultValue, CommandStepOperation, Metadata,
+};
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
-use crate::naming::{root_names, table_base_name};
+use crate::commands::CompiledCommand;
+use crate::naming::{command_pascal_case, root_names, table_base_name};
 use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
 
 /// GraphQL scalar name for a Postgres type (Donat naming).
@@ -135,6 +139,367 @@ fn enum_type(name: &str, values: &[&str]) -> Json {
     })
 }
 
+fn command_type_reference(metadata: &Metadata, type_: &str) -> Json {
+    let (non_null_type, nullable) = match type_.strip_suffix('!') {
+        Some(inner) => (inner, false),
+        None => (type_, true),
+    };
+    let inner = if let Some(list) = non_null_type
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        list_of(command_type_reference(metadata, list))
+    } else {
+        let name = match non_null_type {
+            "Boolean" | "bool" => "Boolean".to_string(),
+            "String" | "string" | "ID" => "String".to_string(),
+            "Int" | "int" => "Int".to_string(),
+            "Float" | "float" | "decimal" => "Float".to_string(),
+            other => other.to_string(),
+        };
+        let kind = if metadata
+            .custom_types
+            .input_objects
+            .iter()
+            .any(|input| input.name == name)
+        {
+            "INPUT_OBJECT"
+        } else if metadata
+            .custom_types
+            .enums
+            .iter()
+            .any(|enum_| enum_.name == name)
+        {
+            "ENUM"
+        } else {
+            "SCALAR"
+        };
+        named(kind, &name)
+    };
+    if nullable { inner } else { non_null(inner) }
+}
+
+fn command_type_scalars(
+    metadata: &Metadata,
+    type_: &str,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) {
+    let type_ = type_.strip_suffix('!').unwrap_or(type_);
+    if let Some(inner) = type_
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        command_type_scalars(metadata, inner, types, scalars, generated);
+        return;
+    }
+    let scalar = match type_ {
+        "Boolean" | "bool" => Some("Boolean"),
+        "String" | "string" | "ID" => Some("String"),
+        "Int" | "int" => Some("Int"),
+        "Float" | "float" | "decimal" => Some("Float"),
+        "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(type_),
+        _ => None,
+    };
+    if let Some(scalar) = scalar {
+        scalars.insert(scalar.to_string());
+        return;
+    }
+    if let Some(input) = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .find(|input| input.name == type_)
+    {
+        if generated.insert(input.name.clone()) {
+            for field in &input.fields {
+                command_type_scalars(metadata, &field.type_, types, scalars, generated);
+            }
+            types.push(input_object_type(
+                &input.name,
+                input
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        input_value(&field.name, command_type_reference(metadata, &field.type_))
+                    })
+                    .collect(),
+            ));
+        }
+        return;
+    }
+    if let Some(enum_) = metadata
+        .custom_types
+        .enums
+        .iter()
+        .find(|enum_| enum_.name == type_)
+        && generated.insert(enum_.name.clone())
+    {
+        types.push(enum_type(
+            &enum_.name,
+            &enum_
+                .values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+        ));
+        return;
+    }
+    scalars.insert(type_.to_string());
+}
+
+fn command_result_type(
+    command: &CompiledCommand,
+    name: &str,
+    value: &MetadataCommandResultValue,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let contract = &command.descriptor().result.roots[name].type_ref;
+    let field_order = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: Some(field),
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .and_then(|step| match &step.operation {
+                CommandStepOperation::AllocateMany { allocate_many } => match field.as_str() {
+                    "groups" => Some(allocate_many.returning.groups.clone()),
+                    "lines" => Some(allocate_many.returning.lines.clone()),
+                    "backorders" => Some(allocate_many.returning.backorders.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }),
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: None,
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .map(|step| match &step.operation {
+                CommandStepOperation::SelectOne { select_one } => select_one.returning.clone(),
+                CommandStepOperation::SelectMany { select_many } => select_many.returning.clone(),
+                CommandStepOperation::Insert { insert } => insert.returning.clone(),
+                CommandStepOperation::InsertMany { insert_many } => insert_many.returning.clone(),
+                CommandStepOperation::Update { update } => update.returning.clone(),
+                CommandStepOperation::UpdateMany { update_many } => update_many.returning.clone(),
+                CommandStepOperation::UpdateWhen { update_when } => update_when.returning.clone(),
+                CommandStepOperation::InsertWhen { insert_when } => insert_when.returning.clone(),
+                CommandStepOperation::Decision { decision } => decision.returning.clone(),
+                CommandStepOperation::DecisionMany { decision_many } => {
+                    decision_many.returning.clone()
+                }
+                CommandStepOperation::Delete { delete } => delete.returning.clone(),
+                CommandStepOperation::Aggregate { aggregate } => {
+                    aggregate.values.keys().cloned().collect()
+                }
+                CommandStepOperation::Project { project } => {
+                    project.values.keys().cloned().collect()
+                }
+                CommandStepOperation::ProjectMany { project_many } => {
+                    project_many.values.keys().cloned().collect()
+                }
+                CommandStepOperation::FixedRows { fixed_rows } => fixed_rows
+                    .rows
+                    .first()
+                    .map(|row| row.keys().cloned().collect())
+                    .unwrap_or_default(),
+                CommandStepOperation::Assert { .. }
+                | CommandStepOperation::AssertWhen { .. }
+                | CommandStepOperation::AllocateMany { .. } => Vec::new(),
+            }),
+        MetadataCommandResultValue::ProjectedStep { project, .. } => {
+            Some(project.keys().cloned().collect())
+        }
+        _ => None,
+    };
+    let row_name = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            as_,
+            column,
+            field,
+            ..
+        } if column.is_none() => as_.clone().unwrap_or_else(|| match field {
+            Some(field) => format!(
+                "{}{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step),
+                command_pascal_case(field),
+            ),
+            None => format!(
+                "{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step)
+            ),
+        }),
+        MetadataCommandResultValue::ProjectedStep { step, .. } => format!(
+            "{}{}Row",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(step)
+        ),
+        _ => format!(
+            "{}{}Value",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(name)
+        ),
+    };
+    command_contract_reference(
+        contract,
+        &row_name,
+        field_order.as_deref(),
+        types,
+        scalars,
+        generated,
+    )
+}
+
+fn command_contract_reference(
+    contract: &TypeRef,
+    object_name: &str,
+    field_order: Option<&[String]>,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let inner = match &contract.value_type {
+        ValueType::Scalar { scalar } => {
+            let name = match scalar {
+                ValueScalar::Boolean => "Boolean".to_owned(),
+                ValueScalar::String => "String".to_owned(),
+                ValueScalar::Int32 => "Int".to_owned(),
+                ValueScalar::Int64 => "int8".to_owned(),
+                ValueScalar::UInt64 => "uint8".to_owned(),
+                ValueScalar::Decimal => "Float".to_owned(),
+                ValueScalar::Uuid => "uuid".to_owned(),
+                ValueScalar::Date => "date".to_owned(),
+                ValueScalar::Timestamp => "timestamp".to_owned(),
+                ValueScalar::TimestampTz => "timestamptz".to_owned(),
+                ValueScalar::Json => "json".to_owned(),
+                ValueScalar::Custom { name } => name.clone(),
+            };
+            scalars.insert(name.clone());
+            named("SCALAR", &name)
+        }
+        ValueType::Enum { name, values } => {
+            if generated.insert(name.clone()) {
+                types.push(enum_type(
+                    name,
+                    &values.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            named("ENUM", name)
+        }
+        ValueType::Object { fields } => {
+            if generated.insert(object_name.to_owned()) {
+                let ordered_fields = field_order
+                    .map(|order| {
+                        order
+                            .iter()
+                            .filter_map(|name| fields.get_key_value(name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| fields.iter().collect());
+                let output_fields = ordered_fields
+                    .into_iter()
+                    .map(|(name, field_contract)| {
+                        field(
+                            name,
+                            vec![],
+                            command_contract_reference(
+                                &field_contract.type_ref,
+                                &format!("{object_name}{}", command_pascal_case(name)),
+                                None,
+                                types,
+                                scalars,
+                                generated,
+                            ),
+                        )
+                    })
+                    .collect();
+                types.push(object_type(object_name, output_fields));
+            }
+            named("OBJECT", object_name)
+        }
+        ValueType::List { element } => list_of(command_contract_reference(
+            element,
+            object_name,
+            field_order,
+            types,
+            scalars,
+            generated,
+        )),
+        ValueType::Ref { name } => named("OBJECT", name),
+    };
+    if contract.nullable {
+        inner
+    } else {
+        non_null(inner)
+    }
+}
+
+fn add_command_schema(
+    planner: &Planner,
+    command: &CompiledCommand,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    emitted_row_types: &mut std::collections::BTreeSet<String>,
+    emitted_input_types: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let definition = command.definition();
+    let result_name = format!("{}Result", command_pascal_case(&definition.name));
+    let result_fields = definition
+        .result
+        .fields
+        .iter()
+        .map(|field_definition| {
+            field(
+                &field_definition.name,
+                vec![],
+                command_result_type(
+                    command,
+                    &field_definition.name,
+                    &field_definition.value,
+                    types,
+                    scalars,
+                    emitted_row_types,
+                ),
+            )
+        })
+        .collect();
+    types.push(object_type(&result_name, result_fields));
+    let arguments = definition
+        .arguments
+        .iter()
+        .map(|argument| {
+            command_type_scalars(
+                planner.metadata(),
+                &argument.type_,
+                types,
+                scalars,
+                emitted_input_types,
+            );
+            input_value(
+                &argument.name,
+                command_type_reference(planner.metadata(), &argument.type_),
+            )
+        })
+        .collect();
+    field(&definition.name, arguments, named("OBJECT", &result_name))
+}
+
 const ORDER_BY_VALUES: &[&str] = &[
     "asc",
     "asc_nulls_first",
@@ -207,35 +572,33 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             select_columns.push(gql_name);
         }
         for rel in &entry.object_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
-                        // Donat makes an FK-based object relationship
-                        // non-nullable when the local FK column(s) are NOT
-                        // NULL (the related row always exists).
-                        let base = named("OBJECT", &table_base_name(remote_entry));
-                        let ty = if object_rel_is_non_null(rel, ctx.info) {
-                            non_null(base)
-                        } else {
-                            base
-                        };
-                        fields.push(field(&rel.name, vec![], ty));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                // Donat makes an FK-based object relationship
+                // non-nullable when the local FK column(s) are NOT
+                // NULL (the related row always exists).
+                let base = named("OBJECT", &table_base_name(remote_entry));
+                let ty = if object_rel_is_non_null(rel, ctx.info) {
+                    non_null(base)
+                } else {
+                    base
+                };
+                fields.push(field(&rel.name, vec![], ty));
             }
         }
         for rel in &entry.array_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner.table_ctx_by_name(&remote, &session.role).is_some() {
-                        let remote_base = table_base_name(remote_entry);
-                        fields.push(field(
-                            &rel.name,
-                            select_args(&remote_base),
-                            non_null(list_of(non_null(named("OBJECT", &remote_base)))),
-                        ));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                let remote_base = table_base_name(remote_entry);
+                fields.push(field(
+                    &rel.name,
+                    select_args(&remote_base),
+                    non_null(list_of(non_null(named("OBJECT", &remote_base)))),
+                ));
             }
         }
         types.push(object_type(&base, fields));
@@ -514,6 +877,24 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         }
     }
 
+    let mut emitted_command_input_types = std::collections::BTreeSet::new();
+    for command in planner.command_definitions() {
+        if planner.command_is_visible(command, session) {
+            // Generated output names belong to one command. The static command
+            // catalog rejects cross-command collisions, so introspection must
+            // not silently coalesce two different command definitions here.
+            let mut emitted_command_row_types = std::collections::BTreeSet::new();
+            mutation_fields.push(add_command_schema(
+                planner,
+                command,
+                &mut types,
+                &mut scalars,
+                &mut emitted_command_row_types,
+                &mut emitted_command_input_types,
+            ));
+        }
+    }
+
     // Comparison input objects for every scalar in use.
     for scalar in &scalars {
         let s = named("SCALAR", scalar);
@@ -636,7 +1017,7 @@ pub(crate) fn execute_introspection_schema(
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());
         let value = match root.name.as_str() {
             "__typename" => Json::String("query_root".to_string()),
-            "__schema" => match project(&schema, &root.selection_set, &fragments, variables) {
+            "__schema" => match project(schema, &root.selection_set, &fragments, variables) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             },

@@ -1,0 +1,100 @@
+table:
+  name: payment
+  schema: public
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+array_relationships:
+  - name: events
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: payment_event
+          schema: public
+  - name: refunds
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: refund
+          schema: public
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - currency
+        - provider_reference
+      filter: {}
+  - role: reconciliation_worker
+    permission:
+      columns: "*"
+      filter: {}
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      filter: {}
+command_select_permissions:
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - captured_minor
+        - refunded_minor
+        - chargeback_minor
+        - currency
+        - provider_reference
+      filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}
+  - role: payment_worker
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}

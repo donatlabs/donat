@@ -21,6 +21,7 @@ fn col(name: &str, pg_type: &str, nullable: bool) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        pg_typmod: -1,
         native_type: None,
         nullable,
         has_default: false,
@@ -34,6 +35,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("name", "text", false),
@@ -41,6 +43,7 @@ fn fixture_catalog() -> Catalog {
                 col("secret", "text", true),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -49,6 +52,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("title", "text", false),
@@ -56,6 +60,7 @@ fn fixture_catalog() -> Catalog {
                 col("published", "bool", false),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),

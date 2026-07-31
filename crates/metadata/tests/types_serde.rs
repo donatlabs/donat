@@ -6,9 +6,11 @@
 use std::path::Path;
 
 use donat_metadata::{
-    Columns, CronTrigger, DatabaseUrl, InsertPermission, Metadata, PermissionEntry, QualifiedTable,
-    RemoteSchema, RestEndpoint, SelectPermission, SourceKind, TableConfiguration,
-    load_metadata_dir,
+    ActionEntry, Columns, Command, CommandEffect, CommandIdempotencyKey, CommandResultValue,
+    CommandStepOperation, CommandValue, ConnectorBaseUrl, ConnectorInstance, CronTrigger,
+    DatabaseUrl, InsertPermission, Metadata, PermissionEntry, Process, ProcessLifecycle,
+    ProcessValue, QualifiedTable, RemoteSchema, RestEndpoint, RulesMetadata, SelectPermission,
+    SourceKind, TableConfiguration, TableEntry, action_visible_to_role, load_metadata_dir,
 };
 use serde_json::json;
 
@@ -38,6 +40,86 @@ permission:
         entry.permission.filter["$or"][1]["is_public"]["$eq"],
         json!(true)
     );
+}
+
+#[test]
+fn process_lifecycle_defaults_active_and_retains_explicit_retired() {
+    let definition = |lifecycle: &str| {
+        format!(
+            r#"
+name: archived_checkout
+kind: process
+version: 1
+source: default
+{lifecycle}
+permissions:
+  - role: customer
+start_at: done
+states:
+  - id: done
+    output: {{ values: {{}} }}
+"#
+        )
+    };
+
+    let active: Process = serde_yaml::from_str(&definition(""))
+        .expect("omitted process lifecycle defaults to active");
+    assert_eq!(active.lifecycle, ProcessLifecycle::Active);
+
+    let retired: Process = serde_yaml::from_str(&definition("lifecycle: retired"))
+        .expect("explicit retired process lifecycle deserializes");
+    assert_eq!(retired.lifecycle, ProcessLifecycle::Retired);
+    let serialized = serde_yaml::to_string(&retired).expect("retired lifecycle serializes");
+    assert!(serialized.contains("lifecycle: retired"));
+}
+
+#[test]
+fn process_values_retain_explicit_closed_casts() {
+    let value: ProcessValue = serde_yaml::from_str("{ input: order_id, as: string }")
+        .expect("input values accept the closed scalar cast");
+    let ProcessValue::Input {
+        input,
+        as_,
+        require_non_null,
+    } = value
+    else {
+        panic!("input binding must retain its variant");
+    };
+    assert_eq!(input, "order_id");
+    assert_eq!(as_.as_deref(), Some("string"));
+    assert!(!require_non_null);
+
+    let value: ProcessValue = serde_yaml::from_str("{ activity_key: finalize_order, as: uuid }")
+        .expect("activity keys accept an explicit deterministic UUID cast");
+    let ProcessValue::ActivityKey { activity_key, as_ } = value else {
+        panic!("activity key binding must retain its variant");
+    };
+    assert_eq!(activity_key, "finalize_order");
+    assert_eq!(as_.as_deref(), Some("uuid"));
+
+    let value: ProcessValue = serde_yaml::from_str("{ item: outcome, as: string }")
+        .expect("for_each items accept the closed scalar cast");
+    let ProcessValue::Item { item, as_ } = value else {
+        panic!("item binding must retain its variant");
+    };
+    assert_eq!(item, "outcome");
+    assert_eq!(as_.as_deref(), Some("string"));
+
+    let value: ProcessValue =
+        serde_yaml::from_str("{ state: inspected, field: refund_id, require_non_null: true }")
+            .expect("state values retain an explicit non-null runtime assertion");
+    let ProcessValue::State {
+        state,
+        field,
+        require_non_null,
+        ..
+    } = value
+    else {
+        panic!("state binding must retain its variant");
+    };
+    assert_eq!(state, "inspected");
+    assert_eq!(field, "refund_id");
+    assert!(require_non_null);
 }
 
 #[test]
@@ -72,6 +154,29 @@ fn columns_round_trip_serialization() {
 }
 
 #[test]
+fn empty_action_permissions_are_visible_to_any_explicit_role_without_inheritance() {
+    let public: ActionEntry = serde_json::from_value(json!({
+        "name": "public_action",
+        "definition": { "handler": "https://example.invalid/action" },
+        "permissions": []
+    }))
+    .expect("public action metadata deserializes");
+    let restricted: ActionEntry = serde_json::from_value(json!({
+        "name": "restricted_action",
+        "definition": { "handler": "https://example.invalid/action" },
+        "permissions": [{ "role": "owner" }]
+    }))
+    .expect("restricted action metadata deserializes");
+
+    assert!(action_visible_to_role(&public, "customer"));
+    assert!(action_visible_to_role(&restricted, "owner"));
+    assert!(
+        !action_visible_to_role(&restricted, "member"),
+        "Action permissions retain their existing exact-role semantics"
+    );
+}
+
+#[test]
 fn insert_permission_defaults() {
     // Older metadata omits everything but check; absent columns mean "*",
     // backend_only defaults to false, BoolExp defaults to JSON null.
@@ -90,6 +195,62 @@ fn select_permission_defaults() {
     assert_eq!(perm.limit, None);
     assert!(!perm.allow_aggregations);
     assert!(perm.computed_fields.is_empty());
+}
+
+#[test]
+fn command_only_table_permissions_round_trip_separately_from_crud_permissions() {
+    let table: TableEntry = serde_json::from_value(json!({
+        "table": { "schema": "public", "name": "orders" },
+        "command_select_permissions": [{
+            "role": "customer",
+            "permission": {
+                "columns": ["id", "status"],
+                "filter": { "customer_id": { "_eq": "X-Donat-User-Id" } }
+            }
+        }],
+        "command_insert_permissions": [{
+            "role": "customer",
+            "permission": {
+                "columns": ["customer_id", "status"],
+                "check": { "customer_id": { "_eq": "X-Donat-User-Id" } }
+            }
+        }],
+        "command_update_permissions": [{
+            "role": "worker",
+            "permission": {
+                "columns": ["status"],
+                "filter": {},
+                "check": {}
+            }
+        }],
+        "command_delete_permissions": [{
+            "role": "worker",
+            "permission": { "filter": {} }
+        }]
+    }))
+    .expect("command-only table permissions deserialize");
+
+    assert!(table.select_permissions.is_empty());
+    assert!(table.insert_permissions.is_empty());
+    assert!(table.update_permissions.is_empty());
+    assert!(table.delete_permissions.is_empty());
+    assert_eq!(table.command_select_permissions.len(), 1);
+    assert_eq!(table.command_insert_permissions.len(), 1);
+    assert_eq!(table.command_update_permissions.len(), 1);
+    assert_eq!(table.command_delete_permissions.len(), 1);
+
+    let encoded = serde_json::to_value(table).expect("table permissions serialize");
+    for field in [
+        "command_select_permissions",
+        "command_insert_permissions",
+        "command_update_permissions",
+        "command_delete_permissions",
+    ] {
+        assert!(
+            encoded.get(field).is_some(),
+            "{field} must survive metadata round-trip"
+        );
+    }
 }
 
 #[test]
@@ -158,9 +319,42 @@ fn qualified_table_accepts_bare_name_and_qualified_form() {
     assert_eq!(bare.name(), "author");
     assert_eq!(bare.to_string(), "public.author");
 
+    let dotted: QualifiedTable = serde_yaml::from_str("app.author").unwrap();
+    assert_eq!(dotted, QualifiedTable::Name("app.author".into()));
+    assert_eq!(dotted.schema(), "app");
+    assert_eq!(dotted.name(), "author");
+    assert_eq!(dotted.to_string(), "app.author");
+    assert_eq!(
+        serde_json::to_value(&dotted).unwrap(),
+        json!("app.author"),
+        "the accepted scalar form remains scalar when metadata is serialized"
+    );
+
     let qual: QualifiedTable = serde_yaml::from_str("{ schema: app, name: author }").unwrap();
     assert_eq!(qual.schema(), "app");
     assert_eq!(qual.to_string(), "app.author");
+
+    let parts: QualifiedTable = serde_yaml::from_str("[app, author]").unwrap();
+    assert_eq!(
+        parts,
+        QualifiedTable::Parts(vec!["app".into(), "author".into()])
+    );
+    assert_eq!(parts.schema(), "app");
+    assert_eq!(parts.name(), "author");
+}
+
+#[test]
+fn qualified_table_rejects_malformed_dotted_scalar_names() {
+    for invalid in [".author", "app.", "app.public.author"] {
+        let error = serde_yaml::from_str::<QualifiedTable>(invalid)
+            .expect_err("a dotted relation must contain exactly schema and name");
+        assert!(
+            error.to_string().contains(&format!(
+                "invalid qualified table name '{invalid}': expected 'name' or 'schema.name'"
+            )),
+            "{invalid}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -585,4 +779,895 @@ fn existing_fixture_directory_still_loads() {
     let md = load_metadata_dir(dir).expect("fixture metadata should load");
     assert_eq!(md.sources.len(), 1);
     assert_eq!(md.sources[0].tables.len(), 2);
+}
+
+#[test]
+fn rules_wrapper_round_trips_declared_types_and_expression_source() {
+    // A declarative rule keeps its source text and declared types in metadata;
+    // parsing and source locations belong to the future donat-rules crate.
+    let yaml = r#"
+rules:
+  - name: order_request_is_well_formed
+    parameters:
+      lines: "[CreateOrderLine!]!"
+    result: bool!
+    expression: "size(lines) > 0"
+decision_tables:
+  - name: invoice_approval
+    inputs:
+      amount: decimal!
+    output:
+      route: string!
+    hit_policy: first
+    rows:
+      - id: default
+        when: { amount: "true" }
+        output: { route: manual_approval }
+    test_cases:
+      - name: default route
+        input: { amount: 100 }
+        expect:
+          output: { route: manual_approval }
+          matched_row_id: default
+"#;
+
+    let rules: RulesMetadata = serde_yaml::from_str(yaml).expect("rules wrapper must deserialize");
+    assert_eq!(rules.rules.len(), 1);
+    assert_eq!(rules.rules[0].parameters["lines"], "[CreateOrderLine!]!");
+    assert_eq!(rules.rules[0].result, "bool!");
+    assert_eq!(rules.rules[0].expression, "size(lines) > 0");
+    assert_eq!(rules.decision_tables.len(), 1);
+    assert_eq!(rules.decision_tables[0].rows[0].when["amount"], "true");
+    assert_eq!(
+        rules.decision_tables[0].test_cases[0].expect.matched_row_id,
+        "default"
+    );
+
+    let round_trip: RulesMetadata =
+        serde_json::from_value(serde_json::to_value(&rules).expect("rules wrapper must serialize"))
+            .expect("serialized rules wrapper must deserialize");
+    assert_eq!(round_trip.rules[0].expression, "size(lines) > 0");
+    assert_eq!(
+        round_trip.decision_tables[0].test_cases[0].expect.output["route"],
+        json!("manual_approval")
+    );
+}
+
+#[test]
+fn types_only_rules_wrapper_is_retained_without_empty_rule_sections() {
+    let rules: RulesMetadata = serde_yaml::from_str(
+        r#"
+types:
+  - name: OrderStatus
+    enum: [draft, submitted]
+  - name: CreateOrderLine
+    object:
+      sku: string!
+      status: OrderStatus!
+"#,
+    )
+    .expect("a types-only rules wrapper must deserialize");
+
+    assert_eq!(rules.types.len(), 2);
+    assert_eq!(rules.types[0].name, "OrderStatus");
+    assert_eq!(
+        rules.types[0].enum_values.as_deref(),
+        Some(&["draft".to_owned(), "submitted".to_owned()][..])
+    );
+    assert_eq!(
+        rules.types[1].object.as_ref().expect("object declaration")["status"],
+        "OrderStatus!"
+    );
+    assert!(rules.rules.is_empty());
+    assert!(rules.decision_tables.is_empty());
+    assert!(
+        !rules.is_empty(),
+        "declared types keep the one wrapper present"
+    );
+
+    let serialized = serde_json::to_value(&rules).expect("rules wrapper serializes");
+    assert!(
+        serialized.get("types").is_some(),
+        "types must remain in the wrapper"
+    );
+    assert!(serialized.get("rules").is_none(), "empty rules are omitted");
+    assert!(
+        serialized.get("decision_tables").is_none(),
+        "empty decision tables are omitted"
+    );
+    let round_trip: RulesMetadata = serde_json::from_value(serialized)
+        .expect("types-only wrapper must round-trip through serialization");
+    assert_eq!(round_trip.types.len(), 2);
+}
+
+#[test]
+fn opaque_json_rule_type_retains_exact_closed_bounds() {
+    let rules: RulesMetadata = serde_yaml::from_str(
+        r#"
+types:
+  - name: BoundedProviderEvidence
+    opaque_json:
+      maximum_bytes: 4096
+      maximum_depth: 8
+      maximum_nodes: 128
+"#,
+    )
+    .expect("a bounded opaque JSON declaration must deserialize");
+
+    let serialized = serde_json::to_value(&rules).expect("rules wrapper serializes");
+    assert_eq!(
+        serialized["types"][0]["opaque_json"],
+        json!({
+            "maximum_bytes": 4096,
+            "maximum_depth": 8,
+            "maximum_nodes": 128
+        })
+    );
+
+    for yaml in [
+        r#"
+types:
+  - name: Evidence
+    opaque_json:
+      maximum_bytes: 64
+      maximum_depth: 4
+      maximum_nodes: 16
+      expression: request.body
+"#,
+        r#"
+types:
+  - name: Evidence
+    script: request.body
+"#,
+    ] {
+        serde_yaml::from_str::<RulesMetadata>(yaml)
+            .expect_err("opaque JSON declarations must reject executable or unknown fields");
+    }
+}
+
+#[test]
+fn commands_deserialize_all_step_and_value_forms() {
+    // This exercises parsing only. Cross-step references, table targets, and
+    // rule names are deliberately validated later by catalog compilation.
+    let commands: Vec<Command> = serde_yaml::from_str(
+        r#"
+- name: complete_order
+  source: default
+  permissions:
+    - role: customer
+  arguments:
+    - name: order_id
+      type: uuid!
+    - name: lines
+      type: "[CreateOrderLine!]!"
+  guards:
+    - rule: order_request_is_well_formed
+      with:
+        lines: { arg: lines }
+      message: order request is not valid
+  steps:
+    - name: existing_order
+      select_one:
+        table: public.orders
+        by:
+          id: { arg: order_id }
+        returning: [id, customer_id]
+    - name: order
+      insert:
+        table: public.orders
+        object:
+          customer_id: { step: existing_order, column: customer_id }
+          status: { literal: draft }
+        returning: [id, customer_id, status]
+    - name: lines
+      insert_many:
+        table: public.order_lines
+        for_each: { arg: lines }
+        object:
+          order_id: { step: order, column: id }
+          sku: { item: sku }
+          quantity: { item: quantity }
+        returning: [id, sku, quantity]
+    - name: approved_order
+      update:
+        table: public.orders
+        where:
+          id: { step: order, column: id }
+        set:
+          status:
+            rule: next_order_status
+            with:
+              current: { literal: draft }
+        returning: [id, status]
+    - name: obsolete_order
+      delete:
+        table: public.obsolete_orders
+        where:
+          id: { arg: order_id }
+        returning: [id]
+    - name: order_is_approved
+      assert:
+        rule: order_is_approved
+        with:
+          status: { step: approved_order, column: status }
+        message: order must be approved
+  result:
+    order_id: { step: order, column: id }
+    line_items: { step: lines }
+"#,
+    )
+    .expect("the complete command surface must deserialize");
+
+    let command = &commands[0];
+    assert_eq!(command.arguments[0].name, "order_id");
+    assert_eq!(command.guards[0].rule, "order_request_is_well_formed");
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::SelectOne { .. }
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Insert { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::InsertMany { .. }
+    ));
+    assert!(matches!(
+        &command.steps[3].operation,
+        CommandStepOperation::Update { .. }
+    ));
+    assert!(matches!(
+        &command.steps[4].operation,
+        CommandStepOperation::Delete { .. }
+    ));
+    assert!(matches!(
+        &command.steps[5].operation,
+        CommandStepOperation::Assert { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::InsertMany { insert_many }
+            if matches!(&insert_many.object["sku"], CommandValue::Item { .. })
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Insert { insert }
+            if matches!(&insert.object["status"], CommandValue::Literal { .. })
+    ));
+    assert!(matches!(
+        &command.steps[3].operation,
+        CommandStepOperation::Update { update }
+            if matches!(&update.set["status"], CommandValue::Rule { .. })
+    ));
+    assert!(matches!(
+        command.result.get("order_id"),
+        Some(CommandResultValue::Step { .. })
+    ));
+    assert_eq!(
+        command
+            .result
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["order_id", "line_items"],
+        "command result fields must retain declaration order"
+    );
+
+    let serialized = serde_yaml::to_string(&commands)
+        .expect("command metadata must serialize for an order-preserving round trip");
+    let reloaded: Vec<Command> =
+        serde_yaml::from_str(&serialized).expect("serialized command metadata must deserialize");
+    assert_eq!(
+        reloaded[0]
+            .result
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["order_id", "line_items"],
+        "a command result round trip must retain declaration order"
+    );
+}
+
+#[test]
+fn relational_batch_deserializes_closed_step_and_value_forms() {
+    // This proves the metadata boundary accepts only the declarative batch
+    // shape. Relation kinds, primary keys, permissions, and step ordering are
+    // deliberately catalog-validation concerns.
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: reserve_cart_stock
+source: default
+steps:
+  - name: priced_lines
+    select_many:
+      table: { schema: public, name: cart_pricing }
+      by:
+        cart_id: { step: cart, column: id }
+      order_by: [variant_id]
+      returning: [variant_id, quantity, line_total_minor, currency]
+      require_non_empty: true
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        line_count: { count: {} }
+        subtotal_minor: { sum: { column: line_total_minor } }
+        currency_count: { count_distinct: { column: currency } }
+        currency: { min: { column: currency } }
+  - name: reserve_stock
+    update_many:
+      table: { schema: public, name: inventory_stock }
+      for_each: { step: priced_lines }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: add_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_reserve
+        with:
+          on_hand: { current_column: on_hand }
+          reserved: { current_column: reserved }
+          requested: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+"#,
+    )
+    .expect("the relational batch metadata surface must deserialize");
+
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::SelectMany { select_many }
+            if select_many.order_by == ["variant_id"] && select_many.require_non_empty
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::Aggregate { aggregate }
+            if matches!(&aggregate.values["line_count"], donat_metadata::CommandAggregate::Count { .. })
+                && matches!(&aggregate.values["subtotal_minor"], donat_metadata::CommandAggregate::Sum { .. })
+                && matches!(&aggregate.values["currency_count"], donat_metadata::CommandAggregate::CountDistinct { .. })
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::UpdateMany { update_many }
+            if update_many.require_each
+                && matches!(
+                    &update_many.set["reserved"],
+                    CommandValue::Rule { bindings, .. }
+                        if matches!(bindings["left"], CommandValue::CurrentColumn { .. })
+                )
+    ));
+}
+
+#[test]
+fn bounded_argument_rows_retain_their_declared_structural_bounds() {
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: bounded_argument_rows
+source: default
+arguments:
+  - name: lines
+    type: "[LineInput!]!"
+steps:
+  - name: totals
+    aggregate:
+      from: { arg: lines }
+      maximum_items: 64
+      values:
+        item_count: { count: true }
+  - name: updated
+    update_many:
+      table: public.order_lines
+      for_each: { arg: lines }
+      maximum_items: 64
+      by:
+        id: { item: id }
+      set:
+        quantity: { item: quantity }
+"#,
+    )
+    .expect("bounded argument-row sources must deserialize");
+
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::Aggregate { aggregate }
+            if aggregate.maximum_items == Some(64)
+    ));
+    assert!(matches!(
+        &command.steps[1].operation,
+        CommandStepOperation::UpdateMany { update_many }
+            if update_many.maximum_items == Some(64)
+    ));
+}
+
+#[test]
+fn relational_batch_rejects_invalid_local_yaml_shapes() {
+    // These failures catch a future widening of the closed batch grammar.
+    // They do not cover catalog-dependent source/order/scope semantics.
+    let invalid_documents = [
+        (
+            "unknown select_many key",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+      order_by: [variant_id]
+      arbitrary_sql: SELECT 1
+"#,
+        ),
+        (
+            "empty select_many by",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: {}
+      order_by: [variant_id]
+"#,
+        ),
+        (
+            "missing select_many order_by",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+"#,
+        ),
+        (
+            "duplicate select_many order_by column",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: rows
+    select_many:
+      table: public.cart_pricing
+      by: { cart_id: { arg: cart_id } }
+      order_by: [variant_id, variant_id]
+"#,
+        ),
+        (
+            "unsupported aggregate",
+            r#"
+name: reserve
+source: default
+steps:
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        average: { avg: { column: line_total_minor } }
+"#,
+        ),
+    ];
+
+    for (kind, document) in invalid_documents {
+        let error = serde_yaml::from_str::<Command>(document)
+            .expect_err(&format!("{kind} must be rejected"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field")
+                || rendered.contains("did not match")
+                || rendered.contains("non-empty")
+                || rendered.contains("duplicate"),
+            "{kind} must fail as a closed local shape, got: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn relational_batch_catalog_semantic_cases_remain_loadable_for_task_five() {
+    // Aggregate row-set sources, current_column scope, and reference order
+    // require a resolved command graph and catalog facts. Task 5 owns those
+    // semantic rejections; serde must retain the declarations intact.
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: deferred_semantics
+source: default
+steps:
+  - name: totals
+    aggregate:
+      from: { step: scalar_step }
+      values: { total: { count: {} } }
+  - name: scalar_step
+    select_one:
+      table: public.carts
+      by: { id: { step: later, column: id } }
+      returning: [id]
+  - name: invalid_current_column_scope
+    insert:
+      table: public.carts
+      object: { reserved: { current_column: reserved } }
+"#,
+    )
+    .expect("catalog-validation cases must remain representable in metadata");
+
+    assert_eq!(command.steps.len(), 3);
+    assert!(matches!(
+        &command.steps[0].operation,
+        CommandStepOperation::Aggregate { .. }
+    ));
+    assert!(matches!(
+        &command.steps[2].operation,
+        CommandStepOperation::Insert { insert }
+            if matches!(&insert.object["reserved"], CommandValue::CurrentColumn { .. })
+    ));
+}
+
+#[test]
+fn commands_retain_unvalidated_duplicate_names_and_effect_references() {
+    // Name uniqueness and process contracts are catalog-validation concerns;
+    // loading metadata must retain these declarations for that later phase.
+    let commands: Vec<Command> = serde_yaml::from_str(
+        r#"
+- name: duplicate_command
+  source: default
+  effects:
+    - start_process:
+        process: checkout_order
+        input:
+          order_id: { arg: order_id }
+- name: duplicate_command
+  source: default
+  effects:
+    - signal_process:
+        process: checkout_order
+        signal: approval_recorded
+        correlate:
+          unknown_correlation: { arg: undeclared_correlation }
+        payload:
+          unknown_payload: { arg: undeclared_payload }
+          actor: { session_variable: x-donat-user-id }
+        idempotency_key: { argument: undeclared_idempotency }
+"#,
+    )
+    .expect("unvalidated command declarations must deserialize");
+
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].name, commands[1].name);
+    assert!(commands[0].idempotency.is_none());
+    match &commands[0].effects[0] {
+        CommandEffect::StartProcess {
+            start_process: effect,
+        } => {
+            assert!(effect.idempotency_key.is_none());
+            assert!(matches!(
+                &effect.input["order_id"],
+                CommandValue::Argument { .. }
+            ));
+        }
+        other => panic!("expected start_process effect, got {other:?}"),
+    }
+    match &commands[1].effects[0] {
+        CommandEffect::SignalProcess {
+            signal_process: effect,
+        } => {
+            assert!(matches!(
+                &effect.correlate["unknown_correlation"],
+                CommandValue::Argument { .. }
+            ));
+            assert!(matches!(
+                &effect.payload["unknown_payload"],
+                CommandValue::Argument { .. }
+            ));
+            assert!(matches!(
+                &effect.payload["actor"],
+                CommandValue::SessionVariable { .. }
+            ));
+            assert!(matches!(
+                &effect.idempotency_key,
+                Some(CommandIdempotencyKey::Argument { .. })
+            ));
+        }
+        other => panic!("expected signal_process effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn command_closed_unions_reject_multiple_discriminators_and_unknown_keys() {
+    let invalid_documents = [
+        (
+            "step operation",
+            r#"
+name: create_order
+source: default
+steps:
+  - name: write
+    insert:
+      table: public.orders
+      object: { status: { literal: draft } }
+    delete:
+      table: public.orders
+      where: { id: { arg: id } }
+"#,
+        ),
+        (
+            "command value",
+            r#"
+name: create_order
+source: default
+steps:
+  - name: write
+    insert:
+      table: public.orders
+      object:
+        status: { arg: status, literal: draft }
+"#,
+        ),
+        (
+            "idempotency key",
+            r#"
+name: create_order
+source: default
+idempotency:
+  key: { argument: request_id, unknown: value }
+"#,
+        ),
+        (
+            "idempotency scope",
+            r#"
+name: create_order
+source: default
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: customer_id, session_variable: x-donat-user-id }
+"#,
+        ),
+        (
+            "command effect",
+            r#"
+name: create_order
+source: default
+effects:
+  - start_process:
+      process: checkout_order
+    signal_process:
+      process: checkout_order
+      signal: approved
+"#,
+        ),
+    ];
+
+    for (kind, document) in invalid_documents {
+        let error = serde_yaml::from_str::<Command>(document)
+            .expect_err(&format!("ambiguous {kind} must be rejected"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field") || rendered.contains("did not match"),
+            "{kind} must fail as a closed union, got: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn command_argument_mapping_shorthand_normalizes_to_the_canonical_list() {
+    let command: Command = serde_yaml::from_str(
+        r#"
+name: create_order
+source: default
+arguments:
+  customer_id: uuid!
+  lines: "[CreateOrderLine!]!"
+"#,
+    )
+    .expect("argument mapping shorthand must deserialize");
+
+    assert_eq!(command.arguments.len(), 2);
+    assert_eq!(command.arguments[0].name, "customer_id");
+    assert_eq!(command.arguments[0].type_, "uuid!");
+    assert_eq!(command.arguments[1].name, "lines");
+}
+
+#[test]
+fn commands_absent_from_directory_yield_empty_vec() {
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
+    let md = load_metadata_dir(dir).expect("fixture metadata should load");
+    assert!(md.commands.is_empty());
+}
+
+#[test]
+fn connectors_deserialize_secret_references_and_named_operation_capacity() {
+    // This fails if a future change turns a secret reference into a literal
+    // configuration value, or loses the worker-owned capacity declaration.
+    let connectors: Vec<ConnectorInstance> = serde_yaml::from_str(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+    headers:
+      - name: Authorization
+        value_from_env: LOGISTICS_TOKEN
+  operations:
+    - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      body:
+        order_id: { input: order_id }
+      success_statuses: [200, 201]
+      idempotency: { header: Idempotency-Key }
+      capacity:
+        max_in_flight: 8
+        rate_limit: { permits: 20, per: 1s, burst: 8 }
+        serialize_by: { input: order_id }
+"#,
+    )
+    .expect("connector metadata deserializes");
+
+    let connector = &connectors[0];
+    assert_eq!(connector.name, "logistics_api");
+    assert_eq!(connector.module, "http");
+    assert_eq!(
+        connector.config.endpoint_identity,
+        "logistics_prod_eu_2026_07"
+    );
+    assert_eq!(connector.config.credential_identity, "logistics_primary");
+    assert!(matches!(
+        connector.config.base_url.as_ref(),
+        Some(ConnectorBaseUrl::Literal(value)) if value == "https://logistics.example.test"
+    ));
+    assert_eq!(
+        connector.config.headers[0].value_from_env,
+        "LOGISTICS_TOKEN"
+    );
+    let capacity = connector.operations[0]
+        .capacity
+        .as_ref()
+        .expect("operation capacity is retained");
+    assert_eq!(capacity.max_in_flight, 8);
+    assert_eq!(capacity.rate_limit.permits, 20);
+    assert_eq!(capacity.rate_limit.per, "1s");
+    assert_eq!(capacity.rate_limit.burst, 8);
+    assert_eq!(
+        capacity
+            .serialize_by
+            .as_ref()
+            .expect("serialization is retained")
+            .input,
+        "order_id"
+    );
+
+    let literal_secret = serde_yaml::from_str::<Vec<ConnectorInstance>>(
+        r#"
+- name: stripe
+  module: stripe
+  config:
+    endpoint_identity: stripe_api_2025_06_30
+    credential_identity: stripe_primary
+    secret_key: sk_live_literal_secret
+"#,
+    )
+    .expect_err("secret references require a value_from_env mapping, never a literal");
+    assert!(
+        literal_secret.to_string().contains("secret_key"),
+        "literal secrets must fail at the secret field: {literal_secret}"
+    );
+}
+
+#[test]
+fn http_connector_operations_deserialize_only_declared_dynamic_bindings() {
+    // This fails if a job can later choose a URL, method, or header name
+    // instead of filling only the named value slots deployed with the operation.
+    let connectors: Vec<ConnectorInstance> = serde_yaml::from_str(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+  operations:
+    - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      query:
+        shipment_kind: { input: shipment_kind }
+      headers:
+        - name: X-Request-Source
+          value: donat
+      body:
+        order_id: { input: order_id }
+        address: { input: address }
+      success_statuses: [200, 201]
+      response:
+        shipment_id: { json_pointer: /id, type: string! }
+      idempotency: { header: Idempotency-Key }
+      error_classification:
+        http_5xx: [500, 503]
+      capacity:
+        max_in_flight: 8
+        rate_limit: { permits: 20, per: 1s, burst: 8 }
+        serialize_by: { input: order_id }
+"#,
+    )
+    .expect("a deployed HTTP operation has only static request shape and named bindings");
+
+    let http = connectors[0].operations[0]
+        .http()
+        .expect("the HTTP module receives a typed HTTP operation");
+    assert_eq!(http.version, "v1");
+    assert_eq!(http.method, "POST");
+    assert_eq!(http.path, "/v1/shipments/{input.order_id}");
+    assert_eq!(http.query["shipment_kind"].input, "shipment_kind");
+    assert_eq!(
+        http.idempotency
+            .as_ref()
+            .expect("declared idempotency is retained")
+            .header,
+        "Idempotency-Key"
+    );
+    assert_eq!(
+        connectors[0].operations[0]
+            .capacity()
+            .expect("worker capacity remains deploy-time metadata")
+            .serialize_by
+            .as_ref()
+            .expect("same-resource serialization remains declared")
+            .input,
+        "order_id"
+    );
+}
+
+#[test]
+fn http_connector_operations_reject_raw_request_transport_fields() {
+    let error = serde_yaml::from_str::<Vec<ConnectorInstance>>(
+        r#"
+- name: logistics_api
+  module: http
+  config:
+    endpoint_identity: logistics_prod_eu_2026_07
+    credential_identity: logistics_primary
+    base_url: https://logistics.example.test
+  operations:
+    - name: create_shipment
+      version: v1
+      method: POST
+      path: /v1/shipments/{input.order_id}
+      success_statuses: [200]
+      capacity:
+        max_in_flight: 1
+        rate_limit: { permits: 1, per: 1s, burst: 1 }
+      url: https://attacker.invalid/override
+"#,
+    )
+    .expect_err("operation metadata cannot introduce a raw arbitrary request URL");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "the unsafe raw transport field is rejected during metadata loading"
+    );
+}
+
+#[test]
+fn connectors_absent_from_directory_yield_empty_vec() {
+    // Existing metadata directories remain valid without a new top-level file.
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata"
+    ));
+    let metadata = load_metadata_dir(dir).expect("fixture metadata should load");
+    assert!(metadata.connectors.is_empty());
 }

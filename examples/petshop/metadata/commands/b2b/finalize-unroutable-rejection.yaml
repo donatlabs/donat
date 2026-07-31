@@ -1,0 +1,48 @@
+name: finalize_unroutable_rejection
+source: default
+permissions:
+  - role: b2b_finance
+arguments:
+  - name: approval_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: approval
+    select_one:
+      table: public.purchase_approval
+      by:
+        id: { arg: approval_id }
+        status: { literal: submitted }
+      returning: [id, quote_id, status]
+      require_found: true
+  - name: rejection_is_allowed
+    assert:
+      rule: can_transition_approval
+      with:
+        current: { step: approval, column: status }
+        next: { literal: rejected }
+  - name: reject
+    update:
+      table: public.purchase_approval
+      where:
+        id: { step: approval, column: id }
+        status: { literal: submitted }
+      set:
+        status: { literal: rejected }
+        rejected_by_role: { literal: b2b_finance }
+        rejection_reason: { arg: reason }
+      returning: [id, quote_id, status, rejection_reason]
+      require_affected: true
+result:
+  approval_id: { step: reject, column: id }
+  quote_id: { step: reject, column: quote_id }
+  approval_status: { step: reject, column: status }
+  rejection_reason: { step: reject, column: rejection_reason }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: approval_id }
+  retention: 365d

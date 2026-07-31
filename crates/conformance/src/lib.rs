@@ -23,12 +23,80 @@ use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
 pub mod cron_webhook;
+pub mod provider_stub;
 mod remote_graphql;
 
 // ---------------------------------------------------------------- fixtures
 
 pub fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
+
+/// Apply a checked-in directory of versioned SQL migrations to a suite
+/// database before its first engine request. Migration paths are selected by
+/// the test harness, never from an HTTP request.
+pub fn apply_sql_migration_dir(database_url: &str, dir: &Path) -> Result<()> {
+    let mut migrations = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading migration directory {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading migration entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading migration file type {}", path.display()))?
+            .is_file()
+        {
+            return Err(anyhow!(
+                "migration entry {} is not a regular file",
+                path.display()
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("migration file name {} is not UTF-8", path.display()))?;
+        let (version, description) = name
+            .strip_prefix('V')
+            .and_then(|name| name.split_once("__"))
+            .and_then(|(version, description)| {
+                description.strip_suffix(".sql").map(|d| (version, d))
+            })
+            .ok_or_else(|| anyhow!("invalid migration file name {name}"))?;
+        if version.is_empty()
+            || version.starts_with('0')
+            || !version.bytes().all(|byte| byte.is_ascii_digit())
+            || description.is_empty()
+            || !description
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(anyhow!("invalid migration file name {name}"));
+        }
+        let version = version
+            .parse::<u64>()
+            .with_context(|| format!("invalid migration version in {name}"))?;
+        migrations.push((version, path));
+    }
+
+    migrations.sort_by_key(|(version, _)| *version);
+    for pair in migrations.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(anyhow!("duplicate version {}", pair[0].0));
+        }
+    }
+
+    let mut client = postgres::Client::connect(database_url, postgres::NoTls)
+        .with_context(|| format!("connecting to migration database {database_url}"))?;
+    for (_, path) in migrations {
+        let sql = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading migration {}", path.display()))?;
+        client
+            .batch_execute(&sql)
+            .with_context(|| format!("applying migration {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Load a fixture YAML into JSON, resolving `!include <file>` (both the real
@@ -176,8 +244,8 @@ pub fn json_matches(exp: &Json, act: &Json, sel: Option<&SelMap>) -> bool {
                 return false;
             }
             if let Some(tree) = sel {
-                let eseq: Vec<&String> = e.keys().filter(|k| tree.contains_key(*k)).collect();
-                let aseq: Vec<&String> = a.keys().filter(|k| tree.contains_key(*k)).collect();
+                let eseq: Vec<&String> = e.keys().filter(|k| tree.contains_key(k)).collect();
+                let aseq: Vec<&String> = a.keys().filter(|k| tree.contains_key(k)).collect();
                 if eseq != aseq {
                     return false;
                 }
@@ -237,9 +305,9 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 use std::cell::RefCell;
 
 use donat_metadata::{
-    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
-    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
-    McpMetadata, ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection,
+    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DatabaseUrl, DeletePermission,
+    EventTrigger, FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, McpMetadata,
+    Metadata, ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection,
     RemoteRelationship, RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission,
     Source, SourceKind, TableConfiguration, TableEntry, UpdatePermission,
 };
@@ -938,6 +1006,10 @@ fn default_metadata_with_configuration(
         custom_types: Default::default(),
         cron_triggers: vec![],
         rest_endpoints: vec![],
+        commands: vec![],
+        rules: Default::default(),
+        connectors: vec![],
+        processes: vec![],
         mcp: Default::default(),
     }
 }
@@ -953,6 +1025,7 @@ pub struct Suite {
     name: String,
     backend: Option<BackendId>,
     env: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
@@ -968,6 +1041,7 @@ impl Suite {
             name: name.to_string(),
             backend: None,
             env: vec![],
+            request_headers: vec![],
             args: vec![],
             admin_secret: None,
             webhook: None,
@@ -1057,6 +1131,16 @@ impl Suite {
         self
     }
 
+    /// Add an HTTP/WebSocket request header to every fixture request in this
+    /// suite unless a fixture provides the same header explicitly. This keeps
+    /// suites that exercise one classic role explicit without rewriting each
+    /// copied fixture.
+    pub fn request_header(mut self, name: &str, value: &str) -> Self {
+        self.request_headers
+            .push((name.to_string(), value.to_string()));
+        self
+    }
+
     pub fn env(mut self, k: &str, v: &str) -> Self {
         self.env.push((k.to_string(), v.to_string()));
         self
@@ -1121,12 +1205,17 @@ impl Suite {
             name: self.name,
             backend,
             env: self.env,
+            request_headers: self.request_headers,
             args: self.args,
             admin_secret: self.admin_secret,
             webhook: self.webhook,
             cron: self.cron,
             event: self.event,
-            run_migrations: self.run_migrations,
+            // Every Postgres serving deployment requires the migration-owned
+            // command/Process helpers. Non-Postgres suites keep their native
+            // setup unless a test explicitly requests another migration path.
+            run_migrations: self.run_migrations || backend == BackendId::Postgres,
+            reconcile_metadata: self.run_migrations,
             db_url,
             schema,
             _database: database,
@@ -1166,12 +1255,14 @@ pub struct Running {
     pub name: String,
     pub backend: BackendId,
     env: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
     args: Vec<String>,
     admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
+    reconcile_metadata: bool,
     db_url: String,
     pub schema: String,
     _database: SuiteDatabase,
@@ -1180,6 +1271,26 @@ pub struct Running {
     /// The spawned engine, started on first request (`ensure_engine`).
     engine: RefCell<Option<EngineProc>>,
     http: reqwest::blocking::Client,
+}
+
+fn is_role_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-donat-role") || name.eq_ignore_ascii_case("x-hasura-role")
+}
+
+fn merge_request_headers(
+    defaults: &[(String, String)],
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    for (name, value) in defaults {
+        let overridden = headers.iter().any(|(existing, _)| {
+            existing.eq_ignore_ascii_case(name)
+                || (is_role_header(existing) && is_role_header(name))
+        });
+        if !overridden {
+            headers.push((name.clone(), value.clone()));
+        }
+    }
+    headers
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1604,6 +1715,10 @@ impl Running {
                 select_permissions: vec![],
                 update_permissions: vec![],
                 delete_permissions: vec![],
+                command_insert_permissions: vec![],
+                command_select_permissions: vec![],
+                command_update_permissions: vec![],
+                command_delete_permissions: vec![],
                 event_triggers: vec![],
             });
         }
@@ -2089,11 +2204,11 @@ impl Running {
                 let action = args["action"].as_str().expect("action").to_string();
                 let role = args["role"].as_str().expect("role").to_string();
                 let mut md = self.metadata.borrow_mut();
-                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action) {
-                    if !a.permissions.iter().any(|p| p.role == role) {
-                        a.permissions
-                            .push(donat_metadata::ActionPermission { role });
-                    }
+                if let Some(a) = md.actions.iter_mut().find(|a| a.name == action)
+                    && !a.permissions.iter().any(|p| p.role == role)
+                {
+                    a.permissions
+                        .push(donat_metadata::ActionPermission { role });
                 }
             }
 
@@ -2133,12 +2248,15 @@ impl Running {
 
     /// Serialize the accumulated metadata to a temp `version: 3` directory.
     fn write_metadata_dir(&self) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("dist_conf_md_{}_{}", self.name, std::process::id()));
+        let md = self.metadata.borrow();
+        Self::write_metadata_snapshot(&self.name, &md)
+    }
+
+    fn write_metadata_snapshot(name: &str, md: &Metadata) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dist_conf_md_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("databases")).unwrap();
 
-        let md = self.metadata.borrow();
         std::fs::write(dir.join("version.yaml"), "version: 3\n").unwrap();
         std::fs::write(
             dir.join("databases").join("databases.yaml"),
@@ -2187,6 +2305,34 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.commands.is_empty() {
+            std::fs::write(
+                dir.join("commands.yaml"),
+                serde_yaml::to_string(&md.commands).expect("serialize commands"),
+            )
+            .unwrap();
+        }
+        if !md.processes.is_empty() {
+            std::fs::write(
+                dir.join("flows.yaml"),
+                serde_yaml::to_string(&md.processes).expect("serialize processes"),
+            )
+            .unwrap();
+        }
+        if !md.rules.is_empty() {
+            std::fs::write(
+                dir.join("rules.yaml"),
+                serde_yaml::to_string(&md.rules).expect("serialize rules wrapper"),
+            )
+            .unwrap();
+        }
+        if !md.connectors.is_empty() {
+            std::fs::write(
+                dir.join("connectors.yaml"),
+                serde_yaml::to_string(&md.connectors).expect("serialize connectors"),
+            )
+            .unwrap();
+        }
         if md.mcp.is_configured() {
             std::fs::write(
                 dir.join("mcp.yaml"),
@@ -2215,25 +2361,99 @@ impl Running {
             return;
         }
         let metadata_dir = self.write_metadata_dir();
-        // Apply DDL before serving, like a real deploy: the donat catalog
-        // (migrations) plus per-table event-trigger reconciliation from the
-        // metadata we are about to serve.
+        // Install the migration-owned runtime contract in every Postgres
+        // source before serving. Suites that explicitly request migrations
+        // also reconcile their command, Process, and trigger metadata.
         if self.run_migrations {
             let migrations = workspace_root().join("migrations");
-            let status = Command::new(engine_binary())
-                .arg("migrate")
-                .arg("--migrations-dir")
-                .arg(&migrations)
-                .arg("--metadata-dir")
-                .arg(&metadata_dir)
-                .env("DONAT_DATABASE_URL", &self.db_url)
-                .status()
-                .expect("running donat migrate");
-            assert!(
-                status.success(),
-                "donat migrate failed for suite {}",
-                self.name
-            );
+            let postgres_sources = self
+                .metadata
+                .borrow()
+                .sources
+                .iter()
+                .filter(|source| source.kind == SourceKind::Postgres)
+                .cloned()
+                .collect::<Vec<_>>();
+            let resolve_source_url = |source: &Source| {
+                let connection = source
+                    .configuration
+                    .connection_info
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Postgres source {} has no connection_info in suite {}",
+                            source.name, self.name
+                        )
+                    });
+                match &connection.database_url {
+                    DatabaseUrl::Url(url) => url.clone(),
+                    DatabaseUrl::FromEnv { from_env } => self
+                        .env
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| key == from_env)
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| {
+                            matches!(
+                                from_env.as_str(),
+                                "DONAT_DATABASE_URL" | "DONAT_GRAPHQL_DATABASE_URL"
+                            )
+                            .then(|| self.db_url.clone())
+                        })
+                        .or_else(|| std::env::var(from_env).ok())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Postgres source {} requires missing environment variable {} \
+                                 in suite {}",
+                                source.name, from_env, self.name
+                            )
+                        }),
+                }
+            };
+            let migrate_source = |source: Option<&Source>| {
+                let mut migrate = Command::new(engine_binary());
+                migrate
+                    .arg("migrate")
+                    .arg("--migrations-dir")
+                    .arg(&migrations);
+                if self.reconcile_metadata
+                    && let Some(source) = source
+                {
+                    migrate
+                        .arg("--metadata-dir")
+                        .arg(&metadata_dir)
+                        .arg("--source")
+                        .arg(&source.name);
+                }
+                let database_url = source
+                    .map(&resolve_source_url)
+                    .unwrap_or_else(|| self.db_url.clone());
+                let output = migrate
+                    .env("DONAT_DATABASE_URL", database_url)
+                    .env("DONAT_GRAPHQL_DATABASE_URL", &self.db_url)
+                    .envs(self.env.iter().map(|(key, value)| (key, value)))
+                    .output()
+                    .expect("running donat migrate");
+                assert!(
+                    output.status.success(),
+                    "donat migrate failed for suite {} source {}:\n{}{}",
+                    self.name,
+                    source.map_or("<direct>", |source| source.name.as_str()),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            };
+            if postgres_sources.is_empty() {
+                // Connector-only metadata still serves through the suite's
+                // implicit default Postgres source.
+                migrate_source(None);
+            } else {
+                // Source initialization verifies the migration-owned runtime
+                // contract independently for every Postgres database.
+                for source in &postgres_sources {
+                    migrate_source(Some(source));
+                }
+            }
         }
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -2260,6 +2480,7 @@ impl Running {
                     .arg("--metadata-dir")
                     .arg(&metadata_dir)
                     .env("DONAT_DATABASE_URL", &self.db_url)
+                    .env("DONAT_GRAPHQL_DATABASE_URL", &self.db_url)
                     .stdout(Stdio::from(log.try_clone().unwrap()))
                     .stderr(Stdio::from(log));
                 for a in &self.args {
@@ -2310,7 +2531,12 @@ impl Running {
 
         // Let webhook callback endpoints reach the now-running engine.
         if let Some(handle) = &self.webhook {
-            handle.set(&proc.base_url, self.admin_secret.clone());
+            let role = self
+                .request_headers
+                .iter()
+                .find(|(name, _)| is_role_header(name))
+                .map(|(_, value)| value.clone());
+            handle.set(&proc.base_url, self.admin_secret.clone(), role);
         }
         *self.engine.borrow_mut() = Some(proc);
     }
@@ -2331,6 +2557,27 @@ impl Running {
     /// `donat` catalog directly).
     pub fn db_url(&self) -> &str {
         &self.db_url
+    }
+
+    /// Replace one child-process environment value before a deliberate
+    /// restart. This is a conformance-harness control, not an engine runtime
+    /// configuration API.
+    pub fn set_engine_env_for_restart(&mut self, key: &str, value: &str) {
+        self.env.retain(|(existing, _)| existing != key);
+        self.env.push((key.to_owned(), value.to_owned()));
+    }
+
+    /// Stop the current child and stage a new immutable metadata deployment
+    /// against the same suite database. The next request/base URL lookup runs
+    /// the normal migrate-then-serve path again.
+    pub fn restart_with_metadata(&mut self, metadata: Metadata) {
+        let process = self
+            .engine
+            .get_mut()
+            .take()
+            .expect("restart_with_metadata requires a running engine");
+        drop(process);
+        *self.metadata.get_mut() = metadata;
     }
 
     /// The recording cron webhook stub (only present after
@@ -2400,6 +2647,31 @@ impl Running {
         self.post_inner(path, body, headers, false)
     }
 
+    /// Issue a raw-byte HTTP request against the spawned engine and preserve
+    /// the exact response bytes. This is intentionally a harness helper for
+    /// provider ingress tests; it does not add a new engine API surface.
+    pub fn post_bytes(
+        &self,
+        path: &str,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> (u16, Vec<u8>) {
+        self.ensure_engine();
+        let headers = merge_request_headers(&self.request_headers, headers.to_vec());
+        let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
+        let mut request = self.http.post(format!("{base}{path}")).body(body.to_vec());
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().expect("raw HTTP request failed");
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .expect("read raw HTTP response body")
+            .to_vec();
+        (status, body)
+    }
+
     fn post_inner(
         &self,
         path: &str,
@@ -2419,6 +2691,7 @@ impl Running {
             return (200, json!({"message": "success"}));
         }
         self.ensure_engine();
+        let headers = merge_request_headers(&self.request_headers, headers.to_vec());
         let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
         let mut req = self.http.post(format!("{base}{path}")).json(body);
         let has_accept = headers
@@ -2437,7 +2710,7 @@ impl Running {
         {
             req = req.header("MCP-Protocol-Version", "2025-06-18");
         }
-        for (k, v) in headers {
+        for (k, v) in &headers {
             req = req.header(k, v);
         }
         let resp = req.send().expect("http request failed");
@@ -2448,6 +2721,7 @@ impl Running {
     }
 
     fn auth_headers(&self, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+        headers = merge_request_headers(&self.request_headers, headers);
         if let Some(secret) = &self.admin_secret {
             headers.push(("X-Donat-Admin-Secret".to_string(), secret.clone()));
         }
@@ -2822,6 +3096,26 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn suite_request_headers_are_case_insensitive_and_never_override_fixture_roles() {
+        let defaults = vec![
+            ("X-Donat-Role".to_string(), "tester".to_string()),
+            ("X-Trace-Mode".to_string(), "suite".to_string()),
+        ];
+        let fixture = vec![
+            ("x-hasura-role".to_string(), "fixture-role".to_string()),
+            ("x-trace-mode".to_string(), "fixture".to_string()),
+        ];
+
+        assert_eq!(
+            merge_request_headers(&defaults, fixture),
+            vec![
+                ("x-hasura-role".to_string(), "fixture-role".to_string()),
+                ("x-trace-mode".to_string(), "fixture".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -3266,6 +3560,8 @@ mod tests {
             "actions",
             "agg_relay_introspection",
             "auth_env",
+            "commands",
+            "connectors",
             "cron_triggers",
             "enabled_apis",
             "event_triggers",
@@ -3276,9 +3572,15 @@ mod tests {
             "jwt",
             "mcp_tools",
             "migrate",
+            "petshop",
+            "petshop_process",
+            "process_activity",
+            "process_inbound",
+            "processes",
             "remote_schemas",
             "rest_endpoints",
             "roles_inheritance",
+            "rules",
             "security",
             "subscriptions",
         ];
@@ -3328,6 +3630,191 @@ mod tests {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_rules_wrapper() {
+        let mut with_rules = empty_metadata();
+        with_rules.rules = serde_json::from_value(json!({
+            "rules": [{
+                "name": "is_ready",
+                "result": "bool!",
+                "expression": "true"
+            }],
+            "decision_tables": [{
+                "name": "route",
+                "inputs": {"amount": "int!"},
+                "output": {"route": "string!"},
+                "hit_policy": "first",
+                "rows": [{
+                    "id": "default",
+                    "when": {"amount": "true"},
+                    "output": {"route": "manual"}
+                }]
+            }]
+        }))
+        .expect("rule metadata deserializes");
+        let with_rules_dir = Running::write_metadata_snapshot("rules_wrapper", &with_rules);
+        let rules = std::fs::read_to_string(with_rules_dir.join("rules.yaml"))
+            .expect("nonempty wrapper is serialized");
+        assert!(rules.contains("is_ready"));
+        assert!(rules.contains("decision_tables"));
+
+        let mut with_types_only = empty_metadata();
+        with_types_only.rules = serde_json::from_value(json!({
+            "types": [{
+                "name": "OrderStatus",
+                "enum": ["draft", "submitted"]
+            }]
+        }))
+        .expect("types-only rule metadata deserializes");
+        let with_types_only_dir =
+            Running::write_metadata_snapshot("rules_types_only_wrapper", &with_types_only);
+        let types_only = std::fs::read_to_string(with_types_only_dir.join("rules.yaml"))
+            .expect("a types-only wrapper is serialized");
+        assert!(types_only.contains("OrderStatus"));
+        assert!(!types_only.contains("rules:"));
+        assert!(!types_only.contains("decision_tables:"));
+
+        let without_rules_dir =
+            Running::write_metadata_snapshot("empty_rules_wrapper", &empty_metadata());
+        assert!(
+            !without_rules_dir.join("rules.yaml").exists(),
+            "an empty wrapper must not create rules.yaml"
+        );
+
+        std::fs::remove_dir_all(with_rules_dir).expect("remove rules metadata directory");
+        std::fs::remove_dir_all(with_types_only_dir)
+            .expect("remove types-only rules metadata directory");
+        std::fs::remove_dir_all(without_rules_dir).expect("remove empty metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_nonempty_commands_section() {
+        let mut metadata = empty_metadata();
+        metadata.commands = serde_json::from_value(json!([{
+            "name": "create_order",
+            "source": "default",
+            "permissions": [{"role": "customer"}],
+            "steps": [{
+                "name": "order",
+                "insert": {
+                    "table": {"schema": "public", "name": "orders"},
+                    "object": {"status": {"literal": "draft"}},
+                    "returning": ["id"]
+                }
+            }],
+            "result": {"order_id": {"step": "order", "column": "id"}}
+            ,"effects": [{
+                "start_process": {
+                    "process": "checkout_order",
+                    "idempotency_key": {"argument": "request_id"}
+                }
+            }]
+        }]))
+        .expect("command metadata deserializes");
+
+        let dir = Running::write_metadata_snapshot("commands_section", &metadata);
+        let commands = std::fs::read_to_string(dir.join("commands.yaml"))
+            .expect("nonempty commands section is serialized");
+        assert!(commands.contains("create_order"));
+        assert!(commands.contains("argument: request_id"));
+
+        let reloaded = donat_metadata::load_metadata_dir(&dir)
+            .expect("serialized command metadata reloads through the directory loader");
+        assert_eq!(reloaded.commands[0].name, "create_order");
+        std::fs::remove_dir_all(dir).expect("remove commands metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_connectors_section() {
+        let mut with_connectors = empty_metadata();
+        with_connectors.connectors = serde_json::from_value(json!([{
+            "name": "logistics_api",
+            "module": "http",
+            "config": {
+                "endpoint_identity": "logistics_prod_eu_2026_07",
+                "credential_identity": "logistics_primary",
+                "base_url": "https://logistics.example.test"
+            },
+            "operations": [{
+                "name": "create_shipment",
+                "capacity": {
+                    "max_in_flight": 8,
+                    "rate_limit": { "permits": 20, "per": "1s", "burst": 8 }
+                }
+            }]
+        }]))
+        .expect("connector metadata deserializes");
+
+        let with_connectors_dir =
+            Running::write_metadata_snapshot("connectors_section", &with_connectors);
+        let connectors = std::fs::read_to_string(with_connectors_dir.join("connectors.yaml"))
+            .expect("nonempty connectors section is serialized");
+        assert!(connectors.contains("logistics_api"));
+        assert_eq!(
+            donat_metadata::load_metadata_dir(&with_connectors_dir)
+                .expect("serialized connector metadata reloads")
+                .connectors[0]
+                .name,
+            "logistics_api"
+        );
+
+        let without_connectors_dir =
+            Running::write_metadata_snapshot("empty_connectors_section", &empty_metadata());
+        assert!(
+            !without_connectors_dir.join("connectors.yaml").exists(),
+            "an empty connector list must not create connectors.yaml"
+        );
+
+        std::fs::remove_dir_all(with_connectors_dir).expect("remove connector metadata directory");
+        std::fs::remove_dir_all(without_connectors_dir)
+            .expect("remove empty connector metadata directory");
+    }
+
+    #[test]
+    fn metadata_writer_emits_only_the_nonempty_process_section() {
+        let mut with_processes = empty_metadata();
+        with_processes.processes = serde_json::from_value(json!([{
+            "name": "checkout",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "output": [{ "name": "status", "type": "string!" }],
+            "start_at": "done",
+            "states": [{
+                "id": "done",
+                "output": {
+                    "values": { "status": { "literal": "ready" } }
+                }
+            }]
+        }]))
+        .expect("process metadata deserializes");
+
+        let with_processes_dir =
+            Running::write_metadata_snapshot("processes_section", &with_processes);
+        let flows = std::fs::read_to_string(with_processes_dir.join("flows.yaml"))
+            .expect("nonempty process section is serialized");
+        assert!(flows.contains("checkout"));
+        assert_eq!(
+            donat_metadata::load_metadata_dir(&with_processes_dir)
+                .expect("serialized process metadata reloads")
+                .processes[0]
+                .name,
+            "checkout"
+        );
+
+        let without_processes_dir =
+            Running::write_metadata_snapshot("empty_processes_section", &empty_metadata());
+        assert!(
+            !without_processes_dir.join("flows.yaml").exists(),
+            "an empty process list must not create flows.yaml"
+        );
+
+        std::fs::remove_dir_all(with_processes_dir).expect("remove process metadata directory");
+        std::fs::remove_dir_all(without_processes_dir)
+            .expect("remove empty process metadata directory");
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "donat_conformance_fixture_{tag}_{}_{}",
@@ -3345,6 +3832,22 @@ mod tests {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn duplicate_migration_versions_are_rejected() {
+        let dir = tempdir("duplicate_migration_versions");
+        write(&dir, "V2__first.sql", "SELECT 1;");
+        write(&dir, "V2__second.sql", "SELECT 2;");
+
+        let err = apply_sql_migration_dir("postgresql://unused", &dir)
+            .expect_err("duplicate migration versions must be rejected");
+        assert!(
+            format!("{err:#}").contains("duplicate version 2"),
+            "{err:#}"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove migration test directory");
     }
 
     #[test]

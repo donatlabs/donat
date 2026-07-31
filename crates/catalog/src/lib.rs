@@ -2,8 +2,9 @@
 //!
 //! The single place that knows how to read `pg_catalog`. Produces a
 //! [`Catalog`] snapshot — tables, columns with their SQL types and
-//! nullability, primary keys and foreign keys — which the planner combines
-//! with metadata. Nothing downstream talks to `pg_catalog` directly.
+//! nullability, primary keys, unconditional unique keys, and foreign keys —
+//! which the planner combines with metadata. Nothing downstream talks to
+//! `pg_catalog` directly.
 
 use std::collections::BTreeMap;
 
@@ -55,9 +56,42 @@ pub struct FunctionArg {
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
+    /// The source relation kind. Postgres values retain the `pg_class.relkind`
+    /// distinction so later command validation cannot mistake a view for an
+    /// ordinary writable table.
+    pub relation_kind: RelationKind,
     pub columns: Vec<ColumnInfo>,
     pub primary_key: Vec<String>,
+    /// Ordered column sets from valid, unconditional, non-expression unique
+    /// indexes. Primary keys remain in `primary_key` and are not duplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_keys: Vec<Vec<String>>,
     pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// Relation categories currently returned by the catalog query. The enum
+/// intentionally models only `pg_class.relkind` values the existing query
+/// includes; unknown values are not silently coerced to ordinary tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    ForeignTable,
+    PartitionedTable,
+}
+
+impl RelationKind {
+    fn from_postgres_relkind(relkind: i8) -> Option<Self> {
+        match relkind as u8 as char {
+            'r' => Some(Self::Table),
+            'v' => Some(Self::View),
+            'm' => Some(Self::MaterializedView),
+            'f' => Some(Self::ForeignTable),
+            'p' => Some(Self::PartitionedTable),
+            _ => None,
+        }
+    }
 }
 
 impl TableInfo {
@@ -71,12 +105,19 @@ pub struct ColumnInfo {
     pub name: String,
     /// Postgres type name as reported by pg_catalog (e.g. `int4`, `text`).
     pub pg_type: String,
+    /// Raw `pg_attribute.atttypmod` from PostgreSQL, or `-1` when unavailable.
+    #[serde(default = "default_pg_typmod")]
+    pub pg_typmod: i32,
     /// Backend-native type used for SQL literal casts when it differs from
     /// the logical `pg_type` exposed through the GraphQL schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_type: Option<String>,
     pub nullable: bool,
     pub has_default: bool,
+}
+
+fn default_pg_typmod() -> i32 {
+    -1
 }
 
 impl ColumnInfo {
@@ -95,13 +136,21 @@ pub struct ForeignKey {
 }
 
 const COLUMNS_SQL: &str = r#"
-SELECT n.nspname, c.relname, a.attname, t.typname,
-       NOT a.attnotnull AS nullable,
-       a.atthasdef AS has_default
+SELECT n.nspname, c.relname, a.attname,
+       COALESCE(base_t.typname, t.typname) AS logical_type,
+       a.atttypmod,
+       NOT (a.attnotnull OR t.typnotnull) AS nullable,
+       a.atthasdef AS has_default,
+       c.relkind,
+       CASE WHEN t.typtype = 'd'
+            THEN quote_ident(tn.nspname) || '.' || quote_ident(t.typname)
+       END AS native_type
 FROM pg_attribute a
 JOIN pg_class c ON a.attrelid = c.oid
 JOIN pg_namespace n ON c.relnamespace = n.oid
 JOIN pg_type t ON a.atttypid = t.oid
+JOIN pg_namespace tn ON t.typnamespace = tn.oid
+LEFT JOIN pg_type base_t ON t.typtype = 'd' AND t.typbasetype = base_t.oid
 WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p')
   AND a.attnum > 0
   AND NOT a.attisdropped
@@ -120,6 +169,30 @@ CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
 WHERE con.contype = 'p'
 ORDER BY n.nspname, c.relname, k.ord
+"#;
+
+const UNIQUE_KEYS_SQL: &str = r#"
+SELECT n.nspname, c.relname,
+       array_agg(a.attname ORDER BY key_column.ord)::text[] AS columns
+FROM pg_index index_info
+JOIN pg_class c ON index_info.indrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+CROSS JOIN LATERAL
+  unnest(index_info.indkey::smallint[]) WITH ORDINALITY AS key_column(attnum, ord)
+JOIN pg_attribute a
+  ON a.attrelid = c.oid AND a.attnum = key_column.attnum
+WHERE index_info.indisunique
+  AND NOT index_info.indisprimary
+  AND index_info.indisvalid
+  AND index_info.indisready
+  AND index_info.indpred IS NULL
+  AND index_info.indexprs IS NULL
+  AND key_column.ord <= index_info.indnkeyatts
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'hdb_catalog')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'
+GROUP BY n.nspname, c.relname, index_info.indexrelid
+ORDER BY n.nspname, c.relname, index_info.indexrelid
 "#;
 
 const FOREIGN_KEYS_SQL: &str = r#"
@@ -176,20 +249,25 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
     for row in client.query(COLUMNS_SQL, &[]).await? {
         let schema: String = row.get(0);
         let table: String = row.get(1);
+        let relation_kind = RelationKind::from_postgres_relkind(row.get(7))
+            .expect("COLUMNS_SQL must only return supported pg_class.relkind values");
         let key = format!("{schema}.{table}");
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema,
             name: table,
+            relation_kind,
             columns: vec![],
             primary_key: vec![],
+            unique_keys: vec![],
             foreign_keys: vec![],
         });
         entry.columns.push(ColumnInfo {
             name: row.get(2),
             pg_type: row.get(3),
-            native_type: None,
-            nullable: row.get(4),
-            has_default: row.get(5),
+            pg_typmod: row.get(4),
+            native_type: row.get(8),
+            nullable: row.get(5),
+            has_default: row.get(6),
         });
     }
 
@@ -198,6 +276,14 @@ pub async fn introspect(client: &Client) -> Result<Catalog, tokio_postgres::Erro
         let table: String = row.get(1);
         if let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) {
             info.primary_key.push(row.get(2));
+        }
+    }
+
+    for row in client.query(UNIQUE_KEYS_SQL, &[]).await? {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        if let Some(info) = catalog.tables.get_mut(&format!("{schema}.{table}")) {
+            info.unique_keys.push(row.get(2));
         }
     }
 
@@ -344,6 +430,7 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
                 columns.push(ColumnInfo {
                     name,
                     pg_type: sqlite_type_to_pg(&decl_type).to_string(),
+                    pg_typmod: -1,
                     native_type: None,
                     nullable: notnull == 0,
                     has_default: dflt.is_some(),
@@ -391,8 +478,10 @@ pub fn sqlite_introspect(conn: &rusqlite::Connection) -> rusqlite::Result<Catalo
             TableInfo {
                 schema: "main".to_string(),
                 name: table,
+                relation_kind: RelationKind::Table,
                 columns,
                 primary_key,
+                unique_keys: vec![],
                 foreign_keys,
             },
         );
@@ -432,13 +521,16 @@ pub fn mysql_introspect(conn: &mut mysql::Conn, schema: &str) -> mysql::Result<C
         let entry = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: schema.to_string(),
             name: table.clone(),
+            relation_kind: RelationKind::Table,
             columns: vec![],
             primary_key: vec![],
+            unique_keys: vec![],
             foreign_keys: vec![],
         });
         entry.columns.push(ColumnInfo {
             name: column,
             pg_type: mysql_type_to_pg(&data_type, &column_type).to_string(),
+            pg_typmod: -1,
             // MySQL scalar rendering is coercion-based and does not need the
             // physical COLUMN_TYPE. Keeping it out of the transitional
             // `sql_type()` path ensures logical `bool` reaches SQLgen instead
@@ -584,8 +676,10 @@ pub fn clickhouse_catalog_from_json_each_row(
         let table = catalog.tables.entry(key).or_insert_with(|| TableInfo {
             schema: database.to_string(),
             name: row.table.clone(),
+            relation_kind: RelationKind::Table,
             columns: Vec::new(),
             primary_key: Vec::new(),
+            unique_keys: Vec::new(),
             foreign_keys: Vec::new(),
         });
 
@@ -595,6 +689,7 @@ pub fn clickhouse_catalog_from_json_each_row(
         table.columns.push(ColumnInfo {
             name: row.name,
             pg_type: clickhouse_type_to_pg(&row.native_type).to_string(),
+            pg_typmod: -1,
             native_type: Some(row.native_type.clone()),
             nullable: clickhouse_is_nullable(&row.native_type),
             has_default: !row.default_kind.is_empty(),

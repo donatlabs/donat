@@ -1,0 +1,52 @@
+name: submit_prescription_review
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: order_line_id
+    type: uuid!
+  - name: review_deadline
+    type: timestamptz!
+  - name: request_id
+    type: uuid!
+steps:
+  # This projection is owned by the customer and admits only order lines that
+  # require prescription review. The request never trusts an arbitrary line id.
+  - name: eligible_order_line
+    select_one:
+      table: public.customer_prescription_order_line
+      by:
+        order_line_id: { arg: order_line_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning: [order_line_id, customer_id]
+      require_found: true
+  - name: prescription_request
+    insert:
+      table: public.prescription_request
+      object:
+        customer_id: { step: eligible_order_line, column: customer_id }
+        order_line_id: { step: eligible_order_line, column: order_line_id }
+        review_deadline: { arg: review_deadline }
+        status: { literal: submitted }
+      returning: [id, customer_id, order_line_id, review_deadline, status]
+  - name: submission_audit
+    insert:
+      table: public.prescription_event
+      object:
+        prescription_request_id: { step: prescription_request, column: id }
+        event_type: { literal: submitted }
+        actor_role: { literal: customer }
+        request_id: { arg: request_id }
+      returning: [id, prescription_request_id, event_type, request_id]
+result:
+  prescription_id: { step: prescription_request, column: id }
+  owner_user_id: { step: prescription_request, column: customer_id }
+  order_line_id: { step: prescription_request, column: order_line_id }
+  review_deadline: { step: prescription_request, column: review_deadline }
+  status: { step: prescription_request, column: status }
+  audit: { step: submission_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 365d

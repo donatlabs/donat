@@ -10,10 +10,10 @@
 //! (reconcile), exactly as a real deploy would.
 //!
 //! Difference from Hasura, by design: this engine has no admin role, so
-//! mutations run as an explicit `tester` role (via
-//! DONAT_GRAPHQL_UNAUTHORIZED_ROLE). Session variables are not yet captured
-//! into the event payload (the engine does not set the `donat.user` GUC), so
-//! `event.session_variables` is currently null — asserted as such here.
+//! mutations run as the explicit `tester` role. Session variables are not yet
+//! captured into the event payload (the engine does not set the `donat.user`
+//! GUC), so `event.session_variables` is currently null — asserted as such
+//! here.
 
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ fn event_trigger(name: &str, webhook_suffix: &str, retry: Json) -> EventTrigger 
 /// (migrate + reconcile + serve) to start.
 fn setup(name: &str, trigger: EventTrigger) -> donat_conformance::Running {
     let r = Suite::new(name)
-        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
+        .request_header("X-Donat-Role", "tester")
         .with_event_webhook()
         .start();
 

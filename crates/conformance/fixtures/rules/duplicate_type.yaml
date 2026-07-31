@@ -1,0 +1,5 @@
+types:
+  - name: OrderStatus
+    enum: [draft]
+  - name: OrderStatus
+    enum: [submitted]

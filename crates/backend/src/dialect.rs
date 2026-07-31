@@ -83,7 +83,7 @@ impl Dialect for PostgresDialect {
         if matches!(native_type, "geometry" | "geography") && scalar.as_json().is_object() {
             return self.render_geometry(scalar, native_type);
         }
-        let ty = self.quote_ident(native_type);
+        let ty = self.quote_type_name(native_type);
         match scalar.as_json() {
             serde_json::Value::Null => "NULL".into(),
             serde_json::Value::Bool(b) => {
@@ -125,11 +125,27 @@ impl Dialect for PostgresDialect {
 }
 
 impl PostgresDialect {
+    /// Render a SQL type name that may be schema-qualified.
+    ///
+    /// Catalog introspection reports a domain as `schema.name`. Quoting that
+    /// whole string as one identifier asks PostgreSQL for a type literally
+    /// named `"public.my_domain"`, which does not exist, so every cast against
+    /// a domain-typed column would fail at execution time. Built-in names carry
+    /// no qualifier and are unchanged.
+    pub fn quote_type_name(&self, native_type: &str) -> String {
+        match native_type.split_once('.') {
+            Some((schema, name)) => {
+                format!("{}.{}", self.quote_ident(schema), self.quote_ident(name))
+            }
+            None => self.quote_ident(native_type),
+        }
+    }
+
     /// Byte-for-byte port of sqlgen's `geometry_sql`: GeoJSON objects (or
     /// strings holding GeoJSON, e.g. from session variables) go through
     /// ST_GeomFromGeoJSON; other strings are assumed to be WKT/EWKT.
     fn render_geometry(&self, value: &donat_ir::Scalar, native_type: &str) -> String {
-        let cast = self.quote_ident(native_type);
+        let cast = self.quote_type_name(native_type);
         match value.as_json() {
             serde_json::Value::Object(_) => format!(
                 "(ST_GeomFromGeoJSON({}))::{cast}",
@@ -829,7 +845,7 @@ mod tests {
         // geometry_sql casts via quote_ident(pg_type), i.e. `::"geometry"`.
         assert_eq!(
             d.render_scalar(&s(geo.clone()), "geometry"),
-            format!("(ST_GeomFromGeoJSON('{}'))::\"geometry\"", geo.to_string())
+            format!("(ST_GeomFromGeoJSON('{geo}'))::\"geometry\"")
         );
     }
 

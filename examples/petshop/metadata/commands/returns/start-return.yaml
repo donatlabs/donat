@@ -1,0 +1,46 @@
+# Customer-facing entry point for the return/refund Process. The Process owns
+# the return request itself; this command only proves the caller owns the order
+# before a durable Process exists for it.
+name: start_return
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: lines
+    type: "[ReturnRequestLine!]!"
+  - name: reason
+    type: string!
+  - name: replacement_requested
+    type: bool!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning: [id, customer_id]
+      require_found: true
+result:
+  order_id: { step: order, column: id }
+  owner_user_id: { step: order, column: customer_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: order_id }
+    - { session_variable: x-donat-user-id }
+  retention: 365d
+effects:
+  - start_process:
+      process: return_refund
+      input:
+        order_id: { step: order, column: id }
+        lines: { arg: lines }
+        reason: { arg: reason }
+        replacement_requested: { arg: replacement_requested }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

@@ -1,0 +1,91 @@
+name: request_return
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: lines
+    type: "[ReturnRequestLine!]!"
+  - name: reason
+    type: string!
+  - name: replacement_requested
+    type: bool!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: return_context
+    select_one:
+      table: { schema: public, name: order_return_context }
+      by:
+        order_id: { arg: order_id }
+        customer_id: { session_variable: x-donat-user-id }
+      returning:
+        [order_id, customer_id, payment_id, currency, recipient_name,
+         address_line_1, address_line_2, city, region, postal_code,
+         country_code]
+      require_found: true
+  - name: return_address
+    project:
+      values:
+        recipient_name: { step: return_context, column: recipient_name }
+        address_line_1: { step: return_context, column: address_line_1 }
+        address_line_2: { step: return_context, column: address_line_2 }
+        city: { step: return_context, column: city }
+        region: { step: return_context, column: region }
+        postal_code: { step: return_context, column: postal_code }
+        country_code: { step: return_context, column: country_code }
+  - name: return_request
+    insert:
+      table: { schema: public, name: return_request }
+      object:
+        order_id: { step: return_context, column: order_id }
+        customer_id: { step: return_context, column: customer_id }
+        replacement_requested: { arg: replacement_requested }
+        reason: { arg: reason }
+        status: { literal: requested }
+      returning: [id, order_id, customer_id, replacement_requested, reason, status]
+  # `requested_quantity` is a new return-line fact; it never overwrites the
+  # immutable original order-line quantity.
+  - name: return_items
+    insert_many:
+      table: { schema: public, name: return_item }
+      for_each: { arg: lines }
+      object:
+        return_request_id: { step: return_request, column: id }
+        order_line_id: { item: order_line_id }
+        requested_quantity: { item: requested_quantity }
+        approved_quantity: { literal: 0 }
+        received_quantity: { literal: 0 }
+        inspected_quantity: { literal: 0 }
+      returning: [id, return_request_id, order_line_id, requested_quantity, approved_quantity, received_quantity, inspected_quantity]
+  - name: requested_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_request, column: id }
+        event_type: { literal: requested }
+        actor_role: { literal: customer }
+        request_id: { arg: request_id }
+        reason: { arg: reason }
+      returning: [id, return_request_id, event_type, request_id, reason]
+result:
+  return_id: { step: return_request, column: id }
+  order_id: { step: return_request, column: order_id }
+  replacement_requested: { step: return_request, column: replacement_requested }
+  payment_id: { step: return_context, column: payment_id }
+  currency: { step: return_context, column: currency }
+  return_from: { step: return_address }
+  items:
+    step: return_items
+    project:
+      return_item_id: id
+      order_line_id: order_line_id
+      requested_quantity: requested_quantity
+    maximum_items: 256
+  audit: { step: requested_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 365d

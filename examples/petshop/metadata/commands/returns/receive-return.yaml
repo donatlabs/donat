@@ -1,0 +1,92 @@
+name: receive_return
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: lines
+    type: "[ReturnReceiptLine!]!"
+  - name: receipt_id
+    type: uuid!
+  - name: received_at
+    type: timestamptz!
+steps:
+  - name: return_request
+    select_one:
+      table: { schema: public, name: return_request }
+      by: { id: { arg: return_id } }
+      returning: [id, order_id, status]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_return
+      with:
+        current: { step: return_request, column: status }
+        next: { literal: received }
+  - name: receipt_matches_approval
+    assert:
+      rule: return_receipt_matches_approval
+      with:
+        lines: { arg: lines }
+  - name: received_items
+    update_many:
+      table: { schema: public, name: return_item }
+      for_each: { arg: lines }
+      maximum_items: 256
+      by:
+        id: { item: return_item_id }
+        return_request_id: { step: return_request, column: id }
+      set: { received_quantity: { item: received_quantity } }
+      check:
+        rule: return_received_quantity_is_bounded
+        with:
+          approved_quantity: { current_column: approved_quantity }
+          received_quantity: { item: received_quantity }
+      returning: [id, return_request_id, order_line_id, approved_quantity, received_quantity]
+      require_each: true
+  - name: receipt_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_request, column: id }
+        event_type: { literal: received }
+        actor_role: { literal: fulfilment }
+        request_id: { arg: receipt_id }
+        occurred_at: { arg: received_at }
+      returning: [id, return_request_id, event_type, request_id, occurred_at]
+  - name: received_return
+    update:
+      table: { schema: public, name: return_request }
+      where: { id: { step: return_request, column: id }, status: { literal: approved } }
+      set: { status: { literal: received } }
+      returning: [id, order_id, status]
+      require_affected: true
+  - name: received_quantity
+    aggregate:
+      from: { arg: lines }
+      minimum_items: 1
+      maximum_items: 256
+      values:
+        quantity: { sum: { column: received_quantity } }
+result:
+  return_id: { step: received_return, column: id }
+  order_id: { step: received_return, column: order_id }
+  status: { step: received_return, column: status }
+  items: { step: received_items }
+  audit: { step: receipt_audit }
+idempotency:
+  key: { argument: receipt_id }
+  scope:
+    - { argument: return_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: return_refund
+      signal: return_receipt_recorded
+      correlate:
+        return_id: { step: received_return, column: id }
+      payload:
+        status: { literal: received }
+        received_quantity: { step: received_quantity, column: quantity }
+      idempotency_key: { argument: receipt_id }

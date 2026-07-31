@@ -33,7 +33,7 @@ use crate::state::SharedState;
 /// Run from `migrate` (deploy-time); the serving binary never runs DDL.
 pub async fn reconcile(database_url: &str, metadata: &Metadata) -> anyhow::Result<()> {
     let (client, conn) = tokio_postgres::connect(database_url, NoTls).await?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
 
     // Desired triggers: (pg_trigger_name, schema, table) -> CREATE statement.
     let mut desired: HashMap<String, (String, String, String)> = HashMap::new();

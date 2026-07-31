@@ -1,0 +1,5 @@
+---
+source: crates/rules/tests/postgres.rs
+expression: sql
+---
+(CASE WHEN ((CASE WHEN ((CASE WHEN ((CASE WHEN (((char_length((("input"."name")::text)::text)) = ((2)::int4))) THEN (((jsonb_array_length((("input"."lines")::jsonb)::jsonb)) = ((2)::int4))) ELSE FALSE END)) THEN (((("input"."limit")::int4) IS NULL)) ELSE FALSE END)) THEN (((left((("input"."name")::text)::text, char_length(('A'::text)::text))) = (('A'::text)::text))) ELSE FALSE END)) THEN (((right((("input"."name")::text)::text, char_length(('z'::text)::text))) = (('z'::text)::text))) ELSE FALSE END)

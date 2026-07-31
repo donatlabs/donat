@@ -1,0 +1,147 @@
+name: capture_payment
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: authorization_id
+    type: uuid!
+  - name: shipment_id
+    type: uuid!
+  - name: provider_capture_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: amount_minor
+    type: bigint!
+  - name: provider_outcome
+    type: PaymentOutcome!
+  - name: payload
+    type: BoundedProviderEvidence!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, currency, captured_minor]
+  - name: authorization
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { step: payment, column: id }
+      returning: [id, payment_id, authorized_minor, captured_minor, capture_reserved_minor, status]
+  - name: capture_claim
+    select_one:
+      table: public.payment_capture_claim
+      by:
+        payment_id: { step: payment, column: id }
+        authorization_id: { step: authorization, column: id }
+        shipment_id: { arg: shipment_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: reserved }
+      returning:
+        [id, payment_id, authorization_id, shipment_id, amount_minor,
+         currency, status]
+      require_found: true
+  - name: capture_is_bounded
+    assert:
+      rule: can_complete_claimed_capture
+      with:
+        authorization_state: { step: authorization, column: status }
+        authorized_minor: { step: authorization, column: authorized_minor }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: provider_capture_succeeded
+    assert:
+      rule: payment_outcome_is
+      with:
+        actual: { arg: provider_outcome }
+        expected: { literal: captured }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: capture }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: capture
+    insert:
+      table: public.payment_capture
+      object:
+        payment_id: { step: payment, column: id }
+        authorization_id: { step: authorization, column: id }
+        provider_capture_id: { arg: provider_capture_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: captured }
+      returning: [id, payment_id, authorization_id, amount_minor, status]
+  - name: add_captured_amount
+    update:
+      table: public.payment_authorization
+      where:
+        id: { step: authorization, column: id }
+        status: { literal: authorized }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+      set:
+        captured_minor:
+          rule: add_minor
+          with:
+            left: { step: authorization, column: captured_minor }
+            right: { step: capture_claim, column: amount_minor }
+        capture_reserved_minor:
+          rule: subtract_minor
+          with:
+            left: { step: authorization, column: capture_reserved_minor }
+            right: { step: capture_claim, column: amount_minor }
+      returning: [id, captured_minor, capture_reserved_minor]
+      require_affected: true
+  - name: complete_capture_claim
+    update:
+      table: public.payment_capture_claim
+      where:
+        id: { step: capture_claim, column: id }
+        status: { literal: reserved }
+      set:
+        status: { literal: captured }
+        provider_capture_id: { arg: provider_capture_id }
+      returning:
+        [id, shipment_id, amount_minor, status, provider_capture_id]
+      require_affected: true
+  # The payment row is the money ledger every later module reads: refund
+  # eligibility and the refund bound are both computed from `captured_minor`
+  # here, not from the authorization. A capture that only credited the
+  # authorization would leave every refund unfundable.
+  - name: mark_captured
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+        captured_minor: { step: payment, column: captured_minor }
+      set:
+        status: { literal: captured }
+        captured_minor:
+          rule: add_minor
+          with:
+            left: { step: payment, column: captured_minor }
+            right: { step: capture_claim, column: amount_minor }
+      returning: [id, status, captured_minor]
+      require_affected: true
+result:
+  shipment_id: { arg: shipment_id }
+  payment_id: { step: mark_captured, column: id }
+  status:
+    rule: normalize_payment_state_text
+    with:
+      state: { step: mark_captured, column: status }
+  capture_id: { step: capture, column: id }
+  amount_minor: { step: capture, column: amount_minor }
+  requires_reconciliation: { literal: false }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

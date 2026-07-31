@@ -222,6 +222,78 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
 }
 
 #[test]
+fn command_mutation_keeps_resolved_execution_facts_and_projection() {
+    let root = MutationRoot::Command {
+        alias: "submitted".into(),
+        command: CommandMutation {
+            identity: CommandIdentity {
+                source: "default".into(),
+                name: "create_order".into(),
+                role: "customer".into(),
+            },
+            name: "create_order".into(),
+            steps: vec![CommandExecutionStep::Insert {
+                name: "order".into(),
+                cte: "_cmd_step_0".into(),
+                table: table("orders"),
+                object: vec![CommandAssignment {
+                    column: CommandColumn {
+                        name: "quantity".into(),
+                        pg_type: "int4".into(),
+                        logical_type: "int4".into(),
+                        nullable: false,
+                    },
+                    value: CommandExecutionValue::Scalar {
+                        value: Scalar::Json(json!(1)),
+                        pg_type: "int4".into(),
+                    },
+                }],
+                returning: vec![CommandColumn {
+                    name: "id".into(),
+                    pg_type: "uuid".into(),
+                    logical_type: "uuid".into(),
+                    nullable: false,
+                }],
+                check: None,
+                error_path: "$.selectionSet.submitted".into(),
+            }],
+            guards: vec![],
+            result: vec![CommandResultField {
+                name: "order_id".into(),
+                value: CommandResultValue::StepColumn {
+                    cte: "_cmd_step_0".into(),
+                    column: CommandColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        logical_type: "uuid".into(),
+                        nullable: false,
+                    },
+                },
+            }],
+            idempotency: None,
+            effects: vec![],
+            selection: vec![CommandResultSelection::Scalar {
+                alias: "order".into(),
+                field: "order_id".into(),
+            }],
+        },
+    };
+
+    let serialized = serde_json::to_value(root).expect("command root serializes");
+    assert_eq!(serialized["Command"]["alias"], "submitted");
+    assert_eq!(serialized["Command"]["command"]["name"], "create_order");
+    assert_eq!(
+        serialized["Command"]["command"]["steps"][0]["Insert"]["object"][0]["column"]["pg_type"],
+        "int4"
+    );
+    assert_eq!(
+        serialized["Command"]["command"]["selection"][0]["Scalar"]["alias"],
+        "order"
+    );
+    assert!(serialized["Command"]["command"].get("definition").is_none());
+}
+
+#[test]
 fn clone_is_deep_and_serialization_equivalent() {
     let original = RootField::Select {
         alias: "authors".into(),

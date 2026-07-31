@@ -1,0 +1,143 @@
+name: mock_payout
+module: http
+config:
+  endpoint_identity: petshop_mock_payout_v1
+  credential_identity: petshop_mock_payout_fixture
+  base_url: { value_from_env: PETSHOP_PAYOUT_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: PETSHOP_PAYOUT_API_TOKEN
+operations:
+  - name: create_payout
+    version: v1
+    method: POST
+    path: /v1/payouts
+    input_contract:
+      payout_id: uuid!
+      payout_key: string!
+      vendor_id: uuid!
+      amount_minor: bigint!
+      currency: string!
+    body:
+      payout_id: { input: payout_id }
+      payout_key: { input: payout_key }
+      vendor_id: { input: vendor_id }
+      amount_minor: { input: amount_minor }
+      currency: { input: currency }
+    success_statuses: [200, 201]
+    response:
+      payout_id: { json_pointer: /local_payout_id, type: uuid! }
+      vendor_id: { json_pointer: /vendor_id, type: uuid! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_payout_id: { json_pointer: /payout_id, type: string!, max_bytes: 256 }
+      outcome: { json_pointer: /outcome, type: ProviderPayoutOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-payout-create-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payout_authentication }
+        - { statuses: [408], class: timeout, code: payout_timeout }
+        - { statuses: [429], class: http_429, code: payout_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payout_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payout_rejected }
+      fallback: { class: permanent, code: payout_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: vendor_id }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [payout_key]
+      response_body: [provider_payout_id, normalized_payload]
+
+  - name: lookup_payout
+    version: v1
+    method: POST
+    path: /v1/payout-lookups
+    input_contract:
+      payout_id: uuid!
+      payout_key: string!
+      activity_key: string!
+    body:
+      payout_id: { input: payout_id }
+      payout_key: { input: payout_key }
+      activity_key: { input: activity_key }
+    success_statuses: [200]
+    response:
+      resolution: { json_pointer: /resolution, type: ProviderLookupResolution! }
+      payout_id: { json_pointer: /local_payout_id, type: uuid! }
+      vendor_id: { json_pointer: /vendor_id, type: uuid! }
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_payout_id: { json_pointer: /payout_id, type: string, max_bytes: 256 }
+      outcome: { json_pointer: /outcome, type: ProviderPayoutOutcome! }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    success_contract:
+      discriminator: resolution
+      cases:
+        mutation_found:
+          requires: [provider_payout_id, provider_event_id, outcome]
+        terminal_absence:
+          requires: [provider_event_id, normalized_payload]
+          outcome: failed
+      unproven_absence:
+        error: { class: invariant, code: payout_outcome_ambiguous }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 4096
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: payout_authentication }
+        - { statuses: [408], class: timeout, code: payout_timeout }
+        - { statuses: [425], class: invariant, code: payout_outcome_ambiguous }
+        - { statuses: [429], class: http_429, code: payout_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: payout_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: payout_lookup_rejected }
+      fallback: { class: permanent, code: payout_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: payout_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [payout_key]
+      response_body: [provider_payout_id, normalized_payload]

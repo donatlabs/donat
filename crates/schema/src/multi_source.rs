@@ -13,11 +13,15 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json};
 
+use donat_rules::RuleCatalog;
+
+use crate::commands::{CompiledCommandCatalog, validate_and_extract_finalized_command_catalog};
 use crate::introspection::{build_schema_json, execute_introspection_schema_lazy};
 use crate::naming::table_base_name;
 use crate::plan::{
     Fragments, Plan, PlanError, Planner, PlannerIndex, Session, flatten, value_to_json,
 };
+use crate::process_effects::{FinalizedCommandCatalog, ProcessEffectContractCatalog};
 
 /// A source-local query IR, ready for exactly one backend request.
 #[derive(Debug, Clone)]
@@ -58,15 +62,17 @@ type RootOwners = HashMap<String, String>;
 struct RoleSchemas {
     standard: [Json; 2],
     relay: [Json; 2],
+    mutation_owners: [RootOwners; 2],
 }
 
 /// Immutable schema and source-index state compiled from one metadata/catalog
 /// snapshot. It owns no references into that snapshot.
 pub struct CompiledMultiSourceSchema {
+    command_catalog: Arc<CompiledCommandCatalog>,
+    finalized_command_catalog: Option<Arc<FinalizedCommandCatalog>>,
     source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
     relay_query_owners: HashMap<String, String>,
-    mutation_owners: HashMap<String, String>,
     schema_template: Json,
     relay_id_types: HashSet<String>,
     relay_error: Option<PlanError>,
@@ -112,6 +118,57 @@ impl CompiledMultiSourceSchema {
         catalogs: &HashMap<String, Catalog>,
         infer_function_permissions: bool,
     ) -> Result<Self, PlanError> {
+        if !metadata.commands.is_empty() {
+            return Err(PlanError::validation(
+                "commands.yaml",
+                "commands require an immutable compiled command catalog",
+            ));
+        }
+        Self::compile_with_command_catalog(
+            metadata,
+            catalogs,
+            Arc::new(CompiledCommandCatalog::empty()),
+            infer_function_permissions,
+        )
+    }
+
+    /// Construct a serving schema from command definitions already validated
+    /// against the exact metadata, catalog, and Rules snapshots. This method
+    /// never parses command YAML or mutates command state.
+    pub fn compile_with_command_catalog(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        command_catalog: Arc<CompiledCommandCatalog>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        Self::compile_with_catalogs(
+            metadata,
+            catalogs,
+            command_catalog,
+            None,
+            infer_function_permissions,
+        )
+    }
+
+    fn compile_with_catalogs(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        command_catalog: Arc<CompiledCommandCatalog>,
+        finalized_command_catalog: Option<Arc<FinalizedCommandCatalog>>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        for command in &metadata.commands {
+            if command_catalog
+                .source(&command.source)
+                .and_then(|source| source.command(&command.name))
+                .is_none()
+            {
+                return Err(PlanError::validation(
+                    "commands.yaml",
+                    "compiled command catalog does not match metadata",
+                ));
+            }
+        }
         let source_indexes = metadata
             .sources
             .iter()
@@ -121,9 +178,12 @@ impl CompiledMultiSourceSchema {
             metadata,
             catalogs,
             &source_indexes,
+            Some(command_catalog.as_ref()),
+            finalized_command_catalog.as_deref(),
+            false,
             infer_function_permissions,
         )?;
-        let (query_owners, mutation_owners) = root_owners(&children)?;
+        let (query_owners, standard_mutation_owners) = root_owners(&children)?;
         let schema_template = build_role_independent_schema(metadata, catalogs, &source_indexes)?;
         let roles = metadata_roles(metadata);
         let unknown_role = denied_role_name(&roles);
@@ -171,16 +231,24 @@ impl CompiledMultiSourceSchema {
                         .remove(&role)
                         .expect("standard role schema was composed"),
                     relay: relay.remove(&role).expect("Relay role schema was composed"),
+                    mutation_owners: role_mutation_owners(
+                        &children,
+                        &standard_mutation_owners,
+                        &role,
+                    )?,
                 };
-                (role, schemas)
+                Ok((role, schemas))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, PlanError>>()?;
+        let unknown_mutation_owners =
+            role_mutation_owners(&children, &standard_mutation_owners, &unknown_role)?;
 
         Ok(Self {
+            command_catalog,
+            finalized_command_catalog,
             source_indexes,
             query_owners,
             relay_query_owners,
-            mutation_owners,
             schema_template,
             relay_id_types,
             relay_error,
@@ -188,9 +256,43 @@ impl CompiledMultiSourceSchema {
             unknown_role_schemas: RoleSchemas {
                 standard: unknown_standard,
                 relay: unknown_relay,
+                mutation_owners: unknown_mutation_owners,
             },
             infer_function_permissions,
         })
+    }
+
+    /// Construct a serving schema only from a command snapshot whose Process
+    /// effects have been pinned to this exact immutable contract catalog.
+    ///
+    /// This performs validation only. It never reparses metadata into command
+    /// or Process definitions and owns no runtime or journal handles.
+    pub fn compile_with_command_catalog_and_process_effects(
+        metadata: &Metadata,
+        catalogs: &HashMap<String, Catalog>,
+        rules: &RuleCatalog,
+        commands: &FinalizedCommandCatalog,
+        process_effects: &ProcessEffectContractCatalog,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        let command_catalog = validate_and_extract_finalized_command_catalog(
+            metadata,
+            rules,
+            commands,
+            process_effects,
+        )?;
+        Self::compile_with_catalogs(
+            metadata,
+            catalogs,
+            Arc::new(command_catalog),
+            Some(Arc::new(commands.clone())),
+            infer_function_permissions,
+        )
+    }
+
+    /// The immutable command catalog accepted with this schema snapshot.
+    pub fn command_catalog(&self) -> &CompiledCommandCatalog {
+        self.command_catalog.as_ref()
     }
 
     pub fn source_planner<'a>(
@@ -222,8 +324,17 @@ impl CompiledMultiSourceSchema {
             .source_indexes
             .get(index)
             .ok_or_else(|| PlanError::new("$", "unexpected", "compiled source index is missing"))?;
-        let mut planner =
-            Planner::for_source_with_index(metadata, source, catalog, source_index.clone());
+        let mut planner = Planner::for_source_with_index_and_commands(
+            metadata,
+            source,
+            catalog,
+            source_index.clone(),
+            self.command_catalog.source(&source.name),
+            self.finalized_command_catalog
+                .as_deref()
+                .and_then(|commands| commands.source(&source.name)),
+            false,
+        );
         planner.infer_function_permissions = self.infer_function_permissions;
         Ok(planner)
     }
@@ -240,6 +351,14 @@ impl CompiledMultiSourceSchema {
         };
         &pair[usize::from(session.backend_request)]
     }
+
+    fn mutation_owners(&self, session: &Session) -> &RootOwners {
+        let schemas = self
+            .role_schemas
+            .get(&session.role)
+            .unwrap_or(&self.unknown_role_schemas);
+        &schemas.mutation_owners[usize::from(session.backend_request)]
+    }
 }
 
 impl<'a> MultiSourcePlanner<'a> {
@@ -252,6 +371,9 @@ impl<'a> MultiSourcePlanner<'a> {
             metadata,
             catalogs,
             &compiled.source_indexes,
+            Some(compiled.command_catalog.as_ref()),
+            compiled.finalized_command_catalog.as_deref(),
+            false,
             compiled.infer_function_permissions,
         )?;
         Ok(Self {
@@ -328,7 +450,7 @@ impl<'a> MultiSourcePlanner<'a> {
             return Err(PlanError::validation("$", "selection set cannot be empty"));
         }
         let owners = if is_mutation {
-            &self.compiled.mutation_owners
+            self.compiled.mutation_owners(session)
         } else if self.relay {
             &self.compiled.relay_query_owners
         } else {
@@ -456,6 +578,9 @@ fn build_children<'a>(
     metadata: &'a Metadata,
     catalogs: &'a HashMap<String, Catalog>,
     source_indexes: &[Arc<PlannerIndex>],
+    commands: Option<&'a CompiledCommandCatalog>,
+    finalized_commands: Option<&'a FinalizedCommandCatalog>,
+    expose_all_commands: bool,
     infer_function_permissions: bool,
 ) -> Result<Vec<ChildPlanner<'a>>, PlanError> {
     if metadata.sources.len() != source_indexes.len() {
@@ -477,8 +602,15 @@ fn build_children<'a>(
                     format!("catalog for source '{}' not found", source.name),
                 )
             })?;
-            let mut planner =
-                Planner::for_source_with_index(metadata, source, catalog, index.clone());
+            let mut planner = Planner::for_source_with_index_and_commands(
+                metadata,
+                source,
+                catalog,
+                index.clone(),
+                commands.and_then(|commands| commands.source(&source.name)),
+                finalized_commands.and_then(|commands| commands.source(&source.name)),
+                expose_all_commands,
+            );
             planner.infer_function_permissions = infer_function_permissions;
             Ok(ChildPlanner {
                 source: source.name.clone(),
@@ -500,7 +632,7 @@ fn root_owners(children: &[ChildPlanner<'_>]) -> Result<(RootOwners, RootOwners)
         )?;
         register_owners(
             &mut mutation_owners,
-            child.planner.mutation_root_names(),
+            child.planner.standard_mutation_root_names(),
             &child.source,
             "mutation",
         )?;
@@ -510,6 +642,14 @@ fn root_owners(children: &[ChildPlanner<'_>]) -> Result<(RootOwners, RootOwners)
 
 fn metadata_roles(metadata: &Metadata) -> BTreeSet<String> {
     let mut roles = BTreeSet::new();
+    for command in &metadata.commands {
+        roles.extend(
+            command
+                .permissions
+                .iter()
+                .map(|permission| permission.role.clone()),
+        );
+    }
     for inherited in &metadata.inherited_roles {
         roles.insert(inherited.role_name.clone());
         roles.extend(inherited.role_set.iter().cloned());
@@ -584,6 +724,42 @@ fn compose_role_schemas(
         .collect()
 }
 
+/// Command roots cannot share the source-global ownership table because their
+/// presence is conditional on the explicit role and its effective table
+/// permissions. Overlay them on the already validated standard roots for each
+/// cached role schema, keeping table/function ownership behavior unchanged.
+fn role_mutation_owners(
+    children: &[ChildPlanner<'_>],
+    standard_owners: &RootOwners,
+    role: &str,
+) -> Result<[RootOwners; 2], PlanError> {
+    let owners_for = |backend_request| {
+        let session = Session {
+            role: role.to_string(),
+            vars: HashMap::new(),
+            backend_request,
+        };
+        let mut owners = standard_owners.clone();
+        for child in children {
+            for command in child.planner.command_definitions() {
+                if child
+                    .planner
+                    .command_is_permitted(command.definition(), &session)
+                {
+                    register_owner(
+                        &mut owners,
+                        &command.definition().name,
+                        &child.source,
+                        "mutation",
+                    )?;
+                }
+            }
+        }
+        Ok(owners)
+    };
+    Ok([owners_for(false)?, owners_for(true)?])
+}
+
 /// Composite equivalent of [`crate::execute_introspection`].
 pub fn execute_multi_source_introspection(
     planner: &MultiSourcePlanner,
@@ -629,6 +805,10 @@ fn register_owner(
     Ok(())
 }
 
+/// Build the source-independent selection template used only to compare
+/// response-key shapes before handing an operation to a child planner. It
+/// deliberately excludes commands: command output objects are role-specific,
+/// and command roots are routed through the role-specific owner maps below.
 fn build_role_independent_schema(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
@@ -674,11 +854,14 @@ fn build_role_independent_schema(
                 format!("catalog for source '{}' not found", source.name),
             )
         })?;
-        planners.push(Planner::for_source_with_index(
+        planners.push(Planner::for_source_with_index_and_commands(
             &validation_metadata,
             source,
             catalog,
             index.clone(),
+            None,
+            None,
+            false,
         ));
     }
     let session = Session {

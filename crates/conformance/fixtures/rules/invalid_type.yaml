@@ -1,0 +1,6 @@
+rules:
+  - name: unsupported_type
+    parameters:
+      amount: money!
+    result: bool!
+    expression: "true"

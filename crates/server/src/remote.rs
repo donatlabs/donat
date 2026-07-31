@@ -71,8 +71,8 @@ pub struct RemoteTarget {
 /// If the operation is aimed at a permitted remote schema, validate it
 /// against the role's SDL and return the forwarding target. `None` means
 /// "not a remote operation".
-pub fn match_remote<'m>(
-    engine: &'m Engine,
+pub fn match_remote(
+    engine: &Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -82,8 +82,8 @@ pub fn match_remote<'m>(
 
 /// `internal` requests (remote-relationship joins) may set arguments that
 /// carry @preset (they are server-built, not client input).
-pub fn match_remote_with<'m>(
-    engine: &'m Engine,
+pub fn match_remote_with(
+    engine: &Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -153,10 +153,12 @@ pub fn match_remote_with<'m>(
                     _ => continue,
                 };
                 for item in &set.items {
-                    if let Selection::Field(f) = item {
-                        if f.name != "__schema" && f.name != "__type" && f.name != "__typename" {
-                            root_fields.push(f);
-                        }
+                    if let Selection::Field(f) = item
+                        && f.name != "__schema"
+                        && f.name != "__type"
+                        && f.name != "__typename"
+                    {
+                        root_fields.push(f);
                     }
                 }
             }
@@ -297,10 +299,10 @@ fn type_map<'d>(sdl: &'d SDoc<'static, String>) -> Types<'d> {
 
 fn root_type_name(sdl: &SDoc<'static, String>, types: &Types) -> Option<String> {
     for def in &sdl.definitions {
-        if let SDef::SchemaDefinition(sd) = def {
-            if let Some(q) = &sd.query {
-                return Some(q.clone());
-            }
+        if let SDef::SchemaDefinition(sd) = def
+            && let Some(q) = &sd.query
+        {
+            return Some(q.clone());
         }
     }
     types.contains_key("Query").then(|| "Query".to_string())
@@ -447,15 +449,15 @@ fn decustomize(
     // for the fixtures: prefixes are distinctive).
     let strip_field = |name: &str| -> String {
         for rule in &c.field_names {
-            if let Some(p) = &rule.prefix {
-                if let Some(rest) = name.strip_prefix(p.as_str()) {
-                    return rest.to_string();
-                }
+            if let Some(p) = &rule.prefix
+                && let Some(rest) = name.strip_prefix(p.as_str())
+            {
+                return rest.to_string();
             }
-            if let Some(sfx) = &rule.suffix {
-                if let Some(rest) = name.strip_suffix(sfx.as_str()) {
-                    return rest.to_string();
-                }
+            if let Some(sfx) = &rule.suffix
+                && let Some(rest) = name.strip_suffix(sfx.as_str())
+            {
+                return rest.to_string();
             }
         }
         name.to_string()
@@ -586,10 +588,10 @@ fn apply_presets(
         let mut out = vec![];
         for f in &io.fields {
             for d in &f.directives {
-                if d.name == "preset" {
-                    if let Some((_, v)) = d.arguments.iter().find(|(n, _)| n == "value") {
-                        out.push((f.name.clone(), v.clone()));
-                    }
+                if d.name == "preset"
+                    && let Some((_, v)) = d.arguments.iter().find(|(n, _)| n == "value")
+                {
+                    out.push((f.name.clone(), v.clone()));
                 }
             }
         }
@@ -790,10 +792,10 @@ pub async fn forward(
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if is_session_header(name) || name == "authorization" || name == "cookie" {
-                if let Ok(value) = value.to_str() {
-                    request = request.header(name, value);
-                }
+            if (is_session_header(name) || name == "authorization" || name == "cookie")
+                && let Ok(value) = value.to_str()
+            {
+                request = request.header(name, value);
             }
         }
     }

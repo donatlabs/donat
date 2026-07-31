@@ -1,0 +1,321 @@
+name: mock_carrier
+module: http
+config:
+  endpoint_identity: mock_carrier_v1
+  credential_identity: mock_carrier_bearer
+  base_url: { value_from_env: DONAT_MOCK_CARRIER_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: DONAT_MOCK_CARRIER_TOKEN
+operations:
+  - name: quote
+    version: v1
+    method: POST
+    path: /v1/quotes
+    input_contract:
+      shipment_key: string!
+      origin_location_code: string!
+      destination: string!
+      currency: string!
+      ordered_items: "[AllocationItem!]!"
+    body:
+      shipment_key: { input: shipment_key }
+      origin_location_code: { input: origin_location_code }
+      destination: { input: destination }
+      currency: { input: currency }
+      ordered_items: { input: ordered_items }
+    success_statuses: [200]
+    response:
+      quote_id: { json_pointer: /quote_id, type: string!, max_bytes: 256 }
+      service_code: { json_pointer: /service_code, type: string!, max_bytes: 64 }
+      amount_minor: { json_pointer: /amount_minor, type: bigint! }
+      currency: { json_pointer: /currency, type: string!, max_bytes: 16 }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 64
+      maximum_aggregate_request_bytes: 65536
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 10
+      maximum_json_nodes: 1024
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: carrier_authentication }
+        - { statuses: [408], class: timeout, code: carrier_timeout }
+        - { statuses: [429], class: http_429, code: carrier_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: carrier_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: carrier_rejected }
+      fallback: { class: permanent, code: carrier_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [destination]
+
+  - name: create_label
+    version: v1
+    method: POST
+    path: /v1/shipments/{input.shipment_key}/labels
+    input_contract:
+      shipment_id: uuid!
+      shipment_key: string!
+      origin_location_code: string!
+      destination: string!
+      currency: string!
+      ordered_items: "[AllocationItem!]!"
+    body:
+      shipment_id: { input: shipment_id }
+      shipment_key: { input: shipment_key }
+      origin_location_code: { input: origin_location_code }
+      destination: { input: destination }
+      currency: { input: currency }
+      ordered_items: { input: ordered_items }
+    success_statuses: [200, 201]
+    response:
+      shipment_id: { json_pointer: /shipment_id, type: uuid! }
+      shipment_key: { json_pointer: /shipment_key, type: string!, max_bytes: 256 }
+      carrier_shipment_reference: { json_pointer: /carrier_shipment_reference, type: string, max_bytes: 256 }
+      tracking_number: { json_pointer: /tracking_number, type: string, max_bytes: 256 }
+      label_url: { json_pointer: /label_url, type: string!, max_bytes: 2048 }
+      provider_event_id: { json_pointer: /event_id, type: string!, max_bytes: 256 }
+      normalized_outcome: { json_pointer: /outcome, type: CarrierLabelTerminalOutcome! }
+      failure_code: { json_pointer: /failure_code, type: string, max_bytes: 128 }
+      safe_failure_message: { json_pointer: /safe_failure_message, type: string, max_bytes: 512 }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-carrier-create-label-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
+    bounds:
+      deadline_ms: 10000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 64
+      maximum_aggregate_request_bytes: 65536
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 10
+      maximum_json_nodes: 1024
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: carrier_authentication }
+        - { statuses: [408], class: timeout, code: carrier_timeout }
+        - { statuses: [429], class: http_429, code: carrier_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: carrier_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: carrier_rejected }
+      fallback: { class: permanent, code: carrier_provider_error }
+    timeout: 10s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [destination]
+      response_body: [label_url, carrier_shipment_reference]
+
+  - name: create_return_label
+    version: v1
+    method: POST
+    path: /v1/returns/{input.return_key}/labels
+    input_contract:
+      return_id: uuid!
+      return_key: string!
+      return_from: ReturnAddress!
+      currency: string!
+      return_items: "[ReturnCarrierItem!]!"
+    body:
+      return_id: { input: return_id }
+      return_key: { input: return_key }
+      return_from: { input: return_from }
+      currency: { input: currency }
+      return_items: { input: return_items }
+    success_statuses: [200, 201]
+    response:
+      provider_event_id: { json_pointer: /provider_event_id, type: string!, max_bytes: 256 }
+      provider_return_id: { json_pointer: /return_id, type: string!, max_bytes: 256 }
+      tracking_number: { json_pointer: /tracking_number, type: string!, max_bytes: 256 }
+      label_url: { json_pointer: /label_url, type: string!, max_bytes: 2048 }
+      status: { json_pointer: /status, type: string!, max_bytes: 64 }
+      normalized_payload: { json_pointer: /normalized_payload, type: BoundedProviderEvidence! }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: petshop-mock-carrier-return-label-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.petshop.mock-providers.v1
+              fact_ids: [fact.mock-providers.fixed-idempotency-header, fact.mock-providers.operation-scoped-key, fact.mock-providers.retention-604800000, fact.mock-providers.clock-margin-300000]
+    bounds:
+      deadline_ms: 10000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 64
+      maximum_aggregate_request_bytes: 65536
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 10
+      maximum_json_nodes: 1024
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: carrier_authentication }
+        - { statuses: [408], class: timeout, code: carrier_timeout }
+        - { statuses: [429], class: http_429, code: carrier_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: carrier_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: carrier_rejected }
+      fallback: { class: permanent, code: carrier_provider_error }
+    timeout: 10s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: return_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [return_from]
+      response_body: [label_url, provider_return_id, normalized_payload]
+
+  - name: lookup_label
+    version: v1
+    method: POST
+    path: /v1/shipment-label-lookups
+    input_contract:
+      shipment_id: uuid!
+      shipment_key: string!
+      activity_key: string!
+    body:
+      shipment_id: { input: shipment_id }
+      shipment_key: { input: shipment_key }
+      activity_key: { input: activity_key }
+    success_statuses: [200]
+    response:
+      resolution: { json_pointer: /resolution, type: ProviderLookupResolution! }
+      shipment_id: { json_pointer: /shipment_id, type: uuid! }
+      shipment_key: { json_pointer: /shipment_key, type: string!, max_bytes: 256 }
+      carrier_shipment_reference: { json_pointer: /carrier_shipment_reference, type: string, max_bytes: 256 }
+      tracking_number: { json_pointer: /tracking_number, type: string, max_bytes: 256 }
+      provider_event_id: { json_pointer: /event_id, type: string!, max_bytes: 256 }
+      normalized_outcome: { json_pointer: /outcome, type: CarrierLabelTerminalOutcome! }
+      failure_code: { json_pointer: /failure_code, type: string, max_bytes: 128 }
+      safe_failure_message: { json_pointer: /safe_failure_message, type: string, max_bytes: 512 }
+    success_contract:
+      discriminator: resolution
+      cases:
+        mutation_found:
+          requires: [carrier_shipment_reference, tracking_number]
+          normalized_outcome: label_created
+        terminal_absence:
+          requires: [provider_event_id, failure_code, safe_failure_message]
+          normalized_outcome: label_not_created
+      unproven_absence:
+        error: { class: invariant, code: carrier_label_outcome_ambiguous }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 4096
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: carrier_authentication }
+        - { statuses: [408], class: timeout, code: carrier_timeout }
+        - { statuses: [425], class: invariant, code: carrier_label_outcome_ambiguous }
+        - { statuses: [429], class: http_429, code: carrier_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: carrier_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: carrier_lookup_rejected }
+      fallback: { class: permanent, code: carrier_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 100ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 8
+      rate_limit: { permits: 30, per: 1m, burst: 8 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      response_body: [carrier_shipment_reference]
+
+  - name: track
+    version: v1
+    method: GET
+    path: /v1/shipments/{input.shipment_key}/tracking
+    input_contract:
+      shipment_key: string!
+      carrier_shipment_reference: string!
+    query:
+      carrier_shipment_reference: { input: carrier_shipment_reference }
+    success_statuses: [200]
+    response:
+      provider_event_id: { json_pointer: /event_id, type: string!, max_bytes: 256 }
+      outcome: { json_pointer: /outcome, type: string!, max_bytes: 64 }
+      delivered_at: { json_pointer: /delivered_at, type: timestamptz }
+    effect: read_only
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 4096
+      maximum_aggregate_response_bytes: 16384
+      maximum_output_canonical_bytes: 16384
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: carrier_authentication }
+        - { statuses: [408], class: timeout, code: carrier_timeout }
+        - { statuses: [429], class: http_429, code: carrier_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: carrier_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: carrier_rejected }
+      fallback: { class: permanent, code: carrier_provider_error }
+    timeout: 5s
+    retry:
+      maximum_attempts: 3
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: shipment_key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [carrier_shipment_reference]
+      response_body: [provider_event_id]

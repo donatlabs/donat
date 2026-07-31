@@ -1,0 +1,79 @@
+name: record_chargeback
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_chargeback_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: amount_minor
+    type: bigint!
+  - name: payload
+    type: BoundedProviderEvidence!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status, captured_minor, chargeback_minor]
+  - name: payment_row
+    select_many:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      order_by: [id]
+      returning: [id]
+      require_non_empty: true
+  - name: chargeback_is_bounded
+    assert:
+      rule: can_record_chargeback_amount
+      with:
+        payment_state: { step: payment, column: status }
+        captured_minor: { step: payment, column: captured_minor }
+        chargeback_minor: { step: payment, column: chargeback_minor }
+        requested_amount_minor: { arg: amount_minor }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: chargeback }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: chargeback
+    insert:
+      table: public.payment_chargeback
+      object:
+        payment_id: { step: payment, column: id }
+        provider_chargeback_id: { arg: provider_chargeback_id }
+        amount_minor: { arg: amount_minor }
+        status: { literal: chargeback }
+      returning: [id, payment_id, amount_minor, status]
+  - name: add_chargeback_amount
+    update_many:
+      table: public.payment
+      for_each: { step: payment_row }
+      by:
+        id: { item: id }
+      set:
+        chargeback_minor:
+          rule: add_minor
+          with:
+            left: { current_column: chargeback_minor }
+            right: { arg: amount_minor }
+        status: { literal: chargeback }
+      returning: [id, status, chargeback_minor]
+      require_each: true
+result:
+  payment_id: { step: payment, column: id }
+  payment_update: { step: add_chargeback_amount }
+  chargeback_id: { step: chargeback, column: id }
+  amount_minor: { step: chargeback, column: amount_minor }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

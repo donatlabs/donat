@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/value-contract",
+    "crates/connector-abi",
+    "crates/connector-catalog",
     "crates/metadata",
+    "crates/rules",
     "crates/catalog",
     "crates/schema",
     "crates/ir",
@@ -43,3 +47,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 croner = "3"
 uuid = "1"
+sha2 = "0.10"
+ryu-js = "=1.0.2"

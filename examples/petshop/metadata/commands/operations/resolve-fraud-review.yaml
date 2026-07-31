@@ -1,0 +1,58 @@
+name: resolve_fraud_review
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: fraud_review_id
+    type: uuid!
+  - name: decision
+    type: FraudState!
+  - name: decision_id
+    type: uuid!
+  - name: note
+    type: string
+steps:
+  - name: fraud_review
+    select_one:
+      table: public.payment_fraud_review
+      by:
+        id: { arg: fraud_review_id }
+      returning: [id, payment_id, provider_event_id, status]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_fraud
+      with:
+        current: { step: fraud_review, column: status }
+        next: { arg: decision }
+  - name: decision_audit
+    insert:
+      table: public.payment_fraud_decision
+      object:
+        fraud_review_id: { step: fraud_review, column: id }
+        decision_id: { arg: decision_id }
+        decision: { arg: decision }
+        actor_user_id: { session_variable: x-donat-user-id }
+        actor_role: { literal: support }
+        note: { arg: note }
+      returning: [id, fraud_review_id, decision_id, decision, actor_user_id, actor_role, note]
+  - name: resolved_review
+    update:
+      table: public.payment_fraud_review
+      where:
+        id: { step: fraud_review, column: id }
+        status: { literal: review_required }
+      set:
+        status: { arg: decision }
+      returning: [id, payment_id, provider_event_id, status]
+      require_affected: true
+result:
+  fraud_review_id: { step: resolved_review, column: id }
+  payment_id: { step: resolved_review, column: payment_id }
+  status: { step: resolved_review, column: status }
+  audit: { step: decision_audit }
+idempotency:
+  key: { argument: decision_id }
+  scope:
+    - { argument: fraud_review_id }
+  retention: 365d

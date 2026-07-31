@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use donat_conformance::{engine_binary, pg_admin_url};
+use donat_conformance::{apply_sql_migration_dir, engine_binary, pg_admin_url};
 
 fn with_db(admin_url: &str, db: &str) -> String {
     let (prefix, _) = admin_url.rsplit_once('/').expect("PG_URL has a db path");
@@ -53,6 +53,34 @@ fn run_with_env(db_url: &str, args: &[&str], envs: &[(&str, &str)]) -> (bool, St
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.success(), s)
+}
+
+/// The harness applies an example's own SQL outside refinery, and it has to
+/// order those files numerically. A plain lexical sort runs `V10` before `V2`.
+///
+/// This needs a database, so it belongs beside the other migrator cases rather
+/// than in the crate's unit tests, which run on every backend in the matrix —
+/// including the ones that start no Postgres at all.
+#[test]
+fn migration_files_are_applied_in_numeric_order() {
+    let db = fresh_db("conf_migration_files_sorted");
+    let dir = tmpdir("migration_files_sorted");
+    write(
+        &dir.join("V10__insert_marker.sql"),
+        "INSERT INTO migration_order (version) VALUES (10);",
+    );
+    write(
+        &dir.join("V2__create_marker.sql"),
+        "CREATE TABLE migration_order (version integer NOT NULL);",
+    );
+
+    apply_sql_migration_dir(&db, &dir).expect("migrations apply in numeric order");
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let row = client
+        .query_one("SELECT version FROM migration_order", &[])
+        .expect("the later migration ran after the one that created its table");
+    assert_eq!(row.get::<_, i32>(0), 10);
 }
 
 #[test]
@@ -194,6 +222,110 @@ fn migrate_can_adopt_existing_schema_when_enabled() {
     assert_eq!(v, 1);
 }
 
+/// A database migrated before the move to timestamp versions must not try to
+/// apply the same migrations again under their new numbers.
+#[test]
+fn migrate_carries_a_sequential_history_onto_timestamp_versions() {
+    let db = fresh_db("conf_migrate_renumber");
+    let sequential = tmpdir("renumber_seq");
+    write(
+        &sequential.join("V1__create_widget.sql"),
+        "CREATE TABLE widget (id serial primary key, name text not null);\n",
+    );
+    write(
+        &sequential.join("V2__add_widget_note.sql"),
+        "ALTER TABLE widget ADD COLUMN note text;\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", sequential.to_str().unwrap()],
+    );
+    assert!(ok, "sequential migrate failed:\n{out}");
+
+    // The same two migrations, renamed to timestamps. Re-applying either one
+    // would fail on the existing table or column.
+    let stamped = tmpdir("renumber_ts");
+    write(
+        &stamped.join("V20260613222215__create_widget.sql"),
+        "CREATE TABLE widget (id serial primary key, name text not null);\n",
+    );
+    write(
+        &stamped.join("V20260613222216__add_widget_note.sql"),
+        "ALTER TABLE widget ADD COLUMN note text;\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", stamped.to_str().unwrap()],
+    );
+    assert!(ok, "timestamp migrate failed:\n{out}");
+    assert!(
+        out.contains("up to date"),
+        "the renamed migrations must count as already applied:\n{out}"
+    );
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![20_260_613_222_215, 20_260_613_222_216],
+        "history carries the timestamp versions, and carries them exactly once"
+    );
+}
+
+/// The carry-over joins on the migration name, so a name that does not
+/// identify one migration is left for the ordinary version check to report.
+#[test]
+fn migrate_leaves_an_ambiguous_rename_alone() {
+    let db = fresh_db("conf_migrate_renumber_ambiguous");
+    let sequential = tmpdir("ambiguous_seq");
+    write(
+        &sequential.join("V1__widget.sql"),
+        "CREATE TABLE widget_one (id serial primary key);\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", sequential.to_str().unwrap()],
+    );
+    assert!(ok, "sequential migrate failed:\n{out}");
+
+    // Two timestamped migrations share the applied name, so which one the
+    // history row means is unknowable.
+    let stamped = tmpdir("ambiguous_ts");
+    write(
+        &stamped.join("V20260613222215__widget.sql"),
+        "CREATE TABLE widget_one (id serial primary key);\n",
+    );
+    write(
+        &stamped.join("V20260613222216__widget.sql"),
+        "CREATE TABLE widget_two (id serial primary key);\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", stamped.to_str().unwrap()],
+    );
+    assert!(!ok, "an ambiguous rename must not be guessed at:\n{out}");
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(versions, vec![1], "the history is left untouched");
+}
+
 #[test]
 fn validate_passes_when_consistent_and_fails_when_not() {
     let db = fresh_db("conf_migrate_validate");
@@ -225,7 +357,11 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         widget,
     );
 
-    let (ok, out) = run(&db, &["validate", "--metadata-dir", md.to_str().unwrap()]);
+    let (ok, out) = run_with_env(
+        &db,
+        &["validate", "--metadata-dir", md.to_str().unwrap()],
+        &[("DONAT_GRAPHQL_DATABASE_URL", &db)],
+    );
     assert!(ok, "validate should pass for consistent metadata:\n{out}");
     assert!(
         out.contains("consistent"),
@@ -237,10 +373,79 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         &md.join("databases/default/tables/public_widget.yaml"),
         "table:\n  name: ghost\n  schema: public\n",
     );
-    let (ok, out) = run(&db, &["validate", "--metadata-dir", md.to_str().unwrap()]);
+    let (ok, out) = run_with_env(
+        &db,
+        &["validate", "--metadata-dir", md.to_str().unwrap()],
+        &[("DONAT_GRAPHQL_DATABASE_URL", &db)],
+    );
     assert!(!ok, "validate should fail for a missing table:\n{out}");
     assert!(
         out.contains("does not exist in the database"),
         "expected missing-table inconsistency:\n{out}"
+    );
+}
+
+#[test]
+fn migrate_with_metadata_rejects_invalid_command_before_event_reconciliation() {
+    let db = fresh_db("conf_migrate_invalid_command_metadata");
+    let migrations = tmpdir("invalid_command_metadata_migrations");
+    write(
+        &migrations.join("V1__create_command_validation_orders.sql"),
+        "CREATE TABLE command_validation_orders (id bigint PRIMARY KEY);\n",
+    );
+
+    let metadata = tmpdir("invalid_command_metadata");
+    write(&metadata.join("version.yaml"), "version: 3\n");
+    write(
+        &metadata.join("databases/databases.yaml"),
+        "- name: default\n  kind: postgres\n  configuration:\n    connection_info:\n      database_url:\n        from_env: DONAT_DATABASE_URL\n  tables:\n    - table:\n        schema: public\n        name: command_validation_orders\n      select_permissions:\n        - role: customer\n          permission:\n            columns: \"*\"\n            filter: {}\n      insert_permissions:\n        - role: customer\n          permission:\n            columns: \"*\"\n            check: {}\n      event_triggers:\n        - name: blocked_command\n          definition:\n            insert:\n              columns: \"*\"\n          webhook: http://example.invalid/events\n",
+    );
+    write(
+        &metadata.join("commands.yaml"),
+        "- name: create_order\n  source: default\n  permissions:\n    - role: customer\n  steps:\n    - name: order\n      insert:\n        table:\n          schema: public\n          name: command_validation_orders\n        object:\n          id:\n            literal: \"9223372036854775808\"\n        returning: [id]\n  result:\n    order_id:\n      step: order\n      column: id\n",
+    );
+
+    let (ok, output) = run(
+        &db,
+        &[
+            "migrate",
+            "--migrations-dir",
+            migrations.to_str().unwrap(),
+            "--metadata-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let migrated_table: bool = client
+        .query_one(
+            "SELECT to_regclass('public.command_validation_orders') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let reconciled_trigger_count: i64 = client
+        .query_one(
+            "SELECT count(*)\n             FROM pg_trigger trigger\n             JOIN pg_class relation ON relation.oid = trigger.tgrelid\n             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace\n             WHERE NOT trigger.tgisinternal\n               AND namespace.nspname = 'public'\n               AND relation.relname = 'command_validation_orders'\n               AND trigger.tgname = 'donat_notify_blocked_command_insert'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+
+    assert!(
+        !ok,
+        "migrate --metadata-dir must reject the invalid command after DDL:\n{output}"
+    );
+    assert!(
+        output.contains("commands[0].steps[0]") && output.contains("int8"),
+        "migrate must report the command literal diagnostic:\n{output}"
+    );
+    assert!(
+        migrated_table,
+        "schema migration must complete before validation"
+    );
+    assert_eq!(
+        reconciled_trigger_count, 0,
+        "invalid metadata must not create event-trigger DDL during reconciliation"
     );
 }

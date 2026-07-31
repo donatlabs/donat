@@ -1,0 +1,7 @@
+types:
+  - name: Parent
+    object:
+      child: Child!
+  - name: Child
+    object:
+      parent: Parent!

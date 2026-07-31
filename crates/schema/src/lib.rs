@@ -11,14 +11,21 @@
 //! request runs as an explicit role, and a table without a select
 //! permission for that role simply does not exist in that role's schema.
 
+mod commands;
 mod introspection;
 mod multi_source;
 mod naming;
 mod plan;
 mod plan_mutation;
 mod predicate;
+mod process_effects;
 mod v1;
 
+pub use commands::{
+    CommandDescriptor, CompiledCommand, CompiledCommandCatalog, CompiledSourceCommandCatalog,
+    compile_command_catalog, compile_command_source_catalog, finalize_command_effects,
+    validate_command_catalog, validate_command_source_catalog,
+};
 pub use introspection::execute_introspection;
 pub use multi_source::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, QueryResponseSlot,
@@ -26,3 +33,9 @@ pub use multi_source::{
 };
 pub use naming::{CrudRoots, crud_roots, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};
+pub use process_effects::{
+    FinalizedCommandCatalog, FinalizedCommandEffect, FinalizedCompiledCommand,
+    FinalizedSignalProcessEffect, FinalizedSourceCommandCatalog, FinalizedStartProcessEffect,
+    ProcessEffectContract, ProcessEffectContractCatalog, ProcessEffectContractSource,
+    ProcessSignalEffectContract,
+};

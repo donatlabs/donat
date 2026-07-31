@@ -1,9 +1,9 @@
 //! Ported from tests-py test_actions.py (synchronous actions).
 //!
 //! tests-py runs these as admin; this engine has no admin role, so each
-//! action is granted to an explicit `tester` role (role-less requests fall
-//! back to it via `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`). A dedicated role avoids
-//! the restrictive `user`-role permission the shared schema_setup installs.
+//! action is granted to and invoked under the explicit `tester` role. A
+//! dedicated role avoids the restrictive `user`-role permission the shared
+//! schema_setup installs.
 //! The webhook handler is a
 //! native Rust stub (`action_webhook`) mirroring `ActionsWebhookHandler` in
 //! tests-py/context.py; the engine reaches it through `ACTION_WEBHOOK_HANDLER`.
@@ -20,7 +20,7 @@ const SYNC: &str = "queries/actions/sync";
 /// can read/write through the GraphQL API.
 fn sync_suite(name: &str) -> Running {
     let s = Suite::new(name)
-        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "tester")
+        .request_header("X-Donat-Role", "tester")
         .with_action_webhook()
         .start();
     s.setup_v1q(&format!("{SYNC}/schema_setup.yaml"));

@@ -1,0 +1,56 @@
+name: record_no_show
+source: default
+permissions:
+  - role: groomer
+arguments:
+  - name: booking_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: booking
+    select_one:
+      table: public.grooming_booking
+      by: { id: { arg: booking_id } }
+      returning: [id, slot_key, status]
+      require_found: true
+  - name: no_show_is_allowed
+    assert:
+      rule: can_transition_booking
+      with:
+        current: { step: booking, column: status }
+        next: { literal: no_show }
+  - name: no_show_booking
+    update:
+      table: public.grooming_booking
+      where: { id: { step: booking, column: id }, status: { literal: confirmed } }
+      set: { status: { literal: no_show } }
+      returning: [id, slot_key, status]
+      require_affected: true
+  - name: no_show_audit
+    insert:
+      table: public.grooming_booking_event
+      object:
+        booking_id: { step: no_show_booking, column: id }
+        event_type: { literal: no_show }
+        actor_role: { literal: groomer }
+        request_id: { arg: request_id }
+      returning: [id, booking_id, event_type, request_id]
+result:
+  booking_id: { step: no_show_booking, column: id }
+  slot_key: { step: no_show_booking, column: slot_key }
+  status: { step: no_show_booking, column: status }
+  audit: { step: no_show_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: booking_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: grooming_booking
+      signal: booking_transition_recorded
+      correlate:
+        booking_id: { step: no_show_booking, column: id }
+      payload: { outcome: { literal: no_show } }
+      idempotency_key: { argument: request_id }

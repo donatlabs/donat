@@ -17,7 +17,10 @@ use graphql_parser::query::{
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use donat_metadata::{ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable};
+use donat_metadata::{
+    ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable,
+    action_visible_to_role,
+};
 use donat_schema::Session;
 
 use crate::remote::resolve_url_template;
@@ -35,6 +38,13 @@ pub struct ActionContext {
     actions: Vec<ActionEntry>,
     custom_types: CustomTypes,
     is_query: bool,
+}
+
+pub(crate) struct ActionRequest<'a> {
+    pub(crate) doc: &'a Document<'static, String>,
+    pub(crate) variables: &'a JsonMap<String, Json>,
+    pub(crate) operation_name: Option<&'a str>,
+    pub(crate) headers: &'a HeaderMap,
 }
 
 impl ActionContext {
@@ -76,16 +86,19 @@ pub fn match_action(
 
 /// Resolve every top-level action field by calling its webhook and shaping the
 /// response. Returns a GraphQL HTTP response (`{data}` or `{errors}`).
-pub async fn resolve(
+pub(crate) async fn resolve(
     state: &SharedState,
     engine: EngineSnapshot,
     session: &Session,
     ctx: &ActionContext,
-    doc: &Document<'static, String>,
-    variables: &JsonMap<String, Json>,
-    operation_name: Option<&str>,
-    headers: &HeaderMap,
+    request: ActionRequest<'_>,
 ) -> (StatusCode, Json) {
+    let ActionRequest {
+        doc,
+        variables,
+        operation_name,
+        headers,
+    } = request;
     let Some(op) = select_operation(doc, operation_name) else {
         return err("$", "validation-failed", "no executable operation");
     };
@@ -169,14 +182,10 @@ async fn resolve_action_item(
     let Some(action) = ctx.find(&field.name) else {
         return Err(action_field_not_found(ctx, field));
     };
-    if !action
-        .permissions
-        .iter()
-        .any(|permission| permission.role == session.role)
-    {
+    if !action_visible_to_role(action, &session.role) {
         return Err(action_field_not_found(ctx, field));
     }
-    let value = call_action(
+    let value = call_action(ActionInvocation {
         state,
         engine,
         session,
@@ -184,8 +193,8 @@ async fn resolve_action_item(
         field,
         variables,
         headers,
-        &ctx.custom_types,
-    )
+        custom_types: &ctx.custom_types,
+    })
     .await?;
     Ok((alias, value))
 }
@@ -210,16 +219,28 @@ fn action_field_not_found(
 }
 
 /// Build the webhook payload, POST it, and shape the response.
-async fn call_action(
-    state: &SharedState,
-    engine: &Engine,
-    session: &Session,
-    action: &ActionEntry,
-    field: &Field<'static, String>,
-    variables: &JsonMap<String, Json>,
-    headers: &HeaderMap,
-    custom_types: &CustomTypes,
-) -> Result<Json, (StatusCode, Json)> {
+struct ActionInvocation<'a> {
+    state: &'a SharedState,
+    engine: &'a Engine,
+    session: &'a Session,
+    action: &'a ActionEntry,
+    field: &'a Field<'static, String>,
+    variables: &'a JsonMap<String, Json>,
+    headers: &'a HeaderMap,
+    custom_types: &'a CustomTypes,
+}
+
+async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCode, Json)> {
+    let ActionInvocation {
+        state,
+        engine,
+        session,
+        action,
+        field,
+        variables,
+        headers,
+        custom_types,
+    } = invocation;
     let path = format!("$.selectionSet.{}", field.name);
 
     // Resolve the field arguments into the `input` object.
@@ -250,10 +271,10 @@ async fn call_action(
     if action.definition.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if is_session_header(name) || name == "authorization" {
-                if let Ok(value) = value.to_str() {
-                    req = req.header(name, value);
-                }
+            if (is_session_header(name) || name == "authorization")
+                && let Ok(value) = value.to_str()
+            {
+                req = req.header(name, value);
             }
         }
     }
@@ -309,9 +330,11 @@ async fn call_action(
     // apply), using the raw webhook row for the join values.
     fill_relationships(
         state,
-        engine,
-        session,
-        custom_types,
+        ActionRelationshipContext {
+            engine,
+            session,
+            custom_types,
+        },
         &ty,
         &mut shaped,
         &body,
@@ -335,6 +358,13 @@ struct StateActionRelationshipExecutor<'a> {
     state: &'a SharedState,
 }
 
+#[derive(Clone, Copy)]
+struct ActionRelationshipContext<'a> {
+    engine: &'a Engine,
+    session: &'a Session,
+    custom_types: &'a CustomTypes,
+}
+
 impl ActionRelationshipExecutor for StateActionRelationshipExecutor<'_> {
     fn execute<'a>(
         &'a self,
@@ -353,9 +383,7 @@ impl ActionRelationshipExecutor for StateActionRelationshipExecutor<'_> {
 /// selected output-object relationship into its tracked table.
 fn fill_relationships<'a>(
     state: &'a SharedState,
-    engine: &'a Engine,
-    session: &'a Session,
-    custom_types: &'a CustomTypes,
+    context: ActionRelationshipContext<'a>,
     ty: &'a TypeRef,
     shaped: &'a mut Json,
     raw: &'a Json,
@@ -363,17 +391,7 @@ fn fill_relationships<'a>(
 ) -> BoxFuture<'a, Result<(), (StatusCode, Json)>> {
     Box::pin(async move {
         let executor = StateActionRelationshipExecutor { state };
-        fill_relationships_with(
-            &executor,
-            engine,
-            session,
-            custom_types,
-            ty,
-            shaped,
-            raw,
-            selection,
-        )
-        .await
+        fill_relationships_with(&executor, context, ty, shaped, raw, selection).await
     })
 }
 
@@ -388,6 +406,12 @@ struct ActionRelationshipGroup<'a> {
     selection_path: String,
     field_alias: String,
     entries: Vec<ActionRelationshipEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct ActionRelationshipLocation<'a> {
+    object_pointer: &'a str,
+    selection_path: &'a str,
 }
 
 fn action_pointer_child(base: &str, segment: &str) -> String {
@@ -415,8 +439,7 @@ fn collect_action_relationship_groups<'a>(
     shaped: &Json,
     raw: &Json,
     selection: &'a [Selection<'static, String>],
-    object_pointer: &str,
-    selection_path: &str,
+    location: ActionRelationshipLocation<'_>,
     groups: &mut Vec<ActionRelationshipGroup<'a>>,
 ) {
     if shaped.is_null() {
@@ -432,8 +455,13 @@ fn collect_action_relationship_groups<'a>(
                         item,
                         raw_item,
                         selection,
-                        &action_pointer_child(object_pointer, &index.to_string()),
-                        selection_path,
+                        ActionRelationshipLocation {
+                            object_pointer: &action_pointer_child(
+                                location.object_pointer,
+                                &index.to_string(),
+                            ),
+                            selection_path: location.selection_path,
+                        },
                         groups,
                     );
                 }
@@ -452,14 +480,14 @@ fn collect_action_relationship_groups<'a>(
                     continue;
                 };
                 let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
-                let field_path = format!("{selection_path}.{alias}");
+                let field_path = format!("{}.{alias}", location.selection_path);
                 if let Some(relationship) = object_type
                     .relationships
                     .iter()
                     .find(|relationship| relationship.name == field.name)
                 {
                     let entry = ActionRelationshipEntry {
-                        object_pointer: object_pointer.to_string(),
+                        object_pointer: location.object_pointer.to_string(),
                         filter: relationship_filter(relationship, raw),
                     };
                     if let Some(group) = groups.iter_mut().find(|group| {
@@ -494,8 +522,13 @@ fn collect_action_relationship_groups<'a>(
                             shaped_child,
                             raw_child,
                             &field.selection_set.items,
-                            &action_pointer_child(object_pointer, &alias),
-                            &field_path,
+                            ActionRelationshipLocation {
+                                object_pointer: &action_pointer_child(
+                                    location.object_pointer,
+                                    &alias,
+                                ),
+                                selection_path: &field_path,
+                            },
                             groups,
                         );
                     }
@@ -538,9 +571,11 @@ fn build_action_relationship_batch(group: &ActionRelationshipGroup<'_>) -> Actio
         let variable = format!("__donat_action_rel_w_{index}");
         let alias = format!("__donat_action_rel_{index}");
         definitions.push(format!("${variable}: {base}_bool_exp"));
-        let limit = (group.relationship.type_ != "array")
-            .then_some(", limit: 1")
-            .unwrap_or("");
+        let limit = if group.relationship.type_ != "array" {
+            ", limit: 1"
+        } else {
+            ""
+        };
         roots.push(format!(
             "{alias}: {base}(where: ${variable}{limit}) {selection}"
         ));
@@ -582,7 +617,7 @@ async fn execute_action_relationship_group<E: ActionRelationshipExecutor + ?Size
         Ok(data) => (0..batch.unique_filters.len())
             .map(|index| {
                 shape_rows(
-                    data.get(&format!("__donat_action_rel_{index}"))
+                    data.get(format!("__donat_action_rel_{index}"))
                         .cloned()
                         .unwrap_or(Json::Null),
                 )
@@ -616,9 +651,7 @@ async fn execute_action_relationship_group<E: ActionRelationshipExecutor + ?Size
 
 fn fill_relationships_with<'a, E: ActionRelationshipExecutor + ?Sized>(
     executor: &'a E,
-    engine: &'a Engine,
-    session: &'a Session,
-    custom_types: &'a CustomTypes,
+    context: ActionRelationshipContext<'a>,
     ty: &'a TypeRef,
     shaped: &'a mut Json,
     raw: &'a Json,
@@ -627,13 +660,15 @@ fn fill_relationships_with<'a, E: ActionRelationshipExecutor + ?Sized>(
     Box::pin(async move {
         let mut groups = vec![];
         collect_action_relationship_groups(
-            custom_types,
+            context.custom_types,
             ty,
             shaped,
             raw,
             selection,
-            "",
-            "$",
+            ActionRelationshipLocation {
+                object_pointer: "",
+                selection_path: "$",
+            },
             &mut groups,
         );
         // Groups target independent relationship selections. Bound their
@@ -647,7 +682,13 @@ fn fill_relationships_with<'a, E: ActionRelationshipExecutor + ?Sized>(
             .map(|(index, group)| async move {
                 (
                     index,
-                    execute_action_relationship_group(executor, engine, session, group).await,
+                    execute_action_relationship_group(
+                        executor,
+                        context.engine,
+                        context.session,
+                        group,
+                    )
+                    .await,
                 )
             })
             .collect::<Vec<_>>();
@@ -970,10 +1011,10 @@ mod tests {
         let doc = graphql_parser::parse_query::<String>("{ x { id name } }")
             .unwrap()
             .into_static();
-        if let Definition::Operation(OperationDefinition::SelectionSet(s)) = &doc.definitions[0] {
-            if let Selection::Field(f) = &s.items[0] {
-                return f.selection_set.items.clone();
-            }
+        if let Definition::Operation(OperationDefinition::SelectionSet(s)) = &doc.definitions[0]
+            && let Selection::Field(f) = &s.items[0]
+        {
+            return f.selection_set.items.clone();
         }
         unreachable!()
     }
@@ -1273,9 +1314,11 @@ mod tests {
 
         fill_relationships_with(
             &executor,
-            &engine,
-            &session,
-            &custom_types,
+            ActionRelationshipContext {
+                engine: &engine,
+                session: &session,
+                custom_types: &custom_types,
+            },
             &ty,
             &mut shaped,
             &raw,
@@ -1387,9 +1430,11 @@ mod tests {
             std::time::Duration::from_secs(1),
             fill_relationships_with(
                 &executor,
-                &engine,
-                &session,
-                &custom_types,
+                ActionRelationshipContext {
+                    engine: &engine,
+                    session: &session,
+                    custom_types: &custom_types,
+                },
                 &parse_type("Out"),
                 &mut shaped,
                 &raw,

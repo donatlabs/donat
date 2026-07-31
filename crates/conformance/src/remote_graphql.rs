@@ -143,10 +143,10 @@ fn resolve_root(
         }
         "communications" => {
             let mut rows = all_messages();
-            if let Some(id) = args.get("id") {
-                if !id.is_null() {
-                    rows.retain(|m| &m["id"] == id);
-                }
+            if let Some(id) = args.get("id")
+                && !id.is_null()
+            {
+                rows.retain(|m| &m["id"] == id);
             }
             Json::Array(
                 rows.iter()
@@ -262,10 +262,10 @@ fn apply_filters(mut rows: Vec<Json>, where_: Option<&Json>, includes: Option<&J
                 rows.retain(|m| cmp_int(&m["id"], op, v));
             }
         }
-        if let Some(Json::Object(name)) = w.get("name") {
-            if let Some(eq) = name.get("eq") {
-                rows.retain(|m| &m["name"] == eq);
-            }
+        if let Some(Json::Object(name)) = w.get("name")
+            && let Some(eq) = name.get("eq")
+        {
+            rows.retain(|m| &m["name"] == eq);
         }
     }
     if let Some(Json::Object(inc)) = includes {

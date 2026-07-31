@@ -1,0 +1,56 @@
+name: reserve_grooming_slot
+source: default
+permissions:
+  - role: customer
+# `slot_key` is the canonical, stable resource-and-time key. The database owns
+# a unique constraint on it, so concurrent holds cannot both commit.
+arguments:
+  - name: service_resource_id
+    type: uuid!
+  - name: slot_key
+    type: string!
+  - name: starts_at
+    type: timestamptz!
+  - name: hold_expires_at
+    type: timestamptz!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: hold_deadline_is_valid
+    assert:
+      rule: booking_hold_deadline_is_valid
+      with:
+        database_time: { database_time: now }
+        hold_expires_at: { arg: hold_expires_at }
+        starts_at: { arg: starts_at }
+  - name: booking
+    insert:
+      table: public.grooming_booking
+      object:
+        customer_id: { session_variable: x-donat-user-id }
+        service_resource_id: { arg: service_resource_id }
+        slot_key: { arg: slot_key }
+        starts_at: { arg: starts_at }
+        hold_expires_at: { arg: hold_expires_at }
+        status: { literal: held }
+      returning: [id, customer_id, service_resource_id, slot_key, starts_at, hold_expires_at, status]
+  - name: hold_audit
+    insert:
+      table: public.grooming_booking_event
+      object:
+        booking_id: { step: booking, column: id }
+        event_type: { literal: held }
+        actor_role: { literal: customer }
+        request_id: { arg: request_id }
+      returning: [id, booking_id, event_type, request_id]
+result:
+  booking_id: { step: booking, column: id }
+  slot_key: { step: booking, column: slot_key }
+  hold_expires_at: { step: booking, column: hold_expires_at }
+  status: { step: booking, column: status }
+  audit: { step: hold_audit }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 30d

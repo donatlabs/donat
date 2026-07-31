@@ -301,9 +301,7 @@ fn is_subscription(payload: &Json) -> bool {
 fn subscription_document(
     payload: &Json,
 ) -> Option<graphql_parser::query::Document<'static, String>> {
-    let Some(query) = payload.get("query").and_then(Json::as_str) else {
-        return None;
-    };
+    let query = payload.get("query").and_then(Json::as_str)?;
     // Don't parse a too-deep query here (would overflow); execute_with will
     // reject it with the depth error.
     if gql::query_too_deep(query) {

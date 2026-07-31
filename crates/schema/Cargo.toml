@@ -8,6 +8,7 @@ description = "Planner: GraphQL operation + metadata + catalog -> IR, with permi
 [dependencies]
 donat-metadata = { path = "../metadata" }
 donat-catalog = { path = "../catalog" }
+donat-rules = { path = "../rules" }
 donat-ir = { path = "../ir" }
 donat-backend = { path = "../backend" }
 graphql-parser = { workspace = true }
@@ -16,3 +17,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }

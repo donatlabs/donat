@@ -1,0 +1,55 @@
+- description: A permitted command creates an order and its line in one atomic result.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation CreateOrderWithLine {
+        create_order_with_line(
+          order_id: "550e8400-e29b-41d4-a716-446655440200"
+          line_id: "550e8400-e29b-41d4-a716-446655440201"
+          customer_id: "550e8400-e29b-41d4-a716-446655440001"
+          quantity: 3
+        ) {
+          order_id
+          line_id
+          quantity
+        }
+      }
+  response:
+    data:
+      create_order_with_line:
+        order_id: "550e8400-e29b-41d4-a716-446655440200"
+        line_id: "550e8400-e29b-41d4-a716-446655440201"
+        quantity: 3
+
+- description: Both relations expose the committed command rows to the same explicit role.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      query OrderAndLineAfterCommand {
+        orders {
+          id
+          status
+          quantity
+        }
+        order_lines {
+          id
+          order_id
+          quantity
+        }
+      }
+  response:
+    data:
+      orders:
+        - id: "550e8400-e29b-41d4-a716-446655440200"
+          status: draft
+          quantity: 3
+      order_lines:
+        - id: "550e8400-e29b-41d4-a716-446655440201"
+          order_id: "550e8400-e29b-41d4-a716-446655440200"
+          quantity: 3

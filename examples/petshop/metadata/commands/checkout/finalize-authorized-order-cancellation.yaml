@@ -1,0 +1,84 @@
+name: finalize_authorized_order_cancellation
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: request_id
+    type: string!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+        order_status: { literal: cancellation_requested }
+      returning: [id, order_status]
+      require_found: true
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        order_id: { step: order, column: id }
+        status: { literal: voided }
+      returning: [id, status]
+      require_found: true
+  - name: remaining_reservations
+    select_many:
+      table: public.inventory_reservation
+      by:
+        order_id: { step: order, column: id }
+        status: { literal: reserved }
+      order_by: [id]
+      returning: [id, variant_id, quantity]
+      maximum_rows: 64
+  - name: release_stock
+    update_many:
+      table: public.inventory_stock
+      for_each: { step: remaining_reservations }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: subtract_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_release_stock
+        with:
+          reserved: { current_column: reserved }
+          releasing: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+  - name: release_reservations
+    update_many:
+      table: public.inventory_reservation
+      for_each: { step: remaining_reservations }
+      by:
+        id: { item: id }
+      set:
+        status: { literal: released }
+      returning: [id, status]
+      require_each: true
+  - name: cancel_order
+    update:
+      table: public.orders
+      where:
+        id: { step: order, column: id }
+        order_status: { literal: cancellation_requested }
+      set:
+        order_status: { literal: cancelled }
+      returning: [id, order_status]
+      require_affected: true
+result:
+  order_id: { step: cancel_order, column: id }
+  order_status: { step: cancel_order, column: order_status }
+  payment_id: { step: payment, column: id }
+  released_reservations: { step: release_reservations }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: order_id }
+  retention: 365d

@@ -1,6 +1,7 @@
 //! HTTP entry point. The serving surface is data-plane only:
 //! `/v1/graphql` (+ws), `/v1alpha1/graphql`, `/v1/relay`, `/v1beta1/relay`,
-//! `/healthz`, `/v1/version`. There is NO runtime admin/management API
+//! `/v1/connectors/{instance}/webhooks`, `/healthz`, `/v1/version`. There is
+//! NO runtime admin/management API
 //! (no `/v1/query` run_sql, no metadata mutation): schema is applied with
 //! the `migrate` subcommand, metadata is loaded from YAML at boot.
 //!
@@ -9,17 +10,14 @@
 //! - migrate (DDL): `donat migrate --migrations-dir <dir>`
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
-mod action;
-mod cron;
-mod events;
-mod gql;
-mod jwt;
-mod mcp;
-mod migrate;
-mod remote;
-mod rest;
-mod state;
-mod ws;
+// The binary builds its router from the library's module tree rather than
+// declaring a second copy of it. A second copy compiled the same files again
+// with only the binary's reachability, so everything the integration tests
+// reach through the library facade was reported dead here.
+use donat_server::{
+    connector_webhook, connectors, cron, events, gql, jwt, mcp, migrate, processes, rest, state,
+    validate, ws,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -149,6 +147,9 @@ struct MigrateArgs {
     /// triggers) from this metadata directory after applying SQL migrations.
     #[arg(long)]
     metadata_dir: Option<PathBuf>,
+    /// Metadata source to migrate. Valid only with a metadata directory.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -156,6 +157,9 @@ struct ValidateArgs {
     /// Metadata directory to validate (defaults to --metadata-dir).
     #[arg(long)]
     metadata_dir: Option<PathBuf>,
+    /// Metadata source to validate.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -174,6 +178,167 @@ struct ServeArgs {
     enabled_apis: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentSelection {
+    RefineryOnly {
+        database_url: String,
+        migrations_dir: PathBuf,
+    },
+    MetadataSource {
+        metadata_dir: PathBuf,
+        source_name: String,
+        database_url: String,
+        migrations_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSourceSelection {
+    pub metadata_dir: PathBuf,
+    pub source_name: String,
+    pub database_url: String,
+}
+
+pub(crate) fn resolve_migrate_selection(
+    global: &Args,
+    cli: &MigrateArgs,
+    read_env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<DeploymentSelection> {
+    let metadata_dir = cli
+        .metadata_dir
+        .clone()
+        .or_else(|| global.metadata_dir.clone());
+
+    let Some(metadata_dir) = metadata_dir else {
+        if cli.source.is_some() {
+            anyhow::bail!("--source requires --metadata-dir");
+        }
+        let database_url = resolve_global_database_url(global, &read_env)?.ok_or_else(|| {
+            anyhow::anyhow!("--database-url or --metadata-database-url is required")
+        })?;
+        return Ok(DeploymentSelection::RefineryOnly {
+            database_url,
+            migrations_dir: cli.migrations_dir.clone(),
+        });
+    };
+
+    let selected = resolve_metadata_source(global, metadata_dir, cli.source.as_deref(), &read_env)?;
+    Ok(DeploymentSelection::MetadataSource {
+        metadata_dir: selected.metadata_dir,
+        source_name: selected.source_name,
+        database_url: selected.database_url,
+        migrations_dir: Some(cli.migrations_dir.clone()),
+    })
+}
+
+pub(crate) fn resolve_validate_selection(
+    global: &Args,
+    cli: &ValidateArgs,
+    read_env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<MetadataSourceSelection> {
+    let metadata_dir = cli
+        .metadata_dir
+        .clone()
+        .or_else(|| global.metadata_dir.clone())
+        .ok_or_else(|| anyhow::anyhow!("validate needs --metadata-dir"))?;
+    resolve_metadata_source(global, metadata_dir, cli.source.as_deref(), &read_env)
+}
+
+fn resolve_metadata_source(
+    global: &Args,
+    metadata_dir: PathBuf,
+    requested_source: Option<&str>,
+    read_env: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<MetadataSourceSelection> {
+    use donat_metadata::{DatabaseUrl, SourceKind};
+
+    let metadata = donat_metadata::load_metadata_dir(&metadata_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load metadata from {}: {error}",
+            metadata_dir.display()
+        )
+    })?;
+
+    let source = match requested_source {
+        Some(source_name) => metadata
+            .sources
+            .iter()
+            .find(|source| source.name == source_name)
+            .ok_or_else(|| anyhow::anyhow!("source `{source_name}` was not found in metadata"))?,
+        None => {
+            let mut postgres_sources = metadata
+                .sources
+                .iter()
+                .filter(|source| source.kind == SourceKind::Postgres);
+            let source = postgres_sources
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("metadata contains no Postgres source"))?;
+            if postgres_sources.next().is_some() {
+                anyhow::bail!(
+                    "metadata contains multiple Postgres sources; pass --source explicitly"
+                );
+            }
+            source
+        }
+    };
+
+    if source.kind != SourceKind::Postgres {
+        anyhow::bail!("source `{}` is not Postgres", source.name);
+    }
+
+    let database_url = match source
+        .configuration
+        .connection_info
+        .as_ref()
+        .map(|connection| &connection.database_url)
+    {
+        Some(DatabaseUrl::Url(url)) => url.clone(),
+        Some(DatabaseUrl::FromEnv { from_env }) => read_env(from_env)
+            .map_err(|_| anyhow::anyhow!("source `{}` requires environment variable `{from_env}`", source.name))?,
+        None => resolve_global_database_url(global, read_env)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "source `{}` has no connection URL and --database-url or --metadata-database-url is required",
+                source.name
+            )
+        })?,
+    };
+
+    Ok(MetadataSourceSelection {
+        metadata_dir,
+        source_name: source.name.clone(),
+        database_url,
+    })
+}
+
+fn resolve_global_database_url(
+    global: &Args,
+    read_env: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(url) = &global.database_url {
+        return Ok(Some(url.clone()));
+    }
+    if let Some(url) = &global.metadata_database_url {
+        return Ok(Some(url.clone()));
+    }
+    if let Some(url) = read_optional_env("DONAT_DATABASE_URL", read_env)? {
+        return Ok(Some(url));
+    }
+    read_optional_env("DONAT_GRAPHQL_DATABASE_URL", read_env)
+}
+
+fn read_optional_env(
+    name: &str,
+    read_env: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<String>> {
+    match read_env(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("environment variable `{name}` is not valid Unicode")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -189,49 +354,80 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    let database_url = args
-        .database_url
-        .clone()
-        .or_else(|| args.metadata_database_url.clone())
-        .or_else(|| std::env::var("DONAT_GRAPHQL_DATABASE_URL").ok())
-        .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
-
     // Deploy-time subcommands: do their job and exit (no server, no
     // request-path mutation surface).
     match &args.command {
         Some(Command::Migrate(m)) => {
-            migrate::run_migrate(&database_url, &m.migrations_dir).await?;
-            // Optional deploy-time DDL: reconcile per-table event-trigger
-            // Postgres triggers from the YAML metadata.
-            let md_dir = m.metadata_dir.clone().or_else(|| args.metadata_dir.clone());
-            if let Some(dir) = md_dir {
-                let metadata = donat_metadata::load_metadata_dir(&dir)?;
-                events::reconcile(&database_url, &metadata).await?;
-                tracing::info!(dir = %dir.display(), "event triggers reconciled");
+            match resolve_migrate_selection(&args, m, |name| std::env::var(name))? {
+                DeploymentSelection::RefineryOnly {
+                    database_url,
+                    migrations_dir,
+                } => {
+                    migrate::run_migrate(&database_url, &migrations_dir).await?;
+                }
+                DeploymentSelection::MetadataSource {
+                    metadata_dir,
+                    source_name,
+                    database_url,
+                    migrations_dir,
+                } => {
+                    if let Some(migrations_dir) = migrations_dir {
+                        migrate::run_migrate(&database_url, &migrations_dir).await?;
+                    }
+
+                    // Metadata compilation happens after schema migrations but
+                    // before metadata-owned DDL. A rejected candidate cannot
+                    // partially change event/process deployment state.
+                    let problems = validate::check_source_consistency(
+                        &database_url,
+                        &metadata_dir,
+                        &source_name,
+                    )
+                    .await?;
+                    require_consistent_metadata(&problems)?;
+
+                    let deployment = validate::compile_source_process_deployment(
+                        &database_url,
+                        &metadata_dir,
+                        &source_name,
+                    )
+                    .await?;
+                    processes::reconcile(
+                        &source_name,
+                        &database_url,
+                        &deployment.source_catalog,
+                        &deployment.processes,
+                    )
+                    .await?;
+
+                    let mut metadata = donat_metadata::load_metadata_dir(&metadata_dir)?;
+                    metadata.sources.retain(|source| source.name == source_name);
+                    events::reconcile(&database_url, &metadata).await?;
+                    tracing::info!(
+                        dir = %metadata_dir.display(),
+                        source = %source_name,
+                        "source metadata reconciled"
+                    );
+                }
             }
             return Ok(());
         }
         Some(Command::Validate(v)) => {
-            let dir = v
-                .metadata_dir
-                .clone()
-                .or_else(|| args.metadata_dir.clone())
-                .ok_or_else(|| anyhow::anyhow!("validate needs --metadata-dir"))?;
-            let problems = migrate::check_consistency(&database_url, &dir).await?;
-            if problems.is_empty() {
-                tracing::info!("metadata is consistent");
-                return Ok(());
-            }
-            for p in &problems {
-                tracing::error!("inconsistency: {p}");
-            }
-            anyhow::bail!(
-                "metadata validation failed: {} inconsistency(ies)",
-                problems.len()
-            );
+            let selected = resolve_validate_selection(&args, v, |name| std::env::var(name))?;
+            let problems = validate::check_source_consistency(
+                &selected.database_url,
+                &selected.metadata_dir,
+                &selected.source_name,
+            )
+            .await?;
+            require_consistent_metadata(&problems)?;
+            return Ok(());
         }
         _ => {}
     }
+
+    let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
+        .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
     let port = serve.and_then(|s| s.server_port).unwrap_or(args.port);
     let admin_secret = serve
         .and_then(|s| s.admin_secret.clone())
@@ -278,16 +474,26 @@ async fn main() -> anyhow::Result<()> {
             custom_types: Default::default(),
             cron_triggers: vec![],
             rest_endpoints: vec![],
+            commands: vec![],
+            rules: Default::default(),
+            connectors: vec![],
+            processes: vec![],
             mcp: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);
 
+    // Connector configuration is fully validated before this process opens a
+    // listener. The immutable registry retains runtime credentials privately;
+    // errors contain static metadata or variable names only, never values.
+    let connectors = Arc::new(connectors::ConnectorRegistry::build(&metadata)?);
+
     if let Some(jwt) = &jwt {
         jwt.spawn_refresher(reqwest::Client::new());
     }
     let state: SharedState = Arc::new(AppState {
-        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap_checked(metadata)?)),
+        connectors,
         default_url: database_url,
         admin_secret,
         unauthorized_role,
@@ -348,11 +554,17 @@ async fn main() -> anyhow::Result<()> {
     // Background delivery of table event triggers. The per-table Postgres
     // triggers that capture events are created by `migrate --metadata-dir`.
     events::spawn(state.clone());
-
+    // Durable Process workers retain the exact Engine snapshot published by
+    // sync_sources; polling only wakes source-local journal transactions.
+    processes::spawn(state.clone()).await?;
     // Liveness/version are not data APIs — always mounted.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/version", get(version));
+        .route("/v1/version", get(version))
+        // Connector ingress is a provider-facing deployment surface, not one
+        // of the optional GraphQL/REST/MCP data APIs. It remains signed and
+        // declaration-bound even when all data APIs are disabled.
+        .merge(connector_webhook::router());
     // Data APIs are mounted only when enabled (deploy-time flag); a disabled
     // surface's routes are simply absent => plain 404.
     if enabled_apis.graphql {
@@ -388,6 +600,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn require_consistent_metadata(problems: &[String]) -> anyhow::Result<()> {
+    if problems.is_empty() {
+        tracing::info!("metadata is consistent");
+        return Ok(());
+    }
+    for problem in problems {
+        tracing::error!("inconsistency: {problem}");
+    }
+    anyhow::bail!(
+        "metadata validation failed: {} inconsistency(ies)",
+        problems.len()
+    );
 }
 
 async fn healthz() -> &'static str {
@@ -440,7 +666,103 @@ async fn relay(
 
 #[cfg(test)]
 mod tests {
-    use super::{EnabledApis, parse_enabled_apis};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        Args, DeploymentSelection, EnabledApis, MetadataSourceSelection, MigrateArgs, ValidateArgs,
+        parse_enabled_apis, resolve_migrate_selection, resolve_validate_selection,
+    };
+
+    static NEXT_METADATA_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestMetadataDir {
+        path: PathBuf,
+    }
+
+    impl TestMetadataDir {
+        fn new(sources: &str) -> Self {
+            let sequence = NEXT_METADATA_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "donat-source-selection-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(path.join("databases"))
+                .expect("test metadata directory should be created");
+            std::fs::write(path.join("version.yaml"), "version: 3\n")
+                .expect("test metadata version should be written");
+            std::fs::write(path.join("databases/databases.yaml"), sources)
+                .expect("test source metadata should be written");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestMetadataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn args(
+        metadata_dir: Option<PathBuf>,
+        database_url: Option<&str>,
+        metadata_database_url: Option<&str>,
+    ) -> Args {
+        Args {
+            metadata_dir,
+            database_url: database_url.map(str::to_owned),
+            metadata_database_url: metadata_database_url.map(str::to_owned),
+            port: 8080,
+            admin_secret: None,
+            enabled_apis: None,
+            command: None,
+        }
+    }
+
+    fn migrate_args(metadata_dir: Option<PathBuf>, source: Option<&str>) -> MigrateArgs {
+        MigrateArgs {
+            migrations_dir: PathBuf::from("schema-migrations"),
+            metadata_dir,
+            source: source.map(str::to_owned),
+        }
+    }
+
+    fn validate_args(metadata_dir: Option<PathBuf>, source: Option<&str>) -> ValidateArgs {
+        ValidateArgs {
+            metadata_dir,
+            source: source.map(str::to_owned),
+        }
+    }
+
+    fn expect_refinery_url(selection: DeploymentSelection, expected_url: &str) {
+        match selection {
+            DeploymentSelection::RefineryOnly {
+                database_url,
+                migrations_dir,
+            } => {
+                assert_eq!(database_url, expected_url);
+                assert_eq!(migrations_dir, PathBuf::from("schema-migrations"));
+            }
+            DeploymentSelection::MetadataSource { .. } => {
+                panic!("expected refinery-only deployment selection")
+            }
+        }
+    }
+
+    fn expect_metadata_source(
+        selection: MetadataSourceSelection,
+        expected_dir: &Path,
+        expected_source: &str,
+        expected_url: &str,
+    ) {
+        assert_eq!(selection.metadata_dir, expected_dir);
+        assert_eq!(selection.source_name, expected_source);
+        assert_eq!(selection.database_url, expected_url);
+    }
 
     fn apis(graphql: bool, rest: bool, mcp: bool) -> EnabledApis {
         EnabledApis { graphql, rest, mcp }
@@ -486,5 +808,358 @@ mod tests {
     #[test]
     fn empty_enables_none() {
         assert_eq!(parse_enabled_apis(Some("")), apis(false, false, false));
+    }
+
+    #[test]
+    fn source_selection_refinery_only_url_precedence_is_stable() {
+        let cli = migrate_args(None, None);
+
+        let selection = resolve_migrate_selection(
+            &args(
+                None,
+                Some("postgres://explicit"),
+                Some("postgres://metadata-alias"),
+            ),
+            &cli,
+            |name| match name {
+                "DONAT_DATABASE_URL" => Ok("postgres://donat-env".to_owned()),
+                "DONAT_GRAPHQL_DATABASE_URL" => Ok("postgres://graphql-env".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .expect("explicit database URL should resolve");
+        expect_refinery_url(selection, "postgres://explicit");
+
+        let selection = resolve_migrate_selection(
+            &args(None, None, Some("postgres://metadata-alias")),
+            &cli,
+            |name| match name {
+                "DONAT_DATABASE_URL" => Ok("postgres://donat-env".to_owned()),
+                "DONAT_GRAPHQL_DATABASE_URL" => Ok("postgres://graphql-env".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .expect("metadata database URL alias should resolve");
+        expect_refinery_url(selection, "postgres://metadata-alias");
+
+        let selection =
+            resolve_migrate_selection(&args(None, None, None), &cli, |name| match name {
+                "DONAT_DATABASE_URL" => Ok("postgres://donat-env".to_owned()),
+                "DONAT_GRAPHQL_DATABASE_URL" => Ok("postgres://graphql-env".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+            .expect("DONAT_DATABASE_URL should resolve");
+        expect_refinery_url(selection, "postgres://donat-env");
+
+        let selection =
+            resolve_migrate_selection(&args(None, None, None), &cli, |name| match name {
+                "DONAT_GRAPHQL_DATABASE_URL" => Ok("postgres://graphql-env".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+            .expect("legacy GraphQL database URL alias should resolve");
+        expect_refinery_url(selection, "postgres://graphql-env");
+    }
+
+    #[test]
+    fn source_selection_refinery_only_requires_a_database_url() {
+        let error =
+            resolve_migrate_selection(&args(None, None, None), &migrate_args(None, None), |_| {
+                Err(std::env::VarError::NotPresent)
+            })
+            .expect_err("refinery-only migration without a URL must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--database-url or --metadata-database-url is required"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_refinery_only_rejects_source_without_loading_metadata() {
+        let error = resolve_migrate_selection(
+            &args(None, Some("postgres://explicit"), None),
+            &migrate_args(None, Some("primary")),
+            |_| panic!("refinery-only migration with an explicit URL must not read environment"),
+        )
+        .expect_err("--source without metadata must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--source requires --metadata-dir"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_validate_requires_metadata() {
+        let error = resolve_validate_selection(
+            &args(None, Some("postgres://fallback"), None),
+            &validate_args(None, None),
+            |_| panic!("validation without metadata must not read environment"),
+        )
+        .expect_err("validation without metadata must fail");
+
+        assert!(
+            error.to_string().contains("validate needs --metadata-dir"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_explicit_postgres_source_uses_its_literal_url() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://primary
+  tables: []
+- name: secondary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://secondary
+  tables: []
+"#,
+        );
+        let global = args(
+            None,
+            Some("postgres://must-not-win"),
+            Some("postgres://must-not-win-either"),
+        );
+        let cli = validate_args(Some(metadata.path().to_path_buf()), Some("secondary"));
+
+        let selection = resolve_validate_selection(&global, &cli, |_| {
+            panic!("a literal source URL must not read environment")
+        })
+        .expect("explicit Postgres source should resolve");
+
+        expect_metadata_source(
+            selection,
+            metadata.path(),
+            "secondary",
+            "postgres://secondary",
+        );
+    }
+
+    #[test]
+    fn source_selection_omission_accepts_one_unambiguous_postgres_source() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: local-cache
+  kind: sqlite
+  configuration: {}
+  tables: []
+- name: primary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://primary
+  tables: []
+"#,
+        );
+
+        let selection = resolve_validate_selection(
+            &args(Some(metadata.path().to_path_buf()), None, None),
+            &validate_args(None, None),
+            |_| panic!("a literal source URL must not read environment"),
+        )
+        .expect("one Postgres source should be selected when --source is omitted");
+
+        expect_metadata_source(selection, metadata.path(), "primary", "postgres://primary");
+    }
+
+    #[test]
+    fn source_selection_omission_rejects_zero_or_multiple_postgres_sources() {
+        let no_postgres = TestMetadataDir::new(
+            r#"
+- name: local-cache
+  kind: sqlite
+  configuration: {}
+  tables: []
+"#,
+        );
+        let error = resolve_validate_selection(
+            &args(None, None, None),
+            &validate_args(Some(no_postgres.path().to_path_buf()), None),
+            |_| panic!("ambiguous source selection must fail before reading environment"),
+        )
+        .expect_err("zero Postgres sources must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("metadata contains no Postgres source"),
+            "unexpected error: {error:#}"
+        );
+
+        let two_postgres = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration: {}
+  tables: []
+- name: secondary
+  kind: postgres
+  configuration: {}
+  tables: []
+"#,
+        );
+        let error = resolve_validate_selection(
+            &args(None, None, None),
+            &validate_args(Some(two_postgres.path().to_path_buf()), None),
+            |_| panic!("ambiguous source selection must fail before reading environment"),
+        )
+        .expect_err("multiple Postgres sources must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("metadata contains multiple Postgres sources"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_rejects_unknown_or_non_postgres_explicit_source() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url: postgres://primary
+  tables: []
+- name: local-cache
+  kind: sqlite
+  configuration: {}
+  tables: []
+"#,
+        );
+
+        let error = resolve_validate_selection(
+            &args(None, None, None),
+            &validate_args(Some(metadata.path().to_path_buf()), Some("missing")),
+            |_| panic!("unknown source must fail before reading environment"),
+        )
+        .expect_err("unknown source must fail");
+        assert!(
+            error.to_string().contains("source `missing` was not found"),
+            "unexpected error: {error:#}"
+        );
+
+        let error = resolve_validate_selection(
+            &args(None, None, None),
+            &validate_args(Some(metadata.path().to_path_buf()), Some("local-cache")),
+            |_| panic!("non-Postgres source must fail before reading environment"),
+        )
+        .expect_err("non-Postgres source must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("source `local-cache` is not Postgres"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_resolves_selected_source_from_env() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url:
+        from_env: PRIMARY_DATABASE_URL
+  tables: []
+"#,
+        );
+
+        let selection = resolve_validate_selection(
+            &args(None, Some("postgres://fallback"), None),
+            &validate_args(Some(metadata.path().to_path_buf()), None),
+            |name| match name {
+                "PRIMARY_DATABASE_URL" => Ok("postgres://from-source-env".to_owned()),
+                other => panic!("unexpected environment read: {other}"),
+            },
+        )
+        .expect("source from_env URL should resolve");
+
+        expect_metadata_source(
+            selection,
+            metadata.path(),
+            "primary",
+            "postgres://from-source-env",
+        );
+    }
+
+    #[test]
+    fn source_selection_missing_source_env_fails_closed_without_global_fallback() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url:
+        from_env: PRIMARY_DATABASE_URL
+  tables: []
+"#,
+        );
+
+        let error = resolve_validate_selection(
+            &args(None, Some("postgres://must-not-fallback"), None),
+            &validate_args(Some(metadata.path().to_path_buf()), None),
+            |name| {
+                assert_eq!(name, "PRIMARY_DATABASE_URL");
+                Err(std::env::VarError::NotPresent)
+            },
+        )
+        .expect_err("a missing source environment variable must fail closed");
+
+        assert!(
+            error.to_string().contains("PRIMARY_DATABASE_URL"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn source_selection_global_url_is_fallback_only_when_source_url_is_absent() {
+        let metadata = TestMetadataDir::new(
+            r#"
+- name: primary
+  kind: postgres
+  configuration: {}
+  tables: []
+"#,
+        );
+        let migrate = migrate_args(Some(metadata.path().to_path_buf()), Some("primary"));
+
+        let selection = resolve_migrate_selection(
+            &args(None, Some("postgres://fallback"), None),
+            &migrate,
+            |_| panic!("explicit global fallback must not read environment"),
+        )
+        .expect("source without a connection URL should use the documented fallback");
+
+        match selection {
+            DeploymentSelection::MetadataSource {
+                metadata_dir,
+                source_name,
+                database_url,
+                migrations_dir,
+            } => {
+                assert_eq!(metadata_dir, metadata.path());
+                assert_eq!(source_name, "primary");
+                assert_eq!(database_url, "postgres://fallback");
+                assert_eq!(migrations_dir, Some(PathBuf::from("schema-migrations")));
+            }
+            DeploymentSelection::RefineryOnly { .. } => {
+                panic!("expected metadata-aware deployment selection")
+            }
+        }
     }
 }

@@ -7,7 +7,18 @@
 //! permissions) is testable without a database; everything below it (sqlgen,
 //! executor) is the only code that knows Postgres exists.
 
+mod value_contract;
+
+use std::collections::BTreeMap;
+
 use serde::Serialize;
+
+pub use donat_value_contract::{
+    BoundedInlineBytes, CanonicalDecimal, CanonicalNumber, TypeRef, TypedValue,
+    VALUE_TYPE_LANGUAGE_VERSION, ValueContractCatalog, ValueContractError, ValueContractField,
+    ValueObjectContract, ValueScalar, ValueType, canonical_size,
+};
+pub use value_contract::{ProcessStartPolicy, compile_value_contract_catalog};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Table {
@@ -407,6 +418,561 @@ pub enum MutationRoot {
     Delete {
         alias: String,
         delete: DeleteMutation,
+    },
+    /// A validated declarative command. It is intentionally SQL-free: Task 5
+    /// lowers this immutable command declaration to one Postgres statement.
+    Command {
+        alias: String,
+        command: CommandMutation,
+    },
+    Typename {
+        alias: String,
+        value: String,
+    },
+}
+
+/// The fully resolved command payload crossing the planner/renderer boundary.
+///
+/// SQLgen receives no raw command metadata, catalog, Rule catalog, role, or
+/// request session. Every SQL-relevant identifier, concrete type, role
+/// predicate/check, Rule expression, and idempotency input is resolved by the
+/// source-local planner before this value is constructed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandMutation {
+    pub identity: CommandIdentity,
+    pub name: String,
+    pub steps: Vec<CommandExecutionStep>,
+    pub guards: Vec<CommandRule>,
+    pub result: Vec<CommandResultField>,
+    pub idempotency: Option<CommandIdempotency>,
+    pub effects: Vec<ResolvedCommandEffect>,
+    pub selection: Vec<CommandResultSelection>,
+}
+
+/// Stable execution identity for command journals and durable consumers.
+///
+/// A metadata name alone is source-local, while one command can authorize
+/// multiple classic roles. Keeping all three components distinct prevents a
+/// replay or claim elected for one source/role from crossing into another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandIdentity {
+    pub source: String,
+    pub name: String,
+    pub role: String,
+}
+
+/// One deploy-time tracked column resolved for a command operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandColumn {
+    pub name: String,
+    /// The type this column is declared and cast as. For a domain-typed column
+    /// this is the schema-qualified domain, so generated SQL keeps the exact
+    /// database type.
+    pub pg_type: String,
+    /// The base type behind `pg_type`, used for every decision about what the
+    /// value *means* — which aggregate applies, how it converts to JSON. A
+    /// domain is transparent to those decisions; only the cast keeps its name.
+    pub logical_type: String,
+    pub nullable: bool,
+}
+
+impl CommandColumn {
+    /// A column whose declared type is already its base type.
+    pub fn new(name: String, pg_type: String, nullable: bool) -> Self {
+        Self {
+            name,
+            logical_type: pg_type.clone(),
+            pg_type,
+            nullable,
+        }
+    }
+}
+
+/// A named command CTE operation with all table and explicit-role facts
+/// resolved by the planner.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandExecutionStep {
+    /// One request argument list decoded to a typed bounded relational CTE.
+    /// It is internal to the execution plan and cannot be referenced by
+    /// command metadata or exposed as a result step.
+    ArgumentRows {
+        name: String,
+        cte: String,
+        items: Scalar,
+        columns: Vec<CommandColumn>,
+        minimum_items: u32,
+        maximum_items: u32,
+        error_path: String,
+    },
+    SelectOne {
+        name: String,
+        cte: String,
+        table: Table,
+        by: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_found: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    SelectMany {
+        name: String,
+        cte: String,
+        table: Table,
+        equality: Vec<CommandAssignment>,
+        order_by: Vec<CommandColumn>,
+        returning: Vec<CommandColumn>,
+        require_non_empty: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    Aggregate {
+        name: String,
+        cte: String,
+        input_cte: String,
+        values: Vec<CommandAggregateIr>,
+        error_path: String,
+    },
+    Project {
+        name: String,
+        cte: String,
+        values: Vec<CommandNamedValue>,
+        error_path: String,
+    },
+    ProjectMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        maximum_rows: u32,
+        values: Vec<CommandNamedValue>,
+        error_path: String,
+    },
+    FixedRows {
+        name: String,
+        cte: String,
+        maximum_rows: u32,
+        columns: Vec<CommandColumn>,
+        rows: Vec<Vec<CommandExecutionValue>>,
+        error_path: String,
+    },
+    Decision {
+        name: String,
+        cte: String,
+        decision: CommandDecision,
+        input: Vec<CommandNamedValue>,
+        returning: Vec<CommandColumn>,
+        error_path: String,
+    },
+    DecisionMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        decision: CommandDecision,
+        input: Vec<CommandNamedValue>,
+        returning: Vec<CommandColumn>,
+        order_by: Vec<CommandColumn>,
+        error_path: String,
+    },
+    Insert {
+        name: String,
+        cte: String,
+        table: Table,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    InsertMany {
+        name: String,
+        cte: String,
+        table: Table,
+        items: Scalar,
+        item_fields: Vec<CommandColumn>,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        allow_empty: bool,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    InsertRows {
+        name: String,
+        cte: String,
+        table: Table,
+        input_cte: String,
+        where_nonzero: Option<String>,
+        item_fields: Vec<CommandColumn>,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        allow_empty: bool,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    Update {
+        name: String,
+        cte: String,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        set: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    UpdateWhen {
+        name: String,
+        cte: String,
+        condition: CommandCondition,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        set: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    UpdateMany {
+        name: String,
+        cte: String,
+        table: Table,
+        input_cte: String,
+        primary_key: Vec<CommandAssignment>,
+        guards: Vec<CommandAssignment>,
+        assignments: Vec<CommandAssignment>,
+        check: Option<CommandRule>,
+        returning: Vec<CommandColumn>,
+        require_each: bool,
+        filter: Option<BoolExp>,
+        permission_check: Option<BoolExp>,
+        error_path: String,
+    },
+    Delete {
+        name: String,
+        cte: String,
+        table: Table,
+        predicate: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        require_affected: bool,
+        filter: Option<BoolExp>,
+        error_path: String,
+    },
+    Assert {
+        name: String,
+        rule: CommandRule,
+    },
+    AssertWhen {
+        name: String,
+        condition: CommandCondition,
+        rule: CommandRule,
+    },
+    InsertWhen {
+        name: String,
+        cte: String,
+        condition: CommandCondition,
+        table: Table,
+        object: Vec<CommandAssignment>,
+        returning: Vec<CommandColumn>,
+        check: Option<BoolExp>,
+        error_path: String,
+    },
+    AllocateMany {
+        name: String,
+        cte: String,
+        input_cte: String,
+        request_id: CommandExecutionValue,
+        group_key: Vec<CommandColumn>,
+        requested: CommandColumn,
+        available: CommandColumn,
+        allocated: CommandColumn,
+        backordered: CommandColumn,
+        groups: Vec<CommandColumn>,
+        lines: Vec<CommandColumn>,
+        backorders: Vec<CommandColumn>,
+        group_order_by: Vec<CommandColumn>,
+        line_order_by: Vec<CommandColumn>,
+        maximum_rows: u32,
+        error_path: String,
+    },
+}
+
+/// One named field produced by a pure projection or supplied to a resolved
+/// decision. Names and values are both deployment-validated; SQLgen receives
+/// no raw command value grammar.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandNamedValue {
+    pub name: String,
+    pub column: CommandColumn,
+    pub value: CommandExecutionValue,
+}
+
+/// Immutable identity and output contract of one compiled decision table.
+/// The definition revision prevents request planning from silently crossing a
+/// deployment while Task 4 adds the renderer-owned canonical row program.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecision {
+    pub name: String,
+    pub revision: String,
+    pub hit_policy: CommandDecisionHitPolicy,
+    pub rows: Vec<CommandDecisionRow>,
+}
+
+/// Closed decision hit policy copied from the Rules-owned lowered program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandDecisionHitPolicy {
+    First,
+    Unique,
+}
+
+/// One already-lowered decision row. SQLgen receives no raw decision
+/// metadata, checked expression, or Rule catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecisionRow {
+    pub id: String,
+    pub condition_sql: String,
+    pub output: Vec<CommandDecisionOutput>,
+}
+
+/// One typed business output literal lowered by `donat-rules`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandDecisionOutput {
+    pub name: String,
+    pub sql: String,
+    pub column: CommandColumn,
+}
+
+/// A condition is retained as typed data so SQLgen can materialize a gate.
+/// The request planner must never branch in Rust on this value.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandCondition {
+    ArgumentEquals {
+        argument: Scalar,
+        expected: Scalar,
+        pg_type: String,
+    },
+}
+
+/// One named, catalog-typed aggregation over a prior command row set.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandAggregateIr {
+    Count {
+        output: CommandColumn,
+    },
+    Sum {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    Min {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    Max {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+    CountDistinct {
+        output: CommandColumn,
+        input: CommandColumn,
+    },
+}
+
+impl CommandAggregateIr {
+    pub fn output(&self) -> &CommandColumn {
+        match self {
+            Self::Count { output }
+            | Self::Sum { output, .. }
+            | Self::Min { output, .. }
+            | Self::Max { output, .. }
+            | Self::CountDistinct { output, .. } => output,
+        }
+    }
+}
+
+/// One concrete target-column assignment in a command operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandAssignment {
+    pub column: CommandColumn,
+    pub value: CommandExecutionValue,
+}
+
+/// A typed, closed source for a command value. The renderer never interprets
+/// an argument name, metadata literal, Rule name, or session-variable name.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandExecutionValue {
+    Scalar {
+        value: Scalar,
+        pg_type: String,
+    },
+    StepColumn {
+        cte: String,
+        column: CommandColumn,
+    },
+    StepRows {
+        cte: String,
+        columns: Vec<CommandColumn>,
+    },
+    StepFieldRows {
+        cte: String,
+        field: String,
+        columns: Vec<CommandColumn>,
+        where_nonzero: Option<String>,
+    },
+    Item {
+        field: String,
+        pg_type: String,
+    },
+    CurrentColumn {
+        column: CommandColumn,
+    },
+    Rule {
+        sql: String,
+        pg_type: String,
+    },
+    DatabaseTime {
+        function: CommandDatabaseTime,
+        pg_type: String,
+    },
+}
+
+/// Closed database-clock functions available to commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandDatabaseTime {
+    Now,
+}
+
+/// A Rule expression lowered from the immutable Rules catalog with closed SQL
+/// bindings. `sql` comes only from `donat-rules`; SQLgen does not parse rule
+/// source or resolve a rule name.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandRule {
+    pub sql: String,
+    pub pg_type: String,
+    pub error_path: String,
+    pub message: String,
+}
+
+/// One immutable declared result field, after resolving its producer.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandResultField {
+    pub name: String,
+    pub value: CommandResultValue,
+}
+
+/// Closed source for a declared result field.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandResultValue {
+    StepRow {
+        cte: String,
+        many: bool,
+        /// Fixed declared `returning` columns used for the canonical result.
+        columns: Vec<CommandColumn>,
+    },
+    StepColumn {
+        cte: String,
+        column: CommandColumn,
+    },
+    Scalar {
+        value: Scalar,
+        pg_type: String,
+    },
+    Rule {
+        sql: String,
+        pg_type: String,
+    },
+    ProjectedRows {
+        cte: String,
+        /// Whether the source CTE carries `_cmd_ordinal`. The public value is
+        /// always a bounded list; a scalar source contributes zero or one row.
+        many: bool,
+        columns: Vec<CommandResultProjection>,
+        maximum_items: u32,
+    },
+    Array {
+        value: Scalar,
+        maximum_items: u32,
+    },
+}
+
+/// One declared result-object field projected from a concrete step column.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandResultProjection {
+    pub name: String,
+    pub source: CommandColumn,
+}
+
+/// Inputs that are already resolved before SQLgen computes an idempotency
+/// fingerprint or journal lookup. Scope order is metadata order.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandIdempotency {
+    pub key: Scalar,
+    pub scope: Vec<CommandExecutionValue>,
+    pub input: Scalar,
+    pub retention_seconds: Option<u64>,
+    pub error_path: String,
+}
+
+/// One Process hand-off after the source-local Process revision and every
+/// request value have been resolved. SQLgen receives no raw effect metadata.
+#[derive(Debug, Clone, Serialize)]
+pub enum ResolvedCommandEffect {
+    StartProcess(ResolvedStartProcessEffect),
+    SignalProcess(ResolvedSignalProcessEffect),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedStartProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub start_policy: ProcessStartPolicy,
+    pub input: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    /// Present only when the executing command role is one of the Process's
+    /// declared caller roles. The map contains the compiler-published closed
+    /// subset of session variables, never the ambient request map.
+    pub caller_role: Option<String>,
+    pub caller_session_variables: BTreeMap<String, CommandExecutionValue>,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedSignalProcessEffect {
+    pub source: String,
+    pub process_name: String,
+    pub process_revision: String,
+    pub signal_name: String,
+    pub correlation: BTreeMap<String, CommandExecutionValue>,
+    pub payload: BTreeMap<String, CommandExecutionValue>,
+    pub semantic_idempotency_key: CommandExecutionValue,
+    pub command_invocation_id: CommandInvocationIdSource,
+    pub effect_position: u32,
+}
+
+/// Closed reference to the generation elected by this command statement.
+/// Metadata can never choose or supply an arbitrary UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CommandInvocationIdSource {
+    CurrentExecution,
+}
+
+/// Client projection of a declared command result. Commands do not expose
+/// arbitrary table fields: every selection is rooted in the command's fixed
+/// result mapping and, for row values, the step's fixed `returning` list.
+#[derive(Debug, Clone, Serialize)]
+pub enum CommandResultSelection {
+    Scalar {
+        alias: String,
+        field: String,
+    },
+    Object {
+        alias: String,
+        field: String,
+        selections: Vec<CommandResultSelection>,
+    },
+    List {
+        alias: String,
+        field: String,
+        selections: Vec<CommandResultSelection>,
     },
     Typename {
         alias: String,

@@ -16,7 +16,7 @@
 - Preserve exact Hasura-compatible error `code`, `path`, message, and HTTP status.
 - Keep source-local relationships inside the existing planner; cross-source relationships remain unsupported.
 - Start each behavior change with a failing test and observe the expected failure before production edits.
-- Run the mandatory judge review after every commit.
+- Record focused verification after every commit.
 
 ---
 
@@ -124,14 +124,14 @@ CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 \
 
 Expected: PASS with the new multi-database test and all existing ClickHouse runtime tests.
 
-- [ ] **Step 9: Commit and judge**
+- [ ] **Step 9: Commit and verify**
 
 ```bash
 git add crates/catalog/src/lib.rs crates/server/src/state.rs crates/server/tests/clickhouse_runtime.rs crates/conformance/tests/clickhouse_multi_database.rs
 git commit -m "fix(clickhouse): introspect all tracked databases"
 ```
 
-Dispatch the mandatory judge with the task requirements and fresh test output; continue only after ACCEPT.
+Record verification with the task requirements and fresh test output before continuing.
 
 ---
 
@@ -308,14 +308,14 @@ executor proves one call per source with multiple roots; secondary Postgres,
 SQLite, and MySQL routing tests prove no fallback, and the secondary Postgres
 relationship response is intact.
 
-- [ ] **Step 8: Commit and judge**
+- [ ] **Step 8: Commit and verify**
 
 ```bash
 git add crates/schema/src/lib.rs crates/schema/src/plan.rs crates/schema/src/introspection.rs crates/schema/src/multi_source.rs crates/schema/tests/multi_source.rs crates/server/src/state.rs crates/server/src/gql.rs crates/server/src/main.rs crates/server/tests/multi_source_runtime.rs crates/conformance/tests/multi_source.rs crates/conformance/fixtures/multi_source
 git commit -m "feat(schema): compose GraphQL metadata sources"
 ```
 
-Dispatch the mandatory judge and continue only after ACCEPT.
+Record verification before continuing.
 
 ---
 
@@ -459,7 +459,7 @@ git add crates/backend crates/schema crates/sqlgen crates/server
 git commit -m "test: cover tandt multi-source ClickHouse contract"
 ```
 
-Dispatch the mandatory judge with the per-operation result map and continue only after ACCEPT.
+Record verification with the per-operation result map before continuing.
 
 ---
 
@@ -550,9 +550,9 @@ tandt operations match exact success bodies, the pinned dashboard matches its
 safe negative oracle, and `AnalyticsDashboardStatsSafe` matches its exact
 success body.
 
-- [ ] **Step 6: Run final judge review**
+- [ ] **Step 6: Run final independent review**
 
-Provide the judge with the full `origin/main...HEAD` diff, approved design, this plan, all exact verification commands, and fresh outputs. Address every Critical or Important finding with a test-first fix and a reviewed commit.
+Review the full `origin/main...HEAD` diff against the approved design, this plan, all exact verification commands, and fresh outputs. Address every Critical or Important finding with a test-first fix and a reviewed commit.
 
 - [ ] **Step 7: Build and validate the PR body**
 

@@ -1,0 +1,48 @@
+name: expire_booking_hold
+source: default
+permissions:
+  - role: booking_worker
+arguments:
+  - name: booking_id
+    type: uuid!
+  - name: deadline_id
+    type: uuid!
+steps:
+  - name: booking
+    select_one:
+      table: public.grooming_booking
+      by: { id: { arg: booking_id } }
+      returning: [id, slot_key, status]
+      require_found: true
+  - name: expiry_is_allowed
+    assert:
+      rule: can_transition_booking
+      with:
+        current: { step: booking, column: status }
+        next: { literal: expired }
+  - name: expiry_audit
+    insert:
+      table: public.grooming_booking_event
+      object:
+        booking_id: { step: booking, column: id }
+        event_type: { literal: expired }
+        actor_role: { literal: booking_worker }
+        request_id: { arg: deadline_id }
+      returning: [id, booking_id, event_type, request_id]
+  - name: expired_booking
+    update:
+      table: public.grooming_booking
+      where: { id: { step: booking, column: id }, status: { literal: held } }
+      set: { status: { literal: expired } }
+      returning: [id, slot_key, status]
+      require_affected: true
+result:
+  booking_id: { step: expired_booking, column: id }
+  slot_key: { step: expired_booking, column: slot_key }
+  status: { step: expired_booking, column: status }
+  audit: { step: expiry_audit }
+idempotency:
+  key: { argument: deadline_id }
+  scope:
+    - { argument: booking_id }
+  retention: 365d

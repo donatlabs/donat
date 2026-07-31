@@ -1,0 +1,60 @@
+table:
+  name: product
+  schema: public
+object_relationships:
+  - name: category
+    using:
+      foreign_key_constraint_on: category_id
+array_relationships:
+  - name: variants
+    using:
+      foreign_key_constraint_on:
+        column: product_id
+        table:
+          name: product_variant
+          schema: public
+select_permissions:
+  - role: anonymous
+    permission:
+      columns: "*"
+      filter:
+        status:
+          _eq: published
+      allow_aggregations: true
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        status:
+          _eq: published
+      allow_aggregations: true
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - category_id
+        - slug
+        - title
+        - description
+        - status
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - category_id
+        - slug
+        - title
+        - description
+        - status
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

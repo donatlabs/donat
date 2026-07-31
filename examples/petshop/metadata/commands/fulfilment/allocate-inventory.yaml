@@ -1,0 +1,153 @@
+name: allocate_inventory
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: destination_region
+    type: string!
+  - name: allocation_request_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: { schema: public, name: orders }
+      by: { id: { arg: order_id } }
+      returning: [id, order_status, currency]
+      require_found: true
+  # This view is one deterministic current authorization per paid order. It
+  # keeps the flow from choosing an authorization through a client-side scan.
+  - name: current_authorization
+    select_one:
+      table: { schema: public, name: order_current_authorization }
+      by: { order_id: { arg: order_id } }
+      returning: [payment_id, authorization_id, currency]
+      require_found: true
+  - name: allocation_candidates
+    select_many:
+      table: { schema: public, name: order_inventory_allocation_candidate }
+      by: { order_id: { arg: order_id } }
+      order_by: [line_sequence, location_code, inventory_level_id]
+      returning:
+        [order_id, order_line_id, line_sequence, variant_id, requested_quantity,
+         location_code, inventory_level_id, available_quantity,
+         unit_price_minor, currency]
+      require_non_empty: true
+      maximum_rows: 64
+  # This is a set-based decision application, not a general command loop. The
+  # compiled allocation planner must preserve candidate order while applying
+  # the named, finite location-ranking table to every candidate.
+  - name: ranked_candidates
+    decision_many:
+      decision_table: inventory_location_route
+      from: { step: allocation_candidates }
+      input:
+        region: { arg: destination_region }
+        location_code: { current_column: location_code }
+      returning:
+        [order_id, order_line_id, line_sequence, variant_id, location_code,
+         inventory_level_id, requested_quantity, available_quantity,
+         unit_price_minor, currency, allocation_rank]
+      order_by: [line_sequence, allocation_rank, location_code, inventory_level_id]
+  # The allocation planner consumes one finite ordered candidate row-set and
+  # emits exact location groups plus explicit remainder rows. It neither
+  # accepts a client-supplied quantity nor exposes a predicate or SQL surface.
+  - name: allocation_plan
+    allocate_many:
+      from: { step: ranked_candidates }
+      request_id: { arg: allocation_request_id }
+      group_key: [location_code]
+      exact_quantity_columns:
+        requested: requested_quantity
+        available: available_quantity
+        allocated: quantity
+        backordered: backordered_quantity
+      allocation_id: deterministic
+      returning:
+        groups:
+          [allocation_id, order_id, first_line_sequence, allocation_rank,
+           location_code, currency, items]
+        lines:
+          [allocation_id, order_id, order_line_id, line_sequence, variant_id,
+           location_code, inventory_level_id, requested_quantity,
+           quantity, unit_price_minor, currency]
+        backorders:
+          [order_id, order_line_id, requested_quantity, backordered_quantity]
+      group_order_by: [first_line_sequence, allocation_rank, location_code, allocation_id]
+      line_order_by: [line_sequence, location_code, allocation_id]
+  - name: allocation_group_count
+    aggregate:
+      from: { step: allocation_plan, field: groups }
+      values:
+        item_count: { count: true }
+  - name: allocation_fan_out_is_bounded
+    assert:
+      rule: bounded_fan_out_count
+      with:
+        item_count: { step: allocation_group_count, column: item_count }
+        maximum_items: { literal: 64 }
+  - name: reserve_allocated_inventory
+    update_many:
+      table: { schema: public, name: inventory_level }
+      for_each: { step: allocation_plan, field: lines }
+      by: { id: { item: inventory_level_id } }
+      set:
+        reserved_quantity:
+          rule: add_int
+          with:
+            left: { current_column: reserved_quantity }
+            right: { item: quantity }
+      check:
+        rule: can_reserve_stock
+        with:
+          on_hand: { current_column: on_hand_quantity }
+          reserved: { current_column: reserved_quantity }
+          requested: { item: quantity }
+      returning: [id, reserved_quantity]
+      require_each: true
+  - name: allocations
+    insert_many:
+      table: { schema: public, name: inventory_allocation }
+      for_each: { step: allocation_plan, field: lines }
+      object:
+        allocation_id: { item: allocation_id }
+        order_id: { item: order_id }
+        order_line_id: { item: order_line_id }
+        stock_location_code: { item: location_code }
+        inventory_level_id: { item: inventory_level_id }
+        quantity: { item: quantity }
+        unit_price_minor: { item: unit_price_minor }
+        currency: { item: currency }
+        status: { literal: allocated }
+      returning: [allocation_id, order_line_id, quantity, status]
+      allow_empty: true
+  - name: backorders
+    insert_many:
+      table: { schema: public, name: inventory_backorder }
+      for_each: { step: allocation_plan, field: backorders, where_nonzero: backordered_quantity }
+      object:
+        order_id: { item: order_id }
+        order_line_id: { item: order_line_id }
+        requested_quantity: { item: requested_quantity }
+        backordered_quantity: { item: backordered_quantity }
+        status: { literal: open }
+      returning: [id, order_line_id, backordered_quantity, status]
+      allow_empty: true
+result:
+  allocations:
+    step: allocation_plan
+    field: groups
+    as: AllocationGroup
+    maximum_items: 64
+  backorders:
+    step: backorders
+    as: Backorder
+    maximum_items: 64
+  payment_id: { step: current_authorization, column: payment_id }
+  authorization_id: { step: current_authorization, column: authorization_id }
+  currency: { step: current_authorization, column: currency }
+  allocation_order: [first_line_sequence, allocation_rank, location_code, allocation_id]
+idempotency:
+  key: { argument: allocation_request_id }
+  scope: command

@@ -15,11 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 donat-metadata = { path = "../metadata" }
+donat-rules = { path = "../rules" }
 donat-catalog = { path = "../catalog" }
 donat-schema = { path = "../schema" }
 donat-ir = { path = "../ir" }
 donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }
+donat-connector-abi = { path = "../connector-abi" }
+donat-connector-catalog = { path = "../connector-catalog" }
 graphql-parser = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
@@ -41,3 +44,11 @@ croner = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+percent-encoding = "2"
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hmac = "0.12"
+url = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

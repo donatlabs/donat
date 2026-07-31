@@ -1,0 +1,35 @@
+# Scheduled entry point for a subscription renewal cycle. The renewal order,
+# payment, and dunning ladder belong to the Process; this command proves the
+# subscription exists before one renewal Process is created per occurrence.
+name: start_subscription_renewal
+source: default
+permissions:
+  - role: subscription_worker
+arguments:
+  - name: subscription_id
+    type: uuid!
+  - name: cron_occurrence
+    type: timestamptz!
+steps:
+  - name: subscription
+    select_one:
+      table: public.subscription
+      by:
+        id: { arg: subscription_id }
+      returning: [id, status]
+      require_found: true
+result:
+  subscription_id: { step: subscription, column: id }
+  status: { step: subscription, column: status }
+idempotency:
+  key: { argument: cron_occurrence }
+  scope:
+    - { argument: subscription_id }
+  retention: 365d
+effects:
+  - start_process:
+      process: subscription_renewal
+      input:
+        subscription_id: { step: subscription, column: id }
+        cron_occurrence: { arg: cron_occurrence }
+      idempotency_key: { argument: cron_occurrence }

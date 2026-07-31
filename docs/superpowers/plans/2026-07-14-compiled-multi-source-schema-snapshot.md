@@ -1,7 +1,7 @@
 # Compiled Multi-Source Schema Snapshot Implementation Plan
 
 > **For Codex:** Execute every checkbox in order with RED/GREEN evidence and a
-> judge gate after each commit.
+> focused verification after each commit.
 
 **Goal:** Remove schema composition and source-index construction from GraphQL
 request paths while preserving multi-source permissions, Relay, introspection,
@@ -112,7 +112,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
   `cargo test -p donat-schema --test multi_source`.
   Expected: all tests pass and ordinary operations invoke the provider zero
   times.
-- [ ] Commit this slice and obtain judge PASS before the next commit.
+- [ ] Commit this slice and record verification before the next commit.
 
 ### Task 2: Compile and reuse every source planner index
 
@@ -145,7 +145,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
   `cargo test -p donat-schema --test multi_source` and
   `cargo test -p donat-schema`.
   Expected: all schema tests pass, including collision and permission cases.
-- [ ] Commit this slice and obtain judge PASS before the next commit.
+- [ ] Commit this slice and record verification before the next commit.
 
 ### Task 3: Publish schema and runtime routing atomically
 
@@ -178,7 +178,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
   `cargo test -p donat-server --test sqlite_runtime`, and
   `cargo test -p donat-server --test multi_source_runtime`.
   Expected: positive and negative publication tests and runtime tests pass.
-- [ ] Commit this slice and obtain judge PASS before the next commit.
+- [ ] Commit this slice and record verification before the next commit.
 
 ### Task 4: Use compiled planners on every GraphQL request path
 
@@ -207,7 +207,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
 - [ ] GREEN: run the two focused tests, `cargo test -p donat-server action`, and
   `cargo test -p donat-server --test multi_source_runtime`.
   Expected: all pass without any request-time compile entry point.
-- [ ] Commit this slice and obtain judge PASS before the next commit.
+- [ ] Commit this slice and record verification before the next commit.
 
 ### Task 5: Verify all behavior and security contracts
 
@@ -238,7 +238,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
   `DONAT_EXTERNAL_DB_TESTS=1 PG_URL=postgresql://postgres:postgres@127.0.0.1:15432/postgres CLICKHOUSE_URL=http://donat:donat@127.0.0.1:18123 cargo test -p donat-conformance --test multi_source -- --test-threads=1 --nocapture`.
 - [ ] Confirm explicit roles, unknown-role denial, backend-only permissions,
   Relay, mixed-source routing, actions, and introspection all remain green.
-- [ ] Commit any test-proven correction separately and obtain judge PASS.
+- [ ] Commit any test-proven correction separately and record verification.
 
 ### Task 6: Reproduce and close the latency regression
 
@@ -263,7 +263,7 @@ narrow public `CompiledMultiSourceSchema::source_planner` factory.
 
 - [ ] Run `git diff --check origin/main...HEAD` and inspect for unrelated
   changes.
-- [ ] Obtain final judge PASS over the full diff and fresh verification output.
+- [ ] Complete final independent review over the full diff and fresh verification output.
 - [ ] Push `fix/multi-source-schema-cache`, create/merge the PR according to
   repository policy, and wait for CI.
 - [ ] Build/publish the public Docker image, redeploy tandt, and repeat the

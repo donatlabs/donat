@@ -1,0 +1,5 @@
+types:
+  - name: InvalidType
+    enum: [value]
+    object:
+      field: string!

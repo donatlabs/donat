@@ -1,0 +1,53 @@
+name: record_vendor_acceptance
+source: default
+permissions:
+  - role: vendor
+arguments:
+  - name: vendor_order_id
+    type: uuid!
+  - name: acceptance_id
+    type: uuid!
+steps:
+  - name: vendor_order
+    select_one:
+      table: public.vendor_order
+      by:
+        id: { arg: vendor_order_id }
+      returning: [id, order_id, vendor_id, gross_minor, currency, status]
+      require_found: true
+  - name: vendor_membership
+    select_one:
+      table: public.vendor_membership
+      by:
+        vendor_id: { step: vendor_order, column: vendor_id }
+        user_id: { session_variable: x-donat-user-id }
+      returning: [vendor_id, user_id]
+      require_found: true
+  - name: acceptance
+    insert:
+      table: public.vendor_order_acceptance
+      object:
+        vendor_order_id: { step: vendor_order, column: id }
+        vendor_id: { step: vendor_order, column: vendor_id }
+        acceptance_id: { arg: acceptance_id }
+        accepted_by_user_id: { session_variable: x-donat-user-id }
+      returning: [id, vendor_order_id, vendor_id, acceptance_id]
+  - name: accepted_vendor_order
+    update:
+      table: public.vendor_order
+      where:
+        id: { step: vendor_order, column: id }
+        vendor_id: { step: vendor_membership, column: vendor_id }
+        status: { literal: pending_acceptance }
+      set:
+        status: { literal: accepted }
+      returning: [id, order_id, vendor_id, gross_minor, currency, status]
+      require_affected: true
+result:
+  vendor_order: { step: accepted_vendor_order }
+  acceptance_id: { step: acceptance, column: acceptance_id }
+idempotency:
+  key: { argument: acceptance_id }
+  scope:
+    - { argument: vendor_order_id }
+  retention: 365d

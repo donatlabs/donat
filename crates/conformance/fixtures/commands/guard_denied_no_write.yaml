@@ -1,0 +1,40 @@
+- description: A false command guard returns the structured validation error.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      mutation RejectOrder {
+        create_order(
+          id: "550e8400-e29b-41d4-a716-446655440010"
+          customer_id: "550e8400-e29b-41d4-a716-446655440001"
+          status: "draft"
+          quantity: 0
+          request_id: "550e8400-e29b-41d4-a716-446655440011"
+        ) {
+          order_id
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.create_order
+          code: validation-failed
+        message: order quantity must be positive
+
+- description: The failed command leaves no order visible through the same explicit role.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+  query:
+    query: |
+      query OrdersAfterRejectedCommand {
+        orders {
+          id
+        }
+      }
+  response:
+    data:
+      orders: []

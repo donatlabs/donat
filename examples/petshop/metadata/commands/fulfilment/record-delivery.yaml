@@ -1,0 +1,40 @@
+name: record_delivery
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: shipment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: delivered_at
+    type: timestamptz!
+steps:
+  - name: shipment
+    select_one:
+      table: { schema: public, name: shipment }
+      by: { id: { arg: shipment_id } }
+      returning: [id, allocation_id, order_id, status]
+      require_found: true
+  - name: delivery_event
+    insert:
+      table: { schema: public, name: shipment_result }
+      object:
+        shipment_id: { arg: shipment_id }
+        provider_event_id: { arg: provider_event_id }
+        outcome: { literal: delivered }
+        occurred_at: { arg: delivered_at }
+      returning: [id, shipment_id, provider_event_id, outcome, occurred_at]
+  - name: delivered
+    update:
+      table: { schema: public, name: shipment }
+      where: { id: { arg: shipment_id }, status: { literal: shipped } }
+      set: { status: { literal: delivered }, delivered_at: { arg: delivered_at } }
+      returning: [id, allocation_id, status, delivered_at]
+      require_affected: true
+result:
+  shipment: { step: delivered }
+  delivery_event: { step: delivery_event }
+idempotency:
+  key: { argument: provider_event_id }
+  scope: command

@@ -1,0 +1,9 @@
+name: project_order
+source: default
+steps:
+  - name: projected
+    project:
+      values:
+        order_id: { arg: order_id }
+result:
+  order_id: { step: projected, column: order_id }

@@ -84,6 +84,10 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         custom_types,
         cron_triggers: load_section(dir, "cron_triggers.yaml")?,
         rest_endpoints: load_section(dir, "rest_endpoints.yaml")?,
+        commands: load_section(dir, "commands.yaml")?,
+        rules: load_section(dir, "rules.yaml")?,
+        connectors: load_section(dir, "connectors.yaml")?,
+        processes: load_section(dir, "flows.yaml")?,
         mcp,
     };
     validate_mcp_references(&metadata).map_err(|message| LoadError::Mcp {
@@ -138,7 +142,10 @@ fn validate_mcp(mcp: &crate::types::McpMetadata) -> Result<(), String> {
             ));
         }
         if tool.permissions.is_empty() {
-            return Err(format!("tool '{}' must declare at least one role", tool.name));
+            return Err(format!(
+                "tool '{}' must declare at least one role",
+                tool.name
+            ));
         }
     }
     for table_tool in &mcp.table_tools {
@@ -185,7 +192,10 @@ fn validate_mcp_references(metadata: &Metadata) -> Result<(), String> {
             }
         }
         if let Some(action_name) = &tool.source.action {
-            let Some(action) = metadata.actions.iter().find(|action| action.name == *action_name)
+            let Some(action) = metadata
+                .actions
+                .iter()
+                .find(|action| action.name == *action_name)
             else {
                 return Err(format!(
                     "tool '{}' references unknown action '{}'",
@@ -205,10 +215,14 @@ fn validate_mcp_references(metadata: &Metadata) -> Result<(), String> {
         }
     }
     for table_tool in &metadata.mcp.table_tools {
-        let tracked = metadata.sources.iter().flat_map(|source| &source.tables).any(|entry| {
-            entry.table.schema() == table_tool.table.schema()
-                && entry.table.name() == table_tool.table.name()
-        });
+        let tracked = metadata
+            .sources
+            .iter()
+            .flat_map(|source| &source.tables)
+            .any(|entry| {
+                entry.table.schema() == table_tool.table.schema()
+                    && entry.table.name() == table_tool.table.name()
+            });
         if !tracked {
             return Err(format!(
                 "MCP table tool references untracked table '{}.{}'",
@@ -226,16 +240,21 @@ fn action_output_has_relationships(
     ancestors: &mut HashSet<String>,
 ) -> bool {
     let name = type_.trim_matches(|ch| matches!(ch, '[' | ']' | '!'));
-    let Some(object) = custom_types.objects.iter().find(|object| object.name == name) else {
+    let Some(object) = custom_types
+        .objects
+        .iter()
+        .find(|object| object.name == name)
+    else {
         return false;
     };
     if !ancestors.insert(object.name.clone()) {
         return false;
     }
     let has_relationship = !object.relationships.is_empty()
-        || object.fields.iter().any(|field| {
-            action_output_has_relationships(custom_types, &field.type_, ancestors)
-        });
+        || object
+            .fields
+            .iter()
+            .any(|field| action_output_has_relationships(custom_types, &field.type_, ancestors));
     ancestors.remove(&object.name);
     has_relationship
 }
@@ -266,19 +285,19 @@ fn load_actions(
     Ok((parsed.actions, parsed.custom_types))
 }
 
-/// Load an optional top-level list section (`!include`-resolved). Returns an
-/// empty vec when the file is absent or blank.
-fn load_section<T: serde::de::DeserializeOwned>(
+/// Load an optional top-level section (`!include`-resolved). Returns the
+/// section's default value when the file is absent or blank.
+fn load_section<T: serde::de::DeserializeOwned + Default>(
     dir: &Path,
     file: &str,
-) -> Result<Vec<T>, LoadError> {
+) -> Result<T, LoadError> {
     let path = dir.join(file);
     if !path.exists() {
-        return Ok(vec![]);
+        return Ok(T::default());
     }
     let value = load_yaml_resolved(&path)?;
     if value.is_null() {
-        return Ok(vec![]);
+        return Ok(T::default());
     }
     serde_yaml::from_value(value).map_err(|source| LoadError::Yaml { path, source })
 }

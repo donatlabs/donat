@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value as Json;
 
+type ParsedRequest = (String, Json, Vec<(String, String)>);
+
 /// One recorded delivery: the request path, parsed JSON body, and headers
 /// (lower-cased names).
 #[derive(Clone)]
@@ -100,7 +102,7 @@ pub fn spawn() -> CronWebhook {
 }
 
 /// Parse one HTTP request: returns (path, parsed-json-body, headers).
-fn read_request(stream: &mut TcpStream) -> Option<(String, Json, Vec<(String, String)>)> {
+fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {

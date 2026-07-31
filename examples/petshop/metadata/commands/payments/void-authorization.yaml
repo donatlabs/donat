@@ -1,0 +1,79 @@
+name: void_authorization
+source: default
+permissions:
+  - role: payment_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: authorization_id
+    type: uuid!
+  - name: provider_void_id
+    type: string!
+  - name: provider_event_id
+    type: string!
+  - name: payload
+    type: BoundedProviderEvidence!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment
+      by:
+        id: { arg: payment_id }
+      returning: [id, status]
+  - name: authorization
+    select_one:
+      table: public.payment_authorization
+      by:
+        id: { arg: authorization_id }
+        payment_id: { step: payment, column: id }
+      returning: [id, authorized_minor, captured_minor, capture_reserved_minor, status]
+  - name: void_is_allowed
+    assert:
+      rule: can_void_authorization
+      with:
+        payment_state: { step: payment, column: status }
+        authorization_state: { step: authorization, column: status }
+        authorized_minor: { step: authorization, column: authorized_minor }
+        captured_minor: { step: authorization, column: captured_minor }
+        capture_reserved_minor: { step: authorization, column: capture_reserved_minor }
+  - name: payment_event
+    insert:
+      table: public.payment_event
+      object:
+        payment_id: { step: payment, column: id }
+        event_type: { literal: void }
+        provider_event_id: { arg: provider_event_id }
+        payload: { arg: payload }
+      returning: [id, provider_event_id]
+  - name: void
+    insert:
+      table: public.payment_void
+      object:
+        payment_id: { step: payment, column: id }
+        authorization_id: { step: authorization, column: id }
+        provider_void_id: { arg: provider_void_id }
+        status: { literal: voided }
+      returning: [id, payment_id, authorization_id, status]
+  - name: mark_authorization_voided
+    update:
+      table: public.payment_authorization
+      where:
+        id: { step: authorization, column: id }
+      set:
+        status: { literal: voided }
+      returning: [id, status]
+  - name: mark_payment_voided
+    update:
+      table: public.payment
+      where:
+        id: { step: payment, column: id }
+      set:
+        status: { literal: voided }
+      returning: [id, status]
+result:
+  payment_id: { step: mark_payment_voided, column: id }
+  payment_status: { step: mark_payment_voided, column: status }
+  void_id: { step: void, column: id }
+idempotency:
+  key: { argument: provider_event_id }
+  retention: 365d

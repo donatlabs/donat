@@ -5,6 +5,7 @@
 use donat_ir::*;
 use donat_sqlgen::{
     mutation_to_sql, operation_to_sql, operation_to_sql_opts, quote_ident, quote_lit,
+    quote_type_name,
 };
 use serde_json::json;
 
@@ -434,6 +435,22 @@ fn quote_helpers_double_embedded_quotes() {
     assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     assert_eq!(quote_lit("plain"), "'plain'");
     assert_eq!(quote_lit("O'Brien"), "'O''Brien'");
+}
+
+/// Introspection reports a domain in `schema.name` form. Quoting that as one
+/// identifier asks PostgreSQL for a type literally named
+/// `"public.petshop_required_int8"`, which no database has.
+#[test]
+fn schema_qualified_type_names_quote_each_part() {
+    assert_eq!(quote_type_name("int8"), "\"int8\"");
+    assert_eq!(
+        quote_type_name("public.petshop_required_int8"),
+        "\"public\".\"petshop_required_int8\""
+    );
+    assert_eq!(
+        quote_type_name("we\"ird.ty\"pe"),
+        "\"we\"\"ird\".\"ty\"\"pe\""
+    );
 }
 
 #[test]

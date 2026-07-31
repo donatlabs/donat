@@ -1,0 +1,47 @@
+name: open_vendor_dispute
+source: default
+permissions:
+  - role: vendor
+arguments:
+  - name: vendor_order_id
+    type: uuid!
+  - name: dispute_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: details
+    type: BoundedProviderEvidence!
+steps:
+  - name: vendor_order
+    select_one:
+      table: public.vendor_order
+      by:
+        id: { arg: vendor_order_id }
+      returning: [id, order_id, vendor_id, gross_minor, currency, status]
+      require_found: true
+  - name: vendor_membership
+    select_one:
+      table: public.vendor_membership
+      by:
+        vendor_id: { step: vendor_order, column: vendor_id }
+        user_id: { session_variable: x-donat-user-id }
+      returning: [vendor_id, user_id]
+      require_found: true
+  - name: dispute
+    insert:
+      table: public.vendor_dispute
+      object:
+        dispute_id: { arg: dispute_id }
+        vendor_order_id: { step: vendor_order, column: id }
+        vendor_id: { step: vendor_order, column: vendor_id }
+        reason: { arg: reason }
+        details: { arg: details }
+        status: { literal: open }
+      returning: [id, dispute_id, vendor_order_id, vendor_id, status]
+result:
+  dispute: { step: dispute }
+idempotency:
+  key: { argument: dispute_id }
+  scope:
+    - { argument: vendor_order_id }
+  retention: 365d

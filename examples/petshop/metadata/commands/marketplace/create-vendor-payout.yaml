@@ -1,0 +1,52 @@
+name: create_vendor_payout
+source: default
+permissions:
+  - role: marketplace_worker
+arguments:
+  - name: payout_cycle_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: payout_candidates
+    select_many:
+      table: public.vendor_payout_candidate
+      by:
+        payout_cycle_id: { arg: payout_cycle_id }
+      order_by: [vendor_id]
+      returning: [vendor_id, payout_key, vendor_order_count, gross_minor, commission_minor, net_minor, currency]
+      require_non_empty: true
+  - name: payout_candidate_count
+    aggregate:
+      from: { step: payout_candidates }
+      values:
+        item_count: { count: true }
+  - name: payout_fan_out_is_bounded
+    assert:
+      rule: bounded_fan_out_count
+      with:
+        item_count: { step: payout_candidate_count, column: item_count }
+        maximum_items: { literal: 64 }
+  - name: payouts
+    insert_many:
+      table: public.vendor_payout
+      for_each: { step: payout_candidates }
+      object:
+        payout_cycle_id: { arg: payout_cycle_id }
+        vendor_id: { item: vendor_id }
+        payout_key: { item: payout_key }
+        vendor_order_count: { item: vendor_order_count }
+        gross_minor: { item: gross_minor }
+        commission_minor: { item: commission_minor }
+        net_minor: { item: net_minor }
+        currency: { item: currency }
+        status: { literal: pending }
+      returning: [id, payout_cycle_id, vendor_id, payout_key, net_minor, currency, status]
+result:
+  payout_cycle_id: { arg: payout_cycle_id }
+  payouts: { step: payouts, as: VendorPayoutCandidate, maximum_items: 64 }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: payout_cycle_id }
+  retention: 365d

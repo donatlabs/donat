@@ -1,0 +1,60 @@
+table:
+  name: cart
+  schema: public
+object_relationships:
+  - name: customer
+    using:
+      foreign_key_constraint_on: customer_id
+array_relationships:
+  - name: lines
+    using:
+      foreign_key_constraint_on:
+        column: cart_id
+        table:
+          name: cart_line
+          schema: public
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: b2b_buyer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        _and:
+          - customer_id:
+              _eq: X-Donat-User-Id
+          - status:
+              _eq: cart_open
+      set:
+        customer_id: X-Donat-User-Id
+      columns: []
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - status
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+delete_permissions:
+  - role: customer
+    permission:
+      filter:
+        _and:
+          - customer_id:
+              _eq: X-Donat-User-Id
+          - status:
+              _eq: cart_open

@@ -6,30 +6,23 @@ object_relationships:
     using:
       foreign_key_constraint_on: customer_id
 array_relationships:
-  - name: items
+  - name: lines
     using:
       foreign_key_constraint_on:
         column: order_id
         table:
-          name: order_item
+          name: order_line
           schema: public
-# A shopper places orders for themselves: customer_id is forced to their own
-# session id by the preset, and the check rejects anything else.
-insert_permissions:
-  - role: customer
-    permission:
-      check:
-        customer_id:
-          _eq: X-Donat-User-Id
-      set:
-        customer_id: X-Donat-User-Id
-      columns:
-        - status
-# A shopper reads only their own orders; staff read all of them.
 select_permissions:
   - role: customer
     permission:
-      columns: "*"
+      columns:
+        - id
+        - customer_id
+        - order_status
+        - total_minor
+        - currency
+        - created_at
       filter:
         customer_id:
           _eq: X-Donat-User-Id
@@ -37,15 +30,96 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
-# Order fulfilment (status transitions) belongs to staff.
-update_permissions:
-  - role: staff
+  - role: fulfilment
     permission:
       columns:
-        - status
+        - id
+        - customer_id
+        - order_status
+        - total_minor
+        - currency
+        - created_at
+      # Fulfilment owns an order from the moment its payment is committed:
+      # allocation and shipment run against an authorized order, and capture
+      # only follows a shipped label. Restricting this to `paid` predated the
+      # authorize-then-capture flow and hid every fulfilable order.
+      filter:
+        order_status:
+          _in: [authorized, paid, fulfilled]
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - customer_id
+        - order_status
+        - total_minor
+        - currency
+      filter: {}
+  - role: marketplace_worker
+    permission:
+      columns: "*"
+      filter: {}
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      filter: {}
+command_select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - id
+        - customer_id
+        - checkout_quote_id
+        - order_status
+        - cancellation_reason
+        - subtotal_minor
+        - discount_minor
+        - shipping_minor
+        - tax_minor
+        - total_minor
+        - currency
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+command_insert_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+insert_permissions:
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+command_update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - order_status
+        - cancellation_reason
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+update_permissions:
+  - role: support
+    permission:
+      columns:
+        - order_status
+        - cancellation_reason
       filter: {}
       check: {}
-delete_permissions:
-  - role: staff
+  - role: payment_worker
     permission:
+      columns:
+        - order_status
       filter: {}
+      check: {}

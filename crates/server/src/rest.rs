@@ -201,10 +201,10 @@ pub async fn dispatch(
 
     // Success (data, no errors) -> unwrap the data object; otherwise pass
     // through the engine's status + error body unchanged.
-    if resp.get("errors").is_none() {
-        if let Some(data) = resp.get("data") {
-            return (StatusCode::OK, axum::Json(data.clone())).into_response();
-        }
+    if resp.get("errors").is_none()
+        && let Some(data) = resp.get("data")
+    {
+        return (StatusCode::OK, axum::Json(data.clone())).into_response();
     }
     (status, axum::Json(resp)).into_response()
 }

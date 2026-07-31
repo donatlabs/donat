@@ -1,0 +1,173 @@
+name: prepare_checkout_quote
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: cart_id
+    type: bigint!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: cart
+    select_one:
+      table: public.cart_checkout_context
+      by:
+        cart_id: { arg: cart_id }
+        customer_id: { session_variable: x-donat-user-id }
+        status: { literal: cart_open }
+      returning:
+        [cart_id, customer_id, customer_tier, sales_channel, coupon_present,
+         destination_country_code]
+      require_found: true
+  - name: price_list
+    decision:
+      decision_table: price_list_route
+      input:
+        customer_tier: { step: cart, column: customer_tier }
+        sales_channel: { step: cart, column: sales_channel }
+      returning: [price_list_code]
+  - name: priced_lines
+    select_many:
+      table: public.cart_price_candidate
+      by:
+        cart_id: { step: cart, column: cart_id }
+        price_list_code: { step: price_list, column: price_list_code }
+      order_by: [line_sequence, variant_id]
+      returning:
+        [line_sequence, variant_id, sku, title, quantity, taxable_category,
+         unit_price_minor, line_subtotal_minor, currency]
+      require_non_empty: true
+      maximum_rows: 64
+  - name: subtotal
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        subtotal_minor: { sum: { column: line_subtotal_minor } }
+        currency: { min: { column: currency } }
+        currency_count: { count_distinct: { column: currency } }
+  - name: currency_is_uniform
+    assert:
+      rule: is_single_currency
+      with:
+        currency_count: { step: subtotal, column: currency_count }
+  - name: promotion
+    decision:
+      decision_table: promotion_route
+      input:
+        coupon_present: { step: cart, column: coupon_present }
+        order_total_minor: { step: subtotal, column: subtotal_minor }
+      returning: [promotion_code, discount_bps]
+  - name: shipping
+    decision:
+      decision_table: shipping_service_route
+      input:
+        country_code: { step: cart, column: destination_country_code }
+        order_total_minor: { step: subtotal, column: subtotal_minor }
+      returning: [service_code, shipping_minor]
+  - name: tax_routes
+    decision_many:
+      decision_table: tax_route
+      from: { step: priced_lines }
+      input:
+        country_code: { step: cart, column: destination_country_code }
+        taxable_category: { current_column: taxable_category }
+      returning:
+        [line_sequence, variant_id, quantity, taxable_category,
+         unit_price_minor, line_subtotal_minor, currency, tax_code, tax_bps]
+      order_by: [line_sequence, variant_id]
+  - name: quoted_lines
+    project_many:
+      from: { step: tax_routes }
+      maximum_rows: 64
+      values:
+        variant_id: { current_column: variant_id }
+        quantity: { current_column: quantity }
+        taxable_category: { current_column: taxable_category }
+        tax_code: { current_column: tax_code }
+        tax_bps: { current_column: tax_bps }
+        unit_price_minor: { current_column: unit_price_minor }
+        line_subtotal_minor: { current_column: line_subtotal_minor }
+        discount_minor:
+          rule: basis_points_amount
+          with:
+            amount_minor: { current_column: line_subtotal_minor }
+            basis_points: { step: promotion, column: discount_bps }
+        taxable_minor:
+          rule: subtract_minor
+          with:
+            left: { current_column: line_subtotal_minor }
+            right:
+              rule: basis_points_amount
+              with:
+                amount_minor: { current_column: line_subtotal_minor }
+                basis_points: { step: promotion, column: discount_bps }
+        currency: { current_column: currency }
+  - name: quoted_totals
+    aggregate:
+      from: { step: quoted_lines }
+      values:
+        discount_minor: { sum: { column: discount_minor } }
+        taxable_minor: { sum: { column: taxable_minor } }
+  - name: quote_is_valid
+    assert:
+      rule: checkout_total_is_nonnegative
+      with:
+        subtotal_minor: { step: subtotal, column: subtotal_minor }
+        discount_minor: { step: quoted_totals, column: discount_minor }
+        shipping_minor: { step: shipping, column: shipping_minor }
+  - name: quote
+    insert:
+      table: public.checkout_quote
+      object:
+        cart_id: { step: cart, column: cart_id }
+        customer_id: { step: cart, column: customer_id }
+        price_list_code: { step: price_list, column: price_list_code }
+        promotion_code: { step: promotion, column: promotion_code }
+        discount_bps: { step: promotion, column: discount_bps }
+        shipping_service_code: { step: shipping, column: service_code }
+        subtotal_minor: { step: subtotal, column: subtotal_minor }
+        discount_minor: { step: quoted_totals, column: discount_minor }
+        shipping_minor: { step: shipping, column: shipping_minor }
+        taxable_minor: { step: quoted_totals, column: taxable_minor }
+        currency: { step: subtotal, column: currency }
+        destination_country_code: { step: cart, column: destination_country_code }
+        status: { literal: awaiting_tax }
+      returning:
+        [id, cart_id, customer_id, price_list_code, promotion_code,
+         shipping_service_code, subtotal_minor, discount_minor, shipping_minor,
+         taxable_minor, currency, destination_country_code, status]
+  - name: quote_lines
+    insert_many:
+      table: public.checkout_quote_line
+      for_each: { step: quoted_lines }
+      maximum_items: 64
+      object:
+        checkout_quote_id: { step: quote, column: id }
+        variant_id: { item: variant_id }
+        quantity: { item: quantity }
+        taxable_category: { item: taxable_category }
+        tax_code: { item: tax_code }
+        tax_bps: { item: tax_bps }
+        unit_price_minor: { item: unit_price_minor }
+        line_subtotal_minor: { item: line_subtotal_minor }
+        discount_minor: { item: discount_minor }
+        taxable_minor: { item: taxable_minor }
+        currency: { item: currency }
+      returning:
+        [checkout_quote_id, variant_id, quantity, taxable_category, tax_code, tax_bps,
+         unit_price_minor, line_subtotal_minor, discount_minor, taxable_minor,
+         currency]
+result:
+  checkout_quote_id: { step: quote, column: id }
+  cart_id: { step: quote, column: cart_id }
+  destination_country_code: { step: quote, column: destination_country_code }
+  currency: { step: quote, column: currency }
+  taxable_lines: { step: quote_lines, as: TaxableLine }
+  subtotal_minor: { step: quote, column: subtotal_minor }
+  discount_minor: { step: quote, column: discount_minor }
+  shipping_minor: { step: quote, column: shipping_minor }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 30d

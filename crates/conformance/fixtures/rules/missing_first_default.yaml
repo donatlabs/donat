@@ -1,0 +1,13 @@
+decision_tables:
+  - name: approval_route
+    inputs:
+      amount: int!
+    output:
+      route: string!
+    hit_policy: first
+    rows:
+      - id: high_value
+        when:
+          amount: "amount > 100"
+        output:
+          route: manual
