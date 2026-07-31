@@ -13,7 +13,7 @@ use donat_rules::RuleType;
 use donat_server::connectors::ConnectorRegistry;
 use donat_server::processes::{
     ProcessCommandDescriptor, ProcessDecisionDescriptor, ProcessDependencyCatalog,
-    ProcessRuleDescriptor, ResolvedProcessConnectorOperation,
+    ProcessRuleDescriptor, ResolvedProcessConnectorOperation, ResolvedProcessConnectorTrigger,
     build_process_effect_contract_catalog, compile_process_catalog,
 };
 use serde_json::json;
@@ -56,6 +56,20 @@ impl ProcessDependencyCatalog for Dependencies {
             source,
             instance,
             operation,
+        )
+    }
+
+    fn connector_trigger(
+        &self,
+        source: &str,
+        instance: &str,
+        trigger: &str,
+    ) -> Result<Option<ResolvedProcessConnectorTrigger>, String> {
+        donat_server::processes::ProcessConnectorCatalog::connector_trigger(
+            &self.connectors,
+            source,
+            instance,
+            trigger,
         )
     }
 }
@@ -310,6 +324,110 @@ fn process_compiler_pins_exact_horizon_and_dependency_revision() {
     );
     assert_eq!(process.dependencies.connector_operations.len(), 1);
     assert_ne!(process.definition_fingerprint, process.revision_fingerprint);
+}
+
+#[test]
+fn process_compiler_resolves_webhook_waits_from_the_connector_trigger_catalog() {
+    // This catches treating a provider event name as an unchecked string or
+    // allowing a correlation field/type that the normalized TriggerSpec does
+    // not publish.
+    const API_KEY_ENV: &str = "DONAT_PROCESS_COMPILER_WEBHOOK_API_KEY";
+    const WEBHOOK_SECRET_ENV: &str = "DONAT_PROCESS_COMPILER_WEBHOOK_SECRET";
+    // SAFETY: these test-only environment names are set before this test's
+    // registry is built and are not used by another test target.
+    unsafe {
+        std::env::set_var(API_KEY_ENV, "sk_test_process_compiler");
+        std::env::set_var(WEBHOOK_SECRET_ENV, "whsec_process_compiler");
+    }
+
+    let mut document = serde_json::to_value(base_metadata()).expect("base metadata serializes");
+    document["connectors"] = json!([{
+        "name": "payments",
+        "module": "stripe",
+        "config": {
+            "endpoint_identity": "stripe_process_compiler_test",
+            "credential_identity": "stripe_process_compiler_credential",
+            "secret_key": { "value_from_env": API_KEY_ENV },
+            "webhook_secret": { "value_from_env": WEBHOOK_SECRET_ENV },
+            "api_version": "2026-07-27"
+        },
+        "operations": [{
+            "name": "checkout.create_session",
+            "capacity": {
+                "max_in_flight": 1,
+                "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+            }
+        }]
+    }]);
+    document["processes"][0]["states"] = json!([
+        {
+            "id": "await_payment",
+            "wait": {
+                "webhook": {
+                    "connector": "payments",
+                    "trigger": "checkout.session.completed",
+                    "correlate": {
+                        "client_reference_id": { "input": "order_id" }
+                    }
+                },
+                "deadline": "1h",
+                "next": "done",
+                "on_timeout": "timed_out"
+            }
+        },
+        {
+            "id": "done",
+            "output": { "values": { "status": { "literal": "paid" } } }
+        },
+        {
+            "id": "timed_out",
+            "fail": { "code": "timed_out", "message": "payment timed out" }
+        }
+    ]);
+    document["processes"][0]["start_at"] = json!("await_payment");
+    let metadata: Metadata =
+        serde_json::from_value(document).expect("webhook wait metadata deserializes");
+    let mut dependencies = base_dependencies(16_100);
+    dependencies.connectors =
+        ConnectorRegistry::build(&metadata).expect("Stripe trigger registry compiles");
+
+    let catalog = compile_process_catalog(&metadata, &dependencies)
+        .expect("catalog-owned webhook trigger compiles");
+    let process = catalog
+        .source("default")
+        .unwrap()
+        .process("checkout")
+        .unwrap();
+    assert_eq!(process.dependencies.connector_triggers.len(), 1);
+    assert!(
+        process.states["await_payment"]
+            .output
+            .roots
+            .contains_key("payment_status")
+    );
+
+    let mut unknown = serde_json::to_value(&metadata).expect("webhook metadata serializes");
+    unknown["processes"][0]["states"][0]["wait"]["webhook"]["trigger"] =
+        json!("checkout.session.unknown");
+    let unknown: Metadata =
+        serde_json::from_value(unknown).expect("unknown trigger metadata deserializes");
+    let error = compile_process_catalog(&unknown, &dependencies)
+        .expect_err("unknown webhook trigger must fail closed");
+    assert_eq!(error.path, "processes[0].states[0].wait.webhook.trigger");
+    assert!(error.message.contains("is not executable"));
+
+    let mut wrong_field = serde_json::to_value(&metadata).expect("webhook metadata serializes");
+    wrong_field["processes"][0]["states"][0]["wait"]["webhook"]["correlate"] =
+        json!({ "missing_field": { "input": "order_id" } });
+    let wrong_field: Metadata =
+        serde_json::from_value(wrong_field).expect("wrong correlation metadata deserializes");
+    let error = compile_process_catalog(&wrong_field, &dependencies)
+        .expect_err("unknown normalized event field must fail closed");
+    assert_eq!(
+        error.path,
+        "processes[0].states[0].wait.webhook.correlate.missing_field"
+    );
+    assert!(error.message.contains("normalized event field"));
 }
 
 #[test]

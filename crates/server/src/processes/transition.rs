@@ -435,13 +435,69 @@ impl ProcessRuntime {
             .states
             .get(&snapshot.current_state)
             .and_then(|state| match &state.operation {
-                CompiledProcessStateOperation::Wait(wait) => match wait.as_ref() {
-                    CompiledProcessWaitState::Signal(wait) => Some(wait),
-                    CompiledProcessWaitState::Timer(_) => None,
-                },
+                CompiledProcessStateOperation::Wait(wait) => Some(wait.as_ref()),
                 _ => None,
             })
         else {
+            return Ok(false);
+        };
+        if matches!(wait, CompiledProcessWaitState::Timer(_)) {
+            return Ok(false);
+        }
+        let pending_event_precedes_timer = transaction
+            .query_one(
+                "
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM donat.process_events signal
+                    JOIN donat.process_events timer
+                      ON timer.source_name = signal.source_name
+                     AND timer.id = $2
+                    WHERE signal.source_name = $1
+                      AND signal.instance_id = $3
+                      AND signal.id <> timer.id
+                      AND signal.kind = 'signal'
+                      AND signal.status = 'pending'
+                      AND signal.available_at <= timer.available_at
+                      AND signal.payload_json ->> 'wait_state' = $4
+                      AND signal.payload_json ->> 'wait_version' = $5
+                      AND timer.instance_id = $3
+                      AND timer.kind = 'timer'
+                )
+                ",
+                &[
+                    &self.source_name,
+                    &snapshot.event_id,
+                    &snapshot.instance_id,
+                    &snapshot.current_state,
+                    &snapshot.version.to_string(),
+                ],
+            )
+            .await
+            .context("checking accepted events committed before a Process timeout")?
+            .get::<_, bool>(0);
+        if pending_event_precedes_timer {
+            return Ok(true);
+        }
+        let CompiledProcessWaitState::Signal(wait) = wait else {
+            let CompiledProcessWaitState::Webhook(wait) = wait else {
+                unreachable!("decision timers returned before timeout precedence checks");
+            };
+            if snapshot
+                .event_payload
+                .get("connector_instance")
+                .and_then(Json::as_str)
+                != Some(wait.connector.as_str())
+                || snapshot.event_payload.get("trigger").and_then(Json::as_str)
+                    != Some(wait.trigger.as_str())
+                || snapshot.event_payload.get("route").and_then(Json::as_str) != Some("timeout")
+            {
+                bail!(
+                    "Process webhook timeout event `{}` does not match wait state `{}`",
+                    snapshot.event_id,
+                    snapshot.current_state
+                );
+            }
             return Ok(false);
         };
         if snapshot
@@ -884,6 +940,72 @@ impl ProcessRuntime {
                     }),
                 )
             }
+            CompiledProcessWaitState::Webhook(wait) => {
+                let dependency = definition
+                    .dependencies
+                    .connector_triggers
+                    .get(&(
+                        self.source_name.clone(),
+                        wait.connector.clone(),
+                        wait.trigger,
+                    ))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process connector trigger `{}.{}` is absent from the pinned dependency closure",
+                            wait.connector,
+                            wait.trigger.as_str()
+                        )
+                    })?;
+                let live_spec = self
+                    .connector_registry
+                    .trigger_spec_handle(&self.source_name, &wait.connector, wait.trigger)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process connector trigger `{}.{}` is absent from the immutable registry",
+                            wait.connector,
+                            wait.trigger.as_str()
+                        )
+                    })?;
+                let live_fingerprint = self
+                    .connector_registry
+                    .trigger_configuration_fingerprint(&wait.connector, wait.trigger)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process connector trigger `{}.{}` has no immutable deployment fingerprint",
+                            wait.connector,
+                            wait.trigger.as_str()
+                        )
+                    })?;
+                if dependency.source != self.source_name
+                    || dependency.instance != wait.connector
+                    || !Arc::ptr_eq(&dependency.spec, &live_spec)
+                    || dependency.deployment_fingerprint != live_fingerprint
+                {
+                    bail!(
+                        "Process connector trigger `{}.{}` differs from pinned revision `{}`",
+                        wait.connector,
+                        wait.trigger.as_str(),
+                        snapshot.revision
+                    );
+                }
+                let correlation = Json::Object(
+                    evaluate_process_values(&wait.correlate, &context)?
+                        .into_iter()
+                        .collect(),
+                );
+                let schedule = prepare_signal_deadline(&wait.deadline, &context)?;
+                (
+                    schedule,
+                    json!({
+                        "wait_state": snapshot.current_state,
+                        "wait_version": wait_version,
+                        "connector_instance": wait.connector,
+                        "trigger": wait.trigger.as_str(),
+                        "correlation": correlation,
+                        "route": "timeout",
+                    }),
+                )
+            }
             CompiledProcessWaitState::Timer(wait) => {
                 if !definition
                     .dependencies
@@ -1039,6 +1161,81 @@ impl ProcessRuntime {
                     "signal": wait.signal,
                 }),
             })),
+            (CompiledProcessWaitState::Webhook(wait), "signal") => {
+                if snapshot
+                    .event_payload
+                    .get("connector_instance")
+                    .and_then(Json::as_str)
+                    != Some(wait.connector.as_str())
+                    || snapshot.event_payload.get("trigger").and_then(Json::as_str)
+                        != Some(wait.trigger.as_str())
+                {
+                    return Ok(None);
+                }
+                let output = snapshot
+                    .event_payload
+                    .get("output")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Process webhook event has no normalized output"))?;
+                let dependency = definition
+                    .dependencies
+                    .connector_triggers
+                    .get(&(
+                        self.source_name.clone(),
+                        wait.connector.clone(),
+                        wait.trigger,
+                    ))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process connector trigger `{}.{}` disappeared from the pinned dependency closure",
+                            wait.connector,
+                            wait.trigger.as_str()
+                        )
+                    })?;
+                let donat_connector_catalog::TriggerSpec::Webhook {
+                    output: contract, ..
+                } = dependency.spec.as_ref()
+                else {
+                    bail!("a compiled Process webhook wait retained a poll trigger");
+                };
+                contract
+                    .validate(
+                        &typed_value(&output)
+                            .context("decoding normalized Process webhook output")?,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "Process webhook output violated `{}.{}`: {error}",
+                            wait.connector,
+                            wait.trigger.as_str()
+                        )
+                    })?;
+                validate_state_output(definition, &snapshot, &output)
+                    .context("validating Process webhook wait output")?;
+                Ok(Some(PreparedWaitCompletion {
+                    snapshot,
+                    next: wait.next.clone(),
+                    output: Some(output),
+                    outcome: "webhook_received",
+                    redacted_context: json!({
+                        "connector": wait.connector,
+                        "trigger": wait.trigger.as_str(),
+                    }),
+                }))
+            }
+            (CompiledProcessWaitState::Webhook(wait), "timer") => {
+                Ok(Some(PreparedWaitCompletion {
+                    snapshot,
+                    next: wait.on_timeout.clone(),
+                    output: None,
+                    outcome: "timer_fired",
+                    redacted_context: json!({
+                        "kind": "webhook_timeout",
+                        "connector": wait.connector,
+                        "trigger": wait.trigger.as_str(),
+                    }),
+                }))
+            }
             (CompiledProcessWaitState::Timer(wait), "timer") => {
                 let output = snapshot
                     .event_payload

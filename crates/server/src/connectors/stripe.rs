@@ -6,11 +6,13 @@
 //! request schema.  The production transport always uses Stripe's fixed API
 //! origin; the loopback origin below is compiled only for crate-local tests.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use donat_connector_abi::{BoundedString, Hash256, VerifiedInboundEvent};
+use donat_ir::TypedValue;
 use donat_metadata::{ConnectorConfig, ConnectorOperation, ConnectorOperationProfile};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -20,18 +22,20 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
     ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
-    canonical_json_sha256,
+    WebhookRejection, canonical_json_sha256,
     http::{MAX_HTTP_BODY_BYTES, is_public_address},
 };
 
 pub const CREATE_CHECKOUT_SESSION_OPERATION: &str = "checkout.create_session";
 pub const COMPLETED_WEBHOOK_OPERATION: &str = "checkout.completed_webhook";
 pub const STRIPE_OPERATION_VERSION: &str = "v1";
+pub const COMPLETED_WEBHOOK_TRIGGER: &str = "checkout.session.completed";
+pub const STRIPE_TRIGGER_VERSION: &str = "1.0.0";
 
 const STRIPE_API_ORIGIN: &str = "https://api.stripe.com";
 const WEBHOOK_TIMESTAMP_TOLERANCE: i64 = 300;
@@ -147,43 +151,6 @@ impl CheckoutSessionInput {
             client_reference_id,
             line_items,
         })
-    }
-}
-
-/// A verified, command-safe Checkout completion.  The provider event ID is
-/// intentionally exposed as the future durable ingress deduplication key; no
-/// in-memory duplicate cache can substitute for that durable journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedCheckoutCompletedWebhook {
-    pub provider_event_id: String,
-    pub checkout_session_id: String,
-    pub client_reference_id: Uuid,
-    pub payment_status: String,
-}
-
-/// An inbound verification outcome, deliberately separate from activity
-/// failure routing.  It contains no raw request bytes, secrets, or provider
-/// diagnostic text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebhookRejection {
-    MissingSignature,
-    InvalidSignature,
-    TimestampOutOfTolerance,
-    PayloadTooLarge,
-    MalformedPayload,
-    UnsupportedEvent,
-}
-
-impl WebhookRejection {
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::MissingSignature => "stripe_signature_missing",
-            Self::InvalidSignature => "stripe_signature_invalid",
-            Self::TimestampOutOfTolerance => "stripe_signature_timestamp_out_of_tolerance",
-            Self::PayloadTooLarge => "stripe_webhook_payload_too_large",
-            Self::MalformedPayload => "stripe_webhook_payload_invalid",
-            Self::UnsupportedEvent => "stripe_webhook_unsupported_event",
-        }
     }
 }
 
@@ -442,7 +409,7 @@ impl StripeConnector {
         &self,
         headers: &HeaderMap,
         raw_body: &[u8],
-    ) -> Result<VerifiedCheckoutCompletedWebhook, WebhookRejection> {
+    ) -> Result<VerifiedInboundEvent, WebhookRejection> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| WebhookRejection::TimestampOutOfTolerance)?
@@ -458,7 +425,7 @@ impl StripeConnector {
         headers: &HeaderMap,
         raw_body: &[u8],
         now: i64,
-    ) -> Result<VerifiedCheckoutCompletedWebhook, WebhookRejection> {
+    ) -> Result<VerifiedInboundEvent, WebhookRejection> {
         self.verify_completed_webhook_at_inner(headers, raw_body, now)
     }
 
@@ -467,7 +434,7 @@ impl StripeConnector {
         headers: &HeaderMap,
         raw_body: &[u8],
         now: i64,
-    ) -> Result<VerifiedCheckoutCompletedWebhook, WebhookRejection> {
+    ) -> Result<VerifiedInboundEvent, WebhookRejection> {
         if raw_body.len() > MAX_HTTP_BODY_BYTES {
             return Err(WebhookRejection::PayloadTooLarge);
         }
@@ -515,7 +482,7 @@ impl StripeConnector {
 
         let event: Event =
             serde_json::from_slice(raw_body).map_err(|_| WebhookRejection::MalformedPayload)?;
-        if event.event_type != "checkout.session.completed"
+        if event.event_type != COMPLETED_WEBHOOK_TRIGGER
             || event.data.object.object != "checkout.session"
             || event.id.is_empty()
             || event.data.object.id.is_empty()
@@ -525,12 +492,41 @@ impl StripeConnector {
         }
         let client_reference_id = Uuid::parse_str(&event.data.object.client_reference_id)
             .map_err(|_| WebhookRejection::UnsupportedEvent)?;
-        Ok(VerifiedCheckoutCompletedWebhook {
-            provider_event_id: event.id,
-            checkout_session_id: event.data.object.id,
-            client_reference_id,
-            payment_status: event.data.object.payment_status,
-        })
+        let provider_event_id = BoundedString::try_new(&event.id, 256)
+            .map_err(|_| WebhookRejection::UnsupportedEvent)?;
+        let event_type = BoundedString::try_new(&event.event_type, 256)
+            .map_err(|_| WebhookRejection::UnsupportedEvent)?;
+        let output = TypedValue::Object(BTreeMap::from([
+            ("provider_event_id".to_owned(), TypedValue::String(event.id)),
+            (
+                "event_type".to_owned(),
+                TypedValue::String(event.event_type),
+            ),
+            (
+                "checkout_session_id".to_owned(),
+                TypedValue::String(event.data.object.id),
+            ),
+            (
+                "client_reference_id".to_owned(),
+                TypedValue::String(client_reference_id.to_string()),
+            ),
+            (
+                "payment_status".to_owned(),
+                TypedValue::String(event.data.object.payment_status),
+            ),
+        ]));
+        let redacted_metadata = TypedValue::Object(BTreeMap::from([(
+            "normalized_event".to_owned(),
+            TypedValue::String(COMPLETED_WEBHOOK_TRIGGER.to_owned()),
+        )]));
+        VerifiedInboundEvent::try_new(
+            provider_event_id,
+            event_type,
+            output,
+            Hash256::new(Sha256::digest(raw_body).into()),
+            redacted_metadata,
+        )
+        .map_err(|_| WebhookRejection::UnsupportedEvent)
     }
 }
 
@@ -888,6 +884,7 @@ mod tests {
     use super::{
         super::{ConnectorErrorClass, canonical_json_sha256},
         CheckoutLineItem, CheckoutMode, CheckoutSessionInput, HmacSha256, StripeConnector,
+        TypedValue,
     };
 
     const WEBHOOK_SECRET: &str = "whsec_independent_test_secret";
@@ -1216,15 +1213,27 @@ mod tests {
                 1_700_000_120,
             )
             .expect("the same verified event remains available for durable deduplication");
-        assert_eq!(first.provider_event_id, "evt_test_42");
-        assert_eq!(duplicate.provider_event_id, first.provider_event_id);
-        assert_eq!(first.checkout_session_id, "cs_test_42");
+        assert_eq!(first.provider_event_id(), "evt_test_42");
+        assert_eq!(duplicate.provider_event_id(), first.provider_event_id());
+        let TypedValue::Object(output) = first.output() else {
+            panic!("verified webhook output is an object");
+        };
         assert_eq!(
-            first.client_reference_id,
-            Uuid::parse_str("00000000-0000-4000-8000-000000000042")
-                .expect("fixed UUID literal is valid")
+            output.get("checkout_session_id"),
+            Some(&TypedValue::String("cs_test_42".to_owned()))
         );
-        assert_eq!(first.payment_status, "paid");
+        assert_eq!(
+            output.get("client_reference_id"),
+            Some(&TypedValue::String(
+                Uuid::parse_str("00000000-0000-4000-8000-000000000042")
+                    .expect("fixed UUID literal is valid")
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            output.get("payment_status"),
+            Some(&TypedValue::String("paid".to_owned()))
+        );
 
         let mut modified = COMPLETED_BODY.to_vec();
         modified.push(b' ');
@@ -1235,7 +1244,7 @@ mod tests {
                 1_700_000_120,
             )
             .expect_err("a signature over different raw bytes is rejected");
-        assert_eq!(modified_error.code(), "stripe_signature_invalid");
+        assert_eq!(modified_error.code(), "webhook_signature_invalid");
 
         let malformed_error = connector
             .verify_completed_webhook_at(
@@ -1246,7 +1255,7 @@ mod tests {
                 1_700_000_120,
             )
             .expect_err("a malformed body with an invalid signature never reaches JSON parsing");
-        assert_eq!(malformed_error.code(), "stripe_signature_invalid");
+        assert_eq!(malformed_error.code(), "webhook_signature_invalid");
     }
 
     #[test]
@@ -1262,7 +1271,7 @@ mod tests {
                 1_700_000_301,
             )
             .expect_err("timestamps older than the five-minute tolerance are rejected");
-        assert_eq!(stale.code(), "stripe_signature_timestamp_out_of_tolerance");
+        assert_eq!(stale.code(), "webhook_signature_expired");
 
         let future = connector
             .verify_completed_webhook_at(
@@ -1271,7 +1280,7 @@ mod tests {
                 1_700_000_000,
             )
             .expect_err("a valid signature from far in the future is rejected");
-        assert_eq!(future.code(), "stripe_signature_timestamp_out_of_tolerance");
+        assert_eq!(future.code(), "webhook_signature_expired");
 
         const UNSUPPORTED_BODY: &[u8] = br#"{"id":"evt_test_other","type":"payment_intent.succeeded","data":{"object":{"object":"payment_intent","id":"pi_test_42","client_reference_id":"00000000-0000-4000-8000-000000000042","payment_status":"paid"}}}"#;
         const UNSUPPORTED_SIGNATURE: &str =
@@ -1283,6 +1292,6 @@ mod tests {
                 1_700_000_120,
             )
             .expect_err("only checkout.session.completed is normalized");
-        assert_eq!(unsupported.code(), "stripe_webhook_unsupported_event");
+        assert_eq!(unsupported.code(), "webhook_event_unsupported");
     }
 }

@@ -248,7 +248,7 @@ pub use envelope::{
     MAXIMUM_HEADER_VALUE_BYTES, MAXIMUM_JSON_DEPTH, MAXIMUM_JSON_NODES,
     MAXIMUM_RETAINED_HEADER_BYTES, MAXIMUM_RETRY_AFTER_SECONDS, MAXIMUM_SAFE_MESSAGE_BYTES,
     MAXIMUM_SAFE_STRING_BYTES, MAXIMUM_SELECTED_HEADERS, MAXIMUM_TRANSPORT_RESPONSE_BYTES,
-    NonEmptyVec, StaticSafeMessage, TypedBindings,
+    NonEmptyVec, StaticSafeMessage, TypedBindings, VerifiedInboundEvent,
 };
 pub use host::{BoxFuture, ConnectorIo, ProcessorContext, ProcessorControl};
 pub use ids::{

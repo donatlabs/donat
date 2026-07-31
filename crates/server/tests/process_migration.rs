@@ -467,6 +467,41 @@ async fn process_schema_is_source_qualified_and_exact() {
     assert!(wait_history_index.contains("kind = 'timer'"));
     assert!(wait_history_index.contains("signal_name"));
 
+    let webhook_indexes = client
+        .query(
+            "
+            SELECT index_relation.relname, pg_get_indexdef(index_.indexrelid)
+            FROM pg_index index_
+            JOIN pg_class relation ON relation.oid = index_.indrelid
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+            JOIN pg_class index_relation ON index_relation.oid = index_.indexrelid
+            WHERE namespace.nspname = 'donat'
+              AND relation.relname = 'process_events'
+              AND index_relation.relname = ANY($1::text[])
+            ORDER BY index_relation.relname
+            ",
+            &[&vec![
+                "process_events_wait_instance_idx",
+                "process_events_webhook_wait_history_idx",
+            ]],
+        )
+        .await
+        .expect("webhook wait indexes introspect")
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<BTreeMap<_, _>>();
+    let instance_index = webhook_indexes
+        .get("process_events_wait_instance_idx")
+        .expect("wait-marker lookup must have a source/instance index");
+    assert!(instance_index.contains("(source_name, instance_id, status, created_at, id)"));
+    assert!(instance_index.contains("WHERE (kind = 'timer'::text)"));
+    let webhook_history_index = webhook_indexes
+        .get("process_events_webhook_wait_history_idx")
+        .expect("webhook history must have a bounded containment index");
+    assert!(webhook_history_index.contains("USING gin (payload_json jsonb_path_ops)"));
+    assert!(webhook_history_index.contains("connector_instance"));
+    assert!(webhook_history_index.contains("trigger"));
+
     let helper = client
         .query_one(
             "

@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
-use donat_connector_abi::{CompiledStepId, ConnectorId, OperationId, OriginId};
+use donat_connector_abi::{
+    AuthenticatorId, CodecId, CompiledStepId, ConnectorId, NormalizerId, OperationId, OriginId,
+    TriggerId,
+};
 use donat_connector_catalog::{
     CapacityDefaults, CompiledBinding, CompiledBindingSource, CompiledHeaderBinding,
     CompiledQueryBinding, CompiledRequestShape, CompiledResponseShape, CompiledStepSpec,
     CompleteErrorFallback, ErrorAction, ErrorMap, ErrorMatcher, ErrorRule, FixedIdempotencyBinding,
     FixedOrigin, HttpsOnly, NetworkPolicy, OperationBounds, OperationEffect, OperationSpec,
-    PaginationPlan, ProviderIdempotentStep, RateDefaults, ResponseMapping, RetryAfterPolicy,
-    StableSemver, StatusRange, StepBounds, value_contract_material, value_contract_sha256,
+    PaginationPlan, ProviderIdempotentStep, RateDefaults, RedactionPlan, ResponseMapping,
+    RetryAfterPolicy, StableSemver, StatusRange, StepBounds, TriggerSpec, VersionedProcessorRef,
+    value_contract_material, value_contract_sha256,
 };
 use donat_ir::{
     TypeRef, TypedValue, VALUE_TYPE_LANGUAGE_VERSION, ValueContractCatalog, ValueContractField,
@@ -22,6 +26,57 @@ use donat_metadata::{
 use super::ConnectorDefinition;
 
 const REQUEST_STEP: CompiledStepId = CompiledStepId::literal("request");
+
+pub(super) fn compile_stripe_checkout_completed_trigger_spec(
+    metadata: &Metadata,
+    definition: ConnectorDefinition,
+) -> Result<TriggerSpec, String> {
+    let declarations = ContractDeclarations::new(metadata)?;
+    let event_id = declarations.contract([("provider_event_id", "string!")].into_iter())?;
+    let event_type = declarations.contract([("event_type", "string!")].into_iter())?;
+    let output = declarations.contract(
+        [
+            ("provider_event_id", "string!"),
+            ("event_type", "string!"),
+            ("checkout_session_id", "string!"),
+            ("client_reference_id", "uuid!"),
+            ("payment_status", "string!"),
+        ]
+        .into_iter(),
+    )?;
+    Ok(TriggerSpec::Webhook {
+        connector: ConnectorId::parse(definition.module_name)
+            .map_err(|_| "Stripe connector name is not a canonical ABI ID".to_owned())?,
+        connector_version: parse_stable_semver(definition.semantic_version)?,
+        trigger: TriggerId::parse(super::stripe::COMPLETED_WEBHOOK_TRIGGER)
+            .map_err(|_| "Stripe webhook trigger is not a canonical ABI ID".to_owned())?,
+        trigger_version: parse_stable_semver(super::stripe::STRIPE_TRIGGER_VERSION)?,
+        event_version: StableSemver::new(1, 0, 0),
+        runtime_abi_epoch: definition.runtime_abi,
+        authenticator: VersionedProcessorRef {
+            id: AuthenticatorId::literal("stripe.webhook.signature"),
+            implementation_revision: 1,
+        },
+        codec: VersionedProcessorRef {
+            id: CodecId::literal("json"),
+            implementation_revision: 1,
+        },
+        normalizer: VersionedProcessorRef {
+            id: NormalizerId::literal("stripe.checkout.completed"),
+            implementation_revision: 1,
+        },
+        selected_headers: vec!["stripe-signature".to_owned()],
+        raw_body_max_bytes: NonZeroU32::new(super::http::MAX_HTTP_BODY_BYTES as u32)
+            .expect("the compiled HTTP body limit is nonzero"),
+        timestamp_window_ms: NonZeroU64::new(300_000)
+            .expect("the Stripe timestamp window is nonzero"),
+        event_id,
+        event_type,
+        output,
+        redaction: RedactionPlan::Omit,
+        subscription_operations: None,
+    })
+}
 
 pub(super) fn compile_http_operation_spec(
     metadata: &Metadata,

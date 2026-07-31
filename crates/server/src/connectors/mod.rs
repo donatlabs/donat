@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use donat_connector_abi::OperationId;
-use donat_connector_catalog::OperationSpec;
+use donat_connector_abi::{OperationId, TriggerId, VerifiedInboundEvent};
+use donat_connector_catalog::{OperationSpec, TriggerSpec};
 use donat_metadata::{ConnectorBaseUrl, ConnectorConfig, ConnectorOperation, Metadata};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -22,6 +22,32 @@ use crate::state::{ConnectorStartupError, validate_connector_startup};
 mod catalog;
 pub mod http;
 pub mod stripe;
+
+/// A provider-neutral inbound verification failure. It is intentionally
+/// separate from activity failures and contains no provider diagnostics,
+/// signature bytes, raw body, or secret-derived value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookRejection {
+    MissingSignature,
+    InvalidSignature,
+    TimestampOutOfTolerance,
+    PayloadTooLarge,
+    MalformedPayload,
+    UnsupportedEvent,
+}
+
+impl WebhookRejection {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::MissingSignature => "webhook_signature_missing",
+            Self::InvalidSignature => "webhook_signature_invalid",
+            Self::TimestampOutOfTolerance => "webhook_signature_expired",
+            Self::PayloadTooLarge => "webhook_payload_too_large",
+            Self::MalformedPayload => "webhook_payload_malformed",
+            Self::UnsupportedEvent => "webhook_event_unsupported",
+        }
+    }
+}
 
 /// SHA-256 of a recursively key-sorted JSON value. Connector input is a JSON
 /// object contract, so equivalent object order must never produce a different
@@ -146,7 +172,52 @@ enum RegistryInstance {
     Stripe {
         connector: Box<stripe::StripeConnector>,
         operations: BTreeMap<String, CompiledStripeOperation>,
+        webhook: CompiledWebhookTrigger,
     },
+}
+
+struct CompiledWebhookTrigger {
+    source_name: String,
+    spec: Arc<TriggerSpec>,
+    configuration_fingerprint: String,
+}
+
+/// One immutable deployment-selected webhook verifier. The verifier remains
+/// module-owned, while its normalized behavior is described by the exact
+/// catalog-owned trigger snapshot consumed by Process compilation.
+pub struct WebhookInstance<'a> {
+    source_name: &'a str,
+    trigger: &'a TriggerSpec,
+    connector: &'a stripe::StripeConnector,
+}
+
+impl WebhookInstance<'_> {
+    pub fn source_name(&self) -> &str {
+        self.source_name
+    }
+
+    pub fn trigger(&self) -> &TriggerSpec {
+        self.trigger
+    }
+
+    pub fn raw_body_max_bytes(&self) -> usize {
+        match self.trigger {
+            TriggerSpec::Webhook {
+                raw_body_max_bytes, ..
+            } => raw_body_max_bytes.get() as usize,
+            TriggerSpec::Poll { .. } => {
+                unreachable!("an HTTP webhook route cannot retain a poll trigger")
+            }
+        }
+    }
+
+    pub fn verify(
+        &self,
+        headers: &axum::http::HeaderMap,
+        raw_body: &[u8],
+    ) -> Result<VerifiedInboundEvent, WebhookRejection> {
+        self.connector.verify_completed_webhook(headers, raw_body)
+    }
 }
 
 /// The immutable compiled contract for one deployed HTTP operation. The
@@ -249,6 +320,19 @@ struct StripeConfigurationFingerprint<'a> {
     capacity: &'a donat_metadata::ConnectorCapacity,
 }
 
+#[derive(Serialize)]
+struct StripeWebhookConfigurationFingerprint<'a> {
+    module_name: &'a str,
+    module_semantic_version: &'a str,
+    runtime_abi: u32,
+    trigger_name: &'a str,
+    trigger_version: &'a str,
+    endpoint_identity: &'a str,
+    credential_identity: &'a str,
+    api_version: &'a str,
+    webhook_secret_environment: &'a str,
+}
+
 fn stripe_configuration_fingerprint(
     config: &ConnectorConfig,
     operation: &ConnectorOperation,
@@ -285,6 +369,32 @@ fn stripe_configuration_fingerprint(
     };
     let bytes = serde_json::to_vec(&canonical)
         .expect("validated Stripe fingerprint fields always serialize to JSON");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn stripe_webhook_configuration_fingerprint(config: &ConnectorConfig) -> String {
+    let webhook_secret_environment = &config
+        .webhook_secret
+        .as_ref()
+        .expect("Stripe webhook secret was validated before fingerprinting")
+        .value_from_env;
+    let api_version = config
+        .api_version
+        .as_deref()
+        .expect("Stripe API version was validated before fingerprinting");
+    let canonical = StripeWebhookConfigurationFingerprint {
+        module_name: STRIPE_DEFINITION.module_name,
+        module_semantic_version: STRIPE_DEFINITION.semantic_version,
+        runtime_abi: STRIPE_DEFINITION.runtime_abi,
+        trigger_name: stripe::COMPLETED_WEBHOOK_TRIGGER,
+        trigger_version: stripe::STRIPE_TRIGGER_VERSION,
+        endpoint_identity: &config.endpoint_identity,
+        credential_identity: &config.credential_identity,
+        api_version,
+        webhook_secret_environment,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("validated Stripe webhook fingerprint fields serialize");
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -422,6 +532,26 @@ impl ConnectorRegistry {
                             instance: instance.name.clone(),
                             message: error.to_string(),
                         })?;
+                    let webhook_spec = catalog::compile_stripe_checkout_completed_trigger_spec(
+                        metadata,
+                        STRIPE_DEFINITION,
+                    )
+                    .map_err(|message| {
+                        ConnectorRegistryError::InvalidConfiguration {
+                            instance: instance.name.clone(),
+                            message,
+                        }
+                    })?;
+                    let webhook = CompiledWebhookTrigger {
+                        source_name: source_name
+                            .as_ref()
+                            .expect("connector instances have one Postgres source")
+                            .clone(),
+                        spec: Arc::new(webhook_spec),
+                        configuration_fingerprint: stripe_webhook_configuration_fingerprint(
+                            &instance.config,
+                        ),
+                    };
                     let mut operations = BTreeMap::new();
                     for operation in &instance.operations {
                         let compiled = CompiledStripeOperation {
@@ -450,6 +580,7 @@ impl ConnectorRegistry {
                     RegistryInstance::Stripe {
                         connector: Box::new(connector),
                         operations,
+                        webhook,
                     }
                 }
                 // Keep this defensive branch even though Task 1's static
@@ -475,6 +606,31 @@ impl ConnectorRegistry {
         Self {
             instances: BTreeMap::new(),
             operation_specs: BTreeMap::new(),
+        }
+    }
+
+    /// Resolve one accepted catalog-owned trigger within its exact deployment
+    /// source. Inventory-only or module-local verifier details are absent.
+    pub fn trigger_spec_handle(
+        &self,
+        source_name: &str,
+        instance_name: &str,
+        trigger: TriggerId,
+    ) -> Option<Arc<TriggerSpec>> {
+        match self.instances.get(instance_name)? {
+            RegistryInstance::Stripe { webhook, .. }
+                if webhook.source_name == source_name
+                    && matches!(
+                        webhook.spec.as_ref(),
+                        TriggerSpec::Webhook {
+                            trigger: candidate,
+                            ..
+                        } if *candidate == trigger
+                    ) =>
+            {
+                Some(webhook.spec.clone())
+            }
+            RegistryInstance::Stripe { .. } | RegistryInstance::Http { .. } => None,
         }
     }
 
@@ -528,10 +684,39 @@ impl ConnectorRegistry {
     /// declared module without a webhook verifier, so the HTTP boundary never
     /// exposes connector configuration or capability details to an ingress
     /// caller.
-    pub fn stripe_webhook_instance(&self, name: &str) -> Option<&stripe::StripeConnector> {
+    pub fn webhook_instance(&self, name: &str) -> Option<WebhookInstance<'_>> {
         match self.instances.get(name) {
-            Some(RegistryInstance::Stripe { connector, .. }) => Some(connector),
+            Some(RegistryInstance::Stripe {
+                connector, webhook, ..
+            }) => Some(WebhookInstance {
+                source_name: &webhook.source_name,
+                trigger: webhook.spec.as_ref(),
+                connector,
+            }),
             Some(RegistryInstance::Http { .. }) | None => None,
+        }
+    }
+
+    pub fn trigger_configuration_fingerprint(
+        &self,
+        instance: &str,
+        trigger: TriggerId,
+    ) -> Option<&str> {
+        match self.instances.get(instance) {
+            Some(RegistryInstance::Stripe { webhook, .. })
+                if matches!(
+                    webhook.spec.as_ref(),
+                    TriggerSpec::Webhook {
+                        trigger: candidate,
+                        ..
+                    } if *candidate == trigger
+                ) =>
+            {
+                Some(&webhook.configuration_fingerprint)
+            }
+            Some(RegistryInstance::Stripe { .. }) | Some(RegistryInstance::Http { .. }) | None => {
+                None
+            }
         }
     }
 
@@ -604,6 +789,7 @@ impl ConnectorRegistry {
             RegistryInstance::Stripe {
                 connector,
                 operations,
+                ..
             } => {
                 if !operations.contains_key(operation) {
                     return Err(ConnectorFailure::new(

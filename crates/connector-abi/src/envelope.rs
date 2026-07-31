@@ -206,6 +206,103 @@ impl Hash256 {
     }
 }
 
+/// A provider-authenticated, normalized event crossing the connector/runtime
+/// boundary. Raw request bytes and signature material can never enter this
+/// value; only their fixed digest and a bounded redacted projection survive.
+#[derive(Clone)]
+pub struct VerifiedInboundEvent {
+    provider_event_id: BoundedString,
+    event_type: BoundedString,
+    output: TypedValue,
+    payload_digest: Hash256,
+    redacted_metadata: TypedValue,
+}
+
+impl VerifiedInboundEvent {
+    pub fn try_new(
+        provider_event_id: BoundedString,
+        event_type: BoundedString,
+        output: TypedValue,
+        payload_digest: Hash256,
+        redacted_metadata: TypedValue,
+    ) -> Result<Self, AbiError> {
+        if provider_event_id.is_empty() {
+            return Err(AbiError::InvalidValue(
+                "verified provider event ID must not be empty",
+            ));
+        }
+        if event_type.is_empty() {
+            return Err(AbiError::InvalidValue(
+                "verified provider event type must not be empty",
+            ));
+        }
+        if !matches!(output, TypedValue::Object(_)) {
+            return Err(AbiError::InvalidValue(
+                "verified provider event output must be an object",
+            ));
+        }
+        if !matches!(redacted_metadata, TypedValue::Object(_)) {
+            return Err(AbiError::InvalidValue(
+                "verified event metadata must be an object",
+            ));
+        }
+        validate_inbound_value(&output, "verified event output canonical bytes")?;
+        validate_inbound_value(
+            &redacted_metadata,
+            "verified event metadata canonical bytes",
+        )?;
+        Ok(Self {
+            provider_event_id,
+            event_type,
+            output,
+            payload_digest,
+            redacted_metadata,
+        })
+    }
+
+    pub fn provider_event_id(&self) -> &str {
+        self.provider_event_id.as_str()
+    }
+
+    pub fn event_type(&self) -> &str {
+        self.event_type.as_str()
+    }
+
+    pub fn output(&self) -> &TypedValue {
+        &self.output
+    }
+
+    pub const fn payload_digest(&self) -> &Hash256 {
+        &self.payload_digest
+    }
+
+    pub fn redacted_metadata(&self) -> &TypedValue {
+        &self.redacted_metadata
+    }
+}
+
+impl core::fmt::Debug for VerifiedInboundEvent {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("VerifiedInboundEvent")
+            .field("provider_event_id", &self.provider_event_id.as_str())
+            .field("event_type", &self.event_type.as_str())
+            .field("output", &self.output)
+            .field("payload_digest", &"<sha256>")
+            .field("redacted_metadata", &self.redacted_metadata)
+            .finish()
+    }
+}
+
+fn validate_inbound_value(value: &TypedValue, bound: &'static str) -> Result<(), AbiError> {
+    validate_typed_value_roots(core::iter::once(value))?;
+    let size = canonical_size(value).map_err(|_| AbiError::LimitExceeded(bound))?;
+    if size > MAXIMUM_CANONICAL_OUTPUT_BYTES {
+        return Err(AbiError::LimitExceeded(bound));
+    }
+    Ok(())
+}
+
 pub struct TypedBindings {
     slots: BTreeMap<BindingSlotId, TypedValue>,
 }

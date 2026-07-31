@@ -7,7 +7,8 @@ use donat_connector_abi::{
     ConnectorErrorClass, ConnectorFailure, ConnectorId, ConnectorIo, CredentialFieldId,
     CredentialSpecId, Hash256, InlineId, MAXIMUM_SAFE_STRING_BYTES, NonEmptyVec, NormalizerId,
     OperationId, OriginId, ProcessorContext, ProcessorControl, ProcessorFamilyId, StaticErrorCode,
-    StaticSafeMessage, TriggerId, TypedBindings, catalog_construction, host_construction,
+    StaticSafeMessage, TriggerId, TypedBindings, VerifiedInboundEvent, catalog_construction,
+    host_construction,
 };
 use donat_value_contract::{BoundedInlineBytes, TypedValue};
 
@@ -177,6 +178,81 @@ fn non_empty_vectors_and_hashes_have_checked_neutral_shapes() {
     assert_eq!(hash.as_bytes(), &[7; 32]);
     assert_eq!(copied.as_bytes(), &[7; 32]);
     assert_eq!(size_of::<Hash256>(), 32);
+}
+
+#[test]
+fn verified_inbound_events_are_bounded_normalized_values() {
+    // This catches letting provider modules hand raw bytes, empty dedupe
+    // identities, or an unbounded/non-object payload across the connector ABI.
+    let output = TypedValue::Object(BTreeMap::from([
+        (
+            "provider_event_id".to_owned(),
+            TypedValue::String("evt_42".to_owned()),
+        ),
+        (
+            "payment_status".to_owned(),
+            TypedValue::String("paid".to_owned()),
+        ),
+    ]));
+    let redacted_metadata = TypedValue::Object(BTreeMap::from([(
+        "event_type".to_owned(),
+        TypedValue::String("checkout.session.completed".to_owned()),
+    )]));
+    let event = VerifiedInboundEvent::try_new(
+        BoundedString::try_new("evt_42", 256).unwrap(),
+        BoundedString::try_new("checkout.session.completed", 256).unwrap(),
+        output.clone(),
+        Hash256::new([7; 32]),
+        redacted_metadata.clone(),
+    )
+    .expect("a finite normalized event crosses the ABI");
+
+    assert_eq!(event.provider_event_id(), "evt_42");
+    assert_eq!(event.event_type(), "checkout.session.completed");
+    assert_eq!(event.output(), &output);
+    assert_eq!(event.payload_digest().as_bytes(), &[7; 32]);
+    assert_eq!(event.redacted_metadata(), &redacted_metadata);
+
+    assert_abi_error(
+        VerifiedInboundEvent::try_new(
+            BoundedString::try_new("", 256).unwrap(),
+            BoundedString::try_new("checkout.session.completed", 256).unwrap(),
+            TypedValue::Object(BTreeMap::new()),
+            Hash256::new([0; 32]),
+            TypedValue::Object(BTreeMap::new()),
+        ),
+        AbiError::InvalidValue("verified provider event ID must not be empty"),
+    );
+    assert_abi_error(
+        VerifiedInboundEvent::try_new(
+            BoundedString::try_new("evt_42", 256).unwrap(),
+            BoundedString::try_new("", 256).unwrap(),
+            TypedValue::Object(BTreeMap::new()),
+            Hash256::new([0; 32]),
+            TypedValue::Object(BTreeMap::new()),
+        ),
+        AbiError::InvalidValue("verified provider event type must not be empty"),
+    );
+    assert_abi_error(
+        VerifiedInboundEvent::try_new(
+            BoundedString::try_new("evt_42", 256).unwrap(),
+            BoundedString::try_new("checkout.session.completed", 256).unwrap(),
+            TypedValue::String("not-an-object".to_owned()),
+            Hash256::new([0; 32]),
+            TypedValue::Object(BTreeMap::new()),
+        ),
+        AbiError::InvalidValue("verified provider event output must be an object"),
+    );
+    assert_abi_error(
+        VerifiedInboundEvent::try_new(
+            BoundedString::try_new("evt_42", 256).unwrap(),
+            BoundedString::try_new("checkout.session.completed", 256).unwrap(),
+            TypedValue::Object(BTreeMap::new()),
+            Hash256::new([0; 32]),
+            TypedValue::String("not-an-object".to_owned()),
+        ),
+        AbiError::InvalidValue("verified event metadata must be an object"),
+    );
 }
 
 fn bindings(count: usize) -> BTreeMap<BindingSlotId, TypedValue> {

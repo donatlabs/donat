@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use donat_connector_abi::OperationId;
-use donat_connector_catalog::OperationSpec;
+use donat_connector_abi::{OperationId, TriggerId};
+use donat_connector_catalog::{OperationSpec, TriggerSpec};
 use donat_ir::{
-    ProcessStartPolicy, TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
+    ProcessStartPolicy, TypeRef, VALUE_TYPE_LANGUAGE_VERSION, ValueContractCatalog,
+    ValueContractField, ValueScalar, ValueType,
 };
 use donat_metadata::{
     Metadata, Process, ProcessDeadline, ProcessErrorKind, ProcessErrorRoutes, ProcessField,
     ProcessForEachState, ProcessIdempotencyValue, ProcessLifecycle, ProcessRequestActivity,
     ProcessRequestState, ProcessRetry, ProcessSignalWait, ProcessState, ProcessStateOperation,
-    ProcessValue, ProcessWaitState, SourceKind,
+    ProcessValue, ProcessWaitState, ProcessWebhookGuardValue, ProcessWebhookWait, SourceKind,
 };
 use donat_rules::RuleType;
 use donat_schema::{
@@ -58,6 +59,11 @@ pub struct ResolvedProcessConnectorOperation {
     pub serialization_key_input: Option<String>,
 }
 
+pub struct ResolvedProcessConnectorTrigger {
+    pub spec: Arc<TriggerSpec>,
+    pub deployment_fingerprint: String,
+}
+
 /// Narrow, read-only seam between process compilation and the executable
 /// connector registry.  The returned value contains no runtime handle, URL,
 /// credential, resolved header, or secret.
@@ -68,6 +74,13 @@ pub trait ProcessConnectorCatalog {
         instance: &str,
         operation: &str,
     ) -> Result<Option<ResolvedProcessConnectorOperation>, String>;
+
+    fn connector_trigger(
+        &self,
+        source: &str,
+        instance: &str,
+        trigger: &str,
+    ) -> Result<Option<ResolvedProcessConnectorTrigger>, String>;
 }
 
 impl ProcessConnectorCatalog for ConnectorRegistry {
@@ -96,6 +109,30 @@ impl ProcessConnectorCatalog for ConnectorRegistry {
                 .map(str::to_owned),
         }))
     }
+
+    fn connector_trigger(
+        &self,
+        source: &str,
+        instance: &str,
+        trigger: &str,
+    ) -> Result<Option<ResolvedProcessConnectorTrigger>, String> {
+        let trigger_id = TriggerId::parse(trigger)
+            .map_err(|_| format!("connector trigger `{trigger}` is not a canonical ABI ID"))?;
+        let Some(spec) = self.trigger_spec_handle(source, instance, trigger_id) else {
+            return Ok(None);
+        };
+        let Some(deployment_fingerprint) =
+            self.trigger_configuration_fingerprint(instance, trigger_id)
+        else {
+            return Err(format!(
+                "connector trigger `{source}.{instance}.{trigger}` has no deployment fingerprint"
+            ));
+        };
+        Ok(Some(ResolvedProcessConnectorTrigger {
+            spec,
+            deployment_fingerprint: deployment_fingerprint.to_owned(),
+        }))
+    }
 }
 
 /// Complete immutable inputs consumed by the pure compiler.  Tests may provide
@@ -111,6 +148,12 @@ pub trait ProcessDependencyCatalog {
         instance: &str,
         operation: &str,
     ) -> Result<Option<ResolvedProcessConnectorOperation>, String>;
+    fn connector_trigger(
+        &self,
+        source: &str,
+        instance: &str,
+        trigger: &str,
+    ) -> Result<Option<ResolvedProcessConnectorTrigger>, String>;
 }
 
 pub struct ServerProcessDependencies<'a> {
@@ -202,6 +245,15 @@ impl ProcessDependencyCatalog for ServerProcessDependencies<'_> {
         self.connectors
             .connector_operation(source, instance, operation)
     }
+
+    fn connector_trigger(
+        &self,
+        source: &str,
+        instance: &str,
+        trigger: &str,
+    ) -> Result<Option<ResolvedProcessConnectorTrigger>, String> {
+        self.connectors.connector_trigger(source, instance, trigger)
+    }
 }
 
 fn command_descriptor(descriptor: &CommandDescriptor) -> ProcessCommandDescriptor {
@@ -222,6 +274,7 @@ pub struct ProcessDependencyClosure {
     pub rules: BTreeMap<String, ProcessRuleDescriptor>,
     pub decision_tables: BTreeMap<String, ProcessDecisionDescriptor>,
     pub connector_operations: BTreeMap<(String, String, OperationId), PinnedConnectorOperation>,
+    pub connector_triggers: BTreeMap<(String, String, TriggerId), PinnedConnectorTrigger>,
 }
 
 impl std::fmt::Debug for ProcessDependencyClosure {
@@ -235,6 +288,7 @@ impl std::fmt::Debug for ProcessDependencyClosure {
                 "connector_operation_count",
                 &self.connector_operations.len(),
             )
+            .field("connector_trigger_count", &self.connector_triggers.len())
             .finish()
     }
 }
@@ -246,6 +300,39 @@ pub struct PinnedConnectorOperation {
     pub spec: Arc<OperationSpec>,
     pub deployment_fingerprint: String,
     pub serialization_key_input: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct PinnedConnectorTrigger {
+    pub source: String,
+    pub instance: String,
+    pub spec: Arc<TriggerSpec>,
+    pub deployment_fingerprint: String,
+}
+
+impl std::fmt::Debug for PinnedConnectorTrigger {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (trigger, runtime_abi_epoch) = match self.spec.as_ref() {
+            TriggerSpec::Webhook {
+                trigger,
+                runtime_abi_epoch,
+                ..
+            }
+            | TriggerSpec::Poll {
+                trigger,
+                runtime_abi_epoch,
+                ..
+            } => (trigger.as_str(), runtime_abi_epoch),
+        };
+        formatter
+            .debug_struct("PinnedConnectorTrigger")
+            .field("source", &self.source)
+            .field("instance", &self.instance)
+            .field("trigger", &trigger)
+            .field("runtime_abi_epoch", runtime_abi_epoch)
+            .field("deployment_fingerprint", &self.deployment_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for PinnedConnectorOperation {
@@ -269,6 +356,7 @@ impl ProcessDependencyClosure {
             rules: BTreeMap::new(),
             decision_tables: BTreeMap::new(),
             connector_operations: BTreeMap::new(),
+            connector_triggers: BTreeMap::new(),
         }
     }
 }
@@ -403,6 +491,7 @@ pub enum CompiledProcessWhenPredicate {
 #[derive(Debug, Clone)]
 pub enum CompiledProcessWaitState {
     Signal(CompiledProcessSignalWait),
+    Webhook(CompiledProcessWebhookWait),
     Timer(CompiledProcessTimerWait),
 }
 
@@ -414,6 +503,38 @@ pub struct CompiledProcessSignalWait {
     pub deadline: CompiledProcessSignalDeadline,
     pub next: String,
     pub on_timeout: String,
+}
+
+#[derive(Clone)]
+pub struct CompiledProcessWebhookWait {
+    pub connector: String,
+    pub trigger: TriggerId,
+    pub correlate: BTreeMap<String, ProcessValue>,
+    pub guard: Option<CompiledProcessWebhookGuard>,
+    pub deadline: CompiledProcessSignalDeadline,
+    pub next: String,
+    pub on_timeout: String,
+}
+
+impl std::fmt::Debug for CompiledProcessWebhookWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledProcessWebhookWait")
+            .field("connector", &self.connector)
+            .field("trigger", &self.trigger.as_str())
+            .field("correlate", &self.correlate)
+            .field("guard", &self.guard)
+            .field("deadline", &self.deadline)
+            .field("next", &self.next)
+            .field("on_timeout", &self.on_timeout)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessWebhookGuard {
+    pub rule: String,
+    pub bindings: BTreeMap<String, ProcessWebhookGuardValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +907,19 @@ fn collect_caller_session_variables(
             ProcessStateOperation::Wait { wait } => match wait {
                 ProcessWaitState::Signal(wait) => {
                     collect_value_map_session_variables(&wait.correlate, &mut ambient);
+                    if let ProcessDeadline::Value(value) = &wait.deadline {
+                        collect_value_session_variables(value, &mut ambient);
+                    }
+                }
+                ProcessWaitState::Webhook(wait) => {
+                    collect_value_map_session_variables(&wait.webhook.correlate, &mut ambient);
+                    if let Some(guard) = &wait.webhook.guard {
+                        for binding in guard.bindings.values() {
+                            if let ProcessWebhookGuardValue::Process(value) = binding {
+                                collect_value_session_variables(value, &mut ambient);
+                            }
+                        }
+                    }
                     if let ProcessDeadline::Value(value) = &wait.deadline {
                         collect_value_session_variables(value, &mut ambient);
                     }
@@ -1401,6 +1535,10 @@ fn state_transitions(state: &ProcessState) -> Vec<(&str, bool)> {
             ProcessWaitState::Signal(signal) => {
                 targets.push((signal.next.as_str(), true));
                 targets.push((signal.on_timeout.as_str(), false));
+            }
+            ProcessWaitState::Webhook(webhook) => {
+                targets.push((webhook.next.as_str(), true));
+                targets.push((webhook.on_timeout.as_str(), false));
             }
             ProcessWaitState::Timer(timer) => targets.push((timer.next.as_str(), true)),
         },
@@ -2480,6 +2618,7 @@ fn compile_wait_state(
 ) -> Result<(ValueContractCatalog, CompiledProcessWaitState), PlanError> {
     match wait {
         ProcessWaitState::Signal(signal) => compile_signal_wait(signal, context),
+        ProcessWaitState::Webhook(webhook) => compile_webhook_wait(webhook, context),
         ProcessWaitState::Timer(timer) => {
             let path = format!("{}.wait.timer", context.path);
             let descriptor = context
@@ -2589,45 +2728,7 @@ fn compile_signal_wait(
         context,
         &format!("{path}.correlate"),
     )?;
-    let deadline = match &wait.deadline {
-        ProcessDeadline::Duration(duration) => CompiledProcessSignalDeadline::AfterMilliseconds(
-            parse_duration(duration, &format!("{path}.deadline"))?,
-        ),
-        ProcessDeadline::Value(value) => {
-            let inferred = infer_value(value, context, &format!("{path}.deadline"))?;
-            let type_ref = inferred.known().ok_or_else(|| {
-                validation(
-                    format!("{path}.deadline"),
-                    "signal deadline cannot be an untyped null literal",
-                )
-            })?;
-            if !matches!(
-                type_ref.value_type,
-                ValueType::Scalar {
-                    scalar: ValueScalar::Timestamp | ValueScalar::TimestampTz
-                }
-            ) || type_ref.nullable
-            {
-                return Err(validation(
-                    format!("{path}.deadline"),
-                    "signal deadline must be a non-null timestamp",
-                ));
-            }
-            let kind = match &type_ref.value_type {
-                ValueType::Scalar {
-                    scalar: ValueScalar::Timestamp,
-                } => CompiledProcessTimestampKind::Timestamp,
-                ValueType::Scalar {
-                    scalar: ValueScalar::TimestampTz,
-                } => CompiledProcessTimestampKind::TimestampTz,
-                _ => unreachable!("timestamp shape checked above"),
-            };
-            CompiledProcessSignalDeadline::At {
-                value: value.clone(),
-                kind,
-            }
-        }
-    };
+    let deadline = compile_wait_deadline(&wait.deadline, context, &path, "signal")?;
     let mut roots = signal.correlation.roots.clone();
     for (name, field) in &signal.payload.roots {
         if roots.insert(name.clone(), field.clone()).is_some() {
@@ -2651,6 +2752,234 @@ fn compile_signal_wait(
             on_timeout: wait.on_timeout.clone(),
         }),
     ))
+}
+
+fn compile_webhook_wait(
+    wait: &ProcessWebhookWait,
+    context: &mut CompileContext<'_, '_>,
+) -> Result<(ValueContractCatalog, CompiledProcessWaitState), PlanError> {
+    let path = format!("{}.wait.webhook", context.path);
+    let trigger_id = TriggerId::parse(&wait.webhook.trigger).map_err(|_| {
+        validation(
+            format!("{path}.trigger"),
+            format!(
+                "connector trigger `{}` is not a canonical ABI ID",
+                wait.webhook.trigger
+            ),
+        )
+    })?;
+    let resolved = context
+        .dependencies
+        .connector_trigger(
+            &context.process.source,
+            &wait.webhook.connector,
+            &wait.webhook.trigger,
+        )
+        .map_err(|message| validation(format!("{path}.trigger"), message))?
+        .ok_or_else(|| {
+            validation(
+                format!("{path}.trigger"),
+                format!(
+                    "connector trigger `{}.{}.{}` is not executable",
+                    context.process.source, wait.webhook.connector, wait.webhook.trigger
+                ),
+            )
+        })?;
+    let (catalog_trigger, output) = match resolved.spec.as_ref() {
+        TriggerSpec::Webhook {
+            trigger, output, ..
+        } if *trigger == trigger_id => (*trigger, output.clone()),
+        TriggerSpec::Webhook { .. } => {
+            return Err(validation(
+                format!("{path}.trigger"),
+                "connector registry returned a different webhook trigger identity",
+            ));
+        }
+        TriggerSpec::Poll { .. } => {
+            return Err(validation(
+                format!("{path}.trigger"),
+                "a Process webhook wait cannot consume a poll trigger",
+            ));
+        }
+    };
+    if wait.webhook.correlate.is_empty() {
+        return Err(validation(
+            format!("{path}.correlate"),
+            "webhook correlation must contain at least one normalized event field",
+        ));
+    }
+    for (event_field, expected) in &wait.webhook.correlate {
+        let actual = root_type(&output, event_field).ok_or_else(|| {
+            validation(
+                format!("{path}.correlate.{event_field}"),
+                format!("normalized event field `{event_field}` does not exist"),
+            )
+        })?;
+        if actual.nullable || !scalar_like(actual) {
+            return Err(validation(
+                format!("{path}.correlate.{event_field}"),
+                "webhook correlation requires a non-null scalar or enum event field",
+            ));
+        }
+        validate_value_against(
+            expected,
+            actual,
+            context,
+            &format!("{path}.correlate.{event_field}"),
+        )?;
+    }
+
+    let guard = wait
+        .webhook
+        .guard
+        .as_ref()
+        .map(|guard| {
+            let descriptor = context.dependencies.rule(&guard.rule).ok_or_else(|| {
+                validation(
+                    format!("{path}.guard.rule"),
+                    format!("rule `{}` does not exist", guard.rule),
+                )
+            })?;
+            if descriptor.result != RuleType::Bool {
+                return Err(validation(
+                    format!("{path}.guard.rule"),
+                    "webhook guard rule must return non-null bool",
+                ));
+            }
+            let contract = contract_from_rule_types(&descriptor.bindings);
+            for (name, target) in &contract.roots {
+                let binding = guard.bindings.get(name).ok_or_else(|| {
+                    validation(
+                        format!("{path}.guard.with"),
+                        format!("required guard binding `{name}` is missing"),
+                    )
+                })?;
+                match binding {
+                    ProcessWebhookGuardValue::Event { event } => {
+                        let source = root_type(&output, event).ok_or_else(|| {
+                            validation(
+                                format!("{path}.guard.with.{name}.event"),
+                                format!("normalized event field `{event}` does not exist"),
+                            )
+                        })?;
+                        if !type_assignable(&target.type_ref, source) {
+                            return Err(type_mismatch(
+                                format!("{path}.guard.with.{name}.event"),
+                                &target.type_ref,
+                                source,
+                            ));
+                        }
+                    }
+                    ProcessWebhookGuardValue::Process(value) => validate_value_against(
+                        value,
+                        &target.type_ref,
+                        context,
+                        &format!("{path}.guard.with.{name}"),
+                    )?,
+                }
+            }
+            if let Some(extra) = guard
+                .bindings
+                .keys()
+                .find(|name| !contract.roots.contains_key(*name))
+            {
+                return Err(validation(
+                    format!("{path}.guard.with.{extra}"),
+                    format!(
+                        "guard binding `{extra}` is not declared by rule `{}`",
+                        guard.rule
+                    ),
+                ));
+            }
+            context
+                .closure
+                .rules
+                .insert(descriptor.name.clone(), descriptor);
+            Ok(CompiledProcessWebhookGuard {
+                rule: guard.rule.clone(),
+                bindings: guard.bindings.clone(),
+            })
+        })
+        .transpose()?;
+
+    let deadline = compile_wait_deadline(
+        &wait.deadline,
+        context,
+        &format!("{}.wait", context.path),
+        "webhook",
+    )?;
+    context.closure.connector_triggers.insert(
+        (
+            context.process.source.clone(),
+            wait.webhook.connector.clone(),
+            catalog_trigger,
+        ),
+        PinnedConnectorTrigger {
+            source: context.process.source.clone(),
+            instance: wait.webhook.connector.clone(),
+            spec: resolved.spec,
+            deployment_fingerprint: resolved.deployment_fingerprint,
+        },
+    );
+    Ok((
+        output,
+        CompiledProcessWaitState::Webhook(CompiledProcessWebhookWait {
+            connector: wait.webhook.connector.clone(),
+            trigger: catalog_trigger,
+            correlate: wait.webhook.correlate.clone(),
+            guard,
+            deadline,
+            next: wait.next.clone(),
+            on_timeout: wait.on_timeout.clone(),
+        }),
+    ))
+}
+
+fn compile_wait_deadline(
+    deadline: &ProcessDeadline,
+    context: &CompileContext<'_, '_>,
+    path: &str,
+    kind: &str,
+) -> Result<CompiledProcessSignalDeadline, PlanError> {
+    Ok(match deadline {
+        ProcessDeadline::Duration(duration) => CompiledProcessSignalDeadline::AfterMilliseconds(
+            parse_duration(duration, &format!("{path}.deadline"))?,
+        ),
+        ProcessDeadline::Value(value) => {
+            let inferred = infer_value(value, context, &format!("{path}.deadline"))?;
+            let type_ref = inferred.known().ok_or_else(|| {
+                validation(
+                    format!("{path}.deadline"),
+                    format!("{kind} deadline cannot be an untyped null literal"),
+                )
+            })?;
+            if !matches!(
+                type_ref.value_type,
+                ValueType::Scalar {
+                    scalar: ValueScalar::Timestamp | ValueScalar::TimestampTz
+                }
+            ) || type_ref.nullable
+            {
+                return Err(validation(
+                    format!("{path}.deadline"),
+                    format!("{kind} deadline must be a non-null timestamp"),
+                ));
+            }
+            let kind = match &type_ref.value_type {
+                ValueType::Scalar {
+                    scalar: ValueScalar::Timestamp,
+                } => CompiledProcessTimestampKind::Timestamp,
+                ValueType::Scalar {
+                    scalar: ValueScalar::TimestampTz,
+                } => CompiledProcessTimestampKind::TimestampTz,
+                _ => unreachable!("timestamp shape checked above"),
+            };
+            CompiledProcessSignalDeadline::At {
+                value: value.clone(),
+                kind,
+            }
+        }
+    })
 }
 
 fn compile_for_each_state(
@@ -4024,13 +4353,154 @@ pub fn process_dependency_descriptors(
             })
         })
         .collect::<Vec<_>>();
+    let connector_triggers = dependencies
+        .connector_triggers
+        .values()
+        .map(|dependency| match dependency.spec.as_ref() {
+            TriggerSpec::Webhook {
+                connector,
+                connector_version,
+                trigger,
+                trigger_version,
+                event_version,
+                runtime_abi_epoch,
+                authenticator,
+                codec,
+                normalizer,
+                selected_headers,
+                raw_body_max_bytes,
+                timestamp_window_ms,
+                event_id,
+                event_type,
+                output,
+                redaction,
+                subscription_operations,
+            } => serde_json::json!({
+                "kind": "webhook",
+                "source": dependency.source,
+                "instance": dependency.instance,
+                "connector": connector.as_str(),
+                "connector_version": [
+                    connector_version.major,
+                    connector_version.minor,
+                    connector_version.patch
+                ],
+                "trigger": trigger.as_str(),
+                "trigger_version": [
+                    trigger_version.major,
+                    trigger_version.minor,
+                    trigger_version.patch
+                ],
+                "event_version": [
+                    event_version.major,
+                    event_version.minor,
+                    event_version.patch
+                ],
+                "runtime_abi_epoch": runtime_abi_epoch,
+                "value_language_epoch": VALUE_TYPE_LANGUAGE_VERSION,
+                "authenticator": {
+                    "id": authenticator.id.as_str(),
+                    "implementation_revision": authenticator.implementation_revision,
+                },
+                "codec": {
+                    "id": codec.id.as_str(),
+                    "implementation_revision": codec.implementation_revision,
+                },
+                "normalizer": {
+                    "id": normalizer.id.as_str(),
+                    "implementation_revision": normalizer.implementation_revision,
+                },
+                "selected_headers": selected_headers,
+                "raw_body_max_bytes": raw_body_max_bytes.get(),
+                "timestamp_window_ms": timestamp_window_ms.get().to_string(),
+                "event_id_contract_sha256": value_contract_hash(event_id),
+                "event_type_contract_sha256": value_contract_hash(event_type),
+                "output_contract_sha256": value_contract_hash(output),
+                "redaction": redaction_dependency_material(redaction),
+                "subscription_operations": subscription_operations.as_ref().map(|operations| {
+                    serde_json::json!({
+                        "create": operations.create.as_str(),
+                        "delete": operations.delete.as_str(),
+                        "check": operations.check.as_ref().map(|operation| operation.as_str()),
+                    })
+                }),
+                "deployment_fingerprint": dependency.deployment_fingerprint,
+            }),
+            TriggerSpec::Poll {
+                connector,
+                connector_version,
+                trigger,
+                trigger_version,
+                event_version,
+                runtime_abi_epoch,
+                checkpoint,
+                processor,
+                event_type,
+                per_poll_event_limit,
+                ..
+            } => serde_json::json!({
+                "kind": "poll",
+                "source": dependency.source,
+                "instance": dependency.instance,
+                "connector": connector.as_str(),
+                "connector_version": [
+                    connector_version.major,
+                    connector_version.minor,
+                    connector_version.patch
+                ],
+                "trigger": trigger.as_str(),
+                "trigger_version": [
+                    trigger_version.major,
+                    trigger_version.minor,
+                    trigger_version.patch
+                ],
+                "event_version": [
+                    event_version.major,
+                    event_version.minor,
+                    event_version.patch
+                ],
+                "runtime_abi_epoch": runtime_abi_epoch,
+                "value_language_epoch": VALUE_TYPE_LANGUAGE_VERSION,
+                "checkpoint_contract_sha256": value_contract_hash(checkpoint),
+                "event_type_contract_sha256": value_contract_hash(event_type),
+                "processor": {
+                    "id": processor.id.as_str(),
+                    "implementation_revision": processor.implementation_revision,
+                },
+                "per_poll_event_limit": per_poll_event_limit.get(),
+                "deployment_fingerprint": dependency.deployment_fingerprint,
+            }),
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "definition_fingerprint": definition_fingerprint,
         "commands": commands,
         "rules": rules,
         "decision_tables": decisions,
         "connector_operations": connector_operations,
+        "connector_triggers": connector_triggers,
     })
+}
+
+fn value_contract_hash(contract: &ValueContractCatalog) -> String {
+    let material =
+        donat_connector_catalog::value_contract_material(contract, VALUE_TYPE_LANGUAGE_VERSION)
+            .expect("compiled Process connector contract has canonical material");
+    let hash = donat_connector_catalog::value_contract_sha256(&material)
+        .expect("compiled Process connector contract hashes");
+    hex_hash(hash.as_bytes())
+}
+
+fn redaction_dependency_material(redaction: &donat_connector_catalog::RedactionPlan) -> Json {
+    match redaction {
+        donat_connector_catalog::RedactionPlan::Omit => serde_json::json!({ "kind": "omit" }),
+        donat_connector_catalog::RedactionPlan::Fixed { replacement } => {
+            serde_json::json!({ "kind": "fixed", "replacement": replacement })
+        }
+        donat_connector_catalog::RedactionPlan::PreserveLast { characters } => {
+            serde_json::json!({ "kind": "preserve_last", "characters": characters })
+        }
+    }
 }
 
 fn contract_material(contract: &ValueContractCatalog) -> Json {

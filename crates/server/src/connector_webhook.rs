@@ -1,17 +1,13 @@
 //! Signed inbound connector webhooks.
 //!
 //! This is deliberately a narrow provider ingress boundary, not a generic
-//! webhook API.  It selects only a deployment-declared compiled connector,
-//! retains the provider's raw bytes through signature verification, and does
-//! not parse or expose configuration values in HTTP responses.
-//!
-//! There is no durable process ingress journal in this phase.  A verified
-//! event therefore receives `503 Service Unavailable` rather than a success
-//! acknowledgement: returning a 2xx response before durable acceptance would
-//! lose a provider event.  In particular, this module owns no queue, retry
-//! state, audit record, process signal, activity failure, or `on_error`
-//! input. The durable process ingress implementation will introduce the
-//! transaction that can safely turn a verified event into an acknowledgement.
+//! webhook API. It selects only a deployment-declared compiled connector,
+//! retains exact raw bytes through signature verification, then passes only a
+//! bounded normalized event to the source-local durable Process transaction.
+//! A success response is impossible until the delivery audit, provider-event
+//! dedupe identity, and optional Process event have committed together.
+
+use std::collections::BTreeMap;
 
 use axum::{
     Router,
@@ -21,9 +17,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use donat_connector_catalog::TriggerSpec;
+use donat_ir::TypedValue;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    connectors::{http::MAX_HTTP_BODY_BYTES, stripe::WebhookRejection},
+    connectors::WebhookRejection,
+    processes::{
+        InvalidSignatureStatus, persist_invalid_from_engine, persist_verified_from_engine,
+    },
     state::SharedState,
 };
 
@@ -41,35 +43,106 @@ pub fn router() -> Router<SharedState> {
 ///
 /// The instance is resolved before the body is read.  This makes undeclared
 /// names indistinguishable from other absent routes even if their request body
-/// is oversized or malformed.  Only the Stripe module currently declares an
+/// is oversized or malformed. Only the Stripe module currently declares an
 /// inbound verifier; HTTP connector instances have no inbound route.
 pub async fn receive(
     State(state): State<SharedState>,
     Path(instance): Path<String>,
     request: Request,
 ) -> Response {
-    let Some(connector) = state.connectors.stripe_webhook_instance(&instance) else {
+    let Some(connector) = state.connectors.webhook_instance(&instance) else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let source_name = connector.source_name().to_owned();
+    let (trigger_id, raw_body_max_bytes) = match connector.trigger() {
+        TriggerSpec::Webhook {
+            trigger,
+            raw_body_max_bytes,
+            ..
+        } => (*trigger, raw_body_max_bytes.get() as usize),
+        TriggerSpec::Poll { .. } => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
 
     let headers = request.headers().clone();
-    let raw_body = match to_bytes(request.into_body(), MAX_HTTP_BODY_BYTES).await {
+    let raw_body = match to_bytes(request.into_body(), raw_body_max_bytes).await {
         Ok(body) => body,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
-    match connector.verify_completed_webhook(&headers, &raw_body) {
-        Ok(_event) => {
-            // A verified event cannot be acknowledged until a later durable
-            // process-ingress transaction accepts its provider event ID.
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+    // The borrowed registry instance ends here: every durable step below works
+    // from the immutable Engine snapshot and the owned verified event.
+    let verification = connector.verify(&headers, &raw_body);
+
+    match verification {
+        Ok(event) => {
+            let Some(trigger) =
+                state
+                    .connectors
+                    .trigger_spec_handle(&source_name, &instance, trigger_id)
+            else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let engine = state.engine_snapshot().await;
+            match persist_verified_from_engine(
+                engine.as_ref(),
+                state.connectors.as_ref(),
+                &source_name,
+                &instance,
+                trigger.as_ref(),
+                event,
+            )
+            .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => {
+                    tracing::error!(
+                        source = %source_name,
+                        connector = %instance,
+                        error = %error,
+                        "verified connector webhook could not be committed"
+                    );
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
         }
-        Err(
-            WebhookRejection::MissingSignature
-            | WebhookRejection::InvalidSignature
-            | WebhookRejection::TimestampOutOfTolerance
-            | WebhookRejection::PayloadTooLarge
-            | WebhookRejection::MalformedPayload
-            | WebhookRejection::UnsupportedEvent,
-        ) => StatusCode::BAD_REQUEST.into_response(),
+        Err(WebhookRejection::PayloadTooLarge) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(rejection) => {
+            let status = match rejection {
+                WebhookRejection::MissingSignature => InvalidSignatureStatus::Missing,
+                WebhookRejection::InvalidSignature => InvalidSignatureStatus::Invalid,
+                WebhookRejection::TimestampOutOfTolerance => InvalidSignatureStatus::Expired,
+                WebhookRejection::MalformedPayload => InvalidSignatureStatus::Malformed,
+                WebhookRejection::UnsupportedEvent => InvalidSignatureStatus::Unsupported,
+                WebhookRejection::PayloadTooLarge => {
+                    unreachable!("payload-too-large rejection returned above")
+                }
+            };
+            let payload_digest: [u8; 32] = Sha256::digest(&raw_body).into();
+            let redacted_metadata = BTreeMap::from([(
+                "reason".to_owned(),
+                TypedValue::String(rejection.code().to_owned()),
+            )]);
+            let engine = state.engine_snapshot().await;
+            if let Err(error) = persist_invalid_from_engine(
+                engine.as_ref(),
+                state.connectors.as_ref(),
+                &source_name,
+                &instance,
+                status,
+                &payload_digest,
+                &redacted_metadata,
+            )
+            .await
+            {
+                tracing::warn!(
+                    source = %source_name,
+                    connector = %instance,
+                    error = %error,
+                    "invalid connector webhook audit could not be committed"
+                );
+            }
+            StatusCode::BAD_REQUEST.into_response()
+        }
     }
 }

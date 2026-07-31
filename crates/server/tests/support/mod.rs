@@ -88,9 +88,18 @@ impl TestDatabase {
         metadata: &Metadata,
         process_name: &str,
     ) -> (ProcessRuntime, String) {
+        self.runtime_with_connectors(metadata, process_name, Arc::new(ConnectorRegistry::empty()))
+            .await
+    }
+
+    pub async fn runtime_with_connectors(
+        &self,
+        metadata: &Metadata,
+        process_name: &str,
+        connectors: Arc<ConnectorRegistry>,
+    ) -> (ProcessRuntime, String) {
         let catalog = self.catalog().await;
         let catalogs = HashMap::from([("default".to_owned(), catalog)]);
-        let connectors = Arc::new(ConnectorRegistry::empty());
         let candidate =
             compile_pure_engine_candidate(metadata, &catalogs, connectors.as_ref(), true)
                 .expect("Process wait candidate compiles");

@@ -1474,6 +1474,7 @@ pub struct ProcessWhenCase {
 #[serde(untagged, deny_unknown_fields)]
 pub enum ProcessWaitState {
     Signal(ProcessSignalWait),
+    Webhook(ProcessWebhookWait),
     Timer(ProcessTimerWait),
 }
 
@@ -1489,6 +1490,40 @@ pub struct ProcessSignalWait {
     pub deadline: ProcessDeadline,
     pub next: String,
     pub on_timeout: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWebhookWait {
+    pub webhook: ProcessWebhookSubscription,
+    pub deadline: ProcessDeadline,
+    pub next: String,
+    pub on_timeout: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWebhookSubscription {
+    pub connector: String,
+    pub trigger: String,
+    pub correlate: BTreeMap<String, ProcessValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<ProcessWebhookGuard>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWebhookGuard {
+    pub rule: String,
+    #[serde(rename = "with")]
+    pub bindings: BTreeMap<String, ProcessWebhookGuardValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProcessWebhookGuardValue {
+    Event { event: String },
+    Process(ProcessValue),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
