@@ -1571,7 +1571,10 @@ pub enum ProcessForEachState {
         completion: String,
         #[serde(default, skip_serializing_if = "is_false")]
         preserve_input: bool,
-        request: ProcessRequestActivity,
+        // Boxed because a request activity is far larger than a command one,
+        // and an unboxed variant would make every `ProcessForEachState` — most
+        // of them commands — carry the request variant's footprint.
+        request: Box<ProcessRequestActivity>,
         next: String,
     },
 }

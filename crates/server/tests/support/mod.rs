@@ -1,3 +1,9 @@
+// One shared helper module compiled into every integration-test binary that
+// declares `mod support`. No single binary uses all of it, so a helper the
+// others rely on reads as dead here — deleting on that signal breaks the
+// tests that do call it.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

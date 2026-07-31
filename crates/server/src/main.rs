@@ -10,26 +10,14 @@
 //! - migrate (DDL): `donat migrate --migrations-dir <dir>`
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 
-mod action;
-mod connector_webhook;
-// The binary has its own module tree for its historic entry point while the
-// integration tests use the library facade. Connector activity dispatch lands
-// in Task 3, so the binary currently uses only registry construction here.
-mod commands;
-#[allow(dead_code)]
-mod connectors;
-mod cron;
-mod events;
-mod gql;
-mod jwt;
-mod mcp;
-mod migrate;
-mod processes;
-mod remote;
-mod rest;
-mod state;
-mod validate;
-mod ws;
+// The binary builds its router from the library's module tree rather than
+// declaring a second copy of it. A second copy compiled the same files again
+// with only the binary's reachability, so everything the integration tests
+// reach through the library facade was reported dead here.
+use donat_server::{
+    connector_webhook, connectors, cron, events, gql, jwt, mcp, migrate, processes, rest, state,
+    validate, ws,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

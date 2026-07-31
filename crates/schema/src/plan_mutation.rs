@@ -47,6 +47,18 @@ struct CommandCurrentContext {
     alias: &'static str,
 }
 
+/// Which row a command value is being resolved against.
+///
+/// `item` is the element of a batch step, `current` the row a check or an
+/// update reads before it writes. They are always threaded together — a
+/// resolver that can see one can see the other — so they travel as one value
+/// rather than as two positional arguments repeated down every signature.
+#[derive(Clone, Copy, Default)]
+struct CommandRowContext<'a> {
+    item: Option<&'a CommandItemContext>,
+    current: Option<&'a CommandCurrentContext>,
+}
+
 #[derive(Clone)]
 struct ResolvedCommandRowSet {
     cte: String,
@@ -370,8 +382,7 @@ impl<'a> Planner<'a> {
                     &guard.bindings,
                     &arguments,
                     &resolved_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     &format!("{path}.guards[{index}]"),
                     path.to_owned(),
                     guard
@@ -578,8 +589,7 @@ impl<'a> Planner<'a> {
                     name,
                     value,
                     resolved_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     &value_path,
                 )?;
                 let resolved = self.resolve_command_value(
@@ -588,8 +598,7 @@ impl<'a> Planner<'a> {
                     &target,
                     arguments,
                     resolved_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     Some(session),
                     &value_path,
                 )?;
@@ -741,8 +750,7 @@ impl<'a> Planner<'a> {
                     &assert.bindings,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                     error_path.to_owned(),
                     // Without a declared message, name the step and the rule
@@ -783,8 +791,7 @@ impl<'a> Planner<'a> {
                     &select_one.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -817,8 +824,7 @@ impl<'a> Planner<'a> {
                     &select_many.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -892,8 +898,7 @@ impl<'a> Planner<'a> {
                     &project.values,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                 )?;
                 let returning = values
@@ -926,8 +931,10 @@ impl<'a> Planner<'a> {
                     &project_many.values,
                     arguments,
                     previous_steps,
-                    None,
-                    Some(&current),
+                    CommandRowContext {
+                        item: None,
+                        current: Some(&current),
+                    },
                     path,
                 )?;
                 let returning = values
@@ -962,8 +969,7 @@ impl<'a> Planner<'a> {
                     first,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                 )?;
                 let columns = first_values
@@ -1007,8 +1013,7 @@ impl<'a> Planner<'a> {
                     &decision.returning,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                 )?;
                 Ok((
@@ -1041,8 +1046,10 @@ impl<'a> Planner<'a> {
                     &decision_many.returning,
                     arguments,
                     previous_steps,
-                    None,
-                    Some(&current),
+                    CommandRowContext {
+                        item: None,
+                        current: Some(&current),
+                    },
                     path,
                 )?;
                 let order_by = decision_many
@@ -1090,8 +1097,7 @@ impl<'a> Planner<'a> {
                     &assert_when.bindings,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                     error_path.to_owned(),
                     assert_when.message.clone().unwrap_or_else(|| {
@@ -1136,8 +1142,7 @@ impl<'a> Planner<'a> {
                     &insert.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1187,8 +1192,7 @@ impl<'a> Planner<'a> {
                     &insert_when.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1272,8 +1276,10 @@ impl<'a> Planner<'a> {
                     &insert_many.table,
                     arguments,
                     previous_steps,
-                    Some(&item),
-                    None,
+                    CommandRowContext {
+                        item: Some(&item),
+                        current: None,
+                    },
                     session,
                     path,
                 )?;
@@ -1343,8 +1349,7 @@ impl<'a> Planner<'a> {
                     &update.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1354,8 +1359,7 @@ impl<'a> Planner<'a> {
                     &update.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1413,8 +1417,7 @@ impl<'a> Planner<'a> {
                     &update_when.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1424,8 +1427,7 @@ impl<'a> Planner<'a> {
                     &update_when.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1513,8 +1515,10 @@ impl<'a> Planner<'a> {
                     &update_many.table,
                     arguments,
                     previous_steps,
-                    Some(&item),
-                    Some(&current),
+                    CommandRowContext {
+                        item: Some(&item),
+                        current: Some(&current),
+                    },
                     session,
                     path,
                 )?;
@@ -1524,8 +1528,10 @@ impl<'a> Planner<'a> {
                     &update_many.table,
                     arguments,
                     previous_steps,
-                    Some(&item),
-                    Some(&current),
+                    CommandRowContext {
+                        item: Some(&item),
+                        current: Some(&current),
+                    },
                     session,
                     path,
                 )?;
@@ -1535,8 +1541,10 @@ impl<'a> Planner<'a> {
                     &update_many.table,
                     arguments,
                     previous_steps,
-                    Some(&item),
-                    Some(&current),
+                    CommandRowContext {
+                        item: Some(&item),
+                        current: Some(&current),
+                    },
                     session,
                     path,
                 )?;
@@ -1557,8 +1565,10 @@ impl<'a> Planner<'a> {
                             &check.bindings,
                             arguments,
                             previous_steps,
-                            Some(&item),
-                            Some(&current),
+                            CommandRowContext {
+                                item: Some(&item),
+                                current: Some(&current),
+                            },
                             path,
                             error_path.to_owned(),
                             "command update_many check rejected".to_owned(),
@@ -1614,8 +1624,7 @@ impl<'a> Planner<'a> {
                     &delete.table,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     session,
                     path,
                 )?;
@@ -1680,8 +1689,7 @@ impl<'a> Planner<'a> {
                     "_cmd_request_id",
                     &allocate_many.request_id,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     path,
                 )?;
                 let request_id = self.resolve_command_value(
@@ -1690,8 +1698,7 @@ impl<'a> Planner<'a> {
                     &request_column,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     None,
                     path,
                 )?;
@@ -1892,30 +1899,21 @@ impl<'a> Planner<'a> {
         values: &BTreeMap<String, CommandValue>,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         path: &str,
     ) -> Result<Vec<CommandNamedValue>, PlanError> {
         values
             .iter()
             .map(|(name, value)| {
-                let column = resolved_value_column(
-                    command,
-                    name,
-                    value,
-                    previous_steps,
-                    item,
-                    current,
-                    path,
-                )?;
+                let column =
+                    resolved_value_column(command, name, value, previous_steps, row, path)?;
                 let value = self.resolve_command_value(
                     command,
                     value,
                     &column,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     None,
                     path,
                 )?;
@@ -1947,8 +1945,7 @@ impl<'a> Planner<'a> {
                     column,
                     arguments,
                     previous_steps,
-                    None,
-                    None,
+                    CommandRowContext::default(),
                     None,
                     path,
                 )
@@ -1965,8 +1962,7 @@ impl<'a> Planner<'a> {
         returning_names: &[String],
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         path: &str,
     ) -> Result<(CommandDecision, Vec<CommandNamedValue>, Vec<CommandColumn>), PlanError> {
         let table = command.rules().decision_table(table_name).ok_or_else(|| {
@@ -1989,8 +1985,7 @@ impl<'a> Planner<'a> {
                     &column,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     None,
                     path,
                 )?;
@@ -2024,9 +2019,9 @@ impl<'a> Planner<'a> {
                         nullable: matches!(output.type_, RuleType::Nullable(_)),
                     });
                 }
-                current
+                row.current
                     .map(|current| &current.fields)
-                    .or_else(|| item.map(|item| &item.fields))
+                    .or_else(|| row.item.map(|item| &item.fields))
                     .and_then(|fields| fields.get(name))
                     .cloned()
                     .ok_or_else(|| {
@@ -2081,8 +2076,7 @@ impl<'a> Planner<'a> {
         table: &donat_metadata::QualifiedTable,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         session: &Session,
         path: &str,
     ) -> Result<Vec<CommandAssignment>, PlanError> {
@@ -2101,8 +2095,7 @@ impl<'a> Planner<'a> {
                     &column,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     Some(session),
                     path,
                 )?;
@@ -2119,8 +2112,7 @@ impl<'a> Planner<'a> {
         target: &CommandColumn,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         session: Option<&Session>,
         path: &str,
     ) -> Result<CommandExecutionValue, PlanError> {
@@ -2176,7 +2168,7 @@ impl<'a> Planner<'a> {
                 })
             }
             CommandValue::Item { item: field } => {
-                let item = item.ok_or_else(|| {
+                let item = row.item.ok_or_else(|| {
                     PlanError::validation(path, "insert_many item value was not resolved")
                 })?;
                 let source = item.fields.get(field).ok_or_else(|| {
@@ -2191,7 +2183,7 @@ impl<'a> Planner<'a> {
                 })
             }
             CommandValue::CurrentColumn { current_column } => {
-                let current = current.ok_or_else(|| {
+                let current = row.current.ok_or_else(|| {
                     PlanError::validation(
                         path,
                         "current_column escaped its resolved update_many scope",
@@ -2209,8 +2201,7 @@ impl<'a> Planner<'a> {
                     bindings,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     path,
                 )?;
                 Ok(CommandExecutionValue::Rule {
@@ -2238,8 +2229,7 @@ impl<'a> Planner<'a> {
         bindings: &BTreeMap<String, CommandValue>,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         diagnostic_path: &str,
         error_path: String,
         message: String,
@@ -2250,8 +2240,7 @@ impl<'a> Planner<'a> {
             bindings,
             arguments,
             previous_steps,
-            item,
-            current,
+            row,
             diagnostic_path,
         )?;
         Ok(CommandRule {
@@ -2270,8 +2259,7 @@ impl<'a> Planner<'a> {
         bindings: &BTreeMap<String, CommandValue>,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         path: &str,
     ) -> Result<SqlExpression, PlanError> {
         let rule = command.rules().rule(name).ok_or_else(|| {
@@ -2290,8 +2278,7 @@ impl<'a> Planner<'a> {
                     expected_type,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     path,
                 )?,
             ));
@@ -2312,8 +2299,7 @@ impl<'a> Planner<'a> {
         expected_type: &donat_rules::RuleType,
         arguments: &BTreeMap<String, Scalar>,
         previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-        item: Option<&CommandItemContext>,
-        current: Option<&CommandCurrentContext>,
+        row: CommandRowContext<'_>,
         path: &str,
     ) -> Result<SqlBinding, PlanError> {
         match value {
@@ -2346,7 +2332,7 @@ impl<'a> Planner<'a> {
                 )))
             }
             CommandValue::Item { item: field } => {
-                let item = item.ok_or_else(|| {
+                let item = row.item.ok_or_else(|| {
                     PlanError::validation(path, "command rule item binding escaped insert_many")
                 })?;
                 if !item.fields.contains_key(field) {
@@ -2362,7 +2348,7 @@ impl<'a> Planner<'a> {
                 )))
             }
             CommandValue::CurrentColumn { current_column } => {
-                let current = current.ok_or_else(|| {
+                let current = row.current.ok_or_else(|| {
                     PlanError::validation(path, "command rule current_column escaped update_many")
                 })?;
                 if !current.fields.contains_key(current_column) {
@@ -2384,8 +2370,7 @@ impl<'a> Planner<'a> {
                     bindings,
                     arguments,
                     previous_steps,
-                    item,
-                    current,
+                    row,
                     path,
                 )?))
             }
@@ -2565,7 +2550,13 @@ impl<'a> Planner<'a> {
                     PlanError::validation(path, format!("unknown compiled rule '{rule}'"))
                 })?;
                 let expression = self.lower_command_rule_expression(
-                    command, rule, bindings, arguments, steps, None, None, path,
+                    command,
+                    rule,
+                    bindings,
+                    arguments,
+                    steps,
+                    CommandRowContext::default(),
+                    path,
                 )?;
                 Ok(CommandResultValue::Rule {
                     sql: expression.into_sql(),
@@ -2611,8 +2602,7 @@ impl<'a> Planner<'a> {
                     CommandIdempotencyScope::Argument { argument } => {
                         Ok(CommandExecutionValue::Scalar {
                             value: command_argument(arguments, argument, path)?,
-                            pg_type: command_argument_pg_type(command, argument, path)?
-                                .to_owned(),
+                            pg_type: command_argument_pg_type(command, argument, path)?.to_owned(),
                         })
                     }
                     CommandIdempotencyScope::SessionVariable { session_variable } => {
@@ -4504,8 +4494,7 @@ fn resolved_value_column(
     name: &str,
     value: &CommandValue,
     previous_steps: &BTreeMap<String, ResolvedCommandStep>,
-    item: Option<&CommandItemContext>,
-    current: Option<&CommandCurrentContext>,
+    row: CommandRowContext<'_>,
     path: &str,
 ) -> Result<CommandColumn, PlanError> {
     let (pg_type, nullable) = match value {
@@ -4533,13 +4522,15 @@ fn resolved_value_column(
             (column.pg_type.clone(), column.nullable)
         }
         CommandValue::Item { item: field } => {
-            let column = item
+            let column = row
+                .item
                 .and_then(|item| item.fields.get(field))
                 .ok_or_else(|| PlanError::validation(path, "projected item was not resolved"))?;
             (column.pg_type.clone(), column.nullable)
         }
         CommandValue::CurrentColumn { current_column } => {
-            let column = current
+            let column = row
+                .current
                 .and_then(|current| current.fields.get(current_column))
                 .ok_or_else(|| {
                     PlanError::validation(path, "projected current row was not resolved")

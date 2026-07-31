@@ -1799,10 +1799,14 @@ fn source_element_key(
         .collect()
 }
 
+/// One array's elements addressed by their composite key, each kept with the
+/// index it occupied so a mount can report the path it actually came from.
+type SourceKeyedElements<'a> = BTreeMap<Vec<Option<String>>, (usize, &'a serde_json::Value)>;
+
 fn source_keyed_elements<'a>(
     value: Option<&'a serde_json::Value>,
     key: &[donat_connector_catalog::CanonicalProjectionKeyPart],
-) -> Result<BTreeMap<Vec<Option<String>>, (usize, &'a serde_json::Value)>, String> {
+) -> Result<SourceKeyedElements<'a>, String> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };

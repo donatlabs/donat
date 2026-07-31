@@ -2581,13 +2581,14 @@ fn collect_required_session_variables(
         }
 
         if let Some(idempotency) = &command.idempotency
-            && let CommandIdempotencyScopeSpec::Values(scopes) = &idempotency.scope {
-                for scope in scopes {
-                    if let CommandIdempotencyScope::SessionVariable { session_variable } = scope {
-                        insert_unconstrained_session_contract(&mut required, session_variable);
-                    }
+            && let CommandIdempotencyScopeSpec::Values(scopes) = &idempotency.scope
+        {
+            for scope in scopes {
+                if let CommandIdempotencyScope::SessionVariable { session_variable } = scope {
+                    insert_unconstrained_session_contract(&mut required, session_variable);
                 }
             }
+        }
         for effect in &command.effects {
             let values = match effect {
                 CommandEffect::StartProcess { start_process } => {

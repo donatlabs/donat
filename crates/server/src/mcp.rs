@@ -200,7 +200,7 @@ const MCP_MAX_ARGUMENT_DEPTH: usize = 32;
 const MCP_MAX_ARGUMENT_NODES: usize = 4096;
 /// Bound the whole MCP JSON-RPC request body before parsing. The per-method
 /// limits still apply after parsing; this protects the JSON boundary itself.
-pub(crate) const MCP_MAX_REQUEST_BYTES: usize = 128 * 1024;
+pub const MCP_MAX_REQUEST_BYTES: usize = 128 * 1024;
 /// Bound MCP tool result structured content. Row-count limits alone do not
 /// cap large text/json values, so successful tool outputs also need a byte
 /// ceiling before entering the MCP response transcript.
