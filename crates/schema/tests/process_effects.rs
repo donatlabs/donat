@@ -519,3 +519,107 @@ fn process_start_effect_persists_only_the_compiled_caller_session_subset() {
         "missing session variable: \"x-donat-user-id\""
     );
 }
+
+/// A Process input contract inlines a declared input object, while a Command
+/// argument keeps its nominal reference. Both describe the same closed
+/// contract, so passing the typed list into the Process must be assignable.
+#[test]
+fn process_effect_accepts_a_named_input_object_against_its_inlined_contract() {
+    let metadata: Metadata = serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": { "database_url": "postgres://unused" }
+            }
+        }],
+        "custom_types": {
+            "input_objects": [{
+                "name": "ReturnLine",
+                "fields": [
+                    { "name": "order_line_id", "type": "uuid!" },
+                    { "name": "requested_quantity", "type": "Int!" }
+                ]
+            }]
+        },
+        "commands": [{
+            "name": "start_return",
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "arguments": [
+                { "name": "request_id", "type": "uuid!" },
+                { "name": "lines", "type": "[ReturnLine!]!" }
+            ],
+            "steps": [],
+            "result": { "request_id": { "arg": "request_id" } },
+            "idempotency": {
+                "key": { "argument": "request_id" },
+                "scope": "command"
+            },
+            "effects": [{
+                "start_process": {
+                    "process": "returns",
+                    "input": { "lines": { "arg": "lines" } },
+                    "idempotency_key": { "argument": "request_id" }
+                }
+            }]
+        }]
+    }))
+    .expect("named input-object command metadata deserializes");
+
+    let commands = compile_command_catalog(
+        &metadata,
+        &HashMap::from([("default".to_owned(), Catalog::default())]),
+        &compile_catalog(&[], &[]).expect("empty Rules catalog compiles"),
+        true,
+    )
+    .expect("pre-process Commands compile");
+
+    let element = TypeRef {
+        nullable: false,
+        value_type: ValueType::Object {
+            fields: BTreeMap::from([
+                ("order_line_id".to_owned(), required(ValueScalar::Uuid)),
+                (
+                    "requested_quantity".to_owned(),
+                    required(ValueScalar::Int32),
+                ),
+            ]),
+        },
+    };
+    let contracts = ProcessEffectContractCatalog {
+        sources: BTreeMap::from([(
+            "default".to_owned(),
+            BTreeMap::from([(
+                "returns".to_owned(),
+                ProcessEffectContract {
+                    process_name: "returns".to_owned(),
+                    current_revision: "returns-r1".to_owned(),
+                    start_policy: ProcessStartPolicy::Enabled,
+                    start_input: ValueContractCatalog {
+                        roots: BTreeMap::from([(
+                            "lines".to_owned(),
+                            ValueContractField {
+                                required: true,
+                                type_ref: TypeRef {
+                                    nullable: false,
+                                    value_type: ValueType::List {
+                                        element: Box::new(element),
+                                    },
+                                },
+                            },
+                        )]),
+                        named_objects: BTreeMap::new(),
+                    },
+                    process_key: None,
+                    caller_session_variables: BTreeMap::new(),
+                    signals: BTreeMap::new(),
+                },
+            )]),
+        )]),
+    };
+
+    finalize_command_effects(commands, &contracts)
+        .expect("a named input object is assignable to its own inlined contract");
+}

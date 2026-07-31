@@ -1463,6 +1463,42 @@ fn effect_type_assignable(
             actual_objects,
             visited,
         ),
+        // One side may declare a named input object while the other inlines the
+        // same closed contract. A nominal reference and its resolved fields
+        // describe one contract, so compare the resolved fields rather than the
+        // spelling.
+        (
+            ValueType::Object {
+                fields: target_fields,
+            },
+            ValueType::Ref { name: actual_name },
+        ) => actual_objects
+            .get(actual_name)
+            .is_some_and(|actual_object| {
+                effect_fields_assignable(
+                    target_fields,
+                    target_objects,
+                    &actual_object.fields,
+                    actual_objects,
+                    visited,
+                )
+            }),
+        (
+            ValueType::Ref { name: target_name },
+            ValueType::Object {
+                fields: actual_fields,
+            },
+        ) => target_objects
+            .get(target_name)
+            .is_some_and(|target_object| {
+                effect_fields_assignable(
+                    &target_object.fields,
+                    target_objects,
+                    actual_fields,
+                    actual_objects,
+                    visited,
+                )
+            }),
         (ValueType::Ref { name: target_name }, ValueType::Ref { name: actual_name })
             if target_name == actual_name =>
         {
