@@ -17,6 +17,12 @@ jobs:
       PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The connector source-identity check reads the reviewed bytes out of
+          # the commit its source record pins — `git show <commit>:<path>` —
+          # which a shallow checkout does not have. Verifying a record against
+          # a commit is the point of it, so the history has to be here.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Connector processor boundary policy
