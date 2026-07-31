@@ -48,3 +48,5 @@ the deployed active/live-retired revisions with read-only catalog queries.
 - V7 adds the closed caller role/session snapshot used by `run_as: caller`,
   terminal output and safe failure envelopes, and the internal `continue`
   event consumed by deterministic Process state transitions.
+- V8 adds the bounded JSONB containment index used to classify late signals
+  against retained durable wait history.

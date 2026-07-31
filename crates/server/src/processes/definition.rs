@@ -286,7 +286,7 @@ pub enum CompiledProcessStateOperation {
     Command(CompiledProcessCommandState),
     Request(Box<CompiledProcessRequestState>),
     When(CompiledProcessWhenState),
-    Wait,
+    Wait(Box<CompiledProcessWaitState>),
     ForEach,
     Output(CompiledProcessOutputState),
     Fail(CompiledProcessFailState),
@@ -374,6 +374,44 @@ pub enum CompiledProcessWhenPredicate {
         name: String,
         bindings: BTreeMap<String, ProcessValue>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledProcessWaitState {
+    Signal(CompiledProcessSignalWait),
+    Timer(CompiledProcessTimerWait),
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessSignalWait {
+    pub signal: String,
+    pub role: String,
+    pub correlate: BTreeMap<String, ProcessValue>,
+    pub deadline: CompiledProcessSignalDeadline,
+    pub next: String,
+    pub on_timeout: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledProcessSignalDeadline {
+    AfterMilliseconds(u64),
+    At {
+        value: ProcessValue,
+        kind: CompiledProcessTimestampKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledProcessTimestampKind {
+    Timestamp,
+    TimestampTz,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessTimerWait {
+    pub decision: CompiledProcessDecisionCall,
+    pub duration_output: String,
+    pub next: String,
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +671,8 @@ fn compile_process(
             input: &input,
             state_types: &state_types,
             ancestors: &graph.ancestors[state_index],
+            definite_ancestors: &graph.definite_ancestors[state_index],
+            available_outputs: &graph.available_outputs[state_index],
             state_indices: &graph.state_indices,
             signals: &signals,
             dependencies,
@@ -1159,6 +1199,14 @@ struct ValidatedGraph {
     state_indices: BTreeMap<String, usize>,
     topological_order: Vec<usize>,
     ancestors: Vec<BTreeSet<usize>>,
+    definite_ancestors: Vec<BTreeSet<usize>>,
+    available_outputs: Vec<BTreeSet<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StateTransition {
+    target: usize,
+    output_available: bool,
 }
 
 fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanError> {
@@ -1186,15 +1234,19 @@ fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanE
 
     let mut edges = vec![Vec::new(); process.states.len()];
     for (index, state) in process.states.iter().enumerate() {
-        for target in state_targets(state) {
+        for (target, output_available) in state_transitions(state) {
             let Some(&target_index) = state_indices.get(target) else {
                 return Err(validation(
                     format!("{path}.states[{index}]"),
                     format!("state transition target `{target}` does not exist"),
                 ));
             };
-            if !edges[index].contains(&target_index) {
-                edges[index].push(target_index);
+            let transition = StateTransition {
+                target: target_index,
+                output_available,
+            };
+            if !edges[index].contains(&transition) {
+                edges[index].push(transition);
             }
         }
     }
@@ -1205,7 +1257,7 @@ fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanE
         if std::mem::replace(&mut reachable[index], true) {
             continue;
         }
-        pending.extend(edges[index].iter().copied());
+        pending.extend(edges[index].iter().map(|edge| edge.target));
     }
     if let Some((index, state)) = process
         .states
@@ -1221,8 +1273,8 @@ fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanE
 
     let mut indegree = vec![0_usize; process.states.len()];
     for targets in &edges {
-        for target in targets {
-            indegree[*target] += 1;
+        for edge in targets {
+            indegree[edge.target] += 1;
         }
     }
     let mut queue = VecDeque::from_iter(
@@ -1234,10 +1286,10 @@ fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanE
     let mut topological_order = Vec::with_capacity(process.states.len());
     while let Some(index) = queue.pop_front() {
         topological_order.push(index);
-        for target in &edges[index] {
-            indegree[*target] -= 1;
-            if indegree[*target] == 0 {
-                queue.push_back(*target);
+        for edge in &edges[index] {
+            indegree[edge.target] -= 1;
+            if indegree[edge.target] == 0 {
+                queue.push_back(edge.target);
             }
         }
     }
@@ -1254,43 +1306,85 @@ fn validate_graph(process: &Process, path: &str) -> Result<ValidatedGraph, PlanE
 
     let mut ancestors = vec![BTreeSet::new(); process.states.len()];
     for index in &topological_order {
-        for target in &edges[*index] {
+        for edge in &edges[*index] {
             let inherited = ancestors[*index].clone();
-            ancestors[*target].insert(*index);
-            ancestors[*target].extend(inherited);
+            ancestors[edge.target].insert(*index);
+            ancestors[edge.target].extend(inherited);
         }
     }
+
+    let mut definite_ancestors = vec![None; process.states.len()];
+    let mut available_outputs = vec![None; process.states.len()];
+    definite_ancestors[start_index] = Some(BTreeSet::new());
+    available_outputs[start_index] = Some(BTreeSet::new());
+    for index in &topological_order {
+        let inherited_ancestors = definite_ancestors[*index]
+            .as_ref()
+            .expect("every validated state is reachable")
+            .clone();
+        let inherited_outputs = available_outputs[*index]
+            .as_ref()
+            .expect("every validated state is reachable")
+            .clone();
+        for edge in &edges[*index] {
+            let mut path_ancestors = inherited_ancestors.clone();
+            path_ancestors.insert(*index);
+            intersect_path_guarantees(&mut definite_ancestors[edge.target], path_ancestors);
+
+            let mut path_outputs = inherited_outputs.clone();
+            if edge.output_available {
+                path_outputs.insert(*index);
+            }
+            intersect_path_guarantees(&mut available_outputs[edge.target], path_outputs);
+        }
+    }
+
     Ok(ValidatedGraph {
         state_indices,
         topological_order,
         ancestors,
+        definite_ancestors: definite_ancestors
+            .into_iter()
+            .map(|states| states.expect("every validated state is reachable"))
+            .collect(),
+        available_outputs: available_outputs
+            .into_iter()
+            .map(|states| states.expect("every validated state is reachable"))
+            .collect(),
     })
 }
 
-fn state_targets(state: &ProcessState) -> Vec<&str> {
+fn intersect_path_guarantees(current: &mut Option<BTreeSet<usize>>, candidate: BTreeSet<usize>) {
+    match current {
+        Some(current) => current.retain(|state| candidate.contains(state)),
+        None => *current = Some(candidate),
+    }
+}
+
+fn state_transitions(state: &ProcessState) -> Vec<(&str, bool)> {
     let mut targets = Vec::new();
     match &state.operation {
-        ProcessStateOperation::Command { command } => targets.push(command.next.as_str()),
+        ProcessStateOperation::Command { command } => targets.push((command.next.as_str(), true)),
         ProcessStateOperation::Request { request } => {
-            targets.push(request.next.as_str());
-            push_error_targets(&mut targets, request.on_error.as_ref());
+            targets.push((request.next.as_str(), true));
+            push_error_transitions(&mut targets, request.on_error.as_ref(), false);
         }
         ProcessStateOperation::When { when } => {
-            targets.extend(when.cases.iter().map(|case| case.next.as_str()));
-            targets.push(when.default.as_str());
+            targets.extend(when.cases.iter().map(|case| (case.next.as_str(), true)));
+            targets.push((when.default.as_str(), true));
         }
         ProcessStateOperation::Wait { wait } => match wait {
             ProcessWaitState::Signal(signal) => {
-                targets.push(signal.next.as_str());
-                targets.push(signal.on_timeout.as_str());
+                targets.push((signal.next.as_str(), true));
+                targets.push((signal.on_timeout.as_str(), false));
             }
-            ProcessWaitState::Timer(timer) => targets.push(timer.next.as_str()),
+            ProcessWaitState::Timer(timer) => targets.push((timer.next.as_str(), true)),
         },
         ProcessStateOperation::ForEach { for_each } => match for_each.as_ref() {
-            ProcessForEachState::Command { next, .. } => targets.push(next.as_str()),
+            ProcessForEachState::Command { next, .. } => targets.push((next.as_str(), true)),
             ProcessForEachState::Request { request, next, .. } => {
-                targets.push(next.as_str());
-                push_error_targets(&mut targets, request.on_error.as_ref());
+                targets.push((next.as_str(), true));
+                push_error_transitions(&mut targets, request.on_error.as_ref(), true);
             }
         },
         ProcessStateOperation::Output { .. } | ProcessStateOperation::Fail { .. } => {}
@@ -1298,10 +1392,19 @@ fn state_targets(state: &ProcessState) -> Vec<&str> {
     targets
 }
 
-fn push_error_targets<'a>(targets: &mut Vec<&'a str>, routes: Option<&'a ProcessErrorRoutes>) {
+fn push_error_transitions<'a>(
+    targets: &mut Vec<(&'a str, bool)>,
+    routes: Option<&'a ProcessErrorRoutes>,
+    output_available: bool,
+) {
     if let Some(routes) = routes {
-        targets.extend(routes.routes.iter().map(|route| route.next.as_str()));
-        targets.push(routes.fallback.next.as_str());
+        targets.extend(
+            routes
+                .routes
+                .iter()
+                .map(|route| (route.next.as_str(), output_available)),
+        );
+        targets.push((routes.fallback.next.as_str(), output_available));
     }
 }
 
@@ -1424,6 +1527,8 @@ struct CompileContext<'a, 'b> {
     input: &'a ValueContractCatalog,
     state_types: &'a BTreeMap<String, ValueContractCatalog>,
     ancestors: &'a BTreeSet<usize>,
+    definite_ancestors: &'a BTreeSet<usize>,
+    available_outputs: &'a BTreeSet<usize>,
     state_indices: &'a BTreeMap<String, usize>,
     signals: &'a BTreeMap<String, CompiledProcessSignal>,
     dependencies: &'a dyn ProcessDependencyCatalog,
@@ -1484,11 +1589,14 @@ fn compile_state(
                 CompiledProcessStateOperation::When(compiled),
             )
         }
-        ProcessStateOperation::Wait { wait } => (
-            compile_wait_state(wait, context)?,
-            BTreeMap::new(),
-            CompiledProcessStateOperation::Wait,
-        ),
+        ProcessStateOperation::Wait { wait } => {
+            let (output, compiled) = compile_wait_state(wait, context)?;
+            (
+                output,
+                BTreeMap::new(),
+                CompiledProcessStateOperation::Wait(Box::new(compiled)),
+            )
+        }
         ProcessStateOperation::ForEach { for_each } => {
             let (output, horizons) = compile_for_each_state(for_each, &state.id, context)?;
             (output, horizons, CompiledProcessStateOperation::ForEach)
@@ -2301,7 +2409,7 @@ fn latest_matching_state_contract<'a>(
     context
         .state_indices
         .iter()
-        .filter(|(_, index)| context.ancestors.contains(index))
+        .filter(|(_, index)| context.available_outputs.contains(index))
         .filter_map(|(name, index)| {
             context
                 .state_types
@@ -2340,7 +2448,7 @@ fn validate_literal_matches(
 fn compile_wait_state(
     wait: &ProcessWaitState,
     context: &mut CompileContext<'_, '_>,
-) -> Result<ValueContractCatalog, PlanError> {
+) -> Result<(ValueContractCatalog, CompiledProcessWaitState), PlanError> {
     match wait {
         ProcessWaitState::Signal(signal) => compile_signal_wait(signal, context),
         ProcessWaitState::Timer(timer) => {
@@ -2385,7 +2493,17 @@ fn compile_wait_state(
                 .closure
                 .decision_tables
                 .insert(descriptor.name.clone(), descriptor.clone());
-            Ok(contract_from_rule_types(&descriptor.output))
+            Ok((
+                contract_from_rule_types(&descriptor.output),
+                CompiledProcessWaitState::Timer(CompiledProcessTimerWait {
+                    decision: CompiledProcessDecisionCall {
+                        name: descriptor.name.clone(),
+                        input: timer.timer.bindings.clone(),
+                    },
+                    duration_output: timer.timer.output.clone(),
+                    next: timer.next.clone(),
+                }),
+            ))
         }
     }
 }
@@ -2393,7 +2511,7 @@ fn compile_wait_state(
 fn compile_signal_wait(
     wait: &ProcessSignalWait,
     context: &mut CompileContext<'_, '_>,
-) -> Result<ValueContractCatalog, PlanError> {
+) -> Result<(ValueContractCatalog, CompiledProcessWaitState), PlanError> {
     let path = format!("{}.wait", context.path);
     let signal = context.signals.get(&wait.signal).ok_or_else(|| {
         validation(
@@ -2442,10 +2560,10 @@ fn compile_signal_wait(
         context,
         &format!("{path}.correlate"),
     )?;
-    match &wait.deadline {
-        ProcessDeadline::Duration(duration) => {
-            parse_duration(duration, &format!("{path}.deadline"))?;
-        }
+    let deadline = match &wait.deadline {
+        ProcessDeadline::Duration(duration) => CompiledProcessSignalDeadline::AfterMilliseconds(
+            parse_duration(duration, &format!("{path}.deadline"))?,
+        ),
         ProcessDeadline::Value(value) => {
             let inferred = infer_value(value, context, &format!("{path}.deadline"))?;
             let type_ref = inferred.known().ok_or_else(|| {
@@ -2466,8 +2584,21 @@ fn compile_signal_wait(
                     "signal deadline must be a non-null timestamp",
                 ));
             }
+            let kind = match &type_ref.value_type {
+                ValueType::Scalar {
+                    scalar: ValueScalar::Timestamp,
+                } => CompiledProcessTimestampKind::Timestamp,
+                ValueType::Scalar {
+                    scalar: ValueScalar::TimestampTz,
+                } => CompiledProcessTimestampKind::TimestampTz,
+                _ => unreachable!("timestamp shape checked above"),
+            };
+            CompiledProcessSignalDeadline::At {
+                value: value.clone(),
+                kind,
+            }
         }
-    }
+    };
     let mut roots = signal.correlation.roots.clone();
     for (name, field) in &signal.payload.roots {
         if roots.insert(name.clone(), field.clone()).is_some() {
@@ -2477,10 +2608,20 @@ fn compile_signal_wait(
             ));
         }
     }
-    Ok(ValueContractCatalog {
-        roots,
-        named_objects: BTreeMap::new(),
-    })
+    Ok((
+        ValueContractCatalog {
+            roots,
+            named_objects: BTreeMap::new(),
+        },
+        CompiledProcessWaitState::Signal(CompiledProcessSignalWait {
+            signal: wait.signal.clone(),
+            role: wait.role.clone(),
+            correlate: wait.correlate.clone(),
+            deadline,
+            next: wait.next.clone(),
+            on_timeout: wait.on_timeout.clone(),
+        }),
+    ))
 }
 
 fn compile_for_each_state(
@@ -2798,6 +2939,14 @@ fn infer_value(
                     format!("state reference `{state}.{field}` must target a transition ancestor"),
                 ));
             }
+            if !context.available_outputs.contains(state_index) {
+                return Err(validation(
+                    path,
+                    format!(
+                        "state output `{state}.{field}` is not available on every transition path"
+                    ),
+                ));
+            }
             let contract = context.state_types.get(state).ok_or_else(|| {
                 validation(
                     path,
@@ -2892,6 +3041,12 @@ fn infer_value(
                 return Err(validation(
                     path,
                     "activity_key_for_state must reference a transition ancestor",
+                ));
+            }
+            if !context.definite_ancestors.contains(state_index) {
+                return Err(validation(
+                    path,
+                    "activity_key_for_state is not available on every transition path",
                 ));
             }
             match as_.as_deref() {

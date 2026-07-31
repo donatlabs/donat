@@ -21,8 +21,8 @@ use crate::connectors::ConnectorRegistry;
 use crate::state::{SharedState, SourceRuntime};
 
 use super::{
-    ActivityConsumption, DeployedSourceProcessCatalog, ProcessActivityExecutor, StartConsumption,
-    TransitionConsumption,
+    ActivityConsumption, DeployedSourceProcessCatalog, ProcessActivityExecutor, SignalConsumption,
+    StartConsumption, TransitionConsumption,
 };
 
 /// Immutable planning inputs captured from the same published Engine
@@ -233,6 +233,18 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                 continue;
             }
         }
+        match consume_one_signal(&runtime).await {
+            Ok(signal_progressed) => progressed |= signal_progressed,
+            Err(error) => {
+                tracing::error!(
+                    source = %runtime.source_name,
+                    error = %error,
+                    "Process signal consumer failed"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        }
         match runtime.consume_one_transition().await {
             Ok(TransitionConsumption::NoWork) => {}
             Ok(TransitionConsumption::Advanced {
@@ -310,6 +322,22 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     %activity_job_id,
                     state,
                     "Process activity scheduled"
+                );
+            }
+            Ok(TransitionConsumption::WaitEntered {
+                instance_id,
+                event_id,
+                timer_event_id,
+                state,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    %timer_event_id,
+                    state,
+                    "Process wait became receptive"
                 );
             }
             Err(error) => {
@@ -442,6 +470,66 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
             tokio::time::sleep(poll_interval).await;
         }
     }
+}
+
+async fn consume_one_signal(runtime: &ProcessRuntime) -> anyhow::Result<bool> {
+    Ok(match runtime.consume_one_signal().await? {
+        SignalConsumption::NoWork => false,
+        SignalConsumption::Accepted {
+            request_id,
+            instance_id,
+            event_id,
+        } => {
+            tracing::debug!(
+                source = %runtime.source_name,
+                %request_id,
+                %instance_id,
+                %event_id,
+                "Process signal accepted"
+            );
+            true
+        }
+        SignalConsumption::Duplicate { request_id } => {
+            tracing::debug!(
+                source = %runtime.source_name,
+                %request_id,
+                "duplicate Process signal audited"
+            );
+            true
+        }
+        SignalConsumption::Unmatched { request_id } => {
+            tracing::warn!(
+                source = %runtime.source_name,
+                %request_id,
+                "unmatched Process signal audited"
+            );
+            true
+        }
+        SignalConsumption::Ambiguous { request_id } => {
+            tracing::warn!(
+                source = %runtime.source_name,
+                %request_id,
+                "ambiguous Process signal audited"
+            );
+            true
+        }
+        SignalConsumption::GuardFalse { request_id } => {
+            tracing::warn!(
+                source = %runtime.source_name,
+                %request_id,
+                "guard-false Process signal audited"
+            );
+            true
+        }
+        SignalConsumption::UnexpectedState { request_id } => {
+            tracing::warn!(
+                source = %runtime.source_name,
+                %request_id,
+                "unexpected-state Process signal audited"
+            );
+            true
+        }
+    })
 }
 
 fn process_poll_interval() -> Duration {

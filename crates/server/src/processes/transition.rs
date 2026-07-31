@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use donat_ir::CommandMutation;
 use donat_metadata::ProcessErrorKind;
 use donat_schema::Session;
@@ -14,11 +15,12 @@ use uuid::Uuid;
 use crate::connectors::canonical_json_sha256;
 
 use super::start::typed_value;
-use super::value::{ProcessValueContext, evaluate_process_values};
+use super::value::{ProcessValueContext, evaluate_process_value, evaluate_process_values};
 use super::{
     CompiledProcessCommandRole, CompiledProcessCommandState, CompiledProcessDefinition,
     CompiledProcessFailState, CompiledProcessOutputState, CompiledProcessRequestState,
-    CompiledProcessStateOperation, CompiledProcessWhenPredicate, CompiledProcessWhenState,
+    CompiledProcessSignalDeadline, CompiledProcessStateOperation, CompiledProcessTimestampKind,
+    CompiledProcessWaitState, CompiledProcessWhenPredicate, CompiledProcessWhenState,
     ProcessCommandOutcome, ProcessRuntime, execute_process_command_in_savepoint,
 };
 use crate::commands::CommandBusinessRejection;
@@ -54,6 +56,12 @@ pub enum TransitionConsumption {
         instance_id: Uuid,
         event_id: Uuid,
         activity_job_id: Uuid,
+        state: String,
+    },
+    WaitEntered {
+        instance_id: Uuid,
+        event_id: Uuid,
+        timer_event_id: Uuid,
         state: String,
     },
 }
@@ -124,6 +132,25 @@ struct PreparedFailTransition {
     state: CompiledProcessFailState,
 }
 
+enum PreparedTimerSchedule {
+    AfterMilliseconds(i64),
+    At(DateTime<Utc>),
+}
+
+struct PreparedWaitEntry {
+    snapshot: TransitionSnapshot,
+    schedule: PreparedTimerSchedule,
+    timer_payload: Json,
+}
+
+struct PreparedWaitCompletion {
+    snapshot: TransitionSnapshot,
+    next: String,
+    output: Option<Json>,
+    outcome: &'static str,
+    redacted_context: Json,
+}
+
 enum PreparedTransition {
     Command(PreparedCommandTransition),
     Request(PreparedRequestTransition),
@@ -132,6 +159,8 @@ enum PreparedTransition {
     When(PreparedWhenTransition),
     Output(PreparedOutputTransition),
     Fail(PreparedFailTransition),
+    WaitEntry(PreparedWaitEntry),
+    WaitCompletion(PreparedWaitCompletion),
 }
 
 impl PreparedTransition {
@@ -144,6 +173,8 @@ impl PreparedTransition {
             Self::When(prepared) => &prepared.snapshot,
             Self::Output(prepared) => &prepared.snapshot,
             Self::Fail(prepared) => &prepared.snapshot,
+            Self::WaitEntry(prepared) => &prepared.snapshot,
+            Self::WaitCompletion(prepared) => &prepared.snapshot,
         }
     }
 }
@@ -156,7 +187,14 @@ impl ProcessRuntime {
     /// short transaction locks the exact event/instance pair, verifies the
     /// version, and commits one state transition.
     pub async fn consume_one_transition(&self) -> anyhow::Result<TransitionConsumption> {
-        let Some(prepared) = self.prepare_one_transition().await? else {
+        self.consume_one_transition_kind(None).await
+    }
+
+    pub(crate) async fn consume_one_transition_kind(
+        &self,
+        event_kind: Option<&str>,
+    ) -> anyhow::Result<TransitionConsumption> {
+        let Some(prepared) = self.prepare_one_transition(event_kind).await? else {
             return Ok(TransitionConsumption::NoWork);
         };
 
@@ -175,6 +213,16 @@ impl ProcessRuntime {
                 .commit()
                 .await
                 .context("committing stale Process transition claim")?;
+            return Ok(TransitionConsumption::NoWork);
+        }
+        if self
+            .pending_signal_precedes_timer(&transaction, prepared.snapshot())
+            .await?
+        {
+            transaction
+                .commit()
+                .await
+                .context("committing Process timeout deferral")?;
             return Ok(TransitionConsumption::NoWork);
         }
 
@@ -237,12 +285,147 @@ impl ProcessRuntime {
                     code: prepared.state.code,
                 }
             }
+            PreparedTransition::WaitEntry(prepared) => {
+                let timer_event_id =
+                    commit_wait_entry(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::WaitEntered {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    timer_event_id,
+                    state: prepared.snapshot.current_state,
+                }
+            }
+            PreparedTransition::WaitCompletion(prepared) => {
+                commit_wait_completion(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::Advanced {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    from_state: prepared.snapshot.current_state,
+                    to_state: prepared.next,
+                }
+            }
         };
         transaction
             .commit()
             .await
             .context("committing Process deterministic transition")?;
         Ok(result)
+    }
+
+    async fn pending_signal_precedes_timer(
+        &self,
+        transaction: &Transaction<'_>,
+        snapshot: &TransitionSnapshot,
+    ) -> anyhow::Result<bool> {
+        if snapshot.event_kind != "timer" {
+            return Ok(false);
+        }
+        let definition = self
+            .deployed_catalog
+            .revision(&snapshot.process_name, &snapshot.revision)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process timer `{}` references absent revision `{}`",
+                    snapshot.event_id,
+                    snapshot.revision
+                )
+            })?;
+        let Some(wait) = definition
+            .states
+            .get(&snapshot.current_state)
+            .and_then(|state| match &state.operation {
+                CompiledProcessStateOperation::Wait(wait) => match wait.as_ref() {
+                    CompiledProcessWaitState::Signal(wait) => Some(wait),
+                    CompiledProcessWaitState::Timer(_) => None,
+                },
+                _ => None,
+            })
+        else {
+            return Ok(false);
+        };
+        if snapshot
+            .event_payload
+            .get("signal_name")
+            .and_then(Json::as_str)
+            != Some(wait.signal.as_str())
+            || snapshot.event_payload.get("route").and_then(Json::as_str) != Some("timeout")
+        {
+            bail!(
+                "Process signal timeout event `{}` does not match wait state `{}`",
+                snapshot.event_id,
+                snapshot.current_state
+            );
+        }
+        let correlation = snapshot.event_payload.get("correlation").ok_or_else(|| {
+            anyhow!(
+                "Process signal timeout event `{}` has no correlation",
+                snapshot.event_id
+            )
+        })?;
+        let wait_signal = definition.signals.get(&wait.signal).ok_or_else(|| {
+            anyhow!(
+                "Process signal `{}` disappeared from revision `{}`",
+                wait.signal,
+                snapshot.revision
+            )
+        })?;
+        let rows = transaction
+            .query(
+                "
+                SELECT request.process_revision
+                FROM donat.process_signal_requests request
+                JOIN donat.process_events timer
+                  ON timer.source_name = request.source_name
+                 AND timer.id = $2
+                WHERE request.source_name = $1
+                  AND request.process_name = $3
+                  AND request.signal_name = $4
+                  AND request.correlation_json = $5
+                  AND request.status = 'pending'
+                  AND request.created_at >= timer.created_at
+                  AND request.created_at <= timer.available_at
+                  AND timer.instance_id = $6
+                  AND timer.process_name = $3
+                  AND timer.revision = $7
+                  AND timer.kind = 'timer'
+                ORDER BY request.created_at, request.id
+                ",
+                &[
+                    &self.source_name,
+                    &snapshot.event_id,
+                    &snapshot.process_name,
+                    &wait.signal,
+                    &correlation,
+                    &snapshot.instance_id,
+                    &snapshot.revision,
+                ],
+            )
+            .await
+            .context("checking signals committed before a Process timeout")?;
+        for row in rows {
+            let request_revision: String = row.get("process_revision");
+            let request_definition = self
+                .deployed_catalog
+                .revision(&snapshot.process_name, &request_revision)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pending Process signal references absent revision `{request_revision}`"
+                    )
+                })?;
+            let request_signal = request_definition
+                .signals
+                .get(&wait.signal)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pending Process signal `{}` is absent from revision `{request_revision}`",
+                        wait.signal
+                    )
+                })?;
+            if request_signal.contract_fingerprint == wait_signal.contract_fingerprint {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn consume_prepared_command(
@@ -275,12 +458,16 @@ impl ProcessRuntime {
         }
     }
 
-    async fn prepare_one_transition(&self) -> anyhow::Result<Option<PreparedTransition>> {
+    async fn prepare_one_transition(
+        &self,
+        event_kind: Option<&str>,
+    ) -> anyhow::Result<Option<PreparedTransition>> {
         let client = self
             .pool
             .get()
             .await
             .context("reading due Process transitions")?;
+        let event_kind = event_kind.map(str::to_owned);
         let rows = client
             .query(
                 "
@@ -302,21 +489,29 @@ impl ProcessRuntime {
                 JOIN donat.process_instances instance
                   ON instance.source_name = event.source_name
                  AND instance.id = event.instance_id
+                 AND instance.process_name = event.process_name
+                 AND instance.revision = event.revision
                 WHERE event.source_name = $1
                   AND event.status = 'pending'
+                  AND ($2::text IS NULL OR event.kind = $2)
                   AND event.kind IN (
                       'start',
                       'continue',
+                      'signal',
+                      'timer',
                       'activity_succeeded',
                       'activity_failed',
                       'retry_exhausted'
                   )
                   AND event.available_at <= statement_timestamp()
                   AND instance.status = 'running'
-                ORDER BY event.available_at, event.id
-                LIMIT $2
+                ORDER BY
+                    event.available_at,
+                    CASE WHEN event.kind = 'signal' THEN 0 ELSE 1 END,
+                    event.id
+                LIMIT $3
                 ",
-                &[&self.source_name, &PREPARATION_BATCH_SIZE],
+                &[&self.source_name, &event_kind, &PREPARATION_BATCH_SIZE],
             )
             .await
             .context("reading due Process event snapshots")?;
@@ -349,9 +544,12 @@ impl ProcessRuntime {
                 .operation
                 .clone();
             let prepared = match operation {
-                CompiledProcessStateOperation::Command(state) => {
+                CompiledProcessStateOperation::Command(state)
+                    if deterministic_event_kind(&snapshot.event_kind) =>
+                {
                     Some(self.prepare_command_transition(snapshot, definition, state)?)
                 }
+                CompiledProcessStateOperation::Command(_) => None,
                 CompiledProcessStateOperation::Request(state) => {
                     let state = state.as_ref().clone();
                     match snapshot.event_kind.as_str() {
@@ -371,27 +569,286 @@ impl ProcessRuntime {
                         _ => None,
                     }
                 }
-                CompiledProcessStateOperation::When(state) => {
+                CompiledProcessStateOperation::When(state)
+                    if deterministic_event_kind(&snapshot.event_kind) =>
+                {
                     Some(self.prepare_when_transition(snapshot, definition, state)?)
                 }
-                CompiledProcessStateOperation::Output(state) => {
+                CompiledProcessStateOperation::When(_) => None,
+                CompiledProcessStateOperation::Output(state)
+                    if deterministic_event_kind(&snapshot.event_kind) =>
+                {
                     Some(self.prepare_output_transition(snapshot, definition, state)?)
                 }
-                CompiledProcessStateOperation::Fail(state) => {
+                CompiledProcessStateOperation::Output(_) => None,
+                CompiledProcessStateOperation::Fail(state)
+                    if deterministic_event_kind(&snapshot.event_kind) =>
+                {
                     Some(PreparedTransition::Fail(PreparedFailTransition {
                         snapshot,
                         state,
                     }))
                 }
-                CompiledProcessStateOperation::Wait | CompiledProcessStateOperation::ForEach => {
-                    None
+                CompiledProcessStateOperation::Fail(_) => None,
+                CompiledProcessStateOperation::Wait(state) => {
+                    self.prepare_wait_transition(snapshot, definition, state.as_ref().clone())?
                 }
+                CompiledProcessStateOperation::ForEach => None,
             };
             if prepared.is_some() {
                 return Ok(prepared);
             }
         }
         Ok(None)
+    }
+
+    fn prepare_wait_transition(
+        &self,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessWaitState,
+    ) -> anyhow::Result<Option<PreparedTransition>> {
+        match snapshot.event_kind.as_str() {
+            "start" | "continue" => {
+                let prepared = self.prepare_wait_entry(snapshot, &definition, &state)?;
+                Ok(Some(PreparedTransition::WaitEntry(prepared)))
+            }
+            "signal" | "timer" => {
+                let prepared = self.prepare_wait_completion(snapshot, &definition, &state)?;
+                Ok(prepared.map(PreparedTransition::WaitCompletion))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn prepare_wait_entry(
+        &self,
+        snapshot: TransitionSnapshot,
+        definition: &CompiledProcessDefinition,
+        state: &CompiledProcessWaitState,
+    ) -> anyhow::Result<PreparedWaitEntry> {
+        let wait_version = next_version(&snapshot)?;
+        let context = process_value_context(&self.source_name, &snapshot);
+        let (schedule, timer_payload) = match state {
+            CompiledProcessWaitState::Signal(wait) => {
+                let signal = definition.signals.get(&wait.signal).ok_or_else(|| {
+                    anyhow!(
+                        "compiled Process signal `{}` disappeared from revision `{}`",
+                        wait.signal,
+                        snapshot.revision
+                    )
+                })?;
+                if signal.role.as_ref().is_some_and(|role| role != &wait.role) {
+                    bail!(
+                        "compiled Process signal `{}` role differs from wait state `{}`",
+                        wait.signal,
+                        snapshot.current_state
+                    );
+                }
+                let correlation = Json::Object(
+                    evaluate_process_values(&wait.correlate, &context)?
+                        .into_iter()
+                        .collect(),
+                );
+                signal
+                    .correlation
+                    .validate(
+                        &typed_value(&correlation).context("decoding Process wait correlation")?,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "Process wait correlation violated signal `{}` contract: {error}",
+                            wait.signal
+                        )
+                    })?;
+                let schedule = prepare_signal_deadline(&wait.deadline, &context)?;
+                (
+                    schedule,
+                    json!({
+                        "wait_state": snapshot.current_state,
+                        "wait_version": wait_version,
+                        "signal_name": wait.signal,
+                        "correlation": correlation,
+                        "route": "timeout",
+                    }),
+                )
+            }
+            CompiledProcessWaitState::Timer(wait) => {
+                if !definition
+                    .dependencies
+                    .decision_tables
+                    .contains_key(&wait.decision.name)
+                {
+                    bail!(
+                        "Process decision table `{}` is absent from the pinned dependency closure",
+                        wait.decision.name
+                    );
+                }
+                let rules = self.planning_snapshot.rules();
+                if rules.decision_table(&wait.decision.name).is_none() {
+                    bail!(
+                        "Process decision table `{}` is absent from the immutable rule snapshot",
+                        wait.decision.name
+                    );
+                }
+                let input = evaluate_process_values(&wait.decision.input, &context)?;
+                let result = rules
+                    .evaluate_decision(&wait.decision.name, &input)
+                    .map_err(|error| {
+                        anyhow!(
+                            "evaluating Process timer decision table `{}`: {error}",
+                            wait.decision.name
+                        )
+                    })?;
+                let delay_seconds = result
+                    .output
+                    .get(&wait.duration_output)
+                    .and_then(Json::as_i64)
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process timer decision output `{}` must be a non-negative integer",
+                            wait.duration_output
+                        )
+                    })?;
+                let delay_milliseconds = delay_seconds
+                    .checked_mul(1_000)
+                    .ok_or_else(|| anyhow!("Process timer duration overflowed milliseconds"))?;
+                validate_state_output(definition, &snapshot, &result.output)
+                    .context("validating Process timer decision output")?;
+                (
+                    PreparedTimerSchedule::AfterMilliseconds(delay_milliseconds),
+                    json!({
+                        "wait_state": snapshot.current_state,
+                        "wait_version": wait_version,
+                        "decision_table": wait.decision.name,
+                        "matched_row_id": result.matched_row_id,
+                        "output": result.output,
+                        "route": "timer",
+                    }),
+                )
+            }
+        };
+        Ok(PreparedWaitEntry {
+            snapshot,
+            schedule,
+            timer_payload,
+        })
+    }
+
+    fn prepare_wait_completion(
+        &self,
+        snapshot: TransitionSnapshot,
+        definition: &CompiledProcessDefinition,
+        state: &CompiledProcessWaitState,
+    ) -> anyhow::Result<Option<PreparedWaitCompletion>> {
+        if !wait_event_matches_snapshot(&snapshot) {
+            return Ok(None);
+        }
+        match (state, snapshot.event_kind.as_str()) {
+            (CompiledProcessWaitState::Signal(wait), "signal") => {
+                if snapshot
+                    .event_payload
+                    .get("signal_name")
+                    .and_then(Json::as_str)
+                    != Some(wait.signal.as_str())
+                {
+                    return Ok(None);
+                }
+                let signal = definition.signals.get(&wait.signal).ok_or_else(|| {
+                    anyhow!(
+                        "compiled Process signal `{}` disappeared from revision `{}`",
+                        wait.signal,
+                        snapshot.revision
+                    )
+                })?;
+                let correlation = snapshot
+                    .event_payload
+                    .get("correlation")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Process signal event has no correlation object"))?;
+                let payload = snapshot
+                    .event_payload
+                    .get("payload")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Process signal event has no payload object"))?;
+                signal
+                    .correlation
+                    .validate(
+                        &typed_value(&correlation)
+                            .context("decoding Process signal event correlation")?,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "Process signal event correlation violated `{}`: {error}",
+                            wait.signal
+                        )
+                    })?;
+                signal
+                    .payload
+                    .validate(
+                        &typed_value(&payload).context("decoding Process signal event payload")?,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "Process signal event payload violated `{}`: {error}",
+                            wait.signal
+                        )
+                    })?;
+                let mut output = correlation
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Process signal correlation is not an object"))?;
+                for (name, value) in payload
+                    .as_object()
+                    .ok_or_else(|| anyhow!("Process signal payload is not an object"))?
+                {
+                    if output.insert(name.clone(), value.clone()).is_some() {
+                        bail!("Process signal field `{name}` exists in correlation and payload");
+                    }
+                }
+                let output = Json::Object(output);
+                validate_state_output(definition, &snapshot, &output)
+                    .context("validating Process signal wait output")?;
+                Ok(Some(PreparedWaitCompletion {
+                    snapshot,
+                    next: wait.next.clone(),
+                    output: Some(output),
+                    outcome: "signal_received",
+                    redacted_context: json!({ "signal": wait.signal }),
+                }))
+            }
+            (CompiledProcessWaitState::Signal(wait), "timer") => Ok(Some(PreparedWaitCompletion {
+                snapshot,
+                next: wait.on_timeout.clone(),
+                output: None,
+                outcome: "timer_fired",
+                redacted_context: json!({
+                    "kind": "signal_timeout",
+                    "signal": wait.signal,
+                }),
+            })),
+            (CompiledProcessWaitState::Timer(wait), "timer") => {
+                let output = snapshot
+                    .event_payload
+                    .get("output")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Process timer event has no decision output"))?;
+                validate_state_output(definition, &snapshot, &output)
+                    .context("validating persisted Process timer output")?;
+                Ok(Some(PreparedWaitCompletion {
+                    snapshot,
+                    next: wait.next.clone(),
+                    output: Some(output),
+                    outcome: "timer_fired",
+                    redacted_context: json!({
+                        "kind": "decision_timer",
+                        "decision_table": wait.decision.name,
+                    }),
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn prepare_command_transition(
@@ -925,6 +1382,55 @@ fn process_value_context<'a>(
     }
 }
 
+fn prepare_signal_deadline(
+    deadline: &CompiledProcessSignalDeadline,
+    context: &ProcessValueContext<'_>,
+) -> anyhow::Result<PreparedTimerSchedule> {
+    match deadline {
+        CompiledProcessSignalDeadline::AfterMilliseconds(milliseconds) => {
+            Ok(PreparedTimerSchedule::AfterMilliseconds(
+                i64::try_from(*milliseconds)
+                    .context("Process signal deadline exceeds PostgreSQL interval input")?,
+            ))
+        }
+        CompiledProcessSignalDeadline::At { value, kind } => {
+            let value = evaluate_process_value(value, context)
+                .context("evaluating absolute Process signal deadline")?;
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("absolute Process signal deadline is not a string"))?;
+            let at = match kind {
+                CompiledProcessTimestampKind::TimestampTz => DateTime::parse_from_rfc3339(value)
+                    .map_err(|error| {
+                        anyhow!("invalid Process timestamptz deadline `{value}`: {error}")
+                    })?
+                    .with_timezone(&Utc),
+                CompiledProcessTimestampKind::Timestamp => {
+                    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+                        .map_err(|error| {
+                            anyhow!("invalid Process timestamp deadline `{value}`: {error}")
+                        })?
+                        .and_utc()
+                }
+            };
+            Ok(PreparedTimerSchedule::At(at))
+        }
+    }
+}
+
+fn wait_event_matches_snapshot(snapshot: &TransitionSnapshot) -> bool {
+    snapshot
+        .event_payload
+        .get("wait_state")
+        .and_then(Json::as_str)
+        == Some(snapshot.current_state.as_str())
+        && snapshot
+            .event_payload
+            .get("wait_version")
+            .and_then(Json::as_i64)
+            == Some(snapshot.version)
+}
+
 fn state_output(state: &Json, state_name: &str) -> anyhow::Result<Json> {
     state
         .as_object()
@@ -957,6 +1463,10 @@ fn process_error_kind_name(kind: &ProcessErrorKind) -> &'static str {
         ProcessErrorKind::Invariant => "invariant",
         ProcessErrorKind::RetryExhausted => "retry_exhausted",
     }
+}
+
+fn deterministic_event_kind(kind: &str) -> bool {
+    matches!(kind, "start" | "continue")
 }
 
 fn validate_state_output(
@@ -1049,6 +1559,8 @@ async fn lock_prepared_snapshot(
             JOIN donat.process_instances instance
               ON instance.source_name = event.source_name
              AND instance.id = event.instance_id
+             AND instance.process_name = event.process_name
+             AND instance.revision = event.revision
             WHERE event.source_name = $1
               AND event.id = $2
               AND event.instance_id = $3
@@ -1057,6 +1569,8 @@ async fn lock_prepared_snapshot(
               AND event.kind IN (
                   'start',
                   'continue',
+                  'signal',
+                  'timer',
                   'activity_succeeded',
                   'activity_failed',
                   'retry_exhausted'
@@ -1121,6 +1635,195 @@ async fn commit_applied_command(
         next_version(&prepared.snapshot)?,
     )
     .await
+}
+
+async fn commit_wait_entry(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedWaitEntry,
+) -> anyhow::Result<Uuid> {
+    let version = next_version(&prepared.snapshot)?;
+    let (available_at, delay_milliseconds) = match prepared.schedule {
+        PreparedTimerSchedule::AfterMilliseconds(milliseconds) => (None, Some(milliseconds)),
+        PreparedTimerSchedule::At(at) => (Some(at), None),
+    };
+    let idempotency_key = format!(
+        "wait-timer:{}:{}:{version}",
+        prepared.snapshot.instance_id, prepared.snapshot.current_state
+    );
+    let timer_event_id: Uuid = transaction
+        .query_one(
+            "
+            WITH wait_clock AS (
+                SELECT statement_timestamp() AS at
+            )
+            INSERT INTO donat.process_events (
+                source_name,
+                instance_id,
+                process_name,
+                revision,
+                kind,
+                payload_json,
+                idempotency_key,
+                available_at,
+                status,
+                created_at
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                $4,
+                'timer',
+                $5,
+                $6,
+                COALESCE(
+                    $7::timestamptz,
+                    wait_clock.at + ($8::bigint * interval '1 millisecond')
+                ),
+                'pending',
+                wait_clock.at
+            FROM wait_clock
+            RETURNING id
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.process_name,
+                &prepared.snapshot.revision,
+                &prepared.timer_payload,
+                &idempotency_key,
+                &available_at,
+                &delay_milliseconds,
+            ],
+        )
+        .await
+        .context("scheduling durable Process wait timer")?
+        .get("id");
+
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET version = $4,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $5
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.current_state,
+                &version,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("committing receptive Process wait version")?;
+    if updated != 1 {
+        bail!("locked Process wait state did not become receptive exactly once");
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    append_transition_log(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.snapshot.current_state,
+        "wait_entered",
+        None,
+        json!({ "timer_event_id": timer_event_id.to_string() }),
+    )
+    .await?;
+    Ok(timer_event_id)
+}
+
+async fn commit_wait_completion(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedWaitCompletion,
+) -> anyhow::Result<()> {
+    if let Some(output) = &prepared.output {
+        advance_instance(
+            transaction,
+            source_name,
+            &prepared.snapshot,
+            &prepared.next,
+            output,
+        )
+        .await?;
+    } else {
+        advance_instance_without_output(
+            transaction,
+            source_name,
+            &prepared.snapshot,
+            &prepared.next,
+        )
+        .await?;
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    let closed_competitors =
+        close_competing_wait_events(transaction, source_name, &prepared.snapshot).await?;
+    let mut redacted_context = prepared
+        .redacted_context
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    redacted_context.insert(
+        "closed_competing_events".to_owned(),
+        Json::from(closed_competitors),
+    );
+    append_transition_log(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.next,
+        prepared.outcome,
+        None,
+        Json::Object(redacted_context),
+    )
+    .await?;
+    append_continue_event(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        next_version(&prepared.snapshot)?,
+    )
+    .await
+}
+
+async fn close_competing_wait_events(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+) -> anyhow::Result<u64> {
+    transaction
+        .execute(
+            "
+            UPDATE donat.process_events
+            SET status = 'failed',
+                consumed_at = statement_timestamp(),
+                attempts = attempts + 1
+            WHERE source_name = $1
+              AND instance_id = $2
+              AND id <> $3
+              AND status = 'pending'
+              AND kind IN ('signal', 'timer')
+              AND payload_json ->> 'wait_state' = $4
+              AND payload_json ->> 'wait_version' = $5
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.event_id,
+                &snapshot.current_state,
+                &snapshot.version.to_string(),
+            ],
+        )
+        .await
+        .context("closing stale Process wait competitors")
 }
 
 async fn commit_request_schedule(
@@ -1474,6 +2177,43 @@ async fn advance_instance(
         )
         .await
         .context("advancing Process state")?;
+    if updated != 1 {
+        bail!("locked Process instance did not advance exactly once");
+    }
+    Ok(())
+}
+
+async fn advance_instance_without_output(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+    next: &str,
+) -> anyhow::Result<()> {
+    let version = next_version(snapshot)?;
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET current_state = $4,
+                version = $5,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $6
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.current_state,
+                &next,
+                &version,
+                &snapshot.version,
+            ],
+        )
+        .await
+        .context("advancing Process state without an output")?;
     if updated != 1 {
         bail!("locked Process instance did not advance exactly once");
     }

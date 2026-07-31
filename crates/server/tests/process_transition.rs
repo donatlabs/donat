@@ -677,6 +677,118 @@ async fn process_command_transition_executes_once_and_advances_atomically() {
 }
 
 #[tokio::test]
+async fn activity_event_cannot_execute_an_unrelated_deterministic_state() {
+    // This catches widening the transition event query without retaining the
+    // closed event-kind gate for Command/When/Output/Fail states.
+    let database = TestDatabase::create("process_transition_event_kind_gate").await;
+    let metadata = transition_metadata(false);
+    let (runtime, revision) = runtime(&database, &metadata).await;
+    seed_start(&database.url, &revision).await;
+    let instance_id = match runtime
+        .consume_one_start()
+        .await
+        .expect("Process start consumes")
+    {
+        StartConsumption::Started { instance_id, .. } => instance_id,
+        other => panic!("expected a new Process instance, got {other:?}"),
+    };
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("Process event-kind gate is seedable");
+    let connection = tokio::spawn(connection);
+    let start_event_id: Uuid = client
+        .query_one(
+            "
+            SELECT id
+            FROM donat.process_events
+            WHERE source_name = 'default'
+              AND instance_id = $1
+              AND kind = 'start'
+              AND status = 'pending'
+            ",
+            &[&instance_id],
+        )
+        .await
+        .expect("pending start token exists")
+        .get(0);
+    let unrelated_event_id: Uuid = client
+        .query_one(
+            "
+            INSERT INTO donat.process_events (
+                source_name,
+                instance_id,
+                process_name,
+                revision,
+                kind,
+                payload_json,
+                idempotency_key,
+                available_at,
+                status
+            )
+            VALUES (
+                'default',
+                $1,
+                'transition_test',
+                $2,
+                'activity_succeeded',
+                '{}'::jsonb,
+                'unrelated-activity-success',
+                statement_timestamp() - interval '1 hour',
+                'pending'
+            )
+            RETURNING id
+            ",
+            &[&instance_id, &revision],
+        )
+        .await
+        .expect("an older unrelated activity event inserts")
+        .get(0);
+    connection.abort();
+
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("the legal start token executes the Command"),
+        TransitionConsumption::Advanced {
+            event_id,
+            from_state,
+            to_state,
+            ..
+        } if event_id == start_event_id
+            && from_state == "record"
+            && to_state == "done"
+    ));
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("event-kind outcome is inspectable");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "
+            SELECT
+                (SELECT count(*) FROM public.process_test_ledger),
+                (SELECT status
+                 FROM donat.process_events
+                 WHERE source_name = 'default' AND id = $1),
+                (SELECT status
+                 FROM donat.process_events
+                 WHERE source_name = 'default' AND id = $2)
+            ",
+            &[&unrelated_event_id, &start_event_id],
+        )
+        .await
+        .expect("only the legal transition token was consumed");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, String>(1), "pending");
+    assert_eq!(row.get::<_, String>(2), "consumed");
+    connection.abort();
+    database.drop().await;
+}
+
+#[tokio::test]
 async fn process_command_later_assert_rolls_back_savepoint_and_commits_rejection() {
     let database = TestDatabase::create("process_transition_rejected").await;
     let metadata = transition_metadata(true);

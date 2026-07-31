@@ -789,6 +789,102 @@ fn process_compiler_rejects_unknown_rules_decisions_and_signals() {
 }
 
 #[test]
+fn signal_output_is_unavailable_on_the_timeout_path() {
+    let dependencies = base_dependencies(16_100);
+    let mut document = serde_json::to_value(base_metadata()).expect("metadata serializes");
+    document["processes"][0]["signals"] = json!([
+        {
+            "name": "payment_completed",
+            "role": "customer",
+            "correlation": { "order_id": "uuid!" },
+            "payload": { "status": "string!" }
+        }
+    ]);
+    document["processes"][0]["start_at"] = json!("await_payment");
+    document["processes"][0]["states"] = json!([
+        {
+            "id": "await_payment",
+            "wait": {
+                "signal": "payment_completed",
+                "role": "customer",
+                "verification": "required",
+                "persist_before_match": true,
+                "correlate": {
+                    "order_id": { "input": "order_id" }
+                },
+                "deadline": "1h",
+                "next": "completed",
+                "on_timeout": "timed_out"
+            }
+        },
+        {
+            "id": "completed",
+            "output": {
+                "values": {
+                    "status": { "state": "await_payment", "field": "status" }
+                }
+            }
+        },
+        {
+            "id": "timed_out",
+            "output": {
+                "values": {
+                    "status": { "state": "await_payment", "field": "status" }
+                }
+            }
+        }
+    ]);
+    let metadata: Metadata =
+        serde_json::from_value(document).expect("signal wait metadata deserializes");
+
+    let error = compile_process_catalog(&metadata, &dependencies)
+        .expect_err("a signal payload does not exist on the timeout path");
+
+    assert_eq!(error.path, "processes[0].states[2].output.values.status");
+    assert!(
+        error
+            .message
+            .contains("is not available on every transition path")
+    );
+}
+
+#[test]
+fn request_output_is_unavailable_when_success_and_error_paths_rejoin() {
+    // This catches collapsing two semantic edges to the same target and then
+    // assuming the request result exists on the error edge.
+    let dependencies = base_dependencies(16_100);
+    let mut document = serde_json::to_value(base_metadata()).expect("metadata serializes");
+    document["processes"][0]["states"][0]["request"]["next"] = json!("joined");
+    document["processes"][0]["states"][0]["request"]["on_error"] = json!({
+        "routes": [{
+            "kinds": ["authentication"],
+            "next": "joined"
+        }],
+        "fallback": { "next": "joined" }
+    });
+    document["processes"][0]["states"][1] = json!({
+        "id": "joined",
+        "output": {
+            "values": {
+                "status": { "state": "authorize", "field": "status" }
+            }
+        }
+    });
+    let metadata: Metadata =
+        serde_json::from_value(document).expect("joined activity routes deserialize");
+
+    let error = compile_process_catalog(&metadata, &dependencies)
+        .expect_err("request output does not exist after an error route");
+
+    assert_eq!(error.path, "processes[0].states[1].output.values.status");
+    assert!(
+        error
+            .message
+            .contains("is not available on every transition path")
+    );
+}
+
+#[test]
 fn retry_horizon_includes_single_attempt_grace_and_rejects_overflow() {
     let mut single_attempt = base_metadata();
     request_state_mut(&mut single_attempt).retry.max_attempts = 1;

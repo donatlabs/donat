@@ -10,7 +10,9 @@ mod command;
 mod definition;
 mod reconcile;
 mod runtime;
+mod signal;
 mod start;
+mod timer;
 mod transition;
 mod value;
 
@@ -20,5 +22,6 @@ pub use command::*;
 pub use definition::*;
 pub use reconcile::*;
 pub use runtime::*;
+pub use signal::*;
 pub use start::*;
 pub use transition::*;

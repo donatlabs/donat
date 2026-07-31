@@ -46,6 +46,19 @@ not repeat graph-resolution heuristics. A terminal `output` stores its validated
 closed value both in state history and `terminal_output_json`; an explicit
 `fail` stores only its deploy-time safe code and message.
 
+The compiler performs path-sensitive dataflow over the acyclic transition
+graph. It distinguishes a state that is an ancestor on some path, a state that
+must execute on every reaching path, and a state whose output must have been
+persisted on every reaching path. A single request result is unavailable on
+`on_error`, and a signal result is unavailable on `on_timeout`; a downstream
+join may reference either only when every incoming path provides it. A
+`for_each` with `completion: collect` is different: its typed
+`successful_items`/`failed_items` collection is the result of both success and
+item-error completion routes, so it remains available on those routes.
+`activity_key_for_state` similarly requires that its state executed on every
+incoming path. These checks happen at deployment rather than becoming a
+worker-time missing-value retry loop.
+
 A finalized Command executes as one statement inside
 `SAVEPOINT donat_process_command`. Only an exact `P0D01`
 `donat.graphql-error.v1` envelope rolls back to that savepoint and commits a
@@ -72,6 +85,6 @@ revision-pinned, and auditable, while ordinary infrastructure failures remain
 retryable because the durable token is unchanged.
 
 The journal stores a bounded caller context and one internal token per running
-state. Runtime preparation may do pure work more than once under contention,
-but domain writes and state advancement occur once after the locked version
-check.
+state. Branch-sensitive output mistakes fail deployment. Runtime preparation
+may do pure work more than once under contention, but domain writes and state
+advancement occur once after the locked version check.

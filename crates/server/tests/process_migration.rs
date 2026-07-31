@@ -425,6 +425,29 @@ async fn process_schema_is_source_qualified_and_exact() {
         .get(0);
     assert_eq!(oversized_json_without_check, 0);
 
+    let wait_history_index: Option<String> = client
+        .query_opt(
+            "
+            SELECT pg_get_indexdef(index_.indexrelid)
+            FROM pg_index index_
+            JOIN pg_class relation ON relation.oid = index_.indrelid
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+            JOIN pg_class index_relation ON index_relation.oid = index_.indexrelid
+            WHERE namespace.nspname = 'donat'
+              AND relation.relname = 'process_events'
+              AND index_relation.relname = 'process_events_signal_wait_history_idx'
+            ",
+            &[],
+        )
+        .await
+        .expect("signal wait history index introspects")
+        .map(|row| row.get(0));
+    let wait_history_index =
+        wait_history_index.expect("signal wait history must have a bounded lookup index");
+    assert!(wait_history_index.contains("USING gin (payload_json jsonb_path_ops)"));
+    assert!(wait_history_index.contains("kind = 'timer'"));
+    assert!(wait_history_index.contains("signal_name"));
+
     let helper = client
         .query_one(
             "
