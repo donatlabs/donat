@@ -5,18 +5,21 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use donat_ir::CommandMutation;
+use donat_metadata::ProcessErrorKind;
 use donat_schema::Session;
 use serde_json::{Value as Json, json};
 use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
+use crate::connectors::canonical_json_sha256;
+
 use super::start::typed_value;
 use super::value::{ProcessValueContext, evaluate_process_values};
 use super::{
     CompiledProcessCommandRole, CompiledProcessCommandState, CompiledProcessDefinition,
-    CompiledProcessFailState, CompiledProcessOutputState, CompiledProcessStateOperation,
-    CompiledProcessWhenPredicate, CompiledProcessWhenState, ProcessCommandOutcome, ProcessRuntime,
-    execute_process_command_in_savepoint,
+    CompiledProcessFailState, CompiledProcessOutputState, CompiledProcessRequestState,
+    CompiledProcessStateOperation, CompiledProcessWhenPredicate, CompiledProcessWhenState,
+    ProcessCommandOutcome, ProcessRuntime, execute_process_command_in_savepoint,
 };
 use crate::commands::CommandBusinessRejection;
 
@@ -47,11 +50,18 @@ pub enum TransitionConsumption {
         event_id: Uuid,
         error: CommandBusinessRejection,
     },
+    ActivityScheduled {
+        instance_id: Uuid,
+        event_id: Uuid,
+        activity_job_id: Uuid,
+        state: String,
+    },
 }
 
 struct TransitionSnapshot {
     event_id: Uuid,
     event_kind: String,
+    event_payload: Json,
     instance_id: Uuid,
     process_name: String,
     revision: String,
@@ -78,6 +88,32 @@ struct PreparedWhenTransition {
     redacted_context: Json,
 }
 
+struct PreparedRequestTransition {
+    snapshot: TransitionSnapshot,
+    state: CompiledProcessRequestState,
+    input: Json,
+    request_fingerprint: String,
+    serialization_key_hash: Option<Vec<u8>>,
+}
+
+struct PreparedRequestSuccessTransition {
+    snapshot: TransitionSnapshot,
+    state: CompiledProcessRequestState,
+    activity_job_id: Uuid,
+    attempt: i32,
+    lease_generation: i64,
+    output: Json,
+}
+
+struct PreparedRequestFailureTransition {
+    snapshot: TransitionSnapshot,
+    activity_job_id: Uuid,
+    attempt: i32,
+    lease_generation: i64,
+    next: String,
+    error_kind: String,
+}
+
 struct PreparedOutputTransition {
     snapshot: TransitionSnapshot,
     output: Json,
@@ -90,6 +126,9 @@ struct PreparedFailTransition {
 
 enum PreparedTransition {
     Command(PreparedCommandTransition),
+    Request(PreparedRequestTransition),
+    RequestSuccess(PreparedRequestSuccessTransition),
+    RequestFailure(PreparedRequestFailureTransition),
     When(PreparedWhenTransition),
     Output(PreparedOutputTransition),
     Fail(PreparedFailTransition),
@@ -99,6 +138,9 @@ impl PreparedTransition {
     fn snapshot(&self) -> &TransitionSnapshot {
         match self {
             Self::Command(prepared) => &prepared.snapshot,
+            Self::Request(prepared) => &prepared.snapshot,
+            Self::RequestSuccess(prepared) => &prepared.snapshot,
+            Self::RequestFailure(prepared) => &prepared.snapshot,
             Self::When(prepared) => &prepared.snapshot,
             Self::Output(prepared) => &prepared.snapshot,
             Self::Fail(prepared) => &prepared.snapshot,
@@ -140,6 +182,34 @@ impl ProcessRuntime {
             PreparedTransition::Command(prepared) => {
                 self.consume_prepared_command(&transaction, &prepared)
                     .await?
+            }
+            PreparedTransition::Request(prepared) => {
+                let activity_job_id =
+                    commit_request_schedule(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::ActivityScheduled {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    activity_job_id,
+                    state: prepared.snapshot.current_state,
+                }
+            }
+            PreparedTransition::RequestSuccess(prepared) => {
+                commit_request_success(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::Advanced {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    from_state: prepared.snapshot.current_state.clone(),
+                    to_state: prepared.state.next,
+                }
+            }
+            PreparedTransition::RequestFailure(prepared) => {
+                commit_request_failure(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::Advanced {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    from_state: prepared.snapshot.current_state.clone(),
+                    to_state: prepared.next,
+                }
             }
             PreparedTransition::When(prepared) => {
                 commit_when(&transaction, &self.source_name, &prepared).await?;
@@ -217,6 +287,7 @@ impl ProcessRuntime {
                 SELECT
                     event.id AS event_id,
                     event.kind AS event_kind,
+                    event.payload_json AS event_payload,
                     instance.id AS instance_id,
                     instance.process_name,
                     instance.revision,
@@ -233,7 +304,13 @@ impl ProcessRuntime {
                  AND instance.id = event.instance_id
                 WHERE event.source_name = $1
                   AND event.status = 'pending'
-                  AND event.kind IN ('start', 'continue')
+                  AND event.kind IN (
+                      'start',
+                      'continue',
+                      'activity_succeeded',
+                      'activity_failed',
+                      'retry_exhausted'
+                  )
                   AND event.available_at <= statement_timestamp()
                   AND instance.status = 'running'
                 ORDER BY event.available_at, event.id
@@ -275,6 +352,25 @@ impl ProcessRuntime {
                 CompiledProcessStateOperation::Command(state) => {
                     Some(self.prepare_command_transition(snapshot, definition, state)?)
                 }
+                CompiledProcessStateOperation::Request(state) => {
+                    let state = state.as_ref().clone();
+                    match snapshot.event_kind.as_str() {
+                        "start" | "continue" => {
+                            Some(self.prepare_request_transition(snapshot, definition, state)?)
+                        }
+                        "activity_succeeded" => Some(
+                            self.prepare_request_success_transition(
+                                &client, snapshot, definition, state,
+                            )
+                            .await?,
+                        ),
+                        "activity_failed" | "retry_exhausted" => Some(
+                            self.prepare_request_failure_transition(&client, snapshot, state)
+                                .await?,
+                        ),
+                        _ => None,
+                    }
+                }
                 CompiledProcessStateOperation::When(state) => {
                     Some(self.prepare_when_transition(snapshot, definition, state)?)
                 }
@@ -287,9 +383,9 @@ impl ProcessRuntime {
                         state,
                     }))
                 }
-                CompiledProcessStateOperation::Request
-                | CompiledProcessStateOperation::Wait
-                | CompiledProcessStateOperation::ForEach => None,
+                CompiledProcessStateOperation::Wait | CompiledProcessStateOperation::ForEach => {
+                    None
+                }
             };
             if prepared.is_some() {
                 return Ok(prepared);
@@ -376,6 +472,288 @@ impl ProcessRuntime {
             state,
             command,
         }))
+    }
+
+    fn prepare_request_transition(
+        &self,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessRequestState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let dependency = definition
+            .dependencies
+            .connector_operations
+            .get(&(
+                self.source_name.clone(),
+                state.connector.clone(),
+                state.operation,
+            ))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process connector operation `{}.{}` is absent from the pinned dependency closure",
+                    state.connector,
+                    state.operation.as_str()
+                )
+            })?;
+        if dependency.source != self.source_name
+            || dependency.instance != state.connector
+            || dependency.spec.operation != state.operation
+        {
+            bail!(
+                "pinned Process connector identity differs from request state `{}`",
+                snapshot.current_state
+            );
+        }
+        let live_spec = self
+            .connector_registry
+            .operation_spec_handle(&self.source_name, &state.connector, state.operation)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process connector operation `{}.{}` is absent from the immutable registry",
+                    state.connector,
+                    state.operation.as_str()
+                )
+            })?;
+        let live_fingerprint = self
+            .connector_registry
+            .configuration_fingerprint(&state.connector, state.operation.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process connector operation `{}.{}` has no immutable deployment fingerprint",
+                    state.connector,
+                    state.operation.as_str()
+                )
+            })?;
+        if !Arc::ptr_eq(&dependency.spec, &live_spec)
+            || dependency.deployment_fingerprint != live_fingerprint
+            || dependency.serialization_key_input.as_deref()
+                != self
+                    .connector_registry
+                    .serialization_key_input(&state.connector, state.operation.as_str())
+        {
+            bail!(
+                "Process connector operation `{}.{}` differs from pinned revision `{}`",
+                state.connector,
+                state.operation.as_str(),
+                snapshot.revision
+            );
+        }
+        let provider_idempotent = matches!(
+            dependency.spec.effect,
+            donat_connector_catalog::OperationEffect::ProviderIdempotent { .. }
+        );
+        if provider_idempotent != state.provider_idempotent {
+            bail!(
+                "Process request state `{}` has a mismatched connector effect",
+                snapshot.current_state
+            );
+        }
+
+        let input = Json::Object(
+            evaluate_process_values(
+                &state.input,
+                &process_value_context(&self.source_name, &snapshot),
+            )?
+            .into_iter()
+            .collect(),
+        );
+        dependency
+            .spec
+            .input
+            .validate(&typed_value(&input).context("decoding Process activity input")?)
+            .map_err(|error| anyhow!("Process activity input violated its contract: {error}"))?;
+        let request_fingerprint = canonical_json_sha256(&input);
+        let serialization_key_hash = dependency
+            .serialization_key_input
+            .as_deref()
+            .map(|field| super::activity::process_serialization_key_hash(&input, field))
+            .transpose()?;
+        Ok(PreparedTransition::Request(PreparedRequestTransition {
+            snapshot,
+            state,
+            input,
+            request_fingerprint,
+            serialization_key_hash,
+        }))
+    }
+
+    async fn prepare_request_success_transition(
+        &self,
+        client: &tokio_postgres::Client,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessRequestState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let activity_job_id = snapshot
+            .event_payload
+            .get("activity_job_id")
+            .and_then(Json::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| anyhow!("Process activity success event has no valid job ID"))?;
+        let attempt = snapshot
+            .event_payload
+            .get("attempt")
+            .and_then(Json::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow!("Process activity success event has no valid attempt"))?;
+        let lease_generation = snapshot
+            .event_payload
+            .get("lease_generation")
+            .and_then(Json::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                anyhow!("Process activity success event has no valid lease generation")
+            })?;
+        let row = client
+            .query_opt(
+                "
+                SELECT
+                    result_json,
+                    request_fingerprint,
+                    connector_instance,
+                    operation,
+                    state_name,
+                    attempts,
+                    lease_generation
+                FROM donat.process_activity_jobs
+                WHERE source_name = $1
+                  AND id = $2
+                  AND instance_id = $3
+                  AND status = 'succeeded'
+                ",
+                &[&self.source_name, &activity_job_id, &snapshot.instance_id],
+            )
+            .await
+            .context("reading successful Process activity result")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process activity success event references no succeeded job `{activity_job_id}`"
+                )
+            })?;
+        let output: Json = row
+            .get::<_, Option<Json>>("result_json")
+            .ok_or_else(|| anyhow!("succeeded Process activity has no result"))?;
+        let connector: String = row.get("connector_instance");
+        let operation: String = row.get("operation");
+        let state_name: String = row.get("state_name");
+        let stored_attempt: i32 = row.get("attempts");
+        let stored_generation: i64 = row.get("lease_generation");
+        if connector != state.connector
+            || operation != state.operation.as_str()
+            || state_name != snapshot.current_state
+            || stored_attempt != attempt
+            || stored_generation != lease_generation
+        {
+            bail!("Process activity success event differs from its terminal job");
+        }
+        validate_state_output(&definition, &snapshot, &output)
+            .context("validating Process activity state output")?;
+        Ok(PreparedTransition::RequestSuccess(
+            PreparedRequestSuccessTransition {
+                snapshot,
+                state,
+                activity_job_id,
+                attempt,
+                lease_generation,
+                output,
+            },
+        ))
+    }
+
+    async fn prepare_request_failure_transition(
+        &self,
+        client: &tokio_postgres::Client,
+        snapshot: TransitionSnapshot,
+        state: CompiledProcessRequestState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let activity_job_id = snapshot
+            .event_payload
+            .get("activity_job_id")
+            .and_then(Json::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| anyhow!("Process activity failure event has no valid job ID"))?;
+        let row = client
+            .query_opt(
+                "
+                SELECT
+                    state_name,
+                    connector_instance,
+                    operation,
+                    attempts,
+                    lease_generation,
+                    last_error_json
+                FROM donat.process_activity_jobs
+                WHERE source_name = $1
+                  AND id = $2
+                  AND instance_id = $3
+                  AND status = 'failed'
+                ",
+                &[&self.source_name, &activity_job_id, &snapshot.instance_id],
+            )
+            .await
+            .context("reading failed Process activity")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process activity failure event references no failed job `{activity_job_id}`"
+                )
+            })?;
+        let state_name: String = row.get("state_name");
+        let connector: String = row.get("connector_instance");
+        let operation: String = row.get("operation");
+        let attempt: i32 = row.get("attempts");
+        let lease_generation: i64 = row.get("lease_generation");
+        let stored_error: Json = row
+            .get::<_, Option<Json>>("last_error_json")
+            .ok_or_else(|| anyhow!("failed Process activity has no safe error"))?;
+        if state_name != snapshot.current_state
+            || connector != state.connector
+            || operation != state.operation.as_str()
+        {
+            bail!("Process activity failure event differs from its terminal job");
+        }
+        let event_error = snapshot
+            .event_payload
+            .get("error")
+            .ok_or_else(|| anyhow!("Process activity failure event has no safe error"))?;
+        if event_error != &stored_error {
+            bail!("Process activity failure event differs from the stored safe error");
+        }
+        let error_kind = if snapshot.event_kind == "retry_exhausted" {
+            "retry_exhausted"
+        } else {
+            stored_error
+                .get("class")
+                .and_then(Json::as_str)
+                .ok_or_else(|| anyhow!("Process activity safe error has no class"))?
+        };
+        let routes = state.on_error.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Process request state `{}` has no compiled error route",
+                snapshot.current_state
+            )
+        })?;
+        let next = routes
+            .routes
+            .iter()
+            .find(|route| {
+                route
+                    .kinds
+                    .iter()
+                    .any(|kind| process_error_kind_name(kind) == error_kind)
+            })
+            .map(|route| route.next.clone())
+            .unwrap_or_else(|| routes.fallback.next.clone());
+        Ok(PreparedTransition::RequestFailure(
+            PreparedRequestFailureTransition {
+                snapshot,
+                activity_job_id,
+                attempt,
+                lease_generation,
+                next,
+                error_kind: error_kind.to_owned(),
+            },
+        ))
     }
 
     fn prepare_when_transition(
@@ -518,6 +896,7 @@ fn transition_snapshot(row: &Row) -> TransitionSnapshot {
     TransitionSnapshot {
         event_id: row.get("event_id"),
         event_kind: row.get("event_kind"),
+        event_payload: row.get("event_payload"),
         instance_id: row.get("instance_id"),
         process_name: row.get("process_name"),
         revision: row.get("revision"),
@@ -564,6 +943,20 @@ fn json_matches(
     Ok(expected
         .iter()
         .all(|(field, expected)| object.get(field) == Some(expected)))
+}
+
+fn process_error_kind_name(kind: &ProcessErrorKind) -> &'static str {
+    match kind {
+        ProcessErrorKind::Authentication => "authentication",
+        ProcessErrorKind::Transport => "transport",
+        ProcessErrorKind::Timeout => "timeout",
+        ProcessErrorKind::Http429 => "http_429",
+        ProcessErrorKind::Http5xx => "http_5xx",
+        ProcessErrorKind::Validation => "validation",
+        ProcessErrorKind::Permanent => "permanent",
+        ProcessErrorKind::Invariant => "invariant",
+        ProcessErrorKind::RetryExhausted => "retry_exhausted",
+    }
 }
 
 fn validate_state_output(
@@ -661,7 +1054,13 @@ async fn lock_prepared_snapshot(
               AND event.instance_id = $3
               AND event.status = 'pending'
               AND event.kind = $6
-              AND event.kind IN ('start', 'continue')
+              AND event.kind IN (
+                  'start',
+                  'continue',
+                  'activity_succeeded',
+                  'activity_failed',
+                  'retry_exhausted'
+              )
               AND event.available_at <= statement_timestamp()
               AND instance.status = 'running'
               AND instance.process_name = $4
@@ -722,6 +1121,290 @@ async fn commit_applied_command(
         next_version(&prepared.snapshot)?,
     )
     .await
+}
+
+async fn commit_request_schedule(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedRequestTransition,
+) -> anyhow::Result<Uuid> {
+    let version = next_version(&prepared.snapshot)?;
+    let schedule_to_start_ms = i64::try_from(prepared.state.schedule_to_start_ms)
+        .context("Process schedule_to_start exceeds PostgreSQL interval input")?;
+    let operation = prepared.state.operation.as_str();
+    let logical_activity_id = format!(
+        "activity:v1:{}:{}:{}:{}",
+        prepared.snapshot.revision,
+        prepared.snapshot.instance_id,
+        prepared.snapshot.event_id,
+        prepared.snapshot.current_state
+    );
+    let activity_job_id = transaction
+        .query_one(
+            "
+            WITH activity_clock AS (
+                SELECT statement_timestamp() AS at
+            )
+            INSERT INTO donat.process_activity_jobs (
+                source_name,
+                instance_id,
+                enqueued_from_event_id,
+                state_name,
+                logical_activity_id,
+                connector_instance,
+                operation,
+                serialization_key_hash,
+                input_json,
+                request_fingerprint,
+                status,
+                available_at,
+                schedule_to_start_deadline,
+                created_at,
+                updated_at
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                'scheduled',
+                activity_clock.at,
+                activity_clock.at + ($11::bigint * interval '1 millisecond'),
+                activity_clock.at,
+                activity_clock.at
+            FROM activity_clock
+            RETURNING id
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &prepared.snapshot.current_state,
+                &logical_activity_id,
+                &prepared.state.connector,
+                &operation,
+                &prepared.serialization_key_hash,
+                &prepared.input,
+                &prepared.request_fingerprint,
+                &schedule_to_start_ms,
+            ],
+        )
+        .await
+        .context("scheduling durable Process activity")?
+        .get("id");
+
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET version = $4,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $5
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.current_state,
+                &version,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("committing Process activity schedule version")?;
+    if updated != 1 {
+        bail!("locked Process request state did not schedule exactly once");
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    append_activity_scheduled_log(transaction, source_name, prepared, activity_job_id).await?;
+    Ok(activity_job_id)
+}
+
+async fn commit_request_success(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedRequestSuccessTransition,
+) -> anyhow::Result<()> {
+    advance_instance(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.state.next,
+        &prepared.output,
+    )
+    .await?;
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    transaction
+        .execute(
+            "
+            INSERT INTO donat.process_transition_logs (
+                source_name,
+                instance_id,
+                event_id,
+                activity_job_id,
+                activity_attempt,
+                activity_lease_generation,
+                from_state,
+                to_state,
+                outcome,
+                definition_revision,
+                redacted_context
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    'activity_succeeded', $9, $10)
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &prepared.activity_job_id,
+                &prepared.attempt,
+                &prepared.lease_generation,
+                &prepared.snapshot.current_state,
+                &prepared.state.next,
+                &prepared.snapshot.revision,
+                &json!({ "activity_job_id": prepared.activity_job_id.to_string() }),
+            ],
+        )
+        .await
+        .context("appending Process activity success transition log")?;
+    append_continue_event(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        next_version(&prepared.snapshot)?,
+    )
+    .await
+}
+
+async fn commit_request_failure(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedRequestFailureTransition,
+) -> anyhow::Result<()> {
+    let version = next_version(&prepared.snapshot)?;
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET current_state = $4,
+                version = $5,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $6
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.current_state,
+                &prepared.next,
+                &version,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("routing failed Process activity")?;
+    if updated != 1 {
+        bail!("locked Process activity failure did not route exactly once");
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    transaction
+        .execute(
+            "
+            INSERT INTO donat.process_transition_logs (
+                source_name,
+                instance_id,
+                event_id,
+                activity_job_id,
+                activity_attempt,
+                activity_lease_generation,
+                from_state,
+                to_state,
+                outcome,
+                definition_revision,
+                redacted_context
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    'activity_error_routed', $9, $10)
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &prepared.activity_job_id,
+                &prepared.attempt,
+                &prepared.lease_generation,
+                &prepared.snapshot.current_state,
+                &prepared.next,
+                &prepared.snapshot.revision,
+                &json!({
+                    "error_kind": prepared.error_kind,
+                    "route": prepared.next,
+                }),
+            ],
+        )
+        .await
+        .context("appending Process activity error route log")?;
+    append_continue_event(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        next_version(&prepared.snapshot)?,
+    )
+    .await
+}
+
+async fn append_activity_scheduled_log(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedRequestTransition,
+    activity_job_id: Uuid,
+) -> anyhow::Result<()> {
+    transaction
+        .execute(
+            "
+            INSERT INTO donat.process_transition_logs (
+                source_name,
+                instance_id,
+                event_id,
+                activity_job_id,
+                from_state,
+                to_state,
+                outcome,
+                definition_revision,
+                redacted_context
+            )
+            VALUES ($1, $2, $3, $4, $5, $5, 'activity_scheduled', $6, $7)
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &activity_job_id,
+                &prepared.snapshot.current_state,
+                &prepared.snapshot.revision,
+                &json!({
+                    "connector": prepared.state.connector,
+                    "operation": prepared.state.operation.as_str(),
+                    "request_fingerprint": prepared.request_fingerprint,
+                }),
+            ],
+        )
+        .await
+        .context("appending Process activity schedule log")?;
+    Ok(())
 }
 
 async fn commit_when(

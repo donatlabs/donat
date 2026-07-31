@@ -20,7 +20,10 @@ use donat_schema::{
 use crate::connectors::ConnectorRegistry;
 use crate::state::{SharedState, SourceRuntime};
 
-use super::{DeployedSourceProcessCatalog, StartConsumption, TransitionConsumption};
+use super::{
+    ActivityConsumption, DeployedSourceProcessCatalog, ProcessActivityExecutor, StartConsumption,
+    TransitionConsumption,
+};
 
 /// Immutable planning inputs captured from the same published Engine
 /// candidate as the deployed Process and finalized Command catalogs.
@@ -67,8 +70,8 @@ pub struct ProcessRuntime {
     pub planning_snapshot: Arc<ProcessPlanningSnapshot>,
     pub command_catalog: Arc<CompiledCommandCatalog>,
     pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
-    #[allow(dead_code)]
     pub connector_registry: Arc<ConnectorRegistry>,
+    pub activity_executor: Arc<dyn ProcessActivityExecutor>,
 }
 
 pub fn build_process_runtime(
@@ -79,6 +82,34 @@ pub fn build_process_runtime(
     command_catalog: Arc<CompiledCommandCatalog>,
     finalized_command_catalog: Arc<FinalizedCommandCatalog>,
     connector_registry: Arc<ConnectorRegistry>,
+) -> anyhow::Result<ProcessRuntime> {
+    build_process_runtime_with_activity_executor(
+        source_name,
+        source_runtime,
+        deployed_catalog,
+        planning_snapshot,
+        command_catalog,
+        finalized_command_catalog,
+        connector_registry.clone(),
+        connector_registry,
+    )
+}
+
+/// Assemble a runtime with an explicit connector-execution boundary.
+///
+/// Serving uses the immutable [`ConnectorRegistry`] for both catalog and
+/// execution. The separate argument keeps activity orchestration testable
+/// without weakening the production registry or admitting raw HTTP.
+#[allow(clippy::too_many_arguments)]
+pub fn build_process_runtime_with_activity_executor(
+    source_name: &str,
+    source_runtime: &SourceRuntime,
+    deployed_catalog: Arc<DeployedSourceProcessCatalog>,
+    planning_snapshot: Arc<ProcessPlanningSnapshot>,
+    command_catalog: Arc<CompiledCommandCatalog>,
+    finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    connector_registry: Arc<ConnectorRegistry>,
+    activity_executor: Arc<dyn ProcessActivityExecutor>,
 ) -> anyhow::Result<ProcessRuntime> {
     let SourceRuntime::Postgres { pool, .. } = source_runtime else {
         bail!("Process source `{source_name}` must use Postgres");
@@ -106,6 +137,7 @@ pub fn build_process_runtime(
         command_catalog,
         finalized_command_catalog,
         connector_registry,
+        activity_executor,
     })
 }
 
@@ -264,11 +296,143 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     "Process command state rejected"
                 );
             }
+            Ok(TransitionConsumption::ActivityScheduled {
+                instance_id,
+                event_id,
+                activity_job_id,
+                state,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    %activity_job_id,
+                    state,
+                    "Process activity scheduled"
+                );
+            }
             Err(error) => {
                 tracing::error!(
                     source = %runtime.source_name,
                     error = %error,
                     "Process transition consumer failed"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        }
+        match runtime.consume_one_activity().await {
+            Ok(ActivityConsumption::NoWork) => {}
+            Ok(ActivityConsumption::CapacityDeferred { activity_job_id }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %activity_job_id,
+                    "Process activity deferred by durable capacity"
+                );
+            }
+            Ok(ActivityConsumption::ScheduleToStartTimedOut {
+                instance_id,
+                activity_job_id,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    "Process activity schedule-to-start expired"
+                );
+            }
+            Ok(ActivityConsumption::Succeeded {
+                instance_id,
+                activity_job_id,
+                attempt,
+                lease_generation,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    attempt,
+                    lease_generation,
+                    "Process activity completed"
+                );
+            }
+            Ok(ActivityConsumption::RetryScheduled {
+                instance_id,
+                activity_job_id,
+                failed_attempt,
+                next_attempt,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    failed_attempt,
+                    next_attempt,
+                    "Process activity retry scheduled"
+                );
+            }
+            Ok(ActivityConsumption::RetryExhausted {
+                instance_id,
+                activity_job_id,
+                attempt,
+                lease_generation,
+                last_class,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    attempt,
+                    lease_generation,
+                    ?last_class,
+                    "Process activity retry budget exhausted"
+                );
+            }
+            Ok(ActivityConsumption::Failed {
+                instance_id,
+                activity_job_id,
+                attempt,
+                lease_generation,
+                class,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    attempt,
+                    lease_generation,
+                    ?class,
+                    "Process activity failed"
+                );
+            }
+            Ok(ActivityConsumption::StaleCompletion {
+                instance_id,
+                activity_job_id,
+                attempt,
+                lease_generation,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %activity_job_id,
+                    attempt,
+                    lease_generation,
+                    "stale Process activity completion ignored"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    source = %runtime.source_name,
+                    error = %error,
+                    "Process activity consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
                 continue;

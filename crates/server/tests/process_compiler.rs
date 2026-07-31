@@ -6,8 +6,8 @@ use donat_ir::{
     ProcessStartPolicy, TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
 };
 use donat_metadata::{
-    Metadata, ProcessField, ProcessLifecycle, ProcessOwner, ProcessStateOperation, ProcessValue,
-    SourceKind,
+    Metadata, ProcessErrorKind, ProcessField, ProcessLifecycle, ProcessOwner,
+    ProcessStateOperation, ProcessValue, SourceKind,
 };
 use donat_rules::RuleType;
 use donat_server::connectors::ConnectorRegistry;
@@ -509,6 +509,16 @@ fn process_compiler_rejects_invalid_activity_references_and_contracts() {
         invalid_retry,
         "processes[0].states[0].request.retry.max_attempts",
         "greater than zero",
+    ));
+
+    let mut non_retryable_kind = base_metadata();
+    request_state_mut(&mut non_retryable_kind).retry.retry_on =
+        vec![ProcessErrorKind::Authentication];
+    cases.push((
+        "non-retryable error kind",
+        non_retryable_kind,
+        "processes[0].states[0].request.retry.retry_on[0]",
+        "only transport, timeout, http_429, and http_5xx are retryable",
     ));
 
     for (case, metadata, expected_path, expected_message) in cases {

@@ -549,6 +549,10 @@ impl ValidatedHttpOperation {
         }
         Ok(())
     }
+
+    pub(crate) fn serialization_key_input(&self) -> Option<&str> {
+        self.serialize_by.as_deref()
+    }
 }
 
 /// Validate static HTTP headers and operations without resolving any

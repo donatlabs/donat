@@ -7,10 +7,10 @@ use donat_ir::{
     ProcessStartPolicy, TypeRef, ValueContractCatalog, ValueContractField, ValueScalar, ValueType,
 };
 use donat_metadata::{
-    Metadata, Process, ProcessDeadline, ProcessErrorRoutes, ProcessField, ProcessForEachState,
-    ProcessIdempotencyValue, ProcessLifecycle, ProcessRequestActivity, ProcessRequestState,
-    ProcessRetry, ProcessSignalWait, ProcessState, ProcessStateOperation, ProcessValue,
-    ProcessWaitState, SourceKind,
+    Metadata, Process, ProcessDeadline, ProcessErrorKind, ProcessErrorRoutes, ProcessField,
+    ProcessForEachState, ProcessIdempotencyValue, ProcessLifecycle, ProcessRequestActivity,
+    ProcessRequestState, ProcessRetry, ProcessSignalWait, ProcessState, ProcessStateOperation,
+    ProcessValue, ProcessWaitState, SourceKind,
 };
 use donat_rules::RuleType;
 use donat_schema::{
@@ -55,6 +55,7 @@ pub struct ProcessDecisionDescriptor {
 pub struct ResolvedProcessConnectorOperation {
     pub spec: Arc<OperationSpec>,
     pub deployment_fingerprint: String,
+    pub serialization_key_input: Option<String>,
 }
 
 /// Narrow, read-only seam between process compilation and the executable
@@ -90,6 +91,9 @@ impl ProcessConnectorCatalog for ConnectorRegistry {
         Ok(Some(ResolvedProcessConnectorOperation {
             spec,
             deployment_fingerprint: deployment_fingerprint.to_owned(),
+            serialization_key_input: self
+                .serialization_key_input(instance, operation)
+                .map(str::to_owned),
         }))
     }
 }
@@ -241,6 +245,7 @@ pub struct PinnedConnectorOperation {
     pub instance: String,
     pub spec: Arc<OperationSpec>,
     pub deployment_fingerprint: String,
+    pub serialization_key_input: Option<String>,
 }
 
 impl std::fmt::Debug for PinnedConnectorOperation {
@@ -252,6 +257,7 @@ impl std::fmt::Debug for PinnedConnectorOperation {
             .field("operation", &self.spec.operation.as_str())
             .field("runtime_abi_epoch", &self.spec.runtime_abi_epoch)
             .field("deployment_fingerprint", &self.deployment_fingerprint)
+            .field("serialization_key_input", &self.serialization_key_input)
             .finish_non_exhaustive()
     }
 }
@@ -278,7 +284,7 @@ pub struct CompiledProcessState {
 #[derive(Debug, Clone)]
 pub enum CompiledProcessStateOperation {
     Command(CompiledProcessCommandState),
-    Request,
+    Request(Box<CompiledProcessRequestState>),
     When(CompiledProcessWhenState),
     Wait,
     ForEach,
@@ -292,6 +298,40 @@ pub struct CompiledProcessCommandState {
     pub role: CompiledProcessCommandRole,
     pub arguments: BTreeMap<String, ProcessValue>,
     pub next: String,
+}
+
+#[derive(Clone)]
+pub struct CompiledProcessRequestState {
+    pub connector: String,
+    pub operation: OperationId,
+    pub input: BTreeMap<String, ProcessValue>,
+    pub provider_idempotent: bool,
+    pub schedule_to_start_ms: u64,
+    pub start_to_close_ms: u64,
+    pub retry: ProcessRetry,
+    pub initial_retry_interval_ms: u64,
+    pub maximum_retry_interval_ms: u64,
+    pub next: String,
+    pub on_error: Option<ProcessErrorRoutes>,
+}
+
+impl std::fmt::Debug for CompiledProcessRequestState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledProcessRequestState")
+            .field("connector", &self.connector)
+            .field("operation", &self.operation.as_str())
+            .field("input", &self.input)
+            .field("provider_idempotent", &self.provider_idempotent)
+            .field("schedule_to_start_ms", &self.schedule_to_start_ms)
+            .field("start_to_close_ms", &self.start_to_close_ms)
+            .field("retry", &self.retry)
+            .field("initial_retry_interval_ms", &self.initial_retry_interval_ms)
+            .field("maximum_retry_interval_ms", &self.maximum_retry_interval_ms)
+            .field("next", &self.next)
+            .field("on_error", &self.on_error)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1423,14 +1463,18 @@ fn compile_state(
             )
         }
         ProcessStateOperation::Request { request } => {
-            let (output, horizons) = compile_request_state(
+            let (output, horizons, compiled) = compile_request_state(
                 request,
                 &state.id,
                 None,
                 context,
                 &format!("{}.request", context.path),
             )?;
-            (output, horizons, CompiledProcessStateOperation::Request)
+            (
+                output,
+                horizons,
+                CompiledProcessStateOperation::Request(Box::new(compiled)),
+            )
         }
         ProcessStateOperation::When { when } => {
             let (output, compiled) = compile_when_state(when, context)?;
@@ -1657,8 +1701,15 @@ fn compile_request_state(
     item_key: Option<&str>,
     context: &mut CompileContext<'_, '_>,
     path: &str,
-) -> Result<(ValueContractCatalog, BTreeMap<String, u64>), PlanError> {
-    compile_request(
+) -> Result<
+    (
+        ValueContractCatalog,
+        BTreeMap<String, u64>,
+        CompiledProcessRequestState,
+    ),
+    PlanError,
+> {
+    let (output, horizons, compiled) = compile_request(
         &request.connector,
         &request.operation,
         &request.input,
@@ -1670,7 +1721,37 @@ fn compile_request_state(
         item_key,
         context,
         path,
-    )
+    )?;
+    Ok((
+        output,
+        horizons,
+        CompiledProcessRequestState {
+            connector: compiled.connector,
+            operation: compiled.operation,
+            input: compiled.input,
+            provider_idempotent: compiled.provider_idempotent,
+            schedule_to_start_ms: compiled.schedule_to_start_ms,
+            start_to_close_ms: compiled.start_to_close_ms,
+            retry: compiled.retry,
+            initial_retry_interval_ms: compiled.initial_retry_interval_ms,
+            maximum_retry_interval_ms: compiled.maximum_retry_interval_ms,
+            next: request.next.clone(),
+            on_error: compiled.on_error,
+        },
+    ))
+}
+
+struct CompiledProcessRequestActivity {
+    connector: String,
+    operation: OperationId,
+    input: BTreeMap<String, ProcessValue>,
+    provider_idempotent: bool,
+    schedule_to_start_ms: u64,
+    start_to_close_ms: u64,
+    retry: ProcessRetry,
+    initial_retry_interval_ms: u64,
+    maximum_retry_interval_ms: u64,
+    on_error: Option<ProcessErrorRoutes>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1686,7 +1767,14 @@ fn compile_request(
     item_key: Option<&str>,
     context: &mut CompileContext<'_, '_>,
     path: &str,
-) -> Result<(ValueContractCatalog, BTreeMap<String, u64>), PlanError> {
+) -> Result<
+    (
+        ValueContractCatalog,
+        BTreeMap<String, u64>,
+        CompiledProcessRequestActivity,
+    ),
+    PlanError,
+> {
     if connector.trim().is_empty() || operation.trim().is_empty() {
         return Err(validation(
             path,
@@ -1747,8 +1835,14 @@ fn compile_request(
         start_to_close,
         &format!("{path}.retry"),
     )?;
+    let initial_retry_interval_ms = parse_duration(
+        &retry.initial_interval,
+        &format!("{path}.retry.initial_interval"),
+    )?;
+    let maximum_retry_interval_ms =
+        parse_duration(&retry.max_interval, &format!("{path}.retry.max_interval"))?;
     let mut horizons = BTreeMap::new();
-    match &resolved.spec.effect {
+    let provider_idempotent = match &resolved.spec.effect {
         donat_connector_catalog::OperationEffect::ReadOnly => {
             if idempotency_key.is_some() {
                 return Err(validation(
@@ -1756,6 +1850,7 @@ fn compile_request(
                     "read-only connector operations must remain headerless",
                 ));
             }
+            false
         }
         donat_connector_catalog::OperationEffect::ProviderIdempotent { side_effect_steps } => {
             let key = idempotency_key.ok_or_else(|| {
@@ -1795,8 +1890,10 @@ fn compile_request(
                 }
                 horizons.insert(step.step.as_str().to_owned(), maximum_send_horizon_ms);
             }
+            true
         }
-    }
+    };
+    let compiled_operation = resolved.spec.operation;
     let key = (
         context.process.source.clone(),
         connector.to_owned(),
@@ -1807,9 +1904,11 @@ fn compile_request(
         instance: connector.to_owned(),
         spec: resolved.spec,
         deployment_fingerprint: resolved.deployment_fingerprint,
+        serialization_key_input: resolved.serialization_key_input,
     };
     if let Some(existing) = context.closure.connector_operations.get(&key) {
         if existing.deployment_fingerprint != pinned.deployment_fingerprint
+            || existing.serialization_key_input != pinned.serialization_key_input
             || !Arc::ptr_eq(&existing.spec, &pinned.spec)
         {
             return Err(validation(
@@ -1820,7 +1919,22 @@ fn compile_request(
     } else {
         context.closure.connector_operations.insert(key, pinned);
     }
-    Ok((output_contract, horizons))
+    Ok((
+        output_contract,
+        horizons,
+        CompiledProcessRequestActivity {
+            connector: connector.to_owned(),
+            operation: compiled_operation,
+            input: input.clone(),
+            provider_idempotent,
+            schedule_to_start_ms: schedule_to_start,
+            start_to_close_ms: start_to_close,
+            retry: retry.clone(),
+            initial_retry_interval_ms,
+            maximum_retry_interval_ms,
+            on_error: on_error.cloned(),
+        },
+    ))
 }
 
 fn validate_stable_activity_key(
@@ -1909,6 +2023,18 @@ fn compile_retry_horizon(
     }
     let mut kinds = BTreeSet::new();
     for (index, kind) in retry.retry_on.iter().enumerate() {
+        if !matches!(
+            kind,
+            ProcessErrorKind::Transport
+                | ProcessErrorKind::Timeout
+                | ProcessErrorKind::Http429
+                | ProcessErrorKind::Http5xx
+        ) {
+            return Err(validation(
+                format!("{path}.retry_on[{index}]"),
+                "only transport, timeout, http_429, and http_5xx are retryable",
+            ));
+        }
         if !kinds.insert(format!("{kind:?}")) {
             return Err(validation(
                 format!("{path}.retry_on[{index}]"),
@@ -2497,7 +2623,7 @@ fn compile_request_activity(
     context: &mut CompileContext<'_, '_>,
     path: &str,
 ) -> Result<(ValueContractCatalog, BTreeMap<String, u64>), PlanError> {
-    compile_request(
+    let (output, horizons, _) = compile_request(
         &request.connector,
         &request.operation,
         &request.input,
@@ -2509,7 +2635,8 @@ fn compile_request_activity(
         Some(item_key),
         context,
         path,
-    )
+    )?;
+    Ok((output, horizons))
 }
 
 fn failure_item_type(item: &TypeRef, _item_key: &str) -> TypeRef {
@@ -3643,6 +3770,7 @@ pub fn process_dependency_descriptors(
                 "input_contract_sha256": hex_hash(&spec.input_contract_sha256),
                 "output_contract_sha256": hex_hash(&spec.output_contract_sha256),
                 "deployment_fingerprint": dependency.deployment_fingerprint,
+                "serialization_key_input": dependency.serialization_key_input,
             })
         })
         .collect::<Vec<_>>();

@@ -402,22 +402,24 @@ impl StripeConnector {
             .map_err(|_| invariant_failure("connector activity idempotency key is invalid"))?;
         let authorization = HeaderValue::from_str(&format!("Bearer {}", self.secret_key))
             .map_err(|_| invariant_failure("stripe secret key is invalid"))?;
-        let mut form = url::form_urlencoded::Serializer::new(String::new());
-        form.append_pair("mode", input.mode.as_str());
-        form.append_pair("success_url", &input.success_url);
-        form.append_pair("cancel_url", &input.cancel_url);
-        form.append_pair(
-            "client_reference_id",
-            &input.client_reference_id.to_string(),
-        );
-        for (index, item) in input.line_items.iter().enumerate() {
-            form.append_pair(&format!("line_items[{index}][price]"), &item.price);
+        let body = {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("mode", input.mode.as_str());
+            form.append_pair("success_url", &input.success_url);
+            form.append_pair("cancel_url", &input.cancel_url);
             form.append_pair(
-                &format!("line_items[{index}][quantity]"),
-                &item.quantity.to_string(),
+                "client_reference_id",
+                &input.client_reference_id.to_string(),
             );
-        }
-        let body = form.finish().into_bytes();
+            for (index, item) in input.line_items.iter().enumerate() {
+                form.append_pair(&format!("line_items[{index}][price]"), &item.price);
+                form.append_pair(
+                    &format!("line_items[{index}][quantity]"),
+                    &item.quantity.to_string(),
+                );
+            }
+            form.finish().into_bytes()
+        };
         if body.len() > MAX_HTTP_BODY_BYTES {
             return Err(invariant_failure(
                 "Stripe Checkout request exceeds the 1 MiB limit",

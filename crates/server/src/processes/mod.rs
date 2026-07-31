@@ -4,6 +4,7 @@
 //! not live here.  This module turns finite metadata plus immutable dependency
 //! descriptors into one immutable, fingerprinted catalog.
 
+mod activity;
 mod catalog;
 mod command;
 mod definition;
@@ -13,6 +14,7 @@ mod start;
 mod transition;
 mod value;
 
+pub use activity::*;
 pub use catalog::*;
 pub use command::*;
 pub use definition::*;

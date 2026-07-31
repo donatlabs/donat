@@ -162,6 +162,7 @@ struct CompiledHttpOperation {
 /// unenabled provider capability.
 struct CompiledStripeOperation {
     configuration_fingerprint: String,
+    serialization_key_input: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -428,6 +429,10 @@ impl ConnectorRegistry {
                                 &instance.config,
                                 operation,
                             ),
+                            serialization_key_input: operation
+                                .capacity()
+                                .and_then(|capacity| capacity.serialize_by.as_ref())
+                                .map(|binding| binding.input.clone()),
                         };
                         if operations
                             .insert(operation.name.clone(), compiled)
@@ -541,6 +546,22 @@ impl ConnectorRegistry {
             Some(RegistryInstance::Stripe { operations, .. }) => operations
                 .get(operation)
                 .map(|operation| operation.configuration_fingerprint.as_str()),
+            None => None,
+        }
+    }
+
+    /// Return the optional scalar input that serializes this exact operation.
+    /// An unknown operation and an operation without serialization both return
+    /// `None`; callers already resolve the operation spec before consulting
+    /// this refinement.
+    pub fn serialization_key_input(&self, instance: &str, operation: &str) -> Option<&str> {
+        match self.instances.get(instance) {
+            Some(RegistryInstance::Http { operations, .. }) => operations
+                .get(operation)
+                .and_then(|operation| operation.operation.serialization_key_input()),
+            Some(RegistryInstance::Stripe { operations, .. }) => operations
+                .get(operation)
+                .and_then(|operation| operation.serialization_key_input.as_deref()),
             None => None,
         }
     }
