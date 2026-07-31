@@ -22,3 +22,26 @@ Metadata (table tracking, permissions, relationships, remote schemas,
 allowlists, inherited roles) is NOT migrated — it is desired-state YAML
 loaded at boot via `--metadata-dir`; `validate` fails the deploy if it is
 inconsistent with the schema.
+
+When Process metadata is present, deploy each selected Postgres source
+explicitly:
+
+```sh
+donat migrate \
+  --migrations-dir migrations \
+  --metadata-dir metadata \
+  --source default
+```
+
+After applying versioned DDL, this command reconciles immutable Process
+definition revisions for that source. Reconciliation is deploy-time state,
+not serving-time schema repair: `serve` only verifies the migrated helper and
+the deployed active/live-retired revisions with read-only catalog queries.
+
+## Bundled runtime migrations
+
+- V3–V5 install the Command journal, first-executor claim, and qualified
+  execution identity.
+- V6 installs the source-local Process journal and activity/inbound ledgers,
+  adds the Command execution-generation UUID used by atomic Process outboxes,
+  and owns `donat.check_violation(text)`.

@@ -589,6 +589,12 @@ impl SqlitePool {
 }
 
 impl SourceRuntime {
+    /// Construct the standard bounded Postgres runtime used by serving and
+    /// integration tests.
+    pub fn postgres(url: &str) -> anyhow::Result<Self> {
+        stage_postgres_runtime(url, RuntimePoolSettings::default(), None)
+    }
+
     fn kind(&self) -> SourceKind {
         match self {
             Self::Postgres { .. } => SourceKind::Postgres,
@@ -607,6 +613,14 @@ pub struct Engine {
     pub rule_catalog: Arc<RuleCatalog>,
     /// Catalog snapshot per source name.
     pub catalogs: HashMap<String, Catalog>,
+    /// Pre-Process command descriptors retained for deployment verification.
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    /// The only command catalog accepted by request and Process execution.
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    /// Current metadata Process definitions compiled before journal access.
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    /// Database-verified active plus live-retired executable revisions.
+    pub deployed_process_catalog: Arc<crate::processes::DeployedProcessCatalog>,
     pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
     pub runtimes: HashMap<String, SourceRuntime>,
     /// Normalized documents admitted by the allowlist. This is compiled with
@@ -713,6 +727,10 @@ impl Engine {
             metadata,
             rule_catalog: Arc::new(rule_catalog),
             catalogs: HashMap::new(),
+            command_catalog: Arc::new(CompiledCommandCatalog::default()),
+            finalized_command_catalog: Arc::new(FinalizedCommandCatalog::default()),
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
             compiled: None,
             runtimes: HashMap::new(),
             allowed_queries,
@@ -756,6 +774,10 @@ impl Engine {
             &rule_catalog,
             infer_function_permissions,
         )?);
+        let finalized_command_catalog = Arc::new(finalize_command_effects(
+            command_catalog.as_ref().clone(),
+            &ProcessEffectContractCatalog::default(),
+        )?);
         let compiled = Arc::new(CompiledMultiSourceSchema::compile_with_command_catalog(
             &metadata,
             &catalogs,
@@ -769,12 +791,42 @@ impl Engine {
             metadata,
             rule_catalog,
             catalogs,
+            command_catalog,
+            finalized_command_catalog,
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
             compiled: Some(compiled),
             runtimes,
             allowed_queries,
             rest_queries,
             remote_permission_schemas,
         })
+    }
+
+    fn from_pure_candidate(
+        metadata: Metadata,
+        catalogs: HashMap<String, Catalog>,
+        runtimes: HashMap<String, SourceRuntime>,
+        candidate: PureEngineCandidate,
+        deployed_process_catalog: crate::processes::DeployedProcessCatalog,
+    ) -> Self {
+        let allowed_queries = compile_allowed_queries(&metadata);
+        let rest_queries = crate::rest::compile_saved_queries(&metadata);
+        let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
+        Self {
+            metadata,
+            rule_catalog: candidate.rule_catalog,
+            catalogs,
+            command_catalog: candidate.command_catalog,
+            finalized_command_catalog: candidate.finalized_command_catalog,
+            process_catalog: candidate.process_catalog,
+            deployed_process_catalog: Arc::new(deployed_process_catalog),
+            compiled: candidate.compiled,
+            runtimes,
+            allowed_queries,
+            rest_queries,
+            remote_permission_schemas,
+        }
     }
 }
 
@@ -2003,7 +2055,6 @@ impl AppState {
                         unreachable!("PostgreSQL staging returned a non-PostgreSQL runtime")
                     };
                     let client = pool.get().await?;
-                    ensure_check_violation_helper(&client).await?;
                     (donat_catalog::introspect(&client).await?, runtime)
                 }
                 SourceKind::Sqlite => {
@@ -2112,12 +2163,28 @@ impl AppState {
                 });
             }
         }
-        let candidate = Engine::compiled(
+        let pure = compile_pure_engine_candidate(
+            &metadata,
+            &new_catalogs,
+            self.connectors.as_ref(),
+            self.infer_function_permissions,
+        )?;
+        let deployed_process_catalog = crate::processes::validate_serving_catalogs(
+            &new_runtimes,
+            &metadata,
+            pure.rule_catalog(),
+            pure.process_catalog.as_ref(),
+            pure.command_catalog.as_ref(),
+            self.connectors.as_ref(),
+        )
+        .await?;
+        let candidate = Engine::from_pure_candidate(
             metadata,
             new_catalogs,
             new_runtimes,
-            self.infer_function_permissions,
-        )?;
+            pure,
+            deployed_process_catalog,
+        );
         self.publish_candidate(Ok(candidate)).await?;
         Ok(())
     }
@@ -3079,27 +3146,6 @@ mod clickhouse_transport_tests {
         );
         server.abort();
     }
-}
-
-/// The helper raised by generated mutation SQL on permission-check
-/// violations (SQLSTATE 23514 with a JSON payload).
-pub async fn ensure_check_violation_helper(
-    client: &deadpool_postgres::Client,
-) -> anyhow::Result<()> {
-    client
-        .batch_execute(
-            r#"
-            CREATE SCHEMA IF NOT EXISTS donat;
-            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
-            RETURNS json AS $$
-            BEGIN
-                RAISE EXCEPTION USING message = msg, errcode = '23514';
-            END;
-            $$ LANGUAGE plpgsql;
-            "#,
-        )
-        .await?;
-    Ok(())
 }
 
 /// Make sure the metadata has at least one (default) source so that

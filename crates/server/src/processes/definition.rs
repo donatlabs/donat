@@ -3184,6 +3184,19 @@ fn revision_fingerprint(
     definition_fingerprint: &str,
     dependencies: &ProcessDependencyClosure,
 ) -> Result<String, PlanError> {
+    hash_json(
+        b"donat.process.revision.v1\0",
+        &process_dependency_descriptors(definition_fingerprint, dependencies),
+    )
+}
+
+/// Canonical, non-secret dependency closure persisted beside one executable
+/// Process definition. This is the exact material hashed into the revision,
+/// so a loader can recompile and compare the complete closure byte-for-byte.
+pub fn process_dependency_descriptors(
+    definition_fingerprint: &str,
+    dependencies: &ProcessDependencyClosure,
+) -> Json {
     let commands = dependencies
         .commands
         .iter()
@@ -3250,16 +3263,13 @@ fn revision_fingerprint(
             })
         })
         .collect::<Vec<_>>();
-    hash_json(
-        b"donat.process.revision.v1\0",
-        &serde_json::json!({
-            "definition_fingerprint": definition_fingerprint,
-            "commands": commands,
-            "rules": rules,
-            "decision_tables": decisions,
-            "connector_operations": connector_operations,
-        }),
-    )
+    serde_json::json!({
+        "definition_fingerprint": definition_fingerprint,
+        "commands": commands,
+        "rules": rules,
+        "decision_tables": decisions,
+        "connector_operations": connector_operations,
+    })
 }
 
 fn contract_material(contract: &ValueContractCatalog) -> Json {

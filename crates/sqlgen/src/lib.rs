@@ -1195,10 +1195,11 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
     let result_source = match &invocation {
         Some(invocation) => {
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, {result_cte}.{result_col}, 'succeeded', {expires_at} FROM {claim} CROSS JOIN {result_cte} WHERE {claim}.{claim_state} = 'first' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {input_fingerprint} = EXCLUDED.{input_fingerprint}, {result_col} = EXCLUDED.{result_col}, {status} = EXCLUDED.{status}, {expires_at_col} = EXCLUDED.{expires_at_col} RETURNING {result_col}, {input_fingerprint})",
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {invocation_id}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, gen_random_uuid(), {input_hash}, {result_cte}.{result_col}, 'succeeded', {expires_at} FROM {claim} CROSS JOIN {result_cte} WHERE {claim}.{claim_state} = 'first' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {invocation_id} = EXCLUDED.{invocation_id}, {input_fingerprint} = EXCLUDED.{input_fingerprint}, {result_col} = EXCLUDED.{result_col}, {status} = EXCLUDED.{status}, {expires_at_col} = EXCLUDED.{expires_at_col} RETURNING {result_col}, {input_fingerprint}, {invocation_id})",
                 cte = quote_ident("_cmd_store_first"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocations"),
+                invocation_id = quote_ident("invocation_id"),
                 result_col = quote_ident("result"),
                 status = quote_ident("status"),
                 result_cte = quote_ident("_cmd_result"),
@@ -1214,10 +1215,11 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 expires_at = invocation.expires_at,
             ));
             ctes.push(format!(
-                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, {input_hash}, 'null'::jsonb, 'succeeded', {expires_at} FROM {claim} WHERE {claim}.{claim_state} = 'replay' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {key} = EXCLUDED.{key} RETURNING {result_col}, {input_fingerprint})",
+                "{cte} AS (INSERT INTO {schema}.{table} ({command_identity}, {command_name}, {scope_hash}, {key}, {invocation_id}, {input_fingerprint}, {result_col}, {status}, {expires_at_col}) SELECT {claim}.{command_identity}, {claim}.{command_name}, {claim}.{scope_hash}, {claim}.{key}, gen_random_uuid(), {input_hash}, 'null'::jsonb, 'succeeded', {expires_at} FROM {claim} WHERE {claim}.{claim_state} = 'replay' ON CONFLICT ({command_identity}, {scope_hash}, {key}) DO UPDATE SET {key} = EXCLUDED.{key} RETURNING {result_col}, {input_fingerprint}, {invocation_id})",
                 cte = quote_ident("_cmd_store_replay"),
                 schema = quote_ident("donat"),
                 table = quote_ident("command_invocations"),
+                invocation_id = quote_ident("invocation_id"),
                 command_identity = quote_ident("command_identity"),
                 command_name = quote_ident("command_name"),
                 scope_hash = quote_ident("scope_hash"),
@@ -1232,10 +1234,11 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                 claim_state = quote_ident("claim_state"),
             ));
             ctes.push(format!(
-                "{cte} AS (SELECT {result_col}, {input_fingerprint} FROM {store_first} UNION ALL SELECT {result_col}, {input_fingerprint} FROM {store_replay})",
+                "{cte} AS (SELECT {result_col}, {input_fingerprint}, {invocation_id} FROM {store_first} UNION ALL SELECT {result_col}, {input_fingerprint}, {invocation_id} FROM {store_replay})",
                 cte = quote_ident("_cmd_invocation"),
                 result_col = quote_ident("result"),
                 input_fingerprint = quote_ident("input_fingerprint"),
+                invocation_id = quote_ident("invocation_id"),
                 store_first = quote_ident("_cmd_store_first"),
                 store_replay = quote_ident("_cmd_store_replay"),
             ));

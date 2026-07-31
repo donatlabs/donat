@@ -35,7 +35,7 @@ use crate::process_effects::{
 };
 
 /// Immutable command definitions grouped by their Postgres source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompiledCommandCatalog {
     sources: BTreeMap<String, CompiledSourceCommandCatalog>,
 }

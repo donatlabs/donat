@@ -15,8 +15,14 @@ use donat_schema::{
 
 use crate::connectors::ConnectorRegistry;
 use crate::processes::{
-    CompiledProcessCatalog, build_process_effect_contract_catalog, compile_process_source_catalog,
+    CompiledProcessCatalog, CompiledSourceProcessCatalog, build_process_effect_contract_catalog,
+    compile_process_source_catalog,
 };
+
+pub struct SourceProcessDeployment {
+    pub source_catalog: donat_catalog::Catalog,
+    pub processes: CompiledSourceProcessCatalog,
+}
 
 /// Preserve the pre-source-selection validation API for existing callers.
 ///
@@ -35,6 +41,40 @@ pub async fn check_source_consistency(
     source_name: &str,
 ) -> Result<Vec<String>> {
     check_consistency_inner(database_url, metadata_dir, Some(source_name)).await
+}
+
+/// Rebuild the already validated source-local Process candidate for
+/// deployment reconciliation. The returned catalog was introspected from the
+/// selected database and is never reused for another metadata source.
+pub async fn compile_source_process_deployment(
+    database_url: &str,
+    metadata_dir: &Path,
+    source_name: &str,
+) -> anyhow::Result<SourceProcessDeployment> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+    let selected_metadata = select_metadata(&metadata, Some(source_name))?;
+    let rules = crate::state::compile_rule_catalog(&metadata)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.path, error.message))?;
+    let connectors = ConnectorRegistry::build(&selected_metadata)?;
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .context("connecting to selected source for Process deployment")?;
+    let connection = tokio::spawn(connection);
+    let source_catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting selected source for Process deployment")?;
+    connection.abort();
+    let commands =
+        compile_command_source_catalog(&metadata, source_name, &source_catalog, &rules, true)
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.path, error.message))?;
+    let processes =
+        compile_process_source_catalog(&metadata, source_name, &commands, &rules, &connectors)
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.path, error.message))?;
+    Ok(SourceProcessDeployment {
+        source_catalog,
+        processes,
+    })
 }
 
 async fn check_consistency_inner(

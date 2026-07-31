@@ -397,6 +397,20 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                     require_consistent_metadata(&problems)?;
 
+                    let deployment = validate::compile_source_process_deployment(
+                        &database_url,
+                        &metadata_dir,
+                        &source_name,
+                    )
+                    .await?;
+                    processes::reconcile(
+                        &source_name,
+                        &database_url,
+                        &deployment.source_catalog,
+                        &deployment.processes,
+                    )
+                    .await?;
+
                     let mut metadata = donat_metadata::load_metadata_dir(&metadata_dir)?;
                     metadata.sources.retain(|source| source.name == source_name);
                     events::reconcile(&database_url, &metadata).await?;

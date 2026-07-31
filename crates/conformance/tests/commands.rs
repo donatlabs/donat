@@ -928,12 +928,13 @@ fn command_legacy_unqualified_retry_fails_closed_before_domain_write() {
     client
         .execute(
             "INSERT INTO donat.command_invocations \
-                (command_identity, command_name, scope_hash, key, input_fingerprint, result, expires_at) \
+                (command_identity, command_name, scope_hash, key, invocation_id, input_fingerprint, result, expires_at) \
              VALUES (\
                 'legacy-unqualified:6372656174655f6f72646572',\
                 'create_order',\
                 decode(md5((jsonb_build_array(to_jsonb($1::text)))::text), 'hex'),\
                 $2,\
+                gen_random_uuid(),\
                 decode('01', 'hex'),\
                 '{\"order_id\":\"550e8400-e29b-41d4-a716-446655440094\",\"status\":\"legacy\"}'::jsonb,\
                 statement_timestamp() + interval '1 day'\

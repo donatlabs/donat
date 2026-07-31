@@ -93,7 +93,7 @@ pub struct FinalizedSignalProcessEffect {
     pub effect_position: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FinalizedCommandCatalog {
     pub sources: BTreeMap<String, FinalizedSourceCommandCatalog>,
 }

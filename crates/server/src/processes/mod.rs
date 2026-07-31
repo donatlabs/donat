@@ -4,6 +4,10 @@
 //! not live here.  This module turns finite metadata plus immutable dependency
 //! descriptors into one immutable, fingerprinted catalog.
 
+mod catalog;
 mod definition;
+mod reconcile;
 
+pub use catalog::*;
 pub use definition::*;
+pub use reconcile::*;

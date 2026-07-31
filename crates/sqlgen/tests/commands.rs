@@ -349,6 +349,8 @@ fn postgres_client_at(pg_url: &str) -> Client {
 }
 
 fn install_command_catalog(tx: &mut Transaction<'_>) {
+    tx.query_one("SELECT pg_advisory_xact_lock(604630061)", &[])
+        .expect("serialize command catalog migration in tests");
     tx.batch_execute(include_str!("../../../migrations/V3__donat_commands.sql"))
         .expect("command journal and structured rejection helper install");
     tx.batch_execute(include_str!(
@@ -374,6 +376,24 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
             .expect("source/role-qualified command identity installs"),
         2 => {}
         count => panic!("partial command identity migration in test catalog: {count} columns"),
+    }
+    let invocation_columns: i64 = tx
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name = 'command_invocations' \
+               AND column_name = 'invocation_id'",
+            &[],
+        )
+        .expect("inspect command invocation generation migration state")
+        .get(0);
+    match invocation_columns {
+        0 => tx
+            .batch_execute(include_str!("../../../migrations/V6__donat_processes.sql"))
+            .expect("command generation and process journal catalog installs"),
+        1 => {}
+        count => panic!("invalid invocation generation migration state: {count} columns"),
     }
 }
 
@@ -414,6 +434,9 @@ fn install_check_violation_helper_client(client: &mut Client) {
 
 fn install_command_catalog_client(client: &mut Client) {
     client
+        .query_one("SELECT pg_advisory_lock(604630061)", &[])
+        .expect("serialize command catalog migration in tests");
+    client
         .batch_execute(include_str!("../../../migrations/V3__donat_commands.sql"))
         .expect("command journal and structured rejection helper install");
     client
@@ -441,6 +464,27 @@ fn install_command_catalog_client(client: &mut Client) {
         2 => {}
         count => panic!("partial command identity migration in test catalog: {count} columns"),
     }
+    let invocation_columns: i64 = client
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name = 'command_invocations' \
+               AND column_name = 'invocation_id'",
+            &[],
+        )
+        .expect("inspect command invocation generation migration state")
+        .get(0);
+    match invocation_columns {
+        0 => client
+            .batch_execute(include_str!("../../../migrations/V6__donat_processes.sql"))
+            .expect("command generation and process journal catalog installs"),
+        1 => {}
+        count => panic!("invalid invocation generation migration state: {count} columns"),
+    }
+    client
+        .query_one("SELECT pg_advisory_unlock(604630061)", &[])
+        .expect("release command catalog migration lock");
 }
 
 fn command_catalog_test_lock() -> MutexGuard<'static, ()> {
@@ -735,6 +779,24 @@ fn command_renderer_lowers_guard_and_session_scoped_idempotency() {
 }
 
 #[test]
+fn command_v6_writer_generates_and_replays_one_durable_invocation_uuid() {
+    let sql =
+        donat_sqlgen::mutation_to_sql(&idempotent_insert_root("create_order", "orders", "draft"));
+
+    assert!(
+        sql.starts_with("WITH ") && !sql.contains(';'),
+        "the command writer remains one top-level statement: {sql}"
+    );
+    assert!(
+        sql.contains("\"invocation_id\"")
+            && sql.contains("gen_random_uuid()")
+            && sql.contains("\"_cmd_store_first\"")
+            && sql.contains("\"_cmd_store_replay\""),
+        "first/expired execution must generate and replay must retain the V6 UUID: {sql}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "command effects must be rejected before SQL generation")]
 fn command_renderer_defensively_refuses_effect_bearing_ir() {
     let _ = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
@@ -1007,6 +1069,13 @@ fn command_idempotency_executes_once_replays_and_rejects_changed_input() {
     );
     tx.execute(&first, &[])
         .expect("first command execution inserts and stores its result");
+    let first_invocation_id: String = tx
+        .query_one(
+            "SELECT invocation_id::text FROM donat.command_invocations WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("first command generation UUID is stored")
+        .get(0);
     let rows: i64 = tx
         .query_one(
             &format!("SELECT count(*) FROM \"public\".\"{table_name}\""),
@@ -1018,6 +1087,17 @@ fn command_idempotency_executes_once_replays_and_rejects_changed_input() {
 
     tx.execute(&first, &[])
         .expect("an exact idempotent replay returns the stored result");
+    let replay_invocation_id: String = tx
+        .query_one(
+            "SELECT invocation_id::text FROM donat.command_invocations WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("replayed command generation UUID is stored")
+        .get(0);
+    assert_eq!(
+        replay_invocation_id, first_invocation_id,
+        "exact replay must retain the command execution generation"
+    );
     let replay_rows: i64 = tx
         .query_one(
             &format!("SELECT count(*) FROM \"public\".\"{table_name}\""),
@@ -1143,10 +1223,10 @@ fn command_legacy_unqualified_key_fails_closed_without_a_domain_write() {
     .expect("seed the pre-upgrade domain write");
     tx.execute(
         "INSERT INTO donat.command_invocations \
-         (command_identity, command_name, scope_hash, key, input_fingerprint, result, expires_at) \
+         (command_identity, command_name, scope_hash, key, invocation_id, input_fingerprint, result, expires_at) \
          VALUES ('legacy-unqualified:' || encode(convert_to($1, 'UTF8'), 'hex'), $1, \
                  decode(md5((jsonb_build_array('\"tenant-1\"'::jsonb))::text), 'hex'), \
-                 'request-1', decode('01', 'hex'), '{\"status\":\"legacy\"}'::jsonb, \
+                 'request-1', gen_random_uuid(), decode('01', 'hex'), '{\"status\":\"legacy\"}'::jsonb, \
                  statement_timestamp() + interval '1 day')",
         &[&command_name],
     )
@@ -1826,6 +1906,13 @@ fn command_reclaims_expired_claim_and_replaces_expired_canonical_result() {
     ));
     tx.execute(&first, &[])
         .expect("first command execution stores an expirable invocation");
+    let first_invocation_id: String = tx
+        .query_one(
+            "SELECT invocation_id::text FROM donat.command_invocations WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("first command generation UUID is stored")
+        .get(0);
     tx.execute(
         "UPDATE donat.command_invocation_claims SET expires_at = statement_timestamp() - interval '1 second' WHERE command_name = $1",
         &[&command_name],
@@ -1859,6 +1946,13 @@ fn command_reclaims_expired_claim_and_replaces_expired_canonical_result() {
         )
         .expect("reclaimed invocation result query succeeds")
         .get(0);
+    let reclaimed_invocation_id: String = tx
+        .query_one(
+            "SELECT invocation_id::text FROM donat.command_invocations WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("reclaimed command generation UUID is stored")
+        .get(0);
     assert_eq!(
         target_rows, 2,
         "expired key permits the newly elected write"
@@ -1866,6 +1960,10 @@ fn command_reclaims_expired_claim_and_replaces_expired_canonical_result() {
     assert_eq!(
         stored_status, "approved",
         "reclaim replaces the expired canonical result instead of replaying it"
+    );
+    assert_ne!(
+        reclaimed_invocation_id, first_invocation_id,
+        "expired-key execution must allocate a new command generation"
     );
 
     tx.rollback()

@@ -214,6 +214,7 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
                 "now()".into(),
             ),
             ("command_identity".into(), "text".into(), true, "".into()),
+            ("invocation_id".into(), "uuid".into(), true, "".into()),
         ],
         "journal columns, PostgreSQL types, nullability, and defaults",
     );
@@ -245,22 +246,26 @@ async fn command_invocations_migration_creates_journal_and_graphql_error_helper(
         "the qualified execution identity and hashed scope own replay uniqueness"
     );
 
-    let redundant_unique_constraints: i64 = client
-        .query_one(
+    let unique_constraints = client
+        .query(
             "
-            SELECT count(*)
+            SELECT pg_get_constraintdef(oid)
             FROM pg_constraint
             WHERE conrelid = 'donat.command_invocations'::regclass
               AND contype = 'u'
+            ORDER BY conname
             ",
             &[],
         )
         .await
         .expect("command journal unique-constraint query succeeds")
-        .get(0);
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
     assert_eq!(
-        redundant_unique_constraints, 0,
-        "the primary key is the sole idempotency uniqueness contract"
+        unique_constraints,
+        ["UNIQUE (invocation_id)"],
+        "the idempotency primary key and execution-generation UUID are distinct uniqueness contracts"
     );
 
     let expiry_index: String = client
