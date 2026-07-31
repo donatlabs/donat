@@ -23,6 +23,7 @@ use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
 pub mod cron_webhook;
+pub mod provider_stub;
 mod remote_graphql;
 
 // ---------------------------------------------------------------- fixtures
@@ -3552,6 +3553,7 @@ mod tests {
             "mcp_tools",
             "migrate",
             "petshop",
+            "process_activity",
             "process_inbound",
             "processes",
             "remote_schemas",
