@@ -60,12 +60,23 @@ pub async fn execute_process_command_in_savepoint(
                     .context("rolling back rejected Process command savepoint")?;
                 return Ok(ProcessCommandOutcome::Rejected { error });
             }
-            let sqlstate = error
-                .as_db_error()
-                .map(|error| error.code().code().to_owned())
-                .unwrap_or_else(|| "driver".to_owned());
+            // A durable Process retries this transition forever, so the log is
+            // the only account of why it never lands. Name the schema object
+            // that refused it: the SQLSTATE alone cannot distinguish one check
+            // constraint from another in a command that writes several tables.
+            let (sqlstate, relation) = match error.as_db_error() {
+                Some(error) => (
+                    error.code().code().to_owned(),
+                    format!(
+                        " on {}.{}",
+                        error.table().unwrap_or("?"),
+                        error.constraint().unwrap_or("?")
+                    ),
+                ),
+                None => ("driver".to_owned(), String::new()),
+            };
             Err(anyhow!(
-                "Process command database execution failed with SQLSTATE {sqlstate}"
+                "Process command database execution failed with SQLSTATE {sqlstate}{relation}"
             ))
         }
     }

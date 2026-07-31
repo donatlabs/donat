@@ -692,6 +692,71 @@ fn fulfilment_allocates_ships_and_captures_the_shipped_value() {
     );
 }
 
+/// A scheduled renewal cycle: the Process opens the renewal order and payment,
+/// authorizes it with the provider, and records the renewal outcome. The
+/// dunning ladder exists for declines; a first-attempt authorization skips it.
+#[test]
+fn a_scheduled_subscription_renewal_authorizes_and_renews() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    let suite = start_store(&stub, "petshop_subscription_renewal");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    let subscription_id: String = client
+        .query_one(
+            "INSERT INTO subscription
+                 (customer_id, variant_id, quantity, unit_price_minor, line_total_minor,
+                  currency, status)
+             VALUES ($1, 2, 1, 2499, 2499, 'USD', 'active')
+             RETURNING id::text",
+            &[&CUSTOMER],
+        )
+        .expect("seed one active subscription")
+        .get(0);
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_subscription_renewal(subscription_id: \"{subscription_id}\", cron_occurrence: \"2030-02-01T00:00:00Z\") {{ subscription_id status }} }}"
+            )
+        }),
+        &[(
+            "X-Donat-Role".to_owned(),
+            "subscription_worker".to_owned(),
+        )],
+    );
+    assert_eq!(status, 200, "start_subscription_renewal status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_subscription_renewal reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "subscription_renewal");
+    assert_eq!(
+        output.pointer("/status").and_then(Json::as_str),
+        Some("renewed"),
+        "a first-attempt authorization renews without entering dunning: {output}"
+    );
+
+    // The audit records every attempt, the scheduled cycle included. One row
+    // at attempt 0 means the ladder was never walked.
+    let attempts: Vec<(i32, String)> = client
+        .query(
+            "SELECT attempt, outcome FROM subscription_dunning_attempt ORDER BY attempt",
+            &[],
+        )
+        .expect("read the renewal audit")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![(0, "authorized".to_owned())],
+        "only the scheduled attempt is recorded; no dunning retry ran"
+    );
+}
+
 /// The whole return module: the shopper requests a return of a delivered line,
 /// support approves it, the carrier issues a return label, the warehouse
 /// receives and inspects it, and the provider refunds exactly the inspected
