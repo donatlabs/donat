@@ -1463,7 +1463,20 @@ impl ProcessRuntime {
             .spec
             .input
             .validate(&typed_value(&input).context("decoding Process activity input")?)
-            .map_err(|error| anyhow!("Process activity input violated its contract: {error}"))?;
+            .map_err(|error| {
+                anyhow!(
+                    "Process activity input violated the contract of instance `{}` (declared fields: {}): {error}",
+                    dependency.instance,
+                    dependency
+                        .spec
+                        .input
+                        .roots
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            })?;
         let request_fingerprint = canonical_json_sha256(&input);
         let serialization_key_hash = dependency
             .serialization_key_input
