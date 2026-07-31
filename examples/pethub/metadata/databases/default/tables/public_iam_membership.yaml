@@ -1,0 +1,58 @@
+table:
+  name: iam_membership
+  schema: public
+configuration:
+  column_config:
+    role_name:
+      comment: >-
+        Which tenant role this person holds in this store. A person may hold
+        several, and may hold different ones in different stores — that is why
+        platform_user has no tenant column and this table does.
+
+object_relationships:
+  - name: user
+    using:
+      foreign_key_constraint_on: user_id
+  - name: role
+    using:
+      foreign_key_constraint_on: role_name
+
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, user_id, role_name, created_at]
+      filter: {}
+  # Staff see the roster of their own store.
+  - role: staff
+    permission:
+      columns: [user_id, role_name]
+      filter: {}
+  # Signed in without a store: you may see your own memberships, which is how
+  # a store switcher is built. Note this read is NOT tenant-scoped by session
+  # — platform_visitor has no tenant — it is scoped by subject.
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, user_id, role_name, created_at]
+      filter:
+        user_id:
+          _eq: X-Donat-User-Id
+
+# Command-only in both directions. Self-service role assignment is the
+# canonical privilege-escalation bug, and the only defence that survives a
+# careless permission edit is the root not existing.
+command_insert_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, user_id, role_name]
+      check: {}
+  # accept_invite and register_merchant both create the first membership
+  # before the caller belongs to anything.
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, user_id, role_name]
+      check: {}
+
+command_delete_permissions:
+  - role: merchant_owner
+    permission:
+      filter: {}

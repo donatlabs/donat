@@ -1,0 +1,27 @@
+# Pethub is Petshop plus a platform layer.
+#
+# `extends` composes one metadata directory on top of another: the base is
+# loaded first, this directory is loaded second, and the result is one
+# metadata document. It is what lets the "Petshop is unchanged" contract be
+# structural instead of aspirational — there is no copy of the store to drift
+# out of sync, and `git diff ../petshop` is the proof.
+#
+# This is the one loader capability the example needs. Reaching the same
+# result with `!include` alone is not possible today: an include resolves to a
+# nested value rather than splicing (crates/metadata/src/loader.rs), and the
+# rule catalogue, command index and table index each merge at a different
+# level of the document.
+#
+# Merge semantics, kept deliberately unclever:
+#   - sources merge by name; their table lists concatenate
+#   - tables, commands, rules, types, flows and connectors are keyed by their
+#     own identity and MUST NOT collide
+#   - a collision is a validation error, never a silent override
+#
+# Refusing to override is the important half. An overlay that could quietly
+# replace a Petshop permission would make every audit of the store meaningless
+# — you would have to read both directories to know what is being served.
+# Pethub adds; it never edits.
+
+extends:
+  - path: ../../petshop/metadata

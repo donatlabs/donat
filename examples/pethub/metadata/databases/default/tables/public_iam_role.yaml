@@ -1,0 +1,65 @@
+table:
+  name: iam_role
+  schema: public
+configuration:
+  column_config:
+    compiled_role:
+      comment: >-
+        The engine role this tenant role maps onto. A merchant invents role
+        names freely, but every one of them must point at a compiled role that
+        already exists in metadata: a role is a compiled GraphQL schema, and a
+        tenant cannot cause a compilation. This column is the exact line
+        between what a tenant may define and what only a deploy may.
+    is_system:
+      comment: >-
+        Seeded by register_merchant (owner, staff, fulfilment, support).
+        System roles cannot be deleted, or a merchant could lock themselves
+        out of their own store.
+
+array_relationships:
+  - name: grants
+    using:
+      foreign_key_constraint_on:
+        column: role_name
+        table:
+          name: iam_role_grant
+          schema: public
+  - name: memberships
+    using:
+      foreign_key_constraint_on:
+        column: role_name
+        table:
+          name: iam_membership
+          schema: public
+
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, name, compiled_role, description, is_system, created_at]
+      filter: {}
+  # Staff may see the role catalogue — knowing that "weekend_support" exists
+  # is not a privilege — but not who holds what; that is on iam_membership.
+  - role: staff
+    permission:
+      columns: [name, compiled_role, description]
+      filter: {}
+
+# Writes are command-only. `insert_iam_role` appears on no schema for any
+# role, so the only path is create_tenant_role, which asserts that
+# compiled_role is assignable and that the caller holds iam:administer.
+command_insert_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, name, compiled_role, description, is_system]
+      check: {}
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, name, compiled_role, description, is_system]
+      check: {}
+
+command_delete_permissions:
+  - role: merchant_owner
+    permission:
+      filter:
+        is_system:
+          _eq: false

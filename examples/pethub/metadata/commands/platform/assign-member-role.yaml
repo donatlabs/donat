@@ -1,0 +1,52 @@
+name: assign_member_role
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `iam:administer` by iam.yaml.
+
+arguments:
+  - name: user_id
+    type: uuid!
+  - name: role_name
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  # The subject must already be a member of this store. Assignment changes what
+  # somebody may do here; it is not a way to pull an arbitrary platform user
+  # into the tenant — that is what invite_member is for, and it requires the
+  # person to accept.
+  - name: existing
+    select_one:
+      table: { schema: public, name: iam_membership }
+      by:
+        user_id: { arg: user_id }
+      returning: [tenant_id, user_id, role_name]
+      require_found: true
+
+  - name: role
+    select_one:
+      table: { schema: public, name: iam_role }
+      by:
+        name: { arg: role_name }
+      returning: [name, compiled_role]
+      require_found: true
+
+  - name: assignment
+    insert:
+      table: { schema: public, name: iam_membership }
+      object:
+        user_id: { arg: user_id }
+        role_name: { step: role, column: name }
+      returning: [tenant_id, user_id, role_name]
+
+result:
+  user_id: { step: assignment, column: user_id }
+  role_name: { step: assignment, column: role_name }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: user_id }
+  retention: 365d

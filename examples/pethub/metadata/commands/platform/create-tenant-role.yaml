@@ -1,0 +1,41 @@
+name: create_tenant_role
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `iam:administer` by iam.yaml.
+
+# This is the command the whole two-layer design exists for: a merchant
+# inventing a role of their own, at runtime, without the platform compiling
+# anything. `compiled_role` is typed as AssignableRole, so the set of shapes a
+# tenant may point at is closed by the type system rather than by a check
+# somebody has to remember — and `platform_visitor` is not in that enum.
+
+arguments:
+  - name: name
+    type: string!
+  - name: compiled_role
+    type: AssignableRole!
+  - name: description
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  - name: role
+    insert:
+      table: { schema: public, name: iam_role }
+      object:
+        name: { arg: name }
+        compiled_role: { arg: compiled_role }
+        description: { arg: description }
+        is_system: { literal: false }
+      returning: [name, compiled_role, description, is_system]
+
+result:
+  name: { step: role, column: name }
+  compiled_role: { step: role, column: compiled_role }
+  description: { step: role, column: description }
+
+idempotency:
+  key: { argument: request_id }
+  retention: 365d

@@ -1,0 +1,12 @@
+# The platform layer only. Every Petshop table arrives through
+# `extends: ../../petshop/metadata` and is not restated here — restating one
+# would be a merge collision, which is a validation error by design.
+- "!include public_tenant.yaml"
+- "!include public_platform_user.yaml"
+- "!include public_plan.yaml"
+- "!include public_tenant_usage.yaml"
+- "!include public_tenant_invite.yaml"
+- "!include public_iam_role.yaml"
+- "!include public_iam_role_grant.yaml"
+- "!include public_iam_membership.yaml"
+- "!include public_iam_effective_grant.yaml"

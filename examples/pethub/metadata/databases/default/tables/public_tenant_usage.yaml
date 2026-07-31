@@ -1,0 +1,53 @@
+table:
+  name: tenant_usage
+  schema: public
+configuration:
+  column_config:
+    product_count:
+      comment: >-
+        A maintained counter, not a COUNT(*). Commands increment it in the
+        same statement that performs the write, and the plan ceiling is a
+        check on the new value — the same shape as inventory_stock.reserved in
+        Petshop. There is no table-level aggregate step in the command
+        grammar, and adding one only to count rows would be the wrong
+        primitive: a counter is O(1) and a scan is not.
+
+object_relationships:
+  - name: tenant
+    using:
+      foreign_key_constraint_on: tenant_id
+
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, product_count, member_count, updated_at]
+      filter: {}
+  - role: staff
+    permission:
+      columns: [tenant_id, product_count, member_count]
+      filter: {}
+
+command_insert_permissions:
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, product_count, member_count]
+      check: {}
+
+command_update_permissions:
+  # Every counter movement is a command. Nothing else may touch these numbers,
+  # or the entitlement ceiling becomes advisory.
+  - role: merchant_owner
+    permission:
+      columns: [product_count, member_count]
+      filter: {}
+      check: {}
+  - role: staff
+    permission:
+      columns: [product_count]
+      filter: {}
+      check: {}
+  - role: platform_visitor
+    permission:
+      columns: [member_count]
+      filter: {}
+      check: {}

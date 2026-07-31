@@ -1,0 +1,13 @@
+# Platform commands. Every Petshop command arrives through `extends` and is
+# not repeated here.
+- "!include commands/platform/complete-signup.yaml"
+- "!include commands/platform/register-merchant.yaml"
+- "!include commands/platform/invite-member.yaml"
+- "!include commands/platform/accept-invite.yaml"
+- "!include commands/platform/create-tenant-role.yaml"
+- "!include commands/platform/grant-role-action.yaml"
+- "!include commands/platform/revoke-role-action.yaml"
+- "!include commands/platform/assign-member-role.yaml"
+- "!include commands/platform/remove-member.yaml"
+- "!include commands/platform/transfer-ownership.yaml"
+- "!include commands/platform/change-plan.yaml"

@@ -1,0 +1,33 @@
+name: revoke_role_action
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `iam:administer` by iam.yaml.
+
+arguments:
+  - name: role_name
+    type: string!
+  - name: action
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  - name: revoked
+    delete:
+      table: { schema: public, name: iam_role_grant }
+      where:
+        role_name: { arg: role_name }
+        action: { arg: action }
+      returning: [role_name, action]
+      require_affected: true
+
+result:
+  role_name: { step: revoked, column: role_name }
+  action: { step: revoked, column: action }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: role_name }
+  retention: 365d

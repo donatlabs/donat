@@ -1,0 +1,64 @@
+name: change_plan
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `tenant:billing` by iam.yaml.
+
+# Downgrades are the interesting half. A store already holding 400 products
+# cannot move to a plan that allows 100, and the check happens in the same
+# statement as the change — a limit verified in a separate round trip is not a
+# limit, it is a race.
+
+arguments:
+  - name: plan_code
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  - name: plan
+    select_one:
+      table: { schema: public, name: plan }
+      by:
+        code: { arg: plan_code }
+      returning: [code, max_products, max_members]
+      require_found: true
+
+  - name: usage
+    select_one:
+      table: { schema: public, name: tenant_usage }
+      by:
+        tenant_id: { session_variable: x-donat-tenant-id }
+      returning: [product_count, member_count]
+      require_found: true
+
+  - name: products_fit
+    assert:
+      rule: fits_plan_limit
+      with:
+        current: { step: usage, column: product_count }
+        maximum: { step: plan, column: max_products }
+
+  - name: members_fit
+    assert:
+      rule: fits_plan_limit
+      with:
+        current: { step: usage, column: member_count }
+        maximum: { step: plan, column: max_members }
+
+  - name: store
+    update:
+      table: { schema: public, name: tenant }
+      where:
+        id: { session_variable: x-donat-tenant-id }
+      set:
+        plan_code: { step: plan, column: code }
+      returning: [id, plan_code]
+
+result:
+  tenant_id: { step: store, column: id }
+  plan_code: { step: store, column: plan_code }
+
+idempotency:
+  key: { argument: request_id }
+  retention: 3650d

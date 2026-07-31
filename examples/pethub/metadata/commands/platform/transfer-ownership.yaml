@@ -1,0 +1,71 @@
+name: transfer_ownership
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `tenant:transfer`, deliberately NOT on `iam:administer`: a role that
+# manages other people's access must not be able to dispose of the store.
+
+arguments:
+  - name: new_owner_user_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+
+guards:
+  - rule: is_not_self
+    with:
+      subject_user_id: { arg: new_owner_user_id }
+      caller_user_id: { session_variable: x-donat-user-id }
+    message: the new owner must be a different person
+
+steps:
+  # The recipient must already be a member. Ownership is handed to somebody who
+  # has accepted an invitation to this store, never pushed onto an arbitrary
+  # platform user.
+  - name: recipient
+    select_one:
+      table: { schema: public, name: iam_membership }
+      by:
+        user_id: { arg: new_owner_user_id }
+      returning: [tenant_id, user_id, role_name]
+      require_found: true
+
+  - name: promoted
+    insert:
+      table: { schema: public, name: iam_membership }
+      object:
+        user_id: { step: recipient, column: user_id }
+        role_name: { literal: owner }
+      returning: [tenant_id, user_id, role_name]
+
+  # Ownership is added before it is removed, in one statement, so there is no
+  # instant at which the store has no owner — not even one that a crash could
+  # freeze.
+  - name: demoted
+    delete:
+      table: { schema: public, name: iam_membership }
+      where:
+        user_id: { session_variable: x-donat-user-id }
+        role_name: { literal: owner }
+      returning: [user_id, role_name]
+      require_affected: true
+
+  - name: store
+    update:
+      table: { schema: public, name: tenant }
+      where:
+        id: { session_variable: x-donat-tenant-id }
+      set:
+        owner_user_id: { step: recipient, column: user_id }
+      returning: [id, owner_user_id]
+
+result:
+  tenant_id: { step: store, column: id }
+  owner_user_id: { step: store, column: owner_user_id }
+  previous_owner_user_id: { step: demoted, column: user_id }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: new_owner_user_id }
+  retention: 3650d

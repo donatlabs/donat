@@ -1,0 +1,50 @@
+name: complete_signup
+source: default
+permissions:
+  - role: platform_visitor
+
+# A signed-in person with no store yet. This is the only command in the
+# example that belongs to no tenant, so it says so: it touches platform_user,
+# which tenancy.yaml exempts as `scope_via: memberships`, and nothing else.
+tenant: none
+
+arguments:
+  - name: signup_key
+    type: uuid!
+    description: >-
+      Must equal the caller's own user id. It is the idempotency key, which is
+      what makes a second sign-in a replay instead of a unique-violation: the
+      command grammar has no insert-if-absent, and adding one purely for this
+      case would be the wrong primitive.
+  - name: email
+    type: string!
+  - name: display_name
+    type: string!
+
+guards:
+  - rule: is_self
+    with:
+      subject_user_id: { arg: signup_key }
+      caller_user_id: { session_variable: x-donat-user-id }
+    message: signup_key must be the caller's own user id
+
+steps:
+  - name: person
+    insert:
+      table: { schema: public, name: platform_user }
+      object:
+        id: { session_variable: x-donat-user-id }
+        email: { arg: email }
+        display_name: { arg: display_name }
+      returning: [id, email, display_name]
+
+result:
+  user_id: { step: person, column: id }
+  email: { step: person, column: email }
+  display_name: { step: person, column: display_name }
+
+idempotency:
+  key: { argument: signup_key }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 3650d

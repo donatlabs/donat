@@ -1,0 +1,102 @@
+# In-tenant authorization: AWS-IAM-shaped grants, evaluated in SQL.
+#
+# A compiled role decides the shape of the schema. This file decides the scope
+# within it. A merchant creates roles and grants as ordinary rows; the
+# compiler turns them into predicates on every root the compiled role exposes.
+#
+# Without this file the same behaviour is expressible today — an `_exists`
+# against a grant table repeated in the filter and the check of every
+# permission of every table. That is the state of the art on Hasura, and it is
+# exactly what stops scaling at 160 tables.
+
+iam:
+  source: default
+
+  # The flattened grant relation: one row per (tenant, subject, action). Role
+  # hierarchy is expanded into it by the database view, so the predicate never
+  # has to walk a hierarchy at query time.
+  grants:
+    table: { schema: public, name: iam_effective_grant }
+    subject: { column: user_id, variable: X-Donat-User-Id }
+    tenant: { column: tenant_id }
+    action: { column: action }
+
+  # Which compiled roles are governed by grants at all. `customer` and
+  # `anonymous` are storefront shoppers: they are tenant-scoped, but they hold
+  # no grants and must not be forced through the grant relation.
+  governed_roles: [merchant_owner, staff, fulfilment, support]
+
+  # `service:action`, AWS-style. A grant matches a required action directly or
+  # through one of these expansions.
+  wildcards: ["{resource}:*", "*:{verb}", "*:*"]
+
+  # Table x operation -> required action. The default derives the action from
+  # the table name so a new table is governed the moment it is tracked; an
+  # override groups several tables under one business resource.
+  actions:
+    default:
+      select: "{table}:read"
+      insert: "{table}:create"
+      update: "{table}:update"
+      delete: "{table}:delete"
+    overrides:
+      # An order and its lines are one resource to a merchant.
+      - tables:
+          - { schema: public, name: orders }
+          - { schema: public, name: order_line }
+        resource: order
+      - tables:
+          - { schema: public, name: product }
+          - { schema: public, name: product_variant }
+          - { schema: public, name: category }
+        resource: catalog
+      - tables:
+          - { schema: public, name: inventory_stock }
+          - { schema: public, name: inventory_reservation }
+        resource: inventory
+      - tables:
+          - { schema: public, name: shipment }
+        resource: fulfilment
+      - tables:
+          - { schema: public, name: payment }
+          - { schema: public, name: payment_event }
+          - { schema: public, name: refund }
+        resource: payment
+
+  # Commands are gated by an action too, so a merchant role can be allowed to
+  # read orders but not to cancel them. The command's own `permissions:` list
+  # remains the outer gate; this is an additional, narrower one.
+  command_actions:
+    default: "{command}:invoke"
+    overrides:
+      - { command: cancel_order, action: "order:cancel" }
+      - { command: approve_return, action: "return:approve" }
+      - { command: capture_payment, action: "payment:capture" }
+      # Platform commands that manage IAM itself are the sharpest edge in the
+      # whole design: a role able to grant actions can grant itself anything.
+      - { command: create_tenant_role, action: "iam:administer" }
+      - { command: grant_role_action, action: "iam:administer" }
+      - { command: revoke_role_action, action: "iam:administer" }
+      - { command: assign_member_role, action: "iam:administer" }
+      - { command: invite_member, action: "iam:administer" }
+      - { command: remove_member, action: "iam:administer" }
+      # Ownership transfer is deliberately NOT an `iam:administer` action.
+      # An administrator manages other people's access; only an owner may
+      # hand over the tenant itself.
+      - { command: transfer_ownership, action: "tenant:transfer" }
+      - { command: change_plan, action: "tenant:billing" }
+
+  # The caller's effective grant set is resolved once per request as a CTE in
+  # the same single statement, and every root predicate references it. The
+  # alternative — an `_exists` subquery inside each row predicate — is what
+  # makes hand-rolled Hasura IAM slow. `token` would inline grants from the
+  # JWT: faster still, but revocation then lags until the token expires, so it
+  # is not the default.
+  evaluation: request_cte
+
+  # Actions a tenant's own roles may never hold, whatever the merchant writes
+  # into their grant rows. These belong to the platform.
+  reserved_actions:
+    - "platform:*"
+    - "tenant:create"
+    - "tenant:suspend"

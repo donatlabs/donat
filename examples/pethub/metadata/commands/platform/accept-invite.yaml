@@ -1,0 +1,144 @@
+name: accept_invite
+source: default
+permissions:
+  - role: platform_visitor
+
+# The caller belongs to no tenant yet — that is the entire point of the
+# command. The tenant for every write below is taken from the invitation row,
+# not from the session, so a caller cannot direct the membership anywhere the
+# invitation did not name.
+tenant:
+  from: { step: invite, column: tenant_id }
+
+arguments:
+  - name: code_hash
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  # The one unscoped read in the example. It is legal because the lookup is by
+  # a unique, unguessable digest, because the command derives its tenant from
+  # the row it returns, and because tenancy.yaml requires every such step to be
+  # declared and listed by `donat validate`.
+  - name: invite
+    select_one:
+      table: { schema: public, name: tenant_invite }
+      tenant: unscoped
+      by:
+        code_hash: { arg: code_hash }
+      returning: [id, tenant_id, role_name, email, expires_at, accepted_at]
+      require_found: true
+
+  - name: still_open
+    assert:
+      rule: invite_is_open
+      with:
+        database_time: { database_time: now }
+        expires_at: { step: invite, column: expires_at }
+
+  # From here on every step is scoped to the invitation's tenant. This lookup
+  # therefore cannot read another store's row even though the argument is
+  # entirely caller-controlled.
+  - name: store
+    select_one:
+      table: { schema: public, name: tenant }
+      by:
+        id: { step: invite, column: tenant_id }
+      returning: [id, status, default_member_role]
+      require_found: true
+
+  - name: serving
+    assert:
+      rule: tenant_is_serving
+      with:
+        status: { step: store, column: status }
+
+  - name: joiner
+    select_one:
+      table: { schema: public, name: platform_user }
+      by:
+        id: { session_variable: x-donat-user-id }
+      returning: [id, email]
+      require_found: true
+
+  - name: invited_person
+    assert:
+      rule: invite_matches_email
+      with:
+        invited_email: { step: invite, column: email }
+        caller_email: { step: joiner, column: email }
+
+  # The default role is resolved at acceptance time, not at invitation time: a
+  # merchant who tightens their onboarding policy today has tightened it for
+  # the invitations they sent last week too.
+  #
+  # `fallback` is the one command-value addition this example asks for, and it
+  # compiles to COALESCE. It cannot be a rule: the rule profile forbids every
+  # operation on a nullable operand except is_null / == null / != null, and it
+  # has no flow-sensitive refinement, so `is_null(a) ? b : a` is a type error
+  # by design (ADR-003, spec 004). Choosing between values is a command-grammar
+  # concern, and keeping it there leaves the rule language's null discipline
+  # exactly as strict as it is today.
+  - name: granted_role
+    project:
+      values:
+        role_name:
+          fallback:
+            - { step: invite, column: role_name }
+            - { step: store, column: default_member_role }
+
+  # The role must exist in this tenant. The lookup is tenant-scoped by the
+  # compiler, so an invitation naming a role that was deleted, or that only
+  # ever existed in another store, fails here instead of creating a membership
+  # that resolves to no compiled role at all.
+  - name: role
+    select_one:
+      table: { schema: public, name: iam_role }
+      by:
+        name: { step: granted_role, field: role_name }
+      returning: [name, compiled_role]
+      require_found: true
+
+  - name: membership
+    insert:
+      table: { schema: public, name: iam_membership }
+      object:
+        user_id: { step: joiner, column: id }
+        role_name: { step: role, column: name }
+      returning: [tenant_id, user_id, role_name]
+
+  # Single use. The unique constraint on code_hash plus this update mean a
+  # replayed code is a no-op, not a second membership.
+  - name: consumed
+    update:
+      table: { schema: public, name: tenant_invite }
+      where:
+        id: { step: invite, column: id }
+      set:
+        accepted_at: { database_time: now }
+        accepted_by: { step: joiner, column: id }
+      returning: [id, accepted_at]
+
+  - name: member_count
+    update:
+      table: { schema: public, name: tenant_usage }
+      where:
+        tenant_id: { step: invite, column: tenant_id }
+      set:
+        member_count:
+          rule: increment
+          with:
+            value: { current_column: member_count }
+      returning: [member_count]
+
+result:
+  tenant_id: { step: membership, column: tenant_id }
+  role_name: { step: membership, column: role_name }
+  accepted_at: { step: consumed, column: accepted_at }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 365d

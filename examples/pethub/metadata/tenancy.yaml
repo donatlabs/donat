@@ -1,0 +1,118 @@
+# Engine-wide tenancy for the `default` source.
+#
+# This file is the entire multitenant surface of the store domain. No Petshop
+# table, permission, command, rule or flow is modified: the compiler injects
+# the tenant predicate and the tenant preset into the IR, so every surface —
+# GraphQL, REST, MCP, commands, durable processes — is scoped by construction
+# rather than by a filter someone remembered to write.
+
+tenancy:
+  source: default
+
+  # row_key   — one database, a tenant column on every table (wave 1)
+  # schema    — one schema per tenant, search_path selected per checkout
+  # source    — one database per tenant, pool registry built at boot
+  #
+  # The binding is deliberately a single declaration: the data model, the
+  # permissions and the commands below do not change when it changes.
+  binding: row_key
+
+  # The session variable carrying the tenant. `trust: jwt_claim` means it is
+  # only ever read from a verified token: an untrusted request may not supply
+  # it as a header, exactly as it may not supply its own role today. A
+  # trusted request (admin secret) may supply the header, which is what the
+  # conformance harness and service-to-service callers use.
+  variable: X-Donat-Tenant-Id
+  trust: jwt_claim
+
+  # The default tenant column. Every tracked table in this source must have
+  # it, or appear under `keys:` or `exempt:` below. A table that has neither
+  # fails `donat validate` and the engine refuses to boot — this is the whole
+  # point: forgetting the 158th table must be impossible, not merely unlikely.
+  key: tenant_id
+
+  # The tenant registry itself. `status` gates every request: a suspended or
+  # closed tenant is refused before planning, not filtered afterwards.
+  registry:
+    table: { schema: public, name: tenant }
+    key: id
+    status:
+      column: status
+      serving: [active]
+
+  # Tables whose tenant key is a different column. This is NOT an exemption —
+  # these rows still belong to exactly one tenant. Keeping the distinction in
+  # the syntax is deliberate: putting `tenant` in `exempt:` instead would let
+  # any member of any tenant read the whole tenant registry.
+  keys:
+    - { table: { schema: public, name: tenant }, key: id }
+
+  # Tables that genuinely have no single owning tenant.
+  exempt:
+    # Platform-owned reference data. `shared: read_only` makes `donat validate`
+    # reject any insert/update/delete permission granted to a tenant-facing
+    # role: a shared writable table is a side channel between tenants.
+    - table: { schema: public, name: plan }
+      shared: read_only
+
+    # A person may belong to several stores, so the row has no one tenant.
+    # Visibility is the intersection of memberships: you can see a user if you
+    # share a tenant with them. `scope_via` names an array relationship and
+    # compiles to a correlated traversal — `_exists` cannot express this,
+    # because it switches the predicate context to the remote table entirely
+    # (crates/schema/src/predicate.rs).
+    - table: { schema: public, name: platform_user }
+      scope_via: memberships
+
+  # An invitation is a tenant-keyed row like any other — it is NOT exempt.
+  # The one place it must be read outside a tenant scope is accept_invite,
+  # which runs before the invitee belongs to anything. That is declared on the
+  # single step that needs it (`tenant: unscoped`) rather than by weakening
+  # the table for every reader, and it is legal only when:
+  #
+  #   - the step is a select_one whose `by` covers a unique constraint,
+  #   - the command declares `tenant: { from: <that step> }`, so the rest of
+  #     the statement is scoped by what the row said, and
+  #   - the lookup key is unguessable, which is the actual authorization.
+  #
+  # Every use of it should be countable on one hand and visible in review.
+  # `donat validate` lists them.
+  unscoped_steps: audited
+
+  # Which compiled role a caller may use is resolved from their membership,
+  # not taken from the request. The client still names a role, exactly as
+  # today; the engine additionally proves that this subject holds that
+  # compiled role in this tenant, and refuses otherwise. There is no admin
+  # role and no bypass: the lookup itself runs under an explicit, narrow
+  # permission declared on the view (see public_iam_effective_grant.yaml).
+  role_resolution:
+    table: { schema: public, name: iam_effective_grant }
+    subject: { column: user_id, variable: X-Donat-User-Id }
+    tenant: { column: tenant_id }
+    compiled_role: { column: compiled_role }
+    # Roles a request may use without any membership at all: the storefront
+    # shopper and the anonymous catalogue browser are customers of a store,
+    # not staff of a tenant. They are still tenant-scoped by the predicate
+    # above — they simply have no IAM grants.
+    unauthenticated_roles: [anonymous, customer]
+    reject_unlisted: true
+
+  # Engine-owned journals live outside metadata and have no permissions, so
+  # they need their own scoping statement. Without this, two tenants sharing
+  # an idempotency key would replay each other's command results: the journal
+  # primary key is (command_identity, scope_hash, key) and command_identity is
+  # source + command + role only (ADR-008) — the tenant is not in it.
+  journals:
+    # Add the tenant to every command idempotency scope, and fail validation
+    # for any command in this source that does not carry it.
+    command_idempotency_scope: required
+    # Process instances, timers, waits and reconciliation are claimed per
+    # tenant, so a worker never leases another tenant's instance.
+    process_instances: required
+    # Event log rows carry their originating tenant.
+    event_log: required
+    # Cron is not tenant-scoped in wave 1. Every trigger in this source must
+    # declare `tenant: system` and touch only exempt tables; anything else
+    # fails validation rather than silently letting one tenant consume an
+    # occurrence belonging to all of them.
+    cron: system_only

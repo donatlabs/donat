@@ -1,0 +1,82 @@
+# Platform rules. Petshop's own rule catalogue arrives through `extends` and
+# is not repeated here; a duplicate name would be a merge collision.
+
+types:
+  # The compiled roles a tenant may point one of its own roles at. This enum
+  # IS the allowlist: `platform_visitor` is absent, so a merchant cannot mint a
+  # role that escapes their tenant, and the check is a type check rather than a
+  # rule someone has to remember to call.
+  - name: AssignableRole
+    enum: [merchant_owner, staff, fulfilment, support]
+
+  - name: TenantStatus
+    enum: [active, suspended, closed]
+
+rules:
+  # --- Entitlements -------------------------------------------------------
+  # Checked against the maintained counters in tenant_usage, inside the same
+  # statement as the write being gated.
+  # "Is there room for one more?" — the strict form, used before a write.
+  - name: within_plan_limit
+    parameters: { current: int!, maximum: int! }
+    result: bool!
+    expression: "current >= 0 && current < maximum"
+
+  # "Does what already exists still fit?" — the inclusive form, used when
+  # changing plan. A store holding exactly 100 products may stay on a
+  # 100-product plan; it may not add the 101st.
+  - name: fits_plan_limit
+    parameters: { current: int!, maximum: int! }
+    result: bool!
+    expression: "current >= 0 && current <= maximum"
+
+  - name: increment
+    parameters: { value: int! }
+    result: int!
+    expression: "value + 1"
+
+  - name: decrement_to_zero
+    parameters: { value: int! }
+    result: int!
+    expression: "value > 0 ? value - 1 : 0"
+
+  # --- Invitations --------------------------------------------------------
+  - name: invite_is_open
+    parameters: { database_time: timestamptz!, expires_at: timestamptz! }
+    result: bool!
+    expression: "database_time < expires_at"
+
+  - name: invite_matches_email
+    parameters: { invited_email: string!, caller_email: string! }
+    result: bool!
+    expression: "invited_email == caller_email"
+
+  # --- Tenant lifecycle ---------------------------------------------------
+  - name: tenant_is_serving
+    parameters: { status: TenantStatus! }
+    result: bool!
+    expression: "status == TenantStatus::active"
+
+  # A store must never be left without an owner: this engine has no admin
+  # role, so an ownerless tenant is unrecoverable by anyone, including the
+  # platform. The defence is structural rather than numeric — ownership is
+  # transferred, never removed, so the count can never reach zero and no
+  # command has to reason about how many owners happen to exist.
+  - name: role_is_not_owner
+    parameters: { role_name: string! }
+    result: bool!
+    expression: "role_name != \"owner\""
+
+  - name: is_not_self
+    parameters: { subject_user_id: uuid!, caller_user_id: uuid! }
+    result: bool!
+    expression: "subject_user_id != caller_user_id"
+
+  - name: is_self
+    parameters: { subject_user_id: uuid!, caller_user_id: uuid! }
+    result: bool!
+    expression: "subject_user_id == caller_user_id"
+
+# Slug shape (length, charset, uniqueness) is a database constraint, not a
+# rule: the rule language has no string functions, and a CHECK plus a UNIQUE
+# index enforce it closer to the data and for every writer at once.

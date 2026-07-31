@@ -1,0 +1,54 @@
+table:
+  name: iam_effective_grant
+  schema: public
+configuration:
+  column_config:
+    action:
+      comment: >-
+        A database view flattening membership -> role -> grant into one row per
+        (tenant, user, compiled_role, action). Hierarchy expansion happens
+        here, once, rather than in every predicate. If it ever becomes a
+        bottleneck it becomes a materialized view refreshed by the same
+        commands that write the grants — without any metadata change.
+
+# This view has two jobs, and both of them are engine-facing.
+#
+# 1. tenancy.yaml `role_resolution` reads it to prove that the caller actually
+#    holds the compiled role their request names. That lookup runs under the
+#    permission declared here, for the requesting role — it is not a bypass,
+#    and there is no admin path that skips it.
+#
+# 2. iam.yaml `evaluation: request_cte` resolves the caller's action set from
+#    it once per request and every root predicate references that CTE, instead
+#    of an `_exists` subquery per row per table.
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, user_id, compiled_role, action]
+      filter: {}
+  # Everyone else may read only their own grants. Reading another person's
+  # effective permissions is an administrative act.
+  - role: staff
+    permission:
+      columns: [user_id, compiled_role, action]
+      filter:
+        user_id:
+          _eq: X-Donat-User-Id
+  - role: fulfilment
+    permission:
+      columns: [user_id, compiled_role, action]
+      filter:
+        user_id:
+          _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: [user_id, compiled_role, action]
+      filter:
+        user_id:
+          _eq: X-Donat-User-Id
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, user_id, compiled_role, action]
+      filter:
+        user_id:
+          _eq: X-Donat-User-Id

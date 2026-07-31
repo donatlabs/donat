@@ -1,0 +1,64 @@
+# Plan entitlements, compiled into the writes they gate.
+#
+# This file exists because of a constraint the overlay design creates on
+# purpose. Petshop exposes `product` as ordinary CRUD, with its own
+# insert_permissions. Pethub must cap how many products a store may hold — and
+# it may not edit the Petshop permission to add the check, because an overlay
+# that can quietly rewrite the base would make every audit of the base
+# meaningless.
+#
+# The answer is the same one tenancy already uses: add a layer, do not edit the
+# text. tenancy.yaml ANDs a tenant predicate into every Petshop permission
+# without touching a line of it; a quota ANDs a ceiling into the insert check
+# the same way. The store's YAML stays a store's YAML, and the platform's
+# concerns stay in the platform's files.
+
+quotas:
+  source: default
+
+  # Counters live in tenant_usage and move inside the statement that performs
+  # the write. A quota is never a COUNT(*) taken beforehand: that is a race,
+  # and under concurrency it is the race that lets a store cross its ceiling.
+  counters:
+    table: { schema: public, name: tenant_usage }
+    tenant: { column: tenant_id }
+
+  # The ceiling comes from the tenant's plan, so raising a limit is a row
+  # change, not a deploy.
+  limits:
+    table: { schema: public, name: plan }
+    key: { column: code }
+    via: { table: { schema: public, name: tenant }, column: plan_code }
+
+  entitlements:
+    - name: products
+      counter: product_count
+      maximum: max_products
+      rule: within_plan_limit
+      # Every insert into these tables consumes one unit; every delete
+      # releases one. Variants do not count separately — a merchant thinks in
+      # products, and a limit that counts something the user cannot see is a
+      # support ticket waiting to happen.
+      consumes:
+        - { table: { schema: public, name: product } }
+
+    # There is deliberately no "locations" entitlement. Petshop models a stock
+    # location as a `stock_location_code` text column, not as an entity, so
+    # there is nothing to count and a ceiling would have no writer to gate.
+    # Adding the plan column anyway is how limits quietly become fiction —
+    # `donat validate` should reject a plan ceiling that no entitlement
+    # consumes, and that rule only has teeth if this example obeys it.
+
+    # Members are consumed by accept_invite and released by remove_member,
+    # which maintain the counter explicitly because both are commands with
+    # other work to do. The entitlement is declared here anyway so that the
+    # ceiling has one home and `donat validate` can prove that every counter
+    # named by a plan column is actually maintained by something.
+    - name: members
+      counter: member_count
+      maximum: max_members
+      rule: within_plan_limit
+      consumes:
+        - { command: accept_invite }
+      releases:
+        - { command: remove_member }

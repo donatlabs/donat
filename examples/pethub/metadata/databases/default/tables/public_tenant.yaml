@@ -1,0 +1,90 @@
+table:
+  name: tenant
+  schema: public
+configuration:
+  column_config:
+    id:
+      comment: >-
+        The tenant identity. It is the tenant key of this table (declared in
+        tenancy.yaml under `keys:`, not `exempt:`) so a member of one store can
+        never enumerate the others.
+    default_member_role:
+      comment: >-
+        The IAM role granted to a person who accepts an invitation that does
+        not name one. Changing this row changes onboarding for the whole
+        store — no deploy, no metadata change.
+object_relationships:
+  - name: plan
+    using:
+      foreign_key_constraint_on: plan_code
+array_relationships:
+  - name: memberships
+    using:
+      foreign_key_constraint_on:
+        column: tenant_id
+        table:
+          name: iam_membership
+          schema: public
+  - name: roles
+    using:
+      foreign_key_constraint_on:
+        column: tenant_id
+        table:
+          name: iam_role
+          schema: public
+
+select_permissions:
+  # Everyone inside the store sees their own store. The tenant predicate is
+  # injected by the compiler, so `filter: {}` here means "this tenant", not
+  # "every tenant" — which is precisely the property that makes the Petshop
+  # permissions work unchanged.
+  - role: merchant_owner
+    permission:
+      columns: [id, slug, name, status, plan_code, default_member_role, owner_user_id, created_at]
+      filter: {}
+  - role: staff
+    permission:
+      columns: [id, slug, name, status, plan_code, created_at]
+      filter: {}
+  - role: support
+    permission:
+      columns: [id, slug, name, status, plan_code, created_at]
+      filter: {}
+  - role: fulfilment
+    permission:
+      columns: [id, slug, name, status, created_at]
+      filter: {}
+  # The storefront needs the store's public identity to render itself.
+  - role: customer
+    permission:
+      columns: [id, slug, name]
+      filter: {}
+  - role: anonymous
+    permission:
+      columns: [id, slug, name]
+      filter: {}
+
+update_permissions:
+  # Renaming the store is ordinary CRUD. Everything that changes who may do
+  # what — status, plan, owner, default role — is command-only below, because
+  # those columns are the tenant's security boundary.
+  - role: merchant_owner
+    permission:
+      columns: [name]
+      filter: {}
+      check: {}
+
+command_insert_permissions:
+  # A tenant row is created by register_merchant and by nothing else. There is
+  # no insert_permissions block, so `insert_tenant` exists on no schema.
+  - role: platform_visitor
+    permission:
+      columns: [id, slug, name, status, plan_code, default_member_role, owner_user_id]
+      check: {}
+
+command_update_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [owner_user_id, default_member_role, plan_code]
+      filter: {}
+      check: {}

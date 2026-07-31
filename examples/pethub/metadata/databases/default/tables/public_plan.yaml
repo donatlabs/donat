@@ -1,0 +1,32 @@
+table:
+  name: plan
+  schema: public
+configuration:
+  column_config:
+    max_products:
+      comment: >-
+        Entitlement ceilings are enforced against the counters in
+        tenant_usage, inside the same statement as the write they gate. A
+        limit checked in a separate round trip is not a limit.
+
+# Platform-owned reference data, shared by every tenant and writable by none
+# of them. tenancy.yaml marks it `shared: read_only`, which makes any
+# insert/update/delete permission for a tenant-facing role a validation
+# failure: a shared writable table is a side channel between tenants.
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [code, name, max_products, max_members, price_minor, currency]
+      filter: {}
+  - role: staff
+    permission:
+      columns: [code, name, max_products, max_members]
+      filter: {}
+  - role: platform_visitor
+    permission:
+      columns: [code, name, max_products, max_members, price_minor, currency]
+      filter: {}
+  - role: anonymous
+    permission:
+      columns: [code, name, price_minor, currency]
+      filter: {}

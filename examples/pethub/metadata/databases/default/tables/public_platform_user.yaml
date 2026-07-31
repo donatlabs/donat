@@ -1,0 +1,67 @@
+table:
+  name: platform_user
+  schema: public
+configuration:
+  column_config:
+    id:
+      comment: >-
+        Equal to the X-Donat-User-Id session variable. One person, one row,
+        however many stores they belong to — which is why this table is
+        `scope_via: memberships` in tenancy.yaml rather than tenant-keyed.
+array_relationships:
+  - name: memberships
+    using:
+      foreign_key_constraint_on:
+        column: user_id
+        table:
+          name: iam_membership
+          schema: public
+
+select_permissions:
+  # Staff can see the colleagues they share a store with. The compiler adds
+  # the membership-intersection traversal declared by `scope_via`; without it
+  # this filter would expose the platform's entire user list.
+  - role: merchant_owner
+    permission:
+      columns: [id, email, display_name, created_at]
+      filter: {}
+  - role: staff
+    permission:
+      columns: [id, display_name]
+      filter: {}
+  - role: support
+    permission:
+      columns: [id, display_name]
+      filter: {}
+  - role: fulfilment
+    permission:
+      columns: [id, display_name]
+      filter: {}
+  # Signed in, no store yet: you can always read yourself. This is the only
+  # row a platform_visitor can reach anywhere in the schema.
+  - role: platform_visitor
+    permission:
+      columns: [id, email, display_name]
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+
+update_permissions:
+  - role: platform_visitor
+    permission:
+      columns: [display_name]
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+      check:
+        id:
+          _eq: X-Donat-User-Id
+
+command_insert_permissions:
+  # Created by register_merchant and accept_invite on first sign-in.
+  - role: platform_visitor
+    permission:
+      columns: [id, email, display_name]
+      check:
+        id:
+          _eq: X-Donat-User-Id

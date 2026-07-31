@@ -1,0 +1,147 @@
+name: register_merchant
+source: default
+permissions:
+  - role: platform_visitor
+
+# The tenant does not exist when this command starts — this statement is what
+# creates it. `establishes` tells the compiler that the tenant key for every
+# write below comes from a step rather than from the session, and that the
+# idempotency scope may omit the tenant (there is nothing to scope to yet).
+# Without it, the tenancy compiler would reject the command for writing
+# tenant-keyed rows with no tenant in the session, which is exactly the check
+# that makes every other command safe.
+tenant:
+  establishes: { step: tenant, column: id }
+
+arguments:
+  - name: tenant_id
+    type: uuid!
+  - name: slug
+    type: string!
+  - name: store_name
+    type: string!
+  - name: plan_code
+    type: string!
+  - name: request_id
+    type: uuid!
+
+steps:
+  # The plan is platform-owned shared reference data: readable here, writable
+  # by no tenant-facing role anywhere in the metadata.
+  - name: plan
+    select_one:
+      table: { schema: public, name: plan }
+      by:
+        code: { arg: plan_code }
+      returning: [code, max_products, max_members]
+      require_found: true
+
+  - name: founder
+    select_one:
+      table: { schema: public, name: platform_user }
+      by:
+        id: { session_variable: x-donat-user-id }
+      returning: [id, email, display_name]
+      require_found: true
+
+  - name: tenant
+    insert:
+      table: { schema: public, name: tenant }
+      object:
+        id: { arg: tenant_id }
+        slug: { arg: slug }
+        name: { arg: store_name }
+        status: { literal: active }
+        plan_code: { step: plan, column: code }
+        # The role a future invitee gets by default. It is a column, not
+        # metadata, so a merchant changes their own onboarding policy without
+        # a deploy.
+        default_member_role: { literal: staff }
+        owner_user_id: { step: founder, column: id }
+      returning: [id, slug, status, default_member_role]
+
+  # Two seeded roles: the one that owns the store, and the one new joiners
+  # get. Everything else the merchant creates themselves with
+  # create_tenant_role — which is the feature this example exists to prove.
+  - name: owner_role
+    insert:
+      table: { schema: public, name: iam_role }
+      object:
+        tenant_id: { step: tenant, column: id }
+        name: { literal: owner }
+        compiled_role: { literal: merchant_owner }
+        description: { literal: Full control of this store }
+        is_system: { literal: true }
+      returning: [name, compiled_role]
+
+  - name: staff_role
+    insert:
+      table: { schema: public, name: iam_role }
+      object:
+        tenant_id: { step: tenant, column: id }
+        name: { literal: staff }
+        compiled_role: { literal: staff }
+        description: { literal: Day-to-day store staff }
+        is_system: { literal: true }
+      returning: [name, compiled_role]
+
+  # `*:*` inside one tenant. iam.yaml `reserved_actions` still withholds
+  # `platform:*`, `tenant:create` and `tenant:suspend`, so the widest grant a
+  # merchant can hold stops at the edge of their own store.
+  - name: owner_grant
+    insert:
+      table: { schema: public, name: iam_role_grant }
+      object:
+        tenant_id: { step: tenant, column: id }
+        role_name: { step: owner_role, column: name }
+        action: { literal: "*:*" }
+      returning: [role_name, action]
+
+  - name: staff_catalog_grant
+    insert:
+      table: { schema: public, name: iam_role_grant }
+      object:
+        tenant_id: { step: tenant, column: id }
+        role_name: { step: staff_role, column: name }
+        action: { literal: "catalog:*" }
+      returning: [role_name, action]
+
+  - name: staff_order_grant
+    insert:
+      table: { schema: public, name: iam_role_grant }
+      object:
+        tenant_id: { step: tenant, column: id }
+        role_name: { step: staff_role, column: name }
+        action: { literal: "order:read" }
+      returning: [role_name, action]
+
+  - name: founder_membership
+    insert:
+      table: { schema: public, name: iam_membership }
+      object:
+        tenant_id: { step: tenant, column: id }
+        user_id: { step: founder, column: id }
+        role_name: { step: owner_role, column: name }
+      returning: [tenant_id, user_id, role_name]
+
+  - name: usage
+    insert:
+      table: { schema: public, name: tenant_usage }
+      object:
+        tenant_id: { step: tenant, column: id }
+        product_count: { literal: 0 }
+        member_count: { literal: 1 }
+      returning: [tenant_id, member_count]
+
+result:
+  tenant_id: { step: tenant, column: id }
+  slug: { step: tenant, column: slug }
+  status: { step: tenant, column: status }
+  default_member_role: { step: tenant, column: default_member_role }
+  owner_role: { step: owner_role, column: name }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 3650d

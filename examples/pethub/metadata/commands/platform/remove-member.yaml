@@ -1,0 +1,67 @@
+name: remove_member
+source: default
+permissions:
+  - role: merchant_owner
+# Gated on `iam:administer` by iam.yaml.
+
+arguments:
+  - name: user_id
+    type: uuid!
+  - name: role_name
+    type: string!
+  - name: request_id
+    type: uuid!
+
+guards:
+  # An owner cannot remove themselves.
+  - rule: is_not_self
+    with:
+      subject_user_id: { arg: user_id }
+      caller_user_id: { session_variable: x-donat-user-id }
+    message: an owner cannot remove their own membership
+
+  # Nor anybody else's ownership. Handing the store over is transfer_ownership,
+  # which is gated on `tenant:transfer` rather than `iam:administer`: someone
+  # who administers access manages other people's permissions, and that is a
+  # different thing from disposing of the store. Counting remaining owners
+  # instead would be the wrong shape — it would make "can I remove this
+  # person" depend on how many owners happen to exist right now, and it would
+  # block removing an ordinary member from a store that has a single owner,
+  # which is the common case.
+  - rule: role_is_not_owner
+    with:
+      role_name: { arg: role_name }
+    message: ownership is transferred, not removed
+
+steps:
+  - name: removed
+    delete:
+      table: { schema: public, name: iam_membership }
+      where:
+        user_id: { arg: user_id }
+        role_name: { arg: role_name }
+      returning: [user_id, role_name]
+      require_affected: true
+
+  - name: member_count
+    update:
+      table: { schema: public, name: tenant_usage }
+      where:
+        tenant_id: { session_variable: x-donat-tenant-id }
+      set:
+        member_count:
+          rule: decrement_to_zero
+          with:
+            value: { current_column: member_count }
+      returning: [member_count]
+
+result:
+  user_id: { step: removed, column: user_id }
+  role_name: { step: removed, column: role_name }
+  member_count: { step: member_count, column: member_count }
+
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: user_id }
+  retention: 365d

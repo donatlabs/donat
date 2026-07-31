@@ -1,0 +1,55 @@
+table:
+  name: iam_role_grant
+  schema: public
+configuration:
+  column_config:
+    action:
+      comment: >-
+        An IAM action string — `order:read`, `catalog:*`, `*:read`. iam.yaml
+        maps every table, operation and command onto one of these, and
+        `reserved_actions` there lists the ones a tenant may never hold
+        whatever it writes here.
+
+object_relationships:
+  - name: role
+    using:
+      foreign_key_constraint_on: role_name
+
+select_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, role_name, action, created_at]
+      filter: {}
+  # Anyone governed by grants may read their own effective set, so a UI can
+  # grey out what the person cannot do. Reading your own permissions is not a
+  # permission; being unable to read them just produces a worse UI.
+  - role: staff
+    permission:
+      columns: [role_name, action]
+      filter: {}
+  - role: fulfilment
+    permission:
+      columns: [role_name, action]
+      filter: {}
+  - role: support
+    permission:
+      columns: [role_name, action]
+      filter: {}
+
+# Command-only, and gated on `iam:administer` in iam.yaml. This is the sharpest
+# table in the example: a role that can write here can write itself anything,
+# so there is deliberately no ordinary insert or delete permission at all.
+command_insert_permissions:
+  - role: merchant_owner
+    permission:
+      columns: [tenant_id, role_name, action]
+      check: {}
+  - role: platform_visitor
+    permission:
+      columns: [tenant_id, role_name, action]
+      check: {}
+
+command_delete_permissions:
+  - role: merchant_owner
+    permission:
+      filter: {}
