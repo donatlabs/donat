@@ -206,23 +206,15 @@ macro_rules! declare_canonical_projection_route_model {
         #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
         pub enum $mount {
             RootField { canonical_json_path: &'static str },
-            SourcePath {
-                segments: &'static [$mount_segment],
-            },
+            SourcePath { segments: &'static [$mount_segment] },
         }
 
         #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
         pub enum $mount_segment {
             Field(&'static str),
-            TaggedKind {
-                expected_kind: &'static str,
-            },
-            TaggedValue {
-                expected_kind: &'static str,
-            },
-            KeyedElement {
-                key: &'static [$key_part],
-            },
+            TaggedKind { expected_kind: &'static str },
+            TaggedValue { expected_kind: &'static str },
+            KeyedElement { key: &'static [$key_part] },
         }
 
         #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -233,9 +225,7 @@ macro_rules! declare_canonical_projection_route_model {
         #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
         pub enum $static_segment {
             Field(&'static str),
-            TaggedValue {
-                expected_kind: &'static str,
-            },
+            TaggedValue { expected_kind: &'static str },
         }
 
         #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -486,8 +476,7 @@ macro_rules! source_route_probe_memberships {
                 $owner,
                 $field,
             ),
-            disposition:
-                CanonicalProjectionProbeDisposition::PublicPipelineRejected,
+            disposition: CanonicalProjectionProbeDisposition::PublicPipelineRejected,
         }]
     };
     ($owner:expr, $field:expr, ExecutableRejected) => {
@@ -506,8 +495,7 @@ macro_rules! source_route_probe_memberships {
                     $owner,
                     "ExecutablePublicPipeline",
                 ),
-                disposition:
-                    CanonicalProjectionProbeDisposition::PublicPipelineRejected,
+                disposition: CanonicalProjectionProbeDisposition::PublicPipelineRejected,
             },
         ]
     };

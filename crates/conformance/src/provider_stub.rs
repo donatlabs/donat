@@ -148,6 +148,12 @@ impl ProviderStub {
         self.calls_for(path).len()
     }
 
+    /// Resolve a request path to its answer.
+    ///
+    /// An operation template can carry a runtime value in its path -- a payment
+    /// id, an order id -- so a fixture cannot always name the exact path. A
+    /// registration whose key ends in `*` matches every path with that prefix;
+    /// exact keys always win.
     fn answer(&self, path: &str) -> ScriptedResponse {
         let mut state = self.state.lock().unwrap();
         if let Some(queue) = state.scripts.get_mut(path)
@@ -155,10 +161,25 @@ impl ProviderStub {
         {
             return queue.remove(0);
         }
+        let prefix_script = state
+            .scripts
+            .keys()
+            .find(|key| prefix_matches(key, path))
+            .cloned();
+        if let Some(key) = prefix_script
+            && let Some(queue) = state.scripts.get_mut(&key)
+            && !queue.is_empty()
+        {
+            return queue.remove(0);
+        }
+        if let Some(response) = state.defaults.get(path) {
+            return response.clone();
+        }
         state
             .defaults
-            .get(path)
-            .cloned()
+            .iter()
+            .find(|(key, _)| prefix_matches(key, path))
+            .map(|(_, response)| response.clone())
             .unwrap_or_else(|| ScriptedResponse::ok(json!({})))
     }
 
@@ -196,6 +217,12 @@ pub fn spawn() -> ProviderStub {
     });
 
     stub
+}
+
+/// A registration key ending in `*` matches every path with that prefix.
+fn prefix_matches(key: &str, path: &str) -> bool {
+    key.strip_suffix('*')
+        .is_some_and(|prefix| path.starts_with(prefix))
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<ProviderCall> {
