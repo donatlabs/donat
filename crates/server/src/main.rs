@@ -27,6 +27,7 @@ mod processes;
 mod remote;
 mod rest;
 mod state;
+mod validate;
 mod ws;
 
 use std::net::SocketAddr;
@@ -364,44 +365,66 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    let database_url = args
-        .database_url
-        .clone()
-        .or_else(|| args.metadata_database_url.clone())
-        .or_else(|| std::env::var("DONAT_GRAPHQL_DATABASE_URL").ok())
-        .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
-
     // Deploy-time subcommands: do their job and exit (no server, no
     // request-path mutation surface).
     match &args.command {
         Some(Command::Migrate(m)) => {
-            migrate::run_migrate(&database_url, &m.migrations_dir).await?;
-            // Optional deploy-time DDL: reconcile per-table event-trigger
-            // Postgres triggers from the YAML metadata. Validate after schema
-            // DDL but before reconciliation so inconsistent command metadata
-            // cannot create or remove metadata-derived database objects.
-            let md_dir = m.metadata_dir.clone().or_else(|| args.metadata_dir.clone());
-            if let Some(dir) = md_dir {
-                let problems = migrate::check_consistency(&database_url, &dir).await?;
-                require_consistent_metadata(&problems)?;
-                let metadata = donat_metadata::load_metadata_dir(&dir)?;
-                events::reconcile(&database_url, &metadata).await?;
-                tracing::info!(dir = %dir.display(), "event triggers reconciled");
+            match resolve_migrate_selection(&args, m, |name| std::env::var(name))? {
+                DeploymentSelection::RefineryOnly {
+                    database_url,
+                    migrations_dir,
+                } => {
+                    migrate::run_migrate(&database_url, &migrations_dir).await?;
+                }
+                DeploymentSelection::MetadataSource {
+                    metadata_dir,
+                    source_name,
+                    database_url,
+                    migrations_dir,
+                } => {
+                    if let Some(migrations_dir) = migrations_dir {
+                        migrate::run_migrate(&database_url, &migrations_dir).await?;
+                    }
+
+                    // Metadata compilation happens after schema migrations but
+                    // before metadata-owned DDL. A rejected candidate cannot
+                    // partially change event/process deployment state.
+                    let problems = validate::check_source_consistency(
+                        &database_url,
+                        &metadata_dir,
+                        &source_name,
+                    )
+                    .await?;
+                    require_consistent_metadata(&problems)?;
+
+                    let mut metadata = donat_metadata::load_metadata_dir(&metadata_dir)?;
+                    metadata.sources.retain(|source| source.name == source_name);
+                    events::reconcile(&database_url, &metadata).await?;
+                    tracing::info!(
+                        dir = %metadata_dir.display(),
+                        source = %source_name,
+                        "source metadata reconciled"
+                    );
+                }
             }
             return Ok(());
         }
         Some(Command::Validate(v)) => {
-            let dir = v
-                .metadata_dir
-                .clone()
-                .or_else(|| args.metadata_dir.clone())
-                .ok_or_else(|| anyhow::anyhow!("validate needs --metadata-dir"))?;
-            let problems = migrate::check_consistency(&database_url, &dir).await?;
+            let selected = resolve_validate_selection(&args, v, |name| std::env::var(name))?;
+            let problems = validate::check_source_consistency(
+                &selected.database_url,
+                &selected.metadata_dir,
+                &selected.source_name,
+            )
+            .await?;
             require_consistent_metadata(&problems)?;
             return Ok(());
         }
         _ => {}
     }
+
+    let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
+        .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
     let port = serve.and_then(|s| s.server_port).unwrap_or(args.port);
     let admin_secret = serve
         .and_then(|s| s.admin_secret.clone())

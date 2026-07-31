@@ -2351,6 +2351,8 @@ impl Running {
                 .arg(&migrations)
                 .arg("--metadata-dir")
                 .arg(&metadata_dir)
+                .arg("--source")
+                .arg("default")
                 .env("DONAT_DATABASE_URL", &self.db_url)
                 .status()
                 .expect("running donat migrate");

@@ -345,6 +345,17 @@ impl CompiledProcessCatalog {
     pub fn sources(&self) -> impl Iterator<Item = (&String, &CompiledSourceProcessCatalog)> {
         self.sources.iter()
     }
+
+    /// Assemble one independently compiled source for effect-contract
+    /// validation without inventing catalogs for unselected databases.
+    pub fn single_source(
+        source_name: impl Into<String>,
+        source: CompiledSourceProcessCatalog,
+    ) -> Self {
+        Self {
+            sources: BTreeMap::from([(source_name.into(), source)]),
+        }
+    }
 }
 
 pub fn compile_process_catalog(
@@ -370,6 +381,60 @@ pub fn compile_process_catalog(
         }
     }
     Ok(catalog)
+}
+
+/// Compile only the Process declarations owned by one selected Postgres
+/// source. Deployment uses this entry point after introspecting that source's
+/// real catalog; it never substitutes the selected catalog for another source.
+pub fn compile_process_source_catalog(
+    metadata: &Metadata,
+    source_name: &str,
+    commands: &donat_schema::CompiledSourceCommandCatalog,
+    rules: &donat_rules::RuleCatalog,
+    connectors: &dyn ProcessConnectorCatalog,
+) -> Result<CompiledSourceProcessCatalog, PlanError> {
+    let source = metadata
+        .sources
+        .iter()
+        .find(|source| source.name == source_name)
+        .ok_or_else(|| {
+            validation(
+                "processes",
+                format!("process source `{source_name}` does not exist"),
+            )
+        })?;
+    if source.kind != SourceKind::Postgres {
+        return Err(validation(
+            "processes",
+            format!("process source `{source_name}` requires a Postgres source"),
+        ));
+    }
+
+    let aggregate_commands =
+        CompiledCommandCatalog::single_source(source_name.to_owned(), commands.clone());
+    let dependencies =
+        ServerProcessDependencies::new(metadata, &aggregate_commands, rules, connectors);
+    let mut compiled = CompiledSourceProcessCatalog::default();
+    for (process_index, process) in metadata.processes.iter().enumerate() {
+        if process.source != source_name {
+            continue;
+        }
+        let definition = compile_process(metadata, &dependencies, process_index, process)?;
+        if compiled
+            .processes
+            .insert(process.name.clone(), definition)
+            .is_some()
+        {
+            return Err(validation(
+                format!("processes[{process_index}].name"),
+                format!(
+                    "process `{}` is declared more than once in source `{source_name}`",
+                    process.name
+                ),
+            ));
+        }
+    }
+    Ok(compiled)
 }
 
 pub fn build_process_effect_contract_catalog(

@@ -47,6 +47,18 @@ impl CompiledCommandCatalog {
         }
     }
 
+    /// Assemble one already compiled source into the aggregate shape consumed
+    /// by source-local Process validation. This does not widen the source
+    /// boundary or compile any additional metadata.
+    pub fn single_source(
+        source_name: impl Into<String>,
+        source: CompiledSourceCommandCatalog,
+    ) -> Self {
+        Self {
+            sources: BTreeMap::from([(source_name.into(), source)]),
+        }
+    }
+
     /// The already validated commands belonging to one source.
     pub fn source(&self, source: &str) -> Option<&CompiledSourceCommandCatalog> {
         self.sources.get(source)

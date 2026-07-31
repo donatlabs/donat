@@ -15,4 +15,5 @@ pub mod processes;
 pub mod remote;
 pub mod rest;
 pub mod state;
+pub mod validate;
 pub mod ws;
