@@ -17,6 +17,7 @@ use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use donat_conformance::{Suite, Transport, fixture_root};
+use donat_metadata::McpMetadata;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Map as JsonMap, Value as Json, json};
 
@@ -151,11 +152,11 @@ fn mcp_tools() {
         "initialize_meta_progress_token_invalid_rejected.yaml",
         "initialize_unknown_param_rejected.yaml",
         "mcp_protocol_version_header_unsupported_rejected.yaml",
-        "origin_remote_rejected.yaml",
-        "get_origin_remote_rejected.yaml",
-        "delete_origin_remote_rejected.yaml",
-        "put_origin_remote_rejected.yaml",
-        "host_remote_rejected.yaml",
+        "origin_remote_accepted.yaml",
+        "get_origin_remote_method_not_allowed.yaml",
+        "delete_origin_remote_method_not_allowed.yaml",
+        "put_origin_remote_method_not_allowed.yaml",
+        "host_remote_accepted.yaml",
         "session_id_invalid_rejected.yaml",
         "accept_missing_sse_rejected.yaml",
         "accept_sse_q_zero_rejected.yaml",
@@ -253,6 +254,20 @@ fn mcp_tools() {
     }
 
     s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
+}
+
+#[test]
+fn configured_empty_mcp_publication_hides_legacy_tools() {
+    let s = Suite::new("mcp_empty_publication").start();
+    s.setup_v1q(&format!("{MCP}/setup.yaml"));
+    s.set_mcp_metadata(McpMetadata::default());
+
+    for fixture in [
+        "configured_empty_tools_list.yaml",
+        "configured_empty_tools_call.yaml",
+    ] {
+        s.check_query_f(&format!("{MCP}/{fixture}"), Transport::Http);
+    }
 }
 
 #[test]
@@ -859,7 +874,7 @@ fn mcp_rejects_oversized_accept_header_without_reflection() {
 }
 
 #[test]
-fn mcp_rejects_missing_host_header() {
+fn mcp_accepts_missing_host_header_at_the_application_layer() {
     let s = Suite::new("mcp_missing_host").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
 
@@ -869,6 +884,7 @@ fn mcp_rejects_missing_host_header() {
         &format!(
             "POST /mcp HTTP/1.0\r\n\
 Accept: application/json, text/event-stream\r\n\
+MCP-Protocol-Version: 2025-06-18\r\n\
 Content-Type: application/json\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\
@@ -879,14 +895,12 @@ Connection: close\r\n\
     );
 
     assert!(
-        response.starts_with("HTTP/1.0 421") || response.starts_with("HTTP/1.1 421"),
+        response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"),
         "raw response: {:?}",
         response
     );
     assert!(
-        response.contains(r#""id":null"#)
-            && response.contains(r#""code":-32600"#)
-            && response.contains(r#""message":"forbidden MCP host""#),
+        response.contains(r#""id":99"#) && response.contains(r#""name":"list_tables""#),
         "{response}"
     );
 
@@ -1633,13 +1647,14 @@ fn mcp_rejects_oversized_protocol_version_header_without_reflection() {
 }
 
 #[test]
-fn mcp_rejects_duplicate_origin_header() {
+fn mcp_accepts_duplicate_origin_header_at_the_application_layer() {
     let s = Suite::new("mcp_duplicate_origin").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
 
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .header("Content-Type", "application/json")
         .header("Origin", "http://localhost:3000")
         .header("Origin", "https://evil.example")
@@ -1647,21 +1662,17 @@ fn mcp_rejects_duplicate_origin_header() {
         .send()
         .expect("http request failed");
 
-    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(resp.status().as_u16(), 200);
     let body: Json = resp.json().expect("json body");
-    assert_eq!(body["id"], json!(null));
-    assert_eq!(body["error"]["code"], json!(-32600));
-    assert_eq!(
-        body["error"]["message"],
-        json!("duplicate MCP origin header")
-    );
-    assert!(body.get("result").is_none(), "{body}");
+    assert_eq!(body["id"], json!(94));
+    assert!(body["result"]["tools"].is_array(), "{body}");
+    assert!(body.get("error").is_none(), "{body}");
 
     s.teardown_v1q(&format!("{MCP}/teardown.yaml"));
 }
 
 #[test]
-fn mcp_rejects_oversized_origin_and_host_headers_without_reflection() {
+fn mcp_accepts_large_origin_and_host_headers_at_the_application_layer() {
     let s = Suite::new("mcp_oversized_origin_host").start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
 
@@ -1672,21 +1683,18 @@ fn mcp_rejects_oversized_origin_and_host_headers_without_reflection() {
     let resp = reqwest::blocking::Client::new()
         .post(format!("{}/mcp", s.base_url()))
         .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
         .header("Content-Type", "application/json")
         .header("Origin", origin_payload)
         .body(r#"{"jsonrpc":"2.0","id":96,"method":"tools/list"}"#)
         .send()
         .expect("http request failed");
 
-    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(resp.status().as_u16(), 200);
     let body: Json = resp.json().expect("json body");
-    assert_eq!(body["id"], json!(null));
-    assert_eq!(body["error"]["code"], json!(-32600));
-    assert_eq!(
-        body["error"]["message"],
-        json!("MCP origin header must be at most 512 characters")
-    );
-    assert!(body.get("result").is_none(), "{body}");
+    assert_eq!(body["id"], json!(96));
+    assert!(body["result"]["tools"].is_array(), "{body}");
+    assert!(body.get("error").is_none(), "{body}");
     let response_text = body.to_string();
     assert!(
         !response_text.contains("ignore previous instructions"),
@@ -1705,6 +1713,7 @@ fn mcp_rejects_oversized_origin_and_host_headers_without_reflection() {
             "POST /mcp HTTP/1.1\r\n\
 Host: {host_payload}\r\n\
 Accept: application/json, text/event-stream\r\n\
+MCP-Protocol-Version: 2025-06-18\r\n\
 Content-Type: application/json\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\
@@ -1715,14 +1724,12 @@ Connection: close\r\n\
     );
 
     assert!(
-        response.starts_with("HTTP/1.1 400"),
+        response.starts_with("HTTP/1.1 200"),
         "raw response: {:?}",
         response
     );
     assert!(
-        response.contains(r#""id":null"#)
-            && response.contains(r#""code":-32600"#)
-            && response.contains(r#""message":"MCP host header must be at most 255 characters""#),
+        response.contains(r#""id":97"#) && response.contains(r#""name":"list_tables""#),
         "{response}"
     );
     assert!(

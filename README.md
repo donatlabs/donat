@@ -102,7 +102,7 @@ root operation, with permission predicates inside the plan.
 |---|---|
 | **GraphQL** | Queries, mutations, subscriptions, Relay, aggregates, relationships, computed fields, JSONB, and PostGIS on the Postgres reference backend. |
 | **REST** | Metadata-declared endpoints backed by saved GraphQL operations; path, query, and body values become operation variables. |
-| **MCP** | Permission-aware Streamable HTTP tools for discovering tables and querying or mutating data. |
+| **MCP** | Permission-aware HTTP tools. A separate `mcp.yaml` can publish a small, role-scoped agent contract over saved GraphQL operations and explicit table CRUD. |
 | **Events & actions** | Postgres event triggers, durable cron delivery, and synchronous typed webhook actions. |
 | **Remote & multi-source schemas** | Role-scoped remote GraphQL schemas and composed metadata sources where capabilities allow it. |
 

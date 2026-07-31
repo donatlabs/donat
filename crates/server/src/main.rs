@@ -478,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
             rules: Default::default(),
             connectors: vec![],
             processes: vec![],
+            mcp: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);
