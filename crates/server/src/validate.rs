@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use donat_metadata::{Metadata, SourceKind};
 use donat_schema::{
     CompiledCommandCatalog, PlanError, compile_command_source_catalog, finalize_command_effects,
+    validate_command_source_catalog,
 };
 
 use crate::connectors::ConnectorRegistry;
@@ -188,6 +189,14 @@ fn validate_selected_executable_catalog(
     rules: &donat_rules::RuleCatalog,
     problems: &mut Vec<String>,
 ) {
+    let command_diagnostics =
+        validate_command_source_catalog(metadata, source_name, catalog, rules, true);
+    if !command_diagnostics.is_empty() {
+        for error in command_diagnostics {
+            push_plan_error(problems, error);
+        }
+        return;
+    }
     let commands = match compile_command_source_catalog(metadata, source_name, catalog, rules, true)
     {
         Ok(commands) => commands,

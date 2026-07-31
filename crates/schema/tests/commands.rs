@@ -14,7 +14,7 @@ use donat_rules::{
 use donat_schema::{
     CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, Session,
     compile_command_catalog, compile_command_source_catalog, execute_multi_source_introspection,
-    validate_command_catalog,
+    validate_command_catalog, validate_command_source_catalog,
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
@@ -2419,6 +2419,36 @@ fn missing_command_source_catalog_is_a_validation_error() {
     assert_eq!(
         error.message,
         "catalog for command source 'default' is missing"
+    );
+}
+
+#[test]
+fn source_validation_collects_selected_errors_without_renumbering_paths() {
+    let mut first = valid_command();
+    first["steps"][0]["insert"]["object"]["unknown_first"] = json!({ "literal": 1 });
+
+    let mut other_source = valid_command();
+    other_source["name"] = json!("create_secondary_order");
+    other_source["source"] = json!("secondary");
+    other_source["steps"][0]["insert"]["object"]["unknown_secondary"] = json!({ "literal": 1 });
+
+    let mut last = valid_command();
+    last["name"] = json!("create_last_order");
+    last["steps"][0]["insert"]["object"]["unknown_last"] = json!({ "literal": 1 });
+
+    let metadata = two_source_metadata(vec![first, other_source, last]);
+    let catalogs = two_source_catalogs();
+    let diagnostics =
+        validate_command_source_catalog(&metadata, "default", &catalogs["default"], &rules(), true);
+
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].path, "commands[0].steps[0]");
+    assert_eq!(diagnostics[1].path, "commands[2].steps[0]");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|error| !error.path.starts_with("commands[1]")),
+        "selected-source validation must not compile another source: {diagnostics:#?}"
     );
 }
 

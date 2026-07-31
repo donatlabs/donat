@@ -743,6 +743,7 @@ pub fn compile_command_catalog(
         catalogs,
         rules,
         infer_function_permissions,
+        None,
     );
     match diagnostics.into_iter().next() {
         Some(diagnostic) => Err(diagnostic),
@@ -3091,8 +3092,54 @@ pub fn validate_command_catalog(
     rules: &RuleCatalog,
     infer_function_permissions: bool,
 ) -> Vec<PlanError> {
-    compile_command_catalog_with_diagnostics(metadata, catalogs, rules, infer_function_permissions)
-        .1
+    compile_command_catalog_with_diagnostics(
+        metadata,
+        catalogs,
+        rules,
+        infer_function_permissions,
+        None,
+    )
+    .1
+}
+
+/// Collect every diagnostic for one source without renumbering metadata paths.
+///
+/// Source-selected deployment cannot use the fail-fast source compiler for
+/// validation: doing so would hide independent errors after the first invalid
+/// command. Filtering inside the aggregate traversal preserves the original
+/// `commands[N]` indices while never borrowing another source's catalog.
+pub fn validate_command_source_catalog(
+    metadata: &Metadata,
+    source_name: &str,
+    catalog: &Catalog,
+    rules: &RuleCatalog,
+    infer_function_permissions: bool,
+) -> Vec<PlanError> {
+    let Some(source) = metadata
+        .sources
+        .iter()
+        .find(|source| source.name == source_name)
+    else {
+        return vec![PlanError::validation(
+            "commands",
+            format!("command source '{source_name}' does not exist"),
+        )];
+    };
+    if source.kind != SourceKind::Postgres {
+        return vec![PlanError::validation(
+            "commands",
+            format!("command source '{source_name}' requires a Postgres source"),
+        )];
+    }
+    let catalogs = HashMap::from([(source_name.to_owned(), catalog.clone())]);
+    compile_command_catalog_with_diagnostics(
+        metadata,
+        &catalogs,
+        rules,
+        infer_function_permissions,
+        Some(source_name),
+    )
+    .1
 }
 
 fn compile_command_catalog_with_diagnostics(
@@ -3100,11 +3147,14 @@ fn compile_command_catalog_with_diagnostics(
     catalogs: &HashMap<String, Catalog>,
     rules: &RuleCatalog,
     infer_function_permissions: bool,
+    source_filter: Option<&str>,
 ) -> (CompiledCommandCatalog, Vec<PlanError>) {
     let rules_snapshot = Arc::new(rules.clone());
     let mut sources = BTreeMap::new();
     for source in &metadata.sources {
-        if source.kind == SourceKind::Postgres {
+        if source.kind == SourceKind::Postgres
+            && source_filter.is_none_or(|selected| source.name == selected)
+        {
             sources.insert(source.name.clone(), CompiledSourceCommandCatalog::default());
         }
     }
@@ -3119,6 +3169,9 @@ fn compile_command_catalog_with_diagnostics(
         infer_function_permissions,
     };
     for (index, command) in metadata.commands.iter().enumerate() {
+        if source_filter.is_some_and(|selected| command.source != selected) {
+            continue;
+        }
         let path = format!("commands[{index}]");
         let Some(source) = metadata
             .sources
