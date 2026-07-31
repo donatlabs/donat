@@ -217,7 +217,7 @@ fn validate_rejects_non_finite_or_unknown_declared_rule_types() {
         (
             "ambiguous_type_body",
             AMBIGUOUS_TYPE_BODY,
-            "exactly one of object or enum",
+            "exactly one of object, enum, or opaque_json",
         ),
     ];
 

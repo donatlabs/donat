@@ -225,7 +225,11 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         widget,
     );
 
-    let (ok, out) = run(&db, &["validate", "--metadata-dir", md.to_str().unwrap()]);
+    let (ok, out) = run_with_env(
+        &db,
+        &["validate", "--metadata-dir", md.to_str().unwrap()],
+        &[("DONAT_GRAPHQL_DATABASE_URL", &db)],
+    );
     assert!(ok, "validate should pass for consistent metadata:\n{out}");
     assert!(
         out.contains("consistent"),
@@ -237,7 +241,11 @@ fn validate_passes_when_consistent_and_fails_when_not() {
         &md.join("databases/default/tables/public_widget.yaml"),
         "table:\n  name: ghost\n  schema: public\n",
     );
-    let (ok, out) = run(&db, &["validate", "--metadata-dir", md.to_str().unwrap()]);
+    let (ok, out) = run_with_env(
+        &db,
+        &["validate", "--metadata-dir", md.to_str().unwrap()],
+        &[("DONAT_GRAPHQL_DATABASE_URL", &db)],
+    );
     assert!(!ok, "validate should fail for a missing table:\n{out}");
     assert!(
         out.contains("does not exist in the database"),

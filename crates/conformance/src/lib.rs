@@ -304,8 +304,8 @@ pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> boo
 use std::cell::RefCell;
 
 use donat_metadata::{
-    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DeletePermission, EventTrigger,
-    FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
+    AllowlistEntry, ArrayRelationship, ComputedField, CronTrigger, DatabaseUrl, DeletePermission,
+    EventTrigger, FunctionEntry, FunctionPermission, InheritedRole, InsertPermission, Metadata,
     ObjectRelationship, PermissionEntry, QualifiedTable, QueryCollection, RemoteRelationship,
     RemoteSchema, RemoteSchemaPermission, RestEndpoint, SelectPermission, Source, SourceKind,
     TableConfiguration, TableEntry, UpdatePermission,
@@ -1209,7 +1209,11 @@ impl Suite {
             webhook: self.webhook,
             cron: self.cron,
             event: self.event,
-            run_migrations: self.run_migrations,
+            // Every Postgres serving deployment requires the migration-owned
+            // command/Process helpers. Non-Postgres suites keep their native
+            // setup unless a test explicitly requests another migration path.
+            run_migrations: self.run_migrations || backend == BackendId::Postgres,
+            reconcile_metadata: self.run_migrations,
             db_url,
             schema,
             _database: database,
@@ -1256,6 +1260,7 @@ pub struct Running {
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
     run_migrations: bool,
+    reconcile_metadata: bool,
     db_url: String,
     pub schema: String,
     _database: SuiteDatabase,
@@ -2347,27 +2352,99 @@ impl Running {
             return;
         }
         let metadata_dir = self.write_metadata_dir();
-        // Apply DDL before serving, like a real deploy: the donat catalog
-        // (migrations) plus per-table event-trigger reconciliation from the
-        // metadata we are about to serve.
+        // Install the migration-owned runtime contract in every Postgres
+        // source before serving. Suites that explicitly request migrations
+        // also reconcile their command, Process, and trigger metadata.
         if self.run_migrations {
             let migrations = workspace_root().join("migrations");
-            let status = Command::new(engine_binary())
-                .arg("migrate")
-                .arg("--migrations-dir")
-                .arg(&migrations)
-                .arg("--metadata-dir")
-                .arg(&metadata_dir)
-                .arg("--source")
-                .arg("default")
-                .env("DONAT_DATABASE_URL", &self.db_url)
-                .status()
-                .expect("running donat migrate");
-            assert!(
-                status.success(),
-                "donat migrate failed for suite {}",
-                self.name
-            );
+            let postgres_sources = self
+                .metadata
+                .borrow()
+                .sources
+                .iter()
+                .filter(|source| source.kind == SourceKind::Postgres)
+                .cloned()
+                .collect::<Vec<_>>();
+            let resolve_source_url = |source: &Source| {
+                let connection = source
+                    .configuration
+                    .connection_info
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Postgres source {} has no connection_info in suite {}",
+                            source.name, self.name
+                        )
+                    });
+                match &connection.database_url {
+                    DatabaseUrl::Url(url) => url.clone(),
+                    DatabaseUrl::FromEnv { from_env } => self
+                        .env
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| key == from_env)
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| {
+                            matches!(
+                                from_env.as_str(),
+                                "DONAT_DATABASE_URL" | "DONAT_GRAPHQL_DATABASE_URL"
+                            )
+                            .then(|| self.db_url.clone())
+                        })
+                        .or_else(|| std::env::var(from_env).ok())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Postgres source {} requires missing environment variable {} \
+                                 in suite {}",
+                                source.name, from_env, self.name
+                            )
+                        }),
+                }
+            };
+            let migrate_source = |source: Option<&Source>| {
+                let mut migrate = Command::new(engine_binary());
+                migrate
+                    .arg("migrate")
+                    .arg("--migrations-dir")
+                    .arg(&migrations);
+                if self.reconcile_metadata
+                    && let Some(source) = source
+                {
+                    migrate
+                        .arg("--metadata-dir")
+                        .arg(&metadata_dir)
+                        .arg("--source")
+                        .arg(&source.name);
+                }
+                let database_url = source
+                    .map(&resolve_source_url)
+                    .unwrap_or_else(|| self.db_url.clone());
+                let output = migrate
+                    .env("DONAT_DATABASE_URL", database_url)
+                    .env("DONAT_GRAPHQL_DATABASE_URL", &self.db_url)
+                    .envs(self.env.iter().map(|(key, value)| (key, value)))
+                    .output()
+                    .expect("running donat migrate");
+                assert!(
+                    output.status.success(),
+                    "donat migrate failed for suite {} source {}:\n{}{}",
+                    self.name,
+                    source.map_or("<direct>", |source| source.name.as_str()),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            };
+            if postgres_sources.is_empty() {
+                // Connector-only metadata still serves through the suite's
+                // implicit default Postgres source.
+                migrate_source(None);
+            } else {
+                // Source initialization verifies the migration-owned runtime
+                // contract independently for every Postgres database.
+                for source in &postgres_sources {
+                    migrate_source(Some(source));
+                }
+            }
         }
         let log_dir = workspace_root().join("target/conformance-logs");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -2394,6 +2471,7 @@ impl Running {
                     .arg("--metadata-dir")
                     .arg(&metadata_dir)
                     .env("DONAT_DATABASE_URL", &self.db_url)
+                    .env("DONAT_GRAPHQL_DATABASE_URL", &self.db_url)
                     .stdout(Stdio::from(log.try_clone().unwrap()))
                     .stderr(Stdio::from(log));
                 for a in &self.args {
@@ -2470,6 +2548,27 @@ impl Running {
     /// `donat` catalog directly).
     pub fn db_url(&self) -> &str {
         &self.db_url
+    }
+
+    /// Replace one child-process environment value before a deliberate
+    /// restart. This is a conformance-harness control, not an engine runtime
+    /// configuration API.
+    pub fn set_engine_env_for_restart(&mut self, key: &str, value: &str) {
+        self.env.retain(|(existing, _)| existing != key);
+        self.env.push((key.to_owned(), value.to_owned()));
+    }
+
+    /// Stop the current child and stage a new immutable metadata deployment
+    /// against the same suite database. The next request/base URL lookup runs
+    /// the normal migrate-then-serve path again.
+    pub fn restart_with_metadata(&mut self, metadata: Metadata) {
+        let process = self
+            .engine
+            .get_mut()
+            .take()
+            .expect("restart_with_metadata requires a running engine");
+        drop(process);
+        *self.metadata.get_mut() = metadata;
     }
 
     /// The recording cron webhook stub (only present after
