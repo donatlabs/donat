@@ -52,7 +52,7 @@ fn registry_has_only_the_compiled_http_and_stripe_modules_and_is_immutable_after
 }
 
 #[test]
-fn registry_rejects_private_network_policy_in_deployment_metadata() {
+fn registry_rejects_a_declared_network_policy_in_deployment_metadata() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
         "sources": postgres_sources(),
@@ -70,15 +70,15 @@ fn registry_rejects_private_network_policy_in_deployment_metadata() {
     .expect("connector metadata deserializes before runtime validation");
 
     let error = match ConnectorRegistry::build(&metadata) {
-        Ok(_) => panic!("private network access is not a deployable HTTP connector capability"),
+        Ok(_) => panic!("the engine implements no connector network policy to declare"),
         Err(error) => error,
     };
 
     assert!(
         error
             .to_string()
-            .contains("network_policy must be public_only"),
-        "startup rejects the bypass rather than publishing an SSRF-capable connector"
+            .contains("http connector does not accept network_policy"),
+        "startup rejects an unimplemented setting rather than silently ignoring it"
     );
 }
 
@@ -561,69 +561,31 @@ async fn dns_and_connect_failures_are_transport_errors() {
 }
 
 #[tokio::test]
-async fn public_only_rejects_every_non_global_initial_address_without_a_loopback_test_escape_hatch()
-{
-    for address in [
-        Ipv4Addr::LOCALHOST.into(),
-        Ipv4Addr::new(10, 0, 0, 1).into(),
-        Ipv4Addr::new(169, 254, 1, 1).into(),
-        Ipv4Addr::new(224, 0, 0, 1).into(),
-        Ipv4Addr::UNSPECIFIED.into(),
-        Ipv4Addr::new(192, 0, 2, 1).into(),
-        Ipv6Addr::UNSPECIFIED.into(),
-        Ipv6Addr::LOCALHOST.into(),
-        Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 1).into(),
-        Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xc000, 0x0201).into(),
-        Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001).into(),
-    ] {
-        let transport = Arc::new(RecordingTransport::response(RawHttpResponse::json(
-            StatusCode::OK,
-            json!({}),
-        )));
-        let failure = public_connector(
-            Arc::new(SequenceResolver::new([
-                Ok(vec![address]),
-                Ok(vec![address]),
-            ])),
-            transport.clone(),
-        )
-        .execute(&operation("/blocked"), json!({}), context())
-        .await
-        .expect_err("public_only refuses a non-global address");
-        assert_eq!(
-            failure.class,
-            ConnectorErrorClass::Invariant,
-            "address {address}"
-        );
-        assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
-    }
-}
-
-#[tokio::test]
-async fn public_only_re_resolves_immediately_before_connect_and_rejects_dns_rebinding() {
-    let transport = Arc::new(RecordingTransport::response(RawHttpResponse::json(
-        StatusCode::OK,
-        json!({}),
-    )));
+async fn the_connected_peer_is_pinned_to_the_connect_time_resolution() {
+    // The name resolves to one address while the request is prepared and to a
+    // different one immediately before connecting. Whatever the deployment's
+    // egress rules allow, one request must stay on one resolved host, so a peer
+    // outside the connect-time set is an invariant failure.
+    let transport = Arc::new(RecordingTransport::response(
+        RawHttpResponse::json(StatusCode::OK, json!({}))
+            .with_peer(SocketAddr::from(([8, 8, 8, 8], 443))),
+    ));
     let failure = public_connector(
         Arc::new(SequenceResolver::new([
             Ok(vec![Ipv4Addr::new(8, 8, 8, 8).into()]),
-            Ok(vec![Ipv4Addr::LOCALHOST.into()]),
+            Ok(vec![Ipv4Addr::new(1, 1, 1, 1).into()]),
         ])),
         transport.clone(),
     )
     .execute(&operation("/rebinding"), json!({}), context())
     .await
-    .expect_err("the connect-time resolution rejects a rebinding to loopback");
+    .expect_err("a peer outside the connect-time resolution is rejected");
 
     assert_eq!(failure.class, ConnectorErrorClass::Invariant);
-    assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        failure.safe_message,
+        "connector transport connected to an unresolved peer"
+    );
 }
 
 #[tokio::test]
@@ -652,7 +614,7 @@ async fn a_declared_template_contract_violation_is_an_invariant_failure() {
 }
 
 #[tokio::test]
-async fn public_only_requires_a_known_vetted_remote_peer_before_accepting_a_response() {
+async fn a_response_without_an_observed_peer_is_rejected() {
     let transport = Arc::new(RecordingTransport::response(RawHttpResponse::json(
         StatusCode::OK,
         json!({"ok": true}),
@@ -673,7 +635,7 @@ async fn public_only_requires_a_known_vetted_remote_peer_before_accepting_a_resp
 }
 
 #[tokio::test]
-async fn public_only_rejects_an_unvetted_or_private_observed_peer() {
+async fn an_unvetted_observed_peer_is_rejected() {
     for peer in [
         SocketAddr::from(([1, 1, 1, 1], 443)),
         SocketAddr::from(([127, 0, 0, 1], 443)),
@@ -690,13 +652,13 @@ async fn public_only_rejects_an_unvetted_or_private_observed_peer() {
         )
         .execute(&operation("/peer"), json!({}), context())
         .await
-        .expect_err("the observed peer must be public and in the vetted set");
+        .expect_err("the observed peer must be in the vetted set");
         assert_eq!(failure.class, ConnectorErrorClass::Invariant, "peer {peer}");
     }
 }
 
 #[tokio::test]
-async fn public_only_accepts_a_vetted_public_observed_peer() {
+async fn a_vetted_observed_peer_is_accepted() {
     let result = public_connector(
         Arc::new(SequenceResolver::new([
             Ok(vec![Ipv4Addr::new(8, 8, 8, 8).into()]),
@@ -715,7 +677,7 @@ async fn public_only_accepts_a_vetted_public_observed_peer() {
 }
 
 #[tokio::test]
-async fn public_only_resolution_precedes_request_template_preparation() {
+async fn host_resolution_precedes_request_template_preparation() {
     let transport = Arc::new(RecordingTransport::response(RawHttpResponse::json(
         StatusCode::OK,
         json!({}),
@@ -726,19 +688,15 @@ async fn public_only_resolution_precedes_request_template_preparation() {
         .build()
         .expect("static operation is valid");
     let failure = public_connector(
-        Arc::new(SequenceResolver::new([Ok(vec![
-            Ipv4Addr::LOCALHOST.into(),
-        ])])),
+        Arc::new(SequenceResolver::new([Err(ResolveError::new("unresolved"))])),
         transport.clone(),
     )
     .execute(&operation, json!({}), context())
     .await
-    .expect_err("unsafe DNS must stop execution before input/template processing");
+    .expect_err("a failed resolution stops execution before input/template processing");
 
-    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
-    assert_eq!(
-        failure.safe_message,
-        "connector network policy rejected a non-public destination"
-    );
+    // The operation body names an input the caller never sent: reporting the
+    // transport failure instead proves resolution ran first.
+    assert_eq!(failure.class, ConnectorErrorClass::Transport);
     assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
 }

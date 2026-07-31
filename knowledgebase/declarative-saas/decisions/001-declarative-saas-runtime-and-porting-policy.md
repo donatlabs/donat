@@ -44,12 +44,10 @@ stable idempotency keys, rather than incorrectly holding a database row lock
 over HTTP or claiming exactly-once behavior. Rule expressions are a strict,
 typed CEL profile with no scripting, implicit database reads, or nondeterminism.
 
-For the HTTP connector's `public_only` policy, the current [IANA IPv6
-Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml)
-is the security-policy source. Prefixes marked `Globally Reachable` as `False`
-or `N/A` are denied before connection; explicitly `True` sub-prefixes remain
-allowed where they override a broader special-purpose range. The registry is a
-behavior-only reference, not an imported source or fixture.
+The HTTP connector originally classified destination addresses against the
+IANA IPv6 Special-Purpose Address Registry to deny non-globally-reachable
+hosts. That policy has been withdrawn: destination reachability belongs to the
+deployment's network layer. See [[026-connector-egress-is-a-network-concern]].
 
 Every specification and implementation change that uses an external reference
 must record the upstream URL, immutable revision, exact source or fixture

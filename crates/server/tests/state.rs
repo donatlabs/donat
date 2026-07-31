@@ -349,7 +349,7 @@ async fn consistency_rejects_static_http_config_errors_without_resolving_environ
     let rendered = problems.join("\n");
 
     assert!(
-        rendered.contains("network_policy must be public_only"),
+        rendered.contains("http connector does not accept network_policy"),
         "{rendered}"
     );
     assert!(

@@ -27,8 +27,7 @@ use uuid::Uuid;
 
 use super::{
     ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
-    WebhookRejection, canonical_json_sha256,
-    http::{MAX_HTTP_BODY_BYTES, is_public_address},
+    WebhookRejection, canonical_json_sha256, http::MAX_HTTP_BODY_BYTES,
 };
 
 pub const CREATE_CHECKOUT_SESSION_OPERATION: &str = "checkout.create_session";
@@ -243,8 +242,6 @@ pub struct StripeConnector {
 
 struct StripeTransport {
     base_url: Url,
-    #[cfg(test)]
-    permits_private_test_destination: bool,
 }
 
 impl StripeConnector {
@@ -299,14 +296,12 @@ impl StripeConnector {
         api_version: &str,
         base_url: &str,
     ) -> Result<Self, StripeConfigError> {
-        let mut connector = Self::new(
+        Self::new(
             secret_key.to_owned(),
             webhook_secret.to_owned(),
             api_version,
             base_url,
-        )?;
-        connector.transport.permits_private_test_destination = true;
-        Ok(connector)
+        )
     }
 
     fn new(
@@ -343,11 +338,7 @@ impl StripeConnector {
             secret_key,
             webhook_secret,
             api_version,
-            transport: StripeTransport {
-                base_url,
-                #[cfg(test)]
-                permits_private_test_destination: false,
-            },
+            transport: StripeTransport { base_url },
         })
     }
 
@@ -638,47 +629,32 @@ impl StripeTransport {
             .map_err(|_| transport_failure())?
             .map(|address| address.ip())
             .collect::<Vec<_>>();
-        if addresses.is_empty()
-            || (!self.permits_private_destinations()
-                && addresses.iter().any(|address| !is_public_address(*address)))
-        {
-            return Err(invariant_failure(
-                "connector network policy rejected a non-public destination",
-            ));
+        if addresses.is_empty() {
+            return Err(transport_failure());
         }
         Ok(addresses)
     }
 
+    /// The connection must land on one of the addresses this request already
+    /// resolved, so a name cannot resolve to one address for validation and
+    /// another for transport. Egress reachability itself is a network-layer
+    /// concern.
     fn validate_peer(
         &self,
         destination: &[IpAddr],
         peer: Option<SocketAddr>,
     ) -> Result<(), ConnectorFailure> {
-        if self.permits_private_destinations() {
-            return Ok(());
-        }
         let Some(peer) = peer else {
             return Err(invariant_failure(
-                "connector network policy could not verify the connected peer",
+                "connector transport could not verify the connected peer",
             ));
         };
-        if !is_public_address(peer.ip()) || !destination.contains(&peer.ip()) {
+        if !destination.contains(&peer.ip()) {
             return Err(invariant_failure(
-                "connector network policy rejected the connected peer",
+                "connector transport connected to an unresolved peer",
             ));
         }
         Ok(())
-    }
-
-    fn permits_private_destinations(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.permits_private_test_destination
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
     }
 }
 

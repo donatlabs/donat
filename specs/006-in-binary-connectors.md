@@ -266,7 +266,6 @@ enabled operation is declared at deploy time:
     endpoint_identity: logistics_prod_eu_2026_07
     credential_identity: logistics_primary
     base_url: { value_from_env: LOGISTICS_BASE_URL }
-    network_policy: private_allowed
     headers:
       - name: Authorization
         value_from_env: LOGISTICS_TOKEN
@@ -305,12 +304,17 @@ slot with a type-compatible value.
 
 The client follows no redirects. It applies an operation deadline from the
 process activity, limits a request body, response body, and raw webhook body to
-1 MiB, and revalidates the resolved destination on every connection.
-public_only is the default network policy; private_allowed is a deploy-time
-opt-in for explicitly configured internal systems. Neither a GraphQL caller nor
-a process event can select the policy, base URL, host, port, or DNS target.
-This preserves useful internal HTTP integrations without turning process input
-into an SSRF primitive.
+1 MiB, and re-resolves the configured host immediately before connecting. The
+connected peer must be one of the addresses that resolution returned, so one
+request stays on one resolved host.
+
+The engine enforces no destination reachability policy: which hosts an instance
+may reach is a deployment network concern (egress rules, firewall, VPC), not an
+application setting. A `network_policy` declaration is therefore rejected as an
+unsupported connector setting rather than silently ignored. Neither a GraphQL
+caller nor a process event can select the base URL, host, port, or DNS target,
+so process input still cannot aim the engine anywhere it was not configured to
+call.
 
 An HTTP operation used by a durable activity must declare an idempotency
 header. The validator rejects a durable process reference to an operation
