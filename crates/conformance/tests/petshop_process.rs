@@ -352,3 +352,67 @@ fn a_shopper_cancels_an_authorized_order_and_the_process_voids_the_payment() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The booking module has no provider at all: it reserves a hold, parks on a
+/// typed signal, and the shopper's confirmation Command advances it.
+#[test]
+fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    let suite = start_store(&stub, "petshop_grooming_booking");
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_grooming_booking(service_resource_id: \"550e8400-e29b-41d4-a716-446655440920\", slot_key: \"2026-08-01T10:00\", starts_at: \"2030-01-02T10:00:00Z\", hold_expires_at: \"2030-01-01T10:00:00Z\", request_id: \"550e8400-e29b-41d4-a716-446655440921\") {{ slot_key }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "start_grooming_booking status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+
+    // Wait until the hold exists and the Process parks on its signal.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let booking_id: String = loop {
+        let row = client
+            .query_opt("SELECT id::text FROM grooming_booking LIMIT 1", &[])
+            .expect("poll for the reserved hold");
+        if let Some(row) = row {
+            break row.get(0);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the booking Process never reserved its hold: {}",
+            process_diagnostics(&mut client)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ confirm_booking(booking_id: \"{booking_id}\", request_id: \"550e8400-e29b-41d4-a716-446655440922\") {{ booking_id }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "confirm_booking status: {body}");
+
+    let output = await_terminal(&mut client, "grooming_booking");
+    assert_eq!(
+        output.pointer("/booking_id").and_then(Json::as_str),
+        Some(booking_id.as_str()),
+        "the booking Process reports the hold it confirmed: {output}"
+    );
+}

@@ -117,6 +117,17 @@ impl SqlExpression {
         }
     }
 
+    /// The statement's own clock. A Rule that compares a deadline against
+    /// "now" needs one deterministic reading for the whole statement, which is
+    /// exactly what `statement_timestamp()` gives; callers still cannot supply
+    /// a time expression of their own.
+    pub fn database_time(type_: RuleType) -> Self {
+        Self {
+            sql: "statement_timestamp()".to_owned(),
+            type_,
+        }
+    }
+
     /// Consume a SQL expression that was constructed by this module. This is
     /// the planner-to-IR hand-off for an already compiled Rule; callers cannot
     /// construct a `SqlExpression` from arbitrary text.

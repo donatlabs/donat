@@ -2388,6 +2388,12 @@ impl<'a> Planner<'a> {
                 path,
                 "session variables are not legal compiled Rule bindings",
             )),
+            // A Rule that guards a deadline reads the statement clock, so this
+            // is a legal binding: the value is the database's own time, not
+            // anything a caller can supply.
+            CommandValue::DatabaseTime { database_time } if database_time == "now" => Ok(
+                SqlBinding::expression(SqlExpression::database_time(RuleType::Timestamp)),
+            ),
             CommandValue::Step { .. } | CommandValue::DatabaseTime { .. } => Err(
                 PlanError::validation(path, "value is not legal in a compiled Rule binding"),
             ),
