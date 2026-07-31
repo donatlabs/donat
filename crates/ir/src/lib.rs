@@ -465,8 +465,27 @@ pub struct CommandIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandColumn {
     pub name: String,
+    /// The type this column is declared and cast as. For a domain-typed column
+    /// this is the schema-qualified domain, so generated SQL keeps the exact
+    /// database type.
     pub pg_type: String,
+    /// The base type behind `pg_type`, used for every decision about what the
+    /// value *means* — which aggregate applies, how it converts to JSON. A
+    /// domain is transparent to those decisions; only the cast keeps its name.
+    pub logical_type: String,
     pub nullable: bool,
+}
+
+impl CommandColumn {
+    /// A column whose declared type is already its base type.
+    pub fn new(name: String, pg_type: String, nullable: bool) -> Self {
+        Self {
+            name,
+            logical_type: pg_type.clone(),
+            pg_type,
+            nullable,
+        }
+    }
 }
 
 /// A named command CTE operation with all table and explicit-role facts

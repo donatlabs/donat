@@ -240,6 +240,7 @@ fn command_mutation_keeps_resolved_execution_facts_and_projection() {
                     column: CommandColumn {
                         name: "quantity".into(),
                         pg_type: "int4".into(),
+                        logical_type: "int4".into(),
                         nullable: false,
                     },
                     value: CommandExecutionValue::Scalar {
@@ -250,6 +251,7 @@ fn command_mutation_keeps_resolved_execution_facts_and_projection() {
                 returning: vec![CommandColumn {
                     name: "id".into(),
                     pg_type: "uuid".into(),
+                    logical_type: "uuid".into(),
                     nullable: false,
                 }],
                 check: None,
@@ -263,6 +265,7 @@ fn command_mutation_keeps_resolved_execution_facts_and_projection() {
                     column: CommandColumn {
                         name: "id".into(),
                         pg_type: "uuid".into(),
+                        logical_type: "uuid".into(),
                         nullable: false,
                     },
                 },

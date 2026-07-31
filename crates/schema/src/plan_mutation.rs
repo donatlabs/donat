@@ -1651,11 +1651,13 @@ impl<'a> Planner<'a> {
                 let allocated = CommandColumn {
                     name: allocate_many.exact_quantity_columns.allocated.clone(),
                     pg_type: requested.pg_type.clone(),
+                    logical_type: requested.pg_type.clone(),
                     nullable: false,
                 };
                 let backordered = CommandColumn {
                     name: allocate_many.exact_quantity_columns.backordered.clone(),
                     pg_type: requested.pg_type.clone(),
+                    logical_type: requested.pg_type.clone(),
                     nullable: false,
                 };
                 let group_key = allocate_many
@@ -1689,6 +1691,7 @@ impl<'a> Planner<'a> {
                         "allocation_id" => Ok(CommandColumn {
                             name: name.to_owned(),
                             pg_type: "uuid".to_owned(),
+                            logical_type: "uuid".to_owned(),
                             nullable: false,
                         }),
                         "first_line_sequence" => {
@@ -1699,6 +1702,7 @@ impl<'a> Planner<'a> {
                         "items" => Ok(CommandColumn {
                             name: name.to_owned(),
                             pg_type: "jsonb".to_owned(),
+                            logical_type: "jsonb".to_owned(),
                             nullable: false,
                         }),
                         name if name == allocated.name => Ok(allocated.clone()),
@@ -1965,6 +1969,7 @@ impl<'a> Planner<'a> {
                 let column = CommandColumn {
                     name: name.clone(),
                     pg_type: command_rule_pg_type(type_).to_owned(),
+                    logical_type: command_rule_pg_type(type_).to_owned(),
                     nullable: matches!(type_, RuleType::Nullable(_)),
                 };
                 let value = self.resolve_command_value(
@@ -2006,6 +2011,7 @@ impl<'a> Planner<'a> {
                     return Ok(CommandColumn {
                         name: name.clone(),
                         pg_type: command_rule_pg_type(&output.type_).to_owned(),
+                        logical_type: command_rule_pg_type(&output.type_).to_owned(),
                         nullable: matches!(output.type_, RuleType::Nullable(_)),
                     });
                 }
@@ -2043,6 +2049,7 @@ impl<'a> Planner<'a> {
                                 column: CommandColumn {
                                     name: name.clone(),
                                     pg_type: command_rule_pg_type(&output.type_).to_owned(),
+                                    logical_type: command_rule_pg_type(&output.type_).to_owned(),
                                     nullable: matches!(output.type_, RuleType::Nullable(_)),
                                 },
                                 name,
@@ -2791,6 +2798,7 @@ impl<'a> Planner<'a> {
                 let inferred = CommandColumn {
                     name: item.clone(),
                     pg_type: command_rule_item_pg_type(expected_type).to_owned(),
+                    logical_type: command_rule_item_pg_type(expected_type).to_owned(),
                     nullable: command_rule_item_nullable(expected_type),
                 };
                 match fields.get(item) {
@@ -4379,7 +4387,11 @@ fn complete_process_command_field(
 fn command_column(column: &donat_catalog::ColumnInfo) -> CommandColumn {
     CommandColumn {
         name: column.name.clone(),
+        // A domain-typed column keeps its exact database type for casts and
+        // CTE column lists, while every decision about the value's meaning
+        // uses the base type the domain wraps.
         pg_type: column.sql_type().to_owned(),
+        logical_type: column.pg_type.clone(),
         nullable: column.nullable,
     }
 }
@@ -4443,6 +4455,7 @@ fn command_argument_row_columns(
             Ok(CommandColumn {
                 name: name.clone(),
                 pg_type: command_contract_pg_type(&field.type_ref),
+                logical_type: command_contract_pg_type(&field.type_ref),
                 nullable: !field.required || field.type_ref.nullable,
             })
         })
@@ -4539,6 +4552,7 @@ fn resolved_value_column(
     };
     Ok(CommandColumn {
         name: name.to_owned(),
+        logical_type: pg_type.clone(),
         pg_type,
         nullable,
     })
@@ -4731,6 +4745,7 @@ fn resolve_command_aggregate(
     let count_output = || CommandColumn {
         name: name.to_owned(),
         pg_type: "int8".to_owned(),
+        logical_type: "int8".to_owned(),
         nullable: false,
     };
     match aggregate {
@@ -4739,7 +4754,7 @@ fn resolve_command_aggregate(
         }),
         CommandAggregate::Sum { sum } => {
             let input = input_column(command_aggregate_selector(sum, path)?)?;
-            let pg_type = match input.pg_type.as_str() {
+            let pg_type = match input.logical_type.as_str() {
                 "int2" | "int4" | "serial" => "int8",
                 "int8" | "bigint" | "bigserial" => "int8",
                 "float4" => "float4",
@@ -4756,6 +4771,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: pg_type.to_owned(),
+                    logical_type: pg_type.to_owned(),
                     nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,
@@ -4767,6 +4783,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: input.pg_type.clone(),
+                    logical_type: input.pg_type.clone(),
                     nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,
@@ -4778,6 +4795,7 @@ fn resolve_command_aggregate(
                 output: CommandColumn {
                     name: name.to_owned(),
                     pg_type: input.pg_type.clone(),
+                    logical_type: input.pg_type.clone(),
                     nullable: !row_set.guaranteed_non_empty || input.nullable,
                 },
                 input,

@@ -981,7 +981,7 @@ fn text_array(items: &[String]) -> String {
 /// GeoJSON, e.g. from session variables) go through ST_GeomFromGeoJSON;
 /// other strings are assumed to be WKT/EWKT.
 fn geometry_sql(value: &Scalar, pg_type: &str) -> String {
-    let cast = quote_ident(pg_type);
+    let cast = quote_type_name(pg_type);
     match value.as_json() {
         serde_json::Value::Object(_) => format!(
             "(ST_GeomFromGeoJSON({}))::{cast}",
@@ -2141,7 +2141,7 @@ fn command_step_cte(
                     format!(
                         "{} {}",
                         quote_ident(&column.name),
-                        quote_ident(&column.pg_type)
+                        quote_type_name(&column.pg_type)
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2706,7 +2706,7 @@ fn command_allocate_many_ctes(
     );
     let allocated_sql = format!(
         "greatest(least(greatest(({available_sql})::numeric, 0::numeric), greatest(({requested_sql})::numeric - ({prior_available}), 0::numeric)), 0::numeric)::{}",
-        quote_ident(&allocated.pg_type),
+        quote_type_name(&allocated.pg_type),
     );
     let ranked = format!(
         "{ranked} AS MATERIALIZED (SELECT {input_alias}.*, {allocated_sql} AS {allocated} FROM {input} AS {input_alias} WHERE {execution_gate})",
@@ -2794,7 +2794,7 @@ fn command_allocate_many_ctes(
             let expression = if column.name == backordered.name {
                 format!(
                     "greatest(max({requested})::numeric - sum({allocated})::numeric, 0::numeric)::{}",
-                    quote_ident(&column.pg_type),
+                    quote_type_name(&column.pg_type),
                     requested = qualified("_cmd_ranked", &requested.name),
                     allocated = qualified("_cmd_ranked", &allocated.name),
                 )
@@ -2979,7 +2979,7 @@ fn command_decision_ctes(
                             format!(
                                 "({})::{} AS {}",
                                 output.sql,
-                                quote_ident(&output.column.pg_type),
+                                quote_type_name(&output.column.pg_type),
                                 quote_ident(name),
                             )
                         })
@@ -3098,7 +3098,7 @@ fn command_aggregate_sql(aggregate: &CommandAggregateIr, input_alias: &str) -> S
     };
     format!(
         "({expression})::{} AS {}",
-        quote_ident(&output.pg_type),
+        quote_type_name(&output.pg_type),
         quote_ident(&output.name),
     )
 }
@@ -3195,12 +3195,12 @@ fn command_value_sql_scoped(
         CommandExecutionValue::Item { field, .. } => qualified(item_alias, field),
         CommandExecutionValue::CurrentColumn { column } => qualified(current_alias, &column.name),
         CommandExecutionValue::Rule { sql, pg_type } => {
-            format!("({sql})::{}", quote_ident(pg_type))
+            format!("({sql})::{}", quote_type_name(pg_type))
         }
         CommandExecutionValue::DatabaseTime {
             function: CommandDatabaseTime::Now,
             pg_type,
-        } => format!("statement_timestamp()::{}", quote_ident(pg_type)),
+        } => format!("statement_timestamp()::{}", quote_type_name(pg_type)),
     }
 }
 
@@ -3296,12 +3296,12 @@ fn command_result_value_sql(ctx: &mut Ctx, value: &CommandResultValue) -> String
         }
         CommandResultValue::StepColumn { cte, column } => format!(
             "(SELECT {} FROM {} LIMIT 1)",
-            ctx.column_output(cte, &column.name, &column.pg_type),
+            ctx.column_output(cte, &column.name, &column.logical_type),
             quote_ident(cte),
         ),
         CommandResultValue::Scalar { value, pg_type } => scalar_sql(&ctx.dialect, value, pg_type),
         CommandResultValue::Rule { sql, pg_type } => {
-            format!("({sql})::{}", quote_ident(pg_type))
+            format!("({sql})::{}", quote_type_name(pg_type))
         }
         CommandResultValue::ProjectedRows {
             cte,
@@ -3314,7 +3314,11 @@ fn command_result_value_sql(ctx: &mut Ctx, value: &CommandResultValue) -> String
                 .map(|projection| {
                     (
                         projection.name.clone(),
-                        ctx.column_output(cte, &projection.source.name, &projection.source.pg_type),
+                        ctx.column_output(
+                            cte,
+                            &projection.source.name,
+                            &projection.source.logical_type,
+                        ),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3352,7 +3356,7 @@ fn command_row_json(ctx: &mut Ctx, columns: &[CommandColumn], alias: &str) -> St
         .map(|column| {
             (
                 column.name.clone(),
-                ctx.column_output(alias, &column.name, &column.pg_type),
+                ctx.column_output(alias, &column.name, &column.logical_type),
             )
         })
         .collect::<Vec<_>>();
@@ -4834,6 +4838,17 @@ fn mysql_json_column(expression: &str, pg_type: &str, stringify_numerics: bool) 
 pub fn quote_ident(ident: &str) -> String {
     use donat_backend::Dialect;
     donat_backend::PostgresDialect.quote_ident(ident)
+}
+
+/// Render a SQL type name that may be schema-qualified.
+///
+/// Catalog introspection reports a domain as `schema.name`. Quoting that whole
+/// string as one identifier asks PostgreSQL for a type literally named
+/// `"public.petshop_required_int8"`, which does not exist, so every cast
+/// against a domain-typed column fails at execution time. Built-in names carry
+/// no qualifier and are unchanged.
+pub fn quote_type_name(pg_type: &str) -> String {
+    donat_backend::PostgresDialect.quote_type_name(pg_type)
 }
 
 pub fn quote_lit(s: &str) -> String {

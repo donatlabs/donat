@@ -19,6 +19,7 @@ fn column(name: &str, pg_type: &str) -> CommandColumn {
     CommandColumn {
         name: name.to_owned(),
         pg_type: pg_type.to_owned(),
+        logical_type: pg_type.to_owned(),
         nullable: false,
     }
 }
