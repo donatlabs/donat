@@ -138,6 +138,8 @@ impl ProcessRuntime {
                     current_state,
                     input_json,
                     state_json,
+                    caller_role,
+                    caller_session_json,
                     version
                 )
                 SELECT
@@ -150,6 +152,8 @@ impl ProcessRuntime {
                     $6,
                     request.input_json,
                     '{}'::jsonb,
+                    request.caller_role,
+                    request.caller_session_json,
                     0
                 FROM donat.process_start_requests request
                 WHERE request.source_name = $1
@@ -407,7 +411,7 @@ async fn mark_request(
     Ok(())
 }
 
-fn typed_value(value: &Json) -> anyhow::Result<TypedValue> {
+pub(crate) fn typed_value(value: &Json) -> anyhow::Result<TypedValue> {
     Ok(match value {
         Json::Null => TypedValue::Null,
         Json::Bool(value) => TypedValue::Boolean(*value),

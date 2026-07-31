@@ -45,3 +45,6 @@ the deployed active/live-retired revisions with read-only catalog queries.
 - V6 installs the source-local Process journal and activity/inbound ledgers,
   adds the Command execution-generation UUID used by atomic Process outboxes,
   and owns `donat.check_violation(text)`.
+- V7 adds the closed caller role/session snapshot used by `run_as: caller`,
+  terminal output and safe failure envelopes, and the internal `continue`
+  event consumed by deterministic Process state transitions.

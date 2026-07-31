@@ -1367,8 +1367,17 @@ fn command_effect_cte(ctx: &mut Ctx, effect: &ResolvedCommandEffect) -> String {
         ResolvedCommandEffect::StartProcess(effect) => {
             let input = command_effect_object(ctx, &effect.input);
             let idempotency_key = command_effect_key(ctx, &effect.semantic_idempotency_key);
+            let caller_role = effect
+                .caller_role
+                .as_deref()
+                .map(quote_lit)
+                .unwrap_or_else(|| "NULL::text".to_owned());
+            let caller_session = effect.caller_role.as_ref().map_or_else(
+                || "NULL::jsonb".to_owned(),
+                |_| command_effect_object(ctx, &effect.caller_session_variables),
+            );
             format!(
-                "{cte} AS (INSERT INTO {schema}.{table} ({source_name}, {process_name}, {revision}, {input_json}, {command_invocation_id}, {effect_position}, {idempotency_key_col}, {status}) SELECT {source}, {process}, {process_revision}, {input}, {store}.{invocation_id}, {position}, {idempotency_key}, 'pending' FROM {store} RETURNING {id})",
+                "{cte} AS (INSERT INTO {schema}.{table} ({source_name}, {process_name}, {revision}, {input_json}, {caller_role_col}, {caller_session_col}, {command_invocation_id}, {effect_position}, {idempotency_key_col}, {status}) SELECT {source}, {process}, {process_revision}, {input}, {caller_role}, {caller_session}, {store}.{invocation_id}, {position}, {idempotency_key}, 'pending' FROM {store} RETURNING {id})",
                 cte = quote_ident(&format!("_cmd_effect_{}", effect.effect_position)),
                 schema = quote_ident("donat"),
                 table = quote_ident("process_start_requests"),
@@ -1376,6 +1385,8 @@ fn command_effect_cte(ctx: &mut Ctx, effect: &ResolvedCommandEffect) -> String {
                 process_name = quote_ident("process_name"),
                 revision = quote_ident("revision"),
                 input_json = quote_ident("input_json"),
+                caller_role_col = quote_ident("caller_role"),
+                caller_session_col = quote_ident("caller_session_json"),
                 command_invocation_id = quote_ident("command_invocation_id"),
                 effect_position = quote_ident("effect_position"),
                 idempotency_key_col = quote_ident("idempotency_key"),
@@ -1384,6 +1395,8 @@ fn command_effect_cte(ctx: &mut Ctx, effect: &ResolvedCommandEffect) -> String {
                 process = quote_lit(&effect.process_name),
                 process_revision = quote_lit(&effect.process_revision),
                 input = input,
+                caller_role = caller_role,
+                caller_session = caller_session,
                 store = quote_ident("_cmd_store_first"),
                 invocation_id = quote_ident("invocation_id"),
                 position = effect.effect_position,

@@ -649,6 +649,10 @@ impl PureEngineCandidate {
     pub fn rule_catalog(&self) -> &RuleCatalog {
         self.rule_catalog.as_ref()
     }
+
+    pub fn rule_catalog_handle(&self) -> Arc<RuleCatalog> {
+        self.rule_catalog.clone()
+    }
 }
 
 /// Compile one all-or-nothing serving candidate in dependency order without

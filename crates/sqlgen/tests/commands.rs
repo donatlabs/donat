@@ -395,6 +395,26 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
         1 => {}
         count => panic!("invalid invocation generation migration state: {count} columns"),
     }
+    let caller_context_columns: i64 = tx
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name = 'process_start_requests' \
+               AND column_name = 'caller_role'",
+            &[],
+        )
+        .expect("inspect Process caller-context migration state")
+        .get(0);
+    match caller_context_columns {
+        0 => tx
+            .batch_execute(include_str!(
+                "../../../migrations/V7__process_execution_context.sql"
+            ))
+            .expect("Process caller context and deterministic events install"),
+        1 => {}
+        count => panic!("invalid Process caller-context migration state: {count} columns"),
+    }
 }
 
 fn install_command_identity_catalog(tx: &mut Transaction<'_>) {
@@ -481,6 +501,26 @@ fn install_command_catalog_client(client: &mut Client) {
             .expect("command generation and process journal catalog installs"),
         1 => {}
         count => panic!("invalid invocation generation migration state: {count} columns"),
+    }
+    let caller_context_columns: i64 = client
+        .query_one(
+            "SELECT count(*) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'donat' \
+               AND table_name = 'process_start_requests' \
+               AND column_name = 'caller_role'",
+            &[],
+        )
+        .expect("inspect Process caller-context migration state")
+        .get(0);
+    match caller_context_columns {
+        0 => client
+            .batch_execute(include_str!(
+                "../../../migrations/V7__process_execution_context.sql"
+            ))
+            .expect("Process caller context and deterministic events install"),
+        1 => {}
+        count => panic!("invalid Process caller-context migration state: {count} columns"),
     }
     client
         .query_one("SELECT pg_advisory_unlock(604630061)", &[])
@@ -827,6 +867,8 @@ fn effectful_command_root(start_policy: ProcessStartPolicy) -> MutationRoot {
                     value(json!("550e8400-e29b-41d4-a716-446655440010"), "uuid"),
                 )]),
                 semantic_idempotency_key: value(json!("request-1"), "text"),
+                caller_role: None,
+                caller_session_variables: std::collections::BTreeMap::new(),
                 command_invocation_id: CommandInvocationIdSource::CurrentExecution,
                 effect_position: 0,
             }),
@@ -850,6 +892,22 @@ fn effectful_command_root(start_policy: ProcessStartPolicy) -> MutationRoot {
         ],
         selection: vec![],
     })
+}
+
+fn caller_effectful_command_root() -> MutationRoot {
+    let mut root = effectful_command_root(ProcessStartPolicy::Enabled);
+    let MutationRoot::Command { command, .. } = &mut root else {
+        unreachable!("effectful root is a Command");
+    };
+    let ResolvedCommandEffect::StartProcess(start) = &mut command.effects[0] else {
+        unreachable!("first effect is a Process start");
+    };
+    start.caller_role = Some("customer".to_owned());
+    start.caller_session_variables = std::collections::BTreeMap::from([(
+        "x-donat-user-id".to_owned(),
+        value(json!("550e8400-e29b-41d4-a716-446655440099"), "text"),
+    )]);
+    root
 }
 
 #[test]
@@ -992,6 +1050,37 @@ fn command_effects_commit_atomically_and_exact_replay_writes_no_second_outbox() 
     assert_eq!(counts.get::<_, i64>(1), 1);
 
     tx.rollback().expect("effect test state rolls back");
+}
+
+#[test]
+fn command_start_effect_writes_the_exact_closed_caller_context() {
+    let _guard = command_catalog_test_lock();
+    let mut client = postgres_client();
+    let mut tx = client.transaction().expect("effect transaction starts");
+    install_command_catalog(&mut tx);
+    insert_process_revision(&mut tx, "checkout", "checkout-r1");
+    insert_process_revision(&mut tx, "approval", "approval-r2");
+    let sql = donat_sqlgen::mutation_to_sql(&caller_effectful_command_root());
+
+    tx.query_one(&sql, &[])
+        .expect("caller-qualified Process start effect commits");
+    let start = tx
+        .query_one(
+            "SELECT caller_role, caller_session_json \
+             FROM donat.process_start_requests \
+             WHERE source_name = 'default' AND process_name = 'checkout'",
+            &[],
+        )
+        .expect("caller Process start context is durable");
+    assert_eq!(start.get::<_, String>("caller_role"), "customer");
+    assert_eq!(
+        start.get::<_, Json>("caller_session_json"),
+        json!({
+            "x-donat-user-id": "550e8400-e29b-41d4-a716-446655440099"
+        })
+    );
+
+    tx.rollback().expect("caller effect test state rolls back");
 }
 
 #[test]

@@ -1041,6 +1041,7 @@ fn finalize_one_command_effects(
                         process_key: start_process.process_key.clone(),
                         input: start_process.input.clone(),
                         semantic_idempotency_key,
+                        caller_session_variables: target.caller_session_variables.clone(),
                         effect_position,
                     }))
                 }

@@ -907,6 +907,11 @@ pub struct ResolvedStartProcessEffect {
     pub start_policy: ProcessStartPolicy,
     pub input: BTreeMap<String, CommandExecutionValue>,
     pub semantic_idempotency_key: CommandExecutionValue,
+    /// Present only when the executing command role is one of the Process's
+    /// declared caller roles. The map contains the compiler-published closed
+    /// subset of session variables, never the ambient request map.
+    pub caller_role: Option<String>,
+    pub caller_session_variables: BTreeMap<String, CommandExecutionValue>,
     pub command_invocation_id: CommandInvocationIdSource,
     pub effect_position: u32,
 }

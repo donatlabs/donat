@@ -89,6 +89,8 @@ fn expected_columns() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "instance_id",
                 "created_at",
                 "consumed_at",
+                "caller_role",
+                "caller_session_json",
             ],
         ),
         (
@@ -107,6 +109,10 @@ fn expected_columns() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "version",
                 "created_at",
                 "updated_at",
+                "caller_role",
+                "caller_session_json",
+                "terminal_output_json",
+                "failure_json",
             ],
         ),
         (
@@ -284,8 +290,8 @@ async fn table_columns(client: &Client, table: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn process_v6_schema_is_source_qualified_and_exact() {
-    let (admin_url, database_name, database_url) = isolated_database("process_v6").await;
+async fn process_schema_is_source_qualified_and_exact() {
+    let (admin_url, database_name, database_url) = isolated_database("process_schema").await;
     run_migrate(&database_url, &migrations_dir())
         .await
         .expect("bundled migrations apply");

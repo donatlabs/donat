@@ -118,6 +118,7 @@ fn effect_contracts() -> ProcessEffectContractCatalog {
                         start_policy: ProcessStartPolicy::Enabled,
                         start_input: contract([]),
                         process_key: None,
+                        caller_session_variables: BTreeMap::new(),
                         signals: BTreeMap::from([(
                             "approval_decision".to_owned(),
                             ProcessSignalEffectContract {
@@ -146,6 +147,7 @@ fn effect_contracts() -> ProcessEffectContractCatalog {
                                 scalar: ValueScalar::Uuid,
                             },
                         }),
+                        caller_session_variables: BTreeMap::new(),
                         signals: BTreeMap::new(),
                     },
                 ),
@@ -414,4 +416,106 @@ fn request_planner_lowers_finalized_effects_to_closed_source_local_ir() {
             pg_type,
         }) if value == "approved" && pg_type == "text"
     ));
+}
+
+#[test]
+fn process_start_effect_persists_only_the_compiled_caller_session_subset() {
+    let metadata = command_metadata();
+    let catalogs = HashMap::from([("default".to_owned(), Catalog::default())]);
+    let rules = compile_catalog(&[], &[]).expect("empty Rules catalog compiles");
+    let mut contracts = effect_contracts();
+    contracts
+        .sources
+        .get_mut("default")
+        .unwrap()
+        .get_mut("checkout")
+        .unwrap()
+        .caller_session_variables = BTreeMap::from([(
+        "customer".to_owned(),
+        BTreeSet::from(["x-donat-user-id".to_owned()]),
+    )]);
+    let commands = compile_command_catalog(&metadata, &catalogs, &rules, true)
+        .expect("pre-process Commands compile");
+    let finalized =
+        finalize_command_effects(commands, &contracts).expect("process effects finalize");
+    let schema = CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+        &metadata, &catalogs, &rules, &finalized, &contracts, true,
+    )
+    .expect("serving schema retains caller Process contracts");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &schema)
+        .expect("request planner binds the immutable serving snapshot");
+    let document = graphql_parser::parse_query::<String>(
+        r#"
+        mutation {
+          kickoff(
+            request_id: "550e8400-e29b-41d4-a716-446655440001"
+            order_id: "550e8400-e29b-41d4-a716-446655440002"
+            decision: "approved"
+          ) {
+            order_id
+          }
+        }
+        "#,
+    )
+    .expect("effect-bearing command query parses")
+    .into_static();
+    let session = Session {
+        role: "customer".to_owned(),
+        vars: HashMap::from([
+            (
+                "x-donat-user-id".to_owned(),
+                "550e8400-e29b-41d4-a716-446655440099".to_owned(),
+            ),
+            (
+                "x-unrelated-request-header".to_owned(),
+                "must-not-be-persisted".to_owned(),
+            ),
+        ]),
+        backend_request: false,
+    };
+    let plan = planner
+        .plan(&document, None, &serde_json::Map::new(), &session)
+        .expect("the complete caller session plans");
+    let MultiSourcePlan::Mutation { roots, .. } = plan else {
+        panic!("expected a mutation plan");
+    };
+    let donat_ir::MutationRoot::Command { command, .. } = &roots[0] else {
+        panic!("expected a command root");
+    };
+    let ResolvedCommandEffect::StartProcess(start) = &command.effects[0] else {
+        panic!("first effect must be a resolved start");
+    };
+    assert_eq!(start.caller_role.as_deref(), Some("customer"));
+    assert_eq!(
+        start
+            .caller_session_variables
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["x-donat-user-id"]
+    );
+    assert!(matches!(
+        start.caller_session_variables.get("x-donat-user-id"),
+        Some(CommandExecutionValue::Scalar {
+            value: Scalar::Json(value),
+            pg_type,
+        }) if value == "550e8400-e29b-41d4-a716-446655440099" && pg_type == "text"
+    ));
+
+    let missing = planner
+        .plan(
+            &document,
+            None,
+            &serde_json::Map::new(),
+            &Session {
+                role: "customer".to_owned(),
+                vars: HashMap::new(),
+                backend_request: false,
+            },
+        )
+        .expect_err("a missing compiled caller variable must fail before SQL");
+    assert_eq!(
+        missing.message,
+        "missing session variable: \"x-donat-user-id\""
+    );
 }

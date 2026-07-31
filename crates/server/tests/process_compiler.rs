@@ -286,6 +286,7 @@ fn command_dependencies() -> Dependencies {
             arguments: contract([("order_id", ValueScalar::Uuid)]),
             result: contract([("status", ValueScalar::String)]),
             allowed_roles: ["customer".to_owned()].into_iter().collect(),
+            required_session_variables: BTreeMap::new(),
             definition_fingerprint: "record-checkout-v1".to_owned(),
         },
     );
@@ -659,6 +660,39 @@ fn process_compiler_rejects_unknown_commands_and_wrong_roles() {
         .expect_err("caller role outside command permissions must fail closed");
     assert_eq!(error.path, "processes[0].states[0].command.run_as");
     assert!(error.message.contains("process caller role `customer`"));
+
+    let mut fixed_metadata = command_metadata();
+    let ProcessStateOperation::Command { command } =
+        &mut fixed_metadata.processes[0].states[0].operation
+    else {
+        unreachable!("command metadata starts with a command");
+    };
+    command.run_as = "customer".to_owned();
+    let mut fixed_dependencies = command_dependencies();
+    fixed_dependencies
+        .commands
+        .get_mut(&("default".to_owned(), "record_checkout".to_owned()))
+        .unwrap()
+        .required_session_variables = BTreeMap::from([(
+        "customer".to_owned(),
+        BTreeMap::from([(
+            "x-donat-user-id".to_owned(),
+            TypeRef {
+                nullable: false,
+                value_type: ValueType::Scalar {
+                    scalar: ValueScalar::Uuid,
+                },
+            },
+        )]),
+    )]);
+    let error = compile_process_catalog(&fixed_metadata, &fixed_dependencies)
+        .expect_err("fixed Process roles cannot invent an ambient session");
+    assert_eq!(error.path, "processes[0].states[0].command.run_as");
+    assert!(
+        error
+            .message
+            .contains("fixed Process command role `customer` requires session variables")
+    );
 }
 
 #[test]
@@ -857,6 +891,7 @@ fn process_revision_is_stable_closed_and_pins_the_catalog_arc() {
                 named_objects: BTreeMap::new(),
             },
             allowed_roles: ["customer".to_owned()].into_iter().collect(),
+            required_session_variables: BTreeMap::new(),
             definition_fingerprint: "unused-v1".to_owned(),
         },
     );
@@ -972,6 +1007,7 @@ fn petshop_dependencies(metadata: &Metadata) -> Dependencies {
                         .iter()
                         .map(|permission| permission.role.clone())
                         .collect(),
+                    required_session_variables: BTreeMap::new(),
                     definition_fingerprint: format!("petshop-command:{}:v1", command.name),
                 },
             )

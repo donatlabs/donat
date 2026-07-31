@@ -9,8 +9,8 @@ use donat_schema::{CompiledCommandCatalog, FinalizedCommandCatalog};
 use donat_server::connectors::ConnectorRegistry;
 use donat_server::migrate::run_migrate;
 use donat_server::processes::{
-    DeployedSourceProcessCatalog, ProcessRuntime, StartConsumption, build_process_runtime,
-    reconcile, validate_serving_catalogs,
+    DeployedSourceProcessCatalog, ProcessPlanningSnapshot, ProcessRuntime, StartConsumption,
+    build_process_runtime, reconcile, validate_serving_catalogs,
 };
 use donat_server::state::{SourceRuntime, compile_pure_engine_candidate};
 use serde_json::{Value as Json, json};
@@ -215,6 +215,15 @@ async fn runtime_from_snapshot(
     let candidate =
         compile_pure_engine_candidate(metadata, &source_catalogs, connectors.as_ref(), true)
             .expect("Process candidate compiles");
+    let planning_snapshot = Arc::new(ProcessPlanningSnapshot::new(
+        Arc::new(metadata.clone()),
+        Arc::new(source_catalogs.clone()),
+        candidate
+            .compiled
+            .clone()
+            .expect("Process candidate has a compiled schema"),
+        candidate.rule_catalog_handle(),
+    ));
     let source_runtime =
         SourceRuntime::postgres(database_url).expect("Postgres Process source constructs");
     let deployed = validate_serving_catalogs(
@@ -236,6 +245,7 @@ async fn runtime_from_snapshot(
                 .expect("deployed source Process catalog exists")
                 .clone(),
         ),
+        planning_snapshot,
         candidate.command_catalog,
         candidate.finalized_command_catalog,
         connectors,
@@ -344,15 +354,30 @@ fn valid_input() -> Json {
 
 #[test]
 fn process_runtime_rejects_non_postgres_source() {
+    let metadata = process_metadata("analytics", "ready");
+    let source_catalogs = catalogs("analytics");
+    let connectors = Arc::new(ConnectorRegistry::empty());
+    let candidate =
+        compile_pure_engine_candidate(&metadata, &source_catalogs, connectors.as_ref(), true)
+            .expect("planning candidate compiles");
     let error = build_process_runtime(
         "analytics",
         &SourceRuntime::Clickhouse {
             url: "http://clickhouse.invalid".to_owned(),
         },
         Arc::new(DeployedSourceProcessCatalog::default()),
+        Arc::new(ProcessPlanningSnapshot::new(
+            Arc::new(metadata),
+            Arc::new(source_catalogs),
+            candidate
+                .compiled
+                .clone()
+                .expect("planning candidate has a compiled schema"),
+            candidate.rule_catalog_handle(),
+        )),
         Arc::new(CompiledCommandCatalog::default()),
         Arc::new(FinalizedCommandCatalog::default()),
-        Arc::new(ConnectorRegistry::empty()),
+        connectors,
     )
     .err()
     .expect("non-Postgres Process runtime must be rejected");
@@ -385,11 +410,21 @@ fn process_runtime_rejects_cross_source_deployed_catalog() {
     let source_runtime =
         SourceRuntime::postgres("postgresql://postgres:postgres@127.0.0.1:1/not_connected")
             .expect("lazy Postgres pool constructs without connecting");
+    let planning_snapshot = Arc::new(ProcessPlanningSnapshot::new(
+        Arc::new(metadata),
+        Arc::new(source_catalogs),
+        candidate
+            .compiled
+            .clone()
+            .expect("secondary candidate has a compiled schema"),
+        candidate.rule_catalog_handle(),
+    ));
 
     let error = build_process_runtime(
         "default",
         &source_runtime,
         Arc::new(deployed),
+        planning_snapshot,
         candidate.command_catalog,
         candidate.finalized_command_catalog,
         connectors,

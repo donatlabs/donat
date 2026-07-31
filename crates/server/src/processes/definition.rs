@@ -32,6 +32,7 @@ pub struct ProcessCommandDescriptor {
     pub arguments: ValueContractCatalog,
     pub result: ValueContractCatalog,
     pub allowed_roles: BTreeSet<String>,
+    pub required_session_variables: BTreeMap<String, BTreeMap<String, TypeRef>>,
     pub definition_fingerprint: String,
 }
 
@@ -206,6 +207,7 @@ fn command_descriptor(descriptor: &CommandDescriptor) -> ProcessCommandDescripto
         arguments: descriptor.arguments.clone(),
         result: descriptor.result.clone(),
         allowed_roles: descriptor.allowed_roles.clone(),
+        required_session_variables: descriptor.required_session_variables.clone(),
         definition_fingerprint: descriptor.definition_fingerprint.clone(),
     }
 }
@@ -265,11 +267,84 @@ impl ProcessDependencyClosure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompiledProcessState {
     pub id: String,
     pub output: ValueContractCatalog,
     pub maximum_send_horizons_ms: BTreeMap<String, u64>,
+    pub operation: CompiledProcessStateOperation,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledProcessStateOperation {
+    Command(CompiledProcessCommandState),
+    Request,
+    When(CompiledProcessWhenState),
+    Wait,
+    ForEach,
+    Output(CompiledProcessOutputState),
+    Fail(CompiledProcessFailState),
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessCommandState {
+    pub name: String,
+    pub role: CompiledProcessCommandRole,
+    pub arguments: BTreeMap<String, ProcessValue>,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledProcessCommandRole {
+    Caller {
+        required_session_variables: BTreeMap<String, BTreeSet<String>>,
+    },
+    Fixed {
+        role: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessWhenState {
+    pub decision_table: Option<CompiledProcessDecisionCall>,
+    pub cases: Vec<CompiledProcessWhenCase>,
+    pub default: String,
+    /// Ordinary literal cases compare one exact ancestor output. Retaining its
+    /// state ID prevents runtime graph heuristics from diverging from the
+    /// deploy-time type check.
+    pub literal_output_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessDecisionCall {
+    pub name: String,
+    pub input: BTreeMap<String, ProcessValue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessWhenCase {
+    pub predicate: CompiledProcessWhenPredicate,
+    pub next: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledProcessWhenPredicate {
+    Matches(BTreeMap<String, Json>),
+    Rule {
+        name: String,
+        bindings: BTreeMap<String, ProcessValue>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessOutputState {
+    pub values: BTreeMap<String, ProcessValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProcessFailState {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +358,7 @@ pub struct CompiledProcessDefinition {
     pub process_key: Option<TypeRef>,
     pub signals: BTreeMap<String, CompiledProcessSignal>,
     pub states: BTreeMap<String, CompiledProcessState>,
+    pub caller_session_variables: BTreeMap<String, BTreeSet<String>>,
     pub dependencies: ProcessDependencyClosure,
     pub definition_fingerprint: String,
     pub revision_fingerprint: String,
@@ -474,6 +550,7 @@ pub fn build_process_effect_contract_catalog(
                         },
                         start_input: process.input.clone(),
                         process_key: process.process_key.clone(),
+                        caller_session_variables: process.caller_session_variables.clone(),
                         signals,
                     },
                 )
@@ -527,6 +604,8 @@ fn compile_process(
         state_types.insert(state.id.clone(), compiled.output.clone());
         states.insert(state.id.clone(), compiled);
     }
+    let caller_session_variables =
+        collect_caller_session_variables(process, &closure, &format!("{base}.states"))?;
     let definition_fingerprint = definition_fingerprint(process, &input, &output, &signals)?;
     let revision_fingerprint = revision_fingerprint(&definition_fingerprint, &closure)?;
     Ok(CompiledProcessDefinition {
@@ -539,10 +618,178 @@ fn compile_process(
         process_key,
         signals,
         states,
+        caller_session_variables,
         dependencies: closure,
         definition_fingerprint,
         revision_fingerprint,
     })
+}
+
+fn collect_caller_session_variables(
+    process: &Process,
+    closure: &ProcessDependencyClosure,
+    path: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>, PlanError> {
+    let mut by_role = process
+        .permissions
+        .iter()
+        .map(|permission| (permission.role.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for permission in &process.permissions {
+        if let Some(name) = &permission.owner_session_variable {
+            by_role
+                .get_mut(&permission.role)
+                .expect("permission role initialized")
+                .insert(name.to_ascii_lowercase());
+        }
+    }
+
+    let mut ambient = BTreeSet::new();
+    if let Some(owner) = &process.owner {
+        collect_value_session_variables(&owner.capture, &mut ambient);
+    }
+    if let Some(idempotency) = &process.idempotency {
+        for value in std::iter::once(&idempotency.key).chain(&idempotency.scope) {
+            if let ProcessIdempotencyValue::SessionVariable { session_variable } = value {
+                ambient.insert(session_variable.to_ascii_lowercase());
+            }
+        }
+    }
+
+    for (state_index, state) in process.states.iter().enumerate() {
+        let state_path = format!("{path}[{state_index}]");
+        match &state.operation {
+            ProcessStateOperation::Command { command } => {
+                collect_value_map_session_variables(&command.arguments, &mut ambient);
+                collect_caller_command_session_variables(
+                    process,
+                    closure,
+                    &command.name,
+                    &command.run_as,
+                    &state_path,
+                    &mut by_role,
+                )?;
+            }
+            ProcessStateOperation::Request { request } => {
+                collect_value_map_session_variables(&request.input, &mut ambient);
+            }
+            ProcessStateOperation::When { when } => {
+                collect_value_map_session_variables(&when.input, &mut ambient);
+                for case in &when.cases {
+                    collect_value_map_session_variables(&case.bindings, &mut ambient);
+                }
+            }
+            ProcessStateOperation::Wait { wait } => match wait {
+                ProcessWaitState::Signal(wait) => {
+                    collect_value_map_session_variables(&wait.correlate, &mut ambient);
+                    if let ProcessDeadline::Value(value) = &wait.deadline {
+                        collect_value_session_variables(value, &mut ambient);
+                    }
+                }
+                ProcessWaitState::Timer(wait) => {
+                    collect_value_map_session_variables(&wait.timer.bindings, &mut ambient);
+                }
+            },
+            ProcessStateOperation::ForEach { for_each } => match for_each.as_ref() {
+                ProcessForEachState::Command { input, command, .. } => {
+                    collect_value_session_variables(input, &mut ambient);
+                    collect_value_map_session_variables(&command.arguments, &mut ambient);
+                    collect_caller_command_session_variables(
+                        process,
+                        closure,
+                        &command.name,
+                        &command.run_as,
+                        &state_path,
+                        &mut by_role,
+                    )?;
+                }
+                ProcessForEachState::Request { input, request, .. } => {
+                    collect_value_session_variables(input, &mut ambient);
+                    collect_value_map_session_variables(&request.input, &mut ambient);
+                }
+            },
+            ProcessStateOperation::Output { output } => {
+                collect_value_map_session_variables(&output.values, &mut ambient);
+            }
+            ProcessStateOperation::Fail { .. } => {}
+        }
+    }
+
+    for variables in by_role.values_mut() {
+        variables.extend(ambient.iter().cloned());
+    }
+    Ok(by_role)
+}
+
+fn collect_caller_command_session_variables(
+    process: &Process,
+    closure: &ProcessDependencyClosure,
+    command_name: &str,
+    run_as: &str,
+    path: &str,
+    by_role: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), PlanError> {
+    if run_as != "caller" {
+        return Ok(());
+    }
+    let descriptor = closure
+        .commands
+        .get(&(process.source.clone(), command_name.to_owned()))
+        .ok_or_else(|| {
+            validation(
+                path,
+                format!(
+                    "compiled caller command `{command_name}` is absent from the dependency closure"
+                ),
+            )
+        })?;
+    for permission in &process.permissions {
+        let target = by_role
+            .get_mut(&permission.role)
+            .expect("permission role initialized");
+        target.extend(
+            descriptor
+                .required_session_variables
+                .get(&permission.role)
+                .into_iter()
+                .flat_map(|variables| variables.keys())
+                .map(|name| name.to_ascii_lowercase()),
+        );
+    }
+    Ok(())
+}
+
+fn collect_value_map_session_variables(
+    values: &BTreeMap<String, ProcessValue>,
+    output: &mut BTreeSet<String>,
+) {
+    for value in values.values() {
+        collect_value_session_variables(value, output);
+    }
+}
+
+fn collect_value_session_variables(value: &ProcessValue, output: &mut BTreeSet<String>) {
+    match value {
+        ProcessValue::SessionVariable { session_variable } => {
+            output.insert(session_variable.to_ascii_lowercase());
+        }
+        ProcessValue::BoundedConcat { bounded_concat } => {
+            for value in &bounded_concat.inputs {
+                collect_value_session_variables(value, output);
+            }
+        }
+        ProcessValue::BoundedFlatten { bounded_flatten } => {
+            collect_value_session_variables(&bounded_flatten.from, output);
+        }
+        ProcessValue::Input { .. }
+        | ProcessValue::State { .. }
+        | ProcessValue::Item { .. }
+        | ProcessValue::Literal { .. }
+        | ProcessValue::ActivityKey { .. }
+        | ProcessValue::ActivityKeyForState { .. }
+        | ProcessValue::Run { .. }
+        | ProcessValue::WorkflowTime { .. } => {}
+    }
 }
 
 fn validation(path: impl Into<String>, message: impl Into<String>) -> PlanError {
@@ -1149,7 +1396,7 @@ fn compile_state(
     state: &ProcessState,
     context: &mut CompileContext<'_, '_>,
 ) -> Result<CompiledProcessState, PlanError> {
-    let (output, maximum_send_horizons_ms) = match &state.operation {
+    let (output, maximum_send_horizons_ms, operation) = match &state.operation {
         ProcessStateOperation::Command { command } => {
             let descriptor = compile_command_activity(
                 &command.name,
@@ -1158,23 +1405,49 @@ fn compile_state(
                 context,
                 &format!("{}.command", context.path),
             )?;
-            (descriptor.result, BTreeMap::new())
+            let role = compile_command_role(
+                context.process,
+                &descriptor,
+                &command.run_as,
+                &format!("{}.command.run_as", context.path),
+            )?;
+            (
+                descriptor.result,
+                BTreeMap::new(),
+                CompiledProcessStateOperation::Command(CompiledProcessCommandState {
+                    name: command.name.clone(),
+                    role,
+                    arguments: command.arguments.clone(),
+                    next: command.next.clone(),
+                }),
+            )
         }
-        ProcessStateOperation::Request { request } => compile_request_state(
-            request,
-            &state.id,
-            None,
-            context,
-            &format!("{}.request", context.path),
-        )?,
+        ProcessStateOperation::Request { request } => {
+            let (output, horizons) = compile_request_state(
+                request,
+                &state.id,
+                None,
+                context,
+                &format!("{}.request", context.path),
+            )?;
+            (output, horizons, CompiledProcessStateOperation::Request)
+        }
         ProcessStateOperation::When { when } => {
-            (compile_when_state(when, context)?, BTreeMap::new())
+            let (output, compiled) = compile_when_state(when, context)?;
+            (
+                output,
+                BTreeMap::new(),
+                CompiledProcessStateOperation::When(compiled),
+            )
         }
-        ProcessStateOperation::Wait { wait } => {
-            (compile_wait_state(wait, context)?, BTreeMap::new())
-        }
+        ProcessStateOperation::Wait { wait } => (
+            compile_wait_state(wait, context)?,
+            BTreeMap::new(),
+            CompiledProcessStateOperation::Wait,
+        ),
         ProcessStateOperation::ForEach { for_each } => {
-            compile_for_each_state(for_each, &state.id, context)?
+            let (output, horizons) = compile_for_each_state(for_each, &state.id, context)?;
+            (output, horizons, CompiledProcessStateOperation::ForEach)
         }
         ProcessStateOperation::Output { output } => {
             validate_binding_map(
@@ -1194,6 +1467,9 @@ fn compile_state(
                     &format!("{}.output", context.path),
                 )?,
                 BTreeMap::new(),
+                CompiledProcessStateOperation::Output(CompiledProcessOutputState {
+                    values: output.values.clone(),
+                }),
             )
         }
         ProcessStateOperation::Fail { fail } => {
@@ -1203,13 +1479,21 @@ fn compile_state(
                     "fail state code and safe message must not be empty",
                 ));
             }
-            (empty_contract(), BTreeMap::new())
+            (
+                empty_contract(),
+                BTreeMap::new(),
+                CompiledProcessStateOperation::Fail(CompiledProcessFailState {
+                    code: fail.code.clone(),
+                    message: fail.message.clone(),
+                }),
+            )
         }
     };
     Ok(CompiledProcessState {
         id: state.id.clone(),
         output,
         maximum_send_horizons_ms,
+        operation,
     })
 }
 
@@ -1300,7 +1584,52 @@ fn validate_run_as(
             ),
         ));
     }
+    if descriptor
+        .required_session_variables
+        .get(run_as)
+        .is_some_and(|variables| !variables.is_empty())
+    {
+        return Err(validation(
+            path,
+            format!(
+                "fixed Process command role `{run_as}` requires session variables, but fixed roles have no ambient request session"
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn compile_command_role(
+    process: &Process,
+    descriptor: &ProcessCommandDescriptor,
+    run_as: &str,
+    path: &str,
+) -> Result<CompiledProcessCommandRole, PlanError> {
+    validate_run_as(process, descriptor, run_as, path)?;
+    if run_as != "caller" {
+        return Ok(CompiledProcessCommandRole::Fixed {
+            role: run_as.to_owned(),
+        });
+    }
+    let required_session_variables = process
+        .permissions
+        .iter()
+        .map(|permission| {
+            (
+                permission.role.clone(),
+                descriptor
+                    .required_session_variables
+                    .get(&permission.role)
+                    .into_iter()
+                    .flat_map(|variables| variables.keys())
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(CompiledProcessCommandRole::Caller {
+        required_session_variables,
+    })
 }
 
 fn validate_caller_role(
@@ -1681,7 +2010,7 @@ fn format_number(value: u64) -> String {
 fn compile_when_state(
     when: &donat_metadata::ProcessWhenState,
     context: &mut CompileContext<'_, '_>,
-) -> Result<ValueContractCatalog, PlanError> {
+) -> Result<(ValueContractCatalog, CompiledProcessWhenState), PlanError> {
     let path = format!("{}.when", context.path);
     if when.cases.is_empty() {
         return Err(validation(
@@ -1724,7 +2053,29 @@ fn compile_when_state(
             .closure
             .decision_tables
             .insert(table_name.clone(), descriptor);
-        return Ok(output_contract);
+        return Ok((
+            output_contract,
+            CompiledProcessWhenState {
+                decision_table: Some(CompiledProcessDecisionCall {
+                    name: table_name.clone(),
+                    input: when.input.clone(),
+                }),
+                cases: when
+                    .cases
+                    .iter()
+                    .map(|case| CompiledProcessWhenCase {
+                        predicate: CompiledProcessWhenPredicate::Matches(
+                            case.matches
+                                .clone()
+                                .expect("decision cases were validated as literal matches"),
+                        ),
+                        next: case.next.clone(),
+                    })
+                    .collect(),
+                default: when.default.clone(),
+                literal_output_state: None,
+            },
+        ));
     }
     if !when.input.is_empty() {
         return Err(validation(
@@ -1734,6 +2085,8 @@ fn compile_when_state(
     }
 
     let mut matched_contract: Option<ValueContractCatalog> = None;
+    let mut literal_output_state: Option<String> = None;
+    let mut compiled_cases = Vec::with_capacity(when.cases.len());
     for (case_index, case) in when.cases.iter().enumerate() {
         let case_path = format!("{path}.cases[{case_index}]");
         match (&case.matches, &case.rule) {
@@ -1744,14 +2097,29 @@ fn compile_when_state(
                         "literal match case must not declare rule bindings",
                     ));
                 }
-                let source = latest_matching_state_contract(matches, context).ok_or_else(|| {
-                    validation(
+                let (source_state, source) = latest_matching_state_contract(matches, context)
+                    .ok_or_else(|| {
+                        validation(
+                            format!("{case_path}.matches"),
+                            "match fields do not resolve to one prior state output",
+                        )
+                    })?;
+                if literal_output_state
+                    .as_ref()
+                    .is_some_and(|existing| existing != source_state)
+                {
+                    return Err(validation(
                         format!("{case_path}.matches"),
-                        "match fields do not resolve to one prior state output",
-                    )
-                })?;
+                        "all literal match cases in one when state must resolve to the same prior state output",
+                    ));
+                }
+                literal_output_state.get_or_insert_with(|| source_state.to_owned());
                 validate_literal_matches(matches, source, &format!("{case_path}.matches"))?;
                 matched_contract.get_or_insert_with(|| source.clone());
+                compiled_cases.push(CompiledProcessWhenCase {
+                    predicate: CompiledProcessWhenPredicate::Matches(matches.clone()),
+                    next: case.next.clone(),
+                });
             }
             (None, Some(rule_name)) => {
                 let descriptor = context.dependencies.rule(rule_name).ok_or_else(|| {
@@ -1773,6 +2141,13 @@ fn compile_when_state(
                     &format!("{case_path}.with"),
                 )?;
                 context.closure.rules.insert(rule_name.clone(), descriptor);
+                compiled_cases.push(CompiledProcessWhenCase {
+                    predicate: CompiledProcessWhenPredicate::Rule {
+                        name: rule_name.clone(),
+                        bindings: case.bindings.clone(),
+                    },
+                    next: case.next.clone(),
+                });
             }
             _ => {
                 return Err(validation(
@@ -1782,13 +2157,21 @@ fn compile_when_state(
             }
         }
     }
-    Ok(matched_contract.unwrap_or_else(empty_contract))
+    Ok((
+        matched_contract.unwrap_or_else(empty_contract),
+        CompiledProcessWhenState {
+            decision_table: None,
+            cases: compiled_cases,
+            default: when.default.clone(),
+            literal_output_state,
+        },
+    ))
 }
 
 fn latest_matching_state_contract<'a>(
     matches: &BTreeMap<String, Json>,
     context: &'a CompileContext<'_, '_>,
-) -> Option<&'a ValueContractCatalog> {
+) -> Option<(&'a str, &'a ValueContractCatalog)> {
     context
         .state_indices
         .iter()
@@ -1802,10 +2185,10 @@ fn latest_matching_state_contract<'a>(
                         .keys()
                         .all(|field| contract.roots.contains_key(field))
                 })
-                .map(|contract| (*index, contract))
+                .map(|contract| (*index, name.as_str(), contract))
         })
-        .max_by_key(|(index, _)| *index)
-        .map(|(_, contract)| contract)
+        .max_by_key(|(index, _, _)| *index)
+        .map(|(_, name, contract)| (name, contract))
 }
 
 fn validate_literal_matches(

@@ -25,7 +25,7 @@ use crate::plan::{
     Fragments, MutationKind, PlanError, Planner, Session, TableCtx, field_not_found, flatten,
     is_session_var_name, unexpected_arg, value_to_json,
 };
-use crate::process_effects::FinalizedCommandEffect;
+use crate::process_effects::{FinalizedCommandEffect, FinalizedCompiledCommand};
 
 struct ResolvedCommandStep {
     cte: String,
@@ -243,6 +243,87 @@ impl<'a> Planner<'a> {
         })())
     }
 
+    /// Plan one Process-owned Command from an already published finalized
+    /// snapshot. This is deliberately not a GraphQL adapter: arguments and
+    /// the classic role/session are supplied explicitly, the complete closed
+    /// result contract is selected, and no ambient request field can enter.
+    pub fn plan_process_command(
+        &self,
+        expected: &FinalizedCompiledCommand,
+        arguments: BTreeMap<String, Json>,
+        session: &Session,
+        path: &str,
+    ) -> Result<CommandMutation, PlanError> {
+        let name = expected.command.definition().name.as_str();
+        let published = self.finalized_command_named(name).ok_or_else(|| {
+            PlanError::new(
+                path,
+                "unexpected",
+                format!("finalized command `{name}` is absent from the serving snapshot"),
+            )
+        })?;
+        if published.command.descriptor().definition_fingerprint
+            != expected.command.descriptor().definition_fingerprint
+            || published.command.descriptor().source != expected.command.descriptor().source
+            || !same_finalized_effect_identities(&published.effects, &expected.effects)
+        {
+            return Err(PlanError::new(
+                path,
+                "unexpected",
+                format!("finalized command `{name}` does not match the serving snapshot"),
+            ));
+        }
+
+        let command = &published.command;
+        if !self.command_is_permitted(command.definition(), session) {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "command `{name}` is not executable as role `{}`",
+                    session.role
+                ),
+            ));
+        }
+        self.validate_command_runtime_permissions(command.definition(), session, path)?;
+        validate_closed_process_session(command, session, path)?;
+
+        let mut supplied = arguments;
+        let mut coerced = BTreeMap::new();
+        for argument in &command.definition().arguments {
+            let value = supplied.remove(&argument.name).unwrap_or(Json::Null);
+            if value.is_null() && argument.type_.ends_with('!') {
+                return Err(PlanError::validation(
+                    path,
+                    format!("missing required field argument: \"{}\"", argument.name),
+                ));
+            }
+            let value = coerce_command_argument_value(
+                self.metadata(),
+                command.rules(),
+                &argument.type_,
+                &value,
+                &format!("{path}.arguments.{}", argument.name),
+            )?;
+            coerced.insert(argument.name.clone(), Scalar::Json(value));
+        }
+        if let Some(extra) = supplied.keys().next() {
+            return Err(PlanError::validation(
+                &format!("{path}.arguments.{extra}"),
+                format!("unexpected command argument `{extra}`"),
+            ));
+        }
+
+        let selection = complete_process_command_selection(command.descriptor(), path)?;
+        self.resolve_command_execution(
+            command,
+            &published.effects,
+            coerced,
+            selection,
+            session,
+            path,
+        )
+    }
+
     fn resolve_command_execution(
         &self,
         command: &CompiledCommand,
@@ -377,6 +458,35 @@ impl<'a> Planner<'a> {
                             index,
                             &effect_path,
                         )?;
+                        let caller_role = effect
+                            .caller_session_variables
+                            .contains_key(&session.role)
+                            .then(|| session.role.clone());
+                        let caller_session_variables = effect
+                            .caller_session_variables
+                            .get(&session.role)
+                            .into_iter()
+                            .flatten()
+                            .map(|name| {
+                                let value = session.var(name).ok_or_else(|| {
+                                    PlanError::new(
+                                        &effect_path,
+                                        "not-found",
+                                        format!(
+                                            "missing session variable: \"{}\"",
+                                            name.to_ascii_lowercase()
+                                        ),
+                                    )
+                                })?;
+                                Ok((
+                                    name.clone(),
+                                    CommandExecutionValue::Scalar {
+                                        value: Scalar::Json(Json::String(value.to_owned())),
+                                        pg_type: "text".to_owned(),
+                                    },
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
                         Ok(ResolvedCommandEffect::StartProcess(
                             ResolvedStartProcessEffect {
                                 source: effect.source.clone(),
@@ -397,6 +507,8 @@ impl<'a> Planner<'a> {
                                     arguments,
                                     &effect_path,
                                 )?,
+                                caller_role,
+                                caller_session_variables,
                                 command_invocation_id: CommandInvocationIdSource::CurrentExecution,
                                 effect_position: effect.effect_position,
                             },
@@ -4090,6 +4202,178 @@ impl<'a> Planner<'a> {
         }
         Ok(MutationOutput::Response(out))
     }
+}
+
+fn validate_closed_process_session(
+    command: &CompiledCommand,
+    session: &Session,
+    path: &str,
+) -> Result<(), PlanError> {
+    let required = command
+        .descriptor()
+        .required_session_variables
+        .get(&session.role)
+        .map(|variables| {
+            variables
+                .keys()
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let actual = session
+        .vars
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != required {
+        let missing = required.difference(&actual).cloned().collect::<Vec<_>>();
+        let extra = actual.difference(&required).cloned().collect::<Vec<_>>();
+        return Err(PlanError::validation(
+            path,
+            format!(
+                "Process command session variables are not closed (missing: [{}], extra: [{}])",
+                missing.join(", "),
+                extra.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn same_finalized_effect_identities(
+    left: &[FinalizedCommandEffect],
+    right: &[FinalizedCommandEffect],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (FinalizedCommandEffect::Start(left), FinalizedCommandEffect::Start(right)) => {
+                    left.source == right.source
+                        && left.process_name == right.process_name
+                        && left.process_revision == right.process_revision
+                        && left.start_policy == right.start_policy
+                        && left.effect_position == right.effect_position
+                }
+                (FinalizedCommandEffect::Signal(left), FinalizedCommandEffect::Signal(right)) => {
+                    left.source == right.source
+                        && left.process_name == right.process_name
+                        && left.process_revision == right.process_revision
+                        && left.signal_name == right.signal_name
+                        && left.compatible_revisions == right.compatible_revisions
+                        && left.effect_position == right.effect_position
+                }
+                _ => false,
+            })
+}
+
+fn complete_process_command_selection(
+    descriptor: &crate::commands::CommandDescriptor,
+    path: &str,
+) -> Result<Vec<CommandResultSelection>, PlanError> {
+    descriptor
+        .result
+        .roots
+        .iter()
+        .map(|(name, field)| {
+            complete_process_command_field(name, &field.type_ref, &descriptor.result, path, 0)
+        })
+        .collect()
+}
+
+fn complete_process_command_field(
+    name: &str,
+    type_ref: &TypeRef,
+    catalog: &ValueContractCatalog,
+    path: &str,
+    depth: usize,
+) -> Result<CommandResultSelection, PlanError> {
+    if depth > 64 {
+        return Err(PlanError::new(
+            path,
+            "unexpected",
+            "command result contract recursion escaped deployment validation",
+        ));
+    }
+    let object_fields = match &type_ref.value_type {
+        ValueType::Object { fields } => Some(fields),
+        ValueType::Ref { name } => Some(
+            &catalog
+                .named_objects
+                .get(name)
+                .ok_or_else(|| {
+                    PlanError::new(
+                        path,
+                        "unexpected",
+                        format!("command result references absent object contract `{name}`"),
+                    )
+                })?
+                .fields,
+        ),
+        _ => None,
+    };
+    if let Some(fields) = object_fields {
+        let selections = fields
+            .iter()
+            .map(|(field_name, field)| {
+                complete_process_command_field(
+                    field_name,
+                    &field.type_ref,
+                    catalog,
+                    path,
+                    depth + 1,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(CommandResultSelection::Object {
+            alias: name.to_owned(),
+            field: name.to_owned(),
+            selections,
+        });
+    }
+    if let ValueType::List { element } = &type_ref.value_type {
+        let element_object = match &element.value_type {
+            ValueType::Object { fields } => Some(fields),
+            ValueType::Ref { name } => Some(
+                &catalog
+                    .named_objects
+                    .get(name)
+                    .ok_or_else(|| {
+                        PlanError::new(
+                            path,
+                            "unexpected",
+                            format!("command result references absent object contract `{name}`"),
+                        )
+                    })?
+                    .fields,
+            ),
+            _ => None,
+        };
+        if let Some(fields) = element_object {
+            let selections = fields
+                .iter()
+                .map(|(field_name, field)| {
+                    complete_process_command_field(
+                        field_name,
+                        &field.type_ref,
+                        catalog,
+                        path,
+                        depth + 1,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(CommandResultSelection::List {
+                alias: name.to_owned(),
+                field: name.to_owned(),
+                selections,
+            });
+        }
+    }
+    Ok(CommandResultSelection::Scalar {
+        alias: name.to_owned(),
+        field: name.to_owned(),
+    })
 }
 
 fn command_column(column: &donat_catalog::ColumnInfo) -> CommandColumn {

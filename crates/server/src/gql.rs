@@ -1783,30 +1783,16 @@ fn query_error_json(e: QueryError) -> Json {
     }
 }
 
-const COMMAND_GRAPHQL_ERROR_SQLSTATE: &str = "P0D01";
-const COMMAND_GRAPHQL_ERROR_KIND: &str = "donat.graphql-error.v1";
-
-fn command_graphql_error_json(message: &str) -> Option<Json> {
-    let Json::Object(payload) = serde_json::from_str::<Json>(message).ok()? else {
-        return None;
-    };
-    if payload.len() != 4
-        || payload.get("kind").and_then(Json::as_str) != Some(COMMAND_GRAPHQL_ERROR_KIND)
-    {
-        return None;
-    }
-    let code = payload.get("code").and_then(Json::as_str)?;
-    let path = payload.get("path").and_then(Json::as_str)?;
-    let message = payload.get("message").and_then(Json::as_str)?;
-    if code.is_empty() || !path.starts_with('$') {
-        return None;
-    }
-    Some(json!({
+fn command_business_rejection_json(rejection: &crate::commands::CommandBusinessRejection) -> Json {
+    json!({
         "errors": [{
-            "extensions": { "path": path, "code": code },
-            "message": message,
+            "extensions": {
+                "path": rejection.path,
+                "code": rejection.code,
+            },
+            "message": rejection.message,
         }]
-    }))
+    })
 }
 
 fn permission_error_json(message: &str) -> Option<Json> {
@@ -1835,8 +1821,10 @@ fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("data-exception", "command database error");
     };
-    if db.code().code() == COMMAND_GRAPHQL_ERROR_SQLSTATE {
-        return command_graphql_error_json(db.message())
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
             .unwrap_or_else(|| error_json("data-exception", "command database error"));
     }
     if db.code().code() == "23514"
@@ -1851,8 +1839,10 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
     };
-    if db.code().code() == COMMAND_GRAPHQL_ERROR_SQLSTATE {
-        return command_graphql_error_json(db.message())
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
             .unwrap_or_else(|| error_json("data-exception", "database error"));
     }
     // Our check_violation() raises 23514 with a JSON payload carrying the

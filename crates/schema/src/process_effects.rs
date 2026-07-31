@@ -25,6 +25,10 @@ pub struct ProcessEffectContract {
     pub start_policy: ProcessStartPolicy,
     pub start_input: ValueContractCatalog,
     pub process_key: Option<TypeRef>,
+    /// Exact request-session names retained when a Process is started by one
+    /// of its declared caller roles. Values are resolved by the command
+    /// planner; metadata cannot add an ambient header to this set.
+    pub caller_session_variables: BTreeMap<String, BTreeSet<String>>,
     pub signals: BTreeMap<String, ProcessSignalEffectContract>,
 }
 
@@ -77,6 +81,7 @@ pub struct FinalizedStartProcessEffect {
     pub process_key: Option<CommandValue>,
     pub input: BTreeMap<String, CommandValue>,
     pub semantic_idempotency_key: CommandIdempotencyKey,
+    pub caller_session_variables: BTreeMap<String, BTreeSet<String>>,
     pub effect_position: u32,
 }
 

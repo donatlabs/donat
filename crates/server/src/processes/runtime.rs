@@ -5,25 +5,67 @@
 //! catalogs that were validated together; workers never consult mutable
 //! metadata or reconstruct a dependency while consuming journal rows.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use donat_schema::{CompiledCommandCatalog, FinalizedCommandCatalog};
+use donat_catalog::Catalog;
+use donat_metadata::Metadata;
+use donat_rules::RuleCatalog;
+use donat_schema::{
+    CompiledCommandCatalog, CompiledMultiSourceSchema, FinalizedCommandCatalog, Planner,
+};
 
 use crate::connectors::ConnectorRegistry;
 use crate::state::{SharedState, SourceRuntime};
 
-use super::{DeployedSourceProcessCatalog, StartConsumption};
+use super::{DeployedSourceProcessCatalog, StartConsumption, TransitionConsumption};
+
+/// Immutable planning inputs captured from the same published Engine
+/// candidate as the deployed Process and finalized Command catalogs.
+#[derive(Clone)]
+pub struct ProcessPlanningSnapshot {
+    metadata: Arc<Metadata>,
+    catalogs: Arc<HashMap<String, Catalog>>,
+    compiled: Arc<CompiledMultiSourceSchema>,
+    rules: Arc<RuleCatalog>,
+}
+
+impl ProcessPlanningSnapshot {
+    pub fn new(
+        metadata: Arc<Metadata>,
+        catalogs: Arc<HashMap<String, Catalog>>,
+        compiled: Arc<CompiledMultiSourceSchema>,
+        rules: Arc<RuleCatalog>,
+    ) -> Self {
+        Self {
+            metadata,
+            catalogs,
+            compiled,
+            rules,
+        }
+    }
+
+    pub(crate) fn planner(
+        &self,
+        source_name: &str,
+    ) -> Result<Planner<'_>, donat_schema::PlanError> {
+        self.compiled
+            .source_planner(&self.metadata, &self.catalogs, source_name)
+    }
+
+    pub(crate) fn rules(&self) -> &RuleCatalog {
+        self.rules.as_ref()
+    }
+}
 
 pub struct ProcessRuntime {
     pub source_name: String,
     pub pool: deadpool_postgres::Pool,
     pub deployed_catalog: Arc<DeployedSourceProcessCatalog>,
-    // Task 10 consumes both catalogs from this same immutable snapshot.
-    #[allow(dead_code)]
+    pub planning_snapshot: Arc<ProcessPlanningSnapshot>,
     pub command_catalog: Arc<CompiledCommandCatalog>,
-    #[allow(dead_code)]
     pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
     #[allow(dead_code)]
     pub connector_registry: Arc<ConnectorRegistry>,
@@ -33,6 +75,7 @@ pub fn build_process_runtime(
     source_name: &str,
     source_runtime: &SourceRuntime,
     deployed_catalog: Arc<DeployedSourceProcessCatalog>,
+    planning_snapshot: Arc<ProcessPlanningSnapshot>,
     command_catalog: Arc<CompiledCommandCatalog>,
     finalized_command_catalog: Arc<FinalizedCommandCatalog>,
     connector_registry: Arc<ConnectorRegistry>,
@@ -59,6 +102,7 @@ pub fn build_process_runtime(
         source_name: source_name.to_owned(),
         pool: pool.clone(),
         deployed_catalog,
+        planning_snapshot,
         command_catalog,
         finalized_command_catalog,
         connector_registry,
@@ -77,6 +121,16 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     }
 
     let engine = state.engine_snapshot().await;
+    let compiled = engine
+        .compiled
+        .clone()
+        .context("Process workers require a compiled serving schema snapshot")?;
+    let planning_snapshot = Arc::new(ProcessPlanningSnapshot::new(
+        Arc::new(engine.metadata.clone()),
+        Arc::new(engine.catalogs.clone()),
+        compiled,
+        engine.rule_catalog.clone(),
+    ));
     let mut runtimes = Vec::new();
     for (source_name, deployed_catalog) in &engine.deployed_process_catalog.sources {
         if deployed_catalog.active.is_empty() && deployed_catalog.live_retired.is_empty() {
@@ -89,6 +143,7 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
             source_name,
             source_runtime,
             Arc::new(deployed_catalog.clone()),
+            planning_snapshot.clone(),
             engine.command_catalog.clone(),
             engine.finalized_command_catalog.clone(),
             state.connectors.clone(),
@@ -109,14 +164,14 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
 
 async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
     loop {
+        let mut progressed = false;
         match runtime.consume_one_start().await {
-            Ok(StartConsumption::NoWork) => {
-                tokio::time::sleep(poll_interval).await;
-            }
+            Ok(StartConsumption::NoWork) => {}
             Ok(StartConsumption::Started {
                 request_id,
                 instance_id,
             }) => {
+                progressed = true;
                 tracing::debug!(
                     source = %runtime.source_name,
                     %request_id,
@@ -128,6 +183,7 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                 request_id,
                 instance_id,
             }) => {
+                progressed = true;
                 tracing::debug!(
                     source = %runtime.source_name,
                     %request_id,
@@ -142,7 +198,84 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     "Process start consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
+                continue;
             }
+        }
+        match runtime.consume_one_transition().await {
+            Ok(TransitionConsumption::NoWork) => {}
+            Ok(TransitionConsumption::Advanced {
+                instance_id,
+                event_id,
+                from_state,
+                to_state,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    from_state,
+                    to_state,
+                    "Process state advanced"
+                );
+            }
+            Ok(TransitionConsumption::Completed {
+                instance_id,
+                event_id,
+                state,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    state,
+                    "Process instance completed"
+                );
+            }
+            Ok(TransitionConsumption::Failed {
+                instance_id,
+                event_id,
+                state,
+                code,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    state,
+                    code,
+                    "Process instance failed explicitly"
+                );
+            }
+            Ok(TransitionConsumption::CommandRejected {
+                instance_id,
+                event_id,
+                error,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    code = %error.code,
+                    path = %error.path,
+                    "Process command state rejected"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    source = %runtime.source_name,
+                    error = %error,
+                    "Process transition consumer failed"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        }
+        if !progressed {
+            tokio::time::sleep(poll_interval).await;
         }
     }
 }

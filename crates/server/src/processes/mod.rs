@@ -5,13 +5,18 @@
 //! descriptors into one immutable, fingerprinted catalog.
 
 mod catalog;
+mod command;
 mod definition;
 mod reconcile;
 mod runtime;
 mod start;
+mod transition;
+mod value;
 
 pub use catalog::*;
+pub use command::*;
 pub use definition::*;
 pub use reconcile::*;
 pub use runtime::*;
 pub use start::*;
+pub use transition::*;

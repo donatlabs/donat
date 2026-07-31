@@ -25,6 +25,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/019-command-only-table-permissions]]
 - [[decisions/020-command-unconditional-unique-identity]]
 - [[decisions/021-pinned-source-local-process-start-consumption]]
+- [[decisions/022-closed-deterministic-process-transitions]]
 
 ## Reference governance
 
