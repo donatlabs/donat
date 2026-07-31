@@ -26,6 +26,15 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/020-command-unconditional-unique-identity]]
 - [[decisions/021-pinned-source-local-process-start-consumption]]
 - [[decisions/022-closed-deterministic-process-transitions]]
+- [[decisions/023-durable-wait-linearization]]
+- [[decisions/024-bounded-fanout-item-journal]]
+- [[decisions/025-verified-inbound-delivery-and-wait-correlation]]
+- [[decisions/026-connector-egress-is-a-network-concern]]
+- [[decisions/027-process-entry-point-commands]]
+- [[decisions/028-effect-contracts-compare-resolved-fields]]
+- [[decisions/029-connector-response-contract-is-the-activity-output-schema]]
+- [[decisions/030-command-arguments-of-named-types-compile-to-their-declared-representation]]
+- [[decisions/031-a-durable-retry-must-name-its-cause]]
 
 ## Reference governance
 
