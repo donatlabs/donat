@@ -9,15 +9,15 @@ use donat_connector_catalog::{
     CANONICAL_PROVENANCE_LOADER_BRANCH_CANDIDATES, CANONICAL_SEMANTIC_LOADER_BRANCH_CANDIDATES,
     CANONICAL_SOURCE_LOADER_BRANCH_CANDIDATES, CanonicalMutationCase,
     CanonicalProjectionAssignment, CanonicalProjectionDependencyEdge, CanonicalProjectionMount,
-    CanonicalProjectionMountSegment, CanonicalProjectionProbeDisposition,
-    CanonicalProjectionRoute, CanonicalProjectionRouteId, CanonicalProjectionStaticSegment,
-    CanonicalPublicInputProbeId, DonatPolicyId, SourceReviewRegistry, TypedValueMaterialV1,
-    ValueContractMaterialV1, canonical_material_bytes, canonical_projection_owner_manifest,
-    canonicalize_raw, compile_connector_manifest, decode_source_record_material,
-    decode_value_contract_material, load_connector_manifest_bytes, load_record, load_record_bytes,
-    provenance_material, provenance_sha256, record_sha256, selected_response_header,
-    semantic_material, semantic_sha256, source_record_material, typed_value_material,
-    validate_canonical_owner_manifest, value_contract_material, value_contract_sha256,
+    CanonicalProjectionMountSegment, CanonicalProjectionProbeDisposition, CanonicalProjectionRoute,
+    CanonicalProjectionRouteId, CanonicalProjectionStaticSegment, CanonicalPublicInputProbeId,
+    DonatPolicyId, SourceReviewRegistry, TypedValueMaterialV1, ValueContractMaterialV1,
+    canonical_material_bytes, canonical_projection_owner_manifest, canonicalize_raw,
+    compile_connector_manifest, decode_source_record_material, decode_value_contract_material,
+    load_connector_manifest_bytes, load_record, load_record_bytes, provenance_material,
+    provenance_sha256, record_sha256, selected_response_header, semantic_material, semantic_sha256,
+    source_record_material, typed_value_material, validate_canonical_owner_manifest,
+    value_contract_material, value_contract_sha256,
 };
 use donat_value_contract::{
     BoundedInlineBytes, CanonicalDecimal, CanonicalNumber, TypeRef, TypedValue,
@@ -309,9 +309,7 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let npm = cases.remove("npm-verified").unwrap();
-    let provider = cases
-        .remove("provider-repository-reviewed-use")
-        .unwrap();
+    let provider = cases.remove("provider-repository-reviewed-use").unwrap();
     let donat = cases.remove("donat-owned").unwrap();
 
     let mut npm_fields = npm.clone();
@@ -339,16 +337,12 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         npm_fields["subject"]["value"]["repository"]["url"].clone();
     npm_fields["subject"]["value"]["tag_commit"] =
         serde_json::json!("eedcba9876543210fedcba9876543210fedcba98");
-    npm_fields["subject"]["value"]["signature"]["value"]["signatures"][0]
-        ["signature_sha256"] = serde_json::json!(
-        "515263748596a7b8c9daebfc0d1e2f405162738495a6b7c8d9eafb0c1d2e3f50"
-    );
+    npm_fields["subject"]["value"]["signature"]["value"]["signatures"][0]["signature_sha256"] =
+        serde_json::json!("515263748596a7b8c9daebfc0d1e2f405162738495a6b7c8d9eafb0c1d2e3f50");
     npm_fields["subject"]["value"]["signature"]["value"]["signatures"][0]["key_id"] =
         serde_json::json!("npm.key.probe");
     npm_fields["subject"]["value"]["signature"]["value"]["registry_metadata_sha256"] =
-        serde_json::json!(
-            "9192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90"
-        );
+        serde_json::json!("9192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90");
     npm_fields["subject"]["value"]["provenance"]["value"]["registry_metadata_sha256"] =
         npm_fields["subject"]["value"]["signature"]["value"]["registry_metadata_sha256"].clone();
     npm_fields["subject"]["value"]["maintainers"] =
@@ -359,9 +353,8 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         serde_json::json!("owner.serpapi.next");
     npm_fields["license"]["value"]["spdx_id"] = serde_json::json!("Apache-2.0");
     npm_fields["license"]["value"]["license_file_path"] = serde_json::json!("LICENSE-APACHE");
-    npm_fields["license"]["value"]["license_file_sha256"] = serde_json::json!(
-        "d1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0"
-    );
+    npm_fields["license"]["value"]["license_file_sha256"] =
+        serde_json::json!("d1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0");
     npm_fields["notice"]["license_file_path"] =
         npm_fields["license"]["value"]["license_file_path"].clone();
     npm_fields["notice"]["license_file_sha256"] =
@@ -374,16 +367,12 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     npm_fields["entrypoints"] = serde_json::json!(["probe.js"]);
     npm_fields["dependencies"][0]["disposition"]["value"]["replacement"] =
         serde_json::json!("donat.value.contract.probe");
-    npm_fields["dependencies"][0]["dependency"] =
-        serde_json::json!("n8n-workflow-probe");
+    npm_fields["dependencies"][0]["dependency"] = serde_json::json!("n8n-workflow-probe");
     npm_fields["admission"]["value"]["findings"] = serde_json::json!(["finding.probe"]);
-    npm_fields["safety_findings"]["findings"][0]["finding_id"] =
-        serde_json::json!("finding.probe");
+    npm_fields["safety_findings"]["findings"][0]["finding_id"] = serde_json::json!("finding.probe");
     npm_fields["safety_findings"]["findings"][0]["kind"] = serde_json::json!("port.probe");
-    npm_fields["safety_findings"]["findings"][0]["location"] =
-        serde_json::json!("crates/probe.rs");
-    npm_fields["safety_findings"]["findings"][0]["message"] =
-        serde_json::json!("Probe finding.");
+    npm_fields["safety_findings"]["findings"][0]["location"] = serde_json::json!("crates/probe.rs");
+    npm_fields["safety_findings"]["findings"][0]["message"] = serde_json::json!("Probe finding.");
     npm_fields["reviewer"] = serde_json::json!("reviewer.probe");
     npm_fields["approval_date"] = serde_json::json!("2026-07-30");
     npm_fields["proposed_manifest"] =
@@ -404,9 +393,7 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     provider_fields["subject"]["value"]["evidence"][0]["source"]["value"]["path"] =
         serde_json::json!("spec/openapi-probe.json");
     provider_fields["subject"]["value"]["evidence"][0]["content_sha256"] =
-        serde_json::json!(
-            "3333333333333333333333333333333333333333333333333333333333333333"
-        );
+        serde_json::json!("3333333333333333333333333333333333333333333333333333333333333333");
     provider_fields["subject"]["value"]["evidence"][0]["accessed_on"] =
         serde_json::json!("2026-07-30");
     provider_fields["subject"]["value"]["evidence"][0]["terms"]["value"]["decision_id"] =
@@ -423,11 +410,9 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         serde_json::json!("/paths/~1widgets-probe/post");
     provider_fields["artifact_hashes"][0]["artifact_id"] =
         serde_json::json!("artifact.openapi.probe");
-    provider_fields["artifact_hashes"][0]["digest"] = serde_json::json!(
-        "3333333333333333333333333333333333333333333333333333333333333333"
-    );
-    provider_fields["artifact_hashes"][0]["path"] =
-        serde_json::json!("spec/openapi-probe.json");
+    provider_fields["artifact_hashes"][0]["digest"] =
+        serde_json::json!("3333333333333333333333333333333333333333333333333333333333333333");
+    provider_fields["artifact_hashes"][0]["path"] = serde_json::json!("spec/openapi-probe.json");
     provider_fields["entrypoints"][0] = serde_json::json!("spec/openapi-probe.json");
     provider_fields["provider_contracts"][0]["contract_id"] =
         serde_json::json!("contract.demo.probe");
@@ -436,11 +421,9 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     provider_fields["admission"]["value"]["contracts"][0] =
         provider_fields["provider_contracts"][0]["contract_id"].clone();
     provider_fields["license"]["value"]["spdx_id"] = serde_json::json!("Apache-2.0");
-    provider_fields["license"]["value"]["license_file_path"] =
-        serde_json::json!("LICENSE-APACHE");
-    provider_fields["license"]["value"]["license_file_sha256"] = serde_json::json!(
-        "3222222222222222222222222222222222222222222222222222222222222222"
-    );
+    provider_fields["license"]["value"]["license_file_path"] = serde_json::json!("LICENSE-APACHE");
+    provider_fields["license"]["value"]["license_file_sha256"] =
+        serde_json::json!("3222222222222222222222222222222222222222222222222222222222222222");
     provider_fields["notice"]["license_file_path"] =
         provider_fields["license"]["value"]["license_file_path"].clone();
     provider_fields["notice"]["license_file_sha256"] =
@@ -465,23 +448,20 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     donat_fields["subject"]["value"]["files"][0]["path"] =
         serde_json::json!("crates/server/src/connectors/http_probe.rs");
-    donat_fields["subject"]["value"]["files"][0]["sha256"] = serde_json::json!(
-        "3111111111111111111111111111111111111111111111111111111111111111"
-    );
+    donat_fields["subject"]["value"]["files"][0]["sha256"] =
+        serde_json::json!("3111111111111111111111111111111111111111111111111111111111111111");
     donat_fields["entrypoints"][0] =
         serde_json::json!("crates/server/src/connectors/http_probe.rs");
     donat_fields["license"]["value"]["spdx_id"] = serde_json::json!("MIT");
     donat_fields["license"]["value"]["license_file_path"] = serde_json::json!("LICENSE-MIT");
-    donat_fields["license"]["value"]["license_file_sha256"] = serde_json::json!(
-        "4222222222222222222222222222222222222222222222222222222222222222"
-    );
+    donat_fields["license"]["value"]["license_file_sha256"] =
+        serde_json::json!("4222222222222222222222222222222222222222222222222222222222222222");
     donat_fields["notice"]["license_file_path"] =
         donat_fields["license"]["value"]["license_file_path"].clone();
     donat_fields["notice"]["license_file_sha256"] =
         donat_fields["license"]["value"]["license_file_sha256"].clone();
     donat_fields["notice"]["id"] = serde_json::json!("notice.donat.probe");
-    donat_fields["notice"]["required_copyright_lines"] =
-        serde_json::json!(["Copyright Donat"]);
+    donat_fields["notice"]["required_copyright_lines"] = serde_json::json!(["Copyright Donat"]);
     donat_fields["notice"]["notice_bundle_destination"] =
         serde_json::json!("THIRD_PARTY_NOTICES.probe.md");
     donat_fields["admission"]["value"]["operations"] = serde_json::json!(["post"]);
@@ -512,16 +492,12 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         SourcePublicProbeFamily {
             group: "npm-collections-and-typed-values",
             baseline: npm.clone(),
-            changed: cases
-                .remove("npm-collections-and-typed-values")
-                .unwrap(),
+            changed: cases.remove("npm-collections-and-typed-values").unwrap(),
         },
         SourcePublicProbeFamily {
             group: "npm-absent-mismatch-written-grant",
             baseline: npm.clone(),
-            changed: cases
-                .remove("npm-absent-mismatch-written-grant")
-                .unwrap(),
+            changed: cases.remove("npm-absent-mismatch-written-grant").unwrap(),
         },
         SourcePublicProbeFamily {
             group: "npm-rejected-and-verified-provenance",
@@ -543,9 +519,7 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
         SourcePublicProbeFamily {
             group: "provider-versioned-document-section",
             baseline: provider,
-            changed: cases
-                .remove("provider-versioned-document-section")
-                .unwrap(),
+            changed: cases.remove("provider-versioned-document-section").unwrap(),
         },
     ]
 }
@@ -553,10 +527,7 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
 #[test]
 fn source_public_probe_family_pairs_pass_the_real_loader() {
     for family in source_public_probe_family_pairs() {
-        for (side, document) in [
-            ("baseline", &family.baseline),
-            ("changed", &family.changed),
-        ] {
+        for (side, document) in [("baseline", &family.baseline), ("changed", &family.changed)] {
             let yaml = serde_yaml::to_string(document).unwrap();
             load_record_bytes(yaml.as_bytes()).unwrap_or_else(|error| {
                 panic!(
@@ -1557,9 +1528,7 @@ fn source_static_key_value(
                         "tag {expected_kind:?} was mounted on a non-object key value"
                     ));
                 };
-                if object.get("kind").and_then(serde_json::Value::as_str)
-                    != Some(*expected_kind)
-                {
+                if object.get("kind").and_then(serde_json::Value::as_str) != Some(*expected_kind) {
                     return Ok(None);
                 }
                 let Some(payload) = object.get("value") else {
@@ -1596,7 +1565,10 @@ fn source_keyed_elements<'a>(
     let mut elements = BTreeMap::new();
     for (index, element) in array.iter().enumerate() {
         let element_key = source_element_key(element, key)?;
-        if elements.insert(element_key.clone(), (index, element)).is_some() {
+        if elements
+            .insert(element_key.clone(), (index, element))
+            .is_some()
+        {
             return Err(format!(
                 "keyed Source mount resolved duplicate key {element_key:?}"
             ));
@@ -1605,10 +1577,7 @@ fn source_keyed_elements<'a>(
     Ok(elements)
 }
 
-fn source_mount_path(
-    path: Option<&str>,
-    field: &str,
-) -> Option<String> {
+fn source_mount_path(path: Option<&str>, field: &str) -> Option<String> {
     path.map(|path| material_path(path, field))
 }
 
@@ -1669,14 +1638,8 @@ fn resolve_source_mount(
                     next.push(SourceMountCursor {
                         baseline,
                         changed,
-                        baseline_path: source_mount_path(
-                            cursor.baseline_path.as_deref(),
-                            field,
-                        ),
-                        changed_path: source_mount_path(
-                            cursor.changed_path.as_deref(),
-                            field,
-                        ),
+                        baseline_path: source_mount_path(cursor.baseline_path.as_deref(), field),
+                        changed_path: source_mount_path(cursor.changed_path.as_deref(), field),
                     });
                 }
                 CanonicalProjectionMountSegment::TaggedKind { expected_kind } => {
@@ -1726,8 +1689,7 @@ fn resolve_source_mount(
                     for element_key in shared {
                         let (baseline_index, baseline_value) =
                             baseline.remove(&element_key).unwrap();
-                        let (changed_index, changed_value) =
-                            changed.remove(&element_key).unwrap();
+                        let (changed_index, changed_value) = changed.remove(&element_key).unwrap();
                         next.push(SourceMountCursor {
                             baseline: Some(baseline_value),
                             changed: Some(changed_value),
@@ -1771,8 +1733,7 @@ fn resolve_source_mount(
                         (1, 1) => {
                             let (_, (baseline_index, baseline_value)) =
                                 baseline.pop_first().unwrap();
-                            let (_, (changed_index, changed_value)) =
-                                changed.pop_first().unwrap();
+                            let (_, (changed_index, changed_value)) = changed.pop_first().unwrap();
                             next.push(SourceMountCursor {
                                 baseline: Some(baseline_value),
                                 changed: Some(changed_value),
@@ -1833,8 +1794,8 @@ fn source_material_value(document: &serde_json::Value) -> serde_json::Value {
     serde_json::from_slice(&canonical_material_bytes(&material).unwrap()).unwrap()
 }
 
-fn source_public_probe_family_route_deltas(
-) -> BTreeMap<&'static str, BTreeSet<CanonicalProjectionRouteId>> {
+fn source_public_probe_family_route_deltas()
+-> BTreeMap<&'static str, BTreeSet<CanonicalProjectionRouteId>> {
     source_public_probe_family_pairs()
         .into_iter()
         .map(|family| {
@@ -1876,7 +1837,8 @@ fn source_public_probe_family_route_delta_report() {
         .iter()
         .filter(|route| {
             route.route_id.case == CanonicalMutationCase::SourceRecord
-                && route.disposition == donat_connector_catalog::CanonicalMutationDisposition::Mutable
+                && route.disposition
+                    == donat_connector_catalog::CanonicalMutationDisposition::Mutable
                 && !covered.contains(&route.route_id)
         })
         .map(|route| route.route_id)
@@ -1892,9 +1854,8 @@ fn artifact_hash_digest_route_resolves_its_keyed_public_delta() {
     let baseline_document =
         fixture_document(include_str!("fixtures/provider-contract-record.yaml"));
     let mut changed_document = baseline_document.clone();
-    changed_document["artifact_hashes"][0]["digest"] = serde_json::json!(
-        "3333333333333333333333333333333333333333333333333333333333333333"
-    );
+    changed_document["artifact_hashes"][0]["digest"] =
+        serde_json::json!("3333333333333333333333333333333333333333333333333333333333333333");
     changed_document["subject"]["value"]["evidence"][0]["content_sha256"] =
         changed_document["artifact_hashes"][0]["digest"].clone();
     let baseline = source_material_value(&baseline_document);
