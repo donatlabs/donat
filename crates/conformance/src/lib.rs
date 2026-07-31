@@ -3552,6 +3552,7 @@ mod tests {
             "mcp_tools",
             "migrate",
             "petshop",
+            "process_inbound",
             "processes",
             "remote_schemas",
             "rest_endpoints",
