@@ -2,5 +2,10 @@ request:
   path: /v1/connectors/payments/webhooks
   body: '{"id":"evt_connector_verified","type":"checkout.session.completed","data":{"object":{"object":"checkout.session","id":"cs_connector_verified","client_reference_id":"00000000-0000-4000-8000-000000000042","payment_status":"paid"}}}'
 response:
-  status: 503
+  status: 204
   body: ""
+expect:
+  connector_instance: payments
+  provider_event_id: evt_connector_verified
+  first_outcome: unmatched
+  repeat_outcome: duplicate

@@ -1,8 +1,9 @@
 //! Donat-owned conformance cases for the deployed connector boundary.
 //!
-//! Connector activity execution has no HTTP caller surface yet: it is owned by
-//! the future durable process worker. These cases intentionally exercise only
-//! deployment startup and the provider-facing signed ingress route.
+//! Connector activity execution has no HTTP caller surface: it is owned by the
+//! durable process worker. These cases intentionally exercise only deployment
+//! startup and the provider-facing signed ingress route, whose verified
+//! deliveries are acknowledged solely through their committed durable audit.
 
 use std::{
     path::{Path, PathBuf},
@@ -13,6 +14,7 @@ use std::{
 
 use donat_conformance::{Suite, engine_binary, fixture_root, load_fixture};
 use hmac::{Hmac, Mac};
+use postgres::NoTls;
 use serde_json::Value as Json;
 use sha2::Sha256;
 
@@ -205,11 +207,11 @@ fn stripe_signature_rejection_has_the_fixture_defined_minimal_http_response() {
 }
 
 #[test]
-fn verified_stripe_event_has_no_delivery_acknowledgement_before_process_ingress() {
+fn verified_stripe_event_is_acknowledged_only_with_its_committed_durable_audit() {
     let metadata = connector_metadata(&fixture("stripe_webhook_metadata.yaml"));
-    let case = fixture("stripe_verified_event_unavailable.yaml");
+    let case = fixture("stripe_verified_event_unmatched.yaml");
     let body = fixture_text(&case, "/request/body").as_bytes();
-    let suite = Suite::new("connector_verified_event_unavailable")
+    let suite = Suite::new("connector_verified_event_unmatched")
         .initial_metadata(metadata)
         .env(API_KEY_ENV, "sk-conformance-api-key")
         .env(WEBHOOK_SECRET_ENV, WEBHOOK_SECRET)
@@ -218,17 +220,78 @@ fn verified_stripe_event_has_no_delivery_acknowledgement_before_process_ingress(
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Stripe-Signature".to_string(), stripe_signature(body)),
     ];
+    let path = fixture_text(&case, "/request/path");
+    let instance = fixture_text(&case, "/expect/connector_instance");
+    let provider_event_id = fixture_text(&case, "/expect/provider_event_id");
 
-    let (status, response) = suite.post_bytes(fixture_text(&case, "/request/path"), body, &headers);
+    let (status, response) = suite.post_bytes(path, body, &headers);
 
     assert_eq!(status, fixture_status(&case), "verified event status");
-    assert!(
-        !(200..300).contains(&status),
-        "a verified event must not be acknowledged before durable process ingress"
-    );
     assert_eq!(
         response,
         fixture_text(&case, "/response/body").as_bytes(),
         "verified event response body"
     );
+
+    // The acknowledgement is only trustworthy if the delivery audit and the
+    // provider dedupe identity are already visible to an independent client.
+    let mut client = postgres::Client::connect(suite.db_url(), NoTls)
+        .expect("connect after the verified delivery is acknowledged");
+    let first = client
+        .query_one(
+            "
+            SELECT outcome, instance_id::text, process_event_id::text
+            FROM donat.process_inbound_deliveries
+            WHERE source_name = 'default'
+              AND connector_instance = $1
+              AND provider_event_id = $2
+            ",
+            &[&instance, &provider_event_id],
+        )
+        .expect("one committed delivery audit row");
+    assert_eq!(
+        first.get::<_, String>(0),
+        fixture_text(&case, "/expect/first_outcome"),
+        "a verified event with no receptive wait is audited, not accepted"
+    );
+    assert_eq!(first.get::<_, Option<String>>(1), None);
+    assert_eq!(first.get::<_, Option<String>>(2), None);
+
+    // A provider retry of the same verified event is acknowledged again, adds a
+    // distinct audit row, and never duplicates the dedupe identity.
+    let (repeat_status, repeat_response) = suite.post_bytes(path, body, &headers);
+    assert_eq!(repeat_status, fixture_status(&case), "repeat event status");
+    assert_eq!(
+        repeat_response,
+        fixture_text(&case, "/response/body").as_bytes()
+    );
+
+    let ledger = client
+        .query_one(
+            "
+            SELECT
+                (SELECT count(*) FROM donat.process_inbound_deliveries
+                 WHERE source_name = 'default' AND connector_instance = $1
+                   AND provider_event_id = $2),
+                (SELECT count(*) FROM donat.process_inbound_deliveries
+                 WHERE source_name = 'default' AND connector_instance = $1
+                   AND provider_event_id = $2 AND outcome = $3),
+                (SELECT count(*) FROM donat.process_inbound_events
+                 WHERE source_name = 'default' AND connector_instance = $1
+                   AND provider_event_id = $2)
+            ",
+            &[
+                &instance,
+                &provider_event_id,
+                &fixture_text(&case, "/expect/repeat_outcome"),
+            ],
+        )
+        .expect("read the split inbound audit and dedupe ledger");
+    assert_eq!(ledger.get::<_, i64>(0), 2, "every attempt is audited");
+    assert_eq!(
+        ledger.get::<_, i64>(1),
+        1,
+        "the retry is audited as duplicate"
+    );
+    assert_eq!(ledger.get::<_, i64>(2), 1, "one provider dedupe identity");
 }
