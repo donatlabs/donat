@@ -96,10 +96,12 @@ insert_permissions:
       #
       # Entries run in document order and the first violated entry is the
       # error the caller sees. A validator passes only on TRUE, so an unknown
-      # value never satisfies one: `quality_grade > 3` already rejects a null
-      # without any help. `not_null` adds nothing to that decision — it buys a
-      # message that names the real cause instead of reporting a comparison
-      # the caller never got to fail.
+      # value never satisfies one — the runtime would refuse a null here even
+      # if nothing said so. What `not_null` adds is that the metadata says so:
+      # it names the real cause in the message, and it is what makes the
+      # comparison below typeable, since the rule profile refuses to read a
+      # nullable value and has no flow-sensitive refinement to find the guard
+      # on its own.
       validate:
         - not_null: quality_grade
           message: quality_grade cannot be null
@@ -124,11 +126,10 @@ update_permissions:
           - product:
               status:
                 _eq: published
-      # Deliberately spelled without `not_null`, so one column proves both
-      # behaviours in one fixture file: the same null that insert reports as
-      # "cannot be null" is reported here as the failed comparison. Nothing
-      # about the decision changes — a null is refused either way — only the
-      # message the caller reads.
+      # The same declaration as insert, and not by copy-paste discipline: a
+      # bare `quality_grade > 3` here would not compile at all, because the
+      # column is nullable and the rule profile refuses to read a nullable
+      # value. Presence is declared or the deployment is refused.
       #
       # The list reads the updated row, so renaming an ungraded legacy variant
       # fails until the same statement grades it. That is a real consequence
@@ -136,6 +137,8 @@ update_permissions:
       # is asserted in fixtures/petshop/validation.yaml rather than left to be
       # discovered in production.
       validate:
+        - not_null: quality_grade
+          message: quality_grade cannot be null
         - expression: "quality_grade > 3"
           message: quality_grade must be greater than 3
 delete_permissions:

@@ -99,6 +99,8 @@ struct MutationSelectOptions<'a> {
     check_path: &'a str,
     extra_ctes: Vec<String>,
     extra_checks: Vec<(String, &'a BoolExp, String, Vec<RelationshipCteOverride>)>,
+    /// Ordered per-role value validators over the written rows.
+    validators: &'a [RowValidator],
     output: &'a MutationOutput,
 }
 
@@ -3966,12 +3968,13 @@ fn mutation_to_sql_full(
                 }
             }
             ctx.mutation_select(MutationSelectOptions {
-                cte: "ins",
+                cte: INSERT_ROW_ALIAS,
                 dml: &stmt,
                 check: insert.check.as_ref(),
                 check_path: &insert.check_path,
                 extra_ctes,
                 extra_checks,
+                validators: &insert.validators,
                 output: &insert.output,
             })
         }
@@ -4022,12 +4025,13 @@ fn mutation_to_sql_full(
             }
             stmt.push_str(" RETURNING *");
             ctx.mutation_select(MutationSelectOptions {
-                cte: "upd",
+                cte: UPDATE_ROW_ALIAS,
                 dml: &stmt,
                 check: update.check.as_ref(),
                 check_path: &update.check_path,
                 extra_ctes: vec![],
                 extra_checks: vec![],
+                validators: &update.validators,
                 output: &update.output,
             })
         }
@@ -4048,6 +4052,7 @@ fn mutation_to_sql_full(
                 dml: &stmt,
                 check: None,
                 check_path: "$",
+                validators: &[],
                 extra_ctes: vec![],
                 extra_checks: vec![],
                 output: &delete.output,
@@ -4764,6 +4769,7 @@ impl Ctx {
             dml,
             check,
             check_path,
+            validators,
             extra_ctes,
             extra_checks,
             output,
@@ -4804,6 +4810,22 @@ impl Ctx {
         };
 
         let mut guarded = result;
+        // Validators are wrapped first, so they end up innermost: a role that
+        // may not write the row at all is told that, and is never handed a
+        // message about a value it was not allowed to submit. Within the list
+        // the wrap order is reversed, which leaves the first declared entry
+        // outermost — document order is the reported order.
+        for validator in validators.iter().rev() {
+            let violated = format!(
+                "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
+                validator.sql,
+            );
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.raise_graphql_error('validation-failed', {path}, {message})::json ELSE {guarded} END",
+                path = quote_lit(&validator.error_path),
+                message = quote_lit(&validator.message),
+            );
+        }
         for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
             let check_cte_ident = quote_ident(&check_cte);
             let violated = format!(
@@ -4974,6 +4996,13 @@ pub fn quote_lit(s: &str) -> String {
 ///
 /// The rule crate intentionally receives no raw identifier rendering API: both
 /// components are quoted here before they can become a SQL fragment.
+/// The CTE that holds the rows an INSERT wrote. Rule lowering happens in the
+/// planner, before SQLgen picks a name, so the name is part of the contract
+/// between them rather than a local choice here.
+pub const INSERT_ROW_ALIAS: &str = "ins";
+/// The CTE that holds the rows an UPDATE wrote.
+pub const UPDATE_ROW_ALIAS: &str = "upd";
+
 pub fn rule_qualified_column(alias: &str, column: &str) -> String {
     format!("{}.{}", quote_ident(alias), quote_ident(column))
 }
@@ -5294,6 +5323,7 @@ mod dialect_dispatch_tests {
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
+                validators: vec![],
                 output,
             },
         };
@@ -5335,6 +5365,7 @@ mod dialect_dispatch_tests {
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
+                validators: vec![],
                 output: MutationOutput::Response(vec![
                     MutationResponseField::AffectedRows {
                         alias: "affected_rows".into(),

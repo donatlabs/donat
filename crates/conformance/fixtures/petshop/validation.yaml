@@ -5,13 +5,12 @@
 # and back-office SQL leave older variants ungraded. What the staff role may
 # write through the API is stricter than what the column permits.
 #
-# The invariant these cases pin down is that a validator passes only on TRUE.
-# An unknown value therefore never satisfies one, whatever the predicate says,
-# and the difference between the two spellings is the message, never the
-# decision:
+# The invariant these cases pin down is that a validator passes only on TRUE,
+# so an unknown value never satisfies one whatever the predicate says. Presence
+# is always declared rather than inferred, in one of two spellings:
 #
-#   insert declares `not_null` first  -> a null reports "cannot be null"
-#   update declares only `> 3`        -> the same null reports the comparison
+#   not_null: quality_grade    -> the row is refused, with that entry's message
+#   when_present: description  -> the null rows are excluded from the check
 #
 # The cases run in order; the update cases depend on the rows the earlier ones
 # leave behind.
@@ -126,8 +125,7 @@
 
 - description: >-
     Renaming an ungraded legacy variant fails: the update validator reads the
-    updated row, and that row is still ungraded. The update permission omits
-    `not_null`, so the null surfaces as the comparison it could not satisfy.
+    updated row, and that row is still ungraded.
   url: /v1/graphql
   status: 200
   headers:
@@ -147,7 +145,7 @@
       - extensions:
           path: $
           code: validation-failed
-        message: quality_grade must be greater than 3
+        message: quality_grade cannot be null
 
 - description: The rejected rename left the legacy variant untouched.
   url: /v1/graphql
@@ -208,7 +206,7 @@
       update_product_variant:
         affected_rows: 1
 
-- description: Clearing the grade is refused, because unknown never satisfies a validator.
+- description: Clearing the grade is refused, and the null is named as a null.
   url: /v1/graphql
   status: 200
   headers:
@@ -228,7 +226,7 @@
       - extensions:
           path: $
           code: validation-failed
-        message: quality_grade must be greater than 3
+        message: quality_grade cannot be null
 
 - description: >-
     A validator constrains one role, not the table. The customer role has no

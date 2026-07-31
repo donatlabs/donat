@@ -980,6 +980,22 @@ pub enum CommandResultSelection {
     },
 }
 
+/// One compiled entry of a write permission's `validate` list.
+///
+/// `sql` is a Postgres boolean over the written-row CTE, produced either by
+/// `donat-rules` lowering or by a null test the planner rendered itself.
+/// Neither the rule source nor the column name reaches SQLgen as text: this
+/// mirrors [`CommandRule`], which made the same guarantee for commands.
+///
+/// A validator passes only when the boolean is TRUE. An unknown value is a
+/// violation, which is what makes a null-handling mistake fail closed.
+#[derive(Debug, Clone, Serialize)]
+pub struct RowValidator {
+    pub sql: String,
+    pub message: String,
+    pub error_path: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InsertMutation {
     pub table: Table,
@@ -995,6 +1011,9 @@ pub struct InsertMutation {
     pub check: Option<BoolExp>,
     /// Error path reported on check violation.
     pub check_path: String,
+    /// Ordered per-role value validators over the inserted rows. The first
+    /// violated entry is the one reported.
+    pub validators: Vec<RowValidator>,
     pub output: MutationOutput,
 }
 
@@ -1010,6 +1029,7 @@ pub struct NestedObjectInsert {
     pub row: Vec<Option<Scalar>>,
     pub check: Option<BoolExp>,
     pub check_path: String,
+    pub validators: Vec<RowValidator>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1032,6 +1052,8 @@ pub struct UpdateMutation {
     pub check: Option<BoolExp>,
     /// Error path reported on check violation.
     pub check_path: String,
+    /// Ordered per-role value validators over the updated rows.
+    pub validators: Vec<RowValidator>,
     pub output: MutationOutput,
 }
 

@@ -172,8 +172,20 @@ impl CompiledMultiSourceSchema {
         let source_indexes = metadata
             .sources
             .iter()
-            .map(Planner::compile_index)
+            .map(|source| {
+                let empty = Catalog::default();
+                let catalog = catalogs.get(source.name.as_str()).unwrap_or(&empty);
+                Planner::compile_index(source, catalog)
+            })
             .collect::<Vec<_>>();
+        // Metadata that does not compile must never reach a serving snapshot.
+        // Retaining the diagnostic and failing here is what keeps a broken
+        // validator a deployment error rather than a request-time surprise.
+        for index in &source_indexes {
+            if let Some(message) = index.validators.errors().first() {
+                return Err(PlanError::validation("tables", message.clone()));
+            }
+        }
         let mut children = build_children(
             metadata,
             catalogs,

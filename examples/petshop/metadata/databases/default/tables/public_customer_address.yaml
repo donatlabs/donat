@@ -40,7 +40,8 @@ insert_permissions:
           message: line1 must be at least 3 characters
         - expression: 'size(postal_code) <= 16'
           message: postal_code is limited to 16 characters
-        - expression: 'is_null(line2) || size(line2) >= 2'
+        - expression: 'size(line2) >= 2'
+          when_present: line2
           message: line2 must be at least 2 characters when present
 update_permissions:
   - role: customer
@@ -63,7 +64,8 @@ update_permissions:
           message: line1 must be at least 3 characters
         - expression: 'size(postal_code) <= 16'
           message: postal_code is limited to 16 characters
-        - expression: 'is_null(line2) || size(line2) >= 2'
+        - expression: 'size(line2) >= 2'
+          when_present: line2
           message: line2 must be at least 2 characters when present
 delete_permissions:
   - role: customer

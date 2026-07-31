@@ -2657,6 +2657,36 @@ pub struct SelectPermission {
     pub computed_fields: Vec<String>,
 }
 
+/// One entry of a write permission's `validate` list.
+///
+/// `check` is a predicate over the session and the row and answers whether the
+/// role may write it. A validator answers a different question — whether the
+/// value itself is acceptable — over the row as written, and carries its own
+/// message. Exactly one of `expression` and `not_null` is present; which one,
+/// and what the referenced columns must be, is settled against the catalogue
+/// during deploy-time compilation rather than here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionValidator {
+    /// Rule-profile source, type checked against the table's columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    /// A column that must not be null in the written row. It also refines that
+    /// column to its non-null type for the entries that follow, which is what
+    /// lets a later expression compare it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_null: Option<String>,
+    /// Scopes an `expression` to rows where this column is present, and makes
+    /// it non-null inside that expression.
+    ///
+    /// It exists because presence is declared here, never inferred: the rule
+    /// profile has no flow-sensitive refinement, so an `is_null` arm written
+    /// inside the expression would not make the other arm type check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_present: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InsertPermission {
     #[serde(default)]
@@ -2668,6 +2698,8 @@ pub struct InsertPermission {
     pub columns: Columns,
     #[serde(default)]
     pub backend_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validate: Vec<PermissionValidator>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2680,6 +2712,8 @@ pub struct UpdatePermission {
     pub check: Option<BoolExp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validate: Vec<PermissionValidator>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

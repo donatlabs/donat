@@ -236,6 +236,8 @@ pub struct PlannerIndex {
     pub(crate) mutation_roots: HashMap<String, (MutationKind, usize)>,
     /// mutation root field name -> function index (exposed_as: mutation).
     mutation_function_roots: HashMap<String, usize>,
+    /// Write-permission validators, compiled once per source.
+    pub(crate) validators: crate::validators::ValidatorIndex,
 }
 
 pub struct Planner<'a> {
@@ -313,20 +315,30 @@ impl<'a> Planner<'a> {
                 source_kind: SourceKind::Postgres,
                 expose_all_commands: false,
             },
-            Self::compile_index_parts(&[], &[], donat_backend::capabilities::postgres()),
+            Self::compile_index_parts(
+                &[],
+                &[],
+                donat_backend::capabilities::postgres(),
+                crate::validators::ValidatorIndex::default(),
+            ),
         )
     }
 
     /// Construct a planner for one exact metadata source. The composite
     /// planner uses this to preserve all source-local authority.
     pub fn for_source(metadata: &'a Metadata, source: &'a Source, catalog: &'a Catalog) -> Self {
-        let index = Self::compile_index(source);
+        let index = Self::compile_index(source, catalog);
         Self::for_source_with_index(metadata, source, catalog, index)
     }
 
-    pub(crate) fn compile_index(source: &Source) -> Arc<PlannerIndex> {
+    pub(crate) fn compile_index(source: &Source, catalog: &Catalog) -> Arc<PlannerIndex> {
         let capabilities = capabilities_for_source(source.kind);
-        Self::compile_index_parts(&source.tables, &source.functions, capabilities)
+        Self::compile_index_parts(
+            &source.tables,
+            &source.functions,
+            capabilities,
+            crate::validators::ValidatorIndex::build(source, catalog),
+        )
     }
 
     pub(crate) fn for_source_with_index(
@@ -368,6 +380,7 @@ impl<'a> Planner<'a> {
         tables: &[TableEntry],
         functions: &[donat_metadata::FunctionEntry],
         capabilities: donat_backend::Capabilities,
+        validators: crate::validators::ValidatorIndex,
     ) -> Arc<PlannerIndex> {
         let mut by_table = HashMap::new();
         let mut roots = HashMap::new();
@@ -446,6 +459,7 @@ impl<'a> Planner<'a> {
             roots,
             mutation_roots,
             mutation_function_roots,
+            validators,
         })
     }
 

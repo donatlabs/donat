@@ -133,6 +133,7 @@ fn insert_check_expression_wraps_check_violation() {
             op: CompareOp::Neq(Scalar::Json(json!("admin"))),
         }),
         check_path: "$.selectionSet.insert_author.args.objects".into(),
+        validators: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),
@@ -170,6 +171,7 @@ fn update_check_expression_wraps_check_violation() {
             op: CompareOp::Neq(Scalar::Json(json!("admin"))),
         }),
         check_path: "$".into(),
+        validators: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),
@@ -196,6 +198,7 @@ fn update_jsonb_append_uses_concat_and_null_coalesce() {
         predicate: Some(eq("id", "int4", json!(1))),
         check: None,
         check_path: "$".into(),
+        validators: vec![],
         output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
     };
     let sql = mutation_to_sql(&MutationRoot::Update {
@@ -225,10 +228,12 @@ fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returni
             row: vec![Some(Scalar::Json(json!("math")))],
             check: None,
             check_path: "$.selectionSet.insert_author_one.args.object.profile.data".into(),
+            validators: vec![],
         }],
         on_conflict: None,
         check: None,
         check_path: "$.selectionSet.insert_author_one.args.object".into(),
+        validators: vec![],
         output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
     };
     let sql = mutation_to_sql(&MutationRoot::Insert {
@@ -276,10 +281,12 @@ fn after_parent_nested_check_reads_parent_from_insert_cte() {
                 }),
             }),
             check_path: "$.selectionSet.insert_author_one.args.object.profile.data".into(),
+            validators: vec![],
         }],
         on_conflict: None,
         check: None,
         check_path: "$.selectionSet.insert_author_one.args.object".into(),
+        validators: vec![],
         output: MutationOutput::SingleRow(vec![column("id", "id", "int4")]),
     };
     let sql = mutation_to_sql(&MutationRoot::Insert {
@@ -320,6 +327,7 @@ fn insert_missing_values_render_default_and_do_nothing() {
         }),
         check: None,
         check_path: "$".into(),
+        validators: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),
@@ -355,6 +363,7 @@ fn on_conflict_do_update_applies_filter_and_presets() {
         }),
         check: None,
         check_path: "$".into(),
+        validators: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),

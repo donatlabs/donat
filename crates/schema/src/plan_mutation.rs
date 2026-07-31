@@ -3551,6 +3551,13 @@ impl<'a> Planner<'a> {
             .collect();
 
         let check = self.parse_check_exp(&perm.check, ctx, session, path)?;
+        let check_path = format!("{path}.args.objects");
+        let validators = self.validators.get(
+            &format!("{}.{}", ctx.info.schema, ctx.info.name),
+            &session.role,
+            crate::validators::ValidatorOp::Insert,
+            &check_path,
+        )?;
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
@@ -3564,7 +3571,8 @@ impl<'a> Planner<'a> {
             nested_object_inserts,
             on_conflict,
             check,
-            check_path: format!("{path}.args.objects"),
+            check_path,
+            validators,
             output,
         })
     }
@@ -3705,6 +3713,28 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // A nested insert writes its child rows into a CTE this planner does
+        // not name, so a validator lowered against the ordinary insert alias
+        // would silently target the wrong rows. Refusing the plan keeps the
+        // declared check enforced; quietly dropping it would turn a nested
+        // insert into a way around the role's own contract.
+        let nested_path = format!("{path}.args.object.{key}.data");
+        if !self
+            .validators
+            .get(
+                &format!("{}.{}", remote_ctx.info.schema, remote_ctx.info.name),
+                &session.role,
+                crate::validators::ValidatorOp::Insert,
+                &nested_path,
+            )?
+            .is_empty()
+        {
+            return Err(PlanError::validation(
+                &nested_path,
+                "a nested insert cannot satisfy the target table's validate list; insert the row through its own mutation root",
+            ));
+        }
+
         Ok(Some(NestedObjectInsert {
             relationship_name: key.to_string(),
             table: Table {
@@ -3719,7 +3749,8 @@ impl<'a> Planner<'a> {
             columns,
             row,
             check: self.parse_check_exp(&remote_perm.check, &remote_ctx, session, path)?,
-            check_path: format!("{path}.args.object.{key}.data"),
+            check_path: nested_path,
+            validators: Vec::new(),
         }))
     }
 
@@ -4023,6 +4054,12 @@ impl<'a> Planner<'a> {
             Some(check) => self.parse_check_exp(check, ctx, session, path)?,
             None => None,
         };
+        let validators = self.validators.get(
+            &format!("{}.{}", ctx.info.schema, ctx.info.name),
+            &session.role,
+            crate::validators::ValidatorOp::Update,
+            "$",
+        )?;
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
@@ -4035,6 +4072,7 @@ impl<'a> Planner<'a> {
             predicate,
             check,
             check_path: "$".to_string(),
+            validators,
             output,
         })
     }
