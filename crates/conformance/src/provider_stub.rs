@@ -13,10 +13,10 @@
 //! Raw HTTP/1.1, one request per connection (`Connection: close`), matching the
 //! dependency-free style of the rest of the harness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde_json::{Value as Json, json};
 
@@ -93,6 +93,8 @@ fn resolve_request_references(body: &Json, request: &Json) -> Json {
 struct StubState {
     scripts: HashMap<String, Vec<ScriptedResponse>>,
     defaults: HashMap<String, ScriptedResponse>,
+    held: HashSet<String>,
+    holding: HashMap<String, usize>,
     calls: Vec<ProviderCall>,
 }
 
@@ -101,6 +103,7 @@ struct StubState {
 pub struct ProviderStub {
     base: String,
     state: Arc<Mutex<StubState>>,
+    resumed: Arc<Condvar>,
 }
 
 impl ProviderStub {
@@ -125,6 +128,56 @@ impl ProviderStub {
             .unwrap()
             .defaults
             .insert(path.to_owned(), response);
+    }
+
+    /// Hold every request to this path before it is answered.
+    ///
+    /// A module whose behaviour depends on *when* a caller acts — cancelling
+    /// while a payment is still pending — needs that window to exist for real
+    /// rather than by sleeping. Holding the provider keeps the Process parked
+    /// in one activity for as long as the case needs, and [`Self::release`]
+    /// lets it finish. Held requests are recorded only once released, so
+    /// `count_for` still counts answered calls.
+    pub fn hold(&self, path: &str) {
+        self.state.lock().unwrap().held.insert(path.to_owned());
+    }
+
+    /// Let every held request on this path proceed.
+    pub fn release(&self, path: &str) {
+        self.state.lock().unwrap().held.remove(path);
+        self.resumed.notify_all();
+    }
+
+    /// Block until a request for this path has arrived and is being held.
+    pub fn await_held(&self, path: &str, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.state.lock().unwrap().holding.contains_key(path) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Park this request while its path is held.
+    fn wait_while_held(&self, path: &str) {
+        let mut state = self.state.lock().unwrap();
+        if !state.held.contains(path) {
+            return;
+        }
+        *state.holding.entry(path.to_owned()).or_default() += 1;
+        while state.held.contains(path) {
+            state = self.resumed.wait(state).unwrap();
+        }
+        if let Some(count) = state.holding.get_mut(path) {
+            *count -= 1;
+            if *count == 0 {
+                state.holding.remove(path);
+            }
+        }
     }
 
     /// Every provider call recorded so far, in arrival order.
@@ -195,6 +248,7 @@ pub fn spawn() -> ProviderStub {
     let stub = ProviderStub {
         base: format!("http://127.0.0.1:{port}"),
         state: Arc::new(Mutex::new(StubState::default())),
+        resumed: Arc::new(Condvar::new()),
     };
     let accepting = stub.clone();
 
@@ -204,6 +258,7 @@ pub fn spawn() -> ProviderStub {
             let stub = accepting.clone();
             std::thread::spawn(move || {
                 if let Some(call) = read_request(&mut stream) {
+                    stub.wait_while_held(&call.path);
                     // Take the scripted answer before recording, so a queue of
                     // one response cannot be consumed twice by concurrent
                     // attempts and the recorded order stays the arrival order.

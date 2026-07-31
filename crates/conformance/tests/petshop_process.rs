@@ -19,6 +19,7 @@ const REVIEWER: &str = "veterinarian-1";
 const TAX_QUOTE_PATH: &str = "/v1/tax-quotes";
 const AUTHORIZE_PATH: &str = "/v1/payment-authorizations";
 const VOID_PATH: &str = "/v1/payment-authorizations/*";
+const LOOKUP_PATH: &str = "/v1/payment-operation-lookups";
 
 fn petshop_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -104,6 +105,42 @@ fn void_response() -> ScriptedResponse {
         "status": "voided",
         "normalized_payload": { "gateway": "mock", "voided": true }
     }))
+}
+
+/// The provider proving it never carried out the mutation it was asked about.
+/// The lookup contract is non-null throughout, so an absence still has to
+/// answer every declared field.
+fn lookup_absence_response() -> ScriptedResponse {
+    ScriptedResponse::ok(json!({
+        "found": false,
+        "terminal_absence_proven": true,
+        "provider_event_id": "evt_petshop_lookup_absent",
+        "provider_mutation_id": "",
+        "provider_reference": "",
+        "outcome": "failed",
+        "amount_minor": 0,
+        "currency": "USD",
+        "normalized_payload": { "gateway": "mock", "found": false }
+    }))
+}
+
+fn cancel_order(
+    suite: &donat_conformance::Running,
+    order_id: &str,
+    request_id: &str,
+) -> (u16, Json) {
+    suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ cancel_order(order_id: \"{order_id}\", request_id: \"{request_id}\") {{ order_id order_status }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    )
 }
 
 fn request_cancellation(
@@ -431,6 +468,89 @@ fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
         output.pointer("/booking_id").and_then(Json::as_str),
         Some(booking_id.as_str()),
         "the booking Process reports the hold it confirmed: {output}"
+    );
+}
+
+/// A shopper cancels while the payment is still pending. The claim beats the
+/// in-flight authorization, and the cancellation Process asks the provider to
+/// prove the authorization never committed before it releases the reservation.
+///
+/// The window is real, not slept for: the provider holds the authorize call
+/// until the cancellation Command has committed its claim.
+#[test]
+fn a_shopper_cancels_a_pending_checkout_and_the_process_proves_no_authorization() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    stub.set_default(LOOKUP_PATH, lookup_absence_response());
+    stub.hold(AUTHORIZE_PATH);
+    let suite = start_store(&stub, "petshop_checkout_cancellation");
+    let cart_id = seed_cart(suite.db_url());
+
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440940");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    assert!(
+        stub.await_held(AUTHORIZE_PATH, Duration::from_secs(60)),
+        "the checkout Process never reached its authorization request: {}",
+        process_diagnostics(&mut client)
+    );
+
+    let order_id: String = client
+        .query_one(
+            "SELECT id::text FROM orders WHERE order_status = 'checkout_started'",
+            &[],
+        )
+        .expect("checkout committed one order with a pending payment")
+        .get(0);
+
+    let (status, body) = cancel_order(&suite, &order_id, "550e8400-e29b-41d4-a716-446655440941");
+    assert_eq!(status, 200, "cancel_order status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "cancel_order reported errors: {body}"
+    );
+
+    // The claim is committed. Let the authorization attempt finish the only way
+    // it now can: the provider is unavailable, the retries exhaust, and the
+    // checkout Process falls through to its own reconciliation.
+    stub.script(
+        AUTHORIZE_PATH,
+        vec![
+            ScriptedResponse::status(503),
+            ScriptedResponse::status(503),
+            ScriptedResponse::status(503),
+        ],
+    );
+    stub.release(AUTHORIZE_PATH);
+
+    let output = await_terminal(&mut client, "checkout_cancellation");
+    assert_eq!(
+        output.pointer("/status").and_then(Json::as_str),
+        Some("cancelled"),
+        "the cancellation Process cancelled the order without a void: {output}"
+    );
+
+    let released: i64 = client
+        .query_one(
+            "SELECT count(*) FROM inventory_reservation WHERE order_id::text = $1 AND status = 'released'",
+            &[&order_id],
+        )
+        .expect("read the released reservations")
+        .get(0);
+    assert!(
+        released > 0,
+        "proving the authorization absent releases the reserved stock"
+    );
+    let voids = stub
+        .calls()
+        .into_iter()
+        .filter(|call| call.path.starts_with("/v1/payment-authorizations/"))
+        .count();
+    assert_eq!(
+        voids, 0,
+        "an authorization that never committed is never voided"
     );
 }
 
