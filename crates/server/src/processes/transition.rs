@@ -1,6 +1,6 @@
 //! One-state-at-a-time execution for deterministic Process states.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
@@ -9,6 +9,7 @@ use donat_ir::CommandMutation;
 use donat_metadata::ProcessErrorKind;
 use donat_schema::Session;
 use serde_json::{Value as Json, json};
+use sha2::{Digest, Sha256};
 use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
@@ -18,10 +19,11 @@ use super::start::typed_value;
 use super::value::{ProcessValueContext, evaluate_process_value, evaluate_process_values};
 use super::{
     CompiledProcessCommandRole, CompiledProcessCommandState, CompiledProcessDefinition,
-    CompiledProcessFailState, CompiledProcessOutputState, CompiledProcessRequestState,
-    CompiledProcessSignalDeadline, CompiledProcessStateOperation, CompiledProcessTimestampKind,
-    CompiledProcessWaitState, CompiledProcessWhenPredicate, CompiledProcessWhenState,
-    ProcessCommandOutcome, ProcessRuntime, execute_process_command_in_savepoint,
+    CompiledProcessFailState, CompiledProcessForEachActivity, CompiledProcessForEachState,
+    CompiledProcessOutputState, CompiledProcessRequestState, CompiledProcessSignalDeadline,
+    CompiledProcessStateOperation, CompiledProcessTimestampKind, CompiledProcessWaitState,
+    CompiledProcessWhenPredicate, CompiledProcessWhenState, ProcessCommandOutcome, ProcessRuntime,
+    execute_process_command_in_savepoint,
 };
 use crate::commands::CommandBusinessRejection;
 
@@ -57,6 +59,19 @@ pub enum TransitionConsumption {
         event_id: Uuid,
         activity_job_id: Uuid,
         state: String,
+    },
+    FanOutExpanded {
+        instance_id: Uuid,
+        event_id: Uuid,
+        state: String,
+        item_count: usize,
+        scheduled_count: usize,
+    },
+    FanOutItemCompleted {
+        instance_id: Uuid,
+        event_id: Uuid,
+        state: String,
+        ordinal: i32,
     },
     WaitEntered {
         instance_id: Uuid,
@@ -102,6 +117,65 @@ struct PreparedRequestTransition {
     input: Json,
     request_fingerprint: String,
     serialization_key_hash: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct PreparedActivityInput {
+    input: Json,
+    request_fingerprint: String,
+    serialization_key_hash: Option<Vec<u8>>,
+}
+
+struct PreparedFanOutItem {
+    ordinal: i32,
+    item_key: String,
+    item_key_identity: String,
+    item: Json,
+    request: Option<PreparedActivityInput>,
+}
+
+struct PreparedFanOutExpansion {
+    snapshot: TransitionSnapshot,
+    definition: Arc<CompiledProcessDefinition>,
+    state: CompiledProcessForEachState,
+    items: Vec<PreparedFanOutItem>,
+}
+
+struct PreparedFanOutFailure {
+    snapshot: TransitionSnapshot,
+    code: &'static str,
+    message: &'static str,
+}
+
+struct PreparedFanOutCommandItem {
+    snapshot: TransitionSnapshot,
+    definition: Arc<CompiledProcessDefinition>,
+    state: CompiledProcessForEachState,
+    ordinal: i32,
+    item_key: String,
+    item_key_identity: String,
+    item: Json,
+    command: CommandMutation,
+}
+
+struct PreparedFanOutRequestCompletion {
+    snapshot: TransitionSnapshot,
+    definition: Arc<CompiledProcessDefinition>,
+    state: CompiledProcessForEachState,
+    ordinal: i32,
+    item_key: String,
+    item_key_identity: String,
+    item: Json,
+    activity_job_id: Uuid,
+    attempt: i32,
+    lease_generation: i64,
+    result: Result<Json, Json>,
+}
+
+struct FanOutItemFailure {
+    output: Json,
+    route: String,
+    error_kind: String,
 }
 
 struct PreparedRequestSuccessTransition {
@@ -161,6 +235,10 @@ enum PreparedTransition {
     Fail(PreparedFailTransition),
     WaitEntry(PreparedWaitEntry),
     WaitCompletion(PreparedWaitCompletion),
+    FanOutExpansion(PreparedFanOutExpansion),
+    FanOutFailure(PreparedFanOutFailure),
+    FanOutCommandItem(Box<PreparedFanOutCommandItem>),
+    FanOutRequestCompletion(PreparedFanOutRequestCompletion),
 }
 
 impl PreparedTransition {
@@ -175,6 +253,10 @@ impl PreparedTransition {
             Self::Fail(prepared) => &prepared.snapshot,
             Self::WaitEntry(prepared) => &prepared.snapshot,
             Self::WaitCompletion(prepared) => &prepared.snapshot,
+            Self::FanOutExpansion(prepared) => &prepared.snapshot,
+            Self::FanOutFailure(prepared) => &prepared.snapshot,
+            Self::FanOutCommandItem(prepared) => &prepared.snapshot,
+            Self::FanOutRequestCompletion(prepared) => &prepared.snapshot,
         }
     }
 }
@@ -303,6 +385,25 @@ impl ProcessRuntime {
                     from_state: prepared.snapshot.current_state,
                     to_state: prepared.next,
                 }
+            }
+            PreparedTransition::FanOutExpansion(prepared) => {
+                commit_fanout_expansion(&transaction, &self.source_name, &prepared).await?
+            }
+            PreparedTransition::FanOutFailure(prepared) => {
+                commit_fanout_failure(&transaction, &self.source_name, &prepared).await?;
+                TransitionConsumption::Failed {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    state: prepared.snapshot.current_state,
+                    code: prepared.code.to_owned(),
+                }
+            }
+            PreparedTransition::FanOutCommandItem(prepared) => {
+                self.consume_prepared_fanout_command(&transaction, &prepared)
+                    .await?
+            }
+            PreparedTransition::FanOutRequestCompletion(prepared) => {
+                commit_fanout_request_completion(&transaction, &self.source_name, &prepared).await?
             }
         };
         transaction
@@ -458,6 +559,97 @@ impl ProcessRuntime {
         }
     }
 
+    async fn consume_prepared_fanout_command(
+        &self,
+        transaction: &Transaction<'_>,
+        prepared: &PreparedFanOutCommandItem,
+    ) -> anyhow::Result<TransitionConsumption> {
+        let CompiledProcessForEachActivity::Command(activity) = &prepared.state.activity else {
+            bail!("prepared command fan-out item retained a request activity");
+        };
+        let outcome =
+            execute_process_command_in_savepoint(transaction, &prepared.command, false).await?;
+        let outcome = match outcome {
+            ProcessCommandOutcome::Applied { result } => {
+                let dependency = prepared
+                    .definition
+                    .dependencies
+                    .commands
+                    .get(&(self.source_name.clone(), activity.name.clone()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Process fan-out command `{}.{}` disappeared from the pinned closure",
+                            self.source_name,
+                            activity.name
+                        )
+                    })?;
+                dependency
+                    .result
+                    .validate(
+                        &typed_value(&result).context("decoding Process command fan-out result")?,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "Process command fan-out result violated `{}`: {error}",
+                            activity.name
+                        )
+                    })?;
+                if merge_fanout_success_item(&prepared.item, &result, prepared.state.preserve_input)
+                    .is_err()
+                {
+                    let output = fanout_failure_output(
+                        &prepared.item,
+                        &prepared.item_key,
+                        "command",
+                        "fanout_result_conflict",
+                        "the fan-out result conflicted with preserved input",
+                        false,
+                        &fanout_logical_activity_id(
+                            &prepared.snapshot,
+                            &prepared.item_key_identity,
+                        ),
+                    )?;
+                    Err(FanOutItemFailure {
+                        output,
+                        route: prepared.state.next.clone(),
+                        error_kind: "invariant".to_owned(),
+                    })
+                } else {
+                    Ok(result)
+                }
+            }
+            ProcessCommandOutcome::Rejected { error } => {
+                let output = fanout_failure_output(
+                    &prepared.item,
+                    &prepared.item_key,
+                    "command",
+                    &error.code,
+                    &error.message,
+                    false,
+                    &fanout_logical_activity_id(&prepared.snapshot, &prepared.item_key_identity),
+                )?;
+                Err(FanOutItemFailure {
+                    output,
+                    route: prepared.state.next.clone(),
+                    error_kind: "command_rejected".to_owned(),
+                })
+            }
+        };
+        commit_fanout_item_completion(
+            transaction,
+            &self.source_name,
+            &prepared.snapshot,
+            &prepared.definition,
+            &prepared.state,
+            prepared.ordinal,
+            &prepared.item_key,
+            &prepared.item_key_identity,
+            outcome,
+            None,
+        )
+        .await
+    }
+
     async fn prepare_one_transition(
         &self,
         event_kind: Option<&str>,
@@ -499,6 +691,7 @@ impl ProcessRuntime {
                       'continue',
                       'signal',
                       'timer',
+                      'fanout_item',
                       'activity_succeeded',
                       'activity_failed',
                       'retry_exhausted'
@@ -593,7 +786,25 @@ impl ProcessRuntime {
                 CompiledProcessStateOperation::Wait(state) => {
                     self.prepare_wait_transition(snapshot, definition, state.as_ref().clone())?
                 }
-                CompiledProcessStateOperation::ForEach => None,
+                CompiledProcessStateOperation::ForEach(state) => {
+                    let state = state.as_ref().clone();
+                    match snapshot.event_kind.as_str() {
+                        "start" | "continue" => {
+                            Some(self.prepare_fanout_expansion(snapshot, definition, state)?)
+                        }
+                        "fanout_item" => Some(
+                            self.prepare_fanout_command_item(&client, snapshot, definition, state)
+                                .await?,
+                        ),
+                        "activity_succeeded" | "activity_failed" | "retry_exhausted" => Some(
+                            self.prepare_fanout_request_completion(
+                                &client, snapshot, definition, state,
+                            )
+                            .await?,
+                        ),
+                        _ => None,
+                    }
+                }
             };
             if prepared.is_some() {
                 return Ok(prepared);
@@ -857,37 +1068,63 @@ impl ProcessRuntime {
         definition: Arc<CompiledProcessDefinition>,
         state: CompiledProcessCommandState,
     ) -> anyhow::Result<PreparedTransition> {
+        let command = self.prepare_command_mutation(
+            &snapshot,
+            &definition,
+            &state.name,
+            &state.role,
+            &state.arguments,
+            process_value_context(&self.source_name, &snapshot),
+        )?;
+
+        Ok(PreparedTransition::Command(PreparedCommandTransition {
+            snapshot,
+            definition,
+            state,
+            command,
+        }))
+    }
+
+    fn prepare_command_mutation(
+        &self,
+        snapshot: &TransitionSnapshot,
+        definition: &CompiledProcessDefinition,
+        command_name: &str,
+        role: &CompiledProcessCommandRole,
+        bindings: &std::collections::BTreeMap<String, donat_metadata::ProcessValue>,
+        context: ProcessValueContext<'_>,
+    ) -> anyhow::Result<CommandMutation> {
         let finalized = self
             .finalized_command_catalog
             .source(&self.source_name)
-            .and_then(|catalog| catalog.command(&state.name))
+            .and_then(|catalog| catalog.command(command_name))
             .ok_or_else(|| {
                 anyhow!(
                     "finalized Process command `{}.{}` is absent from the immutable snapshot",
                     self.source_name,
-                    state.name
+                    command_name
                 )
             })?;
         let pre_process = self
             .command_catalog
             .source(&self.source_name)
-            .and_then(|catalog| catalog.command(&state.name))
+            .and_then(|catalog| catalog.command(command_name))
             .ok_or_else(|| {
                 anyhow!(
                     "compiled Process command `{}.{}` is absent from the immutable snapshot",
                     self.source_name,
-                    state.name
+                    command_name
                 )
             })?;
         let dependency = definition
             .dependencies
             .commands
-            .get(&(self.source_name.clone(), state.name.clone()))
+            .get(&(self.source_name.clone(), command_name.to_owned()))
             .ok_or_else(|| {
                 anyhow!(
                     "Process command `{}.{}` is absent from the pinned dependency closure",
                     self.source_name,
-                    state.name
+                    command_name
                 )
             })?;
         let expected = &dependency.definition_fingerprint;
@@ -897,16 +1134,13 @@ impl ProcessRuntime {
             bail!(
                 "Process command `{}.{}` differs from pinned revision `{}`",
                 self.source_name,
-                state.name,
+                command_name,
                 snapshot.revision
             );
         }
 
-        let session = process_command_session(&definition, &state, &snapshot)?;
-        let arguments = evaluate_process_values(
-            &state.arguments,
-            &process_value_context(&self.source_name, &snapshot),
-        )?;
+        let session = process_command_session(definition, role, snapshot)?;
+        let arguments = evaluate_process_values(bindings, &context)?;
         let planner = self
             .planning_snapshot
             .planner(&self.source_name)
@@ -921,14 +1155,9 @@ impl ProcessRuntime {
                     snapshot.process_name, snapshot.current_state
                 ),
             )
-            .map_err(|error| anyhow!("planning Process command `{}`: {error}", state.name))?;
+            .map_err(|error| anyhow!("planning Process command `{command_name}`: {error}"))?;
 
-        Ok(PreparedTransition::Command(PreparedCommandTransition {
-            snapshot,
-            definition,
-            state,
-            command,
-        }))
+        Ok(command)
     }
 
     fn prepare_request_transition(
@@ -937,6 +1166,28 @@ impl ProcessRuntime {
         definition: Arc<CompiledProcessDefinition>,
         state: CompiledProcessRequestState,
     ) -> anyhow::Result<PreparedTransition> {
+        let prepared = self.prepare_activity_input(
+            &snapshot,
+            &definition,
+            &state,
+            process_value_context(&self.source_name, &snapshot),
+        )?;
+        Ok(PreparedTransition::Request(PreparedRequestTransition {
+            snapshot,
+            state,
+            input: prepared.input,
+            request_fingerprint: prepared.request_fingerprint,
+            serialization_key_hash: prepared.serialization_key_hash,
+        }))
+    }
+
+    fn prepare_activity_input(
+        &self,
+        snapshot: &TransitionSnapshot,
+        definition: &CompiledProcessDefinition,
+        state: &CompiledProcessRequestState,
+        context: ProcessValueContext<'_>,
+    ) -> anyhow::Result<PreparedActivityInput> {
         let dependency = definition
             .dependencies
             .connector_operations
@@ -1007,12 +1258,9 @@ impl ProcessRuntime {
         }
 
         let input = Json::Object(
-            evaluate_process_values(
-                &state.input,
-                &process_value_context(&self.source_name, &snapshot),
-            )?
-            .into_iter()
-            .collect(),
+            evaluate_process_values(&state.input, &context)?
+                .into_iter()
+                .collect(),
         );
         dependency
             .spec
@@ -1025,13 +1273,308 @@ impl ProcessRuntime {
             .as_deref()
             .map(|field| super::activity::process_serialization_key_hash(&input, field))
             .transpose()?;
-        Ok(PreparedTransition::Request(PreparedRequestTransition {
-            snapshot,
-            state,
+        Ok(PreparedActivityInput {
             input,
             request_fingerprint,
             serialization_key_hash,
-        }))
+        })
+    }
+
+    fn prepare_fanout_expansion(
+        &self,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessForEachState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let input = match evaluate_process_value(
+            &state.input,
+            &process_value_context(&self.source_name, &snapshot),
+        ) {
+            Ok(input) => input,
+            Err(_) => {
+                return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                    snapshot,
+                    code: "fanout_input_invalid",
+                    message: "the bounded fan-out input could not be evaluated",
+                }));
+            }
+        };
+        let Some(values) = input.as_array() else {
+            return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                snapshot,
+                code: "fanout_input_not_list",
+                message: "the bounded fan-out input is not a list",
+            }));
+        };
+        if values.len() > state.max_items as usize {
+            return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                snapshot,
+                code: "fanout_max_items_exceeded",
+                message: "the bounded fan-out input exceeded max_items",
+            }));
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut items = Vec::with_capacity(values.len());
+        for (ordinal, item) in values.iter().enumerate() {
+            let Some(object) = item.as_object() else {
+                return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                    snapshot,
+                    code: "fanout_item_not_object",
+                    message: "a bounded fan-out item is not an object",
+                }));
+            };
+            let Some(raw_item_key) = object.get(&state.item_key) else {
+                return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                    snapshot,
+                    code: "fanout_item_key_missing",
+                    message: "a bounded fan-out item has no declared item_key",
+                }));
+            };
+            let Some(item_key) = canonical_fanout_item_key(raw_item_key) else {
+                return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                    snapshot,
+                    code: "fanout_item_key_invalid",
+                    message: "a bounded fan-out item_key is not a scalar",
+                }));
+            };
+            if !seen.insert(item_key.identity.clone()) {
+                return Ok(PreparedTransition::FanOutFailure(PreparedFanOutFailure {
+                    snapshot,
+                    code: "fanout_item_key_duplicate",
+                    message: "the bounded fan-out input contains a duplicate item_key",
+                }));
+            }
+            let request = match &state.activity {
+                CompiledProcessForEachActivity::Command(_) => None,
+                CompiledProcessForEachActivity::Request(request) => {
+                    let context = fanout_value_context(
+                        &self.source_name,
+                        &snapshot,
+                        item,
+                        &item_key.identity,
+                    );
+                    Some(self.prepare_activity_input(&snapshot, &definition, request, context)?)
+                }
+            };
+            items.push(PreparedFanOutItem {
+                ordinal: i32::try_from(ordinal)
+                    .expect("compiled fan-out maximum fits PostgreSQL integer"),
+                item_key: item_key.output,
+                item_key_identity: item_key.identity,
+                item: item.clone(),
+                request,
+            });
+        }
+
+        Ok(PreparedTransition::FanOutExpansion(
+            PreparedFanOutExpansion {
+                snapshot,
+                definition,
+                state,
+                items,
+            },
+        ))
+    }
+
+    async fn prepare_fanout_command_item(
+        &self,
+        client: &tokio_postgres::Client,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessForEachState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let CompiledProcessForEachActivity::Command(activity) = &state.activity else {
+            bail!(
+                "Process fan-out item event references request state `{}`",
+                snapshot.current_state
+            );
+        };
+        let ordinal = fanout_event_ordinal(&snapshot)?;
+        let item_key_identity = fanout_event_item_key_identity(&snapshot)?.to_owned();
+        let entry_event_id = fanout_event_entry_id(&snapshot)?;
+        if !fanout_event_matches_snapshot(&snapshot) {
+            bail!(
+                "Process fan-out item event `{}` differs from active state `{}`",
+                snapshot.event_id,
+                snapshot.current_state
+            );
+        }
+        let row = client
+            .query_opt(
+                "
+                SELECT item_key, item_json
+                FROM donat.process_fanout_items
+                WHERE source_name = $1
+                  AND instance_id = $2
+                  AND state_name = $3
+                  AND entry_event_id = $4
+                  AND ordinal = $5
+                  AND item_key_identity = $6
+                  AND status = 'scheduled'
+                  AND activity_job_id IS NULL
+                ",
+                &[
+                    &self.source_name,
+                    &snapshot.instance_id,
+                    &snapshot.current_state,
+                    &entry_event_id,
+                    &ordinal,
+                    &item_key_identity,
+                ],
+            )
+            .await
+            .context("reading scheduled Process command fan-out item")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process fan-out item event `{}` has no scheduled item",
+                    snapshot.event_id
+                )
+            })?;
+        let item: Json = row.get("item_json");
+        let item_key: String = row.get("item_key");
+        let command = self.prepare_command_mutation(
+            &snapshot,
+            &definition,
+            &activity.name,
+            &activity.role,
+            &activity.arguments,
+            fanout_value_context(&self.source_name, &snapshot, &item, &item_key_identity),
+        )?;
+        Ok(PreparedTransition::FanOutCommandItem(Box::new(
+            PreparedFanOutCommandItem {
+                snapshot,
+                definition,
+                state,
+                ordinal,
+                item_key,
+                item_key_identity,
+                item,
+                command,
+            },
+        )))
+    }
+
+    async fn prepare_fanout_request_completion(
+        &self,
+        client: &tokio_postgres::Client,
+        snapshot: TransitionSnapshot,
+        definition: Arc<CompiledProcessDefinition>,
+        state: CompiledProcessForEachState,
+    ) -> anyhow::Result<PreparedTransition> {
+        let CompiledProcessForEachActivity::Request(request) = &state.activity else {
+            bail!(
+                "Process activity completion references command fan-out state `{}`",
+                snapshot.current_state
+            );
+        };
+        let activity_job_id = snapshot
+            .event_payload
+            .get("activity_job_id")
+            .and_then(Json::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| anyhow!("Process fan-out activity event has no valid job ID"))?;
+        let row = client
+            .query_opt(
+                "
+                SELECT
+                    item.ordinal,
+                    item.item_key,
+                    item.item_key_identity,
+                    item.item_json,
+                    job.state_name,
+                    job.connector_instance,
+                    job.operation,
+                    job.status AS job_status,
+                    job.attempts,
+                    job.lease_generation,
+                    job.result_json,
+                    job.last_error_json
+                FROM donat.process_fanout_items item
+                JOIN donat.process_activity_jobs job
+                  ON job.source_name = item.source_name
+                 AND job.id = item.activity_job_id
+                 AND job.instance_id = item.instance_id
+                 AND job.state_name = item.state_name
+                WHERE item.source_name = $1
+                  AND item.instance_id = $2
+                  AND item.state_name = $3
+                  AND item.activity_job_id = $4
+                  AND item.status = 'scheduled'
+                ",
+                &[
+                    &self.source_name,
+                    &snapshot.instance_id,
+                    &snapshot.current_state,
+                    &activity_job_id,
+                ],
+            )
+            .await
+            .context("reading terminal Process request fan-out item")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Process fan-out activity event references no scheduled item `{activity_job_id}`"
+                )
+            })?;
+        let state_name: String = row.get("state_name");
+        let connector: String = row.get("connector_instance");
+        let operation: String = row.get("operation");
+        let job_status: String = row.get("job_status");
+        let attempt: i32 = row.get("attempts");
+        let lease_generation: i64 = row.get("lease_generation");
+        if state_name != snapshot.current_state
+            || connector != request.connector
+            || operation != request.operation.as_str()
+        {
+            bail!("Process fan-out activity event differs from its terminal job");
+        }
+
+        let result = if snapshot.event_kind == "activity_succeeded" {
+            let event_attempt = snapshot
+                .event_payload
+                .get("attempt")
+                .and_then(Json::as_i64)
+                .and_then(|value| i32::try_from(value).ok());
+            let event_generation = snapshot
+                .event_payload
+                .get("lease_generation")
+                .and_then(Json::as_i64);
+            if job_status != "succeeded"
+                || event_attempt != Some(attempt)
+                || event_generation != Some(lease_generation)
+            {
+                bail!("Process fan-out activity success event is not fenced to its terminal job");
+            }
+            Ok(row
+                .get::<_, Option<Json>>("result_json")
+                .ok_or_else(|| anyhow!("succeeded Process fan-out activity has no result"))?)
+        } else {
+            if job_status != "failed" {
+                bail!("Process fan-out activity failure event references a non-failed job");
+            }
+            let error = row
+                .get::<_, Option<Json>>("last_error_json")
+                .ok_or_else(|| anyhow!("failed Process fan-out activity has no safe error"))?;
+            if snapshot.event_payload.get("error") != Some(&error) {
+                bail!("Process fan-out activity failure event differs from the stored safe error");
+            }
+            Err(error)
+        };
+        Ok(PreparedTransition::FanOutRequestCompletion(
+            PreparedFanOutRequestCompletion {
+                snapshot,
+                definition,
+                state,
+                ordinal: row.get("ordinal"),
+                item_key: row.get("item_key"),
+                item_key_identity: row.get("item_key_identity"),
+                item: row.get("item_json"),
+                activity_job_id,
+                attempt,
+                lease_generation,
+                result,
+            },
+        ))
     }
 
     async fn prepare_request_success_transition(
@@ -1379,7 +1922,207 @@ fn process_value_context<'a>(
         caller_session: snapshot.caller_session.as_ref(),
         workflow_time: &snapshot.workflow_time,
         item: None,
+        item_key: None,
     }
+}
+
+fn fanout_value_context<'a>(
+    source_name: &'a str,
+    snapshot: &'a TransitionSnapshot,
+    item: &'a Json,
+    item_key_identity: &'a str,
+) -> ProcessValueContext<'a> {
+    ProcessValueContext {
+        source_name,
+        instance_id: snapshot.instance_id,
+        input: &snapshot.input,
+        state: &snapshot.state,
+        caller_session: snapshot.caller_session.as_ref(),
+        workflow_time: &snapshot.workflow_time,
+        item: Some(item),
+        item_key: Some(item_key_identity),
+    }
+}
+
+struct CanonicalFanOutItemKey {
+    identity: String,
+    output: String,
+}
+
+fn canonical_fanout_item_key(value: &Json) -> Option<CanonicalFanOutItemKey> {
+    let output = match value {
+        Json::String(value) => value.clone(),
+        Json::Number(value) => value.to_string(),
+        Json::Bool(value) => value.to_string(),
+        _ => return None,
+    };
+    Some(CanonicalFanOutItemKey {
+        identity: serde_json::to_string(value)
+            .expect("a scalar Process fan-out item key always serializes"),
+        output,
+    })
+}
+
+fn fanout_event_matches_snapshot(snapshot: &TransitionSnapshot) -> bool {
+    snapshot
+        .event_payload
+        .get("fanout_state")
+        .and_then(Json::as_str)
+        == Some(snapshot.current_state.as_str())
+        && snapshot
+            .event_payload
+            .get("fanout_version")
+            .and_then(Json::as_i64)
+            == Some(snapshot.version)
+}
+
+fn fanout_event_ordinal(snapshot: &TransitionSnapshot) -> anyhow::Result<i32> {
+    snapshot
+        .event_payload
+        .get("ordinal")
+        .and_then(Json::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| anyhow!("Process fan-out item event has no valid ordinal"))
+}
+
+fn fanout_event_item_key_identity(snapshot: &TransitionSnapshot) -> anyhow::Result<&str> {
+    snapshot
+        .event_payload
+        .get("item_key_identity")
+        .and_then(Json::as_str)
+        .ok_or_else(|| anyhow!("Process fan-out item event has no stable item identity"))
+}
+
+fn fanout_event_entry_id(snapshot: &TransitionSnapshot) -> anyhow::Result<Uuid> {
+    snapshot
+        .event_payload
+        .get("entry_event_id")
+        .and_then(Json::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| anyhow!("Process fan-out item event has no valid entry event ID"))
+}
+
+fn empty_fanout_output() -> Json {
+    json!({
+        "successful_items": [],
+        "failed_items": [],
+        "ordered_results": [],
+    })
+}
+
+fn fanout_logical_activity_id(snapshot: &TransitionSnapshot, item_key_identity: &str) -> String {
+    format!(
+        "fanout:v1:{}:{}:{}:{}",
+        snapshot.revision,
+        snapshot.instance_id,
+        snapshot.current_state,
+        canonical_json_sha256(&Json::String(item_key_identity.to_owned())),
+    )
+}
+
+fn fanout_item_uuid(domain: &[u8], snapshot: &TransitionSnapshot, item_key_identity: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(snapshot.revision.as_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.instance_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.current_state.as_bytes());
+    digest.update(b"\0");
+    digest.update(item_key_identity.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn merge_fanout_success_item(
+    item: &Json,
+    result: &Json,
+    preserve_input: bool,
+) -> anyhow::Result<Json> {
+    let result = result
+        .as_object()
+        .ok_or_else(|| anyhow!("Process fan-out activity result is not an object"))?;
+    if !preserve_input {
+        return Ok(Json::Object(result.clone()));
+    }
+    let mut merged = item
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("Process fan-out item is not an object"))?;
+    for (name, value) in result {
+        if merged.get(name).is_some_and(|existing| existing != value) {
+            bail!("Process fan-out result field `{name}` conflicts with preserved input");
+        }
+        merged.insert(name.clone(), value.clone());
+    }
+    Ok(Json::Object(merged))
+}
+
+fn fanout_failure_output(
+    item: &Json,
+    item_key: &str,
+    stage: &str,
+    code: &str,
+    safe_message: &str,
+    requires_reconciliation: bool,
+    activity_key: &str,
+) -> anyhow::Result<Json> {
+    let mut output = item
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("Process fan-out failure item is not an object"))?;
+    output.insert("item_key".to_owned(), Json::String(item_key.to_owned()));
+    output.insert("stage".to_owned(), Json::String(stage.to_owned()));
+    output.insert("code".to_owned(), Json::String(code.to_owned()));
+    output.insert(
+        "safe_message".to_owned(),
+        Json::String(safe_message.to_owned()),
+    );
+    output.insert(
+        "requires_reconciliation".to_owned(),
+        Json::Bool(requires_reconciliation),
+    );
+    output.insert(
+        "activity_key".to_owned(),
+        Json::String(activity_key.to_owned()),
+    );
+    Ok(Json::Object(output))
+}
+
+fn fanout_request_error_route(
+    request: &CompiledProcessRequestState,
+    error_kind: &str,
+    default: &str,
+) -> String {
+    let Some(routes) = request.on_error.as_ref() else {
+        return default.to_owned();
+    };
+    routes
+        .routes
+        .iter()
+        .find(|route| {
+            route
+                .kinds
+                .iter()
+                .any(|kind| process_error_kind_name(kind) == error_kind)
+        })
+        .map(|route| route.next.clone())
+        .unwrap_or_else(|| routes.fallback.next.clone())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn prepare_signal_deadline(
@@ -1491,10 +2234,10 @@ fn validate_state_output(
 
 fn process_command_session(
     definition: &CompiledProcessDefinition,
-    state: &CompiledProcessCommandState,
+    role: &CompiledProcessCommandRole,
     snapshot: &TransitionSnapshot,
 ) -> anyhow::Result<Session> {
-    match &state.role {
+    match role {
         CompiledProcessCommandRole::Fixed { role } => Ok(Session {
             role: role.clone(),
             vars: HashMap::new(),
@@ -1571,6 +2314,7 @@ async fn lock_prepared_snapshot(
                   'continue',
                   'signal',
                   'timer',
+                  'fanout_item',
                   'activity_succeeded',
                   'activity_failed',
                   'retry_exhausted'
@@ -2069,6 +2813,929 @@ async fn commit_request_failure(
     .await
 }
 
+async fn commit_fanout_expansion(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedFanOutExpansion,
+) -> anyhow::Result<TransitionConsumption> {
+    if prepared.items.is_empty() {
+        let output = empty_fanout_output();
+        validate_state_output(&prepared.definition, &prepared.snapshot, &output)
+            .context("validating empty Process fan-out output")?;
+        advance_instance(
+            transaction,
+            source_name,
+            &prepared.snapshot,
+            &prepared.state.next,
+            &output,
+        )
+        .await?;
+        consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+        append_transition_log(
+            transaction,
+            source_name,
+            &prepared.snapshot,
+            &prepared.state.next,
+            "fanout_completed",
+            None,
+            json!({ "item_count": 0, "scheduled_count": 0 }),
+        )
+        .await?;
+        append_continue_event(
+            transaction,
+            source_name,
+            &prepared.snapshot,
+            next_version(&prepared.snapshot)?,
+        )
+        .await?;
+        return Ok(TransitionConsumption::Advanced {
+            instance_id: prepared.snapshot.instance_id,
+            event_id: prepared.snapshot.event_id,
+            from_state: prepared.snapshot.current_state.clone(),
+            to_state: prepared.state.next.clone(),
+        });
+    }
+
+    let version = next_version(&prepared.snapshot)?;
+    let scheduled_count = prepared
+        .items
+        .len()
+        .min(prepared.state.max_concurrency as usize);
+    match &prepared.state.activity {
+        CompiledProcessForEachActivity::Request(request) => {
+            insert_request_fanout_items(
+                transaction,
+                source_name,
+                prepared,
+                request,
+                scheduled_count,
+            )
+            .await?;
+        }
+        CompiledProcessForEachActivity::Command(_) => {
+            insert_command_fanout_items(
+                transaction,
+                source_name,
+                prepared,
+                version,
+                scheduled_count,
+            )
+            .await?;
+        }
+    }
+
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET version = $4,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $5
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.current_state,
+                &version,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("committing Process fan-out expansion version")?;
+    if updated != 1 {
+        bail!("locked Process fan-out state did not expand exactly once");
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    append_transition_log(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.snapshot.current_state,
+        "fanout_expanded",
+        None,
+        json!({
+            "item_count": prepared.items.len(),
+            "scheduled_count": scheduled_count,
+            "max_concurrency": prepared.state.max_concurrency,
+        }),
+    )
+    .await?;
+    Ok(TransitionConsumption::FanOutExpanded {
+        instance_id: prepared.snapshot.instance_id,
+        event_id: prepared.snapshot.event_id,
+        state: prepared.snapshot.current_state.clone(),
+        item_count: prepared.items.len(),
+        scheduled_count,
+    })
+}
+
+async fn insert_request_fanout_items(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedFanOutExpansion,
+    request: &CompiledProcessRequestState,
+    scheduled_count: usize,
+) -> anyhow::Result<()> {
+    let schedule_to_start_ms = i64::try_from(request.schedule_to_start_ms)
+        .context("fan-out schedule_to_start exceeds PostgreSQL interval input")?;
+    let descriptors = Json::Array(
+        prepared
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let request = item
+                    .request
+                    .as_ref()
+                    .expect("request fan-out item has a prepared activity input");
+                let job_id = fanout_item_uuid(
+                    b"donat.process.fanout-job.v1\0",
+                    &prepared.snapshot,
+                    &item.item_key_identity,
+                );
+                json!({
+                    "job_id": job_id.to_string(),
+                    "ordinal": item.ordinal,
+                    "item_key": item.item_key,
+                    "item_key_identity": item.item_key_identity,
+                    "item": item.item,
+                    "input": request.input,
+                    "request_fingerprint": request.request_fingerprint,
+                    "serialization_key_hash": request
+                        .serialization_key_hash
+                        .as_deref()
+                        .map(lower_hex),
+                    "logical_activity_id": fanout_logical_activity_id(
+                        &prepared.snapshot,
+                        &item.item_key_identity,
+                    ),
+                    "active": index < scheduled_count,
+                })
+            })
+            .collect(),
+    );
+    let operation = request.operation.as_str();
+    let rows = transaction
+        .query(
+            "
+            WITH fanout_clock AS (
+                SELECT statement_timestamp() AS at
+            ),
+            descriptors AS (
+                SELECT *
+                FROM jsonb_to_recordset($8::jsonb) AS item(
+                    job_id uuid,
+                    ordinal integer,
+                    item_key text,
+                    item_key_identity text,
+                    item jsonb,
+                    input jsonb,
+                    request_fingerprint text,
+                    serialization_key_hash text,
+                    logical_activity_id text,
+                    active boolean
+                )
+            ),
+            inserted_jobs AS (
+                INSERT INTO donat.process_activity_jobs (
+                    source_name,
+                    id,
+                    instance_id,
+                    enqueued_from_event_id,
+                    state_name,
+                    logical_activity_id,
+                    connector_instance,
+                    operation,
+                    serialization_key_hash,
+                    input_json,
+                    request_fingerprint,
+                    status,
+                    available_at,
+                    schedule_to_start_deadline,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    $1,
+                    descriptor.job_id,
+                    $2,
+                    $3,
+                    $4,
+                    descriptor.logical_activity_id,
+                    $5,
+                    $6,
+                    CASE
+                        WHEN descriptor.serialization_key_hash IS NULL THEN NULL
+                        ELSE decode(descriptor.serialization_key_hash, 'hex')
+                    END,
+                    descriptor.input,
+                    descriptor.request_fingerprint,
+                    'scheduled',
+                    CASE
+                        WHEN descriptor.active THEN fanout_clock.at
+                        ELSE 'infinity'::timestamptz
+                    END,
+                    CASE
+                        WHEN descriptor.active
+                            THEN fanout_clock.at
+                              + ($7::bigint * interval '1 millisecond')
+                        ELSE 'infinity'::timestamptz
+                    END,
+                    fanout_clock.at,
+                    fanout_clock.at
+                FROM descriptors descriptor
+                CROSS JOIN fanout_clock
+                RETURNING id
+            )
+            INSERT INTO donat.process_fanout_items (
+                source_name,
+                instance_id,
+                state_name,
+                entry_event_id,
+                ordinal,
+                item_key,
+                item_key_identity,
+                item_json,
+                status,
+                activity_job_id
+            )
+            SELECT
+                $1,
+                $2,
+                $4,
+                $3,
+                descriptor.ordinal,
+                descriptor.item_key,
+                descriptor.item_key_identity,
+                descriptor.item,
+                CASE WHEN descriptor.active THEN 'scheduled' ELSE 'pending' END,
+                descriptor.job_id
+            FROM descriptors descriptor
+            JOIN inserted_jobs job ON job.id = descriptor.job_id
+            RETURNING ordinal
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &prepared.snapshot.current_state,
+                &request.connector,
+                &operation,
+                &schedule_to_start_ms,
+                &descriptors,
+            ],
+        )
+        .await
+        .context("persisting bounded Process request fan-out")?;
+    if rows.len() != prepared.items.len() {
+        bail!("Process request fan-out did not persist every bounded item");
+    }
+    Ok(())
+}
+
+async fn insert_command_fanout_items(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedFanOutExpansion,
+    version: i64,
+    scheduled_count: usize,
+) -> anyhow::Result<()> {
+    let descriptors = Json::Array(
+        prepared
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let active = index < scheduled_count;
+                json!({
+                    "ordinal": item.ordinal,
+                    "item_key": item.item_key,
+                    "item_key_identity": item.item_key_identity,
+                    "item": item.item,
+                    "active": active,
+                    "payload": active.then(|| json!({
+                        "fanout_state": prepared.snapshot.current_state,
+                        "fanout_version": version,
+                        "entry_event_id": prepared.snapshot.event_id.to_string(),
+                        "ordinal": item.ordinal,
+                        "item_key_identity": item.item_key_identity,
+                    })),
+                    "idempotency_key": active.then(|| format!(
+                        "fanout-item:{}:{}:{}:{}",
+                        prepared.snapshot.instance_id,
+                        prepared.snapshot.current_state,
+                        version,
+                        canonical_json_sha256(&Json::String(item.item_key_identity.clone())),
+                    )),
+                })
+            })
+            .collect(),
+    );
+    let rows = transaction
+        .query(
+            "
+            WITH descriptors AS (
+                SELECT *
+                FROM jsonb_to_recordset($7::jsonb) AS item(
+                    ordinal integer,
+                    item_key text,
+                    item_key_identity text,
+                    item jsonb,
+                    active boolean,
+                    payload jsonb,
+                    idempotency_key text
+                )
+            ),
+            inserted_items AS (
+                INSERT INTO donat.process_fanout_items (
+                    source_name,
+                    instance_id,
+                    state_name,
+                    entry_event_id,
+                    ordinal,
+                    item_key,
+                    item_key_identity,
+                    item_json,
+                    status
+                )
+                SELECT
+                    $1,
+                    $2,
+                    $5,
+                    $3,
+                    descriptor.ordinal,
+                    descriptor.item_key,
+                    descriptor.item_key_identity,
+                    descriptor.item,
+                    CASE WHEN descriptor.active THEN 'scheduled' ELSE 'pending' END
+                FROM descriptors descriptor
+                RETURNING ordinal
+            ),
+            inserted_events AS (
+                INSERT INTO donat.process_events (
+                    source_name,
+                    instance_id,
+                    process_name,
+                    revision,
+                    kind,
+                    payload_json,
+                    idempotency_key,
+                    status
+                )
+                SELECT
+                    $1,
+                    $2,
+                    $4,
+                    $6,
+                    'fanout_item',
+                    descriptor.payload,
+                    descriptor.idempotency_key,
+                    'pending'
+                FROM descriptors descriptor
+                WHERE descriptor.active
+                RETURNING id
+            )
+            SELECT ordinal
+            FROM inserted_items
+            ORDER BY ordinal
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.event_id,
+                &prepared.snapshot.process_name,
+                &prepared.snapshot.current_state,
+                &prepared.snapshot.revision,
+                &descriptors,
+            ],
+        )
+        .await
+        .context("persisting bounded Process command fan-out")?;
+    if rows.len() != prepared.items.len() {
+        bail!("Process command fan-out did not persist every bounded item");
+    }
+    Ok(())
+}
+
+async fn commit_fanout_failure(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedFanOutFailure,
+) -> anyhow::Result<()> {
+    let version = next_version(&prepared.snapshot)?;
+    let failure = json!({
+        "kind": "process_failed",
+        "code": prepared.code,
+        "message": prepared.message,
+    });
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET status = 'failed',
+                failure_json = $4,
+                version = $5,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $3
+              AND version = $6
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &prepared.snapshot.current_state,
+                &failure,
+                &version,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("failing invalid bounded Process fan-out")?;
+    if updated != 1 {
+        bail!("locked invalid Process fan-out did not fail exactly once");
+    }
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    append_transition_log(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.snapshot.current_state,
+        "fanout_invalid",
+        None,
+        json!({ "code": prepared.code }),
+    )
+    .await
+}
+
+async fn commit_fanout_request_completion(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedFanOutRequestCompletion,
+) -> anyhow::Result<TransitionConsumption> {
+    let request = match &prepared.state.activity {
+        CompiledProcessForEachActivity::Request(request) => request.as_ref(),
+        CompiledProcessForEachActivity::Command(_) => {
+            bail!("prepared request fan-out completion retained a command activity")
+        }
+    };
+    let outcome = match &prepared.result {
+        Ok(result) => {
+            if merge_fanout_success_item(&prepared.item, result, prepared.state.preserve_input)
+                .is_err()
+            {
+                Err(FanOutItemFailure {
+                    output: fanout_failure_output(
+                        &prepared.item,
+                        &prepared.item_key,
+                        "request",
+                        "fanout_result_conflict",
+                        "the fan-out result conflicted with preserved input",
+                        true,
+                        &fanout_logical_activity_id(
+                            &prepared.snapshot,
+                            &prepared.item_key_identity,
+                        ),
+                    )?,
+                    route: fanout_request_error_route(request, "invariant", &prepared.state.next),
+                    error_kind: "invariant".to_owned(),
+                })
+            } else {
+                Ok(result.clone())
+            }
+        }
+        Err(error) => {
+            let error_kind = if prepared.snapshot.event_kind == "retry_exhausted" {
+                "retry_exhausted"
+            } else {
+                error
+                    .get("class")
+                    .and_then(Json::as_str)
+                    .unwrap_or("invariant")
+            };
+            let code = error
+                .get("code")
+                .and_then(Json::as_str)
+                .unwrap_or("activity_failed");
+            let safe_message = error
+                .get("safe_message")
+                .and_then(Json::as_str)
+                .unwrap_or("the connector activity failed");
+            Err(FanOutItemFailure {
+                output: fanout_failure_output(
+                    &prepared.item,
+                    &prepared.item_key,
+                    "request",
+                    code,
+                    safe_message,
+                    true,
+                    &fanout_logical_activity_id(&prepared.snapshot, &prepared.item_key_identity),
+                )?,
+                route: fanout_request_error_route(request, error_kind, &prepared.state.next),
+                error_kind: error_kind.to_owned(),
+            })
+        }
+    };
+    commit_fanout_item_completion(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.definition,
+        &prepared.state,
+        prepared.ordinal,
+        &prepared.item_key,
+        &prepared.item_key_identity,
+        outcome,
+        Some((
+            prepared.activity_job_id,
+            prepared.attempt,
+            prepared.lease_generation,
+        )),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_fanout_item_completion(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+    definition: &CompiledProcessDefinition,
+    state: &CompiledProcessForEachState,
+    ordinal: i32,
+    item_key: &str,
+    item_key_identity: &str,
+    outcome: Result<Json, FanOutItemFailure>,
+    activity: Option<(Uuid, i32, i64)>,
+) -> anyhow::Result<TransitionConsumption> {
+    let (status, result, failure, route, error_kind) = match &outcome {
+        Ok(result) => ("succeeded", Some(result), None, None, None),
+        Err(failure) => (
+            "failed",
+            None,
+            Some(json!({
+                "output": failure.output,
+                "route": failure.route,
+                "error_kind": failure.error_kind,
+            })),
+            Some(failure.route.as_str()),
+            Some(failure.error_kind.as_str()),
+        ),
+    };
+    let activity_job_id = activity.map(|value| value.0);
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_fanout_items
+            SET status = $7,
+                result_json = $8,
+                failure_json = $9,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND instance_id = $2
+              AND state_name = $3
+              AND ordinal = $4
+              AND item_key = $5
+              AND item_key_identity = $6
+              AND status = 'scheduled'
+              AND activity_job_id IS NOT DISTINCT FROM $10
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.current_state,
+                &ordinal,
+                &item_key,
+                &item_key_identity,
+                &status,
+                &result,
+                &failure,
+                &activity_job_id,
+            ],
+        )
+        .await
+        .context("committing terminal Process fan-out item")?;
+    if updated != 1 {
+        bail!("locked Process fan-out item did not complete exactly once");
+    }
+    consume_event(transaction, source_name, snapshot.event_id).await?;
+    let activated_next =
+        activate_next_fanout_item(transaction, source_name, snapshot, state).await?;
+    let unfinished: i64 = transaction
+        .query_one(
+            "
+            SELECT count(*)
+            FROM donat.process_fanout_items
+            WHERE source_name = $1
+              AND instance_id = $2
+              AND state_name = $3
+              AND status IN ('pending', 'scheduled')
+            ",
+            &[&source_name, &snapshot.instance_id, &snapshot.current_state],
+        )
+        .await
+        .context("counting unfinished Process fan-out items")?
+        .get(0);
+    if unfinished > 0 {
+        append_fanout_transition_log(
+            transaction,
+            source_name,
+            snapshot,
+            &snapshot.current_state,
+            if outcome.is_ok() {
+                "fanout_item_succeeded"
+            } else {
+                "fanout_item_failed"
+            },
+            match &outcome {
+                Ok(result)
+                    if matches!(&state.activity, CompiledProcessForEachActivity::Command(_)) =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            },
+            activity,
+            json!({
+                "ordinal": ordinal,
+                "item_key": item_key,
+                "activated_next": activated_next,
+                "activity_job_id": activity_job_id.map(|id| id.to_string()),
+                "route": route,
+                "error_kind": error_kind,
+            }),
+        )
+        .await?;
+        return Ok(TransitionConsumption::FanOutItemCompleted {
+            instance_id: snapshot.instance_id,
+            event_id: snapshot.event_id,
+            state: snapshot.current_state.clone(),
+            ordinal,
+        });
+    }
+
+    let rows = transaction
+        .query(
+            "
+            SELECT item_json, status, result_json, failure_json
+            FROM donat.process_fanout_items
+            WHERE source_name = $1
+              AND instance_id = $2
+              AND state_name = $3
+            ORDER BY ordinal
+            ",
+            &[&source_name, &snapshot.instance_id, &snapshot.current_state],
+        )
+        .await
+        .context("collecting terminal Process fan-out items")?;
+    let mut successful_items = Vec::new();
+    let mut failed_items = Vec::new();
+    let mut ordered_results = Vec::new();
+    let mut next = state.next.clone();
+    let mut failure_route_selected = false;
+    for row in rows {
+        let stored_item: Json = row.get("item_json");
+        let stored_status: String = row.get("status");
+        match stored_status.as_str() {
+            "succeeded" => {
+                let result = row
+                    .get::<_, Option<Json>>("result_json")
+                    .ok_or_else(|| anyhow!("successful Process fan-out item has no result"))?;
+                successful_items.push(merge_fanout_success_item(
+                    &stored_item,
+                    &result,
+                    state.preserve_input,
+                )?);
+                ordered_results.push(result);
+            }
+            "failed" => {
+                let failure = row
+                    .get::<_, Option<Json>>("failure_json")
+                    .ok_or_else(|| anyhow!("failed Process fan-out item has no safe failure"))?;
+                failed_items.push(
+                    failure
+                        .get("output")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("fan-out failure has no output"))?,
+                );
+                if !failure_route_selected
+                    && let Some(route) = failure.get("route").and_then(Json::as_str)
+                {
+                    next = route.to_owned();
+                    failure_route_selected = true;
+                }
+            }
+            other => bail!("terminal Process fan-out retained unfinished item `{other}`"),
+        }
+    }
+    let output = json!({
+        "successful_items": successful_items,
+        "failed_items": failed_items,
+        "ordered_results": ordered_results,
+    });
+    validate_state_output(definition, snapshot, &output)
+        .context("validating collected Process fan-out output")?;
+    advance_instance(transaction, source_name, snapshot, &next, &output).await?;
+    append_fanout_transition_log(
+        transaction,
+        source_name,
+        snapshot,
+        &next,
+        "fanout_completed",
+        match &outcome {
+            Ok(result) if matches!(&state.activity, CompiledProcessForEachActivity::Command(_)) => {
+                Some(result)
+            }
+            _ => None,
+        },
+        activity,
+        json!({
+            "item_count": successful_items.len() + failed_items.len(),
+            "successful_count": successful_items.len(),
+            "failed_count": failed_items.len(),
+            "final_ordinal": ordinal,
+            "activity_job_id": activity_job_id.map(|id| id.to_string()),
+            "route": next,
+        }),
+    )
+    .await?;
+    append_continue_event(transaction, source_name, snapshot, next_version(snapshot)?).await?;
+    Ok(TransitionConsumption::Advanced {
+        instance_id: snapshot.instance_id,
+        event_id: snapshot.event_id,
+        from_state: snapshot.current_state.clone(),
+        to_state: next,
+    })
+}
+
+async fn activate_next_fanout_item(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+    state: &CompiledProcessForEachState,
+) -> anyhow::Result<bool> {
+    match &state.activity {
+        CompiledProcessForEachActivity::Command(_) => {
+            activate_next_command_fanout_item(transaction, source_name, snapshot).await
+        }
+        CompiledProcessForEachActivity::Request(request) => {
+            activate_next_request_fanout_item(
+                transaction,
+                source_name,
+                snapshot,
+                request.schedule_to_start_ms,
+            )
+            .await
+        }
+    }
+}
+
+async fn activate_next_command_fanout_item(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+) -> anyhow::Result<bool> {
+    let row = transaction
+        .query_opt(
+            "
+            WITH next_item AS (
+                SELECT ordinal, item_key_identity, entry_event_id
+                FROM donat.process_fanout_items
+                WHERE source_name = $1
+                  AND instance_id = $2
+                  AND state_name = $3
+                  AND status = 'pending'
+                ORDER BY ordinal
+                FOR UPDATE
+                LIMIT 1
+            ),
+            activated AS (
+                UPDATE donat.process_fanout_items item
+                SET status = 'scheduled',
+                    updated_at = statement_timestamp()
+                FROM next_item
+                WHERE item.source_name = $1
+                  AND item.instance_id = $2
+                  AND item.state_name = $3
+                  AND item.ordinal = next_item.ordinal
+                RETURNING
+                    item.ordinal,
+                    item.item_key_identity,
+                    item.entry_event_id
+            )
+            INSERT INTO donat.process_events (
+                source_name,
+                instance_id,
+                process_name,
+                revision,
+                kind,
+                payload_json,
+                idempotency_key,
+                status
+            )
+            SELECT
+                $1,
+                $2,
+                $4,
+                $5,
+                'fanout_item',
+                jsonb_build_object(
+                    'fanout_state', $3::text,
+                    'fanout_version', $6::bigint,
+                    'entry_event_id', activated.entry_event_id::text,
+                    'ordinal', activated.ordinal,
+                    'item_key_identity', activated.item_key_identity
+                ),
+                'fanout-item:' || $2::text || ':' || $3::text || ':'
+                  || ($6::bigint)::text
+                  || ':' || activated.ordinal::text,
+                'pending'
+            FROM activated
+            RETURNING id
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.current_state,
+                &snapshot.process_name,
+                &snapshot.revision,
+                &snapshot.version,
+            ],
+        )
+        .await
+        .context("activating next Process command fan-out item")?;
+    Ok(row.is_some())
+}
+
+async fn activate_next_request_fanout_item(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+    schedule_to_start_ms: u64,
+) -> anyhow::Result<bool> {
+    let schedule_to_start_ms = i64::try_from(schedule_to_start_ms)
+        .context("fan-out schedule_to_start exceeds PostgreSQL interval input")?;
+    let row = transaction
+        .query_opt(
+            "
+            WITH fanout_clock AS (
+                SELECT statement_timestamp() AS at
+            ),
+            next_item AS (
+                SELECT item.ordinal, item.activity_job_id
+                FROM donat.process_fanout_items item
+                JOIN donat.process_activity_jobs job
+                  ON job.source_name = item.source_name
+                 AND job.id = item.activity_job_id
+                WHERE item.source_name = $1
+                  AND item.instance_id = $2
+                  AND item.state_name = $3
+                  AND item.status = 'pending'
+                  AND job.status = 'scheduled'
+                  AND job.available_at = 'infinity'::timestamptz
+                ORDER BY item.ordinal
+                FOR UPDATE OF item, job
+                LIMIT 1
+            ),
+            activated_item AS (
+                UPDATE donat.process_fanout_items item
+                SET status = 'scheduled',
+                    updated_at = fanout_clock.at
+                FROM next_item, fanout_clock
+                WHERE item.source_name = $1
+                  AND item.instance_id = $2
+                  AND item.state_name = $3
+                  AND item.ordinal = next_item.ordinal
+                RETURNING item.ordinal, item.activity_job_id
+            )
+            UPDATE donat.process_activity_jobs job
+            SET available_at = fanout_clock.at,
+                schedule_to_start_deadline =
+                    fanout_clock.at + ($4::bigint * interval '1 millisecond'),
+                updated_at = fanout_clock.at
+            FROM activated_item, fanout_clock
+            WHERE job.source_name = $1
+              AND job.id = activated_item.activity_job_id
+              AND job.status = 'scheduled'
+            RETURNING job.id
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.current_state,
+                &schedule_to_start_ms,
+            ],
+        )
+        .await
+        .context("activating next Process request fan-out item")?;
+    Ok(row.is_some())
+}
+
 async fn append_activity_scheduled_log(
     transaction: &Transaction<'_>,
     source_name: &str,
@@ -2479,6 +4146,59 @@ async fn append_transition_log(
         )
         .await
         .context("appending Process transition log")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_fanout_transition_log(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    snapshot: &TransitionSnapshot,
+    to_state: &str,
+    outcome: &str,
+    command_result: Option<&Json>,
+    activity: Option<(Uuid, i32, i64)>,
+    redacted_context: Json,
+) -> anyhow::Result<()> {
+    let (activity_job_id, activity_attempt, activity_lease_generation) = activity
+        .map(|(job_id, attempt, generation)| (Some(job_id), Some(attempt), Some(generation)))
+        .unwrap_or((None, None, None));
+    transaction
+        .execute(
+            "
+            INSERT INTO donat.process_transition_logs (
+                source_name,
+                instance_id,
+                event_id,
+                activity_job_id,
+                activity_attempt,
+                activity_lease_generation,
+                from_state,
+                to_state,
+                outcome,
+                definition_revision,
+                command_result_json,
+                redacted_context
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ",
+            &[
+                &source_name,
+                &snapshot.instance_id,
+                &snapshot.event_id,
+                &activity_job_id,
+                &activity_attempt,
+                &activity_lease_generation,
+                &snapshot.current_state,
+                &to_state,
+                &outcome,
+                &snapshot.revision,
+                &command_result,
+                &redacted_context,
+            ],
+        )
+        .await
+        .context("appending Process fan-out transition log")?;
     Ok(())
 }
 

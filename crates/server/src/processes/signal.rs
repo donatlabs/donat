@@ -342,6 +342,7 @@ impl ProcessRuntime {
                 caller_session: candidate.caller_session.as_ref(),
                 workflow_time: &candidate.workflow_time,
                 item: None,
+                item_key: None,
             };
             let expected = Json::Object(
                 evaluate_process_values(&wait.correlate, &context)?

@@ -324,6 +324,40 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     "Process activity scheduled"
                 );
             }
+            Ok(TransitionConsumption::FanOutExpanded {
+                instance_id,
+                event_id,
+                state,
+                item_count,
+                scheduled_count,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    state,
+                    item_count,
+                    scheduled_count,
+                    "Process bounded fan-out expanded"
+                );
+            }
+            Ok(TransitionConsumption::FanOutItemCompleted {
+                instance_id,
+                event_id,
+                state,
+                ordinal,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    state,
+                    ordinal,
+                    "Process bounded fan-out item completed"
+                );
+            }
             Ok(TransitionConsumption::WaitEntered {
                 instance_id,
                 event_id,

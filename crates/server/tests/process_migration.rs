@@ -194,6 +194,25 @@ fn expected_columns() -> BTreeMap<&'static str, &'static [&'static str]> {
             ],
         ),
         (
+            "process_fanout_items",
+            &[
+                "source_name",
+                "instance_id",
+                "state_name",
+                "entry_event_id",
+                "ordinal",
+                "item_key",
+                "item_key_identity",
+                "item_json",
+                "status",
+                "activity_job_id",
+                "result_json",
+                "failure_json",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+        (
             "process_transition_logs",
             &[
                 "source_name",

@@ -23,7 +23,10 @@ use crate::connectors::{
 };
 
 use super::start::typed_value;
-use super::{CompiledProcessRequestState, CompiledProcessStateOperation, ProcessRuntime};
+use super::{
+    CompiledProcessForEachActivity, CompiledProcessRequestState, CompiledProcessStateOperation,
+    ProcessRuntime,
+};
 
 /// The narrow side-effect boundary available to the Process activity worker.
 ///
@@ -326,18 +329,58 @@ impl ProcessRuntime {
         let compiled = definition.states.get(&state_name).ok_or_else(|| {
             anyhow!("Process activity `{activity_job_id}` references absent state `{state_name}`")
         })?;
-        let CompiledProcessStateOperation::Request(state) = &compiled.operation else {
-            bail!(
-                "Process activity `{activity_job_id}` references non-request state `{state_name}`"
-            );
+        let (state, fanout) = match &compiled.operation {
+            CompiledProcessStateOperation::Request(state) => (state.as_ref().clone(), false),
+            CompiledProcessStateOperation::ForEach(state) => match &state.activity {
+                CompiledProcessForEachActivity::Request(request) => {
+                    (request.as_ref().clone(), true)
+                }
+                CompiledProcessForEachActivity::Command(_) => {
+                    bail!(
+                        "Process activity `{activity_job_id}` references command fan-out state `{state_name}`"
+                    )
+                }
+            },
+            _ => {
+                bail!(
+                    "Process activity `{activity_job_id}` references non-request state `{state_name}`"
+                )
+            }
         };
-        let state = state.as_ref().clone();
         if current_state != state_name
             || state.connector != connector
             || state.operation.as_str() != operation
             || canonical_json_sha256(&input) != request_fingerprint
         {
             bail!("Process activity `{activity_job_id}` differs from its pinned request state");
+        }
+        if fanout
+            && transaction
+                .query_opt(
+                    "
+                    SELECT ordinal
+                    FROM donat.process_fanout_items
+                    WHERE source_name = $1
+                      AND instance_id = $2
+                      AND state_name = $3
+                      AND activity_job_id = $4
+                      AND status = 'scheduled'
+                    FOR UPDATE
+                    ",
+                    &[
+                        &self.source_name,
+                        &instance_id,
+                        &state_name,
+                        &activity_job_id,
+                    ],
+                )
+                .await
+                .context("validating claimed Process fan-out activity")?
+                .is_none()
+        {
+            bail!(
+                "Process activity `{activity_job_id}` has no active fan-out item in state `{state_name}`"
+            );
         }
         let dependency = definition
             .dependencies

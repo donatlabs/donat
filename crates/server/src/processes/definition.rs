@@ -287,7 +287,7 @@ pub enum CompiledProcessStateOperation {
     Request(Box<CompiledProcessRequestState>),
     When(CompiledProcessWhenState),
     Wait(Box<CompiledProcessWaitState>),
-    ForEach,
+    ForEach(Box<CompiledProcessForEachState>),
     Output(CompiledProcessOutputState),
     Fail(CompiledProcessFailState),
 }
@@ -298,6 +298,30 @@ pub struct CompiledProcessCommandState {
     pub role: CompiledProcessCommandRole,
     pub arguments: BTreeMap<String, ProcessValue>,
     pub next: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessForEachState {
+    pub input: ProcessValue,
+    pub item_key: String,
+    pub max_items: u32,
+    pub max_concurrency: u32,
+    pub preserve_input: bool,
+    pub next: String,
+    pub activity: CompiledProcessForEachActivity,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledProcessForEachActivity {
+    Command(CompiledProcessCommandActivity),
+    Request(Box<CompiledProcessRequestState>),
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledProcessCommandActivity {
+    pub name: String,
+    pub role: CompiledProcessCommandRole,
+    pub arguments: BTreeMap<String, ProcessValue>,
 }
 
 #[derive(Clone)]
@@ -1598,8 +1622,13 @@ fn compile_state(
             )
         }
         ProcessStateOperation::ForEach { for_each } => {
-            let (output, horizons) = compile_for_each_state(for_each, &state.id, context)?;
-            (output, horizons, CompiledProcessStateOperation::ForEach)
+            let (output, horizons, compiled) =
+                compile_for_each_state(for_each, &state.id, context)?;
+            (
+                output,
+                horizons,
+                CompiledProcessStateOperation::ForEach(Box::new(compiled)),
+            )
         }
         ProcessStateOperation::Output { output } => {
             validate_binding_map(
@@ -2628,34 +2657,45 @@ fn compile_for_each_state(
     for_each: &ProcessForEachState,
     state_id: &str,
     context: &mut CompileContext<'_, '_>,
-) -> Result<(ValueContractCatalog, BTreeMap<String, u64>), PlanError> {
-    let (input, item_key, max_items, max_concurrency, completion, preserve_input) = match for_each {
-        ProcessForEachState::Command {
-            input,
-            item_key,
-            max_items,
-            max_concurrency,
-            completion,
-            preserve_input,
-            ..
-        }
-        | ProcessForEachState::Request {
-            input,
-            item_key,
-            max_items,
-            max_concurrency,
-            completion,
-            preserve_input,
-            ..
-        } => (
-            input,
-            item_key,
-            *max_items,
-            *max_concurrency,
-            completion,
-            *preserve_input,
-        ),
-    };
+) -> Result<
+    (
+        ValueContractCatalog,
+        BTreeMap<String, u64>,
+        CompiledProcessForEachState,
+    ),
+    PlanError,
+> {
+    let (input, item_key, max_items, max_concurrency, completion, preserve_input, next) =
+        match for_each {
+            ProcessForEachState::Command {
+                input,
+                item_key,
+                max_items,
+                max_concurrency,
+                completion,
+                preserve_input,
+                next,
+                ..
+            }
+            | ProcessForEachState::Request {
+                input,
+                item_key,
+                max_items,
+                max_concurrency,
+                completion,
+                preserve_input,
+                next,
+                ..
+            } => (
+                input,
+                item_key,
+                *max_items,
+                *max_concurrency,
+                completion,
+                *preserve_input,
+                next,
+            ),
+        };
     let path = format!("{}.for_each", context.path);
     if max_items == 0 || max_items > 256 {
         return Err(validation(
@@ -2706,7 +2746,7 @@ fn compile_for_each_state(
     }
 
     let previous_item = context.item.replace(item_type.clone());
-    let activity = match for_each {
+    let (activity_result, horizons, activity) = match for_each {
         ProcessForEachState::Command { command, .. } => {
             let descriptor = compile_command_activity(
                 &command.name,
@@ -2715,18 +2755,39 @@ fn compile_for_each_state(
                 context,
                 &format!("{path}.command"),
             )?;
-            (descriptor.result, BTreeMap::new())
+            let role = compile_command_role(
+                context.process,
+                &descriptor,
+                &command.run_as,
+                &format!("{path}.command.run_as"),
+            )?;
+            (
+                descriptor.result,
+                BTreeMap::new(),
+                CompiledProcessForEachActivity::Command(CompiledProcessCommandActivity {
+                    name: command.name.clone(),
+                    role,
+                    arguments: command.arguments.clone(),
+                }),
+            )
         }
-        ProcessForEachState::Request { request, .. } => compile_request_activity(
-            request,
-            state_id,
-            item_key,
-            context,
-            &format!("{path}.request"),
-        )?,
+        ProcessForEachState::Request { request, next, .. } => {
+            let (output, horizons, request) = compile_request_activity(
+                request,
+                state_id,
+                item_key,
+                next,
+                context,
+                &format!("{path}.request"),
+            )?;
+            (
+                output,
+                horizons,
+                CompiledProcessForEachActivity::Request(Box::new(request)),
+            )
+        }
     };
     context.item = previous_item;
-    let (activity_result, horizons) = activity;
 
     let activity_result_object = catalog_root_object(&activity_result);
     let successful_item = if preserve_input {
@@ -2735,25 +2796,35 @@ fn compile_for_each_state(
         activity_result_object.clone()
     };
     let failure = failure_item_type(&item_type, item_key);
+    let output = ValueContractCatalog {
+        roots: BTreeMap::from([
+            (
+                "successful_items".to_owned(),
+                required_field(list_type(successful_item)),
+            ),
+            (
+                "failed_items".to_owned(),
+                required_field(list_type(failure)),
+            ),
+            (
+                "ordered_results".to_owned(),
+                required_field(list_type(activity_result_object)),
+            ),
+        ]),
+        named_objects: BTreeMap::new(),
+    };
     Ok((
-        ValueContractCatalog {
-            roots: BTreeMap::from([
-                (
-                    "successful_items".to_owned(),
-                    required_field(list_type(successful_item)),
-                ),
-                (
-                    "failed_items".to_owned(),
-                    required_field(list_type(failure)),
-                ),
-                (
-                    "ordered_results".to_owned(),
-                    required_field(list_type(activity_result_object)),
-                ),
-            ]),
-            named_objects: BTreeMap::new(),
-        },
+        output,
         horizons,
+        CompiledProcessForEachState {
+            input: input.clone(),
+            item_key: item_key.clone(),
+            max_items,
+            max_concurrency,
+            preserve_input,
+            next: next.clone(),
+            activity,
+        },
     ))
 }
 
@@ -2761,10 +2832,18 @@ fn compile_request_activity(
     request: &ProcessRequestActivity,
     state_id: &str,
     item_key: &str,
+    next: &str,
     context: &mut CompileContext<'_, '_>,
     path: &str,
-) -> Result<(ValueContractCatalog, BTreeMap<String, u64>), PlanError> {
-    let (output, horizons, _) = compile_request(
+) -> Result<
+    (
+        ValueContractCatalog,
+        BTreeMap<String, u64>,
+        CompiledProcessRequestState,
+    ),
+    PlanError,
+> {
+    let (output, horizons, compiled) = compile_request(
         &request.connector,
         &request.operation,
         &request.input,
@@ -2777,7 +2856,23 @@ fn compile_request_activity(
         context,
         path,
     )?;
-    Ok((output, horizons))
+    Ok((
+        output,
+        horizons,
+        CompiledProcessRequestState {
+            connector: compiled.connector,
+            operation: compiled.operation,
+            input: compiled.input,
+            provider_idempotent: compiled.provider_idempotent,
+            schedule_to_start_ms: compiled.schedule_to_start_ms,
+            start_to_close_ms: compiled.start_to_close_ms,
+            retry: compiled.retry,
+            initial_retry_interval_ms: compiled.initial_retry_interval_ms,
+            maximum_retry_interval_ms: compiled.maximum_retry_interval_ms,
+            next: next.to_owned(),
+            on_error: compiled.on_error,
+        },
+    ))
 }
 
 fn failure_item_type(item: &TypeRef, _item_key: &str) -> TypeRef {

@@ -17,6 +17,9 @@ pub(crate) struct ProcessValueContext<'a> {
     /// Database-owned time pinned by the event that made this state due.
     pub workflow_time: &'a Json,
     pub item: Option<&'a Json>,
+    /// Canonical scalar identity for one bounded fan-out item. It is part of
+    /// every activity key evaluated inside that item.
+    pub item_key: Option<&'a str>,
 }
 
 pub(crate) fn evaluate_process_values(
@@ -73,9 +76,12 @@ pub(crate) fn evaluate_process_value(
             object_field(item_value, item, "for_each item")
         }
         ProcessValue::Literal { literal } => Ok(literal.clone()),
-        ProcessValue::ActivityKey { activity_key, as_ } => {
-            Ok(activity_key_value(context, activity_key, as_.as_deref()))
-        }
+        ProcessValue::ActivityKey { activity_key, as_ } => Ok(activity_key_value(
+            context,
+            activity_key,
+            as_.as_deref(),
+            true,
+        )),
         ProcessValue::ActivityKeyForState {
             activity_key_for_state,
             as_,
@@ -83,6 +89,7 @@ pub(crate) fn evaluate_process_value(
             context,
             activity_key_for_state,
             as_.as_deref(),
+            false,
         )),
         ProcessValue::Run { .. } => Ok(Json::String(context.instance_id.to_string())),
         ProcessValue::WorkflowTime { .. } => Ok(context.workflow_time.clone()),
@@ -164,7 +171,12 @@ fn project_list(value: &Json, fields: &[String]) -> anyhow::Result<Json> {
         .map(Json::Array)
 }
 
-fn activity_key_value(context: &ProcessValueContext<'_>, state: &str, cast: Option<&str>) -> Json {
+fn activity_key_value(
+    context: &ProcessValueContext<'_>,
+    state: &str,
+    cast: Option<&str>,
+    include_item: bool,
+) -> Json {
     let mut digest = Sha256::new();
     digest.update(b"donat.process.activity-key.v1\0");
     digest.update(context.source_name.as_bytes());
@@ -172,6 +184,10 @@ fn activity_key_value(context: &ProcessValueContext<'_>, state: &str, cast: Opti
     digest.update(context.instance_id.as_bytes());
     digest.update(b"\0");
     digest.update(state.as_bytes());
+    if include_item && let Some(item_key) = context.item_key {
+        digest.update(b"\0item\0");
+        digest.update(item_key.as_bytes());
+    }
     let digest = digest.finalize();
     if cast == Some("uuid") {
         let mut bytes = [0_u8; 16];

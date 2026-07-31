@@ -2018,6 +2018,40 @@ postpone, never accelerate, but a value beyond the declared upper bound
 terminates that retry path without another send. Exhaustion appends
 `retry_exhausted`. No retry is implicit or infinite.
 
+### 9.1 Bounded fan-out
+
+`for_each` is one finite state, not a loop or child-Process language. Its
+input must evaluate to a list of objects no longer than the compiled
+`max_items` (1–256). `item_key` resolves on every item to a non-null scalar;
+canonical JSON scalar identity is unique even when two display strings are
+equal across different scalar types. An invalid or duplicate runtime item set
+fails the Process before any body work is scheduled.
+
+V9 adds `process_fanout_items`. Entering a non-empty state persists every
+ordinal, item, typed key identity, and request descriptor in one source-local
+transaction, consumes the entry token, and increments the instance version
+without leaving the state. At most `max_concurrency` item tokens or due
+activity jobs exist at once. A terminal item atomically activates the next
+ordinal. Request items use the Section 9 activity worker unchanged; Command
+items use the Section 8 savepoint and a dedicated `fanout_item` journal token.
+Every logical activity and body-local `activity_key` includes the stable item
+identity.
+
+Item completion does not increment the instance version. The last item
+collects one output in original input order and advances exactly once:
+
+- `ordered_results` contains successful raw body results;
+- `successful_items` contains the same results, merged with the original item
+  only when `preserve_input: true`;
+- `failed_items` contains the original item plus `item_key`, `stage`, `code`,
+  `safe_message`, `requires_reconciliation`, and `activity_key`.
+
+A preserved field collision with a different result value is an invariant
+item failure, never a silent overwrite. `completion: collect` waits for every
+item even when errors occur. If request error routes differ, the first failed
+input ordinal chooses the transition after collection; all routes receive the
+same complete typed output.
+
 ## 10. Timers, command signals, and verified inbound delivery
 
 Timers are source-local journal events due by the owning Postgres clock.
@@ -2174,7 +2208,7 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_deployment_selects_one_real_source` | migrate integration | selected source alone is introspected/reconciled; omitted ambiguous source fails |
 | `metadata_free_migrate_preserves_refinery_only_mode` | CLI integration | explicit URL plus no metadata applies migrations without source selection or reconciliation |
 | `serve_with_readonly_role_issues_no_ddl` | state/Postgres | startup succeeds without schema-create privilege and SQL capture contains no DDL |
-| `process_v6_schema_is_exact` | migrate integration | every Section 7 column/key/index exists and no command-journal FK exists |
+| `process_v6_schema_is_exact` | migrate integration | every Section 7 plus V7–V9 column/key/index exists and no command-journal FK exists |
 | `process_sources_sharing_database_are_isolated` | Postgres integration | identical names, UUIDs, and semantic keys in two source namespaces do not collide |
 | `process_live_connector_rebind_is_rejected` | reconcile integration | active/live-retired source-A catalog spec prevents binding that instance to source B |
 | `process_retired_revision_reloads_and_is_available` | restart integration | fresh Engine hash-verifies and exposes non-terminal retired A without executing it |
@@ -2198,6 +2232,11 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_late_takeover_refuses_before_io` | two binaries/clock | final-attempt and `max_attempts: 1` takeover boundaries use the non-renewing deadline and zero provider calls after the permitted grace/window |
 | `process_activity_capacity_is_global` | two binaries | max/rate/serialization policies hold in one source |
 | `process_capacity_bucket_serializes_two_claimers` | two Postgres connections | a barrier race cannot oversubscribe the last slot/token or serialization key |
+| `request_fanout_is_durable_bounded_and_collects_partial_results_in_input_order` | Process/Postgres | every descriptor is durable, only `max_concurrency` items are due, partial failures are safe, and collection follows input order |
+| `command_fanout_uses_distinct_item_keys_and_survives_competing_workers` | Process/Postgres | command item tokens execute once under competing workers and body-local activity keys differ per canonical item identity |
+| `duplicate_fanout_item_keys_fail_closed_without_scheduling_work` | Process/Postgres | duplicate typed item identity fails the Process before any item or activity row is committed |
+| `fanout_input_above_declared_maximum_fails_before_expansion` | Process/Postgres | runtime cardinality above `max_items` fails before item work |
+| `empty_fanout_collects_empty_output_without_creating_item_work` | Process/Postgres | an empty finite input advances once with three empty result lists and no item/activity rows |
 | `process_timer_survives_restart` | controlled DB clock | timer fires once without in-memory state |
 | `process_inbound_audit_is_split` | webhook integration | accepted plus duplicate create two deliveries, one dedupe row, one transition |
 | `process_accepted_delivery_links_instance_history` | webhook/inspect integration | accepted row links source/instance/event and appears in that instance timeline |
@@ -2206,7 +2245,7 @@ a native conformance fixture. The focused identifiers are normative:
 | `process_verified_inbound_ack_matrix_is_exact` | webhook integration | every committed accepted/duplicate/unmatched/ambiguous/guard_false/unexpected_state outcome is empty 204; post-verification DB failure is empty 503 |
 | `process_signal_is_not_buffered` | command/webhook integration | early/late signal cannot advance a later wait |
 | `process_revision_runtime_abi_is_fenced` | rolling deployment | incompatible worker cannot claim pinned work |
-| `process_grammar_has_no_workflow_nodes_or_items` | metadata/runtime | the five state variants are closed; node/item/loop/subworkflow spellings reject |
+| `process_grammar_has_no_workflow_nodes_or_items` | metadata/runtime | the seven state variants are closed; node/loop/subworkflow spellings reject and item bindings remain confined to bounded `for_each` |
 | `connector_pagination_is_bounded_transport_only` | connector/runtime | pages stay inside one activity budget and cannot create process state, branch, retry, timer, command, or DB write |
 | `process_no_management_api` | route/schema test | no process management field or route is published |
 

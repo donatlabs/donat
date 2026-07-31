@@ -50,3 +50,5 @@ the deployed active/live-retired revisions with read-only catalog queries.
   event consumed by deterministic Process state transitions.
 - V8 adds the bounded JSONB containment index used to classify late signals
   against retained durable wait history.
+- V9 adds the finite Process fan-out item journal and its durable command-item
+  event kind; connector items continue to use the existing activity jobs.
