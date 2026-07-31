@@ -745,10 +745,17 @@ impl<'a> Planner<'a> {
                     None,
                     path,
                     error_path.to_owned(),
-                    assert
-                        .message
-                        .clone()
-                        .unwrap_or_else(|| "command assertion rejected".to_owned()),
+                    // Without a declared message, name the step and the rule
+                    // that rejected. Both are metadata identifiers the caller
+                    // may already read in the schema, and a bare "rejected"
+                    // leaves an operator with no way to tell which of a
+                    // command's assertions failed.
+                    assert.message.clone().unwrap_or_else(|| {
+                        format!(
+                            "command assertion `{}` rejected by rule `{}`",
+                            step.name, assert.rule
+                        )
+                    }),
                 )?;
                 Ok((
                     CommandExecutionStep::Assert {
@@ -1087,10 +1094,12 @@ impl<'a> Planner<'a> {
                     None,
                     path,
                     error_path.to_owned(),
-                    assert_when
-                        .message
-                        .clone()
-                        .unwrap_or_else(|| "conditional command assertion rejected".to_owned()),
+                    assert_when.message.clone().unwrap_or_else(|| {
+                        format!(
+                            "conditional command assertion `{}` rejected by rule `{}`",
+                            step.name, assert_when.rule
+                        )
+                    }),
                 )?;
                 Ok((
                     CommandExecutionStep::AssertWhen {
@@ -2532,7 +2541,7 @@ impl<'a> Planner<'a> {
             }
             MetadataCommandResultValue::Argument { arg } => Ok(CommandResultValue::Scalar {
                 value: command_argument(arguments, arg, path)?,
-                pg_type: command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
+                pg_type: command_argument_pg_type(command, arg, path)?.to_owned(),
             }),
             MetadataCommandResultValue::Literal { literal, .. } => {
                 let contract = command
@@ -2602,7 +2611,7 @@ impl<'a> Planner<'a> {
                     CommandIdempotencyScope::Argument { argument } => {
                         Ok(CommandExecutionValue::Scalar {
                             value: command_argument(arguments, argument, path)?,
-                            pg_type: command_argument_pg_type(definition, argument, path)?
+                            pg_type: command_argument_pg_type(command, argument, path)?
                                 .to_owned(),
                         })
                     }
@@ -4501,7 +4510,7 @@ fn resolved_value_column(
 ) -> Result<CommandColumn, PlanError> {
     let (pg_type, nullable) = match value {
         CommandValue::Argument { arg } => (
-            command_argument_pg_type(command.definition(), arg, path)?.to_owned(),
+            command_argument_pg_type(command, arg, path)?.to_owned(),
             command_argument_nullable(command.definition(), arg, path)?,
         ),
         CommandValue::Literal { literal, as_ } => (
@@ -4577,11 +4586,11 @@ fn command_argument_definition<'a>(
 }
 
 fn command_argument_pg_type<'a>(
-    command: &'a Command,
+    command: &'a CompiledCommand,
     name: &str,
     path: &str,
 ) -> Result<&'a str, PlanError> {
-    let type_ = command_argument_definition(command, name, path)?
+    let type_ = command_argument_definition(command.definition(), name, path)?
         .type_
         .trim_end_matches('!');
     if type_.starts_with('[') {
@@ -4598,7 +4607,14 @@ fn command_argument_pg_type<'a>(
         "timestamp" => "timestamp",
         "timestamptz" => "timestamptz",
         "json" | "jsonb" => "jsonb",
-        _ => "jsonb",
+        // A named metadata type decides its own representation. An enum value
+        // is a string everywhere else in the runtime, so rendering it as JSON
+        // would make `'accepted'::jsonb` — a value no argument of that type
+        // can ever take.
+        named => match command.rules().declared_type(named) {
+            Some(declared) => command_rule_pg_type(declared),
+            None => "jsonb",
+        },
     })
 }
 
@@ -4617,7 +4633,7 @@ fn resolve_effect_idempotency_key(
     let CommandIdempotencyKey::Argument { argument } = key;
     Ok(CommandExecutionValue::Scalar {
         value: command_argument(arguments, argument, path)?,
-        pg_type: command_argument_pg_type(command.definition(), argument, path)?.to_owned(),
+        pg_type: command_argument_pg_type(command, argument, path)?.to_owned(),
     })
 }
 
@@ -4673,12 +4689,8 @@ fn resolve_command_condition(
             Ok(CommandCondition::ArgumentEquals {
                 argument: command_argument(arguments, &argument_equals.argument, path)?,
                 expected: Scalar::Json(argument_equals.value.clone()),
-                pg_type: command_argument_pg_type(
-                    command.definition(),
-                    &argument_equals.argument,
-                    path,
-                )?
-                .to_owned(),
+                pg_type: command_argument_pg_type(command, &argument_equals.argument, path)?
+                    .to_owned(),
             })
         }
     }

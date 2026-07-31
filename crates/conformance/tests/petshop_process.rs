@@ -21,6 +21,8 @@ const AUTHORIZE_PATH: &str = "/v1/payment-authorizations";
 const VOID_PATH: &str = "/v1/payment-authorizations/*/voids";
 const LOOKUP_PATH: &str = "/v1/payment-operation-lookups";
 const LABEL_PATH: &str = "/v1/shipments/*/labels";
+const RETURN_LABEL_PATH: &str = "/v1/returns/*/labels";
+const REFUND_PATH: &str = "/v1/payment-authorizations/*/refunds";
 const CAPTURE_PATH: &str = "/v1/payment-authorizations/*/captures";
 
 fn petshop_root() -> PathBuf {
@@ -537,6 +539,83 @@ fn script_fulfilment_providers(stub: &ProviderStub) {
     );
 }
 
+/// Block until a Process wait is receptive.
+///
+/// Signals are never buffered, and a signal committed before its wait became
+/// receptive is deliberately auditable as `unexpected_state` rather than
+/// matched late. Entering a wait is its own transition: the instance reaches
+/// the state first, and the wait's timer event is inserted by the transition
+/// that consumes the entry token. A case that sends a signal must wait for
+/// that timer, not merely for the state name.
+fn await_receptive_wait(client: &mut postgres::Client, process: &str, state: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let receptive: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM donat.process_events event
+                     JOIN donat.process_instances instance
+                       ON instance.source_name = event.source_name
+                      AND instance.id = event.instance_id
+                     WHERE event.source_name = 'default'
+                       AND event.kind = 'timer'
+                       AND event.status = 'pending'
+                       AND event.payload_json ->> 'wait_state' = $2
+                       AND instance.process_name = $1
+                       AND instance.current_state = $2
+                 )",
+                &[&process, &state],
+            )
+            .expect("poll the durable Process instance")
+            .get(0);
+        if receptive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Process '{process}' never became receptive in '{state}': {}",
+            process_diagnostics(client)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Carry one seeded cart all the way to a captured payment: checkout, then the
+/// fulfilment module. Returns the order that a later module works on.
+fn checkout_and_fulfil(
+    suite: &donat_conformance::Running,
+    client: &mut postgres::Client,
+    request_prefix: &str,
+) -> String {
+    let cart_id = seed_cart(suite.db_url());
+    let (status, body) = start_checkout(suite, cart_id, &format!("{request_prefix}0"));
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    let checkout = await_terminal(client, "checkout_payment");
+    let order_id = checkout
+        .pointer("/order_id")
+        .and_then(Json::as_str)
+        .expect("checkout published its order")
+        .to_owned();
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_order_fulfilment(order_id: \"{order_id}\", destination_region: \"northeast\", allocation_request_id: \"{request_prefix}1\") {{ order_id }} }}"
+            )
+        }),
+        &[("X-Donat-Role".to_owned(), "fulfilment".to_owned())],
+    );
+    assert_eq!(status, 200, "start_order_fulfilment status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_order_fulfilment reported errors: {body}"
+    );
+    await_terminal(client, "partial_fulfilment");
+    order_id
+}
+
 /// Fulfilment allocates the authorized order, packs it, ships it through the
 /// carrier, and captures exactly the shipped value — the whole bounded fan-out
 /// driven from one entry-point Command.
@@ -610,6 +689,156 @@ fn fulfilment_allocates_ships_and_captures_the_shipped_value() {
     assert_eq!(
         captured, shipped_value,
         "capture takes exactly the shipped value, never the order total"
+    );
+}
+
+/// The whole return module: the shopper requests a return of a delivered line,
+/// support approves it, the carrier issues a return label, the warehouse
+/// receives and inspects it, and the provider refunds exactly the inspected
+/// amount. Three verified human signals drive one durable Process.
+#[test]
+fn a_returned_line_is_approved_received_inspected_and_refunded() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    script_fulfilment_providers(&stub);
+    stub.set_default(
+        RETURN_LABEL_PATH,
+        ScriptedResponse::ok(json!({
+            "provider_event_id": "evt_petshop_return_label_1",
+            "return_id": "$request:/return_key",
+            "tracking_number": "RETURN-TRACK-1",
+            "label_url": "https://carrier.example/returns/petshop-1.pdf",
+            "status": "created",
+            "normalized_payload": { "carrier": "mock", "label": true }
+        })),
+    );
+    stub.set_default(
+        REFUND_PATH,
+        ScriptedResponse::ok(json!({
+            "provider_event_id": "evt_petshop_refund_1",
+            "refund_id": "refund_petshop_1",
+            "provider_reference": "ref_petshop_1",
+            "status": "refunded",
+            "normalized_payload": { "gateway": "mock", "refunded": true }
+        })),
+    );
+    let suite = start_store(&stub, "petshop_return_refund");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    let order_id = checkout_and_fulfil(&suite, &mut client, "550e8400-e29b-41d4-a716-44665544096");
+
+    let (order_line_id, refund_amount_minor): (String, i64) = {
+        let row = client
+            .query_one(
+                "SELECT id::text, line_subtotal_minor::bigint FROM order_line WHERE order_id::text = $1",
+                &[&order_id],
+            )
+            .expect("the fulfilled order has one line to return");
+        (row.get(0), row.get(1))
+    };
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_return(order_id: \"{order_id}\", lines: [{{order_line_id: \"{order_line_id}\", requested_quantity: 1}}], reason: \"wrong size\", replacement_requested: false, request_id: \"550e8400-e29b-41d4-a716-446655440970\") {{ order_id }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "start_return status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "start_return reported errors: {body}"
+    );
+
+    await_receptive_wait(&mut client, "return_refund", "await_support_decision");
+    let (return_id, return_item_id): (String, String) = {
+        let row = client
+            .query_one(
+                "SELECT return_request.id::text, return_item.id::text
+                 FROM return_request
+                 JOIN return_item ON return_item.return_request_id = return_request.id",
+                &[],
+            )
+            .expect("the Process opened one return request with one item");
+        (row.get(0), row.get(1))
+    };
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ approve_return(return_id: \"{return_id}\", lines: [{{return_item_id: \"{return_item_id}\", approved_quantity: 1}}], decision_id: \"550e8400-e29b-41d4-a716-446655440971\", note: \"approved\") {{ return_id status }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "support".to_owned()),
+            ("X-Donat-User-Id".to_owned(), "support-1".to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "approve_return status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "approve_return reported errors: {body}"
+    );
+
+    await_receptive_wait(&mut client, "return_refund", "await_warehouse_receipt");
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ receive_return(return_id: \"{return_id}\", lines: [{{return_item_id: \"{return_item_id}\", received_quantity: 1}}], receipt_id: \"550e8400-e29b-41d4-a716-446655440972\", received_at: \"2030-01-02T00:00:00Z\") {{ return_id status }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "fulfilment".to_owned()),
+            ("X-Donat-User-Id".to_owned(), "warehouse-1".to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "receive_return status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "receive_return reported errors: {body}"
+    );
+
+    await_receptive_wait(&mut client, "return_refund", "await_inspection");
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ record_return_inspection(return_id: \"{return_id}\", lines: [{{return_item_id: \"{return_item_id}\", inspected_quantity: 1}}], inspection: accepted, refund_amount_minor: {refund_amount_minor}, inspection_id: \"550e8400-e29b-41d4-a716-446655440973\", note: \"as described\") {{ return_id status }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "fulfilment".to_owned()),
+            ("X-Donat-User-Id".to_owned(), "warehouse-1".to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "record_return_inspection status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "record_return_inspection reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "return_refund");
+    assert_eq!(
+        output.pointer("/status").and_then(Json::as_str),
+        Some("refunded"),
+        "the return Process refunds the inspected line: {output}"
+    );
+    assert_eq!(
+        output.pointer("/refund_amount_minor").and_then(Json::as_i64),
+        Some(refund_amount_minor),
+        "the refund is exactly the inspected amount, never the order total: {output}"
+    );
+    assert_eq!(
+        output.pointer("/tracking_number").and_then(Json::as_str),
+        Some("RETURN-TRACK-1"),
+        "the carrier return label is published to the shopper: {output}"
     );
 }
 
@@ -747,28 +976,7 @@ fn a_reviewer_approves_a_prescription_and_the_process_releases_the_line() {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    // Signals are never buffered, so the decision must reach an instance that
-    // has already entered its wait.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let state: Option<String> = client
-            .query_opt(
-                "SELECT current_state FROM donat.process_instances
-                 WHERE source_name = 'default' AND process_name = 'prescription_review'",
-                &[],
-            )
-            .expect("poll for the receptive wait")
-            .map(|row| row.get(0));
-        if state.as_deref() == Some("await_veterinary_decision") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the prescription Process never parked on its decision wait: {}",
-            process_diagnostics(&mut client)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    await_receptive_wait(&mut client, "prescription_review", "await_veterinary_decision");
 
     let (status, body) = suite.post(
         "/v1/graphql",

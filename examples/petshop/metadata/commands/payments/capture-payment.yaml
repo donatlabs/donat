@@ -25,7 +25,7 @@ steps:
       table: public.payment
       by:
         id: { arg: payment_id }
-      returning: [id, status, currency]
+      returning: [id, status, currency, captured_minor]
   - name: authorization
     select_one:
       table: public.payment_authorization
@@ -113,14 +113,25 @@ steps:
       returning:
         [id, shipment_id, amount_minor, status, provider_capture_id]
       require_affected: true
+  # The payment row is the money ledger every later module reads: refund
+  # eligibility and the refund bound are both computed from `captured_minor`
+  # here, not from the authorization. A capture that only credited the
+  # authorization would leave every refund unfundable.
   - name: mark_captured
     update:
       table: public.payment
       where:
         id: { step: payment, column: id }
+        captured_minor: { step: payment, column: captured_minor }
       set:
         status: { literal: captured }
-      returning: [id, status]
+        captured_minor:
+          rule: add_minor
+          with:
+            left: { step: payment, column: captured_minor }
+            right: { step: capture_claim, column: amount_minor }
+      returning: [id, status, captured_minor]
+      require_affected: true
 result:
   shipment_id: { arg: shipment_id }
   payment_id: { step: mark_captured, column: id }

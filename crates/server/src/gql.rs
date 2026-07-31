@@ -1832,6 +1832,16 @@ fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
     {
         return body;
     }
+    // The response stays opaque, but an operator still needs the cause. The
+    // log is the only place it may appear, so record it there rather than
+    // leaving a bare "command database error" with nothing behind it.
+    tracing::warn!(
+        sqlstate = db.code().code(),
+        detail = db.message(),
+        constraint = db.constraint().unwrap_or_default(),
+        table = db.table().unwrap_or_default(),
+        "command statement failed"
+    );
     error_json("data-exception", "command database error")
 }
 
