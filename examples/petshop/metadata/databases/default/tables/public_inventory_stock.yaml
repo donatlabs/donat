@@ -68,17 +68,18 @@ insert_permissions:
         - variant_id
         - on_hand
         - reserved
+command_update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - reserved
+      filter: {}
+      check: {}
 update_permissions:
   - role: staff
     permission:
       columns:
         - on_hand
-        - reserved
-      filter: {}
-      check: {}
-  - role: customer
-    permission:
-      columns:
         - reserved
       filter: {}
       check: {}

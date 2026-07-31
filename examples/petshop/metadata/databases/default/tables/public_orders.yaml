@@ -81,18 +81,19 @@ command_select_permissions:
       filter:
         customer_id:
           _eq: X-Donat-User-Id
-insert_permissions:
+command_insert_permissions:
   - role: customer
     permission:
       columns: "*"
       check:
         customer_id:
           _eq: X-Donat-User-Id
+insert_permissions:
   - role: subscription_worker
     permission:
       columns: "*"
       check: {}
-update_permissions:
+command_update_permissions:
   - role: customer
     permission:
       columns:
@@ -104,6 +105,7 @@ update_permissions:
       check:
         customer_id:
           _eq: X-Donat-User-Id
+update_permissions:
   - role: support
     permission:
       columns:

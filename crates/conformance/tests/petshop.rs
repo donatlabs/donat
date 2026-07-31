@@ -17,6 +17,7 @@ fn petshop_suite(name: &str) -> donat_conformance::Running {
     let metadata = donat_metadata::load_metadata_dir(&root.join("metadata")).unwrap();
     let running = Suite::new(name)
         .initial_metadata(metadata)
+        .with_migrations()
         .admin_secret("petshop-secret")
         .env("PETSHOP_PAYMENT_BASE_URL", "http://127.0.0.1:9")
         .env("PETSHOP_PAYMENT_API_TOKEN", "petshop-test-payment")
