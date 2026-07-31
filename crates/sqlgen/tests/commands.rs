@@ -352,10 +352,12 @@ fn postgres_client_at(pg_url: &str) -> Client {
 fn install_command_catalog(tx: &mut Transaction<'_>) {
     tx.query_one("SELECT pg_advisory_xact_lock(604630061)", &[])
         .expect("serialize command catalog migration in tests");
-    tx.batch_execute(include_str!("../../../migrations/V3__donat_commands.sql"))
-        .expect("command journal and structured rejection helper install");
     tx.batch_execute(include_str!(
-        "../../../migrations/V4__donat_command_claims.sql"
+        "../../../migrations/V20260728192113__donat_commands.sql"
+    ))
+    .expect("command journal and structured rejection helper install");
+    tx.batch_execute(include_str!(
+        "../../../migrations/V20260728202031__donat_command_claims.sql"
     ))
     .expect("command claim election catalog installs");
     let identity_columns: i64 = tx
@@ -372,7 +374,7 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
     match identity_columns {
         0 => tx
             .batch_execute(include_str!(
-                "../../../migrations/V5__qualify_command_identity.sql"
+                "../../../migrations/V20260729055155__qualify_command_identity.sql"
             ))
             .expect("source/role-qualified command identity installs"),
         2 => {}
@@ -391,7 +393,9 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
         .get(0);
     match invocation_columns {
         0 => tx
-            .batch_execute(include_str!("../../../migrations/V6__donat_processes.sql"))
+            .batch_execute(include_str!(
+                "../../../migrations/V20260731002214__donat_processes.sql"
+            ))
             .expect("command generation and process journal catalog installs"),
         1 => {}
         count => panic!("invalid invocation generation migration state: {count} columns"),
@@ -410,7 +414,7 @@ fn install_command_catalog(tx: &mut Transaction<'_>) {
     match caller_context_columns {
         0 => tx
             .batch_execute(include_str!(
-                "../../../migrations/V7__process_execution_context.sql"
+                "../../../migrations/V20260731023031__process_execution_context.sql"
             ))
             .expect("Process caller context and deterministic events install"),
         1 => {}
@@ -458,11 +462,13 @@ fn install_command_catalog_client(client: &mut Client) {
         .query_one("SELECT pg_advisory_lock(604630061)", &[])
         .expect("serialize command catalog migration in tests");
     client
-        .batch_execute(include_str!("../../../migrations/V3__donat_commands.sql"))
+        .batch_execute(include_str!(
+            "../../../migrations/V20260728192113__donat_commands.sql"
+        ))
         .expect("command journal and structured rejection helper install");
     client
         .batch_execute(include_str!(
-            "../../../migrations/V4__donat_command_claims.sql"
+            "../../../migrations/V20260728202031__donat_command_claims.sql"
         ))
         .expect("command claim election catalog installs");
     let identity_columns: i64 = client
@@ -479,7 +485,7 @@ fn install_command_catalog_client(client: &mut Client) {
     match identity_columns {
         0 => client
             .batch_execute(include_str!(
-                "../../../migrations/V5__qualify_command_identity.sql"
+                "../../../migrations/V20260729055155__qualify_command_identity.sql"
             ))
             .expect("source/role-qualified command identity installs"),
         2 => {}
@@ -498,7 +504,9 @@ fn install_command_catalog_client(client: &mut Client) {
         .get(0);
     match invocation_columns {
         0 => client
-            .batch_execute(include_str!("../../../migrations/V6__donat_processes.sql"))
+            .batch_execute(include_str!(
+                "../../../migrations/V20260731002214__donat_processes.sql"
+            ))
             .expect("command generation and process journal catalog installs"),
         1 => {}
         count => panic!("invalid invocation generation migration state: {count} columns"),
@@ -517,7 +525,7 @@ fn install_command_catalog_client(client: &mut Client) {
     match caller_context_columns {
         0 => client
             .batch_execute(include_str!(
-                "../../../migrations/V7__process_execution_context.sql"
+                "../../../migrations/V20260731023031__process_execution_context.sql"
             ))
             .expect("Process caller context and deterministic events install"),
         1 => {}
@@ -1579,7 +1587,7 @@ fn command_legacy_unqualified_key_fails_closed_without_a_domain_write() {
                  statement_timestamp() + interval '1 day')",
         &[&command_name],
     )
-    .expect("seed a preserved pre-V5 completed invocation");
+    .expect("seed a preserved completed invocation that predates qualified identity");
 
     let invocation = idempotent_insert_root_with_id(
         &command_name,
@@ -1591,7 +1599,7 @@ fn command_legacy_unqualified_key_fails_closed_without_a_domain_write() {
         .expect("isolate the expected legacy-key rejection");
     let error = tx
         .execute(&donat_sqlgen::mutation_to_sql(&invocation), &[])
-        .expect_err("an unattributable pre-V5 key must fail closed");
+        .expect_err("an unattributable unqualified key must fail closed");
     assert_eq!(error.code().map(|code| code.code()), Some("P0D01"));
     let payload: Json = serde_json::from_str(
         error

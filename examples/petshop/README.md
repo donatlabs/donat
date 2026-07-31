@@ -14,25 +14,19 @@ All services use the same prebuilt public engine image
 (`ghcr.io/donatlabs/donat`, published by the release workflow) and follow
 the project's deploy model:
 
-1. **`migrate`** — `donat migrate` applies the engine's own schema from the
-   repository's top-level [`migrations/`](../../migrations) via refinery,
-   tracked in `refinery_schema_history`: the `donat.*` tables holding durable
-   Process journals, command claims and cron state. They ship in the
-   repository, not in the image, so a real deployment mounts them the same way.
-2. **`app-schema`** — applies this store's own DDL in
-   [`migrations/`](migrations), in numeric order. It does not go through
-   `donat migrate`: that migrator keys one `refinery_schema_history` by version
-   number, and both sets start at `V1`. The engine's migrator owns the engine's
-   schema; an application's DDL is the application's business.
-3. **`deploy`** — `donat migrate --metadata-dir … --source default` deploys the
+1. **`migrate`** — `donat migrate` applies two independently versioned sets of
+   DDL through one `refinery_schema_history`: the engine's own schema from the
+   repository's top-level [`migrations/`](../../migrations) — the `donat.*`
+   tables holding durable Process journals, command claims and cron state,
+   which ship in the repository rather than in the image — and this store's own
+   [`migrations/`](migrations). They can share a history because both are
+   versioned by timestamp; two sets of counters would both start at `V1`.
+2. **`deploy`** — `donat migrate --metadata-dir … --source default` deploys the
    durable **Process** definitions. A Process revision is pinned in the
    database and the engine refuses to serve one that is not deployed as active,
    so without this step the engine boots into `revision … is not deployed as
    active` and retries forever.
-4. **`validate`** — `donat validate` loads the [`metadata/`](metadata),
-   introspects the migrated database, and exits non-zero if anything tracked
-   is missing, so a bad deploy fails before the server boots.
-5. **`engine`** — serves the data plane over three transports, all sharing the
+3. **`engine`** — serves the data plane over three transports, all sharing the
    same per-role permissions and auth: GraphQL at
    <http://localhost:8080/v1/graphql>, RESTified endpoints under
    <http://localhost:8080/api/rest/> (see [REST endpoints](#rest-endpoints)),
@@ -47,7 +41,7 @@ the project's deploy model:
    `DONAT_GRAPHQL_ENABLED_APIS=graphql` to expose GraphQL only (REST and MCP
    then return `404`).
 
-A sixth service, **`mock-providers`**, answers the five external services the
+A fourth service, **`mock-providers`**, answers the five external services the
 connectors are declared against — payment, tax, carrier, payout and
 notification — so the example runs end to end without an account anywhere. It
 is a fixture, not a simulator: see

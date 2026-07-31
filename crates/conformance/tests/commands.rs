@@ -917,7 +917,7 @@ fn command_legacy_unqualified_retry_fails_closed_before_domain_write() {
         "start the migrated command engine before seeding legacy state: {bootstrap}"
     );
     let mut client = postgres::Client::connect(suite.db_url(), NoTls)
-        .expect("connect to seed a preserved pre-V5 command");
+        .expect("connect to seed a preserved command that predates qualified identity");
     client
         .execute(
             "INSERT INTO public.orders (id, customer_id, status, quantity) \

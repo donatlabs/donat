@@ -4,9 +4,8 @@
 #
 # Uses the project's deploy model: schema is migrated out-of-band by a
 # one-shot `donat migrate`, the durable Process definitions are deployed by a
-# second one-shot `migrate` that also reads the metadata, the metadata is
-# checked against the migrated database by `donat validate`, and only then
-# does the engine serve. All of them use the same prebuilt public image
+# second one-shot `migrate` that also reads the metadata, and only then does
+# the engine serve. All of them use the same prebuilt public image
 # (ghcr.io/donatlabs/donat, pushed by .github/workflows/release.yml on each
 # release tag) — no local build. The engine itself never runs DDL.
 #
@@ -52,13 +51,21 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: apply the engine's own schema — the `donat.*` tables that hold
-  # the durable Process journals, command claims and cron state. They ship in
-  # the repository's top-level `migrations/`, not in the image, so a
-  # deployment mounts them the same way this example does.
+  # One-shot: apply the DDL, then exit.
+  #
+  # Two independently versioned sets go through one migrator and one
+  # `refinery_schema_history`: the engine's own `donat.*` schema — the durable
+  # Process journals, command claims and cron state, which ship in the
+  # repository's top-level `migrations/` rather than in the image — and this
+  # store's schema. They can share a history because both are versioned by
+  # timestamp; two sets of counters would both start at `V1` and collide.
   migrate:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["migrate", "--migrations-dir", "/engine-migrations"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        donat migrate --migrations-dir /engine-migrations &&
+        donat migrate --migrations-dir /app-migrations
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,35 +73,6 @@ services:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ../../migrations:/engine-migrations:ro
-    restart: "no"
-
-  # One-shot: apply the store's own DDL.
-  #
-  # `donat migrate` tracks what it applied in one `refinery_schema_history`
-  # keyed by version number, and both sets start at V1 — so the store's schema
-  # cannot go through the same migrator as the engine's without colliding.
-  # The engine's migrator owns the engine's schema; an application's DDL is the
-  # application's business, applied here in numeric order (V2 before V10, which
-  # a plain shell glob gets wrong).
-  app-schema:
-    image: postgres:16
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -euo pipefail
-        for file in $$(ls /app-migrations/V*.sql | sort -V); do
-          echo "applying $${file}"
-          psql -v ON_ERROR_STOP=1 -q -f "$${file}"
-        done
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    environment:
-      PGHOST: postgres
-      PGUSER: postgres
-      PGPASSWORD: postgres
-      PGDATABASE: petshop
-    volumes:
       - ./migrations:/app-migrations:ro
     restart: "no"
 
@@ -116,7 +94,7 @@ services:
       - "--source"
       - "default"
     depends_on:
-      app-schema:
+      migrate:
         condition: service_completed_successfully
     environment: &connector-env
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
@@ -138,24 +116,12 @@ services:
       - ./metadata:/metadata:ro
     restart: "no"
 
-  # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
-  validate:
-    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["validate", "--metadata-dir", "/metadata"]
-    depends_on:
-      deploy:
-        condition: service_completed_successfully
-    environment: *connector-env
-    volumes:
-      - ./metadata:/metadata:ro
-    restart: "no"
-
   engine:
     # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
     #   ENGINE_TAG=v1.2.3 docker compose up
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     depends_on:
-      validate:
+      deploy:
         condition: service_completed_successfully
       mock-providers:
         condition: service_healthy

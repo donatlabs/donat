@@ -488,18 +488,20 @@ async fn command_identity_migration_quarantines_preexisting_unqualified_keys() {
         NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&staged).expect("staged migration directory creates");
+    // Everything the engine shipped before `qualify_command_identity`, staged
+    // to reproduce a database that predates it.
     for name in [
-        "V1__donat_cron.sql",
-        "V2__donat_event_log.sql",
-        "V3__donat_commands.sql",
-        "V4__donat_command_claims.sql",
+        "V20260613222215__donat_cron.sql",
+        "V20260613222216__donat_event_log.sql",
+        "V20260728192113__donat_commands.sql",
+        "V20260728202031__donat_command_claims.sql",
     ] {
         std::fs::copy(bundled_migrations_dir().join(name), staged.join(name))
             .unwrap_or_else(|error| panic!("stage {name}: {error}"));
     }
     run_migrate(&url, &staged)
         .await
-        .expect("pre-V5 migrations apply");
+        .expect("migrations preceding qualified command identity apply");
 
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
@@ -522,14 +524,14 @@ async fn command_identity_migration_quarantines_preexisting_unqualified_keys() {
             "#,
         )
         .await
-        .expect("seed pre-V5 journal identity");
+        .expect("seed the journal identity that predates qualification");
 
-    let v5 = "V5__qualify_command_identity.sql";
-    std::fs::copy(bundled_migrations_dir().join(v5), staged.join(v5))
-        .unwrap_or_else(|error| panic!("stage {v5}: {error}"));
+    let qualify = "V20260729055155__qualify_command_identity.sql";
+    std::fs::copy(bundled_migrations_dir().join(qualify), staged.join(qualify))
+        .unwrap_or_else(|error| panic!("stage {qualify}: {error}"));
     run_migrate(&url, &staged)
         .await
-        .expect("V5 identity migration applies to an existing journal");
+        .expect("the identity migration applies to an existing journal");
 
     for table in ["command_invocations", "command_invocation_claims"] {
         let identity: String = client

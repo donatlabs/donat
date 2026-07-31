@@ -194,6 +194,110 @@ fn migrate_can_adopt_existing_schema_when_enabled() {
     assert_eq!(v, 1);
 }
 
+/// A database migrated before the move to timestamp versions must not try to
+/// apply the same migrations again under their new numbers.
+#[test]
+fn migrate_carries_a_sequential_history_onto_timestamp_versions() {
+    let db = fresh_db("conf_migrate_renumber");
+    let sequential = tmpdir("renumber_seq");
+    write(
+        &sequential.join("V1__create_widget.sql"),
+        "CREATE TABLE widget (id serial primary key, name text not null);\n",
+    );
+    write(
+        &sequential.join("V2__add_widget_note.sql"),
+        "ALTER TABLE widget ADD COLUMN note text;\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", sequential.to_str().unwrap()],
+    );
+    assert!(ok, "sequential migrate failed:\n{out}");
+
+    // The same two migrations, renamed to timestamps. Re-applying either one
+    // would fail on the existing table or column.
+    let stamped = tmpdir("renumber_ts");
+    write(
+        &stamped.join("V20260613222215__create_widget.sql"),
+        "CREATE TABLE widget (id serial primary key, name text not null);\n",
+    );
+    write(
+        &stamped.join("V20260613222216__add_widget_note.sql"),
+        "ALTER TABLE widget ADD COLUMN note text;\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", stamped.to_str().unwrap()],
+    );
+    assert!(ok, "timestamp migrate failed:\n{out}");
+    assert!(
+        out.contains("up to date"),
+        "the renamed migrations must count as already applied:\n{out}"
+    );
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![20_260_613_222_215, 20_260_613_222_216],
+        "history carries the timestamp versions, and carries them exactly once"
+    );
+}
+
+/// The carry-over joins on the migration name, so a name that does not
+/// identify one migration is left for the ordinary version check to report.
+#[test]
+fn migrate_leaves_an_ambiguous_rename_alone() {
+    let db = fresh_db("conf_migrate_renumber_ambiguous");
+    let sequential = tmpdir("ambiguous_seq");
+    write(
+        &sequential.join("V1__widget.sql"),
+        "CREATE TABLE widget_one (id serial primary key);\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", sequential.to_str().unwrap()],
+    );
+    assert!(ok, "sequential migrate failed:\n{out}");
+
+    // Two timestamped migrations share the applied name, so which one the
+    // history row means is unknowable.
+    let stamped = tmpdir("ambiguous_ts");
+    write(
+        &stamped.join("V20260613222215__widget.sql"),
+        "CREATE TABLE widget_one (id serial primary key);\n",
+    );
+    write(
+        &stamped.join("V20260613222216__widget.sql"),
+        "CREATE TABLE widget_two (id serial primary key);\n",
+    );
+    let (ok, out) = run(
+        &db,
+        &["migrate", "--migrations-dir", stamped.to_str().unwrap()],
+    );
+    assert!(!ok, "an ambiguous rename must not be guessed at:\n{out}");
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = client
+        .query(
+            "SELECT version FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(versions, vec![1], "the history is left untouched");
+}
+
 #[test]
 fn validate_passes_when_consistent_and_fails_when_not() {
     let db = fresh_db("conf_migrate_validate");
