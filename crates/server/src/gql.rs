@@ -1835,9 +1835,15 @@ fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
     // The response stays opaque, but an operator still needs the cause. The
     // log is the only place it may appear, so record it there rather than
     // leaving a bare "command database error" with nothing behind it.
+    //
+    // This is the primary message, never `detail()`. A primary message can
+    // still quote one offending literal ("invalid input syntax for type
+    // integer: \"abc\""), which is why it is not returned to the caller;
+    // `detail()` goes further and prints whole key tuples, so it stays out of
+    // the log as well.
     tracing::warn!(
         sqlstate = db.code().code(),
-        detail = db.message(),
+        message = db.message(),
         constraint = db.constraint().unwrap_or_default(),
         table = db.table().unwrap_or_default(),
         "command statement failed"

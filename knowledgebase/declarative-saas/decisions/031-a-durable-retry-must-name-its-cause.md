@@ -39,8 +39,15 @@ identifies its step and its rule.
 
 Command *response* bodies are unchanged. A command statement embeds request
 values, so a PostgreSQL primary message can disclose them; the opaque
-`data-exception` body stays exactly as it is, and the detail goes to the log
+`data-exception` body stays exactly as it is, and the cause goes to the log
 instead — which previously recorded nothing at all for that case.
+
+The log records the primary message and never `detail()`. This is a deliberate
+line rather than a claim that the log is value-free: a primary message can
+quote one offending literal (`invalid input syntax for type integer: "abc"`),
+while `detail()` prints whole key tuples (`Key (email)=(alice@example.com)
+already exists`). One quoted literal is the price of a diagnosable type error;
+a key tuple is another party's data and stays out of both surfaces.
 
 ## Alternatives
 
@@ -53,8 +60,12 @@ instead — which previously recorded nothing at all for that case.
 ## Consequences
 
 An operator reading the engine log can tell which declaration is wrong without
-instrumenting the engine. Logs carry constraint and relation names, which are
-schema identifiers rather than request data. The assertion message is
-user-visible when no message is declared, so it now names metadata identifiers
-the caller can already read in the schema — declaring a `message` remains the
-way to keep those names private.
+instrumenting the engine.
+
+The assertion message is different from the other two: it is user-visible when
+no message is declared, and a step name and a rule name are *not* otherwise
+readable — neither appears in the generated GraphQL schema. Naming them is
+still right, because a rejected assertion is a validation outcome and telling
+an authorized caller which rule refused their input is what lets them fix it.
+What it discloses is static metadata naming, never data or another party's
+rows. Declaring a `message` remains the way to keep those names private.

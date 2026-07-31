@@ -163,13 +163,17 @@ impl ProviderStub {
     }
 
     /// Park this request while its path is held.
+    ///
+    /// A hold is matched the same way a script is, wildcard included, so
+    /// holding `/v1/shipments/*/labels` is not a silent no-op against the
+    /// concrete path a Process actually requests.
     fn wait_while_held(&self, path: &str) {
         let mut state = self.state.lock().unwrap();
-        if !state.held.contains(path) {
+        if !holds(&state.held, path) {
             return;
         }
         *state.holding.entry(path.to_owned()).or_default() += 1;
-        while state.held.contains(path) {
+        while holds(&state.held, path) {
             state = self.resumed.wait(state).unwrap();
         }
         if let Some(count) = state.holding.get_mut(path) {
@@ -217,7 +221,8 @@ impl ProviderStub {
         let prefix_script = state
             .scripts
             .keys()
-            .find(|key| prefix_matches(key, path))
+            .filter(|key| prefix_matches(key, path))
+            .max_by_key(|key| key.len())
             .cloned();
         if let Some(key) = prefix_script
             && let Some(queue) = state.scripts.get_mut(&key)
@@ -228,10 +233,15 @@ impl ProviderStub {
         if let Some(response) = state.defaults.get(path) {
             return response.clone();
         }
+        // `defaults` is a HashMap, so iteration order is not stable. When more
+        // than one wildcard key matches, take the most specific — the longest
+        // literal text — rather than whichever the hash happened to yield, so
+        // a case cannot pass or fail by hash order.
         state
             .defaults
             .iter()
-            .find(|(key, _)| prefix_matches(key, path))
+            .filter(|(key, _)| prefix_matches(key, path))
+            .max_by_key(|(key, _)| key.len())
             .map(|(_, response)| response.clone())
             .unwrap_or_else(|| ScriptedResponse::ok(json!({})))
     }
@@ -272,6 +282,11 @@ pub fn spawn() -> ProviderStub {
     });
 
     stub
+}
+
+/// Whether any hold registration covers this request path.
+fn holds(held: &HashSet<String>, path: &str) -> bool {
+    held.contains(path) || held.iter().any(|key| prefix_matches(key, path))
 }
 
 /// A registration key containing one `*` matches every path with that prefix
