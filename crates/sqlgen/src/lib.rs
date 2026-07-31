@@ -3426,16 +3426,56 @@ enum CommandRejection {
 /// statement. A permission check that traverses a relationship to such a row
 /// must therefore resolve it against that CTE, exactly as the nested-insert
 /// path already does for GraphQL mutations.
-fn command_written_tables(command: &CommandMutation, index: usize) -> Vec<(&Table, &str)> {
+fn command_written_tables(
+    command: &CommandMutation,
+    index: usize,
+) -> Vec<(&Table, &str, Vec<&str>)> {
     command.steps[..index]
         .iter()
         .filter_map(|step| match step {
-            CommandExecutionStep::Insert { cte, table, .. }
-            | CommandExecutionStep::InsertMany { cte, table, .. }
-            | CommandExecutionStep::InsertRows { cte, table, .. }
-            | CommandExecutionStep::InsertWhen { cte, table, .. }
-            | CommandExecutionStep::Update { cte, table, .. }
-            | CommandExecutionStep::UpdateWhen { cte, table, .. } => Some((table, cte.as_str())),
+            CommandExecutionStep::Insert {
+                cte,
+                table,
+                returning,
+                ..
+            }
+            | CommandExecutionStep::InsertMany {
+                cte,
+                table,
+                returning,
+                ..
+            }
+            | CommandExecutionStep::InsertRows {
+                cte,
+                table,
+                returning,
+                ..
+            }
+            | CommandExecutionStep::InsertWhen {
+                cte,
+                table,
+                returning,
+                ..
+            }
+            | CommandExecutionStep::Update {
+                cte,
+                table,
+                returning,
+                ..
+            }
+            | CommandExecutionStep::UpdateWhen {
+                cte,
+                table,
+                returning,
+                ..
+            } => Some((
+                table,
+                cte.as_str(),
+                returning
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect(),
+            )),
             _ => None,
         })
         .collect()
@@ -3446,7 +3486,7 @@ fn command_written_tables(command: &CommandMutation, index: usize) -> Vec<(&Tabl
 /// override exact.
 fn command_relationship_ctes(
     check: &BoolExp,
-    written: &[(&Table, &str)],
+    written: &[(&Table, &str, Vec<&str>)],
 ) -> Vec<RelationshipCteOverride> {
     let mut overrides = Vec::new();
     collect_command_relationship_ctes(check, written, &mut overrides);
@@ -3455,7 +3495,7 @@ fn command_relationship_ctes(
 
 fn collect_command_relationship_ctes(
     exp: &BoolExp,
-    written: &[(&Table, &str)],
+    written: &[(&Table, &str, Vec<&str>)],
     overrides: &mut Vec<RelationshipCteOverride>,
 ) {
     match exp {
@@ -3470,7 +3510,15 @@ fn collect_command_relationship_ctes(
             join,
             predicate,
         } => {
-            if let Some((_, cte)) = written.iter().find(|(written, _)| *written == table) {
+            // Only redirect when that step actually returns the columns the
+            // join reads; otherwise the committed table remains the only place
+            // the relationship can be resolved.
+            if let Some((_, cte, _)) = written.iter().find(|(written, _, returning)| {
+                *written == table
+                    && join
+                        .iter()
+                        .all(|(_, remote)| returning.contains(&remote.as_str()))
+            }) {
                 overrides.push(RelationshipCteOverride {
                     table: table.clone(),
                     join: join.clone(),

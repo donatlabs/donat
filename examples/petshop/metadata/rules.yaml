@@ -80,6 +80,10 @@ types:
       currency: string!
   - name: TaxableLine
     object:
+      # The quote these lines belong to. The tax operation already receives it
+      # as its own input field; declaring it here keeps the row contract equal
+      # to what the command's projection actually returns.
+      checkout_quote_id: uuid!
       variant_id: bigint!
       quantity: int!
       taxable_category: string!
