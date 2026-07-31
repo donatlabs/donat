@@ -74,6 +74,12 @@ carrier label, a grading floor for staff-created variants. A nullable column
 is usable in an expression only after its presence is declared, which is a
 deploy-time error when forgotten rather than a surprise in production.
 
+A `validate` list on a command permission (ADR-019) refuses publication. The
+shapes are shared, so the key parses, but command steps write through their own
+per-step CTEs and the command planner does not consult this index — accepting it
+would silently drop a declared check. Commands state the same rule in an
+`assert` step, which is already their idiom.
+
 Nested object inserts are refused when the target table's role declares
 validators: the child rows land in a CTE the planner does not name, so the
 lowered expression would target the wrong rows. Failing the plan keeps the

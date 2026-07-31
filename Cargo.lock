@@ -723,6 +723,7 @@ dependencies = [
  "graphql-parser",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",

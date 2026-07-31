@@ -95,6 +95,29 @@ impl ValidatorIndex {
         let mut index = Self::default();
         for entry in &source.tables {
             let key = format!("{}.{}", entry.table.schema(), entry.table.name());
+            // Command permissions reuse the same shapes (ADR-019), so they
+            // parse a `validate` list — but command steps write through their
+            // own per-step CTEs, which this index does not name, and the
+            // command planner does not consult it. Accepting the key would
+            // mean silently ignoring a check the author wrote, which is the
+            // one failure mode a permission plane must not have.
+            for (role, validators) in entry
+                .command_insert_permissions
+                .iter()
+                .map(|permission| (&permission.role, &permission.permission.validate))
+                .chain(
+                    entry
+                        .command_update_permissions
+                        .iter()
+                        .map(|permission| (&permission.role, &permission.permission.validate)),
+                )
+            {
+                if !validators.is_empty() {
+                    index.errors.push(format!(
+                        "{role} command permission on {key}: `validate` is not supported on a command permission; put the check in the command's own `assert` step"
+                    ));
+                }
+            }
             let Some(columns) = catalog_columns(catalog, entry) else {
                 // An untracked or not-yet-introspected table cannot type an
                 // expression. Ordinary planning already refuses it, so there
@@ -566,5 +589,44 @@ mod tests {
         )
         .expect_err("a jsonb column has no rule type");
         assert!(error.contains("undeclared"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod command_permission_tests {
+    use super::*;
+    /// A `validate` list on a command permission must refuse the deployment.
+    /// Command steps write through their own CTEs, so this index cannot
+    /// enforce it — and accepting the key would drop a declared check.
+    #[test]
+    fn a_validate_list_on_a_command_permission_refuses_publication() {
+        let source: Source = serde_yaml::from_str(
+            r#"
+name: default
+kind: postgres
+configuration: {}
+tables:
+  - table: { schema: public, name: audit_entry }
+    command_insert_permissions:
+      - role: fulfilment
+        permission:
+          check: {}
+          validate:
+            - expression: "size(note) >= 3"
+              message: note must be at least 3 characters
+"#,
+        )
+        .expect("command permissions accept the same shapes as ordinary ones");
+
+        let index = ValidatorIndex::build(&source, &Catalog::default());
+        let error = index
+            .errors()
+            .first()
+            .expect("a command permission cannot carry a validate list");
+        assert!(error.contains("public.audit_entry"), "{error}");
+        assert!(
+            error.contains("not supported on a command permission"),
+            "{error}"
+        );
     }
 }
