@@ -15,6 +15,7 @@ use postgres::NoTls;
 use serde_json::{Value as Json, json};
 
 const CUSTOMER: &str = "customer-1";
+const REVIEWER: &str = "veterinarian-1";
 const TAX_QUOTE_PATH: &str = "/v1/tax-quotes";
 const AUTHORIZE_PATH: &str = "/v1/payment-authorizations";
 const VOID_PATH: &str = "/v1/payment-authorizations/*";
@@ -168,7 +169,23 @@ fn process_diagnostics(client: &mut postgres::Client) -> String {
             &[],
         )
         .expect("read the durable activity journal");
+    let signals = client
+        .query(
+            "SELECT process_name, signal_name, status, coalesce(correlation_json::text,'null')
+             FROM donat.process_signal_requests WHERE source_name = 'default' ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default();
     let mut report = String::new();
+    for signal in signals {
+        report.push_str(&format!(
+            "signal {}.{} status={} correlate={}; ",
+            signal.get::<_, String>(0),
+            signal.get::<_, String>(1),
+            signal.get::<_, String>(2),
+            signal.get::<_, String>(3)
+        ));
+    }
     for row in rows {
         report.push_str(&format!(
             "instance {} status={} state={} output={}; ",
@@ -414,5 +431,105 @@ fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
         output.pointer("/booking_id").and_then(Json::as_str),
         Some(booking_id.as_str()),
         "the booking Process reports the hold it confirmed: {output}"
+    );
+}
+
+/// The prescription module reviews a line of the order the checkout module
+/// created: the shopper submits it, the Process waits, and a veterinary
+/// reviewer's decision Command releases it.
+#[test]
+fn a_reviewer_approves_a_prescription_and_the_process_releases_the_line() {
+    let stub = provider_stub::spawn();
+    script_providers(&stub);
+    let suite = start_store(&stub, "petshop_prescription_review");
+    let cart_id = seed_cart(suite.db_url());
+
+    let (status, body) = start_checkout(&suite, cart_id, "550e8400-e29b-41d4-a716-446655440930");
+    assert_eq!(status, 200, "start_checkout status: {body}");
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the Petshop database");
+    await_terminal(&mut client, "checkout_payment");
+
+    let order_line_id: String = client
+        .query_one("SELECT id::text FROM order_line LIMIT 1", &[])
+        .expect("the checkout Process committed order lines")
+        .get(0);
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ start_prescription_review(order_line_id: \"{order_line_id}\", review_deadline: \"2030-01-01T00:00:00Z\", request_id: \"550e8400-e29b-41d4-a716-446655440931\") {{ order_line_id }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "start_prescription_review status: {body}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let prescription_id: String = loop {
+        let row = client
+            .query_opt("SELECT id::text FROM prescription_request LIMIT 1", &[])
+            .expect("poll for the submitted review");
+        if let Some(row) = row {
+            break row.get(0);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the prescription Process never submitted its review: {}",
+            process_diagnostics(&mut client)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Signals are never buffered, so the decision must reach an instance that
+    // has already entered its wait.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state: Option<String> = client
+            .query_opt(
+                "SELECT current_state FROM donat.process_instances
+                 WHERE source_name = 'default' AND process_name = 'prescription_review'",
+                &[],
+            )
+            .expect("poll for the receptive wait")
+            .map(|row| row.get(0));
+        if state.as_deref() == Some("await_veterinary_decision") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the prescription Process never parked on its decision wait: {}",
+            process_diagnostics(&mut client)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ approve_prescription(prescription_id: \"{prescription_id}\", decision_id: \"550e8400-e29b-41d4-a716-446655440932\", review_note: \"ok\") {{ prescription_id }} }}"
+            )
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "veterinary_reviewer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), REVIEWER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "approve_prescription status: {body}");
+    assert!(
+        body.get("errors").is_none(),
+        "approve_prescription reported errors: {body}"
+    );
+
+    let output = await_terminal(&mut client, "prescription_review");
+    assert_eq!(
+        output.pointer("/status").and_then(Json::as_str),
+        Some("approved"),
+        "the reviewer's decision released the line: {output}"
     );
 }
