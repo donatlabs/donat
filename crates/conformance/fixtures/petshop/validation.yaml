@@ -1,0 +1,493 @@
+# Permission validators: per-role value checks a database CHECK cannot make,
+# because a CHECK binds every writer at once and these bind one role.
+#
+# quality_grade is nullable in the catalogue, and stays nullable: migrations
+# and back-office SQL leave older variants ungraded. What the staff role may
+# write through the API is stricter than what the column permits.
+#
+# The invariant these cases pin down is that a validator passes only on TRUE.
+# An unknown value therefore never satisfies one, whatever the predicate says,
+# and the difference between the two spellings is the message, never the
+# decision:
+#
+#   insert declares `not_null` first  -> a null reports "cannot be null"
+#   update declares only `> 3`        -> the same null reports the comparison
+#
+# The cases run in order; the update cases depend on the rows the earlier ones
+# leave behind.
+
+- description: Staff can create a variant that satisfies every validator.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product_variant(objects: [{
+          product_id: 1, sku: "DOG-GRADED-1KG", title: "Graded 1 kg",
+          price_minor: 1999, currency: "USD", active: true, quality_grade: 5
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      insert_product_variant:
+        affected_rows: 1
+
+- description: A value below the floor is rejected with that validator's own message.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product_variant(objects: [{
+          product_id: 1, sku: "DOG-LOW-GRADE-1KG", title: "Low grade 1 kg",
+          price_minor: 1999, currency: "USD", active: true, quality_grade: 3
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product_variant.args.objects
+          code: validation-failed
+        message: quality_grade must be greater than 3
+
+- description: An explicit null is refused as a null, not as a failed comparison.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product_variant(objects: [{
+          product_id: 1, sku: "DOG-NULL-GRADE-1KG", title: "Null grade 1 kg",
+          price_minor: 1999, currency: "USD", active: true, quality_grade: null
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product_variant.args.objects
+          code: validation-failed
+        message: quality_grade cannot be null
+
+- description: >-
+    An omitted column is refused as a null too. The validator reads the row as
+    written, not the submitted object, so a column left to its default is not
+    a way around a validator.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product_variant(objects: [{
+          product_id: 1, sku: "DOG-OMITTED-GRADE-1KG", title: "Omitted grade 1 kg",
+          price_minor: 1999, currency: "USD", active: true
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product_variant.args.objects
+          code: validation-failed
+        message: quality_grade cannot be null
+
+- description: Nothing the rejected mutations submitted reached the table.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      query {
+        product_variant(where: {sku: {_like: "DOG-%GRADE%"}}, order_by: {sku: asc}) {
+          sku
+          quality_grade
+        }
+      }
+  response:
+    data:
+      product_variant:
+        - sku: DOG-GRADED-1KG
+          quality_grade: 5
+
+- description: >-
+    Renaming an ungraded legacy variant fails: the update validator reads the
+    updated row, and that row is still ungraded. The update permission omits
+    `not_null`, so the null surfaces as the comparison it could not satisfy.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        update_product_variant(
+          where: {sku: {_eq: "DOG-CHICKEN-1KG"}},
+          _set: {title: "Chicken 1 kg (renamed)"}
+        ) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $
+          code: validation-failed
+        message: quality_grade must be greater than 3
+
+- description: The rejected rename left the legacy variant untouched.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      query {
+        product_variant(where: {sku: {_eq: "DOG-CHICKEN-1KG"}}) {
+          title
+          quality_grade
+        }
+      }
+  response:
+    data:
+      product_variant:
+        - title: Chicken 1 kg
+          quality_grade: null
+
+- description: Grading the legacy variant in the same statement succeeds.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        update_product_variant(
+          where: {sku: {_eq: "DOG-CHICKEN-1KG"}},
+          _set: {title: "Chicken 1 kg (graded)", quality_grade: 4}
+        ) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      update_product_variant:
+        affected_rows: 1
+
+- description: A later edit of the now-graded variant passes without repeating the grade.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        update_product_variant(
+          where: {sku: {_eq: "DOG-CHICKEN-1KG"}},
+          _set: {title: "Chicken 1 kg"}
+        ) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      update_product_variant:
+        affected_rows: 1
+
+- description: Clearing the grade is refused, because unknown never satisfies a validator.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        update_product_variant(
+          where: {sku: {_eq: "DOG-CHICKEN-1KG"}},
+          _set: {quality_grade: null}
+        ) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $
+          code: validation-failed
+        message: quality_grade must be greater than 3
+
+- description: >-
+    A validator constrains one role, not the table. The customer role has no
+    write access to the catalogue at all, so the grading contract is not what
+    stops it — the absent mutation root is.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_product_variant(objects: [{
+          product_id: 1, sku: "CUSTOMER-GRADED", title: "Customer graded",
+          price_minor: 1, currency: "USD", active: true, quality_grade: 9
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product_variant
+          code: validation-failed
+        message: "field 'insert_product_variant' not found in type: 'mutation_root'"
+
+# --- A ceiling that binds one role, above a constraint that binds everyone ---
+#
+# cart_line.quantity already has a database CHECK for `> 0`, and it stays
+# there: a non-positive quantity is wrong for every writer. The ceiling is not
+# that kind of rule. It exists because a shopper is not a wholesale command,
+# and only the shopper's permission carries it.
+
+- description: The ceiling is inclusive, so the boundary value is accepted.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_cart_line(objects: [{cart_id: 1, variant_id: 1, quantity: 20}]) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      insert_cart_line:
+        affected_rows: 1
+
+- description: One unit above the ceiling is refused with the role's own message.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_cart_line(objects: [{cart_id: 1, variant_id: 2, quantity: 21}]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_cart_line.args.objects
+          code: validation-failed
+        message: a cart line is limited to 20 units
+
+- description: Raising an accepted line past the ceiling is refused too.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        update_cart_line(where: {cart_id: {_eq: 1}}, _set: {quantity: 21}) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $
+          code: validation-failed
+        message: a cart line is limited to 20 units
+
+# The `quantity: 0` case is deliberately absent. It is refused by the database
+# CHECK, and today that answer comes back as SQLSTATE 23514 carrying
+# PostgreSQL's own text under code `permission-error` — the exact
+# proxied-from-the-database shape a later slice is meant to replace. Pinning it
+# here would freeze the wrong contract before that decision is made.
+
+# --- Nullable columns: the escape, spelled out ---
+
+- description: An address without the optional second line is accepted.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_customer_address(objects: [{
+          label: "Home", line1: "12 Kennel Road", city: "Springfield",
+          postal_code: "11223", country_code: "US"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      insert_customer_address:
+        affected_rows: 1
+
+- description: >-
+    A second line that is present must still be usable. The null branch of the
+    expression is what made the previous case pass; it says nothing about a
+    value that is actually there.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_customer_address(objects: [{
+          label: "Work", line1: "12 Kennel Road", line2: "x", city: "Springfield",
+          postal_code: "11223", country_code: "US"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_customer_address.args.objects
+          code: validation-failed
+        message: line2 must be at least 2 characters when present
+
+- description: >-
+    Two validators fail at once and the first one in the list is the one the
+    caller reads. Document order is the contract, not an implementation detail.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_customer_address(objects: [{
+          label: "Bad", line1: "ab", city: "Springfield",
+          postal_code: "0123456789ABCDEFG", country_code: "US"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_customer_address.args.objects
+          code: validation-failed
+        message: line1 must be at least 3 characters
+
+- description: With the first validator satisfied, the second one reports.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: customer
+    X-Donat-User-Id: customer-1
+  query:
+    query: |
+      mutation {
+        insert_customer_address(objects: [{
+          label: "Bad", line1: "12 Kennel Road", city: "Springfield",
+          postal_code: "0123456789ABCDEFG", country_code: "US"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_customer_address.args.objects
+          code: validation-failed
+        message: postal_code is limited to 16 characters
+
+# --- The same escape on a staff-owned table ---
+
+- description: A product may be created before anyone writes copy for it.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product(objects: [{
+          category_id: 1, slug: "undescribed-toy", title: "Undescribed toy",
+          status: "draft"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    data:
+      insert_product:
+        affected_rows: 1
+
+- description: Copy that exists must be worth reading.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product(objects: [{
+          category_id: 1, slug: "terse-toy", title: "Terse toy",
+          description: "Too short.", status: "draft"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product.args.objects
+          code: validation-failed
+        message: description must be at least 20 characters when present
+
+- description: >-
+    A non-null column needs no null handling in its expression, and the
+    validator reports before the nullable one below it.
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Donat-Role: staff
+  query:
+    query: |
+      mutation {
+        insert_product(objects: [{
+          category_id: 1, slug: "ab-toy", title: "ab",
+          description: "Too short.", status: "draft"
+        }]) {
+          affected_rows
+        }
+      }
+  response:
+    errors:
+      - extensions:
+          path: $.selectionSet.insert_product.args.objects
+          code: validation-failed
+        message: title must be at least 3 characters

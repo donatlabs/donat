@@ -43,6 +43,19 @@ insert_permissions:
         - title
         - description
         - status
+      # The null-is-acceptable spelling. description is nullable and stays
+      # optional — a product may be published before anyone writes copy for
+      # it — but a description that exists must be worth reading.
+      #
+      # This is the escape from "unknown never satisfies a validator": say so,
+      # in the expression, and the null branch evaluates to TRUE. Nothing
+      # here is inferred; an author who omits the `is_null` arm gets a
+      # validator that also rejects the absent description.
+      validate:
+        - expression: 'size(title) >= 3'
+          message: title must be at least 3 characters
+        - expression: 'is_null(description) || size(description) >= 20'
+          message: description must be at least 20 characters when present
 update_permissions:
   - role: staff
     permission:
@@ -54,6 +67,11 @@ update_permissions:
         - status
       filter: {}
       check: {}
+      validate:
+        - expression: 'size(title) >= 3'
+          message: title must be at least 3 characters
+        - expression: 'is_null(description) || size(description) >= 20'
+          message: description must be at least 20 characters when present
 delete_permissions:
   - role: staff
     permission:

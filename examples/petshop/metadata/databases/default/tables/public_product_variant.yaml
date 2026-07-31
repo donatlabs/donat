@@ -83,6 +83,28 @@ insert_permissions:
         - price_minor
         - currency
         - active
+        - quality_grade
+      # `check` answers "may this role write this row" — it is a predicate over
+      # the session and the row, and it may traverse relationships. `validate`
+      # answers a different question, "is this value acceptable", over the row
+      # as written: after presets and after column defaults, because the gate
+      # reads the rows the statement returns rather than the input object.
+      #
+      # quality_grade is nullable in the catalogue and stays that way: a
+      # database CHECK would bind every writer, including the migrations that
+      # left older variants ungraded. This binds one role.
+      #
+      # Entries run in document order and the first violated entry is the
+      # error the caller sees. A validator passes only on TRUE, so an unknown
+      # value never satisfies one: `quality_grade > 3` already rejects a null
+      # without any help. `not_null` adds nothing to that decision — it buys a
+      # message that names the real cause instead of reporting a comparison
+      # the caller never got to fail.
+      validate:
+        - not_null: quality_grade
+          message: quality_grade cannot be null
+        - expression: "quality_grade > 3"
+          message: quality_grade must be greater than 3
 update_permissions:
   - role: staff
     permission:
@@ -93,6 +115,7 @@ update_permissions:
         - price_minor
         - currency
         - active
+        - quality_grade
       filter: {}
       check:
         _and:
@@ -101,6 +124,20 @@ update_permissions:
           - product:
               status:
                 _eq: published
+      # Deliberately spelled without `not_null`, so one column proves both
+      # behaviours in one fixture file: the same null that insert reports as
+      # "cannot be null" is reported here as the failed comparison. Nothing
+      # about the decision changes — a null is refused either way — only the
+      # message the caller reads.
+      #
+      # The list reads the updated row, so renaming an ungraded legacy variant
+      # fails until the same statement grades it. That is a real consequence
+      # of validating the written row rather than the submitted fields, and it
+      # is asserted in fixtures/petshop/validation.yaml rather than left to be
+      # discovered in production.
+      validate:
+        - expression: "quality_grade > 3"
+          message: quality_grade must be greater than 3
 delete_permissions:
   - role: staff
     permission:

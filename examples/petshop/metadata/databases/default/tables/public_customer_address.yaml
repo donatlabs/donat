@@ -31,6 +31,17 @@ insert_permissions:
         - city
         - postal_code
         - country_code
+      # country_code has a database CHECK for its two-letter shape, because a
+      # malformed country code is wrong for every writer. Length bounds are
+      # not: they exist so a carrier label prints, and the carrier contract is
+      # the customer's, not the schema's.
+      validate:
+        - expression: 'size(line1) >= 3'
+          message: line1 must be at least 3 characters
+        - expression: 'size(postal_code) <= 16'
+          message: postal_code is limited to 16 characters
+        - expression: 'is_null(line2) || size(line2) >= 2'
+          message: line2 must be at least 2 characters when present
 update_permissions:
   - role: customer
     permission:
@@ -47,6 +58,13 @@ update_permissions:
       check:
         customer_id:
           _eq: X-Donat-User-Id
+      validate:
+        - expression: 'size(line1) >= 3'
+          message: line1 must be at least 3 characters
+        - expression: 'size(postal_code) <= 16'
+          message: postal_code is limited to 16 characters
+        - expression: 'is_null(line2) || size(line2) >= 2'
+          message: line2 must be at least 2 characters when present
 delete_permissions:
   - role: customer
     permission:

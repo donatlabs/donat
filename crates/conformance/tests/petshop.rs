@@ -266,6 +266,17 @@ fn permissions() {
     running.check_query_f("petshop/permissions.yaml", Transport::Http);
 }
 
+/// Permission validators are a per-role value contract, not a table
+/// constraint. The suite is intentionally red until the engine compiles the
+/// `validate` list: today the metadata loader ignores the unknown key, so
+/// every rejection case succeeds instead.
+#[test]
+fn permission_validators() {
+    let running = petshop_suite("petshop_validation");
+    seed_customer_one_rows(running.db_url());
+    running.check_query_f("petshop/validation.yaml", Transport::Http);
+}
+
 #[test]
 fn store_constraints() {
     let root = petshop_root();

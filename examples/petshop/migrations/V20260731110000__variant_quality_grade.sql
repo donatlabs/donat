@@ -1,0 +1,12 @@
+-- A deliberately nullable grading column.
+--
+-- Every other numeric column on this table is NOT NULL, so an expression over
+-- it compiles with no ceremony and can never meet a null. This column exists
+-- to pressure the opposite case: an expression over a nullable column must
+-- not compile until the metadata states, explicitly, what a null means there.
+--
+-- It is nullable in the catalogue on purpose. Migrations and back-office SQL
+-- leave older variants ungraded, and a CHECK constraint would apply to every
+-- writer at once. The staff role's own contract is stricter than the column:
+-- see the `validate` list in the tracked table's metadata.
+ALTER TABLE product_variant ADD COLUMN quality_grade smallint;
