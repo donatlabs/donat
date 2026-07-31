@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use donat_conformance::{engine_binary, pg_admin_url};
+use donat_conformance::{apply_sql_migration_dir, engine_binary, pg_admin_url};
 
 fn with_db(admin_url: &str, db: &str) -> String {
     let (prefix, _) = admin_url.rsplit_once('/').expect("PG_URL has a db path");
@@ -53,6 +53,34 @@ fn run_with_env(db_url: &str, args: &[&str], envs: &[(&str, &str)]) -> (bool, St
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.success(), s)
+}
+
+/// The harness applies an example's own SQL outside refinery, and it has to
+/// order those files numerically. A plain lexical sort runs `V10` before `V2`.
+///
+/// This needs a database, so it belongs beside the other migrator cases rather
+/// than in the crate's unit tests, which run on every backend in the matrix —
+/// including the ones that start no Postgres at all.
+#[test]
+fn migration_files_are_applied_in_numeric_order() {
+    let db = fresh_db("conf_migration_files_sorted");
+    let dir = tmpdir("migration_files_sorted");
+    write(
+        &dir.join("V10__insert_marker.sql"),
+        "INSERT INTO migration_order (version) VALUES (10);",
+    );
+    write(
+        &dir.join("V2__create_marker.sql"),
+        "CREATE TABLE migration_order (version integer NOT NULL);",
+    );
+
+    apply_sql_migration_dir(&db, &dir).expect("migrations apply in numeric order");
+
+    let mut client = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let row = client
+        .query_one("SELECT version FROM migration_order", &[])
+        .expect("the later migration ran after the one that created its table");
+    assert_eq!(row.get::<_, i32>(0), 10);
 }
 
 #[test]

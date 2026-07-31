@@ -3835,39 +3835,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_files_are_sorted_by_numeric_version() {
-        let database_name = suite_database_name("migration_files_sorted");
-        let (admin_url, database_url) =
-            create_suite_db(&database_name).expect("create migration test database");
-        let dir = tempdir("migration_files_sorted");
-        write(
-            &dir,
-            "V10__insert_marker.sql",
-            "INSERT INTO migration_order (version) VALUES (10);",
-        );
-        write(
-            &dir,
-            "V2__create_marker.sql",
-            "CREATE TABLE migration_order (version integer NOT NULL);",
-        );
-
-        apply_sql_migration_dir(&database_url, &dir).expect("migrations apply in numeric order");
-
-        let mut client = pg_client(&database_url);
-        let row = client
-            .query_one("SELECT version FROM migration_order", &[])
-            .expect("migration marker exists");
-        assert_eq!(row.get::<_, i32>(0), 10);
-
-        std::fs::remove_dir_all(dir).expect("remove migration test directory");
-        let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls)
-            .expect("connect to Postgres admin database");
-        admin
-            .batch_execute(&format!("DROP DATABASE {database_name} WITH (FORCE)"))
-            .expect("drop migration test database");
-    }
-
-    #[test]
     fn duplicate_migration_versions_are_rejected() {
         let dir = tempdir("duplicate_migration_versions");
         write(&dir, "V2__first.sql", "SELECT 1;");

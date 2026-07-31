@@ -11,15 +11,24 @@ env:
 
 jobs:
   test:
-    name: Unit and snapshot tests
+    name: Workspace tests
     runs-on: ubuntu-latest
+    env:
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Connector processor boundary policy
         run: python3 scripts/check_connector_processor_boundary.py
-      - name: Unit and snapshot tests
+      # The durable Process journals, the command claim ledger and catalog
+      # introspection are all contracts against a real database, so their
+      # tests need one. They live in the ordinary crates rather than in the
+      # conformance harness because they test one crate's behaviour, not the
+      # engine end to end.
+      - name: Start Postgres
+        run: docker compose -f docker-compose.conformance.yml up -d --wait postgres
+      - name: Workspace tests
         run: cargo test --workspace --exclude donat-conformance
 
   backend-core:
