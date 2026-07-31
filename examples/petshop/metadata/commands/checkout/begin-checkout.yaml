@@ -117,9 +117,11 @@ steps:
         tax_code: { item: tax_code }
         tax_bps: { item: tax_bps }
         currency: { item: currency }
+      # The row permission for order_line is owned through its order, so the
+      # projection returns the key that check reads.
       returning:
-        [id, variant_id, quantity, tax_code, tax_bps, unit_price_minor, line_subtotal_minor,
-         discount_minor, taxable_minor, currency]
+        [id, order_id, variant_id, quantity, tax_code, tax_bps, unit_price_minor,
+         line_subtotal_minor, discount_minor, taxable_minor, currency]
   - name: adjustment_snapshots
     fixed_rows:
       maximum_rows: 4

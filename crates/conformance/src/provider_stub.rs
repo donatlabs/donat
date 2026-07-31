@@ -60,6 +60,35 @@ impl ScriptedResponse {
     }
 }
 
+/// Copy a value out of the request the engine just sent.
+///
+/// A provider usually echoes identifiers it was given — a quote id, an order
+/// id — and a Process asserts that the answer refers to what it asked about.
+/// A scripted body therefore supports one placeholder: a string of the form
+/// `"$request:/json/pointer"` is replaced by the value at that pointer in the
+/// request body, so a fixture does not have to know a runtime-generated UUID.
+fn resolve_request_references(body: &Json, request: &Json) -> Json {
+    match body {
+        Json::String(value) => match value.strip_prefix("$request:") {
+            Some(pointer) => request.pointer(pointer).cloned().unwrap_or(Json::Null),
+            None => body.clone(),
+        },
+        Json::Array(values) => Json::Array(
+            values
+                .iter()
+                .map(|value| resolve_request_references(value, request))
+                .collect(),
+        ),
+        Json::Object(fields) => Json::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), resolve_request_references(value, request)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[derive(Default)]
 struct StubState {
     scripts: HashMap<String, Vec<ScriptedResponse>>,
@@ -157,7 +186,8 @@ pub fn spawn() -> ProviderStub {
                     // Take the scripted answer before recording, so a queue of
                     // one response cannot be consumed twice by concurrent
                     // attempts and the recorded order stays the arrival order.
-                    let response = stub.answer(&call.path);
+                    let mut response = stub.answer(&call.path);
+                    response.body = resolve_request_references(&response.body, &call.body);
                     stub.record(call);
                     write_response(&mut stream, &response);
                 }
