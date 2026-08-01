@@ -63,8 +63,15 @@ services:
   # One-shot bucket setup: a private bucket for ordinary attachments, and a
   # second one served anonymously for attachments declared public — which is
   # also how a deployment would separate them in production.
+  #
+  # Behind a profile so it never joins `up --wait`: that flag treats a container
+  # exiting as a failure even when it exits 0, which would make `make db-up`
+  # report an error after doing exactly the right thing. `docker compose run`
+  # enables a service's own profile, so starting it by name still works — see
+  # `make db-up` and the CI job, which both run it as an explicit step.
   minio-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    profiles: ["init"]
     depends_on:
       minio:
         condition: service_healthy

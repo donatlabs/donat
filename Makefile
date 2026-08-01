@@ -28,9 +28,12 @@ export CONFORMANCE_PG_URL
 export CONFORMANCE_MYSQL_URL
 export CONFORMANCE_CLICKHOUSE_URL
 
-# Start all disposable external database services used by the backend matrix.
+# Start every disposable external service the conformance harness uses: the
+# database matrix, and the object store file attachments require. Bucket setup
+# is a separate step because a one-shot container cannot satisfy `--wait`.
 db-up:
 	$(CONFORMANCE_COMPOSE) up -d --wait
+	$(CONFORMANCE_COMPOSE) run --rm minio-init
 
 db-down:
 	$(CONFORMANCE_COMPOSE) down --remove-orphans
