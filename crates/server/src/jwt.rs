@@ -834,6 +834,82 @@ mod tests {
         assert_eq!(e.code, "access-denied");
     }
 
+    /// The claims_map the petshop example ships with its IdP profile
+    /// (`examples/petshop/auth.env`), against payloads copied from tokens the
+    /// example's provider actually issues: roles at the top level, per-user
+    /// attributes nested under `custom`. `x-donat-user-id` — which every
+    /// customer row filter in that example compares against
+    /// `customer.customer_id` — is populated from the token with no header
+    /// involved.
+    fn petshop_claims_map() -> JwtConfig {
+        config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":"customer",
+                "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}"#,
+        )
+    }
+
+    #[test]
+    fn petshop_claims_map_populates_user_id_from_the_token() {
+        let c = petshop_claims_map();
+
+        let alice = sign(&json!({
+            "iss": "http://localhost:8081/auth/v1/",
+            "aud": "petshop",
+            "sub": "rV1PzHSGqoFt5Eql2DUpc7XN",
+            "typ": "Bearer",
+            "azp": "petshop",
+            "scope": "openid donat",
+            "roles": ["customer"],
+            "custom": { "customer_id": "customer-1" },
+        }));
+        let s = c.session(&alice, None, false).unwrap();
+        assert_eq!(s.role, "customer");
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("customer-1")
+        );
+
+        // A second shopper gets their own id from their own token.
+        let bob = sign(&json!({
+            "roles": ["customer"],
+            "custom": { "customer_id": "customer-2" },
+        }));
+        let s = c.session(&bob, None, false).unwrap();
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("customer-2")
+        );
+
+        // The token bounds the roles: a shopper cannot ask for `staff`.
+        let e = c.session(&alice, Some("staff"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+    }
+
+    /// Staff have no `customer_id` attribute, so their tokens carry no
+    /// `custom` object at all. The `default` in the mapping is what keeps that
+    /// a valid login; the empty value matches no `customer.customer_id`.
+    #[test]
+    fn petshop_claims_map_admits_a_token_without_the_custom_attribute() {
+        let sam = sign(&json!({ "roles": ["staff"], "scope": "openid donat" }));
+
+        let s = petshop_claims_map().session(&sam, Some("staff"), false).unwrap();
+        assert_eq!(s.role, "staff");
+        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some(""));
+
+        // Without the default the same token is rejected outright.
+        let no_default = config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":"customer",
+                "x-donat-user-id":{"path":"$.custom.customer_id"}}"#,
+        );
+        let e = no_default.session(&sam, Some("staff"), false).unwrap_err();
+        assert_eq!(e.code, "jwt-invalid-claims");
+        assert_eq!(e.message, "invalid claims_map entry for x-donat-user-id");
+    }
+
     #[test]
     fn claims_map_accepts_hasura_role_claims() {
         let c = config(

@@ -23,6 +23,9 @@ services:
     # network. Add a `ports:` mapping if you want to inspect it with psql.
     volumes:
       - petshop-db:/var/lib/postgresql/data
+      # Creates the database and role for the optional IdP (profile `auth`).
+      # Entrypoint scripts run only on first initialization of the volume.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Check over TCP (-h 127.0.0.1), not the unix socket: on first init the
       # official image runs a socket-only temp server, so a socket pg_isready
@@ -116,6 +119,62 @@ services:
       - ./metadata:/metadata:ro
     restart: "no"
 
+  # The identity provider, enabled only with the `auth` env file:
+  #
+  #   docker compose --env-file auth.env up
+  #
+  # Opt-in on purpose — the minimal path stays four services and needs no
+  # login. Everything it serves (client, roles, users, the `customer_id`
+  # attribute) is declared in ./bootstrap and versioned with this example, so
+  # there is nothing to click in its admin UI.
+  #
+  # Note that Rauthy applies ./bootstrap only while initializing an empty
+  # database. Editing those files later does nothing until the volume is
+  # recreated with `docker compose down -v`.
+  rauthy:
+    profiles: ["auth"]
+    image: ghcr.io/sebadob/rauthy:0.36.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Its own database inside the Postgres this example already runs, created
+      # by ./initdb/10-rauthy-database.sql. Identity data never shares a
+      # database with the data plane.
+      HIQLITE: "false"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: rauthy
+      PG_PASSWORD: rauthy
+      PG_DB_NAME: rauthy
+      # Plain HTTP on the compose network. A real deployment terminates TLS in
+      # front of it; these three settings exist so the demo needs no certs.
+      LISTEN_SCHEME: http
+      COOKIE_MODE: danger-insecure
+      HQL_INSECURE_COOKIE: "true"
+      PUB_URL: localhost:8081
+      # Mandatory even with hiqlite off (the cluster section is always parsed).
+      HQL_NODE_ID: "1"
+      HQL_SECRET_RAFT: petshop-demo-raft-secret
+      HQL_SECRET_API: petshop-demo-api-secret
+      # Passkey/WebAuthn origin. Mandatory even though the demo users log in
+      # with a password.
+      RP_ID: localhost
+      RP_ORIGIN: http://localhost:8081
+      RP_NAME: Petshop demo
+      # Demo key. Generate your own for anything real:
+      #   head -c 32 /dev/urandom | base64
+      ENC_KEYS: petshop/bOdFPFIWcLJ1VVhTyoyP9cpoGriUl1wdZLGtd2Ztz7M=
+      ENC_KEY_ACTIVE: petshop
+      BOOTSTRAP_ADMIN_EMAIL: admin@petshop.local
+      BOOTSTRAP_ADMIN_PASSWORD_PLAIN: petshop-demo-password
+      BOOTSTRAP_DIR: /bootstrap
+    volumes:
+      - ./bootstrap:/bootstrap:ro
+    ports:
+      # 8081 on the host: the engine already owns 8080.
+      - "8081:8080"
+
   engine:
     # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
     #   ENGINE_TAG=v1.2.3 docker compose up
@@ -136,6 +195,12 @@ services:
       DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
       # Requests with no/role-less auth fall back to the public catalog role.
       DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      # Empty unless auth.env is passed, and an unparseable value simply
+      # leaves JWT mode off — so the default run behaves exactly as before.
+      # With it, a bearer token from the IdP is verified against its JWKS and
+      # `claims_map` turns the token's claims into session variables, so
+      # X-Donat-User-Id arrives from the token instead of from a header.
+      DONAT_GRAPHQL_JWT_SECRET: ${PETSHOP_JWT_CONFIG-}
     volumes:
       - ./metadata:/metadata:ro
     ports:

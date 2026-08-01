@@ -1,0 +1,8 @@
+[
+    {
+        "name": "donat",
+        "attr_include_access": [
+            "customer_id"
+        ]
+    }
+]
