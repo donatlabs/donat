@@ -156,12 +156,33 @@ fn trace_mutation_sql(root: &donat_ir::MutationRoot, sql: &str) {
                 "executing command mutation"
             );
         }
+        // The statement carries a day-scoped signing key and a finished
+        // signed URL. Neither belongs in a log that a request can grow.
+        donat_ir::MutationRoot::RequestFileUpload { request, .. } => {
+            tracing::trace!(
+                target: "donat::sql",
+                attachment = %request.attachment,
+                statement = "file upload request",
+                "executing file upload request"
+            );
+        }
         donat_ir::MutationRoot::FunctionCall { .. }
         | donat_ir::MutationRoot::Insert { .. }
         | donat_ir::MutationRoot::Update { .. }
         | donat_ir::MutationRoot::Delete { .. }
         | donat_ir::MutationRoot::Typename { .. } => {
-            tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+            // A mutation that returns a file column carries the day-scoped
+            // signing key in its statement, so that one is described rather
+            // than printed. Everything else logs in full, as before.
+            if sql.contains("donat.s3_presigned_url(") {
+                tracing::trace!(
+                    target: "donat::sql",
+                    statement = "mutation returning a file column",
+                    "executing mutation"
+                );
+            } else {
+                tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+            }
         }
     }
 }
@@ -738,6 +759,13 @@ async fn execute_parsed_full(
     if let Err(error) = planner.set_relay(relay) {
         return ok(error.to_graphql());
     }
+    // File attachments: the request's clock and signing material. Every URL in
+    // this response is signed against them, so they are resolved once here and
+    // never per row.
+    let storage_context = state.storage_request_context();
+    if let Some(storage) = storage_context.as_ref() {
+        planner.set_storage(storage);
+    }
     // Introspection operations are answered from the type system directly.
     if let Some(result) = donat_schema::execute_multi_source_introspection(
         &planner,
@@ -893,6 +921,7 @@ async fn execute_parsed_full(
                                 donat_ir::MutationRoot::Delete { delete, .. } => &delete.table,
                                 donat_ir::MutationRoot::FunctionCall { .. }
                                 | donat_ir::MutationRoot::Command { .. }
+                                | donat_ir::MutationRoot::RequestFileUpload { .. }
                                 | donat_ir::MutationRoot::Typename { .. } => return None,
                             };
                             let key = format!("{}.{}", table.schema, table.name);
@@ -940,6 +969,7 @@ async fn execute_parsed_full(
                         | donat_ir::MutationRoot::Update { alias, .. }
                         | donat_ir::MutationRoot::Delete { alias, .. }
                         | donat_ir::MutationRoot::Command { alias, .. }
+                        | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
                     (
@@ -2690,6 +2720,8 @@ mod tests {
             allowlist_enabled: false,
             subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
             subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            storage: Arc::new(donat_storage::StorageRegistry::default()),
+            external_base_url: String::new(),
         })
     }
 

@@ -1,10 +1,9 @@
 # Petshop example
 
-A classic pet-store running on **donat** — a small catalogue of pets in
-categories, customers, and their orders — wired up with the permission set a
-normal store needs: a public catalogue, authenticated shoppers, and store
-staff. Every access goes through an explicit role permission — there is no
-admin role.
+A pet store running on **donat** — a catalogue of products and their variants,
+customers, carts and orders — wired up with the permission set a normal store
+needs: a public catalogue, authenticated shoppers, and store staff. Every
+access goes through an explicit role permission — there is no admin role.
 
 ```
 docker compose up
@@ -72,24 +71,39 @@ curl -s localhost:8080/v1/graphql \
 
 ## Data model
 
-| Table        | Purpose                                            |
-|--------------|----------------------------------------------------|
-| `category`   | Catalogue sections (Dogs, Cats, …)                 |
-| `pet`        | Items for sale, with `status` available/pending/sold |
-| `customer`   | Shoppers; `id` is the `X-Donat-User-Id` value     |
-| `orders`     | A customer's order with a fulfilment `status`      |
-| `order_item` | Line items linking an order to pets                |
+| Table             | Purpose                                                       |
+|-------------------|---------------------------------------------------------------|
+| `category`        | Catalogue sections (Dogs, Cats, Reptiles)                      |
+| `product`         | A catalogue entry with a `status` of draft/published/archived  |
+| `product_variant` | What is actually bought: SKU, price, `active` flag             |
+| `inventory_stock` | On-hand and reserved counts per variant                        |
+| `customer`        | Shoppers; `customer_id` is the `X-Donat-User-Id` value         |
+| `customer_address`| Delivery addresses owned by one customer                       |
+| `cart`, `cart_line` | An open basket and its lines                                 |
+| `orders`, `order_line` | A placed order and its priced lines                       |
+| `payment`, `shipment`, `refund` | The money and fulfilment records              |
 
-Relationships: `pet.category`, `category.pets`, `orders.customer`,
-`customer.orders`, `orders.items`, `order_item.order`, `order_item.pet`.
+Relationships: `product.category`, `category.products`, `product.variants`,
+`product_variant.stock`, `cart.lines`, `cart_line.variant`, `orders.customer`,
+`customer.orders`, `orders.lines`.
+
+Another 57 relations exist for the declarative domain below — quotes,
+allocations, returns, subscriptions, vendor payouts. They are tracked inline in
+[`tables.yaml`](metadata/databases/default/tables/tables.yaml) and reachable
+only through Commands, never as generic CRUD roots.
 
 ## Roles
 
 | Role        | Who                | Can do                                                                 |
 |-------------|--------------------|-----------------------------------------------------------------------|
-| `anonymous` | unauthenticated    | Browse categories and **available** pets only. No customer/order data.|
-| `customer`  | a logged-in shopper| See own profile/orders, browse available pets, place orders for self.  |
-| `staff`     | store employee     | Full inventory CRUD, read every customer/order, update order status.   |
+| `anonymous` | unauthenticated    | Browse categories and **published** products with their active variants. No customer, cart or order data. |
+| `customer`  | a logged-in shopper| Own profile, addresses, cart and orders; browse the public catalogue.  |
+| `staff`     | store employee     | Catalogue and inventory CRUD, read every customer and order.           |
+
+The domain Commands add narrower worker roles — `fulfilment`, `support`,
+`payment_worker`, `subscription_worker`, `veterinary_reviewer`, `vendor`,
+`groomer` and others. Each is an ordinary explicit role with its own table
+permissions; none of them is privileged.
 
 There is **no admin role**: every request runs as one of the roles above,
 each scoped by its explicit permissions. `anonymous` is the
@@ -103,54 +117,60 @@ production, issue JWTs instead of passing roles by hand.
 
 All examples below `POST` to `http://localhost:8080/v1/graphql`.
 
+The catalogue and cart-line requests are taken verbatim from
+[`fixtures/petshop`](../../crates/conformance/fixtures/petshop), so their
+shapes are what CI asserts rather than what someone remembered. The others use
+the same roles and permissions but are not themselves fixtures.
+
 ### Public catalogue (anonymous)
 
-No headers needed — only the 4 available pets come back; `Nemo` (sold) and
-`Shadow` (pending) are filtered out by the permission.
+No headers needed. Only published products and active variants come back; the
+draft `turtle-heat-lamp` and the inactive heat-lamp variant are filtered out by
+the permission.
 
 ```bash
 curl -s localhost:8080/v1/graphql -H 'content-type: application/json' -d '{
-  "query": "{ category { name pets { name price status } } }"
+  "query": "{ product(where: {status: {_eq: \"published\"}}, order_by: {slug: asc}) { slug variants(order_by: {sku: asc}) { sku price_minor currency stock { available_quantity } } } }"
 }'
 ```
 
-### Shopper (customer, impersonated as customer id 1)
+### Shopper (customer, impersonated as `customer-1`)
 
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' \
   -H 'x-donat-role: customer' \
-  -H 'x-donat-user-id: 1' \
-  -d '{ "query": "{ customer { name email orders { id status items { quantity pet { name } } } } }" }'
+  -H 'x-donat-user-id: customer-1' \
+  -d '{ "query": "{ customer { customer_id name email } orders { id order_status total_minor } }" }'
 ```
 
-Returns only customer `1`'s own profile and orders — `customer 2`'s data is
-invisible. Browsing `pet` still shows only available pets.
+Returns only `customer-1`'s own profile and orders — `customer-2`'s rows are
+invisible, and asking for them by id returns an empty list rather than an error.
 
-Place an order (the `customer_id` is forced to the session user by a preset, so
-shoppers cannot order on someone else's behalf):
+Add a line to the cart. The upsert edits the existing line instead of creating
+a second one, and the cart must be the caller's own and still open — both are
+permission predicates, not application code:
 
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' \
   -H 'x-donat-role: customer' \
-  -H 'x-donat-user-id: 1' \
-  -d '{ "query": "mutation { insert_orders_one(object: {status: \"placed\"}) { id customer_id status } }" }'
+  -H 'x-donat-user-id: customer-1' \
+  -d '{ "query": "mutation { insert_cart_line(objects: [{cart_id: 1, variant_id: 1, quantity: 1}], on_conflict: {constraint: cart_line_cart_id_variant_id_key, update_columns: [quantity]}) { returning { cart_id variant_id quantity } } }" }'
 ```
 
 ### Store staff
 
-Staff see every pet (including sold/pending) and every order, and can change an
-order's fulfilment status:
+Staff see every product, including drafts, and own the catalogue:
 
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
   -H 'x-donat-admin-secret: petshop-secret' \
   -H 'x-donat-role: staff' \
-  -d '{ "query": "mutation { update_orders(where: {id: {_eq: 1}}, _set: {status: \"shipped\"}) { affected_rows } }" }'
+  -d '{ "query": "mutation { update_product(where: {slug: {_eq: \"turtle-heat-lamp\"}}, _set: {status: \"published\"}) { affected_rows } }" }'
 ```
 
 > A request with **no** role — even with the secret — runs as `anonymous`
@@ -158,6 +178,140 @@ curl -s localhost:8080/v1/graphql \
 > across all customers, ask as `staff`. (If `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
 > were unset, a trusted role-less request would instead be rejected with
 > `x-donat-role header is required`.)
+
+## Per-role value validators
+
+A permission answers two different questions, and they are written separately.
+`check` and `filter` decide **who may write which row**. A `validate` list
+decides **what the value may be**, over the row as written — after presets and
+after column defaults, because the gate reads the rows the statement returns
+rather than the object that was submitted.
+
+This is the rule a database `CHECK` cannot express, because a `CHECK` binds
+every writer at once. `cart_line.quantity` keeps its `> 0` constraint in the
+schema, for everyone. The ceiling belongs to one role:
+
+```yaml
+# metadata/databases/default/tables/public_cart_line.yaml
+insert_permissions:
+  - role: customer
+    permission:
+      check: { cart: { customer_id: { _eq: X-Donat-User-Id } } }
+      columns: [cart_id, variant_id, quantity]
+      validate:
+        - expression: 'quantity <= 20'
+          message: a cart line is limited to 20 units
+```
+
+A shopper asking for 21 gets that sentence back, with code `validation-failed`,
+and nothing is written. A wholesale Command writing the same table is not a
+shopper and does not inherit the limit.
+
+### Nulls are declared, never inferred
+
+Expressions are the rule profile from [`rules.yaml`](metadata/rules.yaml), which
+refuses to read a nullable value — so `quality_grade > 3` on a nullable column
+does not compile, and writing `is_null(quality_grade) || quality_grade > 3`
+does not rescue it either: the second arm still reads a nullable value. Say
+which one you mean:
+
+```yaml
+# public_product_variant.yaml — a null is refused, and named as a null
+validate:
+  - not_null: quality_grade
+    message: quality_grade cannot be null
+  - expression: 'quality_grade > 3'
+    message: quality_grade must be greater than 3
+
+# public_product.yaml — a null is fine; a value that is there must be usable
+validate:
+  - expression: 'size(description) >= 20'
+    when_present: description
+    message: description must be at least 20 characters when present
+```
+
+Entries run in document order and the first violated one is what the caller
+reads. `not_null` also makes the comparison below it typeable; `when_present`
+refines its column inside its own entry only. Forgetting either is a
+**deployment** error naming the table, role and entry — `donat validate`
+reports it and the engine refuses to serve, rather than failing a request
+later.
+
+Four properties hold regardless of how a list is written: a validator passes
+only on TRUE, so an unknown value never satisfies one; a permission failure is
+reported before any validator; an upsert is held to both the insert and the
+update list; and a role that inherits a permission inherits its validators
+with it. See
+[ADR-032](../../knowledgebase/declarative-saas/decisions/032-permission-validators-declare-presence.md)
+for what is deliberately refused instead of enforced.
+
+## Attaching a file
+
+`customer.avatar` is declared as a file column in
+[`public_customer.yaml`](metadata/databases/default/tables/public_customer.yaml),
+backed by the object store in [`storage.yaml`](metadata/storage.yaml) — MinIO
+in this compose, any S3 in production. It carries
+no role list: a customer may upload one because the table's update permission
+lets it write that column, and may read one back because its select permission
+exposes it.
+
+Ask for a URL:
+
+```sh
+curl -s localhost:8080/v1/graphql \
+  -H 'X-Donat-Admin-Secret: petshop-secret' \
+  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -d '{"query":"mutation { donat_request_file_upload(attachment: public_customer_avatar, file_name: \"me.png\", media_type: \"image/png\", size: 1234) { id url method headers { name value } expires_at } }"}'
+```
+
+Upload the bytes to the returned `url` with the returned `method` and every
+header it returned — the URL is presigned by the store and binds them — then
+tell the engine the upload finished, and store the id like any other column
+value:
+
+```sh
+curl -s -X PUT --data-binary @me.png \
+  -H 'Content-Type: image/png' -H "Content-Length: $(stat -c%s me.png)" "<url>"
+curl -s -X POST "<complete_url>"
+
+curl -s localhost:8080/v1/graphql \
+  -H 'X-Donat-Admin-Secret: petshop-secret' \
+  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -d '{"query":"mutation { update_customer(where: {customer_id: {_eq: \"c-1001\"}}, _set: {avatar: \"<id>\"}) { affected_rows } }"}'
+```
+
+The update carries a gate in the same statement: an upload that is not this
+session's, was already used, expired, or whose bytes never arrived fails the
+mutation instead of storing a dangling id.
+
+Reading the column gives an object rather than a bare id. `avatar` is declared
+`public: true`, so its URL is stable, unsigned and immutable — a CDN in front of
+`/v1/files/public/…` caches it forever, and a subscription on the customer never
+sees it change. A private attachment would instead get a short-lived URL the
+database signs while producing the row:
+
+```sh
+curl -s localhost:8080/v1/graphql \
+  -H 'X-Donat-Admin-Secret: petshop-secret' \
+  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -d '{"query":"{ customer { name avatar { id file_name size url } } }"}'
+```
+
+Clearing the column or deleting the row does not delete the object: a mutation
+is database work and performs no file I/O. The background collector reclaims
+objects nothing references any more, and uploads nobody ever claimed, on the
+schedule in `storage.yaml` (one day by default).
+
+Pointing this at a real S3 bucket changes only `storage.yaml`. Note the
+`complete_url` step: it is not a formality. The bytes go straight from the
+browser to the store, so the engine asks the store what it actually holds, then
+moves the verified object out from under the presigned URL, which cannot be
+revoked.
+
+Two more things `storage.yaml` decides here: how many unclaimed uploads one
+shopper may hold at a time, and which browser origins may upload directly. Both
+are counted or checked by the engine, because neither is visible to a reverse
+proxy.
 
 ## REST endpoints
 
@@ -170,41 +324,40 @@ you get depend on your role. Path params, query-string keys, and JSON-body keys
 bind the operation's GraphQL variables (precedence: path > query > body). A
 successful call returns the GraphQL `data` object directly.
 
-| Method & URL                  | Saved query     | Notes                                    |
-|-------------------------------|-----------------|------------------------------------------|
-| `GET /api/rest/pet/:id`       | `PetById`       | One pet; available-only for shoppers     |
-| `GET /api/rest/pets?limit=N`  | `AvailablePets` | The catalogue the role may browse        |
-| `GET /api/rest/categories`    | `Categories`    | Categories with their visible pets        |
-| `POST /api/rest/pet`          | `CreatePet`     | Add inventory (staff only); body → vars  |
+| Method & URL                     | Saved query      | Notes                                        |
+|----------------------------------|------------------|----------------------------------------------|
+| `GET /api/rest/products`         | `Products`       | The published catalogue the role may browse  |
+| `GET /api/rest/products/:slug`   | `ProductBySlug`  | One published product by slug                |
+| `GET /api/rest/cart`             | `Cart`           | The caller's own cart                        |
+| `PUT /api/rest/cart/lines`       | `UpsertCartLine` | The permission-aware cart-line upsert        |
+| `GET /api/rest/orders`           | `Orders`         | The caller's own orders                      |
+| `GET /api/rest/orders/:id`       | `OrderById`      | One caller-visible order by UUID             |
 
 Browse the catalogue as the public (no headers → `anonymous`):
 
 ```bash
-curl -s 'localhost:8080/api/rest/pets?limit=3'
-# {"pet":[{"id":1,"name":"Rex",...},{"id":2,...},{"id":3,...}]}
+curl -s 'localhost:8080/api/rest/products'
 ```
 
-The permission travels with the route — `Shadow` (pending) is hidden from the
-public but visible to staff:
+The permission travels with the route: the same URL as a shopper returns that
+shopper's own cart, and as `anonymous` returns nothing to see — the route does
+not carry an identity of its own.
 
 ```bash
-curl -s localhost:8080/api/rest/pet/4
-# {"pet_by_pk":null}
-
-curl -s localhost:8080/api/rest/pet/4 \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff'
-# {"pet_by_pk":{"id":4,"name":"Shadow","status":"pending",...,"category":{"name":"Cats"}}}
+curl -s localhost:8080/api/rest/cart \
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' -H 'x-donat-user-id: customer-1'
 ```
 
-Add a pet (staff only — the same call as `anonymous` comes back with a
-`validation-failed` error and changes nothing):
+A write goes through the same permissions, presets and validators as the
+GraphQL mutation it wraps — the body keys bind the operation's variables:
 
 ```bash
-curl -s localhost:8080/api/rest/pet \
+curl -s -X PUT localhost:8080/api/rest/cart/lines \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
-  -d '{"name":"Coco","category_id":3,"price":45,"status":"available","description":"Talkative parrot"}'
-# {"insert_pet":{"affected_rows":1,"returning":[{"id":7,"name":"Coco",...}]}}
+  -H 'x-donat-admin-secret: petshop-secret' \
+  -H 'x-donat-role: customer' -H 'x-donat-user-id: customer-1' \
+  -d '{"cart_id":1,"variant_id":1,"quantity":2}'
 ```
 
 An unknown route is `404`; a known route called with the wrong method is `405`.
@@ -237,12 +390,14 @@ curl -s localhost:8080/mcp \
   -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
         "name":"query",
-        "arguments":{"table":"pet","columns":["id","name","status"],
-                     "where":{"status":{"_eq":"pending"}},"order_by":{"id":"asc"}}}}'
-# result.structuredContent: [{"id":4,"name":"Shadow","status":"pending"}]
+        "arguments":{"table":"product","columns":["id","slug","status"],
+                     "where":{"status":{"_eq":"draft"}},"order_by":{"id":"asc"}}}}'
+# result.structuredContent: [{"id":3,"slug":"turtle-heat-lamp","status":"draft"}]
 ```
 
-Insert as staff (`update`/`delete` take a `where` + `set` the same way):
+Insert as staff (`update`/`delete` take a `where` + `set` the same way). The
+write is held to the same validators as every other surface — a `title` under
+three characters comes back as `validation-failed` here too:
 
 ```bash
 curl -s localhost:8080/mcp \
@@ -250,9 +405,9 @@ curl -s localhost:8080/mcp \
   -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
         "name":"insert",
-        "arguments":{"table":"pet","objects":[{"name":"Milo","category_id":2,"price":80,"status":"available"}],
-                     "returning":["id","name"]}}}'
-# result.structuredContent: {"affected_rows":1,"returning":[{"id":8,"name":"Milo"}]}
+        "arguments":{"table":"product","objects":[{"category_id":2,"slug":"cat-tunnel","title":"Cat tunnel","status":"draft"}],
+                     "returning":["id","slug"]}}}'
+# result.structuredContent: {"affected_rows":1,"returning":[{"id":4,"slug":"cat-tunnel"}]}
 ```
 
 `list_tables` reports only what the role may touch — as `staff` it lists every

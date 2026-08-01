@@ -400,6 +400,13 @@ pub struct AppState {
     /// socket subscription must not reserve a database execution slot between
     /// polls.
     pub subscription_poll_permits: Arc<tokio::sync::Semaphore>,
+    /// File attachments (spec 008), resolved once before the listener binds.
+    /// Empty when no table declares a file column, and then nothing about the
+    /// feature is mounted.
+    pub storage: Arc<donat_storage::StorageRegistry>,
+    /// DONAT_EXTERNAL_URL: the absolute prefix for engine-served file URLs.
+    /// Empty means same-origin, which is what a browser needs by default.
+    pub external_base_url: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -1511,6 +1518,18 @@ impl AppState {
         self.engine.read().await.clone()
     }
 
+    /// The signing material one request plans against: the registry plus the
+    /// clock every URL in the response is signed for. `None` when the
+    /// deployment declares no attachments.
+    pub fn storage_request_context(&self) -> Option<donat_storage::RequestContext<'_>> {
+        (!self.storage.is_empty()).then(|| donat_storage::RequestContext {
+            registry: &self.storage,
+            now: chrono::Utc::now(),
+            fixed_upload_id: None,
+            external_base_url: self.external_base_url.clone(),
+        })
+    }
+
     async fn publish_candidate(
         &self,
         candidate: Result<Engine, PlanError>,
@@ -1708,6 +1727,7 @@ impl AppState {
                     | donat_ir::MutationRoot::Update { alias, .. }
                     | donat_ir::MutationRoot::Delete { alias, .. }
                     | donat_ir::MutationRoot::Command { alias, .. }
+                    | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
                 (alias, donat_sqlgen::sqlite_mutation_plan(m))
@@ -1854,6 +1874,7 @@ impl AppState {
                     }
                     donat_ir::MutationRoot::FunctionCall { alias, .. }
                     | donat_ir::MutationRoot::Command { alias, .. }
+                    | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
                 };
                 (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
@@ -2382,6 +2403,8 @@ mod snapshot_tests {
             allowlist_enabled: false,
             subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
             subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            storage: Arc::new(donat_storage::StorageRegistry::default()),
+            external_base_url: String::new(),
         }
     }
 

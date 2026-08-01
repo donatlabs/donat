@@ -65,6 +65,12 @@ pub struct Metadata {
     /// metadata remains transport-neutral and MCP exposure is opt-in.
     #[serde(default, skip_serializing_if = "McpMetadata::is_empty")]
     pub mcp: McpMetadata,
+    /// File attachments from the optional `storage.yaml` section: backends,
+    /// the columns bound to them, and the collector's windows. An absent file
+    /// leaves the whole feature — routes, root field, catalog, background
+    /// task — out of the deployment.
+    #[serde(default, skip_serializing_if = "StorageMetadata::is_empty")]
+    pub storage: StorageMetadata,
 }
 
 /// One named deployment instance of a connector module compiled into the
@@ -2435,6 +2441,12 @@ pub struct TableEntry {
     /// Webhooks fired on row insert/update/delete (Donat event triggers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_triggers: Vec<EventTrigger>,
+    /// Columns of this table that hold a file reference. Declared here, beside
+    /// the table's permissions, because an attachment is a property of the
+    /// table — `storage.yaml` carries only the deployment-wide backends,
+    /// signing, and collector windows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 /// A table event trigger: a webhook called when rows change. Field names
@@ -2760,5 +2772,331 @@ impl Serialize for Columns {
             Columns::Star => serializer.serialize_str("*"),
             Columns::List(cols) => cols.serialize(serializer),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage: file attachments (spec 008)
+// ---------------------------------------------------------------------------
+
+/// The optional `storage.yaml` section: the deployment-wide half of file
+/// attachments — where bytes go, how URLs are signed, and how often the
+/// collector runs. Which column holds a file is declared on the table itself
+/// ([`TableEntry::attachments`]).
+///
+/// Presence is what enables the feature. When the file is absent this value is
+/// empty, and no route, root field, catalog access, or background task exists —
+/// a deployment without attachments is byte-for-byte unaffected.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<StorageBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<StorageSigning>,
+    #[serde(default, skip_serializing_if = "StorageGc::is_default")]
+    pub gc: StorageGc,
+    /// What one session may ask for. Without these a caller can mint upload
+    /// rows as fast as it can send requests.
+    #[serde(default, skip_serializing_if = "StorageLimits::is_default")]
+    pub limits: StorageLimits,
+    /// Which session variable identifies the uploader.
+    #[serde(default, skip_serializing_if = "StorageIdentity::is_default")]
+    pub identity: StorageIdentity,
+    /// Browser origins allowed to upload and download directly.
+    #[serde(default, skip_serializing_if = "StorageCors::is_empty")]
+    pub cors: StorageCors,
+}
+
+impl StorageMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+
+    pub fn backend(&self, name: &str) -> Option<&StorageBackend> {
+        self.backends.iter().find(|b| b.name() == name)
+    }
+}
+
+/// One resolved attachment: the table-local declaration together with the
+/// source and table it was declared on. This is what every consumer downstream
+/// of metadata works with, so nobody re-walks the source tree.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedAttachment<'a> {
+    pub source: &'a str,
+    pub table: &'a QualifiedTable,
+    pub attachment: &'a Attachment,
+}
+
+impl ResolvedAttachment<'_> {
+    /// `<schema>.<table>.<column>` — the stable identity recorded on every
+    /// upload row and used as the GraphQL enum value.
+    pub fn key(&self) -> String {
+        format!("{}.{}", self.table, self.attachment.column)
+    }
+}
+
+impl Metadata {
+    /// Every file column declared anywhere in the metadata, in source and then
+    /// table declaration order.
+    pub fn attachments(&self) -> impl Iterator<Item = ResolvedAttachment<'_>> {
+        self.sources.iter().flat_map(|source| {
+            source.tables.iter().flat_map(move |table| {
+                table
+                    .attachments
+                    .iter()
+                    .map(move |attachment| ResolvedAttachment {
+                        source: &source.name,
+                        table: &table.table,
+                        attachment,
+                    })
+            })
+        })
+    }
+
+    /// Look one up by its `<schema>.<table>.<column>` key.
+    pub fn attachment(&self, key: &str) -> Option<ResolvedAttachment<'_>> {
+        self.attachments().find(|a| a.key() == key)
+    }
+}
+
+/// One deployment-configured place to put bytes. `kind` selects the compiled
+/// implementation; metadata can never supply code or a request shape.
+/// Where bytes go. The enum has one variant today, and stays an enum because
+/// the tag is what a deployment writes: adding a second store must not change
+/// the shape of the first.
+///
+/// There is deliberately no local-disk store. Serving bytes from the engine's
+/// own origin put caller-supplied content next to the GraphQL API, made the
+/// engine a file server on the request path, and needed a second signing
+/// scheme, a second download route, and a traversal guard — all to reimplement
+/// what an object store already does.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageBackend {
+    S3(S3Backend),
+}
+
+impl StorageBackend {
+    pub fn name(&self) -> &str {
+        match self {
+            StorageBackend::S3(b) => &b.name,
+        }
+    }
+}
+
+/// An S3-compatible bucket. `endpoint` and `path_style` cover MinIO and the
+/// other compatible hosts; credentials are [`SecretRef`] only, never literals.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Backend {
+    pub name: String,
+    pub bucket: String,
+    pub region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub path_style: bool,
+    pub access_key_id: SecretRef,
+    pub secret_access_key: SecretRef,
+    /// Where a **public** attachment's stable URL is rooted: a CDN
+    /// distribution, or the bucket's own public origin. Required before an
+    /// attachment on this backend may be declared public — the engine will not
+    /// guess that a bucket is world-readable, and a guessed origin would
+    /// publish links that 403.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+}
+
+/// URL lifetimes, and the secret behind the one URL the engine serves itself.
+///
+/// Upload and download URLs are presigned by the object store, but the call a
+/// client makes to report an upload finished is answered by the engine, and
+/// that capability carries no other proof.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSigning {
+    pub secret: SecretRef,
+    #[serde(default = "default_upload_ttl_seconds")]
+    pub upload_ttl_seconds: u32,
+    #[serde(default = "default_download_ttl_seconds")]
+    pub download_ttl_seconds: u32,
+}
+
+fn default_upload_ttl_seconds() -> u32 {
+    900
+}
+
+fn default_download_ttl_seconds() -> u32 {
+    300
+}
+
+/// One column of this table holds a file reference. Many files per entity is an
+/// ordinary child table carrying such a column.
+///
+/// There is deliberately no role list here. Who may upload into the column is
+/// exactly who may write it — the table's own `insert_permissions` and
+/// `update_permissions`, resolved through inherited roles like every other
+/// write — and who may read a download URL is who its `select_permissions`
+/// already let read the column. A second role list beside those would be a
+/// second authorization model to keep in sync.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    pub column: String,
+    pub backend: String,
+    pub max_bytes: u64,
+    /// Exact media types, no wildcards. Empty accepts any type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_types: Vec<String>,
+    /// The stored bytes are world-readable.
+    ///
+    /// A public attachment is served from a stable, immutable, unsigned URL, so
+    /// a CDN and a browser can cache it forever and a subscription never sees
+    /// it change. That is a real grant, never inferred: anyone holding the URL
+    /// reads the file regardless of the row's select permission, which still
+    /// governs who can *discover* the URL.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
+}
+
+impl Attachment {
+    pub fn allows_media_type(&self, media_type: &str) -> bool {
+        self.media_types.is_empty() || self.media_types.iter().any(|m| m == media_type)
+    }
+}
+
+/// Collector windows. Every window is a whole number of days and defaults to
+/// one, which is the interval the feature was asked for.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageGc {
+    #[serde(default = "default_gc_days")]
+    pub every_days: u32,
+    /// How long an upload nobody claimed is kept past its expiry.
+    #[serde(default = "default_gc_days")]
+    pub pending_ttl_days: u32,
+    /// How long a claimed object no row references any more is kept.
+    #[serde(default = "default_gc_days")]
+    pub orphan_grace_days: u32,
+}
+
+fn default_gc_days() -> u32 {
+    1
+}
+
+/// What one session may ask of the upload surface.
+///
+/// The engine does no network-level rate limiting anywhere — that belongs to
+/// the deployment's reverse proxy. These are the two limits a proxy cannot
+/// express, because both are counted against rows the engine owns.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageLimits {
+    /// Unclaimed uploads one session may hold at a time.
+    #[serde(default = "default_pending_uploads")]
+    pub pending_uploads_per_session: u32,
+    /// Upload URLs one session may mint per minute.
+    #[serde(default = "default_uploads_per_minute")]
+    pub uploads_per_minute_per_session: u32,
+}
+
+fn default_pending_uploads() -> u32 {
+    20
+}
+
+fn default_uploads_per_minute() -> u32 {
+    60
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self {
+            pending_uploads_per_session: default_pending_uploads(),
+            uploads_per_minute_per_session: default_uploads_per_minute(),
+        }
+    }
+}
+
+impl StorageLimits {
+    fn is_default(&self) -> bool {
+        self.pending_uploads_per_session == default_pending_uploads()
+            && self.uploads_per_minute_per_session == default_uploads_per_minute()
+    }
+}
+
+/// Which session variable identifies the uploader.
+///
+/// An upload is bound to the session that asked for it, and this says what
+/// "the session" means. A deployment that identifies tenants by something other
+/// than a user id must say so, or the binding silently weakens to the role.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIdentity {
+    #[serde(default = "default_identity_variable")]
+    pub session_variable: String,
+}
+
+fn default_identity_variable() -> String {
+    "x-donat-user-id".to_string()
+}
+
+impl Default for StorageIdentity {
+    fn default() -> Self {
+        Self {
+            session_variable: default_identity_variable(),
+        }
+    }
+}
+
+impl StorageIdentity {
+    fn is_default(&self) -> bool {
+        self.session_variable == default_identity_variable()
+    }
+}
+
+/// Browser origins allowed to reach the file routes directly.
+///
+/// A browser uploading to a signed URL does so cross-origin, and no other
+/// engine surface needs this, so it is declared here rather than globally.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCors {
+    /// Exact origins, or a single `"*"`. Empty mounts no CORS at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_origins: Vec<String>,
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_seconds: u32,
+}
+
+fn default_cors_max_age() -> u32 {
+    600
+}
+
+impl StorageCors {
+    pub fn is_empty(&self) -> bool {
+        self.allow_origins.is_empty()
+    }
+
+    pub fn allows(&self, origin: &str) -> bool {
+        self.allow_origins.iter().any(|o| o == "*" || o == origin)
+    }
+}
+
+impl Default for StorageGc {
+    fn default() -> Self {
+        Self {
+            every_days: default_gc_days(),
+            pending_ttl_days: default_gc_days(),
+            orphan_grace_days: default_gc_days(),
+        }
+    }
+}
+
+impl StorageGc {
+    fn is_default(&self) -> bool {
+        self.every_days == default_gc_days()
+            && self.pending_ttl_days == default_gc_days()
+            && self.orphan_grace_days == default_gc_days()
     }
 }

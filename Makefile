@@ -11,13 +11,16 @@ test:
 # instances, one database per suite.
 conformance:
 	cargo build -p donat-server --bin donat
-	@PG_URL="$${CONFORMANCE_PG_URL}" cargo test -p donat-conformance -- --test-threads=4
+	@PG_URL="$${CONFORMANCE_PG_URL}" S3_URL="$(CONFORMANCE_S3_URL)" \
+		cargo test -p donat-conformance -- --test-threads=4
 
 CONFORMANCE_COMPOSE ?= docker compose -f docker-compose.conformance.yml
 CONFORMANCE_BACKENDS ?= postgres sqlite mysql clickhouse
 CONFORMANCE_PG_URL ?= $(if $(PG_URL),$(PG_URL),postgresql://postgres:postgres@127.0.0.1:15432/postgres)
 CONFORMANCE_MYSQL_URL ?= $(if $(MYSQL_URL),$(MYSQL_URL),mysql://root:root@127.0.0.1:13306/donat)
 CONFORMANCE_CLICKHOUSE_URL ?= $(if $(CLICKHOUSE_URL),$(CLICKHOUSE_URL),http://donat:donat@127.0.0.1:18123)
+# File attachments need an S3-compatible store; the compose file runs MinIO.
+CONFORMANCE_S3_URL ?= $(if $(S3_URL),$(S3_URL),http://127.0.0.1:19000)
 
 # Export indirection variables so recipes never expand credential-bearing URLs
 # into the command text printed by make (including `make -n`).
@@ -25,9 +28,12 @@ export CONFORMANCE_PG_URL
 export CONFORMANCE_MYSQL_URL
 export CONFORMANCE_CLICKHOUSE_URL
 
-# Start all disposable external database services used by the backend matrix.
+# Start every disposable external service the conformance harness uses: the
+# database matrix, and the object store file attachments require. Bucket setup
+# is a separate step because a one-shot container cannot satisfy `--wait`.
 db-up:
 	$(CONFORMANCE_COMPOSE) up -d --wait
+	$(CONFORMANCE_COMPOSE) run --rm minio-init
 
 db-down:
 	$(CONFORMANCE_COMPOSE) down --remove-orphans

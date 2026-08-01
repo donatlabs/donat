@@ -212,6 +212,22 @@ pub enum FieldValue {
     NestedConnection { conn: Box<Connection> },
     /// Placeholder for a remote-schema join, filled in post-processing.
     RemoteJoin { spec: RemoteJoinSpec },
+    /// A declared file column (spec 008). The column itself holds an upload
+    /// id; what the caller sees is an object assembled from
+    /// `donat.file_uploads`, including a URL the database signs per row.
+    ///
+    /// `url_sql` is a complete SQL expression rendered by the planner from
+    /// request-time material (the day-scoped key, the credential scope, the
+    /// expiry). It contains the placeholder `{row}` wherever the upload row's
+    /// alias belongs; sqlgen owns that alias and substitutes it.
+    FileRef {
+        column: String,
+        /// `<schema>.<table>.<column>` — the projection is narrowed to an
+        /// upload claimed for exactly this column.
+        attachment: String,
+        url_sql: String,
+        fields: Vec<FileRefOutput>,
+    },
     /// Scalar computed field: `"schema"."fn"("outer".*[, session])`.
     ComputedScalar {
         schema: String,
@@ -220,6 +236,26 @@ pub enum FieldValue {
         /// Inherited-role cell guard.
         guard: Option<Box<BoolExp>>,
     },
+}
+
+/// One selected field inside a file column's object.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileRefOutput {
+    pub alias: String,
+    pub field: FileRefField,
+}
+
+/// The closed set of fields a file column exposes. It is closed on purpose:
+/// nothing here lets a caller reach a column of `donat.file_uploads` that the
+/// engine did not choose to publish, such as the session that uploaded it.
+#[derive(Debug, Clone, Serialize)]
+pub enum FileRefField {
+    Id,
+    FileName,
+    MediaType,
+    Size,
+    Url,
+    Typename { value: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -424,6 +460,11 @@ pub enum MutationRoot {
     Command {
         alias: String,
         command: CommandMutation,
+    },
+    /// Mint one upload URL (spec 008).
+    RequestFileUpload {
+        alias: String,
+        request: FileUploadRequest,
     },
     Typename {
         alias: String,
@@ -1014,6 +1055,9 @@ pub struct InsertMutation {
     /// Ordered per-role value validators over the inserted rows. The first
     /// violated entry is the one reported.
     pub validators: Vec<RowValidator>,
+    /// File uploads this write claims (spec 008), one entry per declared file
+    /// column that received a value.
+    pub file_claims: Vec<FileClaim>,
     pub output: MutationOutput,
 }
 
@@ -1054,6 +1098,8 @@ pub struct UpdateMutation {
     pub check_path: String,
     /// Ordered per-role value validators over the updated rows.
     pub validators: Vec<RowValidator>,
+    /// File uploads this write claims (spec 008).
+    pub file_claims: Vec<FileClaim>,
     pub output: MutationOutput,
 }
 
@@ -1080,6 +1126,81 @@ pub struct DeleteMutation {
     pub table: Table,
     pub predicate: Option<BoolExp>,
     pub output: MutationOutput,
+}
+
+/// Moving one upload from 'pending' to 'claimed', inside the same statement as
+/// the write that stores its id.
+///
+/// The gate is intentionally all-or-nothing and reports one message for every
+/// cause — unknown id, already claimed, expired, another column, another
+/// session — so a caller cannot use the refusal to probe other sessions'
+/// uploads.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileClaim {
+    /// `<schema>.<table>.<column>` of the declaring attachment.
+    pub attachment: String,
+    /// The upload ids submitted for this column, already deduplicated.
+    pub upload_ids: Vec<String>,
+    /// The requesting role, which must match the row that minted the upload.
+    pub role: String,
+    /// The requesting session identity, or None for a session without one.
+    pub session_key: Option<String>,
+    pub error_path: String,
+    pub message: String,
+}
+
+/// Minting one upload URL: insert a 'pending' row and return the signed URL the
+/// database builds for it, in one statement.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileUploadRequest {
+    /// Engine-chosen id. It is supplied by the caller of the planner so the
+    /// statement stays deterministic and snapshot-testable.
+    pub upload_id: String,
+    pub attachment: String,
+    pub backend: String,
+    pub object_key: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub declared_bytes: i64,
+    /// Set at request time for backends that enforce the length themselves
+    /// (a presigned PUT signed over content-length); left None when the bytes
+    /// must still be measured by the engine.
+    pub byte_size: Option<i64>,
+    pub role: String,
+    pub session_key: Option<String>,
+    pub expires_at_epoch: i64,
+    /// Unclaimed uploads this session may hold, and how many it may mint per
+    /// minute. Both are counted inside the statement, so the refusal costs one
+    /// round trip and cannot race with a concurrent request.
+    pub max_pending_per_session: u32,
+    pub max_per_minute_per_session: u32,
+    pub limit_message: String,
+    pub error_path: String,
+    /// The upload URL expression, with `{row}` for the inserted row's alias.
+    pub url_sql: String,
+    /// The completion URL expression, or None when the backend needs no
+    /// completion call. Same placeholder.
+    pub complete_url_sql: Option<String>,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub fields: Vec<FileUploadOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileUploadOutput {
+    pub alias: String,
+    pub field: FileUploadField,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum FileUploadField {
+    Id,
+    Url,
+    Method,
+    Headers,
+    CompleteUrl,
+    ExpiresAt,
+    Typename { value: String },
 }
 
 /// What a mutation returns.

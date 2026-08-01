@@ -259,6 +259,11 @@ pub struct Planner<'a> {
     /// contributes command type information for GraphQL validation, while the
     /// cached role schemas and request planner still enforce explicit roles.
     pub(crate) expose_all_commands: bool,
+    /// Request-time material for file attachments (spec 008): the resolved
+    /// storage registry plus the clock the URLs in this response are signed
+    /// against. Absent while compiling the role-independent schema, which needs
+    /// the *shape* of a file column but never a signature.
+    pub(crate) storage: Option<&'a donat_storage::RequestContext<'a>>,
     index: Arc<PlannerIndex>,
 }
 
@@ -484,8 +489,54 @@ impl<'a> Planner<'a> {
             finalized_commands: command_config.finalized_commands,
             source_kind: command_config.source_kind,
             expose_all_commands: command_config.expose_all_commands,
+            storage: None,
             index,
         }
+    }
+
+    /// Attach the request's storage material. Without it a file column still
+    /// exists and still type-checks; only signing a URL for it is refused.
+    pub fn with_storage(mut self, storage: &'a donat_storage::RequestContext<'a>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Whether this planner's source is Postgres. File attachments and
+    /// commands are Postgres-only.
+    pub(crate) fn is_postgres_source(&self) -> bool {
+        self.source_kind == SourceKind::Postgres
+    }
+
+    /// The attachment declared on `table.column`, if any.
+    ///
+    /// This is on the per-column path of every selection, so it must not scan:
+    /// callers that already hold the table entry pass it, and a table with no
+    /// attachments costs one empty-slice check.
+    pub(crate) fn attachment_of<'e>(
+        entry: &'e donat_metadata::TableEntry,
+        column: &str,
+    ) -> Option<&'e donat_metadata::Attachment> {
+        if entry.attachments.is_empty() {
+            return None;
+        }
+        entry.attachments.iter().find(|a| a.column == column)
+    }
+
+    /// The same, when only the table's name is known — a nested insert, which
+    /// happens once per relationship rather than once per column.
+    pub(crate) fn attachment_for(
+        &self,
+        table: &donat_metadata::QualifiedTable,
+        column: &str,
+    ) -> Option<&'a donat_metadata::Attachment> {
+        self.tables
+            .iter()
+            .find(|entry| {
+                !entry.attachments.is_empty()
+                    && entry.table.schema() == table.schema()
+                    && entry.table.name() == table.name()
+            })
+            .and_then(|entry| entry.attachments.iter().find(|a| a.column == column))
     }
 
     /// All query/subscription roots owned by this source, independent of a
@@ -527,7 +578,14 @@ impl<'a> Planner<'a> {
             .then_some(())
             .into_iter()
             .flat_map(|_| self.mutation_function_roots.keys().map(String::as_str));
-        table_roots.chain(function_roots)
+        // The upload root belongs to whichever source declares a file column.
+        // Role visibility is still decided when the field is planned; this is
+        // only composite routing.
+        let file_upload_root = (self.source_kind == SourceKind::Postgres
+            && self.capabilities.mutations
+            && self.tables().iter().any(|t| !t.attachments.is_empty()))
+        .then_some(crate::plan_mutation::FILE_UPLOAD_ROOT);
+        table_roots.chain(function_roots).chain(file_upload_root)
     }
 
     pub(crate) fn command_named(&self, name: &str) -> Option<&CompiledCommand> {
@@ -1514,6 +1572,100 @@ impl<'a> Planner<'a> {
         self.combined_filter(ctx, &ctx.perms, session, path)
     }
 
+    /// A declared file column's projection (spec 008): the closed object built
+    /// from the upload row the column points at.
+    ///
+    /// The URL inside it is signed by the database, per row, from material this
+    /// request resolved — so the response is still assembled entirely in
+    /// Postgres and the engine never walks it.
+    fn file_ref_value(
+        &self,
+        ctx: &TableCtx<'a>,
+        db_name: &str,
+        field: &GqlField<'static, String>,
+        fragments: &Fragments,
+        vars: &JsonMap<String, Json>,
+        path: &str,
+    ) -> Result<FieldValue, PlanError> {
+        let type_name = format!("{}_{db_name}_file", ctx.type_name);
+        if field.selection_set.items.is_empty() {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "field '{}' of type '{type_name}' must have a selection of subfields",
+                    field.name
+                ),
+            ));
+        }
+
+        let Some(storage) = self.storage else {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "field '{}' is not available: this deployment has no storage configuration",
+                    field.name
+                ),
+            ));
+        };
+        let attachment_key = format!(
+            "{}.{}.{db_name}",
+            ctx.entry.table.schema(),
+            ctx.entry.table.name()
+        );
+        let Some(spec) = storage.registry.attachment(&attachment_key) else {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "field '{}' is not available: its storage backend is not configured",
+                    field.name
+                ),
+            ));
+        };
+        let Some(url_sql) = storage.download_url_sql(spec) else {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "field '{}' is not available: its storage backend cannot sign a URL",
+                    field.name
+                ),
+            ));
+        };
+
+        let mut fields = Vec::new();
+        for selected in flatten(&field.selection_set, fragments, vars, Some(&type_name))? {
+            let alias = selected
+                .alias
+                .clone()
+                .unwrap_or_else(|| selected.name.clone());
+            let fpath = format!("{path}.{alias}");
+            if !selected.arguments.is_empty() {
+                return Err(unexpected_arg(&fpath, &selected.arguments[0].0));
+            }
+            let resolved = match selected.name.as_str() {
+                "id" => FileRefField::Id,
+                "file_name" => FileRefField::FileName,
+                "media_type" => FileRefField::MediaType,
+                "size" => FileRefField::Size,
+                "url" => FileRefField::Url,
+                "__typename" => FileRefField::Typename {
+                    value: type_name.clone(),
+                },
+                _ => return Err(field_not_found(&fpath, &selected.name, &type_name)),
+            };
+            fields.push(FileRefOutput {
+                alias,
+                field: resolved,
+            });
+        }
+
+        Ok(FieldValue::FileRef {
+            column: db_name.to_string(),
+            attachment: attachment_key,
+            url_sql,
+            fields,
+        })
+    }
+
     /// OR of the given permissions' row filters; None when any of them is
     /// unrestricted (or the list is empty).
     pub(crate) fn combined_filter(
@@ -1613,6 +1765,23 @@ impl<'a> Planner<'a> {
                     });
                     continue;
                 }
+            }
+
+            // A declared file column? It is an ordinary column the role must
+            // already be allowed to read; what changes is only its shape.
+            if let Some(db_name) = ctx
+                .column_db_name(&field.name)
+                .filter(|c| ctx.column_allowed(c))
+                && Self::attachment_of(ctx.entry, &db_name).is_some()
+            {
+                if !field.arguments.is_empty() {
+                    return Err(unexpected_arg(&fpath, &field.arguments[0].0));
+                }
+                out.push(OutputField {
+                    alias,
+                    value: self.file_ref_value(ctx, &db_name, field, fragments, vars, &fpath)?,
+                });
+                continue;
             }
 
             // Plain column?

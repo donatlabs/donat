@@ -84,11 +84,20 @@ jobs:
         run: cargo test -p donat-server --test clickhouse_runtime -- --include-ignored --nocapture
         env:
           DONAT_EXTERNAL_DB_TESTS: "1"
+      # File attachments have no local-disk backend: every one of their cases
+      # goes to an S3-compatible store, so the Postgres reference leg needs one
+      # exactly the way it needs a database.
+      - name: Start the object store
+        if: matrix.backend == 'postgres'
+        run: |
+          docker compose -f docker-compose.conformance.yml up -d --wait minio
+          docker compose -f docker-compose.conformance.yml run --rm minio-init
       - name: Full Postgres reference conformance
         if: matrix.backend == 'postgres'
         run: env -u MYSQL_URL -u CLICKHOUSE_URL cargo test -p donat-conformance -- --test-threads=4
         env:
           RUST_BACKTRACE: "1"
+          S3_URL: http://127.0.0.1:19000
 
   backend-core-gate:
     name: Conformance matrix
