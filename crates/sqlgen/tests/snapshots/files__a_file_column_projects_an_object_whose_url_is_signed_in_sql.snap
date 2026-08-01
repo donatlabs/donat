@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/files.rs
+expression: sql
+---
+SELECT json_build_object('pet', (SELECT coalesce(json_agg("_t2".j), '[]'::json) FROM (SELECT json_build_object('id', "_t0"."id", 'photo', (SELECT json_build_object('id', "_t1"."id", 'file_name', "_t1"."file_name", 'media_type', "_t1"."media_type", 'size', "_t1"."byte_size", 'url', donat.s3_presigned_url('\xa1b2'::bytea, 'AKIA%2F…', '20260801/eu-central-1/s3/aws4_request', '20260801T120000Z', 300, 'https://bucket.s3.example', 'bucket.s3.example', '/' || "_t1".object_key, 'GET')) FROM donat.file_uploads "_t1" WHERE "_t1"."id" = "_t0"."photo" AND "_t1"."state" = 'claimed' AND "_t1"."attachment" = 'public.pet.photo')) AS j FROM "public"."pet" AS "_t0") AS "_t2")) AS root

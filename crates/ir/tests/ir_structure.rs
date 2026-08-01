@@ -202,6 +202,7 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
         }),
         check_path: "$.selectionSet.insert_author.args.objects".into(),
         validators: vec![],
+        file_claims: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),

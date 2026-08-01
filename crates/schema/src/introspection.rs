@@ -568,6 +568,33 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 .and_then(|c| c.column_config.get(&col.name))
                 .and_then(|cc| cc.comment.as_deref());
             let gql_name = ctx.column_graphql_name(&col.name);
+            // A declared file column keeps its place among the columns — it is
+            // still filterable and orderable by its id — but what it returns is
+            // the file object, so the schema must say so.
+            if let Some(attachment) = crate::plan::Planner::attachment_of(entry, &col.name) {
+                let file_type = format!("{base}_{}_file", attachment.column);
+                let text = non_null(named("SCALAR", "String"));
+                types.push(object_type(
+                    &file_type,
+                    vec![
+                        field("id", vec![], non_null(named("SCALAR", "uuid"))),
+                        field("file_name", vec![], text.clone()),
+                        field("media_type", vec![], text.clone()),
+                        field("size", vec![], named("SCALAR", "bigint")),
+                        field("url", vec![], text),
+                    ],
+                ));
+                scalars.insert("uuid".to_string());
+                scalars.insert("bigint".to_string());
+                let ty = if col.nullable {
+                    named("OBJECT", &file_type)
+                } else {
+                    non_null(named("OBJECT", &file_type))
+                };
+                fields.push(field_desc(&gql_name, vec![], ty, description));
+                select_columns.push(gql_name);
+                continue;
+            }
             fields.push(field_desc(&gql_name, vec![], ty, description));
             select_columns.push(gql_name);
         }
@@ -875,6 +902,59 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 named("OBJECT", &format!("{base}_mutation_response")),
             ));
         }
+    }
+
+    // File attachments: one root field, and it exists only for a role that may
+    // write some declared file column.
+    let writable_attachments = planner.writable_attachments(session);
+    if !writable_attachments.is_empty() {
+        let values: Vec<String> = writable_attachments
+            .iter()
+            .map(|(entry, attachment)| {
+                crate::plan_mutation::attachment_enum_value(entry, attachment)
+            })
+            .collect();
+        let value_refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        types.push(enum_type("donat_file_attachment", &value_refs));
+        types.push(object_type(
+            "donat_file_upload_header",
+            vec![
+                field("name", vec![], non_null(named("SCALAR", "String"))),
+                field("value", vec![], non_null(named("SCALAR", "String"))),
+            ],
+        ));
+        types.push(object_type(
+            "donat_file_upload",
+            vec![
+                field("id", vec![], non_null(named("SCALAR", "uuid"))),
+                field("url", vec![], non_null(named("SCALAR", "String"))),
+                field("method", vec![], non_null(named("SCALAR", "String"))),
+                field(
+                    "headers",
+                    vec![],
+                    non_null(list_of(non_null(named(
+                        "OBJECT",
+                        "donat_file_upload_header",
+                    )))),
+                ),
+                field("complete_url", vec![], named("SCALAR", "String")),
+                field("expires_at", vec![], non_null(named("SCALAR", "String"))),
+            ],
+        ));
+        scalars.insert("uuid".to_string());
+        mutation_fields.push(field(
+            "donat_request_file_upload",
+            vec![
+                input_value(
+                    "attachment",
+                    non_null(named("ENUM", "donat_file_attachment")),
+                ),
+                input_value("file_name", non_null(named("SCALAR", "String"))),
+                input_value("media_type", non_null(named("SCALAR", "String"))),
+                input_value("size", non_null(named("SCALAR", "Int"))),
+            ],
+            non_null(named("OBJECT", "donat_file_upload")),
+        ));
     }
 
     let mut emitted_command_input_types = std::collections::BTreeSet::new();
