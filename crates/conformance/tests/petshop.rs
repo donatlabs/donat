@@ -32,6 +32,13 @@ fn petshop_suite(name: &str) -> donat_conformance::Running {
         )
         .env("PETSHOP_PAYOUT_BASE_URL", "http://127.0.0.1:9")
         .env("PETSHOP_PAYOUT_API_TOKEN", "petshop-test-payout")
+        // The customer avatar is stored in an object store, and the engine
+        // still signs the call reporting an upload finished.
+        .env("PETSHOP_FILE_SIGNING_SECRET", "petshop-test-file-signing")
+        // The avatar column names an object store. These suites never upload,
+        // but the registry resolves every credential before the listener binds.
+        .env("PETSHOP_S3_KEY", "petshop-test-key")
+        .env("PETSHOP_S3_SECRET", "petshop-test-secret")
         .start();
     apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
     running
@@ -47,6 +54,13 @@ fn petshop_domain_suite(name: &str) -> donat_conformance::Running {
     let running = Suite::new(name)
         .initial_metadata(metadata)
         .admin_secret("petshop-secret")
+        // The tracked domain keeps its file column: an attachment is table
+        // metadata, not one of the runtime sections this suite strips.
+        .env("PETSHOP_FILE_SIGNING_SECRET", "petshop-test-file-signing")
+        // The avatar column names an object store. These suites never upload,
+        // but the registry resolves every credential before the listener binds.
+        .env("PETSHOP_S3_KEY", "petshop-test-key")
+        .env("PETSHOP_S3_SECRET", "petshop-test-secret")
         .start();
     apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
     running

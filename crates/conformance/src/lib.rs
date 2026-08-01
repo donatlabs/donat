@@ -23,6 +23,7 @@ use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
 pub mod cron_webhook;
+pub mod object_store;
 pub mod provider_stub;
 mod remote_graphql;
 
@@ -1011,6 +1012,7 @@ fn default_metadata_with_configuration(
         connectors: vec![],
         processes: vec![],
         mcp: Default::default(),
+        storage: Default::default(),
     }
 }
 
@@ -1720,6 +1722,7 @@ impl Running {
                 command_update_permissions: vec![],
                 command_delete_permissions: vec![],
                 event_triggers: vec![],
+                attachments: vec![],
             });
         }
         let entry = source
@@ -2333,6 +2336,13 @@ impl Running {
             )
             .unwrap();
         }
+        if !md.storage.is_empty() {
+            std::fs::write(
+                dir.join("storage.yaml"),
+                serde_yaml::to_string(&md.storage).expect("serialize storage"),
+            )
+            .unwrap();
+        }
         if md.mcp.is_configured() {
             std::fs::write(
                 dir.join("mcp.yaml"),
@@ -2598,6 +2608,30 @@ impl Running {
         self.metadata.borrow_mut().cron_triggers.push(trigger);
     }
 
+    /// Configure the deployment's storage backends before the engine starts.
+    pub fn set_storage(&self, storage: donat_metadata::StorageMetadata) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "set_storage must be called before the engine spawns"
+        );
+        self.metadata.borrow_mut().storage = storage;
+    }
+
+    /// Declare a file column on a tracked table before the engine starts.
+    pub fn add_attachment(&self, table_name: &str, attachment: Json) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "add_attachment must be called before the engine spawns"
+        );
+        let table = QualifiedTable::Qualified {
+            schema: self.schema.clone(),
+            name: table_name.to_string(),
+        };
+        let attachment: donat_metadata::Attachment =
+            serde_json::from_value(attachment).expect("fixture attachment");
+        self.with_table(&table, |entry| entry.attachments.push(attachment));
+    }
+
     /// Configure the explicit MCP publication metadata before the engine
     /// starts. This always writes an `mcp.yaml`, including for an empty
     /// deny-all publication list.
@@ -2670,6 +2704,73 @@ impl Running {
             .expect("read raw HTTP response body")
             .to_vec();
         (status, body)
+    }
+
+    /// Issue an arbitrary-method request at a URL the engine handed out.
+    ///
+    /// File attachments give the caller a URL rather than an endpoint to
+    /// construct, so a test has to follow it exactly as a client would —
+    /// including a URL that points at the object store instead of the engine.
+    /// A path (rather than an absolute URL) is resolved against the engine.
+    pub fn request_url(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (u16, Vec<u8>) {
+        self.ensure_engine();
+        let url = if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
+            format!("{base}{url}")
+        };
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("valid HTTP method");
+        let mut request = self.http.request(method, url).body(body.to_vec());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().expect("raw HTTP request failed");
+        let status = response.status().as_u16();
+        let body = response.bytes().expect("read response body").to_vec();
+        (status, body)
+    }
+
+    /// Like [`Self::request_url`], but also returning the response headers
+    /// (lower-cased names) — a download's headers are part of its contract.
+    pub fn request_url_with_headers(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (u16, Vec<(String, String)>) {
+        self.ensure_engine();
+        let url = if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            let base = self.engine.borrow().as_ref().unwrap().base_url.clone();
+            format!("{base}{url}")
+        };
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("valid HTTP method");
+        let mut request = self.http.request(method, url).body(body.to_vec());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().expect("raw HTTP request failed");
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        (status, headers)
     }
 
     fn post_inner(
@@ -3565,6 +3666,7 @@ mod tests {
             "cron_triggers",
             "enabled_apis",
             "event_triggers",
+            "file_attachments",
             "graphql_mutations",
             "graphql_queries",
             "introspection_descriptions",
