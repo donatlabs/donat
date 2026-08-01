@@ -1,0 +1,17 @@
+[package]
+name = "donat-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "File attachments: the resolved storage registry and the URL signing shared by the planner and the server"
+
+[dependencies]
+donat-metadata = { path = "../metadata" }
+base64 = { workspace = true }
+chrono = { workspace = true }
+hmac = "0.12"
+sha2 = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
