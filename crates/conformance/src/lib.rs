@@ -3570,6 +3570,7 @@ mod tests {
             "introspection_descriptions",
             "jwk",
             "jwt",
+            "jwt_claims_map",
             "mcp_tools",
             "migrate",
             "petshop",
