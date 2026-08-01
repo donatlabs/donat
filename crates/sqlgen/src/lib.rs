@@ -4992,17 +4992,18 @@ pub fn quote_lit(s: &str) -> String {
     donat_backend::PostgresDialect.quote_literal(s)
 }
 
-/// Render a qualified SQL column reference for the declarative rule lowerer.
-///
-/// The rule crate intentionally receives no raw identifier rendering API: both
-/// components are quoted here before they can become a SQL fragment.
 /// The CTE that holds the rows an INSERT wrote. Rule lowering happens in the
 /// planner, before SQLgen picks a name, so the name is part of the contract
 /// between them rather than a local choice here.
 pub const INSERT_ROW_ALIAS: &str = "ins";
+
 /// The CTE that holds the rows an UPDATE wrote.
 pub const UPDATE_ROW_ALIAS: &str = "upd";
 
+/// Render a qualified SQL column reference for the declarative rule lowerer.
+///
+/// The rule crate intentionally receives no raw identifier rendering API: both
+/// components are quoted here before they can become a SQL fragment.
 pub fn rule_qualified_column(alias: &str, column: &str) -> String {
     format!("{}.{}", quote_ident(alias), quote_ident(column))
 }
@@ -5299,6 +5300,80 @@ mod dialect_dispatch_tests {
         assert!(
             !sql.contains("JSON_OBJECT"),
             "binary JSON reorders keys: {sql}"
+        );
+    }
+
+    /// The gate a permission validator renders, and the order it renders in.
+    ///
+    /// Everything asserted here was previously pinned only by the conformance
+    /// suite: a regression in the wrap order, the three-valued gate, the cast
+    /// or the literal escaping would have been invisible to this crate.
+    #[test]
+    fn permission_validators_render_inside_the_check_in_document_order() {
+        let insert = MutationRoot::Insert {
+            alias: "insert_note".into(),
+            insert: InsertMutation {
+                table: Table {
+                    schema: "public".into(),
+                    name: "note".into(),
+                },
+                columns: vec![("body".into(), "text".into())],
+                rows: vec![vec![Some(Scalar::Json(serde_json::json!("hi")))]],
+                nested_object_inserts: vec![],
+                on_conflict: None,
+                check: Some(BoolExp::Compare {
+                    column: "author_id".into(),
+                    pg_type: "text".into(),
+                    op: CompareOp::Eq(Scalar::Json(serde_json::json!("u1"))),
+                }),
+                check_path: "$.selectionSet.insert_note.args.objects".into(),
+                validators: vec![
+                    RowValidator {
+                        sql: r#"length("ins"."body") >= 3"#.into(),
+                        message: "body is too short".into(),
+                        error_path: "$.selectionSet.insert_note.args.objects".into(),
+                    },
+                    RowValidator {
+                        sql: r#"length("ins"."body") <= 400"#.into(),
+                        // An apostrophe must survive as a doubled quote, not
+                        // as a way out of the string literal.
+                        message: "body can't exceed 400 characters".into(),
+                        error_path: "$.selectionSet.insert_note.args.objects".into(),
+                    },
+                ],
+                output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
+                    alias: "affected_rows".into(),
+                }]),
+            },
+        };
+        let sql = mutation_to_sql(&insert);
+
+        // Three-valued: a validator passes only on TRUE, so an unknown value
+        // is a violation.
+        assert!(
+            sql.contains(r#"WHERE (length("ins"."body") >= 3) IS NOT TRUE"#),
+            "{sql}"
+        );
+        // jsonb from the error helper must be cast to match the json the rest
+        // of the expression produces.
+        assert!(
+            sql.contains("donat.raise_graphql_error('validation-failed'"),
+            "{sql}"
+        );
+        assert!(sql.contains(")::json ELSE"), "{sql}");
+        assert!(sql.contains("'body can''t exceed 400 characters'"), "{sql}");
+
+        // The permission check is outermost, so a role that may not write the
+        // row is never told about the value. Among validators the first
+        // declared entry is outermost, so document order is reported order.
+        let check_at = sql.find("donat.check_violation").expect("check gate");
+        let first_at = sql.find("'body is too short'").expect("first validator");
+        let second_at = sql
+            .find("'body can''t exceed 400 characters'")
+            .expect("second validator");
+        assert!(
+            check_at < first_at && first_at < second_at,
+            "check must wrap the validators, and validators keep document order: {sql}"
         );
     }
 

@@ -7,6 +7,25 @@ use std::collections::BTreeMap;
 
 use donat_backend::capabilities::{JsonOps, UpsertKind};
 use donat_ir::*;
+
+/// A write permission that can carry a `validate` list. Implemented only for
+/// the two permissions that have one, so a future third write shape cannot be
+/// wired up while quietly skipping its validators.
+pub(crate) trait HasValidators {
+    fn validators(&self) -> &[donat_metadata::PermissionValidator];
+}
+
+impl HasValidators for donat_metadata::InsertPermission {
+    fn validators(&self) -> &[donat_metadata::PermissionValidator] {
+        &self.validate
+    }
+}
+
+impl HasValidators for donat_metadata::UpdatePermission {
+    fn validators(&self) -> &[donat_metadata::PermissionValidator] {
+        &self.validate
+    }
+}
 use donat_metadata::{
     Columns, Command, CommandAggregate, CommandCondition as MetadataCommandCondition,
     CommandIdempotencyKey, CommandIdempotencyScope, CommandIdempotencyScopeSpec,
@@ -3552,12 +3571,34 @@ impl<'a> Planner<'a> {
 
         let check = self.parse_check_exp(&perm.check, ctx, session, path)?;
         let check_path = format!("{path}.args.objects");
-        let validators = self.validators.get(
-            &format!("{}.{}", ctx.info.schema, ctx.info.name),
-            &session.role,
+        let mut validators = self.resolved_validators(
+            ctx,
+            &ctx.entry.insert_permissions,
+            perm,
             crate::validators::ValidatorOp::Insert,
             &check_path,
         )?;
+        // An upsert writes through the same CTE with the role's update
+        // permission applied (presets and filter are already merged in
+        // `parse_on_conflict`), so the rows it touches must satisfy that
+        // permission's value contract too. Holding an upsert to both lists is
+        // stricter than holding it to whichever branch fired per row, and it
+        // is the only choice that cannot under-enforce: which branch a row
+        // took is not visible to the gate.
+        if on_conflict
+            .as_ref()
+            .is_some_and(|c| !c.update_columns.is_empty())
+            && let Some(update_perm) =
+                self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true)
+        {
+            validators.extend(self.resolved_validators(
+                ctx,
+                &ctx.entry.update_permissions,
+                update_perm,
+                crate::validators::ValidatorOp::UpsertUpdate,
+                &check_path,
+            )?);
+        }
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
@@ -3720,10 +3761,10 @@ impl<'a> Planner<'a> {
         // insert into a way around the role's own contract.
         let nested_path = format!("{path}.args.object.{key}.data");
         if !self
-            .validators
-            .get(
-                &format!("{}.{}", remote_ctx.info.schema, remote_ctx.info.name),
-                &session.role,
+            .resolved_validators(
+                &remote_ctx,
+                &remote_ctx.entry.insert_permissions,
+                remote_perm,
                 crate::validators::ValidatorOp::Insert,
                 &nested_path,
             )?
@@ -4054,9 +4095,10 @@ impl<'a> Planner<'a> {
             Some(check) => self.parse_check_exp(check, ctx, session, path)?,
             None => None,
         };
-        let validators = self.validators.get(
-            &format!("{}.{}", ctx.info.schema, ctx.info.name),
-            &session.role,
+        let validators = self.resolved_validators(
+            ctx,
+            &ctx.entry.update_permissions,
+            perm,
             crate::validators::ValidatorOp::Update,
             "$",
         )?;
@@ -4154,6 +4196,37 @@ impl<'a> Planner<'a> {
             predicate,
             output,
         })
+    }
+
+    /// The compiled validators of an already-resolved write permission.
+    ///
+    /// The lookup is keyed by the role that declared the permission, which
+    /// under inheritance is not the request role. If the permission cannot be
+    /// traced back to an entry in this list — which should not happen, since
+    /// resolution returned a reference into it — a declared list is refused
+    /// rather than skipped.
+    pub(crate) fn resolved_validators<T>(
+        &self,
+        ctx: &TableCtx<'a>,
+        list: &[donat_metadata::PermissionEntry<T>],
+        permission: &T,
+        op: crate::validators::ValidatorOp,
+        error_path: &str,
+    ) -> Result<Vec<donat_ir::RowValidator>, PlanError>
+    where
+        T: HasValidators,
+    {
+        if permission.validators().is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = format!("{}.{}", ctx.info.schema, ctx.info.name);
+        let Some(role) = Planner::declaring_role(list, permission) else {
+            return Err(PlanError::validation(
+                error_path,
+                format!("cannot resolve the role that declared the validators on {table}"),
+            ));
+        };
+        self.validators.get(&table, role, op, error_path)
     }
 
     /// Parse an insert/update `check` expression (None when empty).

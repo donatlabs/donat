@@ -692,6 +692,22 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The role whose metadata entry owns an already-resolved permission.
+    ///
+    /// Resolution walks role inheritance, so the permission a request used may
+    /// have been declared by an ancestor. Anything keyed on the declaring role
+    /// — the validator index, today — must ask for it rather than assume the
+    /// request role. Identity is by address: the reference came out of this
+    /// very list.
+    pub(crate) fn declaring_role<'x, T>(
+        list: &'x [donat_metadata::PermissionEntry<T>],
+        permission: &T,
+    ) -> Option<&'x str> {
+        list.iter()
+            .find(|entry| std::ptr::eq(&entry.permission, permission))
+            .map(|entry| entry.role.as_str())
+    }
+
     /// Resolve a non-select (mutation/function) permission for a role:
     /// a direct permission wins; otherwise the *immediate* parents'
     /// resolved permissions are inherited only when they don't conflict
@@ -808,6 +824,19 @@ impl<'a> Planner<'a> {
 
     /// Conflicting (non-inheritable) mutation permissions of inherited
     /// roles: (role, table name, permission kind).
+    /// Deploy-time problems with the write permissions' `validate` lists.
+    ///
+    /// The serving path refuses publication on these at boot. `donat validate`
+    /// is the gate that is supposed to say so *before* a deploy, so it has to
+    /// ask the same question rather than assume the index is clean.
+    pub fn validator_problems(&self, commands: &[donat_metadata::Command]) -> Vec<String> {
+        let mut problems = self.validators.errors().to_vec();
+        for source in &self.metadata.sources {
+            problems.extend(crate::validators::command_fallback_errors(source, commands));
+        }
+        problems
+    }
+
     pub fn mutation_permission_conflicts(&self) -> Vec<(String, String, &'static str)> {
         let mut out = vec![];
         for role in self.inherited_roles {

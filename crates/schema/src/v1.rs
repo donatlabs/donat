@@ -385,9 +385,10 @@ impl<'a> Planner<'a> {
             _ => Some(BoolExp::And(predicates)),
         };
 
-        let validators = self.validators.get(
-            &format!("{}.{}", ctx.info.schema, ctx.info.name),
-            &session.role,
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.update_permissions,
+            perm,
             crate::validators::ValidatorOp::Update,
             "$",
         )?;
@@ -637,9 +638,10 @@ impl<'a> Planner<'a> {
             }
         };
 
-        let validators = self.validators.get(
-            &format!("{}.{}", ctx.info.schema, ctx.info.name),
-            &session.role,
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.insert_permissions,
+            perm,
             crate::validators::ValidatorOp::Insert,
             "$",
         )?;

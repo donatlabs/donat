@@ -74,11 +74,29 @@ carrier label, a grading floor for staff-created variants. A nullable column
 is usable in an expression only after its presence is declared, which is a
 deploy-time error when forgotten rather than a surprise in production.
 
+The lookup is keyed by the role that *declared* the permission, not the role
+on the request. Role inheritance grants a child the parent's write permission
+wholesale, so keying on the request role would hand the child an empty
+validator list and drop the parent's checks. An upsert is held to both the
+insert and the update permission's lists: its DO UPDATE rows are written by the
+insert statement, and which branch a row took is not visible to the gate, so
+the only choice that cannot under-enforce is to apply both.
+
+Validators are supported on Postgres sources only. The SQLite and MySQL
+mutation executors never read the compiled list, and their introspection
+reports pg-shaped type names, so a list declared there would compile and then
+be dropped; it refuses publication instead.
+
 A `validate` list on a command permission (ADR-019) refuses publication. The
 shapes are shared, so the key parses, but command steps write through their own
 per-step CTEs and the command planner does not consult this index — accepting it
 would silently drop a declared check. Commands state the same rule in an
-`assert` step, which is already their idiom.
+`assert` step, which is already their idiom. The same holds for the reachable
+half of that hole: a command step whose role has no command permission falls
+back to the *ordinary* permission, which is the one carrying validators, so
+that combination refuses publication too. The scan ignores inheritance when
+deciding whether a command permission exists, which can refuse a deployment
+that would have been safe but cannot miss one that would not.
 
 Nested object inserts are refused when the target table's role declares
 validators: the child rows land in a CTE the planner does not name, so the

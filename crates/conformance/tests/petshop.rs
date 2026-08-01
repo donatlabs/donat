@@ -267,9 +267,8 @@ fn permissions() {
 }
 
 /// Permission validators are a per-role value contract, not a table
-/// constraint. The suite is intentionally red until the engine compiles the
-/// `validate` list: today the metadata loader ignores the unknown key, so
-/// every rejection case succeeds instead.
+/// constraint: the same column is written by migrations and commands without
+/// them, and only the role that declared them is held to them.
 #[test]
 fn permission_validators() {
     let running = petshop_suite("petshop_validation");

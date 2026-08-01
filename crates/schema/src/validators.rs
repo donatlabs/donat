@@ -28,13 +28,19 @@ use crate::PlanError;
 pub(crate) enum ValidatorOp {
     Insert,
     Update,
+    /// The update permission's list, lowered against the INSERT CTE.
+    ///
+    /// An upsert writes its DO UPDATE rows through the insert statement, so
+    /// the update contract has to be read off the same rows the insert
+    /// returns. Same list, same messages, different alias.
+    UpsertUpdate,
 }
 
 impl ValidatorOp {
     fn label(self) -> &'static str {
         match self {
             Self::Insert => "insert",
-            Self::Update => "update",
+            Self::Update | Self::UpsertUpdate => "update",
         }
     }
 
@@ -43,7 +49,7 @@ impl ValidatorOp {
     /// rather than a local choice on either side.
     fn row_alias(self) -> &'static str {
         match self {
-            Self::Insert => donat_sqlgen::INSERT_ROW_ALIAS,
+            Self::Insert | Self::UpsertUpdate => donat_sqlgen::INSERT_ROW_ALIAS,
             Self::Update => donat_sqlgen::UPDATE_ROW_ALIAS,
         }
     }
@@ -69,6 +75,15 @@ impl ValidatorIndex {
         &self.errors
     }
 
+    /// The validators of one already-resolved permission.
+    ///
+    /// `role` is the role that *declared* the permission, not the role on the
+    /// request. Those differ under role inheritance: a child role with no
+    /// entry of its own is granted the parent's permission wholesale, and
+    /// keying on the request role would hand it an empty validator list —
+    /// silently dropping the parent's checks for the child. The caller
+    /// therefore passes the declaring role, which it already knows because it
+    /// resolved the permission.
     pub(crate) fn get(
         &self,
         table: &str,
@@ -93,6 +108,13 @@ impl ValidatorIndex {
     /// Compile every `validate` list declared by one source.
     pub(crate) fn build(source: &Source, catalog: &Catalog) -> Self {
         let mut index = Self::default();
+        // Only the Postgres mutation renderer emits the gate. SQLite and
+        // MySQL have their own mutation executors that never read the
+        // compiled list, and their introspection reports pg-shaped type names
+        // — so a validate list there would compile cleanly and then be
+        // dropped on the floor. Refusing is the difference between "not
+        // supported yet" and "silently not enforced".
+        let postgres = matches!(source.kind, donat_metadata::SourceKind::Postgres);
         for entry in &source.tables {
             let key = format!("{}.{}", entry.table.schema(), entry.table.name());
             // Command permissions reuse the same shapes (ADR-019), so they
@@ -118,6 +140,26 @@ impl ValidatorIndex {
                     ));
                 }
             }
+            if !postgres {
+                let declared = entry
+                    .insert_permissions
+                    .iter()
+                    .map(|permission| (&permission.role, &permission.permission.validate))
+                    .chain(
+                        entry
+                            .update_permissions
+                            .iter()
+                            .map(|permission| (&permission.role, &permission.permission.validate)),
+                    )
+                    .find(|(_, validators)| !validators.is_empty());
+                if let Some((role, _)) = declared {
+                    index.errors.push(format!(
+                        "{role} permission on {key}: `validate` is supported only on a Postgres source; this source is {:?}",
+                        source.kind
+                    ));
+                }
+                continue;
+            }
             let Some(columns) = catalog_columns(catalog, entry) else {
                 // An untracked or not-yet-introspected table cannot type an
                 // expression. Ordinary planning already refuses it, so there
@@ -134,6 +176,13 @@ impl ValidatorIndex {
                 );
             }
             for permission in &entry.update_permissions {
+                index.insert_key(
+                    &key,
+                    &permission.role,
+                    ValidatorOp::UpsertUpdate,
+                    &permission.permission.validate,
+                    columns,
+                );
                 index.insert_key(
                     &key,
                     &permission.role,
@@ -164,6 +213,97 @@ impl ValidatorIndex {
         self.compiled
             .insert((table.to_owned(), role.to_owned(), op), compiled);
     }
+}
+
+/// Command steps that would fall back to an ordinary permission carrying a
+/// `validate` list.
+///
+/// `resolve_command_role_perm` prefers a command permission and falls back to
+/// the ordinary one when the role declares none. The ordinary permissions are
+/// exactly the ones that carry validators, and the command planner never
+/// consults this index — so the fallback would apply the permission's columns,
+/// filter, check and presets while quietly dropping its value contract.
+///
+/// The scan is deliberately conservative: it ignores role inheritance when
+/// deciding whether a command permission exists, so it can refuse a
+/// deployment that would in fact have been safe, but it cannot miss one that
+/// would not.
+pub(crate) fn command_fallback_errors(
+    source: &Source,
+    commands: &[donat_metadata::Command],
+) -> Vec<String> {
+    use donat_metadata::CommandStepOperation as Step;
+
+    let mut errors = Vec::new();
+    for command in commands.iter().filter(|c| c.source == source.name) {
+        for step in &command.steps {
+            let (table, op) = match &step.operation {
+                Step::Insert { insert } => (&insert.table, ValidatorOp::Insert),
+                Step::InsertMany { insert_many } => (&insert_many.table, ValidatorOp::Insert),
+                Step::InsertWhen { insert_when } => (&insert_when.table, ValidatorOp::Insert),
+                Step::Update { update } => (&update.table, ValidatorOp::Update),
+                Step::UpdateMany { update_many } => (&update_many.table, ValidatorOp::Update),
+                Step::UpdateWhen { update_when } => (&update_when.table, ValidatorOp::Update),
+                _ => continue,
+            };
+            let Some(entry) = source.tables.iter().find(|entry| {
+                entry.table.schema() == table.schema() && entry.table.name() == table.name()
+            }) else {
+                continue;
+            };
+            let (command_list, ordinary): (Vec<&String>, Vec<(&String, &[PermissionValidator])>) =
+                match op {
+                    ValidatorOp::Insert => (
+                        entry
+                            .command_insert_permissions
+                            .iter()
+                            .map(|permission| &permission.role)
+                            .collect(),
+                        entry
+                            .insert_permissions
+                            .iter()
+                            .map(|permission| {
+                                (&permission.role, permission.permission.validate.as_slice())
+                            })
+                            .collect(),
+                    ),
+                    ValidatorOp::Update | ValidatorOp::UpsertUpdate => (
+                        entry
+                            .command_update_permissions
+                            .iter()
+                            .map(|permission| &permission.role)
+                            .collect(),
+                        entry
+                            .update_permissions
+                            .iter()
+                            .map(|permission| {
+                                (&permission.role, permission.permission.validate.as_slice())
+                            })
+                            .collect(),
+                    ),
+                };
+            for invoker in &command.permissions {
+                if command_list.iter().any(|role| **role == invoker.role) {
+                    continue;
+                }
+                let falls_back_to_validators = ordinary
+                    .iter()
+                    .any(|(role, validators)| **role == invoker.role && !validators.is_empty());
+                if falls_back_to_validators {
+                    errors.push(format!(
+                        "command '{}' step '{}' writes {}.{} as role {}, which would fall back to an ordinary {} permission carrying a `validate` list; that list cannot be enforced on a command step — state the rule in an `assert` step, or give the role its own command permission",
+                        command.name,
+                        step.name,
+                        table.schema(),
+                        table.name(),
+                        invoker.role,
+                        op.label(),
+                    ));
+                }
+            }
+        }
+    }
+    errors
 }
 
 fn catalog_columns<'a>(catalog: &'a Catalog, entry: &TableEntry) -> Option<&'a [ColumnInfo]> {
@@ -294,8 +434,14 @@ fn compile_validators(
                 }));
                 let sql =
                     lower_postgres(rule, &bindings).map_err(|error| format!("{at}: {error}"))?;
+                // A CASE rather than `OR`: Postgres does not promise to
+                // evaluate `OR` left to right, so a lowered expression that
+                // can raise on a NULL operand would raise instead of being
+                // skipped. The profile cannot produce such an expression
+                // today; the CASE costs nothing and does not depend on that
+                // staying true.
                 let sql = match presence_guard {
-                    Some(guard) => format!("({guard}) OR ({sql})"),
+                    Some(guard) => format!("CASE WHEN {guard} THEN TRUE ELSE ({sql}) END"),
                     None => sql,
                 };
                 compiled.push(RowValidator {
@@ -498,7 +644,7 @@ mod tests {
         assert!(
             compiled[0]
                 .sql
-                .starts_with(r#"("ins"."description" IS NULL) OR ("#),
+                .starts_with(r#"CASE WHEN "ins"."description" IS NULL THEN TRUE ELSE ("#),
             "{}",
             compiled[0].sql
         );
@@ -628,5 +774,147 @@ tables:
             error.contains("not supported on a command permission"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+
+    fn source_yaml(body: &str) -> Source {
+        serde_yaml::from_str(body).expect("source metadata parses")
+    }
+
+    /// A `validate` list on a non-Postgres source compiles — the rule types
+    /// resolve, because SQLite introspection reports pg-shaped type names —
+    /// but only the Postgres renderer emits the gate. Compiling and then
+    /// dropping it is the failure mode this refusal exists to prevent.
+    #[test]
+    fn a_non_postgres_source_refuses_a_validate_list() {
+        let source = source_yaml(
+            r#"
+name: analytics
+kind: sqlite
+configuration: {}
+tables:
+  - table: { schema: public, name: note }
+    insert_permissions:
+      - role: author
+        permission:
+          check: {}
+          validate:
+            - expression: "size(body) >= 3"
+              message: body must be at least 3 characters
+"#,
+        );
+        let index = ValidatorIndex::build(&source, &Catalog::default());
+        let error = index
+            .errors()
+            .first()
+            .expect("a validate list on SQLite must refuse publication");
+        assert!(error.contains("only on a Postgres source"), "{error}");
+        assert!(error.contains("public.note"), "{error}");
+    }
+
+    /// `resolve_command_role_perm` falls back to the ordinary permission when
+    /// the role declares no command permission — and the ordinary permission
+    /// is the one that carries validators. The command planner does not
+    /// consult this index, so the fallback would apply the columns, filter,
+    /// check and presets while dropping the value contract.
+    #[test]
+    fn a_command_step_falling_back_to_a_validated_permission_refuses_publication() {
+        let source = source_yaml(
+            r#"
+name: default
+kind: postgres
+configuration: {}
+tables:
+  - table: { schema: public, name: cart_line }
+    insert_permissions:
+      - role: customer
+        permission:
+          check: {}
+          validate:
+            - expression: "quantity <= 20"
+              message: a cart line is limited to 20 units
+"#,
+        );
+        let commands: Vec<donat_metadata::Command> = serde_yaml::from_str(
+            r#"
+- name: add_to_cart
+  source: default
+  permissions:
+    - role: customer
+  steps:
+    - name: line
+      insert:
+        table: { schema: public, name: cart_line }
+        object: {}
+"#,
+        )
+        .expect("command metadata parses");
+
+        let errors = command_fallback_errors(&source, &commands);
+        let error = errors
+            .first()
+            .expect("the fallback would drop the customer's value contract");
+        assert!(error.contains("add_to_cart"), "{error}");
+        assert!(error.contains("cart_line"), "{error}");
+        assert!(error.contains("assert"), "{error}");
+
+        // Giving the role its own command permission removes the fallback,
+        // and with it the reason to refuse.
+        let mut source = source;
+        source.tables[0].command_insert_permissions = source.tables[0].insert_permissions.clone();
+        source.tables[0].command_insert_permissions[0]
+            .permission
+            .validate
+            .clear();
+        assert!(command_fallback_errors(&source, &commands).is_empty());
+    }
+
+    /// An upsert writes its DO UPDATE rows through the INSERT statement, so
+    /// the update contract has to be readable off the insert CTE.
+    #[test]
+    fn the_update_list_is_also_compiled_against_the_insert_alias() {
+        let columns = vec![ColumnInfo {
+            name: "quantity".to_owned(),
+            pg_type: "int4".to_owned(),
+            pg_typmod: -1,
+            native_type: None,
+            nullable: false,
+            has_default: false,
+        }];
+        let validators = [PermissionValidator {
+            expression: Some("quantity <= 20".to_owned()),
+            not_null: None,
+            when_present: None,
+            message: "a cart line is limited to 20 units".to_owned(),
+        }];
+
+        let upd = compile_validators(
+            "public.cart_line",
+            "customer",
+            ValidatorOp::Update,
+            &validators,
+            &columns,
+        )
+        .expect("the update spelling compiles");
+        let upsert = compile_validators(
+            "public.cart_line",
+            "customer",
+            ValidatorOp::UpsertUpdate,
+            &validators,
+            &columns,
+        )
+        .expect("the same list compiles against the insert alias");
+
+        assert!(upd[0].sql.contains(r#""upd"."quantity""#), "{}", upd[0].sql);
+        assert!(
+            upsert[0].sql.contains(r#""ins"."quantity""#),
+            "{}",
+            upsert[0].sql
+        );
+        assert_eq!(upd[0].message, upsert[0].message);
     }
 }

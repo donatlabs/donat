@@ -186,6 +186,13 @@ impl CompiledMultiSourceSchema {
                 return Err(PlanError::validation("tables", message.clone()));
             }
         }
+        for source in &metadata.sources {
+            if let Some(message) =
+                crate::validators::command_fallback_errors(source, &metadata.commands).first()
+            {
+                return Err(PlanError::validation("commands.yaml", message.clone()));
+            }
+        }
         let mut children = build_children(
             metadata,
             catalogs,

@@ -153,6 +153,7 @@ async fn check_consistency_inner(
             "inherited role \"{role}\": conflicting {kind} permission on table \"{table}\""
         ));
     }
+    problems.extend(planner.validator_problems(&validation_metadata.commands));
 
     Ok(problems)
 }
