@@ -1394,3 +1394,85 @@ fn st_d_within_parses_2d_and_3d_variants() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------
+// validators.rs: per-role value validators
+// ---------------------------------------------------------------------
+
+/// Metadata where `user` declares a validator and `assistant` inherits the
+/// permission without declaring anything of its own.
+fn metadata_with_inherited_validator() -> Metadata {
+    let mut md = metadata();
+    let author = md.sources[0]
+        .tables
+        .iter_mut()
+        .find(|entry| entry.table.name() == "author")
+        .expect("the author table is in the fixture");
+    author.insert_permissions[0].permission.validate = serde_json::from_value(json!([{
+        "expression": "size(name) >= 3",
+        "message": "name must be at least 3 characters"
+    }]))
+    .expect("a validate list parses");
+    md.inherited_roles.push(
+        serde_json::from_value(json!({ "role_name": "assistant", "role_set": ["user"] })).unwrap(),
+    );
+    md
+}
+
+fn plan_author_insert(md: &Metadata, role: &str) -> Result<Plan, PlanError> {
+    let cat = catalog();
+    let planner = Planner::new(md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"mutation { insert_author(objects: [{ name: "Ada" }]) { affected_rows } }"#,
+    )
+    .expect("query parses")
+    .into_static();
+    planner.plan(
+        &doc,
+        None,
+        &JsonMap::new(),
+        &session(role, &[("x-donat-user-id", "7")]),
+    )
+}
+
+fn insert_validator_messages(plan: Plan) -> Vec<String> {
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected a mutation plan")
+    };
+    let MutationRoot::Insert { insert, .. } = &roots[0] else {
+        panic!("expected an insert root")
+    };
+    insert
+        .validators
+        .iter()
+        .map(|validator| validator.message.clone())
+        .collect()
+}
+
+/// The role that declared the validators is held to them.
+#[test]
+fn a_declaring_role_carries_its_validators_into_the_plan() {
+    let md = metadata_with_inherited_validator();
+    let plan = plan_author_insert(&md, "user").expect("the declaring role plans an insert");
+    assert_eq!(
+        insert_validator_messages(plan),
+        vec!["name must be at least 3 characters".to_string()]
+    );
+}
+
+/// An inherited role is granted the parent's write permission wholesale —
+/// columns, check, presets. It must inherit the parent's value contract with
+/// them. Keying the validator lookup on the request role instead of the
+/// declaring role made inheritance a way to shed the parent's checks, which
+/// is exactly the shape of hole this asserts against.
+#[test]
+fn an_inherited_role_cannot_shed_the_parents_validators() {
+    let md = metadata_with_inherited_validator();
+    let plan = plan_author_insert(&md, "assistant")
+        .expect("the inherited role plans an insert through the parent's permission");
+    assert_eq!(
+        insert_validator_messages(plan),
+        vec!["name must be at least 3 characters".to_string()],
+        "an inherited role must be held to the permission's validators"
+    );
+}
