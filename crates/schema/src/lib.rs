@@ -20,6 +20,7 @@ mod plan_mutation;
 mod predicate;
 mod process_effects;
 mod v1;
+mod validators;
 
 pub use commands::{
     CommandDescriptor, CompiledCommand, CompiledCommandCatalog, CompiledSourceCommandCatalog,

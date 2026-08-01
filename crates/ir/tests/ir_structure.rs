@@ -201,6 +201,7 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
             op: CompareOp::Gt(Scalar::Json(json!(0))),
         }),
         check_path: "$.selectionSet.insert_author.args.objects".into(),
+        validators: vec![],
         output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
             alias: "affected_rows".into(),
         }]),

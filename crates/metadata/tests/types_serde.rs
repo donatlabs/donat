@@ -1671,3 +1671,100 @@ fn connectors_absent_from_directory_yield_empty_vec() {
     let metadata = load_metadata_dir(dir).expect("fixture metadata should load");
     assert!(metadata.connectors.is_empty());
 }
+
+#[test]
+fn permission_validators_round_trip_both_spellings() {
+    let permission = serde_yaml::from_str::<donat_metadata::InsertPermission>(
+        r#"
+check: {}
+columns: [quality_grade]
+validate:
+  - not_null: quality_grade
+    message: quality_grade cannot be null
+  - expression: "quality_grade > 3"
+    message: quality_grade must be greater than 3
+"#,
+    )
+    .expect("a write permission accepts an ordered validate list");
+
+    assert_eq!(permission.validate.len(), 2);
+    assert_eq!(
+        permission.validate[0].not_null.as_deref(),
+        Some("quality_grade"),
+        "document order is the contract, so the null test stays first"
+    );
+    assert!(permission.validate[0].expression.is_none());
+    assert_eq!(
+        permission.validate[1].expression.as_deref(),
+        Some("quality_grade > 3")
+    );
+    assert_eq!(
+        permission.validate[1].message,
+        "quality_grade must be greater than 3"
+    );
+
+    let round_tripped = serde_yaml::to_string(&permission).expect("serialize the permission");
+    assert!(round_tripped.contains("quality_grade > 3"));
+    assert!(
+        !round_tripped.contains("expression: null"),
+        "the absent spelling must not be written back as an explicit null"
+    );
+}
+
+#[test]
+fn a_validator_accepts_the_when_present_spelling() {
+    let permission = serde_yaml::from_str::<donat_metadata::InsertPermission>(
+        r#"
+check: {}
+validate:
+  - expression: "size(description) >= 20"
+    when_present: description
+    message: description must be at least 20 characters when present
+"#,
+    )
+    .expect("an optional column declares its presence rather than inferring it");
+    assert_eq!(
+        permission.validate[0].when_present.as_deref(),
+        Some("description")
+    );
+    assert!(permission.validate[0].not_null.is_none());
+}
+
+#[test]
+fn a_validator_without_a_message_is_rejected() {
+    let error = serde_yaml::from_str::<donat_metadata::InsertPermission>(
+        r#"
+check: {}
+validate:
+  - expression: "quality_grade > 3"
+"#,
+    )
+    .expect_err("a validator with no message has no error to report");
+    assert!(error.to_string().contains("message"));
+}
+
+#[test]
+fn a_validator_rejects_an_unknown_spelling() {
+    let error = serde_yaml::from_str::<donat_metadata::InsertPermission>(
+        r#"
+check: {}
+validate:
+  - rule: within_plan_limit
+    message: plan limit reached
+"#,
+    )
+    .expect_err("only the closed set of validator spellings is accepted");
+    assert!(error.to_string().contains("rule"));
+}
+
+#[test]
+fn write_permissions_without_validators_stay_valid() {
+    let permission = serde_yaml::from_str::<donat_metadata::UpdatePermission>(
+        r#"
+columns: [title]
+filter: {}
+"#,
+    )
+    .expect("existing metadata has no validate key");
+    assert!(permission.validate.is_empty());
+}

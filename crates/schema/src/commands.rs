@@ -1712,6 +1712,9 @@ fn build_command_descriptor(
         .map(|step| step.name.clone())
         .collect::<HashSet<_>>();
     let mut steps = BTreeMap::new();
+    // One planner for the whole command: building it per step recompiles
+    // this source's validator index — CEL and all — for every step.
+    let step_planner = Planner::for_source(metadata, source, catalog);
     for (index, step) in command.steps.iter().enumerate() {
         let context = ValueContext {
             metadata,
@@ -1724,6 +1727,7 @@ fn build_command_descriptor(
             current_scope: None,
         };
         let output = validate_step(
+            &step_planner,
             source,
             catalog,
             &roles,
@@ -3708,6 +3712,9 @@ fn validate_command(
         ));
     }
     let mut steps = BTreeMap::new();
+    // One planner for the whole command: building it per step recompiles
+    // this source's validator index — CEL and all — for every step.
+    let step_planner = Planner::for_source(metadata, source, catalog);
     for (index, step) in command.steps.iter().enumerate() {
         let step_path = format!("{path}.steps[{index}]");
         let context = ValueContext {
@@ -3720,7 +3727,15 @@ fn validate_command(
             current: None,
             current_scope: None,
         };
-        let output = validate_step(source, catalog, &roles, step, &context, &step_path)?;
+        let output = validate_step(
+            &step_planner,
+            source,
+            catalog,
+            &roles,
+            step,
+            &context,
+            &step_path,
+        )?;
         steps.insert(step.name.clone(), output);
     }
 
@@ -3791,6 +3806,7 @@ fn validate_idempotency_step_scopes(
 }
 
 fn validate_step(
+    planner: &Planner<'_>,
     source: &Source,
     catalog: &Catalog,
     roles: &HashSet<&str>,
@@ -3798,7 +3814,6 @@ fn validate_step(
     context: &ValueContext<'_>,
     path: &str,
 ) -> Result<StepOutput, PlanError> {
-    let planner = Planner::for_source(context.metadata, source, catalog);
     match &step.operation {
         CommandStepOperation::Assert { assert } => {
             validate_rule(
@@ -3831,7 +3846,7 @@ fn validate_step(
             }
             let returning = returning_columns(&select_one.returning, info, path)?;
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -3879,7 +3894,7 @@ fn validate_step(
             }
             let returning = returning_columns(&select_many.returning, info, path)?;
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -3961,7 +3976,7 @@ fn validate_step(
                 )?;
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4019,7 +4034,7 @@ fn validate_step(
                 )?;
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4073,7 +4088,7 @@ fn validate_step(
                 )?;
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4246,7 +4261,7 @@ fn validate_step(
                 collect_current_columns_from_values(check.bindings.values(), &mut read_columns);
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4407,7 +4422,7 @@ fn validate_step(
                 )?;
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4461,7 +4476,7 @@ fn validate_step(
                 )?;
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,
@@ -4599,7 +4614,7 @@ fn validate_step(
                 }
             }
             require_select_permissions(
-                &planner,
+                planner,
                 entry,
                 info,
                 roles,

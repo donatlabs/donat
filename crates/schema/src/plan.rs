@@ -236,6 +236,8 @@ pub struct PlannerIndex {
     pub(crate) mutation_roots: HashMap<String, (MutationKind, usize)>,
     /// mutation root field name -> function index (exposed_as: mutation).
     mutation_function_roots: HashMap<String, usize>,
+    /// Write-permission validators, compiled once per source.
+    pub(crate) validators: crate::validators::ValidatorIndex,
 }
 
 pub struct Planner<'a> {
@@ -313,20 +315,30 @@ impl<'a> Planner<'a> {
                 source_kind: SourceKind::Postgres,
                 expose_all_commands: false,
             },
-            Self::compile_index_parts(&[], &[], donat_backend::capabilities::postgres()),
+            Self::compile_index_parts(
+                &[],
+                &[],
+                donat_backend::capabilities::postgres(),
+                crate::validators::ValidatorIndex::default(),
+            ),
         )
     }
 
     /// Construct a planner for one exact metadata source. The composite
     /// planner uses this to preserve all source-local authority.
     pub fn for_source(metadata: &'a Metadata, source: &'a Source, catalog: &'a Catalog) -> Self {
-        let index = Self::compile_index(source);
+        let index = Self::compile_index(source, catalog);
         Self::for_source_with_index(metadata, source, catalog, index)
     }
 
-    pub(crate) fn compile_index(source: &Source) -> Arc<PlannerIndex> {
+    pub(crate) fn compile_index(source: &Source, catalog: &Catalog) -> Arc<PlannerIndex> {
         let capabilities = capabilities_for_source(source.kind);
-        Self::compile_index_parts(&source.tables, &source.functions, capabilities)
+        Self::compile_index_parts(
+            &source.tables,
+            &source.functions,
+            capabilities,
+            crate::validators::ValidatorIndex::build(source, catalog),
+        )
     }
 
     pub(crate) fn for_source_with_index(
@@ -368,6 +380,7 @@ impl<'a> Planner<'a> {
         tables: &[TableEntry],
         functions: &[donat_metadata::FunctionEntry],
         capabilities: donat_backend::Capabilities,
+        validators: crate::validators::ValidatorIndex,
     ) -> Arc<PlannerIndex> {
         let mut by_table = HashMap::new();
         let mut roots = HashMap::new();
@@ -446,6 +459,7 @@ impl<'a> Planner<'a> {
             roots,
             mutation_roots,
             mutation_function_roots,
+            validators,
         })
     }
 
@@ -678,6 +692,22 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The role whose metadata entry owns an already-resolved permission.
+    ///
+    /// Resolution walks role inheritance, so the permission a request used may
+    /// have been declared by an ancestor. Anything keyed on the declaring role
+    /// — the validator index, today — must ask for it rather than assume the
+    /// request role. Identity is by address: the reference came out of this
+    /// very list.
+    pub(crate) fn declaring_role<'x, T>(
+        list: &'x [donat_metadata::PermissionEntry<T>],
+        permission: &T,
+    ) -> Option<&'x str> {
+        list.iter()
+            .find(|entry| std::ptr::eq(&entry.permission, permission))
+            .map(|entry| entry.role.as_str())
+    }
+
     /// Resolve a non-select (mutation/function) permission for a role:
     /// a direct permission wins; otherwise the *immediate* parents'
     /// resolved permissions are inherited only when they don't conflict
@@ -794,6 +824,19 @@ impl<'a> Planner<'a> {
 
     /// Conflicting (non-inheritable) mutation permissions of inherited
     /// roles: (role, table name, permission kind).
+    /// Deploy-time problems with the write permissions' `validate` lists.
+    ///
+    /// The serving path refuses publication on these at boot. `donat validate`
+    /// is the gate that is supposed to say so *before* a deploy, so it has to
+    /// ask the same question rather than assume the index is clean.
+    pub fn validator_problems(&self, commands: &[donat_metadata::Command]) -> Vec<String> {
+        let mut problems = self.validators.errors().to_vec();
+        for source in &self.metadata.sources {
+            problems.extend(crate::validators::command_fallback_errors(source, commands));
+        }
+        problems
+    }
+
     pub fn mutation_permission_conflicts(&self) -> Vec<(String, String, &'static str)> {
         let mut out = vec![];
         for role in self.inherited_roles {

@@ -385,6 +385,13 @@ impl<'a> Planner<'a> {
             _ => Some(BoolExp::And(predicates)),
         };
 
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.update_permissions,
+            perm,
+            crate::validators::ValidatorOp::Update,
+            "$",
+        )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
 
         Ok(UpdateMutation {
@@ -396,6 +403,7 @@ impl<'a> Planner<'a> {
             predicate,
             check: None,
             check_path: "$".to_string(),
+            validators,
             output,
         })
     }
@@ -630,6 +638,13 @@ impl<'a> Planner<'a> {
             }
         };
 
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.insert_permissions,
+            perm,
+            crate::validators::ValidatorOp::Insert,
+            "$",
+        )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
 
         Ok(InsertMutation {
@@ -643,6 +658,7 @@ impl<'a> Planner<'a> {
             on_conflict,
             check,
             check_path: "$".to_string(),
+            validators,
             output,
         })
     }

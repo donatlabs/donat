@@ -43,6 +43,23 @@ insert_permissions:
         - title
         - description
         - status
+      # The null-is-acceptable spelling. description is nullable and stays
+      # optional — a product may be published before anyone writes copy for
+      # it — but a description that exists must be worth reading.
+      #
+      # `when_present` is the escape from "unknown never satisfies a
+      # validator", and it is a declaration rather than an arm of the
+      # expression: the rule profile has no flow-sensitive refinement, so an
+      # `is_null(description) || size(description) >= 20` would not type check
+      # — `size` would still be reading a nullable value. Declaring the
+      # presence here excludes the null rows and makes the column non-null
+      # inside this one expression.
+      validate:
+        - expression: 'size(title) >= 3'
+          message: title must be at least 3 characters
+        - expression: 'size(description) >= 20'
+          when_present: description
+          message: description must be at least 20 characters when present
 update_permissions:
   - role: staff
     permission:
@@ -54,6 +71,12 @@ update_permissions:
         - status
       filter: {}
       check: {}
+      validate:
+        - expression: 'size(title) >= 3'
+          message: title must be at least 3 characters
+        - expression: 'size(description) >= 20'
+          when_present: description
+          message: description must be at least 20 characters when present
 delete_permissions:
   - role: staff
     permission:

@@ -10,6 +10,7 @@ donat-metadata = { path = "../metadata" }
 donat-catalog = { path = "../catalog" }
 donat-rules = { path = "../rules" }
 donat-ir = { path = "../ir" }
+donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }
 graphql-parser = { workspace = true }
 serde = { workspace = true }
@@ -19,3 +20,6 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

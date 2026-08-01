@@ -99,6 +99,8 @@ struct MutationSelectOptions<'a> {
     check_path: &'a str,
     extra_ctes: Vec<String>,
     extra_checks: Vec<(String, &'a BoolExp, String, Vec<RelationshipCteOverride>)>,
+    /// Ordered per-role value validators over the written rows.
+    validators: &'a [RowValidator],
     output: &'a MutationOutput,
 }
 
@@ -3966,12 +3968,13 @@ fn mutation_to_sql_full(
                 }
             }
             ctx.mutation_select(MutationSelectOptions {
-                cte: "ins",
+                cte: INSERT_ROW_ALIAS,
                 dml: &stmt,
                 check: insert.check.as_ref(),
                 check_path: &insert.check_path,
                 extra_ctes,
                 extra_checks,
+                validators: &insert.validators,
                 output: &insert.output,
             })
         }
@@ -4022,12 +4025,13 @@ fn mutation_to_sql_full(
             }
             stmt.push_str(" RETURNING *");
             ctx.mutation_select(MutationSelectOptions {
-                cte: "upd",
+                cte: UPDATE_ROW_ALIAS,
                 dml: &stmt,
                 check: update.check.as_ref(),
                 check_path: &update.check_path,
                 extra_ctes: vec![],
                 extra_checks: vec![],
+                validators: &update.validators,
                 output: &update.output,
             })
         }
@@ -4048,6 +4052,7 @@ fn mutation_to_sql_full(
                 dml: &stmt,
                 check: None,
                 check_path: "$",
+                validators: &[],
                 extra_ctes: vec![],
                 extra_checks: vec![],
                 output: &delete.output,
@@ -4764,6 +4769,7 @@ impl Ctx {
             dml,
             check,
             check_path,
+            validators,
             extra_ctes,
             extra_checks,
             output,
@@ -4804,6 +4810,22 @@ impl Ctx {
         };
 
         let mut guarded = result;
+        // Validators are wrapped first, so they end up innermost: a role that
+        // may not write the row at all is told that, and is never handed a
+        // message about a value it was not allowed to submit. Within the list
+        // the wrap order is reversed, which leaves the first declared entry
+        // outermost — document order is the reported order.
+        for validator in validators.iter().rev() {
+            let violated = format!(
+                "(SELECT count(*) FROM {cte_ident} WHERE ({}) IS NOT TRUE)",
+                validator.sql,
+            );
+            guarded = format!(
+                "CASE WHEN {violated} > 0 THEN donat.raise_graphql_error('validation-failed', {path}, {message})::json ELSE {guarded} END",
+                path = quote_lit(&validator.error_path),
+                message = quote_lit(&validator.message),
+            );
+        }
         for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
             let check_cte_ident = quote_ident(&check_cte);
             let violated = format!(
@@ -4969,6 +4991,14 @@ pub fn quote_lit(s: &str) -> String {
     use donat_backend::Dialect;
     donat_backend::PostgresDialect.quote_literal(s)
 }
+
+/// The CTE that holds the rows an INSERT wrote. Rule lowering happens in the
+/// planner, before SQLgen picks a name, so the name is part of the contract
+/// between them rather than a local choice here.
+pub const INSERT_ROW_ALIAS: &str = "ins";
+
+/// The CTE that holds the rows an UPDATE wrote.
+pub const UPDATE_ROW_ALIAS: &str = "upd";
 
 /// Render a qualified SQL column reference for the declarative rule lowerer.
 ///
@@ -5273,6 +5303,80 @@ mod dialect_dispatch_tests {
         );
     }
 
+    /// The gate a permission validator renders, and the order it renders in.
+    ///
+    /// Everything asserted here was previously pinned only by the conformance
+    /// suite: a regression in the wrap order, the three-valued gate, the cast
+    /// or the literal escaping would have been invisible to this crate.
+    #[test]
+    fn permission_validators_render_inside_the_check_in_document_order() {
+        let insert = MutationRoot::Insert {
+            alias: "insert_note".into(),
+            insert: InsertMutation {
+                table: Table {
+                    schema: "public".into(),
+                    name: "note".into(),
+                },
+                columns: vec![("body".into(), "text".into())],
+                rows: vec![vec![Some(Scalar::Json(serde_json::json!("hi")))]],
+                nested_object_inserts: vec![],
+                on_conflict: None,
+                check: Some(BoolExp::Compare {
+                    column: "author_id".into(),
+                    pg_type: "text".into(),
+                    op: CompareOp::Eq(Scalar::Json(serde_json::json!("u1"))),
+                }),
+                check_path: "$.selectionSet.insert_note.args.objects".into(),
+                validators: vec![
+                    RowValidator {
+                        sql: r#"length("ins"."body") >= 3"#.into(),
+                        message: "body is too short".into(),
+                        error_path: "$.selectionSet.insert_note.args.objects".into(),
+                    },
+                    RowValidator {
+                        sql: r#"length("ins"."body") <= 400"#.into(),
+                        // An apostrophe must survive as a doubled quote, not
+                        // as a way out of the string literal.
+                        message: "body can't exceed 400 characters".into(),
+                        error_path: "$.selectionSet.insert_note.args.objects".into(),
+                    },
+                ],
+                output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
+                    alias: "affected_rows".into(),
+                }]),
+            },
+        };
+        let sql = mutation_to_sql(&insert);
+
+        // Three-valued: a validator passes only on TRUE, so an unknown value
+        // is a violation.
+        assert!(
+            sql.contains(r#"WHERE (length("ins"."body") >= 3) IS NOT TRUE"#),
+            "{sql}"
+        );
+        // jsonb from the error helper must be cast to match the json the rest
+        // of the expression produces.
+        assert!(
+            sql.contains("donat.raise_graphql_error('validation-failed'"),
+            "{sql}"
+        );
+        assert!(sql.contains(")::json ELSE"), "{sql}");
+        assert!(sql.contains("'body can''t exceed 400 characters'"), "{sql}");
+
+        // The permission check is outermost, so a role that may not write the
+        // row is never told about the value. Among validators the first
+        // declared entry is outermost, so document order is reported order.
+        let check_at = sql.find("donat.check_violation").expect("check gate");
+        let first_at = sql.find("'body is too short'").expect("first validator");
+        let second_at = sql
+            .find("'body can''t exceed 400 characters'")
+            .expect("second validator");
+        assert!(
+            check_at < first_at && first_at < second_at,
+            "check must wrap the validators, and validators keep document order: {sql}"
+        );
+    }
+
     #[test]
     fn mysql_mutation_nodes_json_quote_typenames() {
         let typename_field = || OutputField {
@@ -5294,6 +5398,7 @@ mod dialect_dispatch_tests {
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
+                validators: vec![],
                 output,
             },
         };
@@ -5335,6 +5440,7 @@ mod dialect_dispatch_tests {
                 on_conflict: None,
                 check: None,
                 check_path: "$".into(),
+                validators: vec![],
                 output: MutationOutput::Response(vec![
                     MutationResponseField::AffectedRows {
                         alias: "affected_rows".into(),

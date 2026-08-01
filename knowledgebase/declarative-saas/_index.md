@@ -35,6 +35,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/029-connector-response-contract-is-the-activity-output-schema]]
 - [[decisions/030-command-arguments-of-named-types-compile-to-their-declared-representation]]
 - [[decisions/031-a-durable-retry-must-name-its-cause]]
+- [[decisions/032-permission-validators-declare-presence]]
 
 ## Reference governance
 
