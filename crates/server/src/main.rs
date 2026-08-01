@@ -479,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
             connectors: vec![],
             processes: vec![],
             mcp: Default::default(),
+            storage: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);
@@ -487,6 +488,11 @@ async fn main() -> anyhow::Result<()> {
     // listener. The immutable registry retains runtime credentials privately;
     // errors contain static metadata or variable names only, never values.
     let connectors = Arc::new(connectors::ConnectorRegistry::build(&metadata)?);
+
+    // File attachments resolve their backends and secrets here, before the
+    // listener binds: a missing credential must stop the boot, not surface as
+    // a failed upload later.
+    let storage = Arc::new(donat_storage::StorageRegistry::build(&metadata)?);
 
     if let Some(jwt) = &jwt {
         jwt.spawn_refresher(reqwest::Client::new());
@@ -516,6 +522,11 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|value: &usize| *value > 0)
                 .unwrap_or(16),
         )),
+        storage,
+        external_base_url: std::env::var("DONAT_EXTERNAL_URL")
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string(),
     });
 
     // The database may still be starting; retry the first sync.
@@ -557,6 +568,10 @@ async fn main() -> anyhow::Result<()> {
     // Durable Process workers retain the exact Engine snapshot published by
     // sync_sources; polling only wakes source-local journal transactions.
     processes::spawn(state.clone()).await?;
+    // Reclaiming storage is the only file I/O the engine does outside a
+    // request: a mutation stores an id, and the bytes it orphans are collected
+    // here, on the deployment's own schedule.
+    donat_server::files::spawn(state.clone());
     // Liveness/version are not data APIs — always mounted.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -586,6 +601,13 @@ async fn main() -> anyhow::Result<()> {
                 .delete(mcp::delete_not_allowed)
                 .layer(DefaultBodyLimit::max(mcp::MCP_MAX_REQUEST_BYTES)),
         );
+    }
+    // File attachments are a data-plane surface: the URLs these routes answer
+    // are minted by GraphQL, so they follow the GraphQL flag.
+    if enabled_apis.graphql
+        && let Some(files) = donat_server::files::router(&state)
+    {
+        app = app.merge(files);
     }
     tracing::info!(
         graphql = enabled_apis.graphql,

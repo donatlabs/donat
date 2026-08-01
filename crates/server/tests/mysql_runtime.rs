@@ -113,6 +113,8 @@ fn app_state(db_url: &str) -> Arc<AppState> {
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(donat_storage::StorageRegistry::default()),
+        external_base_url: String::new(),
     })
 }
 

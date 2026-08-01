@@ -659,6 +659,8 @@ async fn shared_state(metadata: Metadata, connectors: Arc<ConnectorRegistry>) ->
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(donat_storage::StorageRegistry::default()),
+        external_base_url: String::new(),
     });
     state
         .sync_sources()
