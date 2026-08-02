@@ -845,9 +845,37 @@ mod tests {
         config(
             r#","claims_map":{
                 "x-donat-allowed-roles":{"path":"$.roles"},
-                "x-donat-default-role":"customer",
+                "x-donat-default-role":{"path":"$.roles[0]"},
                 "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}"#,
         )
+    }
+
+    /// The default role is read from the token, not written as a literal,
+    /// because `session()` checks a *requested* role against the allowed set
+    /// and a default one against nothing. A literal would therefore hand that
+    /// role to every valid token, including one whose claims never mentioned
+    /// it — this asserts the shipped mapping cannot do that.
+    #[test]
+    fn petshop_claims_map_never_defaults_to_a_role_outside_the_token() {
+        let staff_only = sign(&json!({ "roles": ["staff"] }));
+        let session = petshop_claims_map()
+            .session(&staff_only, None, false)
+            .unwrap();
+        assert_eq!(session.role, "staff");
+
+        // A literal default is what this mapping avoids: the same token would
+        // come back holding `customer`, which its claims never granted.
+        let literal = config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":"customer",
+                "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}"#,
+        );
+        assert_eq!(
+            literal.session(&staff_only, None, false).unwrap().role,
+            "customer",
+            "engine behaviour this mapping is written around"
+        );
     }
 
     #[test]

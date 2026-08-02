@@ -103,9 +103,16 @@ curl -s localhost:8080/v1/graphql \
 Alice sees only `customer-1`'s orders and Bob (`bob@example.com`) only
 `customer-2`'s, because `X-Donat-User-Id` now arrives from the token and every
 customer row filter compares it against `customer.customer_id`. Sam
-(`sam@example.com`) has the `staff` role and sees all of them, with
-`-H 'X-Donat-Role: staff'` to select it. Asking for a role the token does not
-carry is denied.
+(`sam@example.com`) has the `staff` role and sees all of them, with no extra
+header: the role is read from the token as well. `X-Donat-Role` is only needed
+to pick between several roles one token carries, and asking for a role the
+token does not carry is denied.
+
+Both role variables are mapped out of the token rather than written as
+literals, and the difference matters if you copy [`auth.env`](auth.env). A
+requested role is checked against the token's role set; a *default* role is
+not. So a literal `x-donat-default-role` hands that role to every valid token,
+including one whose claims never granted it.
 
 The admin UI is at `localhost:8081` (`admin@petshop.local`, same password).
 

@@ -51,10 +51,15 @@ fn start_jwks_stub() -> String {
                     let body = body.clone();
                     async move {
                         (
-                            [("Content-Type", "application/json")],
-                            // No max-age: the engine falls back to its
-                            // Expires-less default and keeps polling, which is
-                            // harmless here.
+                            [
+                                ("Content-Type", "application/json"),
+                                // Without this the engine falls back to a
+                                // one-second refresh and re-fetches throughout
+                                // the run. Harmless, but the key set never
+                                // changes here and refresh timing is `jwk.rs`'s
+                                // subject, not this suite's.
+                                ("Cache-Control", "max-age=600"),
+                            ],
                             body,
                         )
                     }
@@ -193,7 +198,7 @@ fn claims_map_projects_token_identity_onto_row_filters() {
                 "jwk_url": jwks,
                 "claims_map": {
                     "x-donat-allowed-roles": { "path": "$.roles" },
-                    "x-donat-default-role": "customer",
+                    "x-donat-default-role": { "path": "$.roles[0]" },
                     "x-donat-user-id": { "path": "$.custom.customer_id", "default": "" }
                 }
             })
@@ -238,13 +243,11 @@ fn claims_map_projects_token_identity_onto_row_filters() {
 
     // A subject whose token carries no such attribute at all still
     // authenticates — that is what the mapping's `default` is for — and the
-    // unrestricted role sees everything.
+    // unrestricted role sees everything. No role header: the default role is
+    // read from the token too, so the session can only hold a role the claims
+    // granted.
     let sam = token_for(&["staff"], None);
-    let (code, resp) = s.post(
-        "/v1/graphql",
-        &json!({ "query": QUERY }),
-        &bearer_as(&sam, "staff"),
-    );
+    let (code, resp) = s.post("/v1/graphql", &json!({ "query": QUERY }), &bearer(&sam));
     assert_eq!(code, 200, "staff query failed: {resp}");
     assert_eq!(ids(&resp), vec![1, 2, 3], "staff must see every order");
 

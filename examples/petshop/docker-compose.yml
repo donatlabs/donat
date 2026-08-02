@@ -19,12 +19,16 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: petshop
+      # Empty unless auth.env is passed, and the initdb script below creates
+      # nothing when it is — so a run without the identity profile is left with
+      # no extra role.
+      RAUTHY_DB_PASSWORD: ${RAUTHY_DB_PASSWORD-}
     # Not exposed on the host: only the engine talks to it over the compose
     # network. Add a `ports:` mapping if you want to inspect it with psql.
     volumes:
       - petshop-db:/var/lib/postgresql/data
-      # Creates the database and role for the optional IdP (profile `auth`).
-      # Entrypoint scripts run only on first initialization of the volume.
+      # Creates the database and role for the optional IdP. Entrypoint scripts
+      # run only on first initialization of the volume.
       - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Check over TCP (-h 127.0.0.1), not the unix socket: on first init the
@@ -139,13 +143,13 @@ services:
         condition: service_healthy
     environment:
       # Its own database inside the Postgres this example already runs, created
-      # by ./initdb/10-rauthy-database.sql. Identity data never shares a
+      # by ./initdb/10-rauthy-database.sh. Identity data never shares a
       # database with the data plane.
       HIQLITE: "false"
       PG_HOST: postgres
       PG_PORT: "5432"
       PG_USER: rauthy
-      PG_PASSWORD: rauthy
+      PG_PASSWORD: ${RAUTHY_DB_PASSWORD-}
       PG_DB_NAME: rauthy
       # Plain HTTP on the compose network. A real deployment terminates TLS in
       # front of it; these three settings exist so the demo needs no certs.
