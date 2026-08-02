@@ -1176,7 +1176,7 @@ async fn caller_command_rejects_a_persisted_session_outside_its_compiled_contrac
 }
 
 #[tokio::test]
-async fn non_business_database_error_aborts_the_entire_process_transition() {
+async fn a_constraint_violation_fails_the_instance_without_writing_anything() {
     let database = TestDatabase::create("process_transition_database_error").await;
     let metadata = transition_metadata(false);
     let (runtime, revision) = runtime(&database, &metadata).await;
@@ -1205,17 +1205,25 @@ async fn non_business_database_error_aborts_the_entire_process_transition() {
         other => panic!("expected a new Process instance, got {other:?}"),
     };
 
-    let error = runtime
+    // A unique violation is not a business rejection the Process can route,
+    // and it is not transient either: the same write refuses again however
+    // often it is retried. Retrying it forever also held the head of the
+    // shared transition queue, stopping every other instance in the
+    // deployment, so it fails this instance instead. The constraint that
+    // refused it goes to the log; the journal keeps only the safe code.
+    let consumption = runtime
         .consume_one_transition()
         .await
-        .expect_err("a unique violation is not a catchable business rejection");
-    // The transition is retried forever, so the abort also has to say which
-    // schema object refused it — a SQLSTATE alone cannot tell one constraint
-    // from another in a command that writes several tables.
-    assert_eq!(
-        error.to_string(),
-        "Process command database execution failed with SQLSTATE 23505 \
-         on process_test_ledger.process_test_ledger_entity_id_key"
+        .expect("a unique violation is reported, not propagated");
+    assert!(
+        matches!(
+            consumption,
+            TransitionConsumption::CommandFailed {
+                code: "command_constraint_violation",
+                ..
+            }
+        ),
+        "unexpected consumption: {consumption:?}"
     );
     let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
         .await
@@ -1246,13 +1254,25 @@ async fn non_business_database_error_aborts_the_entire_process_transition() {
         )
         .await
         .expect("database error rolled back every Process-owned write");
-    assert_eq!(row.get::<_, String>(0), "running");
+    assert_eq!(row.get::<_, String>(0), "failed");
     assert_eq!(row.get::<_, String>(1), "record");
-    assert_eq!(row.get::<_, i64>(2), 0);
+    assert_eq!(row.get::<_, i64>(2), 1, "failing the instance advances it once");
     assert_eq!(row.get::<_, Json>(3), json!({}));
-    assert_eq!(row.get::<_, i64>(4), 0);
-    assert_eq!(row.get::<_, i64>(5), 0);
-    assert_eq!(row.get::<_, i64>(6), 1);
+    assert_eq!(
+        row.get::<_, i64>(4),
+        0,
+        "the refused command wrote no invocation"
+    );
+    assert_eq!(
+        row.get::<_, i64>(5),
+        1,
+        "the failure is one auditable transition-log entry"
+    );
+    assert_eq!(
+        row.get::<_, i64>(6),
+        0,
+        "the failed instance leaves no pending event behind"
+    );
     connection.abort();
     database.drop().await;
 }

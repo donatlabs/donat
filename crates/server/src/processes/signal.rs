@@ -69,7 +69,12 @@ struct MatchingCandidate {
     revision: String,
     current_state: String,
     version: i64,
+    /// The wait was already receptive when the signal was committed.
     receptive: bool,
+    /// The wait became receptive only afterwards, and declares
+    /// `persist_before_match`. It is a fallback for a signal nobody was
+    /// waiting for yet — never a competitor to a wait that was.
+    persisted: bool,
 }
 
 impl ProcessRuntime {
@@ -352,10 +357,7 @@ impl ProcessRuntime {
             if expected != request.correlation {
                 continue;
             }
-            let receptive = candidate.marker_id.is_some()
-                && candidate
-                    .marker_created_at
-                    .is_some_and(|entered_at| entered_at <= request.created_at)
+            let marker_matches = candidate.marker_id.is_some()
                 && candidate
                     .marker_available_at
                     .is_some_and(|deadline| request.created_at <= deadline)
@@ -364,19 +366,38 @@ impl ProcessRuntime {
                         == Some(request.signal_name.as_str())
                         && payload.get("correlation") == Some(&request.correlation)
                 });
+            // The marker must predate the request: a signal cannot be answered
+            // by a wait that did not exist when it was sent.
+            let entered_before_request = candidate
+                .marker_created_at
+                .is_some_and(|entered_at| entered_at <= request.created_at);
+            let receptive = marker_matches && entered_before_request;
+            // A wait declaring `persist_before_match` may still take a signal
+            // that arrived first — but only if nothing was waiting for it,
+            // which is decided below over all candidates.
+            let persisted = marker_matches && !entered_before_request && wait.persist_before_match;
             matching.push(MatchingCandidate {
                 instance_id: candidate.instance_id,
                 revision: candidate.revision,
                 current_state: candidate.current_state,
                 version: candidate.version,
                 receptive,
+                persisted,
             });
         }
 
-        let receptive = matching
+        let mut receptive = matching
             .iter()
             .filter(|candidate| candidate.receptive)
             .collect::<Vec<_>>();
+        if receptive.is_empty() {
+            // Nobody was waiting when the signal was sent. A wait that has
+            // since opened and declared the signal persisted takes it now.
+            receptive = matching
+                .iter()
+                .filter(|candidate| candidate.persisted)
+                .collect::<Vec<_>>();
+        }
         let mut known_targets = matching
             .iter()
             .map(|candidate| candidate.instance_id)

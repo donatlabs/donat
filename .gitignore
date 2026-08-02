@@ -10,3 +10,4 @@ tests/donat/tests-py/
 *.log
 .claude/agent-memory
 .worktrees/
+tests-system/.stack/

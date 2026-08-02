@@ -1,5 +1,6 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
-	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex
+	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
+	petshop-up petshop-down petshop-system-tests
 
 build:
 	cargo build
@@ -93,6 +94,21 @@ perf-mixed:
 
 run:
 	cargo run --bin donat -- --metadata-dir crates/metadata/tests/fixtures/metadata
+
+# Black-box system tests for the checked-in Petshop example. The stand runs the
+# engine built from this working tree; see tests-system/README.md.
+petshop-up:
+	tests-system/stack.sh up
+
+petshop-down:
+	tests-system/stack.sh down
+
+petshop-system-tests:
+	@test -d tests-system/.venv || python3 -m venv tests-system/.venv
+	@tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
+	@cd tests-system && PETSHOP_BASE_URL="$${PETSHOP_BASE_URL:-http://127.0.0.1:8080}" \
+		PETSHOP_PROVIDERS_URL="$${PETSHOP_PROVIDERS_URL:-http://127.0.0.1:8099}" \
+		.venv/bin/python -m pytest
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux

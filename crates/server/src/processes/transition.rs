@@ -32,6 +32,13 @@ const PREPARATION_BATCH_SIZE: i64 = 128;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransitionConsumption {
     NoWork,
+    /// A Command the database refused unrecoverably. The instance is failed;
+    /// the queue moves on.
+    CommandFailed {
+        instance_id: Uuid,
+        event_id: Uuid,
+        code: &'static str,
+    },
     Advanced {
         instance_id: Uuid,
         event_id: Uuid,
@@ -215,6 +222,9 @@ struct PreparedWaitEntry {
     snapshot: TransitionSnapshot,
     schedule: PreparedTimerSchedule,
     timer_payload: Json,
+    /// The wait declared `persist_before_match`, so a signal already recorded
+    /// as unmatched is offered to it again the moment it becomes receptive.
+    persist_before_match: bool,
 }
 
 struct PreparedWaitCompletion {
@@ -272,6 +282,76 @@ impl ProcessRuntime {
         self.consume_one_transition_kind(None).await
     }
 
+    /// End an instance whose transition cannot be applied, in a transaction of
+    /// its own: the one that failed is already poisoned.
+    async fn fail_instance(
+        &self,
+        failing: FailingTransition,
+        code: &'static str,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<TransitionConsumption> {
+        tracing::error!(
+            source = %self.source_name,
+            instance_id = %failing.instance_id,
+            state = %failing.current_state,
+            code,
+            error = format_args!("{error:#}"),
+            "Process transition failed unrecoverably; failing the instance"
+        );
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .context("failing an unrecoverable Process transition")?;
+        let transaction = client
+            .transaction()
+            .await
+            .context("starting Process failure transaction")?;
+        let failure = json!({
+            "kind": "transition_failed",
+            "code": code,
+            "path": failing.current_state,
+            "message": "the Process transition could not be applied",
+        });
+        let version = failing
+            .version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Process instance version overflow"))?;
+        transaction
+            .execute(
+                "
+                UPDATE donat.process_instances
+                SET status = 'failed',
+                    failure_json = $3,
+                    version = $4,
+                    updated_at = statement_timestamp()
+                WHERE source_name = $1
+                  AND id = $2
+                  AND version = $5
+                  AND status = 'running'
+                ",
+                &[
+                    &self.source_name,
+                    &failing.instance_id,
+                    &failure,
+                    &version,
+                    &failing.version,
+                ],
+            )
+            .await
+            .context("recording an unrecoverable Process transition failure")?;
+        consume_event(&transaction, &self.source_name, failing.event_id).await?;
+        transaction
+            .commit()
+            .await
+            .context("committing an unrecoverable Process transition failure")?;
+        Ok(TransitionConsumption::CommandFailed {
+            instance_id: failing.instance_id,
+            event_id: failing.event_id,
+            code,
+        })
+    }
+
     pub(crate) async fn consume_one_transition_kind(
         &self,
         event_kind: Option<&str>,
@@ -308,7 +388,14 @@ impl ProcessRuntime {
             return Ok(TransitionConsumption::NoWork);
         }
 
-        let result = match prepared {
+        // One instance's refusal is its own. Anything that is not a known
+        // transient condition ends this instance instead of travelling up to
+        // the consumer, where it would be retried against the head of the
+        // shared queue forever — stopping every other Process in the
+        // deployment. See issue #21 for the queue-level half of this.
+        let failing = FailingTransition::of(prepared.snapshot());
+        let applied: anyhow::Result<TransitionConsumption> = async {
+            Ok(match prepared {
             PreparedTransition::Command(prepared) => {
                 self.consume_prepared_command(&transaction, &prepared)
                     .await?
@@ -404,6 +491,16 @@ impl ProcessRuntime {
             }
             PreparedTransition::FanOutRequestCompletion(prepared) => {
                 commit_fanout_request_completion(&transaction, &self.source_name, &prepared).await?
+            }
+        })
+        }
+        .await;
+        let result = match applied {
+            Ok(result) => result,
+            Err(error) if is_transient(&error) => return Err(error),
+            Err(error) => {
+                drop(transaction);
+                return self.fail_instance(failing, "transition_failed", &error).await;
             }
         };
         transaction
@@ -594,8 +691,35 @@ impl ProcessRuntime {
             execute_process_command_in_savepoint(transaction, &prepared.command, false).await?;
         match outcome {
             ProcessCommandOutcome::Applied { result } => {
-                validate_state_output(&prepared.definition, &prepared.snapshot, &result)
-                    .context("validating Process command result")?;
+                // A result that does not fit its declared contract is a
+                // deployment mistake, not weather: the same command will
+                // produce the same shape on every retry. Retrying it forever
+                // held the shared transition queue against every other
+                // instance, so it fails this one and names the cause in the
+                // log.
+                if let Err(error) =
+                    validate_state_output(&prepared.definition, &prepared.snapshot, &result)
+                {
+                    tracing::error!(
+                        instance_id = %prepared.snapshot.instance_id,
+                        state = %prepared.snapshot.current_state,
+                        command = %prepared.state.name,
+                        error = format_args!("{error:#}"),
+                        "Process command result violated its contract; failing the instance"
+                    );
+                    commit_failed_command(
+                        transaction,
+                        &self.source_name,
+                        prepared,
+                        "command_result_contract_violation",
+                    )
+                    .await?;
+                    return Ok(TransitionConsumption::CommandFailed {
+                        instance_id: prepared.snapshot.instance_id,
+                        event_id: prepared.snapshot.event_id,
+                        code: "command_result_contract_violation",
+                    });
+                }
                 commit_applied_command(transaction, &self.source_name, prepared, &result).await?;
                 Ok(TransitionConsumption::Advanced {
                     instance_id: prepared.snapshot.instance_id,
@@ -610,6 +734,14 @@ impl ProcessRuntime {
                     instance_id: prepared.snapshot.instance_id,
                     event_id: prepared.snapshot.event_id,
                     error,
+                })
+            }
+            ProcessCommandOutcome::Unrecoverable { code } => {
+                commit_failed_command(transaction, &self.source_name, prepared, code).await?;
+                Ok(TransitionConsumption::CommandFailed {
+                    instance_id: prepared.snapshot.instance_id,
+                    event_id: prepared.snapshot.event_id,
+                    code,
                 })
             }
         }
@@ -688,6 +820,22 @@ impl ProcessRuntime {
                     output,
                     route: prepared.state.next.clone(),
                     error_kind: "command_rejected".to_owned(),
+                })
+            }
+            ProcessCommandOutcome::Unrecoverable { code } => {
+                let output = fanout_failure_output(
+                    &prepared.item,
+                    &prepared.item_key,
+                    "command",
+                    code,
+                    "the Process command was refused by the database",
+                    false,
+                    &fanout_logical_activity_id(&prepared.snapshot, &prepared.item_key_identity),
+                )?;
+                Err(FanOutItemFailure {
+                    output,
+                    route: prepared.state.next.clone(),
+                    error_kind: "command_failed".to_owned(),
                 })
             }
         };
@@ -896,6 +1044,7 @@ impl ProcessRuntime {
     ) -> anyhow::Result<PreparedWaitEntry> {
         let wait_version = next_version(&snapshot)?;
         let context = process_value_context(&self.source_name, &snapshot);
+        let mut persist_before_match = false;
         let (schedule, timer_payload) = match state {
             CompiledProcessWaitState::Signal(wait) => {
                 let signal = definition.signals.get(&wait.signal).ok_or_else(|| {
@@ -929,6 +1078,7 @@ impl ProcessRuntime {
                         )
                     })?;
                 let schedule = prepare_signal_deadline(&wait.deadline, &context)?;
+                persist_before_match = wait.persist_before_match;
                 (
                     schedule,
                     json!({
@@ -1066,6 +1216,7 @@ impl ProcessRuntime {
             snapshot,
             schedule,
             timer_payload,
+            persist_before_match,
         })
     }
 
@@ -2680,6 +2831,9 @@ async fn commit_wait_entry(
     if updated != 1 {
         bail!("locked Process wait state did not become receptive exactly once");
     }
+    if prepared.persist_before_match {
+        reopen_persisted_signals(transaction, source_name, prepared).await?;
+    }
     consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
     append_transition_log(
         transaction,
@@ -2692,6 +2846,45 @@ async fn commit_wait_entry(
     )
     .await?;
     Ok(timer_event_id)
+}
+
+/// Offer this wait the signals that arrived before it existed.
+///
+/// A signal committed while the instance was still working its way to the wait
+/// finds nothing receptive and is recorded as `unmatched`. `persist_before_
+/// match` is the Process saying that such a signal is not lost: entering the
+/// wait returns those exact correlated requests to `pending`, and the ordinary
+/// consumer matches them against the marker that now exists.
+async fn reopen_persisted_signals(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedWaitEntry,
+) -> anyhow::Result<u64> {
+    let Some(signal_name) = prepared.timer_payload["signal_name"].as_str() else {
+        return Ok(0);
+    };
+    let correlation = prepared.timer_payload["correlation"].clone();
+    let reopened = transaction
+        .execute(
+            "
+            UPDATE donat.process_signal_requests
+            SET status = 'pending'
+            WHERE source_name = $1
+              AND process_name = $2
+              AND signal_name = $3
+              AND correlation_json = $4
+              AND status = 'unmatched'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.process_name,
+                &signal_name,
+                &correlation,
+            ],
+        )
+        .await
+        .context("returning early Process signals to the queue")?;
+    Ok(reopened)
 }
 
 async fn commit_wait_completion(
@@ -4197,6 +4390,67 @@ async fn commit_fail(
     .await
 }
 
+/// Fail an instance whose Command the database refused unrecoverably.
+///
+/// The journal keeps the safe code only; the relation and constraint that
+/// refused it went to the log, where operator detail belongs.
+async fn commit_failed_command(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    prepared: &PreparedCommandTransition,
+    code: &'static str,
+) -> anyhow::Result<()> {
+    let version = next_version(&prepared.snapshot)?;
+    let failure = json!({
+        "kind": "command_failed",
+        "code": code,
+        "path": prepared.snapshot.current_state,
+        "message": "the Process command was refused by the database",
+    });
+    let updated = transaction
+        .execute(
+            "
+            UPDATE donat.process_instances
+            SET status = 'failed',
+                failure_json = $3,
+                version = $4,
+                updated_at = statement_timestamp()
+            WHERE source_name = $1
+              AND id = $2
+              AND current_state = $5
+              AND version = $6
+              AND status = 'running'
+            ",
+            &[
+                &source_name,
+                &prepared.snapshot.instance_id,
+                &failure,
+                &version,
+                &prepared.snapshot.current_state,
+                &prepared.snapshot.version,
+            ],
+        )
+        .await
+        .context("failing an unrecoverable Process command state")?;
+    if updated != 1 {
+        bail!("locked failed Process instance did not fail exactly once");
+    }
+    // No separate journal event: the instance row carries the failure and the
+    // transition log carries the outcome. The event kinds are a closed set,
+    // and an unrecoverable command is not a new kind of Process fact.
+    consume_event(transaction, source_name, prepared.snapshot.event_id).await?;
+    append_transition_log(
+        transaction,
+        source_name,
+        &prepared.snapshot,
+        &prepared.snapshot.current_state,
+        "command_failed",
+        None,
+        json!({ "command": prepared.state.name, "code": code }),
+    )
+    .await
+}
+
 async fn commit_rejected_command(
     transaction: &Transaction<'_>,
     source_name: &str,
@@ -4282,6 +4536,52 @@ async fn commit_rejected_command(
     )
     .await
 }
+
+/// Enough of a snapshot to end the instance a failed transition belonged to.
+#[derive(Clone)]
+struct FailingTransition {
+    instance_id: Uuid,
+    event_id: Uuid,
+    current_state: String,
+    version: i64,
+}
+
+impl FailingTransition {
+    fn of(snapshot: &TransitionSnapshot) -> Self {
+        Self {
+            instance_id: snapshot.instance_id,
+            event_id: snapshot.event_id,
+            current_state: snapshot.current_state.clone(),
+            version: snapshot.version,
+        }
+    }
+}
+
+/// Whether a failure may plausibly succeed on the next attempt.
+///
+/// Deliberately a short, explicit list. Everything outside it — a constraint,
+/// a contract violation, a missing compiled dependency, an invariant — refuses
+/// again in exactly the same way, and retrying it is how one instance used to
+/// stop a whole deployment.
+fn is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(database) = cause.downcast_ref::<tokio_postgres::Error>() {
+            if let Some(database) = database.as_db_error() {
+                let code = database.code().code();
+                // Serialization failure, deadlock, admin shutdown, out of
+                // resources, lock timeout — and every connection class.
+                return matches!(code, "40001" | "40P01" | "57P01" | "53300" | "55P03")
+                    || code.starts_with("08");
+            }
+            // A driver error with no SQLSTATE is a connection problem.
+            return true;
+        }
+        cause
+            .downcast_ref::<deadpool_postgres::PoolError>()
+            .is_some()
+    })
+}
+
 
 fn next_version(snapshot: &TransitionSnapshot) -> anyhow::Result<i64> {
     snapshot

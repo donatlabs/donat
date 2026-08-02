@@ -36,6 +36,9 @@ separate branches and merge independently).
   fails validation until discovery and read dispatch are implemented together
 - [[decisions/009-defer-mcp-action-output-relationships]] — why action tools
   reject output relationships until MCP has a role-scoped target selection
+- [[decisions/010-share-rendered-schema-documents-across-slots]] — why a
+  compiled snapshot shares, serializes and indexes what it keeps, halving the
+  engine's resident memory without changing a served response
 
 ## Cross-cutting
 

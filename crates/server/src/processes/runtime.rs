@@ -308,6 +308,20 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     "Process command state rejected"
                 );
             }
+            Ok(TransitionConsumption::CommandFailed {
+                instance_id,
+                event_id,
+                code,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    code,
+                    "Process command state failed unrecoverably"
+                );
+            }
             Ok(TransitionConsumption::ActivityScheduled {
                 instance_id,
                 event_id,

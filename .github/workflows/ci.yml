@@ -142,9 +142,40 @@ jobs:
       - name: cargo audit
         run: cargo audit --deny warnings
 
+  petshop-system:
+    name: Petshop system tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Raises the example the way its README deploys it — migrate, deploy the
+      # Process revisions, then serve — with the engine built from this commit.
+      - name: Raise the stand
+        run: tests-system/stack.sh up
+      - name: Install the suite
+        run: |
+          python3 -m venv tests-system/.venv
+          tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
+      - name: Black-box system tests
+        working-directory: tests-system
+        env:
+          PETSHOP_BASE_URL: http://127.0.0.1:8080
+          PETSHOP_PROVIDERS_URL: http://127.0.0.1:8099
+        run: .venv/bin/python -m pytest -q
+      - name: Engine log
+        if: failure()
+        run: tail -200 tests-system/.stack/engine.log
+      - name: Drop the stand
+        if: always()
+        run: tests-system/stack.sh down
+
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
-    needs: [test, backend-core-gate, mixed-backend-conformance]
+    needs: [test, backend-core-gate, mixed-backend-conformance, petshop-system]
     strategy:
       matrix:
         target:

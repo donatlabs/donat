@@ -998,3 +998,47 @@ fn forwards_relay_mode_only_to_capable_children() {
         "field 'logs_event_connection' not found in type: 'query_root'"
     );
 }
+
+#[test]
+fn schema_documents_that_cannot_differ_are_rendered_once_and_shared() {
+    // Nothing in this metadata is `backend_only`, and a rendered schema never
+    // depends on Relay, so each role's four schema slots are one document.
+    let metadata = metadata();
+    let catalogs = catalogs();
+
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+
+    // One role in the fixture ("user") plus the synthetic denied role.
+    assert_eq!(
+        compiled.distinct_schema_documents(),
+        2,
+        "each role keeps one rendered document, not one per Relay/backend slot"
+    );
+}
+
+#[test]
+fn a_backend_only_insert_permission_still_gets_its_own_document() {
+    // The one thing `backend_request` changes is whether a `backend_only`
+    // insert permission is visible, so that metadata must keep both variants.
+    let mut metadata = metadata();
+    metadata.sources.truncate(1);
+    metadata.sources[0].tables[0].insert_permissions.push(
+        serde_json::from_value(json!({
+            "role": "user",
+            "permission": { "columns": ["id", "name"], "check": {}, "backend_only": true }
+        }))
+        .expect("insert permission deserializes"),
+    );
+    let mut catalogs = catalogs();
+    catalogs.retain(|source, _| source == "default");
+
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+
+    assert_eq!(
+        compiled.distinct_schema_documents(),
+        4,
+        "both backend_request variants are rendered for each of the two role entries"
+    );
+}
