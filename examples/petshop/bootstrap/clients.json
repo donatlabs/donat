@@ -4,10 +4,10 @@
         "name": "Petshop demo",
         "secret": null,
         "redirect_uris": [
-            "http://localhost:8080/login/callback"
+            "http://localhost:5173/callback"
         ],
         "allowed_origins": [
-            "http://localhost:8080"
+            "http://localhost:5173"
         ],
         "enabled": true,
         "flows_enabled": [

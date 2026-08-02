@@ -110,6 +110,15 @@ carry is denied.
 
 The admin UI is at `localhost:8081` (`admin@petshop.local`, same password).
 
+Attaching a real frontend instead of the `curl` above: the browser flow is
+`authorization_code` with PKCE, and the callback it redirects to belongs to
+**your application**, not to donat — the engine never takes part in the login,
+it only verifies the token your app ends up holding. `bootstrap/clients.json`
+points `redirect_uris` and `allowed_origins` at `http://localhost:5173`, a
+plain dev-server default; change them to wherever your app runs. Because the
+provider reads `bootstrap/` only on an empty database, changing them later
+means `docker compose down -v`.
+
 Two things worth knowing. The provider reads `bootstrap/` only while
 initializing an empty database, so editing those files later does nothing until
 you recreate the volume with `docker compose down -v`. And the compose file
