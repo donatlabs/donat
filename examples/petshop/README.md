@@ -63,6 +63,75 @@ curl -s localhost:8080/v1/graphql \
   -d '{"query":"mutation { start_checkout(cart_id: 1, request_id: \"…\") { cart_id } }"}'
 ```
 
+### Logging in for real
+
+Passing `X-Donat-Role` and `X-Donat-User-Id` by hand is a stand-in for edge
+auth. To see the same example driven by a real login instead, start it with the
+identity profile:
+
+```
+docker compose --env-file auth.env up
+```
+
+That adds one service — [Rauthy](https://github.com/sebadob/rauthy), an
+OpenID Connect provider — and switches the engine into JWT mode. donat itself
+gains no authentication code: it verifies the token against the provider's
+JWKS and turns its claims into session variables. Any other provider works the
+same way; only the mapping in [`auth.env`](auth.env) changes.
+
+The provider is configured entirely by the JSON files in
+[`bootstrap/`](bootstrap), so there is nothing to click in its admin UI. They
+declare the client, the `customer` and `staff` roles, three demo users, and the
+`customer_id` attribute that carries each shopper's business id into the access
+token.
+
+Get a token and use it — note that no role header and no admin secret are
+involved:
+
+```
+TOKEN=$(curl -s -X POST localhost:8081/auth/v1/oidc/token \
+  -d 'grant_type=password&client_id=petshop' \
+  -d 'username=alice@example.com&password=petshop-demo-password' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+curl -s localhost:8080/v1/graphql \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"query":"{ orders { customer_id order_status } }"}'
+```
+
+Alice sees only `customer-1`'s orders and Bob (`bob@example.com`) only
+`customer-2`'s, because `X-Donat-User-Id` now arrives from the token and every
+customer row filter compares it against `customer.customer_id`. Sam
+(`sam@example.com`) has the `staff` role and sees all of them, with no extra
+header: the role is read from the token as well. `X-Donat-Role` is only needed
+to pick between several roles one token carries, and asking for a role the
+token does not carry is denied.
+
+Both role variables are mapped out of the token rather than written as
+literals, and the difference matters if you copy [`auth.env`](auth.env). A
+requested role is checked against the token's role set; a *default* role is
+not. So a literal `x-donat-default-role` hands that role to every valid token,
+including one whose claims never granted it.
+
+The admin UI is at `localhost:8081` (`admin@petshop.local`, same password).
+
+Attaching a real frontend instead of the `curl` above: the browser flow is
+`authorization_code` with PKCE, and the callback it redirects to belongs to
+**your application**, not to donat — the engine never takes part in the login,
+it only verifies the token your app ends up holding. `bootstrap/clients.json`
+points `redirect_uris` and `allowed_origins` at `http://localhost:5173`, a
+plain dev-server default; change them to wherever your app runs. Because the
+provider reads `bootstrap/` only on an empty database, changing them later
+means `docker compose down -v`.
+
+Two things worth knowing. The provider reads `bootstrap/` only while
+initializing an empty database, so editing those files later does nothing until
+you recreate the volume with `docker compose down -v`. And the compose file
+still sets `DONAT_GRAPHQL_ADMIN_SECRET`, which outranks the token — a request
+presenting that secret may still assert a role by header. Drop it for anything
+beyond a demo.
+
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
 > `docker build -t ghcr.io/donatlabs/donat:latest .`

@@ -36,6 +36,9 @@ separate branches and merge independently).
   fails validation until discovery and read dispatch are implemented together
 - [[decisions/009-defer-mcp-action-output-relationships]] — why action tools
   reject output relationships until MCP has a role-scoped target selection
+- [[decisions/010-donat-does-not-own-identity]] — why the engine ships no
+  authentication of its own and the petshop example gets an optional Rauthy
+  profile instead, and why an external IdP is not an admin-role bypass
 
 ## Cross-cutting
 
