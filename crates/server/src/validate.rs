@@ -263,6 +263,28 @@ fn validate_tracked_objects(
                 ));
                 continue;
             }
+            // A file column is an ordinary uuid column, and metadata alone
+            // cannot know whether it exists or what type it has. This is the
+            // one place that can check, so a declaration against a missing or
+            // wrongly typed column fails the deploy rather than the first
+            // upload.
+            for attachment in &entry.attachments {
+                match catalog
+                    .table(schema, name)
+                    .and_then(|table| table.columns.iter().find(|c| c.name == attachment.column))
+                {
+                    Some(column) if column.sql_type() == "uuid" => {}
+                    Some(column) => problems.push(format!(
+                        "attachment \"{schema}.{name}.{}\" must be a uuid column, but it is {}",
+                        attachment.column,
+                        column.sql_type()
+                    )),
+                    None => problems.push(format!(
+                        "attachment \"{schema}.{name}.{}\" references a column that does not exist",
+                        attachment.column
+                    )),
+                }
+            }
             for computed_field in &entry.computed_fields {
                 let function = &computed_field.definition.function;
                 if catalog

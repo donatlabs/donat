@@ -122,6 +122,8 @@ fn state(fixtures: &SqliteFixtures) -> Arc<AppState> {
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(donat_storage::StorageRegistry::default()),
+        external_base_url: String::new(),
     })
 }
 
@@ -493,6 +495,8 @@ async fn secondary_mysql_mutation_never_falls_back_to_default_source() {
         allowlist_enabled: false,
         subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
         subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(donat_storage::StorageRegistry::default()),
+        external_base_url: String::new(),
     });
     state
         .sync_sources()

@@ -41,10 +41,11 @@ tracing-subscriber = { workspace = true }
 refinery = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
 percent-encoding = "2"
+donat-storage = { path = "../storage" }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 hmac = "0.12"

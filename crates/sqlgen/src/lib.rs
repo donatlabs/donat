@@ -101,6 +101,8 @@ struct MutationSelectOptions<'a> {
     extra_checks: Vec<(String, &'a BoolExp, String, Vec<RelationshipCteOverride>)>,
     /// Ordered per-role value validators over the written rows.
     validators: &'a [RowValidator],
+    /// File uploads this write claims (spec 008).
+    file_claims: &'a [donat_ir::FileClaim],
     output: &'a MutationOutput,
 }
 
@@ -702,6 +704,12 @@ impl Ctx {
                             None => call,
                         }
                     }
+                    FieldValue::FileRef {
+                        column,
+                        attachment,
+                        url_sql,
+                        fields,
+                    } => self.file_ref_expr(table_alias, column, attachment, url_sql, fields),
                     FieldValue::Aggregate { .. } | FieldValue::Nodes { .. } => {
                         panic!("aggregate fields must go through aggregate_expr")
                     }
@@ -710,6 +718,60 @@ impl Ctx {
             })
             .collect();
         json_object(&dialect, &pairs)
+    }
+
+    /// A declared file column (spec 008): the object assembled from the
+    /// upload row the column points at.
+    ///
+    /// The correlated subquery keeps this one statement — no second round trip
+    /// and no per-row work in Rust — and it returns NULL for a NULL column,
+    /// which is exactly what an unset attachment should look like. The URL
+    /// expression arrives pre-rendered from the planner with `{row}` standing
+    /// in for the alias chosen here.
+    fn file_ref_expr(
+        &mut self,
+        table_alias: &str,
+        column: &str,
+        attachment: &str,
+        url_sql: &str,
+        fields: &[donat_ir::FileRefOutput],
+    ) -> String {
+        use donat_ir::FileRefField;
+
+        let dialect = self.dialect;
+        let alias = self.alias();
+        let quoted = quote_ident(&alias);
+        let pairs: Vec<(String, String)> = fields
+            .iter()
+            .map(|field| {
+                let value = match &field.field {
+                    FileRefField::Id => qualified(&alias, "id"),
+                    FileRefField::FileName => qualified(&alias, "file_name"),
+                    FileRefField::MediaType => qualified(&alias, "media_type"),
+                    FileRefField::Size => qualified(&alias, "byte_size"),
+                    FileRefField::Url => url_sql.replace("{row}", &quoted),
+                    FileRefField::Typename { value } => typename_literal(&dialect, value),
+                };
+                (field.alias.clone(), value)
+            })
+            .collect();
+        // The join is narrowed to an upload that was actually claimed for THIS
+        // column. The claim gate is the intended way a value gets here, but it
+        // is not the only way one could — a migration, a command step, or a
+        // repair script can put any uuid in the column — and a signed URL must
+        // never be minted for an upload that was not verified, or for one that
+        // belongs to another column. A value that does not qualify reads as
+        // NULL, exactly like an unset attachment.
+        format!(
+            "(SELECT {object} FROM donat.file_uploads {quoted} WHERE {id} = {value} \
+             AND {state} = 'claimed' AND {attachment_column} = {attachment})",
+            object = json_object(&dialect, &pairs),
+            id = qualified(&alias, "id"),
+            value = qualified(table_alias, column),
+            state = qualified(&alias, "state"),
+            attachment_column = qualified(&alias, "attachment"),
+            attachment = quote_lit(attachment),
+        )
     }
 
     /// Column output expression with type-specific casts.
@@ -3827,6 +3889,9 @@ fn mutation_to_sql_full(
     let dialect = ctx.dialect;
     match root {
         MutationRoot::Command { command, .. } => command_to_sql(&mut ctx, command),
+        MutationRoot::RequestFileUpload { request, .. } => {
+            file_upload_request_to_sql(&mut ctx, request)
+        }
         MutationRoot::Typename { value, .. } => {
             format!("SELECT {}::text AS root", quote_lit(value))
         }
@@ -3972,6 +4037,7 @@ fn mutation_to_sql_full(
                 dml: &stmt,
                 check: insert.check.as_ref(),
                 check_path: &insert.check_path,
+                file_claims: &insert.file_claims,
                 extra_ctes,
                 extra_checks,
                 validators: &insert.validators,
@@ -4029,6 +4095,7 @@ fn mutation_to_sql_full(
                 dml: &stmt,
                 check: update.check.as_ref(),
                 check_path: &update.check_path,
+                file_claims: &update.file_claims,
                 extra_ctes: vec![],
                 extra_checks: vec![],
                 validators: &update.validators,
@@ -4052,6 +4119,7 @@ fn mutation_to_sql_full(
                 dml: &stmt,
                 check: None,
                 check_path: "$",
+                file_claims: &[],
                 validators: &[],
                 extra_ctes: vec![],
                 extra_checks: vec![],
@@ -4114,6 +4182,9 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
     match root {
         MutationRoot::Command { .. } => {
             panic!("command mutations are Postgres-only and have no SQLite renderer")
+        }
+        MutationRoot::RequestFileUpload { .. } => {
+            panic!("file attachments are Postgres-only and have no SQLite renderer")
         }
         MutationRoot::Typename { value, .. } => SqliteMutationPlan {
             dml_sql: String::new(),
@@ -4508,6 +4579,9 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
         MutationRoot::Command { .. } => {
             panic!("command mutations are Postgres-only and have no MySQL renderer")
         }
+        MutationRoot::RequestFileUpload { .. } => {
+            panic!("file attachments are Postgres-only and have no MySQL renderer")
+        }
         MutationRoot::Typename { value, .. } => MySqlMutationPlan {
             dml_sql: String::new(),
             single_row_output: false,
@@ -4770,6 +4844,7 @@ impl Ctx {
             check,
             check_path,
             validators,
+            file_claims,
             extra_ctes,
             extra_checks,
             output,
@@ -4826,6 +4901,42 @@ impl Ctx {
                 message = quote_lit(&validator.message),
             );
         }
+        // Claims wrap outside the validators, so an upload that is not the
+        // caller's is reported before any message about the values it
+        // submitted. They stay inside the permission check, so a role that may
+        // not write the row at all never learns anything about an upload.
+        let mut claim_ctes = Vec::new();
+        for (index, claim) in file_claims.iter().enumerate() {
+            let claim_cte = format!("__donat_claim_{index}");
+            let claim_ident = quote_ident(&claim_cte);
+            let ids: Vec<String> = claim
+                .upload_ids
+                .iter()
+                .map(|id| format!("{}::uuid", quote_lit(id)))
+                .collect();
+            let session_key = match &claim.session_key {
+                Some(key) => quote_lit(key),
+                None => "NULL".to_string(),
+            };
+            claim_ctes.push(format!(
+                "{claim_ident} AS (UPDATE donat.file_uploads SET state = 'claimed', \
+                 claimed_at = now() WHERE id IN ({ids}) AND state = 'pending' \
+                 AND expires_at > now() AND byte_size > 0 AND attachment = {attachment} \
+                 AND session_role = {role} AND session_key IS NOT DISTINCT FROM {session_key} \
+                 RETURNING id)",
+                ids = ids.join(", "),
+                attachment = quote_lit(&claim.attachment),
+                role = quote_lit(&claim.role),
+            ));
+            guarded = format!(
+                "CASE WHEN (SELECT count(*) FROM {claim_ident}) <> {expected} THEN \
+                 donat.raise_graphql_error('validation-failed', {path}, {message})::json \
+                 ELSE {guarded} END",
+                expected = claim.upload_ids.len(),
+                path = quote_lit(&claim.error_path),
+                message = quote_lit(&claim.message),
+            );
+        }
         for (check_cte, check, check_path, relationship_ctes) in extra_checks.into_iter().rev() {
             let check_cte_ident = quote_ident(&check_cte);
             let violated = format!(
@@ -4866,8 +4977,110 @@ impl Ctx {
         }
         let mut ctes = vec![format!("{cte_ident} AS ({dml})")];
         ctes.extend(extra_ctes);
+        ctes.extend(claim_ctes);
         format!("WITH {} SELECT {guarded} AS root", ctes.join(", "))
     }
+}
+
+/// Minting one upload URL (spec 008).
+///
+/// One statement: the 'pending' row is inserted and the signed URL is built
+/// from it in the same breath, so there is no window in which a URL exists
+/// without a catalog row to collect. The URL expression arrives pre-rendered
+/// from the planner, with `{row}` standing in for the inserted row's alias.
+fn file_upload_request_to_sql(ctx: &mut Ctx, request: &donat_ir::FileUploadRequest) -> String {
+    use donat_ir::FileUploadField;
+
+    let dialect = ctx.dialect;
+    let cte = quote_ident("__donat_upload");
+    let session_key = match &request.session_key {
+        Some(key) => quote_lit(key),
+        None => "NULL".to_string(),
+    };
+    let byte_size = match request.byte_size {
+        Some(size) => size.to_string(),
+        None => "NULL".to_string(),
+    };
+    // The insert is conditional on the session's own budget, counted in the
+    // same statement. A caller cannot outrun this by sending requests in
+    // parallel: every one of them counts the rows the others committed.
+    let dml = format!(
+        "INSERT INTO donat.file_uploads (id, attachment, backend, object_key, file_name, \
+         media_type, declared_bytes, byte_size, state, session_role, session_key, expires_at) \
+         SELECT {id}::uuid, {attachment}, {backend}, {object_key}, {file_name}, {media_type}, \
+         {declared_bytes}, {byte_size}, 'pending', {role}, {session_key}, to_timestamp({expires}) \
+         WHERE (SELECT count(*) FROM donat.file_uploads b \
+                WHERE b.session_role = {role} \
+                  AND b.session_key IS NOT DISTINCT FROM {session_key} \
+                  AND b.state = 'pending' AND b.expires_at > now()) < {max_pending} \
+           AND (SELECT count(*) FROM donat.file_uploads b \
+                WHERE b.session_role = {role} \
+                  AND b.session_key IS NOT DISTINCT FROM {session_key} \
+                  AND b.created_at > now() - interval '1 minute') < {max_per_minute} \
+         RETURNING *",
+        id = quote_lit(&request.upload_id),
+        attachment = quote_lit(&request.attachment),
+        backend = quote_lit(&request.backend),
+        object_key = quote_lit(&request.object_key),
+        file_name = quote_lit(&request.file_name),
+        media_type = quote_lit(&request.media_type),
+        declared_bytes = request.declared_bytes,
+        role = quote_lit(&request.role),
+        expires = request.expires_at_epoch,
+        max_pending = request.max_pending_per_session,
+        max_per_minute = request.max_per_minute_per_session,
+    );
+
+    let headers = if request.headers.is_empty() {
+        "'[]'::json".to_string()
+    } else {
+        let entries: Vec<String> = request
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "json_build_object('name', {}, 'value', {})",
+                    quote_lit(name),
+                    quote_lit(value)
+                )
+            })
+            .collect();
+        format!("json_build_array({})", entries.join(", "))
+    };
+
+    let pairs: Vec<(String, String)> = request
+        .fields
+        .iter()
+        .map(|field| {
+            let value = match &field.field {
+                FileUploadField::Id => qualified("__donat_upload", "id"),
+                FileUploadField::Url => request.url_sql.replace("{row}", &cte),
+                FileUploadField::Method => quote_lit(&request.method),
+                FileUploadField::Headers => headers.clone(),
+                FileUploadField::CompleteUrl => match &request.complete_url_sql {
+                    Some(sql) => sql.replace("{row}", &cte),
+                    None => "NULL".to_string(),
+                },
+                FileUploadField::ExpiresAt => format!(
+                    "to_char(to_timestamp({}) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+                    request.expires_at_epoch
+                ),
+                FileUploadField::Typename { value } => typename_literal(&dialect, value),
+            };
+            (field.alias.clone(), value)
+        })
+        .collect();
+
+    // No row means the budget was spent. Reporting it as a refusal rather than
+    // an empty result keeps the field non-nullable and tells the caller why.
+    format!(
+        "WITH {cte} AS ({dml}) SELECT CASE WHEN (SELECT count(*) FROM {cte}) = 0 THEN \
+         donat.raise_graphql_error('validation-failed', {path}, {message})::json \
+         ELSE (SELECT {object} FROM {cte}) END AS root",
+        object = json_object(&dialect, &pairs),
+        path = quote_lit(&request.error_path),
+        message = quote_lit(&request.limit_message),
+    )
 }
 
 fn row_function_arg(
@@ -5341,6 +5554,7 @@ mod dialect_dispatch_tests {
                         error_path: "$.selectionSet.insert_note.args.objects".into(),
                     },
                 ],
+                file_claims: vec![],
                 output: MutationOutput::Response(vec![MutationResponseField::AffectedRows {
                     alias: "affected_rows".into(),
                 }]),
@@ -5399,6 +5613,7 @@ mod dialect_dispatch_tests {
                 check: None,
                 check_path: "$".into(),
                 validators: vec![],
+                file_claims: vec![],
                 output,
             },
         };
@@ -5441,6 +5656,7 @@ mod dialect_dispatch_tests {
                 check: None,
                 check_path: "$".into(),
                 validators: vec![],
+                file_claims: vec![],
                 output: MutationOutput::Response(vec![
                     MutationResponseField::AffectedRows {
                         alias: "affected_rows".into(),

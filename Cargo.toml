@@ -5,6 +5,7 @@ members = [
     "crates/connector-abi",
     "crates/connector-catalog",
     "crates/metadata",
+    "crates/storage",
     "crates/rules",
     "crates/catalog",
     "crates/schema",

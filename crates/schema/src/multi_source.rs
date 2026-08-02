@@ -402,6 +402,14 @@ impl<'a> MultiSourcePlanner<'a> {
         })
     }
 
+    /// Attach the request's storage material to every child planner, so a file
+    /// column can be signed wherever it is selected.
+    pub fn set_storage(&mut self, storage: &'a donat_storage::RequestContext<'a>) {
+        for child in &mut self.children {
+            child.planner.storage = Some(storage);
+        }
+    }
+
     /// Apply the Relay mode that was validated during snapshot compilation.
     pub fn set_relay(&mut self, enabled: bool) -> Result<(), PlanError> {
         if enabled && let Some(error) = &self.compiled.relay_error {

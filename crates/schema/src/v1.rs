@@ -393,6 +393,7 @@ impl<'a> Planner<'a> {
             "$",
         )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
+        let file_claims = self.file_claims_for_sets(&ctx.entry.table, &sets, session, "$");
 
         Ok(UpdateMutation {
             table: Table {
@@ -404,6 +405,7 @@ impl<'a> Planner<'a> {
             check: None,
             check_path: "$".to_string(),
             validators,
+            file_claims,
             output,
         })
     }
@@ -646,6 +648,7 @@ impl<'a> Planner<'a> {
             "$",
         )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
+        let file_claims = self.file_claims(&ctx.entry.table, &typed_columns, &rows, session, "$");
 
         Ok(InsertMutation {
             table: Table {
@@ -659,6 +662,7 @@ impl<'a> Planner<'a> {
             check,
             check_path: "$".to_string(),
             validators,
+            file_claims,
             output,
         })
     }
