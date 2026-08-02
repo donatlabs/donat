@@ -4,4 +4,8 @@ target/
 tests/donat/tests-py/
 **/*.log
 .claude/
-knowledgebase/
+# knowledgebase/ is NOT excluded: it is build input, not documentation.
+# crates/connector-catalog/src/canonical.rs embeds ADR 012 with include_str!
+# and parses the owner manifest out of it at compile time, so excluding the
+# directory fails the build outright (and did — the image never published).
+# 716K of markdown; keep it in the context until nothing `include_str!`s it.
