@@ -1,0 +1,7 @@
+[
+    {
+        "name": "customer_id",
+        "desc": "Shopper business id matching the petshop customer table - becomes X-Donat-User-Id",
+        "user_editable": false
+    }
+]

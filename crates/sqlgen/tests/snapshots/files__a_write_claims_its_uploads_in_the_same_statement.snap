@@ -1,0 +1,5 @@
+---
+source: crates/sqlgen/tests/files.rs
+expression: sql
+---
+WITH "ins" AS (INSERT INTO "public"."pet" ("name", "photo") VALUES (('Kit')::"text", ('11111111-1111-1111-1111-111111111111')::"uuid") RETURNING *), "__donat_claim_0" AS (UPDATE donat.file_uploads SET state = 'claimed', claimed_at = now() WHERE id IN ('11111111-1111-1111-1111-111111111111'::uuid) AND state = 'pending' AND expires_at > now() AND byte_size > 0 AND attachment = 'public.pet.photo' AND session_role = 'customer' AND session_key IS NOT DISTINCT FROM 'u-1' RETURNING id) SELECT CASE WHEN (SELECT count(*) FROM "__donat_claim_0") <> 1 THEN donat.raise_graphql_error('validation-failed', '$.selectionSet.insert_pet.args.objects', 'file upload is not available')::json ELSE (SELECT json_build_object('id', "ins"."id") FROM "ins" LIMIT 1) END AS root

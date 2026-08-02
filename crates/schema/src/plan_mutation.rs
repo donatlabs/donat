@@ -113,6 +113,220 @@ impl ResolvedCommandStepKind {
 impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Donat reports "no mutations exist" when not.
+    /// Every file column this role may write, and therefore every column it
+    /// may ask for an upload URL for.
+    ///
+    /// The answer is derived, never declared: writing the column is the whole
+    /// permission. `attachments:` in the table's metadata says which columns
+    /// hold files, not who may fill them.
+    pub(crate) fn writable_attachments(
+        &self,
+        session: &Session,
+    ) -> Vec<(
+        &'a donat_metadata::TableEntry,
+        &'a donat_metadata::Attachment,
+    )> {
+        self.tables()
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .attachments
+                    .iter()
+                    .filter(|attachment| {
+                        self.role_may_write_column(entry, &attachment.column, session)
+                    })
+                    .map(move |attachment| (entry, attachment))
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_writable_attachment(&self, session: &Session) -> bool {
+        self.is_postgres_source() && !self.writable_attachments(session).is_empty()
+    }
+
+    /// Whether the role may write one column through an ordinary insert or
+    /// update. Command-only permissions deliberately do not count: they exist
+    /// to let a closed command write a table without opening a CRUD root, and
+    /// an upload URL is a caller-facing capability.
+    fn role_may_write_column(
+        &self,
+        entry: &donat_metadata::TableEntry,
+        column: &str,
+        session: &Session,
+    ) -> bool {
+        let insertable = self
+            .resolve_role_perm(&entry.insert_permissions, &session.role, |permission| {
+                !permission.backend_only || session.backend_request
+            })
+            .is_some_and(|permission| columns_include(&permission.columns, column));
+        let updatable = self
+            .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
+            .is_some_and(|permission| columns_include(&permission.columns, column));
+        insertable || updatable
+    }
+
+    /// Mint one upload URL.
+    fn plan_file_upload_request(
+        &self,
+        field: &GqlField<'static, String>,
+        fragments: &Fragments,
+        vars: &JsonMap<String, Json>,
+        session: &Session,
+        path: &str,
+    ) -> Result<FileUploadRequest, PlanError> {
+        let mut attachment_arg = None;
+        let mut file_name = None;
+        let mut media_type = None;
+        let mut size = None;
+        for (name, value) in &field.arguments {
+            let value = value_to_json(value, vars, path)?;
+            match name.as_str() {
+                "attachment" => attachment_arg = value.as_str().map(str::to_string),
+                "file_name" => file_name = value.as_str().map(str::to_string),
+                "media_type" => media_type = value.as_str().map(str::to_string),
+                "size" => size = value.as_i64(),
+                other => return Err(unexpected_arg(path, other)),
+            }
+        }
+        let missing = |argument: &str| {
+            PlanError::validation(path, format!("missing required argument '{argument}'"))
+        };
+        let attachment_arg = attachment_arg.ok_or_else(|| missing("attachment"))?;
+        let file_name = file_name.ok_or_else(|| missing("file_name"))?;
+        let media_type = media_type.ok_or_else(|| missing("media_type"))?;
+        let size = size.ok_or_else(|| missing("size"))?;
+
+        // Only the columns this role may write are nameable, so an enum value
+        // it cannot use does not exist for it — the same shape as a table it
+        // has no permission on.
+        let Some((entry, declared)) = self
+            .writable_attachments(session)
+            .into_iter()
+            .find(|(entry, attachment)| attachment_enum_value(entry, attachment) == attachment_arg)
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("unexpected value \"{attachment_arg}\" for enum: 'donat_file_attachment'"),
+            ));
+        };
+        let key = format!(
+            "{}.{}.{}",
+            entry.table.schema(),
+            entry.table.name(),
+            declared.column
+        );
+
+        // Both strings are stored verbatim on a row the caller can create at
+        // will, so they are bounded here rather than left to Postgres.
+        for (argument, value, limit) in [
+            ("file_name", &file_name, 255usize),
+            ("media_type", &media_type, 255usize),
+        ] {
+            if value.is_empty() || value.chars().count() > limit {
+                return Err(PlanError::validation(
+                    path,
+                    format!("'{argument}' must be between 1 and {limit} characters"),
+                ));
+            }
+        }
+        if !declared.allows_media_type(&media_type) {
+            return Err(PlanError::validation(
+                path,
+                format!("media type '{media_type}' is not accepted by '{key}'"),
+            ));
+        }
+        if size <= 0 || size as u64 > declared.max_bytes {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "size {size} is outside the accepted range for '{key}' (1..={})",
+                    declared.max_bytes
+                ),
+            ));
+        }
+
+        let Some(storage) = self.storage else {
+            return Err(PlanError::validation(
+                path,
+                "uploads are not available: this deployment has no storage configuration",
+            ));
+        };
+        let Some(spec) = storage.registry.attachment(&key) else {
+            return Err(PlanError::validation(
+                path,
+                format!("uploads are not available for '{key}': its backend is not configured"),
+            ));
+        };
+        let Some(target) = storage.upload_target(spec, &media_type, size) else {
+            return Err(PlanError::validation(
+                path,
+                format!("uploads are not available for '{key}': its backend cannot sign a URL"),
+            ));
+        };
+
+        let type_name = "donat_file_upload";
+        let mut fields = Vec::new();
+        for selected in flatten(&field.selection_set, fragments, vars, Some(type_name))? {
+            let alias = selected
+                .alias
+                .clone()
+                .unwrap_or_else(|| selected.name.clone());
+            let fpath = format!("{path}.{alias}");
+            let resolved = match selected.name.as_str() {
+                "id" => FileUploadField::Id,
+                "url" => FileUploadField::Url,
+                "method" => FileUploadField::Method,
+                "headers" => FileUploadField::Headers,
+                "complete_url" => FileUploadField::CompleteUrl,
+                "expires_at" => FileUploadField::ExpiresAt,
+                "__typename" => FileUploadField::Typename {
+                    value: type_name.to_string(),
+                },
+                other => return Err(field_not_found(&fpath, other, type_name)),
+            };
+            fields.push(FileUploadOutput {
+                alias,
+                field: resolved,
+            });
+        }
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "field '{FILE_UPLOAD_ROOT}' of type '{type_name}' must have a selection of subfields"
+                ),
+            ));
+        }
+
+        Ok(FileUploadRequest {
+            upload_id: target.upload_id.to_string(),
+            attachment: key,
+            backend: declared.backend.clone(),
+            object_key: target.object_key,
+            file_name,
+            media_type,
+            declared_bytes: size,
+            byte_size: target.byte_size,
+            role: session.role.clone(),
+            session_key: session
+                .var(storage.registry.identity_variable())
+                .map(str::to_string),
+            expires_at_epoch: target.expires_at_epoch,
+            max_pending_per_session: storage.registry.limits().pending_uploads_per_session,
+            max_per_minute_per_session: storage.registry.limits().uploads_per_minute_per_session,
+            limit_message: "too many upload requests: this session already holds the \
+                            maximum number of unclaimed uploads, or has asked for too many \
+                            in the last minute"
+                .to_string(),
+            error_path: path.to_string(),
+            url_sql: quote_sql_literal(&target.url),
+            complete_url_sql: target.complete_url.as_deref().map(quote_sql_literal),
+            method: target.method,
+            headers: target.headers,
+            fields,
+        })
+    }
+
     pub(crate) fn role_has_any_mutation(&self, session: &Session) -> bool {
         if !self.capabilities.mutations {
             return false;
@@ -186,6 +400,14 @@ impl<'a> Planner<'a> {
                 out.push(MutationRoot::Command {
                     alias,
                     command: result?,
+                });
+                continue;
+            }
+            if field.name == FILE_UPLOAD_ROOT && self.has_writable_attachment(session) {
+                out.push(MutationRoot::RequestFileUpload {
+                    alias,
+                    request: self
+                        .plan_file_upload_request(field, fragments, vars, session, &path)?,
                 });
                 continue;
             }
@@ -3602,6 +3824,29 @@ impl<'a> Planner<'a> {
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
+        let mut file_claims = self.file_claims(
+            &ctx.entry.table,
+            &typed_columns,
+            &rows,
+            session,
+            &format!("{path}.args.objects"),
+        );
+        // A nested insert writes another table, but its uploads are claimed by
+        // the same statement, so they belong to the same gate.
+        for nested in &nested_object_inserts {
+            let table = donat_metadata::QualifiedTable::Qualified {
+                schema: nested.table.schema.clone(),
+                name: nested.table.name.clone(),
+            };
+            file_claims.extend(self.file_claims(
+                &table,
+                &nested.columns,
+                std::slice::from_ref(&nested.row),
+                session,
+                &format!("{path}.args.objects"),
+            ));
+        }
+
         Ok(InsertMutation {
             table: Table {
                 schema: ctx.info.schema.clone(),
@@ -3614,6 +3859,7 @@ impl<'a> Planner<'a> {
             check,
             check_path,
             validators,
+            file_claims,
             output,
         })
     }
@@ -4105,6 +4351,8 @@ impl<'a> Planner<'a> {
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
+        let file_claims = self.file_claims_for_sets(&ctx.entry.table, &sets, session, "$");
+
         Ok(UpdateMutation {
             table: Table {
                 schema: ctx.info.schema.clone(),
@@ -4115,8 +4363,97 @@ impl<'a> Planner<'a> {
             check,
             check_path: "$".to_string(),
             validators,
+            file_claims,
             output,
         })
+    }
+
+    /// The claim gates for one write: one per declared file column that
+    /// received a value.
+    ///
+    /// A column the caller left alone produces no gate, so an ordinary update
+    /// that never mentions an attachment costs nothing. `columns` and `rows`
+    /// are the aligned insert shape; every non-null value is an upload id the
+    /// statement must be allowed to consume.
+    pub(crate) fn file_claims(
+        &self,
+        table: &donat_metadata::QualifiedTable,
+        columns: &[(String, String)],
+        rows: &[Vec<Option<Scalar>>],
+        session: &Session,
+        error_path: &str,
+    ) -> Vec<FileClaim> {
+        let mut claims = Vec::new();
+        for (index, (column, _)) in columns.iter().enumerate() {
+            if self.attachment_for(table, column).is_none() {
+                continue;
+            }
+            let ids: Vec<String> = dedup(
+                rows.iter()
+                    .filter_map(|row| row.get(index).and_then(Option::as_ref))
+                    .filter_map(upload_id_of)
+                    .collect(),
+            );
+            if ids.is_empty() {
+                continue;
+            }
+            claims.push(self.file_claim(table, column, ids, session, error_path));
+        }
+        claims
+    }
+
+    /// The same, for the `_set` shape an update uses.
+    pub(crate) fn file_claims_for_sets(
+        &self,
+        table: &donat_metadata::QualifiedTable,
+        sets: &[SetOp],
+        session: &Session,
+        error_path: &str,
+    ) -> Vec<FileClaim> {
+        let mut claims = Vec::new();
+        for op in sets {
+            let SetOp::Set { column, value, .. } = op else {
+                continue;
+            };
+            if self.attachment_for(table, column).is_none() {
+                continue;
+            }
+            let Some(id) = upload_id_of(value) else {
+                continue;
+            };
+            claims.push(self.file_claim(table, column, vec![id], session, error_path));
+        }
+        claims
+    }
+
+    pub(crate) fn file_claim(
+        &self,
+        table: &donat_metadata::QualifiedTable,
+        column: &str,
+        upload_ids: Vec<String>,
+        session: &Session,
+        error_path: &str,
+    ) -> FileClaim {
+        // The same variable the mint used. A deployment that identifies its
+        // tenants by something other than a user id declares it once, in
+        // storage.yaml, rather than having the binding silently weaken to the
+        // role.
+        let identity = self
+            .storage
+            .map(|storage| storage.registry.identity_variable())
+            .unwrap_or("x-donat-user-id");
+        FileClaim {
+            attachment: format!("{}.{}.{column}", table.schema(), table.name()),
+            upload_ids,
+            role: session.role.clone(),
+            session_key: session.var(identity).map(str::to_string),
+            error_path: error_path.to_string(),
+            // One message for every cause. Telling a caller which of them
+            // applied would let it probe for uploads that are not its own.
+            message: "file upload is not available: it is unknown, already used, expired, \
+                      not uploaded, or was requested for another column or session"
+                .to_string(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5370,4 +5707,55 @@ fn coerce_rule_argument_value(
             "argument does not match its declared Rule type",
         ))
     }
+}
+
+/// The submitted value of a file column, when it is a usable upload id.
+///
+/// Anything else — a null, a number, a nested expression — produces no claim
+/// here; it fails later against the column's own `uuid` type, which is the
+/// error the caller should see.
+fn upload_id_of(value: &Scalar) -> Option<String> {
+    value.as_json().as_str().map(str::to_string)
+}
+
+/// Order-preserving deduplication: the gate counts rows it updated, so the same
+/// id submitted twice must be expected once.
+fn dedup(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+/// The root field that mints upload URLs. It exists only for roles that may
+/// write some declared file column, so a deployment without attachments — or a
+/// role without one — sees no new mutation at all.
+pub(crate) const FILE_UPLOAD_ROOT: &str = "donat_request_file_upload";
+
+/// The enum value naming one attachment: `public_pet_photo`.
+pub(crate) fn attachment_enum_value(
+    entry: &donat_metadata::TableEntry,
+    attachment: &donat_metadata::Attachment,
+) -> String {
+    format!(
+        "{}_{}_{}",
+        entry.table.schema(),
+        entry.table.name(),
+        attachment.column
+    )
+}
+
+fn columns_include(columns: &donat_metadata::Columns, column: &str) -> bool {
+    match columns {
+        donat_metadata::Columns::Star => true,
+        donat_metadata::Columns::List(list) => list.iter().any(|c| c == column),
+    }
+}
+
+/// The upload URL is a finished string, not an expression: one request mints
+/// exactly one of them. It still goes through the escaping helper, because
+/// nothing reaches SQL unescaped.
+fn quote_sql_literal(value: &str) -> String {
+    donat_sqlgen::quote_lit(value)
 }

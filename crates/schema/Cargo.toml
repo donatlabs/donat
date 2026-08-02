@@ -10,6 +10,7 @@ donat-metadata = { path = "../metadata" }
 donat-catalog = { path = "../catalog" }
 donat-rules = { path = "../rules" }
 donat-ir = { path = "../ir" }
+donat-storage = { path = "../storage" }
 donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }
 graphql-parser = { workspace = true }

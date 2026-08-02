@@ -36,7 +36,8 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/030-command-arguments-of-named-types-compile-to-their-declared-representation]]
 - [[decisions/031-a-durable-retry-must-name-its-cause]]
 - [[decisions/032-permission-validators-declare-presence]]
-- [[decisions/033-a-declaration-the-runtime-ignores-is-a-defect]]
+- [[decisions/033-files-are-a-column-and-their-urls-are-signed-in-sql]]
+- [[decisions/034-a-declaration-the-runtime-ignores-is-a-defect]]
 
 ## Reference governance
 

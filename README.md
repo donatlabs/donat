@@ -60,6 +60,7 @@ worker to write, no queue to run, no correlation id to invent.
 | A decision | A **Rule** or decision table — typed inputs, an expression or ordered rows, unit-testable in metadata | A tangle of `if` in three services that disagree |
 | A long-running flow | A **Process** — states, waits, timers, signals, bounded fan-out, compensation, pinned revisions | An outbox, a scheduler, a status column that lies |
 | An external system | A **Connector** — declared operations with request and response contracts, error classes, retry, rate limits, idempotency headers | A hand-rolled client per provider, and the reconciliation script |
+| A file on a record | An **Attachment** — a uuid column declared beside the table's permissions, stored in S3 | An upload service, a second permission model, a cleanup cron |
 | Who may see what | Per-role row filters, column sets and presets | An authorization layer per transport |
 
 All of it is YAML in review, applied at deploy time. The engine is one Rust
@@ -128,6 +129,7 @@ so filters, error contracts and policy cannot drift by transport.
 | **MCP** | Permission-aware tools. A separate `mcp.yaml` publishes a small, role-scoped agent contract. |
 | **Commands & Processes** | Transactional domain operations and durable flows, exposed as ordinary mutations. |
 | **Events & actions** | Event triggers, durable cron delivery, verified inbound webhooks, typed synchronous actions. |
+| **Files** | Presigned upload and download URLs for declared file columns on any S3-compatible store, public files served straight from a CDN, and orphaned objects collected in the background. No file byte passes through the engine. |
 
 All request-facing surfaces are on by default; restrict them at deploy time
 with `DONAT_GRAPHQL_ENABLED_APIS=graphql`. A mounted route still needs an

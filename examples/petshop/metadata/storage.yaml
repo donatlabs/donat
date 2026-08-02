@@ -1,0 +1,55 @@
+# Where uploaded files go, how their URLs are signed, and how often abandoned
+# and orphaned objects are reclaimed. Which column holds a file is declared on
+# the table itself (see databases/default/tables/public_customer.yaml).
+backends:
+  - name: media
+    kind: s3
+    # docker-compose runs MinIO beside the engine. Point this at a real bucket
+    # and the rest of the file is unchanged.
+    bucket: petshop-media
+    region: us-east-1
+    endpoint: http://minio:9000
+    # MinIO reachable by hostname needs path-style addressing; a real S3 bucket
+    # does not.
+    path_style: true
+    access_key_id:
+      value_from_env: PETSHOP_S3_KEY
+    secret_access_key:
+      value_from_env: PETSHOP_S3_SECRET
+    # Where a public attachment's stable URL is rooted. In production this is a
+    # CDN distribution; here it is MinIO's own anonymous origin, reachable from
+    # the host.
+    public_base_url: http://127.0.0.1:9000/petshop-media
+
+signing:
+  # The store presigns upload and download URLs; the call reporting an upload
+  # finished is answered by the engine and carries no other proof. Never a
+  # literal in metadata.
+  secret:
+    value_from_env: PETSHOP_FILE_SIGNING_SECRET
+  upload_ttl_seconds: 900
+  download_ttl_seconds: 300
+
+# Every window defaults to one day; they are spelled out here to show the shape.
+gc:
+  every_days: 1
+  pending_ttl_days: 1
+  orphan_grace_days: 1
+
+# What one shopper may ask for. The engine does no network-level rate limiting —
+# that is the reverse proxy's job — but neither of these is visible to a proxy:
+# both are counted against rows the engine owns.
+limits:
+  pending_uploads_per_session: 10
+  uploads_per_minute_per_session: 30
+
+# An upload is bound to the session that asked for it, and this says what "the
+# session" means. The petshop identifies a shopper by customer id.
+identity:
+  session_variable: x-donat-user-id
+
+# A browser uploading to a signed URL does so cross-origin. Nothing else in the
+# engine needs this, so it is declared here.
+cors:
+  allow_origins:
+    - http://localhost:3000
