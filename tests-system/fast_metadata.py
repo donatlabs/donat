@@ -32,6 +32,14 @@ PERIOD = re.compile(r"(?m)^(?P<indent>\s*)deadline:\s*(?P<value>[0-9]+(?:ms|s|m|
 INLINE_PERIOD = re.compile(r"deadline:\s*([0-9]+(?:ms|s|m|h|d))")
 DELAY_SECONDS = re.compile(r"delay_seconds:\s*(?P<value>[0-9]{2,})")
 
+#: The engine on a stand runs on the host, not inside the compose network, so
+#: object-storage addresses have to name the published ports instead of compose
+#: hostnames. The URLs a client is handed must resolve from the host too.
+STORAGE_ADDRESSES = [
+    ("http://minio:9000", "http://127.0.0.1:9100"),
+    ("http://127.0.0.1:9000/petshop-media", "http://127.0.0.1:9100/petshop-media"),
+]
+
 
 def shorten(text: str) -> tuple[str, int]:
     """Rewrite declared periods; report how many were changed."""
@@ -56,20 +64,39 @@ def shorten(text: str) -> tuple[str, int]:
         changes += 1
         return f"delay_seconds: {DUNNING_SECONDS}"
 
+    for compose_address, host_address in STORAGE_ADDRESSES:
+        if compose_address in text:
+            text = text.replace(compose_address, host_address)
+            changes += 1
     text = PERIOD.sub(block, text)
     text = INLINE_PERIOD.sub(inline, text)
     text = DELAY_SECONDS.sub(delay, text)
     return text, changes
 
 
-def build(source: pathlib.Path, destination: pathlib.Path) -> int:
+def rehost_only(text: str) -> tuple[str, int]:
+    """Rewrite object-storage addresses, leaving every declared period alone."""
+
+    changes = 0
+    for compose_address, host_address in STORAGE_ADDRESSES:
+        if compose_address in text:
+            text = text.replace(compose_address, host_address)
+            changes += 1
+    return text, changes
+
+
+def build(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    transform=shorten,
+) -> int:
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(source, destination)
     changed = 0
     for path in destination.rglob("*.yaml"):
         text = path.read_text()
-        rewritten, count = shorten(text)
+        rewritten, count = transform(text)
         if count:
             path.write_text(rewritten)
             changed += count
@@ -79,5 +106,8 @@ def build(source: pathlib.Path, destination: pathlib.Path) -> int:
 if __name__ == "__main__":
     source = pathlib.Path(sys.argv[1])
     destination = pathlib.Path(sys.argv[2])
-    count = build(source, destination)
-    print(f"shortened {count} declared periods into {destination}")
+    # `--rehost` prepares the ordinary stand: object storage addresses only,
+    # every declared period left exactly as the store ships it.
+    transform = rehost_only if "--rehost" in sys.argv[3:] else shorten
+    count = build(source, destination, transform)
+    print(f"rewrote {count} declarations into {destination}")

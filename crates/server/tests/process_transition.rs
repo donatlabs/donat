@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use donat_catalog::Catalog;
 use donat_metadata::Metadata;
@@ -9,7 +10,7 @@ use donat_server::connectors::ConnectorRegistry;
 use donat_server::migrate::run_migrate;
 use donat_server::processes::{
     ProcessPlanningSnapshot, ProcessRuntime, StartConsumption, TransitionConsumption,
-    build_process_runtime, reconcile, validate_serving_catalogs,
+    build_process_runtime, consume_transitions_concurrently, reconcile, validate_serving_catalogs,
 };
 use donat_server::state::{SourceRuntime, compile_pure_engine_candidate};
 use serde_json::{Value as Json, json};
@@ -19,6 +20,10 @@ use uuid::Uuid;
 static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
 
 const ENTITY_ID: &str = "550e8400-e29b-41d4-a716-446655440201";
+const STUCK_ENTITY: &str = "550e8400-e29b-41d4-a716-446655440301";
+const STUCK_REQUEST: &str = "550e8400-e29b-41d4-a716-446655440302";
+const FREE_ENTITY: &str = "550e8400-e29b-41d4-a716-446655440303";
+const FREE_REQUEST: &str = "550e8400-e29b-41d4-a716-446655440304";
 const REQUEST_ID: &str = "550e8400-e29b-41d4-a716-446655440202";
 
 fn postgres_admin_url() -> String {
@@ -242,6 +247,36 @@ fn transition_metadata(reject_after_insert: bool) -> Metadata {
     .expect("Process transition metadata deserializes")
 }
 
+/// Two processes: one whose transition writes the domain table, and one that
+/// touches nothing. Holding that table stops the first and must not stop the
+/// second.
+fn head_of_line_metadata() -> Metadata {
+    let mut document =
+        serde_json::to_value(transition_metadata(false)).expect("transition metadata serializes");
+    let free = json!({
+        "name": "free_test",
+        "kind": "process",
+        "version": 1,
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "input": [
+            { "name": "entity_id", "type": "uuid!" },
+            { "name": "request_id", "type": "uuid!" }
+        ],
+        "output": [{ "name": "status", "type": "string!" }],
+        "start_at": "done",
+        "states": [{
+            "id": "done",
+            "output": { "values": { "status": { "literal": "free" } } }
+        }]
+    });
+    document["processes"]
+        .as_array_mut()
+        .expect("metadata declares processes")
+        .push(free);
+    serde_json::from_value(document).expect("head-of-line metadata deserializes")
+}
+
 fn routed_transition_metadata() -> Metadata {
     let mut document =
         serde_json::to_value(transition_metadata(false)).expect("transition metadata serializes");
@@ -389,17 +424,31 @@ fn caller_transition_metadata() -> Metadata {
 }
 
 async fn runtime(database: &TestDatabase, metadata: &Metadata) -> (ProcessRuntime, String) {
+    let (runtime, revisions) = runtime_with_revisions(database, metadata).await;
+    let revision = revisions
+        .get("transition_test")
+        .expect("the transition process compiles")
+        .clone();
+    (runtime, revision)
+}
+
+/// Every compiled process's revision, for a fixture that declares more than one.
+async fn runtime_with_revisions(
+    database: &TestDatabase,
+    metadata: &Metadata,
+) -> (ProcessRuntime, HashMap<String, String>) {
     let catalog = database.catalog().await;
     let catalogs = HashMap::from([("default".to_owned(), catalog)]);
     let connectors = Arc::new(ConnectorRegistry::empty());
     let candidate = compile_pure_engine_candidate(metadata, &catalogs, connectors.as_ref(), true)
         .expect("Process transition candidate compiles");
-    let process = candidate
+    let revisions: HashMap<String, String> = candidate
         .process_catalog
         .source("default")
-        .and_then(|catalog| catalog.process("transition_test"))
-        .expect("Process transition definition compiles");
-    let revision = process.revision_fingerprint.clone();
+        .expect("default Process catalog exists")
+        .iter()
+        .map(|(name, process)| (name.to_string(), process.revision_fingerprint.clone()))
+        .collect();
     reconcile(
         "default",
         &database.url,
@@ -448,7 +497,7 @@ async fn runtime(database: &TestDatabase, metadata: &Metadata) -> (ProcessRuntim
         connectors,
     )
     .expect("Process transition runtime builds");
-    (runtime, revision)
+    (runtime, revisions)
 }
 
 async fn seed_start(database_url: &str, revision: &str) -> Uuid {
@@ -492,6 +541,41 @@ async fn seed_start(database_url: &str, revision: &str) -> Uuid {
         .get(0);
     connection.abort();
     request_id
+}
+
+async fn seed_named_start(
+    database_url: &str,
+    process_name: &str,
+    revision: &str,
+    entity_id: &str,
+    request_id: &str,
+) -> Uuid {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .expect("Process transition database is available");
+    let connection = tokio::spawn(connection);
+    let seeded = client
+        .query_one(
+            "
+            INSERT INTO donat.process_start_requests (
+                source_name, process_name, revision, input_json,
+                command_invocation_id, effect_position, idempotency_key, status
+            )
+            VALUES ('default', $1, $2, $3, gen_random_uuid(), 0, $4, 'pending')
+            RETURNING id
+            ",
+            &[
+                &process_name,
+                &revision,
+                &json!({ "entity_id": entity_id, "request_id": request_id }),
+                &request_id,
+            ],
+        )
+        .await
+        .expect("named Process start request inserts")
+        .get(0);
+    connection.abort();
+    seeded
 }
 
 async fn seed_caller_start(database_url: &str, revision: &str, caller_session: Json) -> Uuid {
@@ -1131,15 +1215,22 @@ async fn caller_command_rejects_a_persisted_session_outside_its_compiled_contrac
         StartConsumption::Started { instance_id, .. } => instance_id,
         other => panic!("expected a new caller Process instance, got {other:?}"),
     };
-    let error = runtime
+    // Failing closed now means failing *this instance*: the session it was
+    // started with can never match its compiled contract, so retrying it would
+    // hold the shared transition queue against every other Process for ever.
+    let consumption = runtime
         .consume_one_transition()
         .await
-        .expect_err("an ambient persisted variable must fail closed");
+        .expect("an ambient persisted variable ends its own instance");
     assert!(
-        error
-            .to_string()
-            .contains("does not match its compiled closed contract"),
-        "unexpected closed-session error: {error:#}"
+        matches!(
+            consumption,
+            TransitionConsumption::CommandFailed {
+                code: "transition_preparation_failed",
+                ..
+            }
+        ),
+        "unexpected closed-session consumption: {consumption:?}"
     );
 
     let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
@@ -1166,11 +1257,19 @@ async fn caller_command_rejects_a_persisted_session_outside_its_compiled_contrac
         )
         .await
         .expect("closed caller failure leaves no partial transition");
-    assert_eq!(row.get::<_, String>(0), "running");
-    assert_eq!(row.get::<_, i64>(1), 0);
-    assert_eq!(row.get::<_, i64>(2), 0);
-    assert_eq!(row.get::<_, i64>(3), 0);
-    assert_eq!(row.get::<_, i64>(4), 1);
+    assert_eq!(row.get::<_, String>(0), "failed");
+    assert_eq!(
+        row.get::<_, i64>(1),
+        1,
+        "failing the instance advances it once"
+    );
+    assert_eq!(row.get::<_, i64>(2), 0, "nothing was written to the domain");
+    assert_eq!(row.get::<_, i64>(3), 0, "no command was invoked");
+    assert_eq!(
+        row.get::<_, i64>(4),
+        0,
+        "the failed instance leaves no pending event behind"
+    );
     connection.abort();
     database.drop().await;
 }
@@ -1256,7 +1355,11 @@ async fn a_constraint_violation_fails_the_instance_without_writing_anything() {
         .expect("database error rolled back every Process-owned write");
     assert_eq!(row.get::<_, String>(0), "failed");
     assert_eq!(row.get::<_, String>(1), "record");
-    assert_eq!(row.get::<_, i64>(2), 1, "failing the instance advances it once");
+    assert_eq!(
+        row.get::<_, i64>(2),
+        1,
+        "failing the instance advances it once"
+    );
     assert_eq!(row.get::<_, Json>(3), json!({}));
     assert_eq!(
         row.get::<_, i64>(4),
@@ -1274,5 +1377,318 @@ async fn a_constraint_violation_fails_the_instance_without_writing_anything() {
         "the failed instance leaves no pending event behind"
     );
     connection.abort();
+    database.drop().await;
+}
+
+/// One instance that cannot make progress must not stop the others.
+///
+/// The domain table is held by somebody else, so the writing instance's command
+/// cannot commit — a lock conflict, which is transient by definition and is
+/// exactly the failure the taxonomy is supposed to retry. While it retries, an
+/// unrelated instance has to be able to run to completion.
+#[tokio::test]
+async fn a_transiently_stuck_instance_does_not_hold_the_queue() {
+    let database = TestDatabase::create("process_transition_head_of_line").await;
+    // A lock conflict has to give up rather than wait: waiting is a hang, and
+    // a hang is not a failure the queue can step around.
+    set_lock_timeout(&database, "250ms").await;
+    let metadata = head_of_line_metadata();
+    let (runtime, revisions) = runtime_with_revisions(&database, &metadata).await;
+
+    seed_named_start(
+        &database.url,
+        "transition_test",
+        &revisions["transition_test"],
+        STUCK_ENTITY,
+        STUCK_REQUEST,
+    )
+    .await;
+    seed_named_start(
+        &database.url,
+        "free_test",
+        &revisions["free_test"],
+        FREE_ENTITY,
+        FREE_REQUEST,
+    )
+    .await;
+    let stuck = start_one(&runtime).await;
+    let free = start_one(&runtime).await;
+
+    let (blocker, blocker_connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("a second session can hold the domain table");
+    let blocker_connection = tokio::spawn(blocker_connection);
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE public.process_test_ledger IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("the domain table is held");
+
+    // Whatever order the queue picks them up in, the unblocked instance has to
+    // reach its terminal state while the blocked one is still failing.
+    let mut deferred = 0;
+    let mut free_finished = false;
+    for _ in 0..12 {
+        match runtime.consume_one_transition().await {
+            Ok(TransitionConsumption::Deferred { .. }) => deferred += 1,
+            Ok(TransitionConsumption::NoWork) => {}
+            Ok(_) => {}
+            Err(error) => panic!("a transient failure must not reach the consumer: {error:#}"),
+        }
+        free_finished |= instance_status(&database.url, free).await == "terminal";
+        if free_finished && deferred > 0 {
+            break;
+        }
+    }
+
+    assert!(
+        free_finished,
+        "an unrelated instance never finished while another one was stuck"
+    );
+    assert!(deferred > 0, "the stuck transition was never deferred");
+    assert_eq!(
+        instance_status(&database.url, stuck).await,
+        "running",
+        "the blocked instance is still trying, not failed"
+    );
+
+    // The durable answer to "is this deployment stuck, and on what": the event
+    // counts its attempts and its next one is scheduled later than it arrived.
+    let (attempts, rescheduled) = event_retry_state(&database.url, stuck).await;
+    assert!(attempts > 0, "the stuck event records no attempt");
+    assert!(
+        rescheduled,
+        "the stuck event was left due at the moment it arrived"
+    );
+
+    blocker
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("the domain table is released");
+    blocker_connection.abort();
+    database.drop().await;
+}
+
+async fn set_lock_timeout(database: &TestDatabase, timeout: &str) {
+    let (client, connection) = tokio_postgres::connect(&database.admin_url, NoTls)
+        .await
+        .expect("Postgres admin database is available");
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "ALTER DATABASE {} SET lock_timeout = '{timeout}'",
+            database.name
+        ))
+        .await
+        .expect("the test database declares a lock timeout");
+    connection.abort();
+}
+
+async fn start_one(runtime: &ProcessRuntime) -> Uuid {
+    match runtime
+        .consume_one_start()
+        .await
+        .expect("a Process start consumes")
+    {
+        StartConsumption::Started { instance_id, .. } => instance_id,
+        other => panic!("expected a new instance, got {other:?}"),
+    }
+}
+
+async fn instance_status(database_url: &str, instance_id: Uuid) -> String {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .expect("Process instance is readable");
+    let connection = tokio::spawn(connection);
+    let status = client
+        .query_one(
+            "SELECT status FROM donat.process_instances WHERE source_name = 'default' AND id = $1",
+            &[&instance_id],
+        )
+        .await
+        .expect("the instance exists")
+        .get::<_, String>(0);
+    connection.abort();
+    status
+}
+
+/// How many attempts the instance's pending event carries, and whether it has
+/// been pushed into the future rather than left at the head of the queue.
+async fn event_retry_state(database_url: &str, instance_id: Uuid) -> (i32, bool) {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .expect("Process events are readable");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "
+            SELECT attempts, available_at > created_at
+            FROM donat.process_events
+            WHERE source_name = 'default' AND instance_id = $1 AND status = 'pending'
+            ORDER BY available_at DESC
+            LIMIT 1
+            ",
+            &[&instance_id],
+        )
+        .await
+        .expect("the instance has a pending event");
+    let state = (row.get::<_, i32>(0), row.get::<_, bool>(1));
+    connection.abort();
+    state
+}
+
+/// Two instances make progress at the same time, the way two HTTP requests do.
+///
+/// One worker at a time is not a queue, it is a line: an instance waiting on a
+/// lock makes every instance behind it wait for the same lock. Here the first
+/// instance is held on the domain table for the whole of its lock timeout, and
+/// the second has to finish inside that window — which it can only do if the
+/// two are in flight together.
+#[tokio::test]
+async fn one_round_of_the_queue_advances_instances_in_parallel() {
+    let database = TestDatabase::create("process_transition_concurrency").await;
+    set_lock_timeout(&database, "3s").await;
+    let metadata = head_of_line_metadata();
+    let (runtime, revisions) = runtime_with_revisions(&database, &metadata).await;
+    let runtime = Arc::new(runtime);
+
+    seed_named_start(
+        &database.url,
+        "transition_test",
+        &revisions["transition_test"],
+        STUCK_ENTITY,
+        STUCK_REQUEST,
+    )
+    .await;
+    seed_named_start(
+        &database.url,
+        "free_test",
+        &revisions["free_test"],
+        FREE_ENTITY,
+        FREE_REQUEST,
+    )
+    .await;
+    let blocked = start_one(&runtime).await;
+    let free = start_one(&runtime).await;
+
+    let (blocker, blocker_connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("a second session can hold the domain table");
+    let blocker_connection = tokio::spawn(blocker_connection);
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE public.process_test_ledger IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("the domain table is held");
+
+    // One round of the queue, with the first instance stuck waiting three
+    // seconds for a lock it will not get.
+    let round = tokio::time::Instant::now();
+    let outcomes = consume_transitions_concurrently(&runtime, 4).await;
+    let elapsed = round.elapsed();
+
+    let completed: Vec<Uuid> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            Ok(TransitionConsumption::Completed { instance_id, .. }) => Some(*instance_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        completed.contains(&free),
+        "the unblocked instance did not finish in the same round: {outcomes:?}"
+    );
+    assert!(
+        !completed.contains(&blocked),
+        "the blocked instance cannot have completed: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Ok(TransitionConsumption::Deferred { instance_id, .. }) if *instance_id == blocked
+        )),
+        "the blocked instance was not deferred: {outcomes:?}"
+    );
+    // The round took the blocked instance's wait, not that wait plus the other
+    // instance's work queued behind it.
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the round serialized the two instances: {elapsed:?}"
+    );
+
+    blocker
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("the domain table is released");
+    blocker_connection.abort();
+    database.drop().await;
+}
+
+/// The deferral must not need a connection the pool has run out of.
+///
+/// A starved pool is one of the transient failures a transition steps aside
+/// for. If stepping aside itself required a free connection, the queue would
+/// jam in exactly the case the deferral exists to handle — so the transition's
+/// own connection carries it.
+#[tokio::test]
+async fn a_transition_defers_even_with_the_pool_exhausted() {
+    let database = TestDatabase::create("process_transition_pool_starved").await;
+    set_lock_timeout(&database, "250ms").await;
+    let metadata = head_of_line_metadata();
+    let (runtime, revisions) = runtime_with_revisions(&database, &metadata).await;
+
+    seed_named_start(
+        &database.url,
+        "transition_test",
+        &revisions["transition_test"],
+        STUCK_ENTITY,
+        STUCK_REQUEST,
+    )
+    .await;
+    let stuck = start_one(&runtime).await;
+
+    let (blocker, blocker_connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("a second session can hold the domain table");
+    let blocker_connection = tokio::spawn(blocker_connection);
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE public.process_test_ledger IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("the domain table is held");
+
+    // Every connection but one is spoken for, and the transition takes that
+    // one: a deferral asking the pool for another would wait for a slot that
+    // is not coming.
+    let capacity = runtime.pool.status().max_size;
+    let mut held = Vec::new();
+    for _ in 0..capacity.saturating_sub(1) {
+        held.push(
+            runtime
+                .pool
+                .get()
+                .await
+                .expect("the pool hands out its connections"),
+        );
+    }
+
+    let deferred = tokio::time::timeout(
+        Duration::from_secs(20),
+        runtime.consume_one_transition(),
+    )
+    .await
+    .expect("the deferral does not wait for a connection that is not coming")
+    .expect("a transient failure is deferred, not raised");
+
+    assert!(
+        matches!(deferred, TransitionConsumption::Deferred { .. }),
+        "the transition did not step aside with the pool exhausted: {deferred:?}"
+    );
+    let (attempts, rescheduled) = event_retry_state(&database.url, stuck).await;
+    assert!(attempts > 0 && rescheduled, "the deferral did not reach the journal");
+
+    drop(held);
+    blocker
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("the domain table is released");
+    blocker_connection.abort();
     database.drop().await;
 }

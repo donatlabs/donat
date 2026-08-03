@@ -27,6 +27,7 @@
 - "!include commands/returns/request-return.yaml"
 - "!include commands/returns/approve-return.yaml"
 - "!include commands/returns/reject-return.yaml"
+- "!include commands/returns/expire-return.yaml"
 - "!include commands/returns/receive-return.yaml"
 - "!include commands/returns/record-return-inspection.yaml"
 - "!include commands/returns/finalize-return-refund.yaml"

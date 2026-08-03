@@ -203,3 +203,50 @@ fn sqlite_e2e_full_pipeline() {
         json!({ "article_aggregate": { "aggregate": { "count": 5 } } })
     );
 }
+
+/// A wide selection is an ordinary query on SQLite too.
+///
+/// `json_object('k', v, …)` spends two arguments per field, and SQLite caps a
+/// function at `SQLITE_MAX_FUNCTION_ARG` — 127 in a default build. A selection
+/// set is not a place where the caller is supposed to count.
+#[test]
+fn sqlite_answers_a_selection_wider_than_one_json_object_call() {
+    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    seed(&conn);
+    let catalog = sqlite_introspect(&conn).expect("introspect");
+    let md = metadata();
+
+    let width = 80;
+    let aliases: Vec<String> = (0..width).map(|index| format!("f{index}")).collect();
+    let selection = aliases
+        .iter()
+        .map(|alias| format!("{alias}: name"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // The nested relationship sits past the first chunk on purpose: a value
+    // that is itself JSON has to be embedded there, not quoted into a string.
+    let answered = run(
+        &conn,
+        &md,
+        &catalog,
+        &format!(
+            "query {{ author(order_by: {{ id: asc }}, limit: 1) {{ {selection}              articles(order_by: {{ id: asc }}) {{ id title }} }} }}"
+        ),
+    );
+
+    let row = answered["author"][0]
+        .as_object()
+        .expect("one row of many fields");
+    assert_eq!(row.len(), width + 1, "every field asked for is answered");
+    assert!(
+        row["articles"].is_array(),
+        "a nested relationship past the chunk boundary is embedded as JSON, not quoted: {:?}",
+        row["articles"]
+    );
+    assert_eq!(
+        row.keys().take(width).map(String::as_str).collect::<Vec<_>>(),
+        aliases.iter().map(String::as_str).collect::<Vec<_>>(),
+        "and in the order the query asked in"
+    );
+}

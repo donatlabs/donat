@@ -11,7 +11,7 @@ import pytest
 
 from petshop_qa import domain as d
 from petshop_qa import providers as P
-from petshop_qa import until
+from petshop_qa import stays, until
 
 pytestmark = pytest.mark.providers
 
@@ -307,3 +307,230 @@ def test_nothing_is_refunded_before_the_goods_are_inspected(
         """,
         {"return": returned["id"]},
     )["refund"] == []
+
+
+# -- the two dispositions that are not a refund ------------------------------
+
+
+def walk_to_inspection(shopper, support, fulfilment, settle_timeout, *, replacement: bool):
+    """A return approved and received, waiting to be inspected."""
+
+    order = shipped_order(shopper, support, fulfilment, settle_timeout)
+    line_id = order_line_of(shopper, order["id"])
+    shopper.graphql(
+        """
+        mutation Start($order: uuid!, $line: uuid!, $replacement: Boolean!, $request: uuid!) {
+          start_return(
+            order_id: $order,
+            lines: [{order_line_id: $line, requested_quantity: 1}],
+            reason: "wrong size",
+            replacement_requested: $replacement,
+            request_id: $request
+          ) { order_id }
+        }
+        """,
+        {
+            "order": order["id"],
+            "line": line_id,
+            "replacement": replacement,
+            "request": d.new_request_id(),
+        },
+    ).unwrap()
+    returned = await_return(support, order["id"], settle_timeout)
+    item = return_items(fulfilment, returned["id"])[0]
+
+    support.graphql(
+        """
+        mutation Approve($return: uuid!, $item: uuid!, $decision: uuid!) {
+          approve_return(
+            return_id: $return, lines: [{return_item_id: $item, approved_quantity: 1}],
+            decision_id: $decision, note: "approved"
+          ) { return_id }
+        }
+        """,
+        {"return": returned["id"], "item": item["id"], "decision": d.new_request_id()},
+    ).unwrap()
+    fulfilment.graphql(
+        """
+        mutation Receive($return: uuid!, $item: uuid!, $receipt: uuid!) {
+          receive_return(
+            return_id: $return, lines: [{return_item_id: $item, received_quantity: 1}],
+            receipt_id: $receipt, received_at: "2030-01-02T00:00:00Z"
+          ) { return_id }
+        }
+        """,
+        {"return": returned["id"], "item": item["id"], "receipt": d.new_request_id()},
+    ).unwrap()
+    return order, returned, item
+
+
+def inspect(fulfilment, returned: dict, item: dict, decision: str, amount: int = 1000):
+    return fulfilment.graphql(
+        """
+        mutation Inspect(
+          $return: uuid!, $item: uuid!, $inspection: ReturnInspection!,
+          $amount: bigint!, $id: uuid!
+        ) {
+          record_return_inspection(
+            return_id: $return, lines: [{return_item_id: $item, inspected_quantity: 1}],
+            inspection: $inspection, refund_amount_minor: $amount,
+            inspection_id: $id, note: "inspected"
+          ) { return_id status }
+        }
+        """,
+        {
+            "return": returned["id"],
+            "item": item["id"],
+            "inspection": decision,
+            "amount": amount,
+            "id": d.new_request_id(),
+        },
+    )
+
+
+def test_a_shopper_who_asked_for_a_replacement_gets_an_exchange(
+    shopper, support, fulfilment, providers, well_stocked, settle_timeout
+):
+    """The warehouse marks the inspection an exchange, and goods go back out.
+
+    The disposition is the warehouse's call, not the shopper's: asking for a
+    replacement is a request, and `exchange` is the inspection agreeing to it.
+    """
+
+    order, returned, item = walk_to_inspection(
+        shopper, support, fulfilment, settle_timeout, replacement=True
+    )
+    refunds_before = providers.count(P.REFUND)
+
+    inspect(fulfilment, returned, item, "exchange", amount=0).unwrap()
+
+    settled = until(
+        lambda: support.query(
+            "query R($id: uuid!) { return_request(where: {id: {_eq: $id}}) { id status } }",
+            {"id": returned["id"]},
+        )["return_request"],
+        lambda rows: bool(rows) and rows[0]["status"] not in {"inspected", "received"},
+        timeout=settle_timeout,
+        description="the return to reach its disposition",
+    )[0]
+
+    assert settled["status"] == "exchanged", (
+        f"a replacement request is answered with goods, not money: {settled}"
+    )
+    assert providers.count(P.REFUND) == refunds_before, "an exchange refunds nothing"
+
+
+def test_goods_the_warehouse_rejects_are_not_refunded(
+    shopper, support, fulfilment, providers, well_stocked, settle_timeout
+):
+    """What came back is not what was sold, so no money goes back."""
+
+    order, returned, item = walk_to_inspection(
+        shopper, support, fulfilment, settle_timeout, replacement=False
+    )
+    refunds_before = providers.count(P.REFUND)
+
+    inspect(fulfilment, returned, item, "rejected", amount=0).unwrap()
+
+    settled = until(
+        lambda: support.query(
+            "query R($id: uuid!) { return_request(where: {id: {_eq: $id}}) { id status } }",
+            {"id": returned["id"]},
+        )["return_request"],
+        lambda rows: bool(rows) and rows[0]["status"] not in {"inspected", "received"},
+        timeout=settle_timeout,
+        description="the rejected return to settle",
+    )[0]
+
+    assert settled["status"] in {"rejected", "rejected_after_inspection"}, (
+        f"a rejected inspection ends the return: {settled}"
+    )
+    assert providers.count(P.REFUND) == refunds_before, "nothing is refunded for rejected goods"
+
+
+def test_support_can_refuse_a_return_outright(
+    shopper, support, fulfilment, providers, well_stocked, settle_timeout
+):
+    """The desk that approves returns can also say no, and then it ends there.
+
+    A refused request never reaches the warehouse and never reaches the
+    provider: the goods stay with the shopper and the money stays with the
+    store.
+    """
+
+    order = shipped_order(shopper, support, fulfilment, settle_timeout)
+    request_return(shopper, order["id"], order_line_of(shopper, order["id"])).unwrap()
+    returned = await_return(support, order["id"], settle_timeout)
+    refunds_before = providers.count(P.REFUND)
+
+    support.graphql(
+        """
+        mutation Reject($return: uuid!, $decision: uuid!) {
+          reject_return(return_id: $return, reason: "outside the window", decision_id: $decision) {
+            return_id status
+          }
+        }
+        """,
+        {"return": returned["id"], "decision": d.new_request_id()},
+    ).unwrap()
+
+    settled = until(
+        lambda: support.query(
+            "query R($id: uuid!) { return_request(where: {id: {_eq: $id}}) { id status } }",
+            {"id": returned["id"]},
+        )["return_request"],
+        lambda rows: bool(rows) and rows[0]["status"] != "requested",
+        timeout=settle_timeout,
+        description="support's refusal to settle",
+    )[0]
+
+    assert settled["status"] == "rejected", f"a refused return is refused: {settled}"
+    assert providers.count(P.REFUND) == refunds_before, "a refused return refunds nothing"
+    assert return_items(fulfilment, returned["id"]), (
+        "the request is kept on file rather than erased"
+    )
+
+
+def test_a_return_label_the_carrier_will_not_issue_stops_the_return(
+    shopper, support, fulfilment, providers, well_stocked, settle_timeout
+):
+    """Support approved the return, and the carrier cannot produce a label.
+
+    Without a label there is nothing to send the goods back with, so the store
+    does not pretend the return is under way — and above all does not refund
+    for goods that were never shipped back.
+    """
+
+    order = shipped_order(shopper, support, fulfilment, settle_timeout)
+    request_return(shopper, order["id"], order_line_of(shopper, order["id"])).unwrap()
+    returned = await_return(support, order["id"], settle_timeout)
+    item = return_items(fulfilment, returned["id"])[0]
+    providers.fail(P.RETURN_LABEL, status=503, times=10)
+    refunds_before = providers.count(P.REFUND)
+
+    support.graphql(
+        """
+        mutation Approve($return: uuid!, $item: uuid!, $decision: uuid!) {
+          approve_return(
+            return_id: $return, lines: [{return_item_id: $item, approved_quantity: 1}],
+            decision_id: $decision, note: "approved"
+          ) { return_id }
+        }
+        """,
+        {"return": returned["id"], "item": item["id"], "decision": d.new_request_id()},
+    ).unwrap()
+
+    # The carrier is asked, and asked again, and the store stops there.
+    providers.await_call(P.RETURN_LABEL, timeout=settle_timeout)
+    stays(
+        lambda: support.query(
+            "query R($id: uuid!) { return_request(where: {id: {_eq: $id}}) { id status } }",
+            {"id": returned["id"]},
+        )["return_request"][0]["status"],
+        lambda status: status not in {"received", "inspected", "refunded"},
+        duration=4,
+        description="a return with no label to go no further",
+    )
+    assert providers.count(P.REFUND) == refunds_before, (
+        "nothing is refunded for goods that were never sent back"
+    )

@@ -14,13 +14,19 @@ use crate::commands::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessCommandOutcome {
-    Applied { result: Json },
-    Rejected { error: CommandBusinessRejection },
+    Applied {
+        result: Json,
+    },
+    Rejected {
+        error: CommandBusinessRejection,
+    },
     /// The database refused the write in a way that retrying cannot change —
     /// a constraint violation, a missing object, a denied privilege. Retrying
     /// it can only produce the same refusal, and doing so forever holds the
     /// head of the shared transition queue against every other instance.
-    Unrecoverable { code: &'static str },
+    Unrecoverable {
+        code: &'static str,
+    },
 }
 
 pub async fn execute_process_command_in_savepoint(
@@ -96,9 +102,14 @@ pub async fn execute_process_command_in_savepoint(
                     .context("rolling back unrecoverable Process command savepoint")?;
                 return Ok(ProcessCommandOutcome::Unrecoverable { code });
             }
-            Err(anyhow!(
+            // The cause travels with it. A lock timeout, a deadlock or a
+            // dropped connection is retryable, and the only thing that can
+            // tell the consumer so is the database error itself — an
+            // `anyhow!` string would arrive as an unclassifiable failure and
+            // end the instance for a condition that clears on its own.
+            Err(anyhow::Error::new(error).context(format!(
                 "Process command database execution failed with SQLSTATE {sqlstate}{relation}"
-            ))
+            )))
         }
     }
 }

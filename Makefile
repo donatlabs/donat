@@ -105,16 +105,18 @@ run:
 # engine built from this working tree; see tests-system/README.md.
 petshop-up:
 	tests-system/stack.sh up
+	tests-system/stack.sh up-fast
 
 petshop-down:
+	tests-system/stack.sh down-fast
 	tests-system/stack.sh down
 
+# Both stands, because the deadline branches skip themselves when the fast one
+# is not addressed — and a skipped branch reads exactly like a passing one.
 petshop-system-tests:
 	@test -d tests-system/.venv || python3 -m venv tests-system/.venv
 	@tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
-	@cd tests-system && PETSHOP_BASE_URL="$${PETSHOP_BASE_URL:-http://127.0.0.1:8080}" \
-		PETSHOP_PROVIDERS_URL="$${PETSHOP_PROVIDERS_URL:-http://127.0.0.1:8099}" \
-		.venv/bin/python -m pytest
+	@cd tests-system && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux

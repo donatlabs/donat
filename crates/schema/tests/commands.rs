@@ -5726,3 +5726,41 @@ fn petshop_fixed_rows_rejects_bound_overflow() {
         "fixed_rows maximum_rows must be between 1 and 256"
     );
 }
+
+#[test]
+fn idempotency_scoped_by_a_lookup_compiles_and_a_scope_behind_a_write_is_rejected() {
+    // The scope narrows the key to the case being resolved, and the lookup that
+    // finds that case runs before the claim is elected.
+    let mut lookup_scoped = valid_command();
+    lookup_scoped["steps"] = json!([
+        {
+            "name": "existing",
+            "select_one": {
+                "table": { "schema": "public", "name": "orders" },
+                "by": { "id": { "arg": "id" } },
+                "returning": ["id", "status"],
+                "require_found": true
+            }
+        },
+        valid_command()["steps"][0].clone()
+    ]);
+    lookup_scoped["idempotency"] = json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "step": "existing", "column": "id" }]
+    });
+
+    compile(&metadata(vec![lookup_scoped]), RelationKind::Table)
+        .expect("a claim may be scoped by a value only a lookup can produce");
+
+    // A scope the command can only know after writing is not a scope: electing
+    // the claim would mean writing first, and so writing again on every replay.
+    let mut written_scope = valid_command();
+    written_scope["idempotency"] = json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "step": "order", "column": "id" }]
+    });
+    assert_rejected(
+        written_scope,
+        "idempotency scope step 'order' cannot be read before the command writes",
+    );
+}

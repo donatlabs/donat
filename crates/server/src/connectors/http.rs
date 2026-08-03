@@ -1653,14 +1653,17 @@ mod tests {
     #[tokio::test]
     async fn a_declared_error_map_decides_the_failure_class() {
         for (status, expected) in [
-            (StatusCode::SERVICE_UNAVAILABLE, ConnectorErrorClass::Http5xx),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ConnectorErrorClass::Http5xx,
+            ),
             (StatusCode::CONFLICT, ConnectorErrorClass::Validation),
             // Unmapped: the built-in handling still answers for it.
             (StatusCode::IM_A_TEAPOT, ConnectorErrorClass::Permanent),
         ] {
-            let server = LocalServer::start(Router::new().fallback(post(
-                move || async move { (status, Json(json!({ "error": "no" }))) },
-            )))
+            let server = LocalServer::start(Router::new().fallback(post(move || async move {
+                (status, Json(json!({ "error": "no" })))
+            })))
             .await;
             let operation = catalog_declared_operation("/v1/orders");
 

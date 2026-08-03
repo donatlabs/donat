@@ -15,15 +15,18 @@ deployed, does the store behave like a store?
 
 ```bash
 tests-system/stack.sh up                 # database, mock providers, this branch's engine
+tests-system/stack.sh up-fast            # the same store with its periods in seconds
 python3 -m venv tests-system/.venv
 tests-system/.venv/bin/pip install -r tests-system/requirements.txt
 
-export PETSHOP_BASE_URL=http://127.0.0.1:8080
-export PETSHOP_PROVIDERS_URL=http://127.0.0.1:8099
-cd tests-system && .venv/bin/python -m pytest        # or: make petshop-system-tests
+cd tests-system && eval "$(./stack.sh env)" && .venv/bin/python -m pytest
+                                         # or, from the repo root: make petshop-system-tests
 
-tests-system/stack.sh down               # when finished
+tests-system/stack.sh down-fast && tests-system/stack.sh down    # when finished
 ```
+
+`stack.sh env` names whichever stands are answering. Without the fast one every
+deadline branch skips itself, and a run that tested none of them is green.
 
 `stack.sh` follows the deploy model the example documents — `donat migrate` for
 the DDL, a second `migrate` to deploy the durable Process revisions, then the
@@ -40,6 +43,8 @@ look like a passing run, and must not look like a failing store either.
 | `PETSHOP_PROVIDERS_URL` | the mock providers' control plane; unset skips provider-driven cases |
 | `PETSHOP_JWT_KEY` | HS256 key the suite signs its tokens with; must match the engine's `DONAT_GRAPHQL_JWT_SECRET` |
 | `PETSHOP_SETTLE_TIMEOUT` | how long to wait for a durable Process (default 30s) |
+| `PETSHOP_FAST_BASE_URL` | the seconds-scale stand; unset skips every deadline branch |
+| `PETSHOP_FAST_PROVIDERS_URL` | its own mock providers, separate so one stand cannot claim the other's scripted answers |
 
 ## How the tests talk to the store
 
@@ -83,11 +88,21 @@ because they say what this layer of testing is for.
 | A declared `error_map` had **no runtime effect**: a 500 the operation mapped to `http_5xx` was classified `Permanent`, so the flow's three declared attempts became one call | `crates/server/src/connectors/http.rs` |
 | A receipt recorded **before** the return Process reached its wait was dropped; the wait declared `persist_before_match` and nothing read it, so the shopper was never refunded while every Command answered `200` | `crates/server/src/processes/{definition,transition,signal}.rs` |
 | A Command that violated a unique index inside a transition was **retried forever**, and the shared consumer stopped advancing **every** Process in the deployment until the conflict was cleared by hand | `crates/server/src/processes/{command,transition}.rs` |
+| An idempotency scope reading a step result compiled to SQL that named a CTE it never defined, so the Command answered `data-exception` and a reconciliation needing a person could never be closed | `crates/sqlgen/src/lib.rs`, `crates/schema/src/commands.rs` ([ADR 035](../knowledgebase/declarative-saas/decisions/035-an-idempotency-scope-may-read-a-lookup-never-a-write.md)) |
+| A declared `as: string` cast was **never applied**, so a numeric identifier reached a connector as a number and broke the very input contract the cast was written to satisfy — the whole refund-reconciliation branch could not start | `crates/server/src/processes/value.rs` |
+| A return nobody approved ended its Process without writing anything: the shopper's request read `requested` for ever, with no Process left to decide it | `examples/petshop/metadata` (`expire_return`) |
+| Both B2B waits were the only ones in the store without `persist_before_match`, so an approver who answered at once had their decision dropped and the purchase escalated as if nobody had answered | `examples/petshop/metadata/flows/b2b-order-approval.yaml` |
+| The schema published nine filter operators while the engine accepted `_like`/`_ilike` too, so a generated client, an IDE or an agent reading the schema concluded the catalogue could not be searched | `crates/schema/src/introspection.rs` |
+| The schema hid the regex and JSON-key filters the engine accepts, and a composed schema refused to be built at all once a filter's shape depended on the backend | `crates/schema/src/{introspection,multi_source}.rs` |
+| A selection set of more than **50 fields** hit Postgres's `json_build_object` argument ceiling and came back as `data-exception` — a wide table or a dashboard query passes fifty fields without trying | `crates/backend/src/dialect.rs` |
+| One Process instance that could not make progress stopped **every** Process in the deployment: the consumer applied one transition at a time, always the oldest, and a failing or slow one stayed the oldest | `crates/server/src/processes/{runtime,transition,command}.rs` ([ADR 036](../knowledgebase/declarative-saas/decisions/036-the-transition-queue-is-a-work-queue-not-a-line.md)) |
+| A shopper could write their own `payment` row directly — `status: captured` without paying, or a new `amount_minor`. The role held `columns: "*"` insert and update on the money table, when only its own commands ever needed to touch it | `examples/petshop/metadata/databases/default/tables/public_payment.yaml` |
 
-See [ADR 033](../knowledgebase/declarative-saas/decisions/033-a-declaration-the-runtime-ignores-is-a-defect.md).
-Three of the four were fields that parsed, validated and deployed while doing
-nothing — which is indistinguishable from working until something in
-production quietly fails.
+See [ADR 034](../knowledgebase/declarative-saas/decisions/034-a-declaration-the-runtime-ignores-is-a-defect.md).
+Most of them were declarations that parsed, validated and deployed while doing
+nothing — a header binding, an error map, a wait's persistence, a scalar cast.
+That is indistinguishable from working until something in production quietly
+fails, and it is the failure mode this layer of testing exists to catch.
 
 Two gaps in the example itself are still open, and the suite works around
 them in `provision.sql`:
@@ -100,12 +115,34 @@ them in `provision.sql`:
   subscription and marketplace reference rows can be created or replenished by
   any role, through any surface.
 
+## Coverage of the store's flows
+
+The suite reaches **165 of the 169 states** the eleven Petshop flows declare.
+The four it does not reach are defensive defaults that no caller can steer the
+store into — each is unreachable by construction, not untested by omission:
+
+| State | Why nothing can reach it |
+|---|---|
+| `b2b_order_approval.reject_unroutable_quote` | The `b2b_approval_route` decision table ends in a catch-all row (`when: true`), so a quote always routes to `automatic` or `finance_review`. |
+| `b2b_order_approval.route_rejected` | Only `reject_unroutable_quote` leads here. |
+| `grooming_booking.unexpected_hold_transition` | `BookingOutcome` declares `no_show` and `expired` beyond the two the flow routes, but `record_no_show` only applies to a **confirmed** booking — by then the wait is over. Nothing can deliver either outcome into a held one. |
+| `prescription_review.unexpected_reviewer_decision` | `ApprovalDecision` declares `escalated`, and both commands that signal a review decision send a literal `approved` or `rejected`. |
+
+Re-measure after a full run with `.venv/bin/python coverage.py`, which reads
+both stands' Process journals and lists whatever a run did not reach. A number
+that drops means a branch stopped being exercised.
+
 ## Running the suite twice on one stand
 
 `stack.sh provision` between runs, or a fresh stand. It tops the warehouse back
 up and takes settled payout candidates out of the cycle — both consequences of
 the gaps above, not of the tests. CI raises a fresh stand per run, so it needs
 neither.
+
+A fresh stand means stopping **both** stands: they share one Postgres, and
+whichever is stopped last takes the databases with it. Stop only one and the
+next `up` continues on the store the previous run left behind — which reads as
+the suite failing when it is the stand that is stale.
 
 ## Layout
 
@@ -115,4 +152,9 @@ neither.
 | `tests/` | one module per part of the store |
 | `stack.sh` | raise, provision, drop a stand |
 | `provision.sql` | opening stock and reference data |
+| `coverage.py` | which declared flow states a run actually walked |
+| `tests/test_performance.py` | what the store costs to use, as ratios rather than milliseconds |
+| `tests/test_live_updates.py` | the fourth door: a subscription held open over a websocket |
+| `tests/test_rest_surface.py` | every declared RESTified endpoint, its parameters and its walls |
+| `tests/test_attacks.py`, `tests/test_file_attacks.py` | somebody hostile in front of the store, and in front of its bytes |
 | `measure-memory.sh`, `measure-latency.sh`, `compare-latency.sh` | what the engine costs to serve this store |

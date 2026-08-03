@@ -104,7 +104,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
     )
     .expect("real Petshop Commands, Processes, effects, and schema compile together");
 
-    assert_eq!(metadata.commands.len(), 73);
+    assert_eq!(metadata.commands.len(), 74);
     assert_eq!(candidate.process_catalog.len(), 11);
     assert_eq!(
         candidate
@@ -113,7 +113,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
             .flat_map(|(_, source)| source.iter())
             .map(|(_, process)| process.states.len())
             .sum::<usize>(),
-        168
+        171
     );
 
     let finalized_effects = candidate

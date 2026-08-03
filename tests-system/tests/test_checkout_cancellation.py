@@ -14,7 +14,7 @@ import pytest
 
 from petshop_qa import domain as d
 from petshop_qa import providers as P
-from petshop_qa import until
+from petshop_qa import stays, until
 
 pytestmark = [pytest.mark.providers, pytest.mark.serial]
 
@@ -63,6 +63,9 @@ def lookup_says_authorized(providers, amount_minor: int) -> None:
     providers.script(
         P.LOOKUP,
         times=10,
+        # Scoped to the authorization: a cancellation may also ask about the
+        # void, and an unscoped answer would tell it the void was authorized.
+        when={"resource_kind": "authorization"},
         patch={
             "found": True,
             "terminal_absence_proven": False,
@@ -180,3 +183,87 @@ def test_cancelling_twice_cancels_once(
     d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
     assert providers.count(P.VOID) <= 1, "one cancellation, at most one void"
     assert second.errors or second.value("data/cancel_order/order_id") == order["id"]
+
+
+def lookup_says_voided(providers) -> None:
+    """The provider's account of the void the store could not confirm.
+
+    Scoped to the void lookup: the same endpoint answers for the authorization,
+    and the two questions have different answers in this scenario.
+    """
+
+    providers.script(
+        P.LOOKUP,
+        times=10,
+        when={"resource_kind": "void"},
+        patch={
+            "found": True,
+            "terminal_absence_proven": False,
+            "outcome": "voided",
+            "provider_mutation_id": f"void_recovered_{uuid.uuid4().hex[:8]}",
+            "provider_event_id": f"evt_void_{uuid.uuid4().hex[:8]}",
+            "provider_reference": f"ref_void_{uuid.uuid4().hex[:8]}",
+        },
+    )
+
+
+def test_a_void_the_store_could_not_confirm_is_reconciled(
+    shopper, support, providers, well_stocked, settle_timeout
+):
+    """The authorization committed, and then the void call got no answer.
+
+    Neither call can be trusted on its own, so the store asks the provider what
+    happened to the void. It says the hold was released, and that is what gets
+    recorded — the shopper is not left holding a charge for a cancelled order,
+    and the store does not void twice.
+    """
+
+    order = order_in_checkout(shopper, providers, settle_timeout)
+    lookup_says_authorized(providers, order["total_minor"])
+    lookup_says_voided(providers)
+    providers.fail(P.VOID, status=503, times=10)
+
+    cancel(shopper, order["id"]).unwrap()
+
+    providers.await_call(P.VOID, timeout=settle_timeout)
+    payment = d.await_payment_status(
+        support, order["id"], {"voided"}, timeout=settle_timeout
+    )
+
+    assert payment["status"] == "voided", (
+        "a void the provider says it performed is recorded from its own account"
+    )
+    assert providers.count(P.CAPTURE) == 0, "nothing is captured on a cancelled order"
+    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
+
+
+def test_a_void_nobody_can_account_for_is_left_alone(
+    shopper, support, providers, well_stocked, settle_timeout
+):
+    """The void call failed and the provider will not say whether it landed.
+
+    The one answer the store must not round: it neither claims the money is
+    back nor tries again blindly. The hold stays exactly as the provider last
+    confirmed it, for a person to settle.
+    """
+
+    order = order_in_checkout(shopper, providers, settle_timeout)
+    lookup_says_authorized(providers, order["total_minor"])
+    providers.script(
+        P.LOOKUP,
+        times=10,
+        when={"resource_kind": "void"},
+        patch={"found": False, "terminal_absence_proven": False, "outcome": "failed"},
+    )
+    providers.fail(P.VOID, status=503, times=10)
+
+    cancel(shopper, order["id"]).unwrap()
+
+    providers.await_call(P.VOID, timeout=settle_timeout)
+    stays(
+        lambda: [payment["status"] for payment in d.payments_of(support, order["id"])],
+        lambda statuses: "voided" not in statuses,
+        duration=4,
+        description="an unaccounted void to stay unrecorded",
+    )
+    assert providers.count(P.CAPTURE) == 0, "an order being cancelled is never captured"

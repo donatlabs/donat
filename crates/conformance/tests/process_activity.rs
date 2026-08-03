@@ -521,3 +521,76 @@ fn a_catalog_declared_retryable_status_is_retried() {
         "the mapped 500 is retried once, not treated as permanent"
     );
 }
+
+/// A provider that names resources by string is handed a numeric identifier
+/// through the declared cast `as: string`. The compiler types the binding as a
+/// string on the strength of that declaration, so the value on the wire has to
+/// be one — a number would be refused as breaking the operation's own input
+/// contract, and the activity could never run.
+fn scalar_cast_metadata() -> Metadata {
+    let mut document =
+        serde_json::to_value(activity_metadata()).expect("activity metadata serializes");
+    let command = document["commands"][0]
+        .as_object_mut()
+        .expect("the fixture declares one command");
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments")
+        .push(json!({ "name": "sequence", "type": "Int!" }));
+    command["effects"][0]["start_process"]["input"]["sequence"] = json!({ "arg": "sequence" });
+
+    let operation = document["connectors"][0]["operations"][0]
+        .as_object_mut()
+        .expect("the connector declares one operation");
+    operation["input_contract"]["reference"] = json!("string!");
+    operation["body"]["reference"] = json!({ "input": "reference" });
+
+    let process = document["processes"][0]
+        .as_object_mut()
+        .expect("the fixture declares one process");
+    process["input"]
+        .as_array_mut()
+        .expect("process input")
+        .push(json!({ "name": "sequence", "type": "Int!" }));
+    process["states"][0]["request"]["input"]["reference"] =
+        json!({ "input": "sequence", "as": "string" });
+
+    serde_json::from_value(document).expect("scalar-cast metadata parses")
+}
+
+#[test]
+fn a_declared_scalar_cast_reaches_the_provider_as_a_string() {
+    let stub = provider_stub::spawn();
+    stub.set_default(AUTHORIZE_PATH, authorized_response());
+    let suite = Suite::new("process_activity_scalar_cast")
+        .initial_metadata(scalar_cast_metadata())
+        .with_migrations()
+        .env("DONAT_PROVIDER_STUB_BASE_URL", stub.base_url())
+        .env("DONAT_PROVIDER_STUB_TOKEN", PROVIDER_TOKEN)
+        .start();
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ enqueue_authorization(order_id: \"{ORDER_ID}\", \
+                 request_id: \"{REQUEST_ID}\", sequence: 7) {{ order_id }} }}"
+            )
+        }),
+        &[("X-Donat-Role".to_owned(), "customer".to_owned())],
+    );
+    assert_eq!(status, 200, "command mutation status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the source database");
+    await_terminal(&mut client);
+
+    let calls = stub.calls_for(AUTHORIZE_PATH);
+    assert_eq!(calls.len(), 1, "one authorization");
+    assert_eq!(
+        calls[0].body.pointer("/reference"),
+        Some(&json!("7")),
+        "the declared cast is what the provider receives: {}",
+        calls[0].body
+    );
+}

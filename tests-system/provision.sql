@@ -62,3 +62,10 @@ UPDATE vendor_order
 DELETE FROM vendor_payout_reconciliation;
 DELETE FROM vendor_payout_event;
 DELETE FROM vendor_payout;
+
+-- File uploads. A session may hold ten unclaimed uploads at a time, and the
+-- collector reclaims abandoned ones a day later — so a suite that deliberately
+-- leaves uploads unfinished exhausts the allowance on a reused stand long
+-- before the collector runs. Clearing the pending rows is the stand's
+-- equivalent of waiting that day out.
+DELETE FROM donat.file_uploads WHERE state <> 'claimed';

@@ -978,20 +978,57 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
     // Comparison input objects for every scalar in use.
     for scalar in &scalars {
         let s = named("SCALAR", scalar);
-        types.push(input_object_type(
-            &format!("{scalar}_comparison_exp"),
-            vec![
-                input_value("_eq", s.clone()),
-                input_value("_neq", s.clone()),
-                input_value("_gt", s.clone()),
-                input_value("_gte", s.clone()),
-                input_value("_lt", s.clone()),
-                input_value("_lte", s.clone()),
-                input_value("_in", list_of(non_null(s.clone()))),
-                input_value("_nin", list_of(non_null(s.clone()))),
-                input_value("_is_null", named("SCALAR", "Boolean")),
-            ],
-        ));
+        let mut operators = vec![
+            input_value("_eq", s.clone()),
+            input_value("_neq", s.clone()),
+            input_value("_gt", s.clone()),
+            input_value("_gte", s.clone()),
+            input_value("_lt", s.clone()),
+            input_value("_lte", s.clone()),
+            input_value("_in", list_of(non_null(s.clone()))),
+            input_value("_nin", list_of(non_null(s.clone()))),
+            input_value("_is_null", named("SCALAR", "Boolean")),
+        ];
+        // Pattern matching is text-only, and it is how every search box over
+        // this API is written. The engine accepts these on a text column, so
+        // the schema has to offer them there — a client generating types from
+        // an introspection that omitted them could not express a search the
+        // engine answers perfectly well.
+        // What the engine accepts on a text column. `_like` and `_ilike` are
+        // how every search box over this API is written, and the regex family
+        // is what a backend that has one adds to them.
+        if scalar == "String" {
+            operators.extend([
+                input_value("_like", s.clone()),
+                input_value("_nlike", s.clone()),
+                input_value("_ilike", s.clone()),
+                input_value("_nilike", s.clone()),
+            ]);
+            if planner.capabilities.regex_ops {
+                operators.extend([
+                    input_value("_similar", s.clone()),
+                    input_value("_nsimilar", s.clone()),
+                    input_value("_regex", s.clone()),
+                    input_value("_iregex", s.clone()),
+                    input_value("_nregex", s.clone()),
+                    input_value("_niregex", s.clone()),
+                ]);
+            }
+        }
+        // Key tests belong to the document type that has keys.
+        if scalar == "jsonb"
+            && matches!(
+                planner.capabilities.json_ops,
+                donat_backend::capabilities::JsonOps::Jsonb
+            )
+        {
+            operators.extend([
+                input_value("_has_key", named("SCALAR", "String")),
+                input_value("_has_keys_any", list_of(non_null(named("SCALAR", "String")))),
+                input_value("_has_keys_all", list_of(non_null(named("SCALAR", "String")))),
+            ]);
+        }
+        types.push(input_object_type(&format!("{scalar}_comparison_exp"), operators));
         types.push(scalar_type(scalar));
     }
 

@@ -68,6 +68,11 @@ def providers(request, config: Config) -> Providers:
             "the mock providers run without their control plane "
             "(set PETSHOP_PROVIDERS_CONTROL=1 on the stand)"
         )
+    # The store applies several transitions at once, so an order started by the
+    # previous scenario can still be on its way to a provider. Steering one
+    # before that work is done hands this test's scripted answer to the last
+    # test's order — and reads its call in this test's journal.
+    control.await_quiet(seconds=1.5)
     control.reset()
     yield control
     control.reset()
@@ -194,7 +199,7 @@ def fast_config() -> Config:
         base_url=base_url.rstrip("/"),
         jwt_key=resolved.jwt_key,
         jwt_algorithm=resolved.jwt_algorithm,
-        providers_url=resolved.providers_url,
+        providers_url=os.environ.get("PETSHOP_FAST_PROVIDERS_URL", resolved.providers_url or ""),
         request_timeout=resolved.request_timeout,
         settle_timeout=float(os.environ.get("PETSHOP_FAST_SETTLE_TIMEOUT", "45")),
     )
@@ -211,3 +216,33 @@ def fast_store(fast_config: Config) -> Store:
 @pytest.fixture
 def fast_settle_timeout(fast_config: Config) -> float:
     return fast_config.settle_timeout
+
+
+@pytest.fixture
+def fast_providers(fast_config: Config) -> Providers:
+    """The fast stand's own providers.
+
+    Separate from the ordinary stand's on purpose: one shared instance let a
+    scenario's scripted answer be claimed by the other stand's durable work.
+    """
+
+    url = os.environ.get("PETSHOP_FAST_PROVIDERS_URL", "").strip()
+    if not url:
+        pytest.skip("the fast stand's providers need PETSHOP_FAST_PROVIDERS_URL")
+    control = Providers(
+        url.rstrip("/"),
+        request_timeout=fast_config.request_timeout,
+        settle_timeout=fast_config.settle_timeout,
+    )
+    if not control.is_up():
+        pytest.fail(f"no fast-stand providers answering at {url}")
+    # The fast stand's deadlines are seconds, so a previous scenario's ladder is
+    # often still climbing when the next one starts. Steering a provider before
+    # that work is done hands this test's scripted answers to the last one.
+    # Longer than the fast stand's dunning delay, or a ladder still waiting
+    # between its rungs reads as finished and its next call lands in the next
+    # scenario's journal.
+    control.await_quiet(seconds=4.0)
+    control.reset()
+    yield control
+    control.reset()

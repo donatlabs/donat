@@ -33,10 +33,12 @@ PETSHOP_ADMIN_SECRET="${PETSHOP_ADMIN_SECRET:-petshop-secret}"
 PETSHOP_BASE_URL="${PETSHOP_BASE_URL:-http://127.0.0.1:${PETSHOP_PORT}}"
 FAST_PORT="${PETSHOP_FAST_PORT:-8081}"
 FAST_PG_URL="${PETSHOP_FAST_PG_URL:-postgresql://postgres:postgres@127.0.0.1:15434/petshop_fast}"
+STAND_METADATA="$state/metadata"
 FAST_METADATA="$state/metadata-fast"
 FAST_PID="$state/engine-fast.pid"
 FAST_LOG="$state/engine-fast.log"
 PETSHOP_FAST_BASE_URL="${PETSHOP_FAST_BASE_URL:-http://127.0.0.1:${FAST_PORT}}"
+PETSHOP_FAST_PROVIDERS_URL="${PETSHOP_FAST_PROVIDERS_URL:-http://127.0.0.1:8098}"
 
 compose() { docker compose -f "$here/docker-compose.yml" "$@"; }
 
@@ -59,6 +61,16 @@ engine_env() {
   export PETSHOP_NOTIFICATION_API_TOKEN="petshop-notification-token"
   export PETSHOP_PAYOUT_BASE_URL="$PETSHOP_PROVIDERS_URL"
   export PETSHOP_PAYOUT_API_TOKEN="petshop-payout-token"
+  # File attachments: the object store the engine presigns against, and the
+  # secret those signatures are made with.
+  export PETSHOP_S3_KEY="petshopminio"
+  export PETSHOP_S3_SECRET="petshopminiosecret"
+  export PETSHOP_FILE_SIGNING_SECRET="petshop-file-signing-secret"
+  # Durable-queue tuning, forwarded when the caller sets it. Unset is the
+  # engine's own answer: half the source's connection pool.
+  [ -n "${DONAT_PROCESS_TRANSITION_CONCURRENCY:-}" ] &&
+    export DONAT_PROCESS_TRANSITION_CONCURRENCY
+  return 0
 }
 
 engine_is_up() {
@@ -71,7 +83,10 @@ engine_is_up() {
 # stale pid file once left an older build holding the port while a new one
 # exited silently — and the suite then tested the wrong binary.
 engine_pids() {
-  pgrep -f "target/debug/donat --metadata-dir $example/metadata" 2>/dev/null || true
+  # Anchored: the fast stand's directory starts with this one's name, and an
+  # unanchored match would take both stands down together — leaving the
+  # time-based suites to skip themselves on the next run.
+  pgrep -f "target/debug/donat --metadata-dir $STAND_METADATA\$" 2>/dev/null || true
 }
 
 cmd_up() {
@@ -81,12 +96,18 @@ cmd_up() {
     exit 1
   fi
 
-  echo "==> database and mock providers"
-  compose up -d --wait
+  echo "==> database, object storage and mock providers"
+  # The bucket initializer is a one-shot container: `--wait` reads its exit as
+  # a failure, so the long-running services are waited for and it is run after.
+  compose up -d --wait postgres minio mock-providers
+  compose up minio-init >/dev/null 2>&1
 
   echo "==> building the engine from this working tree"
   cargo build --manifest-path "$repo/Cargo.toml" -p donat-server --bin donat
   binary="$repo/target/debug/donat"
+
+  echo "==> pointing object storage at the published ports"
+  python3 "$here/fast_metadata.py" "$example/metadata" "$STAND_METADATA" --rehost
 
   engine_env
   echo "==> applying DDL (engine schema, then the store's)"
@@ -95,7 +116,7 @@ cmd_up() {
 
   echo "==> deploying the durable Process revisions"
   "$binary" migrate --migrations-dir "$repo/migrations" \
-    --metadata-dir "$example/metadata" --source default
+    --metadata-dir "$STAND_METADATA" --source default
 
   cmd_provision
 
@@ -103,12 +124,12 @@ cmd_up() {
   # The suite signs its own tokens with this key; there is no admin role, so a
   # token always names the one role its request runs as.
   DONAT_PORT="$PETSHOP_PORT" \
-  DONAT_METADATA_DIR="$example/metadata" \
+  DONAT_METADATA_DIR="$STAND_METADATA" \
   DONAT_GRAPHQL_ADMIN_SECRET="$PETSHOP_ADMIN_SECRET" \
   DONAT_GRAPHQL_UNAUTHORIZED_ROLE="anonymous" \
   DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"$PETSHOP_JWT_KEY\"}" \
   RUST_LOG="${RUST_LOG:-donat=info}" \
-    nohup "$binary" --metadata-dir "$example/metadata" >"$logfile" 2>&1 &
+    nohup "$binary" --metadata-dir "$STAND_METADATA" >"$logfile" 2>&1 &
   echo $! >"$pidfile"
 
   for _ in $(seq 1 60); do
@@ -141,8 +162,15 @@ cmd_down() {
     kill -9 "$pid" 2>/dev/null || true
   done
   rm -f "$pidfile"
-  compose down --volumes --remove-orphans
-  echo "==> down"
+  # Postgres, MinIO and the provider stand-ins are shared with the fast stand.
+  # Tearing them down while it is serving takes its database and its scripted
+  # providers with it, and its suites then fail on a stand that looks up.
+  if pgrep -f "target/debug/donat --metadata-dir $FAST_METADATA\$" >/dev/null 2>&1; then
+    echo "==> down (containers left up: the fast stand is still serving)"
+  else
+    compose down --volumes --remove-orphans
+    echo "==> down"
+  fi
 }
 
 cmd_logs() { tail -n "${2:-100}" -f "$logfile"; }
@@ -168,7 +196,8 @@ cmd_up_fast() {
   echo "==> rewriting declared periods"
   python3 "$here/fast_metadata.py" "$example/metadata" "$FAST_METADATA"
 
-  compose up -d --wait
+  compose up -d --wait postgres minio mock-providers mock-providers-fast
+  compose up minio-init >/dev/null 2>&1
   cargo build --manifest-path "$repo/Cargo.toml" -p donat-server --bin donat
   binary="$repo/target/debug/donat"
 
@@ -178,6 +207,9 @@ cmd_up_fast() {
         psql -q -U postgres -c "CREATE DATABASE petshop_fast"
 
   engine_env
+  # Its own providers, so a scripted answer here is never claimed by the
+  # ordinary stand's durable work.
+  PETSHOP_PROVIDERS_URL="$PETSHOP_FAST_PROVIDERS_URL" engine_env
   export DONAT_GRAPHQL_DATABASE_URL="$FAST_PG_URL"
   "$binary" migrate --migrations-dir "$repo/migrations"
   "$binary" migrate --migrations-dir "$example/migrations"
@@ -200,6 +232,7 @@ cmd_up_fast() {
          -H 'content-type: application/json' -d '{"query":"{ __typename }"}' >/dev/null 2>&1; then
       echo "==> fast stand up: $PETSHOP_FAST_BASE_URL (log: $FAST_LOG)"
       echo "export PETSHOP_FAST_BASE_URL=$PETSHOP_FAST_BASE_URL"
+      echo "export PETSHOP_FAST_PROVIDERS_URL=$PETSHOP_FAST_PROVIDERS_URL"
       return 0
     fi
     kill -0 "$(cat "$FAST_PID")" 2>/dev/null || { tail -30 "$FAST_LOG" >&2; exit 1; }
@@ -215,7 +248,16 @@ cmd_down_fast() {
     rm -f "$FAST_PID"
   fi
   pkill -f "target/debug/donat --metadata-dir $FAST_METADATA" 2>/dev/null || true
-  echo "==> fast stand down"
+  # Symmetric with `down`: whichever stand goes last takes the shared
+  # containers — and the databases — with it. Otherwise the order the two are
+  # stopped in decides whether the next `up` starts from a clean store, and a
+  # suite run against a stand carrying an earlier run's work is not a fresh run.
+  if pgrep -f "target/debug/donat --metadata-dir $STAND_METADATA\$" >/dev/null 2>&1; then
+    echo "==> fast stand down (containers left up: the ordinary stand is still serving)"
+  else
+    compose down --volumes --remove-orphans
+    echo "==> fast stand down"
+  fi
 }
 
 cmd_env() {
@@ -224,6 +266,16 @@ export PETSHOP_BASE_URL=$PETSHOP_BASE_URL
 export PETSHOP_PROVIDERS_URL=$PETSHOP_PROVIDERS_URL
 export PETSHOP_JWT_KEY=$PETSHOP_JWT_KEY
 EOF
+  # The time-based suites skip themselves when the fast stand is not addressed,
+  # so a stand that is up but unnamed reads as a green run that never ran them.
+  if curl -fsS -m 2 -X POST "$PETSHOP_FAST_BASE_URL/v1/graphql" \
+    -H 'content-type: application/json' -d '{"query":"query { __typename }"}' \
+    >/dev/null 2>&1; then
+    cat <<EOF
+export PETSHOP_FAST_BASE_URL=$PETSHOP_FAST_BASE_URL
+export PETSHOP_FAST_PROVIDERS_URL=$PETSHOP_FAST_PROVIDERS_URL
+EOF
+  fi
 }
 
 case "${1:-}" in

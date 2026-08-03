@@ -103,6 +103,20 @@ class Providers:
     def count(self, path: str) -> int:
         return len(self.calls(path))
 
+    def calls_about(self, path: str, **fields) -> list[dict]:
+        """The calls to `path` whose body carries these exact values.
+
+        A stand serves more than one test's worth of durable work at a time, so
+        counting every call to an operation counts other people's orders too.
+        Scoping by the identifiers under test is what makes a count a fact.
+        """
+
+        return [
+            call
+            for call in self.calls(path)
+            if all(call["body"].get(name) == value for name, value in fields.items())
+        ]
+
     def last_call(self, path: str) -> dict:
         calls = self.calls(path)
         assert calls, f"the store never called {path}"
@@ -116,6 +130,32 @@ class Providers:
             lambda calls: len(calls) >= minimum,
             timeout=timeout if timeout is not None else self._settle_timeout,
             description=f"{minimum} call(s) to {path}",
+        )
+
+    def await_quiet(self, *, seconds: float = 3.0, timeout: float = 60.0) -> None:
+        """Wait until the store stops calling providers.
+
+        A stand carries durable work left by earlier tests, and a scripted
+        answer is claimed by whichever call arrives first. Steering a provider
+        is only meaningful once the previous scenarios have finished theirs.
+        """
+
+        import time
+
+        deadline = time.monotonic() + timeout
+        seen = len(self.calls())
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            now = len(self.calls())
+            if now != seen:
+                seen = now
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= seconds:
+                return
+        raise AssertionError(
+            f"the stand was still calling providers after {timeout:g}s; "
+            "an earlier scenario has not finished"
         )
 
     def pending_scripts(self) -> list[dict]:

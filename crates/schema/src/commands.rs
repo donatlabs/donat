@@ -3804,8 +3804,56 @@ fn validate_idempotency_step_scopes(
                 "idempotency step scope must reference one scalar field",
             ));
         }
+        // The claim is elected from the scope, so every step up to and
+        // including the one it reads runs before the claim exists — and would
+        // run again on a replay. Only a lookup may sit there.
+        let position = command
+            .steps
+            .iter()
+            .position(|declared| declared.name == *step)
+            .ok_or_else(|| {
+                PlanError::validation(path, format!("unknown idempotency scope step '{step}'"))
+            })?;
+        if let Some(writing) = command.steps[..=position]
+            .iter()
+            .find(|declared| command_step_writes(&declared.operation))
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "idempotency scope step '{step}' cannot be read before the command writes: \
+                     step '{}' writes first",
+                    writing.name
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Whether a step changes data. A command's idempotency scope may only read
+/// values produced before anything is written.
+fn command_step_writes(operation: &CommandStepOperation) -> bool {
+    match operation {
+        CommandStepOperation::SelectOne { .. }
+        | CommandStepOperation::SelectMany { .. }
+        | CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::Assert { .. }
+        | CommandStepOperation::AssertWhen { .. }
+        | CommandStepOperation::Decision { .. }
+        | CommandStepOperation::DecisionMany { .. }
+        | CommandStepOperation::Project { .. }
+        | CommandStepOperation::ProjectMany { .. }
+        | CommandStepOperation::FixedRows { .. } => false,
+        CommandStepOperation::Insert { .. }
+        | CommandStepOperation::InsertMany { .. }
+        | CommandStepOperation::InsertWhen { .. }
+        | CommandStepOperation::Update { .. }
+        | CommandStepOperation::UpdateMany { .. }
+        | CommandStepOperation::UpdateWhen { .. }
+        | CommandStepOperation::Delete { .. }
+        | CommandStepOperation::AllocateMany { .. } => true,
+    }
 }
 
 fn validate_step(

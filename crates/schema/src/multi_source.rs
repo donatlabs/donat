@@ -1133,7 +1133,14 @@ where
                 )?,
                 _ => {
                     if let Some(existing) = by_name.get(&name) {
-                        if types[*existing] != ty {
+                        // A filter input's shape follows what the backend can
+                        // honour, and one composed schema has one type per
+                        // name. Offering the union would advertise `_regex` on
+                        // a source that has no regex; the intersection offers
+                        // exactly what every source behind the name can do.
+                        if name.ends_with("_comparison_exp") {
+                            intersect_input_fields(&mut types[*existing], &ty);
+                        } else if types[*existing] != ty {
                             return Err(PlanError::validation(
                                 "$",
                                 format!("incompatible type collision for '{name}'"),
@@ -1762,6 +1769,29 @@ fn root_type(name: &str, fields: Vec<Json>) -> Json {
         "enumValues": null,
         "possibleTypes": null,
     })
+}
+
+/// Keep only the input fields both renderings of a filter type offer.
+///
+/// Two sources render the same `<scalar>_comparison_exp` differently exactly
+/// when their backends differ in what they can filter by. A composed schema
+/// publishes one type, so it publishes the operators every source behind it
+/// can honour — never one that would fail on half the tables that use it.
+fn intersect_input_fields(kept: &mut Json, incoming: &Json) {
+    let Some(offered) = incoming["inputFields"].as_array() else {
+        return;
+    };
+    let names: std::collections::BTreeSet<&str> = offered
+        .iter()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    if let Some(existing) = kept["inputFields"].as_array_mut() {
+        existing.retain(|field| {
+            field["name"]
+                .as_str()
+                .is_some_and(|name| names.contains(name))
+        });
+    }
 }
 
 #[cfg(test)]

@@ -165,6 +165,11 @@ jobs:
       # Process revisions, then serve — with the engine built from this commit.
       - name: Raise the stand
         run: tests-system/stack.sh up
+      # The same store with its declared periods rewritten to seconds. Without
+      # it every deadline branch — dunning, expiries, unanswered approvals —
+      # skips itself, and the run is green having tested none of them.
+      - name: Raise the fast stand
+        run: tests-system/stack.sh up-fast
       - name: Install the suite
         run: |
           python3 -m venv tests-system/.venv
@@ -174,13 +179,19 @@ jobs:
         env:
           PETSHOP_BASE_URL: http://127.0.0.1:8080
           PETSHOP_PROVIDERS_URL: http://127.0.0.1:8099
+          PETSHOP_FAST_BASE_URL: http://127.0.0.1:8081
+          PETSHOP_FAST_PROVIDERS_URL: http://127.0.0.1:8098
         run: .venv/bin/python -m pytest -q
       - name: Engine log
         if: failure()
-        run: tail -200 tests-system/.stack/engine.log
+        run: |
+          tail -200 tests-system/.stack/engine.log
+          tail -200 tests-system/.stack/engine-fast.log
       - name: Drop the stand
         if: always()
-        run: tests-system/stack.sh down
+        run: |
+          tests-system/stack.sh down-fast
+          tests-system/stack.sh down
 
   artifacts:
     name: Build artifact (${{ matrix.target.name }})

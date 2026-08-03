@@ -42,6 +42,9 @@ separate branches and merge independently).
 - [[decisions/011-share-rendered-schema-documents-across-slots]] — why a
   compiled snapshot shares, serializes and indexes what it keeps, halving the
   engine's resident memory without changing a served response
+- [[decisions/012-a-wide-selection-is-an-ordinary-query]] — why an object of
+  more than fifty fields is built from an ordered row set instead of one
+  `json_build_object`, and why field order ruled `jsonb` out
 
 ## Cross-cutting
 

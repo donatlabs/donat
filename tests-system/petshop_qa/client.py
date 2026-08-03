@@ -204,6 +204,23 @@ class Actor:
     def mcp_tool(self, name: str, arguments: Mapping[str, Any]) -> Response:
         return self.mcp("tools/call", {"name": name, "arguments": dict(arguments)})
 
+    # -- subscriptions -----------------------------------------------------
+
+    def live(self, *, timeout: float | None = None):
+        """An open connection this caller can watch the store through.
+
+        The same identity as every other surface: the connection carries the
+        caller's own token, so what it may watch is what it may read.
+        """
+
+        from .live import Live
+
+        return Live(
+            self._config.base_url,
+            self._headers(with_body=False),
+            timeout=timeout if timeout is not None else self._config.request_timeout,
+        )
+
     # -- plumbing ----------------------------------------------------------
 
     def _post(

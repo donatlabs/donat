@@ -38,6 +38,8 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/032-permission-validators-declare-presence]]
 - [[decisions/033-files-are-a-column-and-their-urls-are-signed-in-sql]]
 - [[decisions/034-a-declaration-the-runtime-ignores-is-a-defect]]
+- [[decisions/035-an-idempotency-scope-may-read-a-lookup-never-a-write]]
+- [[decisions/036-the-transition-queue-is-a-work-queue-not-a-line]]
 
 ## Reference governance
 

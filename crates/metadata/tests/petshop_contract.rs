@@ -37,7 +37,7 @@ fn every_petshop_command_file_uses_the_closed_command_grammar() {
     let mut files = Vec::new();
     yaml_files_below(&petshop_metadata_dir().join("commands"), &mut files);
     files.sort();
-    assert_eq!(files.len(), 73);
+    assert_eq!(files.len(), 74);
 
     for path in files {
         let yaml = std::fs::read_to_string(&path).expect("command file must be readable");
@@ -92,7 +92,7 @@ fn petshop_contract_loads_complete_active_grammar() {
     let metadata =
         load_metadata_dir(&petshop_metadata_dir()).expect("real Petshop metadata must load");
 
-    assert_eq!(metadata.commands.len(), 73);
+    assert_eq!(metadata.commands.len(), 74);
     assert_eq!(metadata.connectors.len(), 5);
 
     let serialized =
@@ -165,7 +165,7 @@ fn petshop_contract_loads_complete_active_grammar() {
             ("partial_fulfilment", 14),
             ("payment_reconciliation", 9),
             ("prescription_review", 8),
-            ("return_refund", 28),
+            ("return_refund", 31),
             ("subscription_renewal", 39),
             ("vendor_payout", 6),
         ]),
@@ -196,16 +196,16 @@ fn petshop_contract_loads_complete_active_grammar() {
             });
     assert_eq!(
         process_states.len(),
-        168,
+        171,
         "the complete Petshop state inventory must not shrink silently"
     );
     assert_eq!(
         process_operation_counts,
         BTreeMap::from([
-            ("command", 57),
-            ("fail", 16),
+            ("command", 60),
+            ("fail", 13),
             ("for_each", 15),
-            ("output", 29),
+            ("output", 32),
             ("request", 18),
             ("wait", 10),
             ("when", 23),

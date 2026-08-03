@@ -922,7 +922,9 @@ mod tests {
     fn petshop_claims_map_admits_a_token_without_the_custom_attribute() {
         let sam = sign(&json!({ "roles": ["staff"], "scope": "openid donat" }));
 
-        let s = petshop_claims_map().session(&sam, Some("staff"), false).unwrap();
+        let s = petshop_claims_map()
+            .session(&sam, Some("staff"), false)
+            .unwrap();
         assert_eq!(s.role, "staff");
         assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some(""));
 
