@@ -998,3 +998,94 @@ fn forwards_relay_mode_only_to_capable_children() {
         "field 'logs_event_connection' not found in type: 'query_root'"
     );
 }
+
+#[test]
+fn schema_documents_that_cannot_differ_are_rendered_once_and_shared() {
+    // Nothing in this metadata is `backend_only`, and a rendered schema never
+    // depends on Relay, so each role's four schema slots are one document.
+    let metadata = metadata();
+    let catalogs = catalogs();
+
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+
+    // One role in the fixture ("user") plus the synthetic denied role.
+    assert_eq!(
+        compiled.distinct_schema_documents(),
+        2,
+        "each role keeps one rendered document, not one per Relay/backend slot"
+    );
+}
+
+#[test]
+fn a_backend_only_insert_permission_still_gets_its_own_document() {
+    // The one thing `backend_request` changes is whether a `backend_only`
+    // insert permission is visible, so that metadata must keep both variants.
+    let mut metadata = metadata();
+    metadata.sources.truncate(1);
+    metadata.sources[0].tables[0].insert_permissions.push(
+        serde_json::from_value(json!({
+            "role": "user",
+            "permission": { "columns": ["id", "name"], "check": {}, "backend_only": true }
+        }))
+        .expect("insert permission deserializes"),
+    );
+    let mut catalogs = catalogs();
+    catalogs.retain(|source, _| source == "default");
+
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+
+    assert_eq!(
+        compiled.distinct_schema_documents(),
+        4,
+        "both backend_request variants are rendered for each of the two role entries"
+    );
+}
+
+/// One composed schema has one `String_comparison_exp`, and it offers what
+/// every source behind it can honour.
+///
+/// The fixture composes Postgres, which has a regex engine, with ClickHouse,
+/// which does not. Publishing the union would put `_regex` in front of a client
+/// and fail on half the tables that accept the type; publishing the
+/// intersection tells the truth for all of them.
+#[test]
+fn a_composed_filter_offers_only_what_every_source_can_honour() {
+    let metadata = metadata();
+    let catalogs = catalogs();
+    let compiled =
+        CompiledMultiSourceSchema::compile(&metadata, &catalogs, true).expect("snapshot compiles");
+    let planner = MultiSourcePlanner::from_compiled(&metadata, &catalogs, &compiled)
+        .expect("planner constructs");
+    let doc = graphql_parser::parse_query::<String>(
+        r#"{ __type(name: "String_comparison_exp") { inputFields { name } } }"#,
+    )
+    .expect("query parses")
+    .into_static();
+
+    let data =
+        execute_multi_source_introspection(&planner, &session("user"), &doc, None, &JsonMap::new())
+            .expect("introspection query")
+            .expect("introspection succeeds");
+
+    let offered: Vec<&str> = data["__type"]["inputFields"]
+        .as_array()
+        .expect("the filter input is an input object")
+        .iter()
+        .map(|field| field["name"].as_str().unwrap_or_default())
+        .collect();
+
+    for common in ["_eq", "_in", "_is_null", "_like", "_ilike"] {
+        assert!(
+            offered.contains(&common),
+            "every source can filter by {common}: {offered:?}"
+        );
+    }
+    for postgres_only in ["_regex", "_iregex", "_similar"] {
+        assert!(
+            !offered.contains(&postgres_only),
+            "{postgres_only} is offered by a schema one of whose sources has no regex: {offered:?}"
+        );
+    }
+}

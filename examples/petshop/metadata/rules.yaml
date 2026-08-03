@@ -314,7 +314,11 @@ rules:
   - name: can_transition_return
     parameters: { current: string!, next: ReturnState! }
     result: bool!
-    expression: "(current == \"requested\" && (next == ReturnState::approved || next == ReturnState::rejected)) || (current == \"approved\" && next == ReturnState::received) || (current == \"received\" && next == ReturnState::inspected) || (current == \"inspected\" && (next == ReturnState::refunded || next == ReturnState::exchanged || next == ReturnState::rejected))"
+    # A return may also be refused at the two stages where a deadline can pass
+    # with nothing having happened: approved but never sent back, and received
+    # but never inspected. Both refusals cost the shopper their request, so both
+    # deadlines are long and both write a `return_event` naming the cause.
+    expression: "(current == \"requested\" && (next == ReturnState::approved || next == ReturnState::rejected)) || (current == \"approved\" && (next == ReturnState::received || next == ReturnState::rejected)) || (current == \"received\" && (next == ReturnState::inspected || next == ReturnState::rejected)) || (current == \"inspected\" && (next == ReturnState::refunded || next == ReturnState::exchanged || next == ReturnState::rejected))"
   - name: return_approval_matches_request
     parameters: { lines: "[ReturnApprovalLine!]!" }
     result: bool!

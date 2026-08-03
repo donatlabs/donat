@@ -1308,8 +1308,8 @@ fn all_petshop_processes_compile_and_publish_effect_contracts() {
             }
         }
     }
-    assert_eq!(counts, [57, 18, 23, 10, 15, 29, 16]);
-    assert_eq!(counts.iter().sum::<usize>(), 168);
+    assert_eq!(counts, [60, 18, 23, 10, 15, 32, 13]);
+    assert_eq!(counts.iter().sum::<usize>(), 171);
 
     let dependencies = petshop_dependencies(&metadata);
     let catalog =
@@ -1699,6 +1699,11 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("review_deadline", "timestamptz!"),
         ],
         "expire_prescription" => &[("prescription_id", "uuid!"), ("status", "string!")],
+        "expire_return" => &[
+            ("return_id", "uuid!"),
+            ("order_id", "uuid!"),
+            ("status", "string!"),
+        ],
         "reconcile_payment" => &[("reconciliation_id", "uuid!")],
         "materialize_cancellation_authorization" => &[("authorization_id", "uuid!")],
         "finalize_authorized_order_cancellation" => {

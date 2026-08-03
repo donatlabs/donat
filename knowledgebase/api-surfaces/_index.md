@@ -39,6 +39,12 @@ separate branches and merge independently).
 - [[decisions/010-donat-does-not-own-identity]] — why the engine ships no
   authentication of its own and the petshop example gets an optional Rauthy
   profile instead, and why an external IdP is not an admin-role bypass
+- [[decisions/011-share-rendered-schema-documents-across-slots]] — why a
+  compiled snapshot shares, serializes and indexes what it keeps, halving the
+  engine's resident memory without changing a served response
+- [[decisions/012-a-wide-selection-is-an-ordinary-query]] — why an object of
+  more than fifty fields is built from an ordered row set instead of one
+  `json_build_object`, and why field order ruled `jsonb` out
 
 ## Cross-cutting
 

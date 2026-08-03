@@ -5,8 +5,8 @@
 //! catalogs that were validated together; workers never consult mutable
 //! metadata or reconstruct a dependency while consuming journal rows.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -16,6 +16,8 @@ use donat_rules::RuleCatalog;
 use donat_schema::{
     CompiledCommandCatalog, CompiledMultiSourceSchema, FinalizedCommandCatalog, Planner,
 };
+
+use uuid::Uuid;
 
 use crate::connectors::ConnectorRegistry;
 use crate::state::{SharedState, SourceRuntime};
@@ -72,6 +74,49 @@ pub struct ProcessRuntime {
     pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
     pub connector_registry: Arc<ConnectorRegistry>,
     pub activity_executor: Arc<dyn ProcessActivityExecutor>,
+    /// Instances this process is already working on.
+    ///
+    /// `SKIP LOCKED` is what keeps two *deployments* off one instance; this is
+    /// what keeps two workers of the same deployment from preparing the same
+    /// transition and having one of them throw the work away.
+    pub(crate) in_flight: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+/// Releases the instance when the worker is done with it, however it ends.
+pub(crate) struct InFlightGuard {
+    in_flight: Arc<Mutex<HashSet<Uuid>>>,
+    instance_id: Uuid,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&self.instance_id);
+        }
+    }
+}
+
+impl ProcessRuntime {
+    /// Claim an instance for this worker, or report that another worker of
+    /// this deployment already has it.
+    pub(crate) fn claim_in_flight(&self, instance_id: Uuid) -> Option<InFlightGuard> {
+        let mut in_flight = self.in_flight.lock().ok()?;
+        if !in_flight.insert(instance_id) {
+            return None;
+        }
+        Some(InFlightGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            instance_id,
+        })
+    }
+
+    /// The instances other workers are holding right now.
+    pub(crate) fn busy_instances(&self) -> Vec<Uuid> {
+        self.in_flight
+            .lock()
+            .map(|in_flight| in_flight.iter().copied().collect())
+            .unwrap_or_default()
+    }
 }
 
 pub fn build_process_runtime(
@@ -138,6 +183,7 @@ pub fn build_process_runtime_with_activity_executor(
         finalized_command_catalog,
         connector_registry,
         activity_executor,
+        in_flight: Arc::new(Mutex::new(HashSet::new())),
     })
 }
 
@@ -184,67 +230,75 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
 
     let poll_interval = process_poll_interval();
     for runtime in runtimes {
+        let workers = transition_concurrency(&runtime.pool);
         tracing::info!(
             source = %runtime.source_name,
             poll_milliseconds = poll_interval.as_millis() as u64,
+            transition_workers = workers,
             "Process worker started"
         );
-        tokio::spawn(run(runtime, poll_interval));
+        let runtime = Arc::new(runtime);
+        for _ in 0..workers {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(supervise(
+                runtime.source_name.clone(),
+                "transition",
+                move || transition_worker(Arc::clone(&runtime), poll_interval),
+            ));
+        }
+        let loops = Arc::clone(&runtime);
+        tokio::spawn(supervise(runtime.source_name.clone(), "source", move || {
+            run(Arc::clone(&loops), poll_interval)
+        }));
     }
     Ok(())
 }
 
-async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
+/// How long to wait before starting a worker that died back up. Long enough
+/// that a worker panicking on every iteration cannot become a hot loop, short
+/// enough that a deployment does not notice the gap.
+const WORKER_RESTART_DELAY: Duration = Duration::from_millis(250);
+
+/// Keep one worker running for the life of the process.
+///
+/// Workers are spawned tasks, and a spawned task that panics is simply gone.
+/// Several of them lose themselves one at a time, with nothing to show for it
+/// but a deployment that gets slower and eventually stops — the failure this
+/// whole queue exists to prevent, arriving by another route. So a worker that
+/// dies is started again, and the log says which one and why.
+async fn supervise<F, Fut>(source: String, worker: &'static str, make: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        match tokio::spawn(make()).await {
+            Ok(()) => {
+                tracing::warn!(%source, worker, "Process worker returned; starting it again");
+            }
+            Err(joined) if joined.is_panic() => {
+                tracing::error!(
+                    %source,
+                    worker,
+                    "Process worker panicked; starting it again"
+                );
+            }
+            // Cancelled: the runtime is going away, and so is this.
+            Err(_) => return,
+        }
+        tokio::time::sleep(WORKER_RESTART_DELAY).await;
+    }
+}
+
+/// One transition worker: take the next due transition, apply it, repeat.
+///
+/// Several of these run per source. The queue itself is the hand-off — each
+/// worker claims a different instance with `SKIP LOCKED` — so a transition that
+/// takes a second is that instance's second and nobody else's. A worker that
+/// finds nothing waits out one poll interval before asking again.
+async fn transition_worker(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
     loop {
         let mut progressed = false;
-        match runtime.consume_one_start().await {
-            Ok(StartConsumption::NoWork) => {}
-            Ok(StartConsumption::Started {
-                request_id,
-                instance_id,
-            }) => {
-                progressed = true;
-                tracing::debug!(
-                    source = %runtime.source_name,
-                    %request_id,
-                    %instance_id,
-                    "Process start request consumed"
-                );
-            }
-            Ok(StartConsumption::Duplicate {
-                request_id,
-                instance_id,
-            }) => {
-                progressed = true;
-                tracing::debug!(
-                    source = %runtime.source_name,
-                    %request_id,
-                    %instance_id,
-                    "duplicate Process start request consumed"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    source = %runtime.source_name,
-                    error = format_args!("{error:#}"),
-                    "Process start consumer failed"
-                );
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            }
-        }
-        match consume_one_signal(&runtime).await {
-            Ok(signal_progressed) => progressed |= signal_progressed,
-            Err(error) => {
-                tracing::error!(
-                    source = %runtime.source_name,
-                    error = format_args!("{error:#}"),
-                    "Process signal consumer failed"
-                );
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            }
-        }
         match runtime.consume_one_transition().await {
             Ok(TransitionConsumption::NoWork) => {}
             Ok(TransitionConsumption::Advanced {
@@ -306,6 +360,39 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     code = %error.code,
                     path = %error.path,
                     "Process command state rejected"
+                );
+            }
+            Ok(TransitionConsumption::Deferred {
+                instance_id,
+                event_id,
+                attempts,
+                delay_milliseconds,
+            }) => {
+                // Progress: the queue moved on. `defer_transition` has already
+                // logged the cause (ADR 031) — this is the loop's own record
+                // that it did not stall.
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    attempts,
+                    delay_milliseconds,
+                    "Process transition deferred; the queue continues"
+                );
+            }
+            Ok(TransitionConsumption::CommandFailed {
+                instance_id,
+                event_id,
+                code,
+            }) => {
+                progressed = true;
+                tracing::warn!(
+                    source = %runtime.source_name,
+                    %instance_id,
+                    %event_id,
+                    code,
+                    "Process command state failed unrecoverably"
                 );
             }
             Ok(TransitionConsumption::ActivityScheduled {
@@ -379,6 +466,61 @@ async fn run(runtime: ProcessRuntime, poll_interval: Duration) {
                     source = %runtime.source_name,
                     error = format_args!("{error:#}"),
                     "Process transition consumer failed"
+                );
+            }
+        }
+        if !progressed {
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+async fn run(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
+    loop {
+        let mut progressed = false;
+        match runtime.consume_one_start().await {
+            Ok(StartConsumption::NoWork) => {}
+            Ok(StartConsumption::Started {
+                request_id,
+                instance_id,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %request_id,
+                    %instance_id,
+                    "Process start request consumed"
+                );
+            }
+            Ok(StartConsumption::Duplicate {
+                request_id,
+                instance_id,
+            }) => {
+                progressed = true;
+                tracing::debug!(
+                    source = %runtime.source_name,
+                    %request_id,
+                    %instance_id,
+                    "duplicate Process start request consumed"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    source = %runtime.source_name,
+                    error = format_args!("{error:#}"),
+                    "Process start consumer failed"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        }
+        match consume_one_signal(&runtime).await {
+            Ok(signal_progressed) => progressed |= signal_progressed,
+            Err(error) => {
+                tracing::error!(
+                    source = %runtime.source_name,
+                    error = format_args!("{error:#}"),
+                    "Process signal consumer failed"
                 );
                 tokio::time::sleep(poll_interval).await;
                 continue;
@@ -566,6 +708,63 @@ async fn consume_one_signal(runtime: &ProcessRuntime) -> anyhow::Result<bool> {
     })
 }
 
+/// How many transitions one deployment applies at a time.
+///
+/// The queue is a work queue, not a line: a transition that takes a second is
+/// that instance's second, not everybody's. The bound is what keeps a burst of
+/// due timers from opening a connection per instance — the same reason an HTTP
+/// server has a worker pool rather than a thread per request.
+fn transition_concurrency(pool: &deadpool_postgres::Pool) -> usize {
+    // A transition worker spends its life waiting on the database, so what
+    // bounds it is connections, not cores — the same thing that bounds an HTTP
+    // server talking to one database. Scaling up therefore means giving the
+    // source more connections (`max_connections` on the source), and the
+    // worker count follows.
+    //
+    // Half the pool, because the pool is shared: API requests, the start,
+    // signal, activity and timer consumers all draw from it. Workers that took
+    // every connection would starve the surface they exist to serve, and a
+    // worker that cannot get a connection would spend its attempt waiting for
+    // one.
+    transition_worker_count(
+        pool.status().max_size,
+        std::env::var("DONAT_PROCESS_TRANSITION_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0),
+    )
+}
+
+/// Half the pool by default, and never the whole of it.
+fn transition_worker_count(pool_size: usize, configured: Option<usize>) -> usize {
+    let ceiling = pool_size.saturating_sub(1).max(1);
+    configured.unwrap_or((pool_size / 2).max(1)).min(ceiling)
+}
+
+/// Apply up to `concurrency` transitions at once, and report what each worker
+/// did. Workers claim different instances — one instance's transitions stay
+/// serialized, everything else overlaps.
+pub async fn consume_transitions_concurrently(
+    runtime: &Arc<ProcessRuntime>,
+    concurrency: usize,
+) -> Vec<anyhow::Result<TransitionConsumption>> {
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..concurrency.max(1) {
+        let runtime = Arc::clone(runtime);
+        workers.spawn(async move { runtime.consume_one_transition().await });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(joined) = workers.join_next().await {
+        match joined {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) => outcomes.push(Err(anyhow::anyhow!(
+                "Process transition worker panicked: {error}"
+            ))),
+        }
+    }
+    outcomes
+}
+
 fn process_poll_interval() -> Duration {
     Duration::from_millis(
         std::env::var("DONAT_PROCESS_POLL_MILLISECONDS")
@@ -583,4 +782,66 @@ fn process_workers_disabled() -> bool {
         .is_some_and(|value| {
             value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
         })
+}
+
+#[cfg(test)]
+mod worker_pool_tests {
+    use super::{supervise, transition_worker_count};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Transition workers wait on the database, so the pool is what bounds
+    /// them — the same bound an HTTP server hits against one database. Scaling
+    /// up is a matter of giving the source more connections.
+    #[test]
+    fn workers_follow_the_pool_and_never_take_all_of_it() {
+        assert_eq!(transition_worker_count(16, None), 8);
+        assert_eq!(transition_worker_count(64, None), 32);
+        assert_eq!(transition_worker_count(200, None), 100);
+        // The pool is shared with the API and the other consumers: a worker
+        // per connection would starve the surface the workers exist to serve.
+        assert_eq!(transition_worker_count(16, Some(1_000)), 15);
+        assert_eq!(transition_worker_count(4, Some(4)), 3);
+        // A pool too small to share still runs one worker rather than none.
+        assert_eq!(transition_worker_count(1, None), 1);
+        assert_eq!(transition_worker_count(2, None), 1);
+        // And an operator may ask for fewer.
+        assert_eq!(transition_worker_count(32, Some(2)), 2);
+    }
+
+    /// A worker that panics is started again rather than quietly lost.
+    ///
+    /// Without this, N spawned workers disappear one panic at a time and the
+    /// only symptom is a deployment that gets slower — the failure the queue
+    /// exists to prevent, arriving by another route.
+    #[tokio::test]
+    async fn a_worker_that_panics_is_started_again() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&starts);
+        let supervisor = tokio::spawn(supervise("test".to_owned(), "unit", move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                // Panics the first two times it is started, then stays up.
+                if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                    panic!("a worker fell over");
+                }
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        // Two restarts, each after the supervisor's delay, plus slack.
+        for _ in 0..20 {
+            tokio::time::sleep(super::WORKER_RESTART_DELAY).await;
+            if starts.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+        }
+        supervisor.abort();
+
+        assert!(
+            starts.load(Ordering::SeqCst) >= 3,
+            "a panicking worker was not restarted: {} start(s)",
+            starts.load(Ordering::SeqCst)
+        );
+    }
 }

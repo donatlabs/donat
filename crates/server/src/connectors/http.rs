@@ -4,7 +4,7 @@
 //! declared slots.  There is intentionally no API accepting a caller-supplied
 //! URL, method, header name, redirect policy, or TLS policy.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -230,6 +230,10 @@ pub struct HttpOperation {
     success_statuses: BTreeSet<u16>,
     response_pointers: Vec<ResponsePointer>,
     declared_5xx: BTreeSet<u16>,
+    /// The operation's own `error_map`: which class each status belongs to.
+    /// It is what decides whether a failure is retryable, so it has to reach
+    /// the runtime rather than stay a deploy-time description.
+    declared_classes: BTreeMap<u16, ConnectorErrorClass>,
     idempotency_header: Option<HeaderName>,
 }
 
@@ -243,6 +247,7 @@ pub struct HttpOperationBuilder {
     success_statuses: BTreeSet<u16>,
     response_pointers: Vec<ResponsePointer>,
     declared_5xx: BTreeSet<u16>,
+    declared_classes: BTreeMap<u16, ConnectorErrorClass>,
     idempotency_header: Option<String>,
 }
 
@@ -254,6 +259,7 @@ impl HttpOperation {
             path_template: path_template.to_owned(),
             query_inputs: Vec::new(),
             headers: Vec::new(),
+            declared_classes: BTreeMap::new(),
             body: None,
             success_statuses: BTreeSet::new(),
             response_pointers: Vec::new(),
@@ -303,6 +309,15 @@ impl HttpOperationBuilder {
 
     pub fn declared_5xx(mut self, statuses: impl IntoIterator<Item = StatusCode>) -> Self {
         self.declared_5xx = statuses.into_iter().map(|status| status.as_u16()).collect();
+        self
+    }
+
+    /// Bind the operation's declared error map: status to failure class.
+    pub fn declared_classes(
+        mut self,
+        classes: impl IntoIterator<Item = (u16, ConnectorErrorClass)>,
+    ) -> Self {
+        self.declared_classes = classes.into_iter().collect();
         self
     }
 
@@ -389,8 +404,78 @@ impl HttpOperationBuilder {
             success_statuses: self.success_statuses,
             response_pointers: self.response_pointers,
             declared_5xx: self.declared_5xx,
+            declared_classes: self.declared_classes,
             idempotency_header,
         })
+    }
+}
+
+/// The runtime class an operation's `error_map` names.
+fn metadata_error_class(class: &donat_metadata::ConnectorErrorClass) -> ConnectorErrorClass {
+    use donat_metadata::ConnectorErrorClass as Declared;
+
+    match class {
+        Declared::Authentication => ConnectorErrorClass::Authentication,
+        Declared::Transport => ConnectorErrorClass::Transport,
+        Declared::Timeout => ConnectorErrorClass::Timeout,
+        Declared::Http429 => ConnectorErrorClass::Http429,
+        Declared::Http5xx => ConnectorErrorClass::Http5xx,
+        Declared::Validation => ConnectorErrorClass::Validation,
+        Declared::Permanent => ConnectorErrorClass::Permanent,
+        Declared::Invariant => ConnectorErrorClass::Invariant,
+    }
+}
+
+/// The header a provider-idempotent effect binds its stable key to.
+fn fixed_idempotency_header(http: &donat_metadata::HttpConnectorOperation) -> Option<String> {
+    let donat_metadata::ConnectorEffect::ProviderIdempotent {
+        provider_idempotent,
+    } = http.effect.as_ref()?
+    else {
+        return None;
+    };
+    provider_idempotent
+        .side_effect_steps
+        .first()
+        .map(|step| step.fixed_binding.header.clone())
+}
+
+/// The failure an operation's own error map declares for a status.
+fn declared_failure(class: ConnectorErrorClass, headers: &HeaderMap) -> ConnectorFailure {
+    match class {
+        ConnectorErrorClass::Http429 => ConnectorFailure::new(
+            ConnectorErrorClass::Http429,
+            "connector_http_429",
+            "connector provider rate limited the request",
+        )
+        .with_retry_after(retry_after(headers)),
+        ConnectorErrorClass::Http5xx => ConnectorFailure::new(
+            ConnectorErrorClass::Http5xx,
+            "connector_declared_http_5xx",
+            "connector provider returned a declared server error",
+        ),
+        ConnectorErrorClass::Timeout => timeout_failure(),
+        ConnectorErrorClass::Transport => ConnectorFailure::new(
+            ConnectorErrorClass::Transport,
+            "connector_transport_failure",
+            "connector provider was unreachable",
+        ),
+        ConnectorErrorClass::Authentication => ConnectorFailure::new(
+            ConnectorErrorClass::Authentication,
+            "connector_http_authentication",
+            "connector provider rejected connector authentication",
+        ),
+        ConnectorErrorClass::Validation => {
+            validation_failure("connector provider rejected the declared request")
+        }
+        ConnectorErrorClass::Invariant => {
+            invariant_failure("connector provider answered outside its declared contract")
+        }
+        ConnectorErrorClass::Permanent => ConnectorFailure::new(
+            ConnectorErrorClass::Permanent,
+            "connector_unsupported_http_status",
+            "connector provider returned an unsupported HTTP status",
+        ),
     }
 }
 
@@ -462,8 +547,24 @@ impl ValidatedHttpOperation {
             })
             .collect::<Result<Vec<_>, _>>()?;
         builder = builder.declared_5xx(declared_5xx);
-        if let Some(idempotency) = &http.idempotency {
-            builder = builder.idempotency_header(&idempotency.header);
+        if let Some(error_map) = &http.error_map {
+            builder = builder.declared_classes(error_map.rules.iter().flat_map(|rule| {
+                let class = metadata_error_class(&rule.class_);
+                rule.statuses.iter().map(move |status| (*status, class))
+            }));
+        }
+        // The header the provider deduplicates on is declared in one of two
+        // places. The legacy field names it directly; the effect names it as
+        // the binding of a provider-idempotent step, which is the form the
+        // catalog contract uses. Reading only the first left every operation
+        // declared the second way sending no key at all.
+        let idempotency_header = http
+            .idempotency
+            .as_ref()
+            .map(|idempotency| idempotency.header.clone())
+            .or_else(|| fixed_idempotency_header(http));
+        if let Some(header) = idempotency_header {
+            builder = builder.idempotency_header(&header);
         }
         let capacity = operation.capacity().ok_or_else(|| {
             HttpConfigError::new("capacity is required for every connector operation")
@@ -1170,6 +1271,12 @@ impl HttpConnector {
         }
         let status = response.status.as_u16();
         if !operation.success_statuses.contains(&status) {
+            // What the operation declared about this status wins: the built-in
+            // handling below is the answer for an operation that declared
+            // nothing, not an override of one that did.
+            if let Some(class) = operation.declared_classes.get(&status) {
+                return Err(declared_failure(*class, &response.headers));
+            }
             return Err(match status {
                 408 => timeout_failure(),
                 429 => ConnectorFailure::new(
@@ -1467,6 +1574,114 @@ mod tests {
         .expect("declarative operation metadata deserializes");
         ValidatedHttpOperation::from_metadata(&operation)
             .expect("declarative operation compiles before execution")
+    }
+
+    /// The same operation declared through the catalog fields: the header is
+    /// bound by a provider-idempotent effect, and the retryable statuses come
+    /// from an error map. Metadata written this way must behave identically —
+    /// reading only the legacy fields left it sending no key and treating a
+    /// declared 500 as permanent.
+    fn catalog_declared_operation(path: &str) -> ValidatedHttpOperation {
+        let operation: ConnectorOperation = serde_json::from_value(json!({
+            "name": "create_shipment",
+            "version": "v1",
+            "method": "POST",
+            "path": path,
+            "body": { "order_id": { "input": "order_id" } },
+            "success_statuses": [200],
+            "effect": {
+                "provider_idempotent": {
+                    "side_effect_steps": [{
+                        "step": "request",
+                        "fixed_binding": { "header": "Idempotency-Key" },
+                        "scope": "unit-test-v1",
+                        "minimum_retention_ms": 600000,
+                        "clock_safety_margin_ms": 1000,
+                        "evidence": {
+                            "source_record_id": "source.unit.test.v1",
+                            "fact_ids": ["fact.unit.fixed-idempotency-key"]
+                        }
+                    }]
+                }
+            },
+            "error_map": {
+                "rules": [
+                    { "statuses": [503], "class": "http_5xx", "code": "unavailable" },
+                    { "statuses": [409], "class": "validation", "code": "conflict" }
+                ],
+                "fallback": { "class": "permanent", "code": "provider_error" }
+            },
+            "capacity": {
+                "max_in_flight": 1,
+                "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+            }
+        }))
+        .expect("catalog-declared operation metadata deserializes");
+        ValidatedHttpOperation::from_metadata(&operation)
+            .expect("catalog-declared operation compiles before execution")
+    }
+
+    #[tokio::test]
+    async fn an_effect_declared_binding_puts_the_idempotency_key_on_the_wire() {
+        async fn record(headers: HeaderMap) -> Json<JsonValue> {
+            Json(json!({
+                "idempotency_key": headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok()),
+            }))
+        }
+
+        let server = LocalServer::start(Router::new().fallback(post(record))).await;
+        let operation = catalog_declared_operation("/v1/orders");
+
+        let result = local_connector(&server.base_url)
+            .execute_validated(
+                &operation,
+                json!({ "order_id": "order-42" }),
+                "logical-activity-42",
+                context().deadline,
+            )
+            .await
+            .expect("catalog-declared operation succeeds");
+
+        assert_eq!(
+            result.output["idempotency_key"], "logical-activity-42",
+            "the effect's fixed binding names the header the key travels in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_error_map_decides_the_failure_class() {
+        for (status, expected) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ConnectorErrorClass::Http5xx,
+            ),
+            (StatusCode::CONFLICT, ConnectorErrorClass::Validation),
+            // Unmapped: the built-in handling still answers for it.
+            (StatusCode::IM_A_TEAPOT, ConnectorErrorClass::Permanent),
+        ] {
+            let server = LocalServer::start(Router::new().fallback(post(move || async move {
+                (status, Json(json!({ "error": "no" })))
+            })))
+            .await;
+            let operation = catalog_declared_operation("/v1/orders");
+
+            let failure = local_connector(&server.base_url)
+                .execute_validated(
+                    &operation,
+                    json!({ "order_id": "order-42" }),
+                    "logical-activity-42",
+                    context().deadline,
+                )
+                .await
+                .expect_err("the provider refused");
+
+            assert_eq!(
+                failure.class, expected,
+                "status {status} is classified by what the operation declared"
+            );
+        }
     }
 
     #[tokio::test]

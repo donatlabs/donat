@@ -59,10 +59,32 @@ struct ChildPlanner<'a> {
 
 type RootOwners = HashMap<String, String>;
 
+/// One role's rendered schema, indexed by `session.backend_request`.
+///
+/// Held as serialized JSON rather than as a `Value` tree. Nothing on the
+/// request path reads a schema document — field merging uses
+/// [`ResponseShapeIndex`], planning uses the source indexes — so the tree is
+/// only ever needed by an actual introspection query, which is rare and can
+/// pay to parse it. As a tree the same content costs roughly thirty times its
+/// serialized size, because every node is an `IndexMap` and every type name,
+/// field name and JSON key is its own allocation.
+///
+/// The variants are shared rather than copied whenever they cannot differ,
+/// which is the common case: a deployment without a `backend_only` insert
+/// permission renders one document for both, and a rendered schema never
+/// depends on Relay at all.
+type SchemaVariants = [Arc<[u8]>; 2];
+
 struct RoleSchemas {
-    standard: [Json; 2],
-    relay: [Json; 2],
-    mutation_owners: [RootOwners; 2],
+    standard: SchemaVariants,
+    relay: SchemaVariants,
+    /// Which source owns each mutation root this role may call.
+    ///
+    /// One map, not one per `backend_request` variant: command permission is
+    /// decided by the role alone (`command_is_permitted`), and the table and
+    /// function roots it starts from are session-independent. A change that
+    /// makes either backend-aware has to split this again.
+    mutation_owners: RootOwners,
 }
 
 /// Immutable schema and source-index state compiled from one metadata/catalog
@@ -73,7 +95,7 @@ pub struct CompiledMultiSourceSchema {
     source_indexes: Vec<Arc<PlannerIndex>>,
     query_owners: HashMap<String, String>,
     relay_query_owners: HashMap<String, String>,
-    schema_template: Json,
+    response_shapes: ResponseShapeIndex,
     relay_id_types: HashSet<String>,
     relay_error: Option<PlanError>,
     role_schemas: HashMap<String, RoleSchemas>,
@@ -203,12 +225,24 @@ impl CompiledMultiSourceSchema {
             infer_function_permissions,
         )?;
         let (query_owners, standard_mutation_owners) = root_owners(&children)?;
-        let schema_template = build_role_independent_schema(metadata, catalogs, &source_indexes)?;
+        // Rendered once to derive the merging index, then dropped: only the
+        // index is worth keeping resident.
+        let response_shapes = ResponseShapeIndex::from_schema(&build_role_independent_schema(
+            metadata,
+            catalogs,
+            &source_indexes,
+        )?);
         let roles = metadata_roles(metadata);
         let unknown_role = denied_role_name(&roles);
-        let standard = compose_role_schemas(&children, &roles)?;
-        let unknown_standard = compose_role_schema(&children, &unknown_role)?;
+        let backend_variants_differ = backend_variants_can_differ(metadata);
+        let standard = compose_role_schemas(&children, &roles, backend_variants_differ)?;
+        let unknown_standard = compose_role_schema(&children, &unknown_role, backend_variants_differ)?;
 
+        // Relay decides how a query is planned, never how a schema is
+        // rendered — the schema builder does not read the flag. So the Relay
+        // documents are the standard ones, shared rather than rendered a
+        // second time; only the Relay-specific owner and id-type indexes are
+        // derived here, and they still decide whether Relay is servable.
         let relay_result = (|| {
             let mut relay_query_owners = query_owners.clone();
             let mut relay_id_types = HashSet::new();
@@ -221,35 +255,22 @@ impl CompiledMultiSourceSchema {
                     }
                 }
             }
-            Ok((
-                relay_query_owners,
-                relay_id_types,
-                compose_role_schemas(&children, &roles)?,
-                compose_role_schema(&children, &unknown_role)?,
-            ))
+            Ok((relay_query_owners, relay_id_types))
         })();
-        let (relay_query_owners, relay_id_types, mut relay, unknown_relay, relay_error) =
-            match relay_result {
-                Ok((owners, id_types, schemas, unknown)) => {
-                    (owners, id_types, schemas, unknown, None)
-                }
-                Err(error) => (
-                    query_owners.clone(),
-                    HashSet::new(),
-                    standard.clone(),
-                    unknown_standard.clone(),
-                    Some(error),
-                ),
-            };
+        let (relay_query_owners, relay_id_types, relay_error) = match relay_result {
+            Ok((owners, id_types)) => (owners, id_types, None),
+            Err(error) => (query_owners.clone(), HashSet::new(), Some(error)),
+        };
         let mut standard = standard;
         let role_schemas = roles
             .into_iter()
             .map(|role| {
+                let rendered = standard
+                    .remove(&role)
+                    .expect("standard role schema was composed");
                 let schemas = RoleSchemas {
-                    standard: standard
-                        .remove(&role)
-                        .expect("standard role schema was composed"),
-                    relay: relay.remove(&role).expect("Relay role schema was composed"),
+                    relay: rendered.clone(),
+                    standard: rendered,
                     mutation_owners: role_mutation_owners(
                         &children,
                         &standard_mutation_owners,
@@ -268,13 +289,13 @@ impl CompiledMultiSourceSchema {
             source_indexes,
             query_owners,
             relay_query_owners,
-            schema_template,
+            response_shapes,
             relay_id_types,
             relay_error,
             role_schemas,
             unknown_role_schemas: RoleSchemas {
+                relay: unknown_standard.clone(),
                 standard: unknown_standard,
-                relay: unknown_relay,
                 mutation_owners: unknown_mutation_owners,
             },
             infer_function_permissions,
@@ -358,7 +379,8 @@ impl CompiledMultiSourceSchema {
         Ok(planner)
     }
 
-    fn schema(&self, session: &Session, relay: bool) -> &Json {
+    /// The serialized schema document this session introspects.
+    fn schema(&self, session: &Session, relay: bool) -> &Arc<[u8]> {
         let schemas = self
             .role_schemas
             .get(&session.role)
@@ -371,12 +393,38 @@ impl CompiledMultiSourceSchema {
         &pair[usize::from(session.backend_request)]
     }
 
+    /// How many distinct rendered schema documents this snapshot retains.
+    ///
+    /// Every role has four schema slots — Relay and non-Relay, each in two
+    /// `backend_request` variants — but they share one document whenever they
+    /// render the same one, which is the usual case. This reports documents
+    /// rather than slots, so a regression that starts rendering four
+    /// near-identical copies per role again is visible instead of merely
+    /// expensive.
+    pub fn distinct_schema_documents(&self) -> usize {
+        use std::collections::HashSet as StdHashSet;
+
+        let mut seen: StdHashSet<usize> = StdHashSet::new();
+        let mut count = |variants: &SchemaVariants| {
+            for document in variants {
+                seen.insert(Arc::as_ptr(document).cast::<u8>() as usize);
+            }
+        };
+        for schemas in self.role_schemas.values() {
+            count(&schemas.standard);
+            count(&schemas.relay);
+        }
+        count(&self.unknown_role_schemas.standard);
+        count(&self.unknown_role_schemas.relay);
+        seen.len()
+    }
+
     fn mutation_owners(&self, session: &Session) -> &RootOwners {
         let schemas = self
             .role_schemas
             .get(&session.role)
             .unwrap_or(&self.unknown_role_schemas);
-        &schemas.mutation_owners[usize::from(session.backend_request)]
+        &schemas.mutation_owners
     }
 }
 
@@ -470,7 +518,7 @@ impl<'a> MultiSourcePlanner<'a> {
             &fragments,
             &vars,
             "$.selectionSet",
-            &self.compiled.schema_template,
+            &self.compiled.response_shapes,
             relay_id_types,
         )?;
         if fields.is_empty() {
@@ -596,8 +644,17 @@ impl<'a> MultiSourcePlanner<'a> {
             .ok_or_else(|| PlanError::new("$", "not-found", format!("source '{source}' not found")))
     }
 
+    /// Parse this session's schema document, for an introspection query only.
     fn schema_json(&self, session: &Session) -> Result<Cow<'_, Json>, PlanError> {
-        Ok(Cow::Borrowed(self.compiled.schema(session, self.relay)))
+        let bytes = self.compiled.schema(session, self.relay);
+        let schema = serde_json::from_slice(bytes).map_err(|error| {
+            PlanError::new(
+                "$",
+                "unexpected",
+                format!("compiled schema document could not be read: {error}"),
+            )
+        })?;
+        Ok(Cow::Owned(schema))
     }
 }
 
@@ -729,25 +786,71 @@ fn denied_role_name(roles: &BTreeSet<String>) -> String {
     role
 }
 
-fn compose_role_schema(children: &[ChildPlanner<'_>], role: &str) -> Result<[Json; 2], PlanError> {
-    let compose = |backend_request| {
+/// Whether the two `backend_request` variants of a rendered schema can differ.
+///
+/// That flag changes exactly one thing in a rendered schema: whether a
+/// `backend_only` insert permission is visible. With no such permission
+/// anywhere in the metadata, both variants are the same document, so only one
+/// is rendered and both indices share it.
+fn backend_variants_can_differ(metadata: &Metadata) -> bool {
+    metadata.sources.iter().any(|source| {
+        source.tables.iter().any(|table| {
+            table
+                .insert_permissions
+                .iter()
+                .any(|entry| entry.permission.backend_only)
+        })
+    })
+}
+
+fn compose_role_schema(
+    children: &[ChildPlanner<'_>],
+    role: &str,
+    backend_variants_differ: bool,
+) -> Result<SchemaVariants, PlanError> {
+    let compose = |backend_request| -> Result<Arc<[u8]>, PlanError> {
         let session = Session {
             role: role.to_string(),
             vars: HashMap::new(),
             backend_request,
         };
-        compose_schema(children.iter().map(|child| &child.planner), &session, None)
+        let schema = compose_schema(children.iter().map(|child| &child.planner), &session, None)?;
+        serialize_schema(&schema)
     };
-    Ok([compose(false)?, compose(true)?])
+    let standard = compose(false)?;
+    let backend = if backend_variants_differ {
+        compose(true)?
+    } else {
+        Arc::clone(&standard)
+    };
+    Ok([standard, backend])
+}
+
+/// Freeze a rendered schema into the form the snapshot retains.
+fn serialize_schema(schema: &Json) -> Result<Arc<[u8]>, PlanError> {
+    let bytes = serde_json::to_vec(schema).map_err(|error| {
+        PlanError::new(
+            "$",
+            "unexpected",
+            format!("rendered schema could not be serialized: {error}"),
+        )
+    })?;
+    Ok(Arc::from(bytes.into_boxed_slice()))
 }
 
 fn compose_role_schemas(
     children: &[ChildPlanner<'_>],
     roles: &BTreeSet<String>,
-) -> Result<HashMap<String, [Json; 2]>, PlanError> {
+    backend_variants_differ: bool,
+) -> Result<HashMap<String, SchemaVariants>, PlanError> {
     roles
         .iter()
-        .map(|role| Ok((role.clone(), compose_role_schema(children, role)?)))
+        .map(|role| {
+            Ok((
+                role.clone(),
+                compose_role_schema(children, role, backend_variants_differ)?,
+            ))
+        })
         .collect()
 }
 
@@ -759,32 +862,106 @@ fn role_mutation_owners(
     children: &[ChildPlanner<'_>],
     standard_owners: &RootOwners,
     role: &str,
-) -> Result<[RootOwners; 2], PlanError> {
-    let owners_for = |backend_request| {
-        let session = Session {
-            role: role.to_string(),
-            vars: HashMap::new(),
-            backend_request,
-        };
-        let mut owners = standard_owners.clone();
-        for child in children {
-            for command in child.planner.command_definitions() {
-                if child
-                    .planner
-                    .command_is_permitted(command.definition(), &session)
-                {
-                    register_owner(
-                        &mut owners,
-                        &command.definition().name,
-                        &child.source,
-                        "mutation",
-                    )?;
-                }
+) -> Result<RootOwners, PlanError> {
+    let session = Session {
+        role: role.to_string(),
+        vars: HashMap::new(),
+        backend_request: false,
+    };
+    let mut owners = standard_owners.clone();
+    for child in children {
+        for command in child.planner.command_definitions() {
+            if child
+                .planner
+                .command_is_permitted(command.definition(), &session)
+            {
+                register_owner(
+                    &mut owners,
+                    &command.definition().name,
+                    &child.source,
+                    "mutation",
+                )?;
             }
         }
-        Ok(owners)
-    };
-    Ok([owners_for(false)?, owners_for(true)?])
+    }
+    Ok(owners)
+}
+
+/// What a merged selection set needs to know about the schema, and nothing
+/// more.
+///
+/// GraphQL's field-merging rules ask three questions about a type named in a
+/// fragment condition: is it an object, an interface or a union; which
+/// concrete types can it be; and what does one of its fields return. Answering
+/// them used to mean retaining a rendered `__schema` document covering every
+/// tracked table with every column — descriptions, arguments, input objects
+/// and enums included, none of which merging ever reads. This keeps the three
+/// answers and drops the document.
+///
+/// Types that cannot appear as a fragment condition (scalars, enums, input
+/// objects) are left out: the merging rules already treat an unknown name
+/// permissively, which is exactly how they treated those names before.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseShapeIndex {
+    types: HashMap<String, ShapeEntry>,
+}
+
+#[derive(Debug)]
+struct ShapeEntry {
+    /// `possibleTypes` for an interface or union; the type itself for an
+    /// object. Empty means "not a type condition we can reason about".
+    possible_types: HashSet<String>,
+    /// Field name to the type reference it returns — a small
+    /// `{kind, name, ofType}` chain, the only part of a field that merging
+    /// compares.
+    field_types: HashMap<String, Json>,
+}
+
+impl ResponseShapeIndex {
+    fn from_schema(schema: &Json) -> Self {
+        let mut types = HashMap::new();
+        for ty in schema["types"].as_array().into_iter().flatten() {
+            let Some(name) = ty["name"].as_str() else {
+                continue;
+            };
+            let possible_types = match ty["kind"].as_str() {
+                Some("OBJECT") => HashSet::from([name.to_string()]),
+                Some("INTERFACE") | Some("UNION") => ty["possibleTypes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|possible| possible["name"].as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            let field_types = ty["fields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|field| {
+                    let name = field["name"].as_str()?;
+                    Some((name.to_string(), field["type"].clone()))
+                })
+                .collect();
+            types.insert(
+                name.to_string(),
+                ShapeEntry {
+                    possible_types,
+                    field_types,
+                },
+            );
+        }
+        Self { types }
+    }
+
+    fn field_type(&self, type_name: &str, field_name: &str) -> Option<&Json> {
+        self.types.get(type_name)?.field_types.get(field_name)
+    }
+
+    fn possible_types(&self, type_name: &str) -> Option<&HashSet<String>> {
+        let entry = self.types.get(type_name)?;
+        (!entry.possible_types.is_empty()).then_some(&entry.possible_types)
+    }
 }
 
 /// Composite equivalent of [`crate::execute_introspection`].
@@ -907,8 +1084,11 @@ fn compose_schema<'planner, 'data>(
 where
     'data: 'planner,
 {
-    let mut types = vec![];
-    let mut by_name = HashMap::<String, Json>::new();
+    let mut types: Vec<Json> = vec![];
+    // Where each already-composed type landed in `types`, so a type seen
+    // again in another source is compared against the one kept rather than
+    // against a second copy of it.
+    let mut by_name = HashMap::<String, usize>::new();
     let mut query_fields = vec![];
     let mut subscription_fields = vec![];
     let mut mutation_fields = vec![];
@@ -918,38 +1098,57 @@ where
     let mut base_schema = template.cloned();
 
     for planner in planners {
-        let schema = build_schema_json(planner, session);
+        // The rendered types are moved into the composition, never copied:
+        // a schema of this size is the largest thing built at boot, and a
+        // deep copy of it would be paid for in resident memory that the
+        // allocator does not hand back.
+        let mut schema = build_schema_json(planner, session);
+        let rendered_types = match schema["types"].take() {
+            Json::Array(rendered) => rendered,
+            _ => Vec::new(),
+        };
         if base_schema.is_none() {
-            base_schema = Some(schema.clone());
+            // Only the scaffolding is kept; `types` is replaced below.
+            base_schema = Some(schema);
         }
-        for ty in schema["types"].as_array().into_iter().flatten() {
-            let Some(name) = ty["name"].as_str() else {
+        for mut ty in rendered_types {
+            let Some(name) = ty["name"].as_str().map(str::to_string) else {
                 continue;
             };
-            match name {
+            match name.as_str() {
                 "query_root" => {
-                    append_root_fields(&mut query_fields, &mut query_names, ty, "query")?
+                    append_root_fields(&mut query_fields, &mut query_names, &mut ty, "query")?
                 }
                 "subscription_root" => append_root_fields(
                     &mut subscription_fields,
                     &mut subscription_names,
-                    ty,
+                    &mut ty,
                     "subscription",
                 )?,
-                "mutation_root" => {
-                    append_root_fields(&mut mutation_fields, &mut mutation_names, ty, "mutation")?
-                }
+                "mutation_root" => append_root_fields(
+                    &mut mutation_fields,
+                    &mut mutation_names,
+                    &mut ty,
+                    "mutation",
+                )?,
                 _ => {
-                    if let Some(existing) = by_name.get(name) {
-                        if existing != ty {
+                    if let Some(existing) = by_name.get(&name) {
+                        // A filter input's shape follows what the backend can
+                        // honour, and one composed schema has one type per
+                        // name. Offering the union would advertise `_regex` on
+                        // a source that has no regex; the intersection offers
+                        // exactly what every source behind the name can do.
+                        if name.ends_with("_comparison_exp") {
+                            intersect_input_fields(&mut types[*existing], &ty);
+                        } else if types[*existing] != ty {
                             return Err(PlanError::validation(
                                 "$",
                                 format!("incompatible type collision for '{name}'"),
                             ));
                         }
                     } else {
-                        by_name.insert(name.to_string(), ty.clone());
-                        types.push(ty.clone());
+                        by_name.insert(name, types.len());
+                        types.push(ty);
                     }
                 }
             }
@@ -1042,7 +1241,7 @@ fn collect_fields(
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
     path: &str,
-    schema: &Json,
+    shapes: &ResponseShapeIndex,
     relay_id_types: &HashSet<String>,
 ) -> Result<Vec<CollectedField>, PlanError> {
     let mut fields: Vec<CollectedField> = vec![];
@@ -1093,7 +1292,7 @@ fn collect_fields(
             fragments,
             vars,
             &nested_path,
-            schema,
+            shapes,
             relay_id_types,
         )?;
     }
@@ -1124,7 +1323,7 @@ fn validate_selection_conflicts(
     fragments: &Fragments,
     vars: &JsonMap<String, Json>,
     path: &str,
-    schema: &Json,
+    shapes: &ResponseShapeIndex,
     relay_id_types: &HashSet<String>,
 ) -> Result<(), PlanError> {
     let mut fields = vec![];
@@ -1179,13 +1378,13 @@ fn validate_selection_conflicts(
                     .alias
                     .as_deref()
                     .unwrap_or(right.field.name.as_str());
-                if !scoped_response_shapes_match(left, right, schema, relay_id_types) {
+                if !scoped_response_shapes_match(left, right, shapes, relay_id_types) {
                     return Err(PlanError::validation(
                         &format!("{path}.{}", right.field.name),
                         format!("fields with response key '{right_key}' conflict"),
                     ));
                 }
-                if !scopes_overlap(&left.conditions, &right.conditions, schema) {
+                if !scopes_overlap(&left.conditions, &right.conditions, shapes) {
                     continue;
                 }
                 if left.field.name != right.field.name
@@ -1240,7 +1439,7 @@ fn validate_selection_conflicts(
             fragments,
             vars,
             &nested_path,
-            schema,
+            shapes,
             relay_id_types,
         )?;
     }
@@ -1274,7 +1473,7 @@ fn scoped_field_conflict_identity(field: &ScopedField) -> String {
 fn scoped_response_shapes_match(
     left: &ScopedField,
     right: &ScopedField,
-    schema: &Json,
+    shapes: &ResponseShapeIndex,
     relay_id_types: &HashSet<String>,
 ) -> bool {
     let relay_id = |field: &ScopedField| {
@@ -1287,16 +1486,11 @@ fn scoped_response_shapes_match(
                     .any(|condition| relay_id_types.contains(condition)))
     };
     let field_type = |field: &ScopedField| {
-        field.conditions.iter().rev().find_map(|condition| {
-            schema["types"]
-                .as_array()?
-                .iter()
-                .find(|ty| ty["name"].as_str() == Some(condition.as_str()))?["fields"]
-                .as_array()?
-                .iter()
-                .find(|candidate| candidate["name"] == field.field.name)
-                .map(|candidate| &candidate["type"])
-        })
+        field
+            .conditions
+            .iter()
+            .rev()
+            .find_map(|condition| shapes.field_type(condition, &field.field.name))
     };
     match (relay_id(left), relay_id(right)) {
         (true, true) => return true,
@@ -1442,37 +1636,20 @@ fn directives_include(
     Ok(true)
 }
 
-fn scopes_overlap(left: &[String], right: &[String], schema: &Json) -> bool {
+fn scopes_overlap(left: &[String], right: &[String], shapes: &ResponseShapeIndex) -> bool {
     left.iter().all(|left| {
         right
             .iter()
-            .all(|right| type_conditions_overlap(left, right, schema))
+            .all(|right| type_conditions_overlap(left, right, shapes))
     })
 }
 
-fn type_conditions_overlap(left: &str, right: &str, schema: &Json) -> bool {
+fn type_conditions_overlap(left: &str, right: &str, shapes: &ResponseShapeIndex) -> bool {
     if left == right {
         return true;
     }
-    let possible_types = |name: &str| -> Option<HashSet<String>> {
-        let ty = schema["types"]
-            .as_array()?
-            .iter()
-            .find(|ty| ty["name"] == name)?;
-        match ty["kind"].as_str()? {
-            "OBJECT" => Some(HashSet::from([name.to_string()])),
-            "INTERFACE" | "UNION" => Some(
-                ty["possibleTypes"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(|possible| possible["name"].as_str().map(str::to_string))
-                    .collect(),
-            ),
-            _ => None,
-        }
-    };
-    match (possible_types(left), possible_types(right)) {
-        (Some(left), Some(right)) => !left.is_disjoint(&right),
+    match (shapes.possible_types(left), shapes.possible_types(right)) {
+        (Some(left), Some(right)) => !left.is_disjoint(right),
         _ => true,
     }
 }
@@ -1553,23 +1730,29 @@ fn operation_selection_set<'a>(
     }
 }
 
+/// Move one source's root fields into the composed root, refusing a name that
+/// two sources both claim. The fields are taken out of `ty` rather than copied.
 fn append_root_fields(
     output: &mut Vec<Json>,
     names: &mut HashSet<String>,
-    ty: &Json,
+    ty: &mut Json,
     root_kind: &str,
 ) -> Result<(), PlanError> {
-    for field in ty["fields"].as_array().into_iter().flatten() {
-        let Some(name) = field["name"].as_str() else {
+    let fields = match ty["fields"].take() {
+        Json::Array(fields) => fields,
+        _ => Vec::new(),
+    };
+    for field in fields {
+        let Some(name) = field["name"].as_str().map(str::to_string) else {
             continue;
         };
-        if !names.insert(name.to_string()) {
+        if !names.insert(name.clone()) {
             return Err(PlanError::validation(
                 "$",
                 format!("incompatible {root_kind} root collision for '{name}'"),
             ));
         }
-        output.push(field.clone());
+        output.push(field);
     }
     Ok(())
 }
@@ -1586,6 +1769,29 @@ fn root_type(name: &str, fields: Vec<Json>) -> Json {
         "enumValues": null,
         "possibleTypes": null,
     })
+}
+
+/// Keep only the input fields both renderings of a filter type offer.
+///
+/// Two sources render the same `<scalar>_comparison_exp` differently exactly
+/// when their backends differ in what they can filter by. A composed schema
+/// publishes one type, so it publishes the operators every source behind it
+/// can honour — never one that would fail on half the tables that use it.
+fn intersect_input_fields(kept: &mut Json, incoming: &Json) {
+    let Some(offered) = incoming["inputFields"].as_array() else {
+        return;
+    };
+    let names: std::collections::BTreeSet<&str> = offered
+        .iter()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    if let Some(existing) = kept["inputFields"].as_array_mut() {
+        existing.retain(|field| {
+            field["name"]
+                .as_str()
+                .is_some_and(|name| names.contains(name))
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1614,7 +1820,7 @@ mod performance_tests {
             &HashMap::new(),
             &JsonMap::new(),
             "$.selectionSet",
-            &serde_json::json!({}),
+            &ResponseShapeIndex::default(),
             &HashSet::new(),
         )
         .expect("unique response keys do not conflict");
@@ -1641,7 +1847,7 @@ mod performance_tests {
             &fragments,
             &JsonMap::new(),
             "$.selectionSet",
-            &serde_json::json!({}),
+            &ResponseShapeIndex::default(),
             &HashSet::new(),
         )
         .expect("identical fragment fields do not conflict");
@@ -1670,7 +1876,7 @@ mod performance_tests {
             &fragments,
             &JsonMap::new(),
             "$.selectionSet",
-            &serde_json::json!({}),
+            &ResponseShapeIndex::default(),
             &HashSet::new(),
         )
         .expect("unique nested aliases do not conflict");

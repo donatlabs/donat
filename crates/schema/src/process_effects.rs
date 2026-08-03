@@ -6,6 +6,7 @@
 //! them to pin raw effects to immutable Process revisions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use donat_ir::{ProcessStartPolicy, TypeRef, ValueContractCatalog};
 use donat_metadata::{CommandIdempotencyKey, CommandValue};
@@ -123,6 +124,6 @@ impl FinalizedSourceCommandCatalog {
 
 #[derive(Debug, Clone)]
 pub struct FinalizedCompiledCommand {
-    pub command: CompiledCommand,
+    pub command: Arc<CompiledCommand>,
     pub effects: Vec<FinalizedCommandEffect>,
 }

@@ -64,22 +64,30 @@ command_select_permissions:
         - currency
         - provider_reference
       filter: {}
-insert_permissions:
+# A payment is money, so a shopper reaches it only through their own commands
+# — `begin_checkout` opens one, `cancel_order` and
+# `request_authorized_order_cancellation` ask for it to be stopped. There is no
+# ordinary insert or update for the role at all: what a provider answered is
+# the store's to record, and a caller who could write `captured` or
+# `amount_minor` would have set their own price.
+command_insert_permissions:
   - role: customer
     permission:
-      columns: "*"
+      columns:
+        - order_id
+        - status
+        - amount_minor
+        - currency
+        - authorization_activity_key
       check:
         order:
           customer_id:
             _eq: X-Donat-User-Id
-  - role: subscription_worker
-    permission:
-      columns: "*"
-      check: {}
-update_permissions:
+command_update_permissions:
   - role: customer
     permission:
-      columns: "*"
+      columns:
+        - status
       filter:
         order:
           customer_id:
@@ -88,6 +96,12 @@ update_permissions:
         order:
           customer_id:
             _eq: X-Donat-User-Id
+insert_permissions:
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
   - role: support
     permission:
       columns: "*"

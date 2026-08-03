@@ -45,10 +45,10 @@ pub(crate) fn evaluate_process_value(
     match value {
         ProcessValue::Input {
             input,
+            as_,
             require_non_null,
-            ..
         } => require_value(
-            object_field(context.input, input, "input")?,
+            refine_scalar(object_field(context.input, input, "input")?, as_.as_deref()),
             *require_non_null,
             "input",
             input,
@@ -57,8 +57,8 @@ pub(crate) fn evaluate_process_value(
             state,
             field,
             project,
+            as_,
             require_non_null,
-            ..
         } => {
             let state_value = object_field(context.state, state, "state journal")?;
             let value = object_field(&state_value, field, "state output")?;
@@ -67,13 +67,21 @@ pub(crate) fn evaluate_process_value(
             } else {
                 value
             };
-            require_value(value, *require_non_null, "state output", field)
+            require_value(
+                refine_scalar(value, as_.as_deref()),
+                *require_non_null,
+                "state output",
+                field,
+            )
         }
-        ProcessValue::Item { item, .. } => {
+        ProcessValue::Item { item, as_ } => {
             let item_value = context
                 .item
                 .ok_or_else(|| anyhow!("item binding is outside bounded for_each"))?;
-            object_field(item_value, item, "for_each item")
+            Ok(refine_scalar(
+                object_field(item_value, item, "for_each item")?,
+                as_.as_deref(),
+            ))
         }
         ProcessValue::Literal { literal } => Ok(literal.clone()),
         ProcessValue::ActivityKey { activity_key, as_ } => Ok(activity_key_value(
@@ -171,6 +179,20 @@ fn project_list(value: &Json, fields: &[String]) -> anyhow::Result<Json> {
         .map(Json::Array)
 }
 
+/// Apply a declared `as:` refinement to an evaluated value.
+///
+/// The compiler types a binding on the strength of this declaration, so
+/// evaluation has to honour it: `as: string` renders a scalar in its canonical
+/// text form, and a nominal refinement (`as: <enum>`) keeps the string it
+/// already validated. Null is left alone — a cast never invents a value.
+fn refine_scalar(value: Json, as_: Option<&str>) -> Json {
+    match (as_, value) {
+        (Some("string"), Json::Number(number)) => Json::String(number.to_string()),
+        (Some("string"), Json::Bool(flag)) => Json::String(flag.to_string()),
+        (_, value) => value,
+    }
+}
+
 fn activity_key_value(
     context: &ProcessValueContext<'_>,
     state: &str,
@@ -259,4 +281,83 @@ fn evaluate_bounded_flatten(
         }
     }
     Ok(Json::Array(output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn context<'a>(state: &'a Json, input: &'a Json, time: &'a Json) -> ProcessValueContext<'a> {
+        ProcessValueContext {
+            source_name: "default",
+            instance_id: Uuid::nil(),
+            input,
+            state,
+            caller_session: None,
+            workflow_time: time,
+            item: None,
+            item_key: None,
+        }
+    }
+
+    /// `as: string` is what a flow declares when it hands an identifier to a
+    /// provider that names resources by string. The compiler types the binding
+    /// as a string on the strength of that declaration, so evaluation has to
+    /// produce one — a number reaching the connector would be refused as
+    /// breaking the very contract the cast was written to satisfy.
+    #[test]
+    fn a_declared_string_cast_renders_the_value_as_a_string() {
+        let state = json!({ "inspection": { "refund_id": 1, "amount": 12.5, "open": true } });
+        let input = json!({ "sequence": 42 });
+        let time = json!("2030-01-01T00:00:00Z");
+        let context = context(&state, &input, &time);
+
+        let cast = |field: &str| {
+            evaluate_process_value(
+                &serde_json::from_value(json!({
+                    "state": "inspection", "field": field, "as": "string"
+                }))
+                .expect("a state value with a scalar cast"),
+                &context,
+            )
+            .expect("the cast is deterministic")
+        };
+
+        assert_eq!(cast("refund_id"), json!("1"));
+        assert_eq!(cast("amount"), json!("12.5"));
+        assert_eq!(cast("open"), json!("true"));
+        assert_eq!(
+            evaluate_process_value(
+                &serde_json::from_value(json!({ "input": "sequence", "as": "string" }))
+                    .expect("an input value with a scalar cast"),
+                &context,
+            )
+            .expect("the cast is deterministic"),
+            json!("42"),
+            "an input identifier casts exactly like a state one"
+        );
+    }
+
+    /// A cast never invents a value: an absent optional stays absent rather
+    /// than becoming the string "null", which a provider would file as a real
+    /// resource id.
+    #[test]
+    fn a_string_cast_leaves_a_null_alone() {
+        let state = json!({ "inspection": { "refund_id": null } });
+        let input = json!({});
+        let time = json!("2030-01-01T00:00:00Z");
+        let context = context(&state, &input, &time);
+
+        let value = evaluate_process_value(
+            &serde_json::from_value(json!({
+                "state": "inspection", "field": "refund_id", "as": "string"
+            }))
+            .expect("a state value with a scalar cast"),
+            &context,
+        )
+        .expect("a null optional is a value, not a failure");
+
+        assert_eq!(value, Json::Null);
+    }
 }

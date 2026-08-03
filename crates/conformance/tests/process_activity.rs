@@ -439,3 +439,158 @@ fn retried_activity_reuses_one_provider_idempotency_key_and_commits_once() {
         "the durable job records both attempts"
     );
 }
+
+/// The same deployment declared the way the catalog fields intend it: the
+/// idempotency header comes from the operation's `effect`, and the retryable
+/// statuses from its `error_map`. The legacy `idempotency` and
+/// `error_classification` fields are absent, exactly as in a metadata
+/// directory written against the current contract.
+fn catalog_declared_metadata() -> Metadata {
+    let mut document =
+        serde_json::to_value(activity_metadata()).expect("activity metadata serializes");
+    let operation = document["connectors"][0]["operations"][0]
+        .as_object_mut()
+        .expect("the connector declares one operation");
+    operation.remove("idempotency");
+    operation.remove("error_classification");
+    serde_json::from_value(document).expect("catalog-declared metadata parses")
+}
+
+fn start_catalog_declared_suite(stub: &ProviderStub, name: &str) -> donat_conformance::Running {
+    Suite::new(name)
+        .initial_metadata(catalog_declared_metadata())
+        .with_migrations()
+        .env("DONAT_PROVIDER_STUB_BASE_URL", stub.base_url())
+        .env("DONAT_PROVIDER_STUB_TOKEN", PROVIDER_TOKEN)
+        .start()
+}
+
+/// A provider-idempotent step binds its header from `effect`, not from the
+/// legacy field. Without the header the provider cannot deduplicate a replay,
+/// which is the entire reason the effect is declared.
+#[test]
+fn a_catalog_declared_idempotent_step_sends_its_fixed_header() {
+    let stub = provider_stub::spawn();
+    stub.set_default(AUTHORIZE_PATH, authorized_response());
+    let suite = start_catalog_declared_suite(&stub, "process_activity_catalog_idempotency");
+
+    let (status, body) = enqueue_authorization(&suite);
+    assert_eq!(status, 200, "command mutation status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the source database");
+    await_terminal(&mut client);
+
+    let calls = stub.calls_for(AUTHORIZE_PATH);
+    assert_eq!(calls.len(), 1, "one authorization");
+    assert!(
+        calls[0].header("idempotency-key").is_some(),
+        "the effect's fixed binding puts the stable key on the wire: {:?}",
+        calls[0].headers
+    );
+}
+
+/// `error_map` is what the operation says about provider failures. A status it
+/// maps to `http_5xx` has to reach the retry policy as one.
+#[test]
+fn a_catalog_declared_retryable_status_is_retried() {
+    let stub = provider_stub::spawn();
+    stub.script(
+        AUTHORIZE_PATH,
+        vec![ScriptedResponse::status(500), authorized_response()],
+    );
+    stub.set_default(AUTHORIZE_PATH, authorized_response());
+    let suite = start_catalog_declared_suite(&stub, "process_activity_catalog_retry");
+
+    let (status, body) = enqueue_authorization(&suite);
+    assert_eq!(status, 200, "command mutation status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the source database");
+    let output = await_terminal(&mut client);
+    assert_eq!(
+        output.pointer("/status"),
+        Some(&json!("authorized")),
+        "the declared retry carries the Process through a mapped 5xx"
+    );
+
+    let calls = stub.calls_for(AUTHORIZE_PATH);
+    assert_eq!(
+        calls.len(),
+        2,
+        "the mapped 500 is retried once, not treated as permanent"
+    );
+}
+
+/// A provider that names resources by string is handed a numeric identifier
+/// through the declared cast `as: string`. The compiler types the binding as a
+/// string on the strength of that declaration, so the value on the wire has to
+/// be one — a number would be refused as breaking the operation's own input
+/// contract, and the activity could never run.
+fn scalar_cast_metadata() -> Metadata {
+    let mut document =
+        serde_json::to_value(activity_metadata()).expect("activity metadata serializes");
+    let command = document["commands"][0]
+        .as_object_mut()
+        .expect("the fixture declares one command");
+    command["arguments"]
+        .as_array_mut()
+        .expect("command arguments")
+        .push(json!({ "name": "sequence", "type": "Int!" }));
+    command["effects"][0]["start_process"]["input"]["sequence"] = json!({ "arg": "sequence" });
+
+    let operation = document["connectors"][0]["operations"][0]
+        .as_object_mut()
+        .expect("the connector declares one operation");
+    operation["input_contract"]["reference"] = json!("string!");
+    operation["body"]["reference"] = json!({ "input": "reference" });
+
+    let process = document["processes"][0]
+        .as_object_mut()
+        .expect("the fixture declares one process");
+    process["input"]
+        .as_array_mut()
+        .expect("process input")
+        .push(json!({ "name": "sequence", "type": "Int!" }));
+    process["states"][0]["request"]["input"]["reference"] =
+        json!({ "input": "sequence", "as": "string" });
+
+    serde_json::from_value(document).expect("scalar-cast metadata parses")
+}
+
+#[test]
+fn a_declared_scalar_cast_reaches_the_provider_as_a_string() {
+    let stub = provider_stub::spawn();
+    stub.set_default(AUTHORIZE_PATH, authorized_response());
+    let suite = Suite::new("process_activity_scalar_cast")
+        .initial_metadata(scalar_cast_metadata())
+        .with_migrations()
+        .env("DONAT_PROVIDER_STUB_BASE_URL", stub.base_url())
+        .env("DONAT_PROVIDER_STUB_TOKEN", PROVIDER_TOKEN)
+        .start();
+
+    let (status, body) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": format!(
+                "mutation {{ enqueue_authorization(order_id: \"{ORDER_ID}\", \
+                 request_id: \"{REQUEST_ID}\", sequence: 7) {{ order_id }} }}"
+            )
+        }),
+        &[("X-Donat-Role".to_owned(), "customer".to_owned())],
+    );
+    assert_eq!(status, 200, "command mutation status: {body}");
+
+    let mut client =
+        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the source database");
+    await_terminal(&mut client);
+
+    let calls = stub.calls_for(AUTHORIZE_PATH);
+    assert_eq!(calls.len(), 1, "one authorization");
+    assert_eq!(
+        calls[0].body.pointer("/reference"),
+        Some(&json!("7")),
+        "the declared cast is what the provider receives: {}",
+        calls[0].body
+    );
+}

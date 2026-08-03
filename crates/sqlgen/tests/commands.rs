@@ -3509,3 +3509,134 @@ fn allocation_renderer_conserves_quantities_orders_outputs_and_replays_row_sets(
     assert_eq!(database_error.code().code(), "P0D01");
     assert!(database_error.message().contains("duplicate candidates"));
 }
+
+/// A command whose idempotency scope is a value only its first step can
+/// produce: the case being resolved is found by lookup, and the resolution key
+/// is unique per case rather than globally.
+fn step_scoped_idempotent_root(
+    command_name: &str,
+    table_name: &str,
+    id: &str,
+    key: &str,
+) -> MutationRoot {
+    root(CommandMutation {
+        identity: command_identity(command_name),
+        name: command_name.to_owned(),
+        steps: vec![
+            CommandExecutionStep::SelectOne {
+                name: "case".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table(table_name),
+                by: vec![assignment("id", "uuid", json!(id))],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                require_found: true,
+                filter: None,
+                error_path: "$.selectionSet.resolve_case".to_owned(),
+            },
+            CommandExecutionStep::Update {
+                name: "resolved".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table(table_name),
+                predicate: vec![CommandAssignment {
+                    column: column("id", "uuid"),
+                    value: CommandExecutionValue::StepColumn {
+                        cte: "_cmd_step_0".to_owned(),
+                        column: column("id", "uuid"),
+                    },
+                }],
+                set: vec![assignment("status", "text", json!("resolved"))],
+                returning: vec![column("id", "uuid"), column("status", "text")],
+                require_affected: true,
+                filter: None,
+                check: None,
+                error_path: "$.selectionSet.resolve_case".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "status".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_1".to_owned(),
+                column: column("status", "text"),
+            },
+        }],
+        idempotency: Some(CommandIdempotency {
+            key: Scalar::Json(json!(key)),
+            scope: vec![CommandExecutionValue::StepColumn {
+                cte: "_cmd_step_0".to_owned(),
+                column: column("id", "uuid"),
+            }],
+            input: Scalar::Json(json!({ "status": "resolved" })),
+            retention_seconds: Some(60),
+            error_path: "$.selectionSet.resolve_case".to_owned(),
+        }),
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "status".to_owned(),
+            field: "status".to_owned(),
+        }],
+    })
+}
+
+#[test]
+fn command_idempotency_scoped_by_a_step_result_executes_and_replays() {
+    let _catalog_lock = command_catalog_test_lock();
+    let table_name = format!("command_step_scope_{}", std::process::id());
+    let command_name = format!("sqlgen_step_scope_{}", std::process::id());
+    let first_case = "550e8400-e29b-41d4-a716-4466554400a1";
+    let second_case = "550e8400-e29b-41d4-a716-4466554400a2";
+    let mut client = postgres_client();
+    let mut tx = client
+        .transaction()
+        .expect("start an isolated command renderer transaction");
+    install_command_catalog(&mut tx);
+    tx.batch_execute(&format!(
+        "CREATE TABLE \"public\".\"{table_name}\" (id uuid PRIMARY KEY, status text NOT NULL); \
+         INSERT INTO \"public\".\"{table_name}\" (id, status) \
+         VALUES ('{first_case}', 'open'), ('{second_case}', 'open')"
+    ))
+    .expect("create the command target table");
+
+    let sql = step_scoped_idempotent_root(&command_name, &table_name, first_case, "request-1");
+    let sql = donat_sqlgen::mutation_to_sql(&sql);
+    let step = sql
+        .find("\"_cmd_step_0\" AS")
+        .expect("the scope's step is defined");
+    let claim = sql.find("\"_cmd_claim\" AS").expect("the claim is defined");
+    assert!(
+        step < claim,
+        "a claim keyed on a step result must be able to read that step: {sql}"
+    );
+
+    tx.execute(&sql, &[])
+        .expect("a command scoped by its own lookup executes");
+    let resolved: String = tx
+        .query_one(
+            &format!("SELECT status FROM \"public\".\"{table_name}\" WHERE id = '{first_case}'"),
+            &[],
+        )
+        .expect("the resolved case is readable")
+        .get(0);
+    assert_eq!(resolved, "resolved");
+
+    // The same key against another case is another operation: the scope is the
+    // case, so one resolution key does not close a second case by accident.
+    let other = donat_sqlgen::mutation_to_sql(&step_scoped_idempotent_root(
+        &command_name,
+        &table_name,
+        second_case,
+        "request-1",
+    ));
+    tx.execute(&other, &[])
+        .expect("the same key under another scope is a separate operation");
+    let claims: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM donat.command_invocation_claims WHERE command_name = $1",
+            &[&command_name],
+        )
+        .expect("count the claims")
+        .get(0);
+    assert_eq!(claims, 2, "the step value is what separates the two claims");
+
+    tx.rollback().expect("roll back step-scoped execution");
+}

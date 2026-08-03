@@ -52,6 +52,54 @@ pub trait Dialect {
 #[derive(Debug, Clone, Copy)]
 pub struct PostgresDialect;
 
+/// How many key/value pairs `json_build_object` can take: Postgres allows a
+/// function 100 arguments, and each pair spends two of them.
+const POSTGRES_JSON_OBJECT_PAIRS: usize = 50;
+
+impl PostgresDialect {
+    /// One JSON object of any width, in declaration order.
+    ///
+    /// `json_build_object` runs out of arguments at fifty pairs, which an
+    /// ordinary selection set reaches — a wide table, a dashboard query. Wider
+    /// than that the object is written out instead: its text concatenated in
+    /// query order, each value rendered by `to_json` so it keeps its type and
+    /// its nesting.
+    ///
+    /// Concatenation rather than an aggregate over a `VALUES` list, because a
+    /// row set is a query level of its own and an aggregate selection's values
+    /// (`count(*)`, `sum(...)`) belong to the level above it: Postgres refuses
+    /// them there. `||` stays where the values already are, has no argument
+    /// ceiling, and preserves order exactly — which `jsonb` merging would not.
+    ///
+    /// Only wide objects pay for this; everything narrower keeps the single
+    /// call, and the hot path with it.
+    fn wide_json_object(&self, pairs: &[(String, String)]) -> String {
+        let mut parts = vec![self.quote_literal("{")];
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                parts.push(self.quote_literal(","));
+            }
+            let key = serde_json::to_string(key).expect("a JSON object key always serializes");
+            parts.push(self.quote_literal(&format!("{key}:")));
+            // A NULL value would swallow the whole concatenation, so an absent
+            // value is spelled as the json null it stands for. A bare `NULL` —
+            // what a declared null literal renders to — has no type for
+            // `to_json` to work from at all, and is written out directly.
+            let rendered = if value.trim().eq_ignore_ascii_case("null") {
+                self.quote_literal("null")
+            } else {
+                format!(
+                    "coalesce(to_json({value})::text, {})",
+                    self.quote_literal("null")
+                )
+            };
+            parts.push(rendered);
+        }
+        parts.push(self.quote_literal("}"));
+        format!("({})::json", parts.join(" || "))
+    }
+}
+
 impl Dialect for PostgresDialect {
     fn quote_ident(&self, ident: &str) -> String {
         // Mirrors sqlgen::quote_ident: double-quote, doubling embedded `"`.
@@ -103,6 +151,9 @@ impl Dialect for PostgresDialect {
     fn json_object(&self, pairs: &[(String, String)]) -> String {
         // Mirrors sqlgen's inlined `json_build_object('k', v, …)`: each key is
         // rendered via quote_literal, then key/value alternate, joined by ", ".
+        if pairs.len() > POSTGRES_JSON_OBJECT_PAIRS {
+            return self.wide_json_object(pairs);
+        }
         let body: Vec<String> = pairs
             .iter()
             .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
@@ -168,6 +219,32 @@ impl PostgresDialect {
 #[derive(Debug, Clone, Copy)]
 pub struct SqliteDialect;
 
+/// Key/value pairs one `json_object`/`json_insert` call may carry on SQLite:
+/// `SQLITE_MAX_FUNCTION_ARG` is 127 by default, a pair spends two arguments,
+/// and `json_insert` spends one more on the object it adds to.
+const SQLITE_JSON_OBJECT_PAIRS: usize = 50;
+
+impl SqliteDialect {
+    /// A key as a JSON path SQLite will read as one member name.
+    fn json_path_literal(&self, key: &str) -> String {
+        self.quote_literal(&format!("$.\"{key}\""))
+    }
+
+    /// Whether every key can be named in a JSON path.
+    ///
+    /// SQLite has no escape for a double quote inside a quoted member name —
+    /// both `""` and `\"` are rejected as a bad path — so a key containing one
+    /// cannot be reached by `json_insert` at all. Nothing the engine renders
+    /// produces such a key (aliases and declared result fields are
+    /// identifier-shaped), and if one ever appears the object is built by the
+    /// single call instead, which takes keys as plain string literals. That
+    /// costs the argument ceiling back for that one object, and is the honest
+    /// trade against emitting a path SQLite will refuse at runtime.
+    fn keys_are_path_expressible(pairs: &[(String, String)]) -> bool {
+        pairs.iter().all(|(key, _)| !key.contains('"'))
+    }
+}
+
 impl Dialect for SqliteDialect {
     fn quote_ident(&self, ident: &str) -> String {
         // SQLite uses the same double-quoted identifier syntax as Postgres.
@@ -218,11 +295,33 @@ impl Dialect for SqliteDialect {
 
     fn json_object(&self, pairs: &[(String, String)]) -> String {
         // json1's json_object('k', v, …): keys quoted, values inlined.
-        let body: Vec<String> = pairs
+        let chunked = pairs.len() > SQLITE_JSON_OBJECT_PAIRS && Self::keys_are_path_expressible(pairs);
+        let split = if chunked {
+            pairs.len().min(SQLITE_JSON_OBJECT_PAIRS)
+        } else {
+            pairs.len()
+        };
+        let (head, rest) = pairs.split_at(split);
+        let body: Vec<String> = head
             .iter()
             .map(|(key, value)| format!("{}, {value}", self.quote_literal(key)))
             .collect();
-        format!("json_object({})", body.join(", "))
+        let mut sql = format!("json_object({})", body.join(", "));
+        // SQLite caps a function's arguments too (`SQLITE_MAX_FUNCTION_ARG`,
+        // 127 in a default build), and a pair spends two of them. The rest of
+        // the object is added by chained `json_insert`, each call staying under
+        // the same cap: keys land in the order they are inserted, and a value
+        // built by a json function keeps its JSON subtype rather than being
+        // quoted into a string — which a round trip through a row set would
+        // have lost.
+        for chunk in rest.chunks(SQLITE_JSON_OBJECT_PAIRS) {
+            let additions: Vec<String> = chunk
+                .iter()
+                .map(|(key, value)| format!("{}, {value}", self.json_path_literal(key)))
+                .collect();
+            sql = format!("json_insert({sql}, {})", additions.join(", "));
+        }
+        sql
     }
 
     fn json_array_agg(&self, row_expr: &str, order_by: Option<&str>) -> String {
@@ -877,12 +976,107 @@ mod tests {
         assert_eq!(d.json_object(&[]), "json_build_object()");
     }
 
+    /// `json_build_object` takes at most 100 arguments, so a selection set of
+    /// more than fifty fields cannot be built with one call. Fifty fields on
+    /// one object is an ordinary query — a wide table, a dashboard — and the
+    /// caller must get their data, not a database error about arity.
+    #[test]
+    fn json_object_builds_a_wide_object_without_a_function_argument_limit() {
+        let d = PostgresDialect;
+        let pairs: Vec<(String, String)> = (0..80)
+            .map(|i| (format!("f{i}"), format!("_t0.c{i}")))
+            .collect();
+
+        let sql = d.json_object(&pairs);
+
+        assert!(
+            !sql.starts_with("json_build_object("),
+            "a wide object must not be one over-long call: {sql}"
+        );
+        for (key, value) in pairs.iter() {
+            assert!(
+                sql.contains(&format!("'\"{key}\":' || coalesce(to_json({value})::text, 'null')")),
+                "the wide form must carry {key} with its value: {sql}"
+            );
+        }
+        // Order is the concatenation's own, so the first key precedes the last.
+        assert!(
+            sql.find("\"f0\"").unwrap() < sql.find("\"f79\"").unwrap(),
+            "a wide object is written in query order: {sql}"
+        );
+        // A declared null literal renders to a bare `NULL`, which has no type
+        // for `to_json` to work from: it is written out as the json null.
+        let with_null: Vec<(String, String)> = (0..60)
+            .map(|i| {
+                (
+                    format!("f{i}"),
+                    if i == 3 { "NULL".to_owned() } else { format!("_t0.c{i}") },
+                )
+            })
+            .collect();
+        let nulled = d.json_object(&with_null);
+        assert!(
+            nulled.contains("'\"f3\":' || 'null'"),
+            "an untyped NULL must be written out, never handed to to_json: {nulled}"
+        );
+        assert!(
+            !nulled.contains("to_json(NULL)"),
+            "to_json cannot type a bare NULL: {nulled}"
+        );
+
+        // An aggregate belongs to the query level the object is built in; a
+        // row set of its own would put it one level down, where Postgres
+        // refuses it.
+        let aggregated = d.json_object(
+            &(0..60)
+                .map(|i| (format!("a{i}"), "count(*)".to_owned()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !aggregated.contains("VALUES") && !aggregated.contains("SELECT"),
+            "a wide object must not open a query level of its own: {aggregated}"
+        );
+        // Narrow objects keep the call every existing snapshot was written
+        // against, and the hot path with it.
+        assert!(
+            d.json_object(&pairs[..50]).starts_with("json_build_object("),
+            "fifty pairs still fit one call"
+        );
+    }
+
     #[test]
     fn json_object_quotes_embedded_single_quotes_in_key() {
         let d = PostgresDialect;
         assert_eq!(
             d.json_object(&[("O'Hara".to_string(), "v".to_string())]),
             "json_build_object('O''Hara', v)"
+        );
+    }
+
+    /// SQLite cannot name a member containing a double quote in a JSON path,
+    /// so such an object is built by the single call rather than by a path
+    /// SQLite would refuse.
+    #[test]
+    fn sqlite_falls_back_when_a_key_cannot_be_named_in_a_path() {
+        let d = SqliteDialect;
+        let wide: Vec<(String, String)> = (0..80)
+            .map(|i| (format!("f{i}"), format!("_t0.c{i}")))
+            .collect();
+        assert!(
+            d.json_object(&wide).contains("json_insert("),
+            "an ordinary wide object is chunked"
+        );
+
+        let mut with_quote = wide.clone();
+        with_quote[60] = ("a\"b".to_owned(), "_t0.q".to_owned());
+        let sql = d.json_object(&with_quote);
+        assert!(
+            !sql.contains("json_insert("),
+            "a key with no path spelling must not be reached by json_insert: {sql}"
+        );
+        assert!(
+            sql.contains("'a\"b'"),
+            "the single call takes the key as a literal instead: {sql}"
         );
     }
 

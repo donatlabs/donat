@@ -74,7 +74,17 @@ result:
   subscription_id: { step: subscription, column: id }
   dunning_attempt: { step: dunning_attempt }
   renewal: { step: apply_outcome }
-  subscription: { step: reactivate_subscription }
+  # A conditional step yields nothing on the path it does not run — a decline
+  # reactivates no subscription — so it is projected as a bounded set rather
+  # than a required row, the way `record_shipment_result` treats its own
+  # conditional update. Declaring it required made every declined renewal fail
+  # its Process on a contract violation.
+  subscription:
+    step: reactivate_subscription
+    project:
+      subscription_id: id
+      status: status
+    maximum_items: 1
 idempotency:
   key: { argument: provider_event_id }
   scope:

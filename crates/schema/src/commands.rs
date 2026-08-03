@@ -68,19 +68,22 @@ impl CompiledCommandCatalog {
 /// Immutable commands for one Postgres source.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledSourceCommandCatalog {
-    commands: BTreeMap<String, CompiledCommand>,
+    /// Shared, never copied: the same compiled command is reachable from the
+    /// catalog, from its finalized form, and from the serving snapshot, and a
+    /// command carries its whole definition AST plus two contract catalogs.
+    commands: BTreeMap<String, Arc<CompiledCommand>>,
 }
 
 impl CompiledSourceCommandCatalog {
     /// Look up a command by its deployment-time name.
     pub fn command(&self, name: &str) -> Option<&CompiledCommand> {
-        self.commands.get(name)
+        self.commands.get(name).map(Arc::as_ref)
     }
 
     /// Iteration is intentionally source-local and deterministic. Request
     /// planning consumes this immutable snapshot; it never reads YAML.
     pub(crate) fn commands(&self) -> impl Iterator<Item = &CompiledCommand> {
-        self.commands.values()
+        self.commands.values().map(Arc::as_ref)
     }
 }
 
@@ -765,7 +768,7 @@ pub fn finalize_command_effects(
             finalized_commands.insert(
                 command_name.clone(),
                 FinalizedCompiledCommand {
-                    command: command.clone(),
+                    command: Arc::clone(command),
                     effects,
                 },
             );
@@ -827,7 +830,7 @@ pub(crate) fn validate_and_extract_finalized_command_catalog(
                     "finalized command identity does not match its catalog key",
                 ));
             }
-            commands.insert(command_name.clone(), command.command.clone());
+            commands.insert(command_name.clone(), Arc::clone(&command.command));
         }
         sources.insert(
             source_name.clone(),
@@ -1621,7 +1624,7 @@ pub fn compile_command_source_catalog(
             ));
         }
         let compiled = compile_one_command(&context, source, catalog, command, index)?;
-        commands.insert(command.name.clone(), compiled);
+        commands.insert(command.name.clone(), Arc::new(compiled));
     }
     Ok(CompiledSourceCommandCatalog { commands })
 }
@@ -3265,7 +3268,7 @@ fn compile_command_catalog_with_diagnostics(
                 .get_mut(&source.name)
                 .expect("Postgres command source was initialized")
                 .commands
-                .insert(command.name.clone(), compiled);
+                .insert(command.name.clone(), Arc::new(compiled));
             validated.push(ValidatedCommand {
                 index,
                 source: &source.name,
@@ -3801,8 +3804,56 @@ fn validate_idempotency_step_scopes(
                 "idempotency step scope must reference one scalar field",
             ));
         }
+        // The claim is elected from the scope, so every step up to and
+        // including the one it reads runs before the claim exists — and would
+        // run again on a replay. Only a lookup may sit there.
+        let position = command
+            .steps
+            .iter()
+            .position(|declared| declared.name == *step)
+            .ok_or_else(|| {
+                PlanError::validation(path, format!("unknown idempotency scope step '{step}'"))
+            })?;
+        if let Some(writing) = command.steps[..=position]
+            .iter()
+            .find(|declared| command_step_writes(&declared.operation))
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "idempotency scope step '{step}' cannot be read before the command writes: \
+                     step '{}' writes first",
+                    writing.name
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Whether a step changes data. A command's idempotency scope may only read
+/// values produced before anything is written.
+fn command_step_writes(operation: &CommandStepOperation) -> bool {
+    match operation {
+        CommandStepOperation::SelectOne { .. }
+        | CommandStepOperation::SelectMany { .. }
+        | CommandStepOperation::Aggregate { .. }
+        | CommandStepOperation::Assert { .. }
+        | CommandStepOperation::AssertWhen { .. }
+        | CommandStepOperation::Decision { .. }
+        | CommandStepOperation::DecisionMany { .. }
+        | CommandStepOperation::Project { .. }
+        | CommandStepOperation::ProjectMany { .. }
+        | CommandStepOperation::FixedRows { .. } => false,
+        CommandStepOperation::Insert { .. }
+        | CommandStepOperation::InsertMany { .. }
+        | CommandStepOperation::InsertWhen { .. }
+        | CommandStepOperation::Update { .. }
+        | CommandStepOperation::UpdateMany { .. }
+        | CommandStepOperation::UpdateWhen { .. }
+        | CommandStepOperation::Delete { .. }
+        | CommandStepOperation::AllocateMany { .. } => true,
+    }
 }
 
 fn validate_step(

@@ -83,7 +83,7 @@ states:
         return_id: { state: request_return, field: return_id }
       deadline: 14d
       next: route_support_decision
-      on_timeout: approval_timed_out
+      on_timeout: expire_unanswered_return
 
   - id: route_support_decision
     when:
@@ -132,7 +132,7 @@ states:
         return_id: { state: request_return, field: return_id }
       deadline: 30d
       next: await_inspection
-      on_timeout: return_not_received
+      on_timeout: expire_unreceived_return
 
   - id: await_inspection
     wait:
@@ -144,7 +144,7 @@ states:
         return_id: { state: request_return, field: return_id }
       deadline: 7d
       next: route_disposition
-      on_timeout: inspection_overdue
+      on_timeout: expire_uninspected_return
 
   - id: route_disposition
     when:
@@ -375,25 +375,96 @@ states:
         refund_amount_minor: { literal: null }
         exchange_id: { literal: null }
 
+  # A deadline nobody answered is itself an answer. Ending the Process without
+  # writing it would leave the shopper's request reading as still under
+  # consideration, with no Process left to decide it.
+  - id: expire_unanswered_return
+    command:
+      name: expire_return
+      run_as: support
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        decision_id: { activity_key: expire_unanswered_return, as: uuid }
+        reason: { literal: support did not decide the return before its deadline }
+      next: approval_timed_out
+
   - id: approval_timed_out
-    fail:
-      code: return_approval_timed_out
-      message: Support did not decide the return request before its deadline
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { state: expire_unanswered_return, field: status, as: ReturnState }
+        approved_quantity: { literal: 0 }
+        received_quantity: { literal: 0 }
+        inspected_quantity: { literal: 0 }
+        label_url: { literal: null }
+        tracking_number: { literal: null }
+        public_reason_code: { literal: return_approval_timed_out }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { literal: null }
 
   - id: return_label_requires_reconciliation
     fail:
       code: return_label_requires_reconciliation
       message: The return-label outcome is ambiguous and must be reconciled before retrying
 
+  # A deadline that passes with nothing having happened is still an answer, and
+  # it has to be written down. A Process that ended without touching the domain
+  # would leave the request reading `approved` or `received` for ever, with no
+  # Process left to decide it and a later inspection signalling into nothing.
+  - id: expire_unreceived_return
+    command:
+      name: expire_return
+      run_as: support
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        decision_id: { activity_key: expire_unreceived_return, as: uuid }
+        reason: { literal: the approved return did not arrive before its deadline }
+      next: return_not_received
+
   - id: return_not_received
-    fail:
-      code: return_not_received
-      message: The approved return was not received before its deadline
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { state: expire_unreceived_return, field: status, as: ReturnState }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { literal: 0 }
+        inspected_quantity: { literal: 0 }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { literal: return_not_received }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { literal: null }
+
+  # The goods are in the warehouse and nobody looked at them in time. Refusing
+  # keeps both the goods and the money, which is why the deadline is long — but
+  # it is the lesser of the two: the alternative left the request stuck in
+  # `received` with the refund unreachable and no record of why.
+  - id: expire_uninspected_return
+    command:
+      name: expire_return
+      run_as: support
+      arguments:
+        return_id: { state: request_return, field: return_id }
+        decision_id: { activity_key: expire_uninspected_return, as: uuid }
+        reason: { literal: the received return was not inspected before its deadline }
+      next: inspection_overdue
 
   - id: inspection_overdue
-    fail:
-      code: return_inspection_overdue
-      message: The received return was not inspected before its deadline
+    output:
+      values:
+        return_id: { state: request_return, field: return_id }
+        status: { state: expire_uninspected_return, field: status, as: ReturnState }
+        approved_quantity: { state: await_support_decision, field: approved_quantity }
+        received_quantity: { state: await_warehouse_receipt, field: received_quantity }
+        inspected_quantity: { literal: 0 }
+        label_url: { state: request_return_label, field: label_url }
+        tracking_number: { state: request_return_label, field: tracking_number }
+        public_reason_code: { literal: return_inspection_overdue }
+        refund_id: { literal: null }
+        refund_amount_minor: { literal: null }
+        exchange_id: { literal: null }
 
   - id: refund_requires_reconciliation
     fail:

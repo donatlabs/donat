@@ -11,6 +11,7 @@
 //! this later without touching the IR.
 
 use donat_ir::*;
+use std::collections::BTreeSet;
 
 /// Compile one operation: `SELECT json_build_object('field1', (...), ...)`.
 pub fn operation_to_sql(roots: &[RootField]) -> String {
@@ -1162,6 +1163,16 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
         &effect_policy_gate,
     ));
     let guard_gate = command_gate_exists(guard_cte);
+    // A claim scoped by a step result cannot be elected before that step has
+    // run, so the lookup prefix it depends on is emitted ahead of the
+    // invocation gate and runs on a replay too. Sound only while the prefix
+    // writes nothing — the schema compiler rejects anything else.
+    let scope_prefix = command_scope_prefix(command);
+    for step in &command.steps[..scope_prefix] {
+        if let Some(cte) = command_step_cte(ctx, step, &guard_gate) {
+            ctes.push(cte);
+        }
+    }
     let (execution_gate, invocation) = match &command.idempotency {
         Some(idempotency) => {
             let scope = command_canonical_json_array(ctx, &idempotency.scope);
@@ -1281,10 +1292,16 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
                     enabled = quote_ident("enabled"),
                 );
             }
-            let Some(cte) = command_step_cte(ctx, step, &current_step_gate) else {
+            if index >= scope_prefix {
+                let Some(cte) = command_step_cte(ctx, step, &current_step_gate) else {
+                    continue;
+                };
+                ctes.push(cte);
+            } else if command_step_cte_name(step).is_none() {
                 continue;
-            };
-            ctes.push(cte);
+            }
+            // A hoisted step keeps every gate it declares, in declaration
+            // order; only its relation was defined ahead of the claim.
             if let Some((required_cte, required_gate)) = command_required_step_gate_cte(
                 index,
                 step,
@@ -1593,6 +1610,105 @@ fn command_conditional_rule_gate_cte(
         path = quote_lit(&rule.error_path),
         message = quote_lit(&rule.message),
     )
+}
+
+/// The CTE a step defines, if it defines one.
+fn command_step_cte_name(step: &CommandExecutionStep) -> Option<&str> {
+    match step {
+        CommandExecutionStep::Assert { .. } | CommandExecutionStep::AssertWhen { .. } => None,
+        CommandExecutionStep::ArgumentRows { cte, .. }
+        | CommandExecutionStep::SelectOne { cte, .. }
+        | CommandExecutionStep::SelectMany { cte, .. }
+        | CommandExecutionStep::Aggregate { cte, .. }
+        | CommandExecutionStep::Project { cte, .. }
+        | CommandExecutionStep::ProjectMany { cte, .. }
+        | CommandExecutionStep::FixedRows { cte, .. }
+        | CommandExecutionStep::Decision { cte, .. }
+        | CommandExecutionStep::DecisionMany { cte, .. }
+        | CommandExecutionStep::Insert { cte, .. }
+        | CommandExecutionStep::InsertMany { cte, .. }
+        | CommandExecutionStep::InsertRows { cte, .. }
+        | CommandExecutionStep::InsertWhen { cte, .. }
+        | CommandExecutionStep::Update { cte, .. }
+        | CommandExecutionStep::UpdateWhen { cte, .. }
+        | CommandExecutionStep::UpdateMany { cte, .. }
+        | CommandExecutionStep::Delete { cte, .. }
+        | CommandExecutionStep::AllocateMany { cte, .. } => Some(cte),
+    }
+}
+
+/// Whether a step only reads: it may run before the claim is elected, because
+/// running it twice — once on the first execution, once on a replay — is not
+/// something a caller can observe.
+fn command_step_is_lookup(step: &CommandExecutionStep) -> bool {
+    match step {
+        CommandExecutionStep::ArgumentRows { .. }
+        | CommandExecutionStep::SelectOne { .. }
+        | CommandExecutionStep::SelectMany { .. }
+        | CommandExecutionStep::Aggregate { .. }
+        | CommandExecutionStep::Project { .. }
+        | CommandExecutionStep::ProjectMany { .. }
+        | CommandExecutionStep::FixedRows { .. }
+        | CommandExecutionStep::Decision { .. }
+        | CommandExecutionStep::DecisionMany { .. }
+        | CommandExecutionStep::Assert { .. }
+        | CommandExecutionStep::AssertWhen { .. } => true,
+        CommandExecutionStep::Insert { .. }
+        | CommandExecutionStep::InsertMany { .. }
+        | CommandExecutionStep::InsertRows { .. }
+        | CommandExecutionStep::InsertWhen { .. }
+        | CommandExecutionStep::Update { .. }
+        | CommandExecutionStep::UpdateWhen { .. }
+        | CommandExecutionStep::UpdateMany { .. }
+        | CommandExecutionStep::Delete { .. }
+        | CommandExecutionStep::AllocateMany { .. } => false,
+    }
+}
+
+/// How many leading steps must run before the invocation gate, because the
+/// idempotency scope reads one of them.
+///
+/// A step may only reference steps declared before it, so hoisting the prefix
+/// up to and including the last step the scope names carries every value that
+/// prefix needs. Zero unless the whole prefix is read-only: a claim that had
+/// to write before electing itself would write again on every replay.
+fn command_scope_prefix(command: &CommandMutation) -> usize {
+    let Some(idempotency) = &command.idempotency else {
+        return 0;
+    };
+    let referenced: BTreeSet<&str> = idempotency
+        .scope
+        .iter()
+        .filter_map(command_value_cte_name)
+        .collect();
+    if referenced.is_empty() {
+        return 0;
+    }
+    let Some(last) = command.steps.iter().rposition(|step| {
+        command_step_cte_name(step).is_some_and(|cte| referenced.contains(cte))
+    }) else {
+        return 0;
+    };
+    let prefix = last + 1;
+    if command.steps[..prefix].iter().all(command_step_is_lookup) {
+        prefix
+    } else {
+        0
+    }
+}
+
+/// The step CTE a value reads, if it reads one.
+fn command_value_cte_name(value: &CommandExecutionValue) -> Option<&str> {
+    match value {
+        CommandExecutionValue::StepColumn { cte, .. }
+        | CommandExecutionValue::StepRows { cte, .. }
+        | CommandExecutionValue::StepFieldRows { cte, .. } => Some(cte),
+        CommandExecutionValue::Scalar { .. }
+        | CommandExecutionValue::Item { .. }
+        | CommandExecutionValue::CurrentColumn { .. }
+        | CommandExecutionValue::Rule { .. }
+        | CommandExecutionValue::DatabaseTime { .. } => None,
+    }
 }
 
 fn command_step_condition(step: &CommandExecutionStep) -> Option<&CommandCondition> {

@@ -499,6 +499,10 @@ pub enum CompiledProcessWaitState {
 pub struct CompiledProcessSignalWait {
     pub signal: String,
     pub role: String,
+    /// The wait accepts a signal that was committed before it became
+    /// receptive. Without it, a caller whose Command was accepted can leave
+    /// the instance waiting forever for work that already happened.
+    pub persist_before_match: bool,
     pub correlate: BTreeMap<String, ProcessValue>,
     pub deadline: CompiledProcessSignalDeadline,
     pub next: String,
@@ -2746,6 +2750,7 @@ fn compile_signal_wait(
         CompiledProcessWaitState::Signal(CompiledProcessSignalWait {
             signal: wait.signal.clone(),
             role: wait.role.clone(),
+            persist_before_match: wait.persist_before_match,
             correlate: wait.correlate.clone(),
             deadline,
             next: wait.next.clone(),
