@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,16 +106,32 @@ func (s *service) reset() {
 	}
 }
 
-// gql posts one operation as `role` and returns the decoded response.
+// gql posts one operation as `role` and returns the decoded response, failing
+// the test if the request could not be made at all.
+//
+// It must only be called from the test goroutine: t.Fatalf terminates the
+// goroutine that calls it, so a failure raised from a worker would leave the
+// test hanging rather than failing. Concurrent callers use gqlErr.
 func (s *service) gql(role, query string, vars map[string]any) map[string]any {
 	s.t.Helper()
+	resp, err := s.gqlErr(role, query, vars)
+	if err != nil {
+		s.t.Fatalf("%v", err)
+	}
+	return resp
+}
+
+// gqlErr is the goroutine-safe form: it reports transport and decoding
+// problems as errors instead of failing the test from whichever goroutine
+// happened to hit them.
+func (s *service) gqlErr(role, query string, vars map[string]any) (map[string]any, error) {
 	payload := map[string]any{"query": query}
 	if len(vars) > 0 {
 		payload["variables"] = vars
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		s.t.Fatalf("marshal request: %v", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/graphql", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
@@ -127,9 +144,10 @@ func (s *service) gql(role, query string, vars map[string]any) map[string]any {
 
 	var out map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		s.t.Fatalf("decode response (status %d): %v\nbody: %s", rec.Code, err, rec.Body.String())
+		return nil, fmt.Errorf("decode response (status %d): %w\nbody: %s",
+			rec.Code, err, rec.Body.String())
 	}
-	return out
+	return out, nil
 }
 
 func errorsOf(resp map[string]any) []any {

@@ -233,17 +233,26 @@ func TestConcurrentBorrowersLeaveOneLoan(t *testing.T) {
 	const racers = 4
 	var wg sync.WaitGroup
 	results := make([]map[string]any, racers)
+	failures := make([]error, racers)
 	for i := 0; i < racers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = svc.borrow(copyID)
+			// gqlErr, not gql: a worker must not call t.Fatalf, which would
+			// terminate only that goroutine and hang the test.
+			results[i], failures[i] = svc.gqlErr(roleMember, `
+				mutation ($copy: uuid!, $from: date!, $due: date!) {
+				  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+				}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14)})
 		}(i)
 	}
 	wg.Wait()
 
 	won := 0
-	for _, r := range results {
+	for i, r := range results {
+		if failures[i] != nil {
+			t.Fatalf("racer %d could not reach the service: %v", i, failures[i])
+		}
 		if errorMessage(r) == "" {
 			won++
 		}
