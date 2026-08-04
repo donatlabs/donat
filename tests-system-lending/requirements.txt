@@ -1,0 +1,4 @@
+# Black-box system tests for the lending example. Everything here talks HTTP to
+# already-running stands; nothing imports the engine.
+pytest>=8.3,<9
+requests>=2.32,<3

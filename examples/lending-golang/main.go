@@ -1,7 +1,21 @@
-// Command petshop-golang is a boilerplate for embedding the Donat engine
-// IN-PROCESS in a Go application via the Go SDK.
+// Command lending-golang is a small library-lending service whose business
+// logic is declared in YAML and whose side effects are written in Go.
 //
-// Architecture (in-memory, no webhook):
+// The split it exists to demonstrate:
+//
+//	metadata/commands/*.yaml   the lending decisions — availability, the
+//	                           borrowing limit, the atomic hold, the extension
+//	                           counter. Each compiles to ONE PostgreSQL
+//	                           statement, so no invariant has a window.
+//	metadata/rules.yaml        the arithmetic and thresholds those decisions
+//	                           read, as expressions rather than Go.
+//	handlers.go                what happens AFTER a loan commits — notifying,
+//	                           logging, integrating. Ordinary Go, called
+//	                           in-process, no webhook and no second service.
+//
+// Nothing in this directory reimplements borrowing. `borrowCopy` in the Go
+// tests is a GraphQL call; the rule that refuses a fourth loan lives in
+// rules.yaml and is enforced inside the database statement.
 //
 //	┌─────────────────────────────────────────────────────────┐
 //	│  Go process (single binary, CGO_ENABLED=0)              │
@@ -12,33 +26,23 @@
 //	│                           │                             │
 //	│                    wazero (wasm runtime)                │
 //	│                    ┌──────────────┐                     │
-//	│                    │  core.wasm   │ ← Rust engine       │
+//	│                    │  core.wasm   │ ← Rust planner      │
 //	│                    │  (embedded)  │   compiled to wasm  │
 //	│                    └──────┬───────┘                     │
-//	│                           │ SQL                         │
+//	│                           │ one SQL statement           │
 //	│                       pgxpool ──► Postgres              │
 //	│                           │                             │
 //	│   post-commit hooks, in-process   (handlers.go)         │
-//	│   donat.Registry: on_order_placed, on_pet_status        │
 //	└─────────────────────────────────────────────────────────┘
 //
-// Use it as a template. The pieces you edit are split by concern:
-//
-//	config.go    — environment configuration
-//	handlers.go  — your event-trigger handlers (the business logic)
-//	server.go    — your HTTP routes, mounted next to the engine
-//	main.go      — wiring (this file)
-//
-// Schema is applied OUT-OF-BAND with `donat migrate` (the project's deploy
-// model — the engine never runs DDL). The platform's own deploy-time catalog
-// comes from the engine's migrations, not from a copy in this directory, so
-// the helper functions the error decoder pins cannot drift:
+// Schema is applied out-of-band with the platform's own tooling — the engine
+// never runs DDL, and this example carries no copy of the platform's DDL:
 //
 //	donat --database-url <url> migrate --migrations-dir <repo>/migrations
 //	donat --database-url <url> migrate --migrations-dir migrations
-//	go run .                                                          # serve
+//	go run .
 //
-// docker-compose.yml wires the same flow: postgres → one-shot migrate → app.
+// docker-compose.yml wires the same flow: postgres → two one-shot migrates → app.
 package main
 
 import (
@@ -52,11 +56,12 @@ import (
 )
 
 // coreConfig is the serialised {"metadata":..., "catalog":...} snapshot
-// produced by `donat dump-core-config`. The wasm engine loads it at startup via
-// core_init — no Rust binary is needed at runtime. Regenerate after a schema
-// change:
+// produced by `donat dump-core-config`. The wasm core loads it at startup via
+// core_init, which is also where the declarative metadata is compiled — a
+// command that does not compile fails the boot rather than the first request.
+// Regenerate after a schema or metadata change:
 //
-//	donat dump-core-config --metadata-dir metadata --database-url <url> --out core-config.json
+//	donat --database-url <url> dump-core-config --metadata-dir metadata --out core-config.json
 //
 //go:embed core-config.json
 var coreConfig []byte
@@ -65,19 +70,16 @@ func main() {
 	cfg := LoadConfig()
 	ctx := context.Background()
 
-	// The engine never opens connections itself; you supply the pool
-	// (composability). The schema must already be migrated (`donat migrate`).
+	// The engine never opens connections itself; you supply the pool.
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("pgxpool.New: %v", err)
 	}
 	defer pool.Close()
 
-	// Register your in-process event-trigger handlers (handlers.go).
 	reg := donat.NewRegistry()
 	RegisterHandlers(reg)
 
-	// Build the embedded engine over your pool + the serialised config.
 	eng, err := donat.New(ctx, donat.Config{
 		Backend:  donat.Postgres(pool),
 		Metadata: coreConfig,
@@ -88,10 +90,9 @@ func main() {
 		log.Fatalf("donat.New: %v", err)
 	}
 
-	// Build the HTTP router (server.go) and serve.
 	mux := NewMux(eng)
-	log.Printf("petshop-golang listening on %s", cfg.Addr)
-	log.Printf("  GraphQL:  POST %s/v1/graphql  (header: X-Donat-Role: staff)", cfg.Addr)
+	log.Printf("lending-golang listening on %s", cfg.Addr)
+	log.Printf("  GraphQL:  POST %s/v1/graphql  (header: X-Donat-Role: member)", cfg.Addr)
 	log.Printf("  Healthz:  GET  %s/healthz", cfg.Addr)
 	log.Printf("  Handlers: %v (fire in-process, no webhook)", reg.Names())
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))

@@ -1,0 +1,3 @@
+- "!include commands/borrow-copy.yaml"
+- "!include commands/return-copy.yaml"
+- "!include commands/extend-loan.yaml"

@@ -1,0 +1,65 @@
+table:
+  name: loan
+  schema: public
+object_relationships:
+  - name: copy
+    using:
+      foreign_key_constraint_on: copy_id
+  - name: member
+    using:
+      foreign_key_constraint_on: member_id
+# A member reads their own borrowing history, including closed loans.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      allow_aggregations: true
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Loans are written only by commands. A member has no ordinary insert or update
+# permission here at all: every column below is lifecycle state whose invariants
+# live in borrow_copy, return_copy and extend_loan.
+command_select_permissions:
+  - role: member
+    permission:
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+command_insert_permissions:
+  - role: member
+    permission:
+      check: {}
+      columns: [copy_id, member_id, status, borrowed_on, due_on, extensions]
+command_update_permissions:
+  - role: member
+    permission:
+      columns: [status, returned_on, due_on, extensions]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      check: {}
+# Native Go handler, called in-process right after the transaction commits.
+# Matches donat.On(reg, "on_loan_recorded", ...) in handlers.go.
+#
+# The webhook URL is required by the metadata shape but never dialled in the
+# embedded model: the Go executor dispatches from the compiled plan's hooks.
+event_triggers:
+  - name: on_loan_recorded
+    definition:
+      enable_manual: false
+      insert:
+        columns: "*"
+      update:
+        columns: [status]
+    retry_conf:
+      num_retries: 3
+      interval_sec: 5
+      timeout_sec: 60
+    webhook: http://in-process/events

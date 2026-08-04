@@ -1,0 +1,45 @@
+table:
+  name: copy
+  schema: public
+object_relationships:
+  - name: book
+    using:
+      foreign_key_constraint_on: book_id
+# A member browses shelf state to find something to borrow.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, book_id, label, status]
+      filter: {}
+      allow_aggregations: true
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# `status` moves only through the borrow and return commands. There is
+# deliberately no ordinary update permission for a member: a raw write would
+# flip a copy to on_loan without ever creating the loan that explains it.
+command_select_permissions:
+  - role: member
+    permission:
+      columns: [id, book_id, status]
+      filter: {}
+command_update_permissions:
+  - role: member
+    permission:
+      columns: [status]
+      filter: {}
+      check: {}
+# A librarian still manages the physical shelf directly.
+insert_permissions:
+  - role: librarian
+    permission:
+      check: {}
+      columns: [book_id, label, status]
+update_permissions:
+  - role: librarian
+    permission:
+      columns: [label, status]
+      filter: {}
+      check: {}

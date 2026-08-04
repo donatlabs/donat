@@ -198,6 +198,62 @@ jobs:
         run: CGO_ENABLED=0 go test ./...
         working-directory: sdk/go
 
+  # The lending example is where the embedded core is exercised against real
+  # declarative metadata: three commands, three rules and an event handler,
+  # driven through the engine's own handler against Postgres.
+  lending-example:
+    name: Lending example (commands, rules, in-process handlers)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lending
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - name: Build the engine binary (for migrate)
+        run: cargo build -p donat-server --bin donat
+      # The platform's own catalog, then the example's tables. The example
+      # deliberately carries no copy of the platform's DDL.
+      - name: Apply the platform's migrations
+        run: ./target/debug/donat --database-url "$URL" migrate --migrations-dir migrations
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Apply the example's migrations
+        run: ./target/debug/donat --database-url "$URL" migrate --migrations-dir examples/lending-golang/migrations
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Metadata must be consistent with the database
+        run: ./target/debug/donat --database-url "$URL" validate --metadata-dir examples/lending-golang/metadata
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Test
+        run: CGO_ENABLED=0 go test ./...
+        working-directory: examples/lending-golang
+        env:
+          LENDING_TEST_PG: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Vet
+        run: CGO_ENABLED=0 go vet ./...
+        working-directory: examples/lending-golang
+      - name: gofmt (must be clean)
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+        working-directory: examples/lending-golang
+
   audit:
     name: Security advisories (cargo-audit)
     runs-on: ubuntu-latest

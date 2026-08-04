@@ -5,8 +5,12 @@ version: "3.9"
 #   docker compose up
 #
 # The project's deploy model: schema (and the demo seed) is applied out-of-band
-# by a one-shot `donat migrate` using the prebuilt engine image; the Go app
+# by one-shot `donat migrate` runs using the prebuilt engine image; the Go app
 # never runs DDL — it only serves GraphQL and fires the in-process event hooks.
+#
+# Two migrate services, because this example carries no copy of the platform's
+# own DDL: the engine's migrations come from the engine image, so the helper
+# functions the error decoder pins cannot drift from a stale local copy.
 
 services:
   db:
@@ -27,14 +31,25 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: apply the V{n}__*.sql migrations (donat helper + petshop DDL +
-  # demo seed), then exit. Uses the prebuilt engine image — no local Rust build.
-  migrate:
+  # One-shot: the platform's own deploy-time catalog, straight from the engine
+  # image, so there is exactly one copy of it anywhere.
+  migrate-platform:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["migrate", "--migrations-dir", "/migrations"]
     depends_on:
       db:
         condition: service_healthy
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+    restart: "no"
+
+  # One-shot: the petshop DDL and demo seed, then exit.
+  migrate-domain:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      migrate-platform:
+        condition: service_completed_successfully
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
     volumes:
@@ -48,7 +63,7 @@ services:
       context: ../..
       dockerfile: examples/petshop-golang/Dockerfile
     depends_on:
-      migrate:
+      migrate-domain:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang

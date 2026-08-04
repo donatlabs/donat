@@ -57,7 +57,7 @@ boilerplate:
 | `gen/donat_gen.go` | Generated row structs — `donat codegen go` output, do not edit |
 | `core-config.json` | Pre-serialised `{metadata, catalog}` snapshot for `core_init` |
 | `metadata/` | Petshop YAML metadata with `event_triggers` declarations |
-| `migrations/` | `V{n}__*.sql` — applied by `donat migrate` (V0 = donat helper, V1–V5 = petshop + seed) |
+| `migrations/` | `V{n}__*.sql` — this example's own DDL and demo seed. The platform's deploy-time catalog is NOT copied here; it is applied from the engine's own `migrations/` directory. |
 | `Dockerfile` | Multi-stage, `CGO_ENABLED=0`, distroless final image |
 | `docker-compose.yml` | `db` (postgres:16) → one-shot `migrate` → `app` |
 | `go.mod` | Module with `replace` to the in-repo SDK |
@@ -74,13 +74,15 @@ docker-compose -f examples/petshop-golang/docker-compose.yml up --build
 ```
 
 Compose runs the project's deploy model: `postgres` → a one-shot
-`donat migrate` (applies the schema + demo seed) → the Go `app` (serves GraphQL
+two `donat migrate` runs (the platform's catalog, then this schema + demo seed) → the Go `app` (serves GraphQL
 and fires the in-process hooks). The engine itself never runs DDL.
 
 ### Or run locally (no Docker)
 
 ```bash
 # 1. Migrate the schema once (the engine never runs DDL):
+donat migrate --migrations-dir <repo>/migrations \
+  --database-url postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang
 donat migrate --migrations-dir migrations \
   --database-url postgresql://postgres:postgres@localhost:5432/petshop_golang
 
@@ -244,7 +246,7 @@ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang \
   /tmp/petshop
 ```
 
-Migrate the database first (`donat migrate --migrations-dir migrations
+Migrate the database first — the platform's `migrations/` then this directory's (`donat migrate --migrations-dir migrations
 --database-url <url>`) — the app only serves, it never runs DDL.
 
 The binary is fully static — no libc, no cgo, no runtime dependencies other

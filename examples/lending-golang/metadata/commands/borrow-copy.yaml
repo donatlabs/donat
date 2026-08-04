@@ -1,0 +1,97 @@
+# Lend one copy to the calling member.
+#
+# Everything that makes this a lending decision rather than two writes is
+# declared here: the copy must still be on the shelf when the statement runs,
+# the member must be under their own limit, and the copy's hold and the loan
+# row must land together or not at all. All of it compiles into one PostgreSQL
+# statement, so there is no window in which a copy is held but unborrowed.
+name: borrow_copy
+source: default
+permissions:
+  - role: member
+arguments:
+  - name: copy_id
+    type: uuid!
+  - name: borrowed_on
+    type: date!
+  - name: due_on
+    type: date!
+steps:
+  # The copy must be available *now*. `require_found` turns a race with another
+  # borrower into a rejection rather than a silently empty result.
+  - name: shelf_copy
+    select_one:
+      table: public.copy
+      by:
+        id: { arg: copy_id }
+        status: { literal: available }
+      returning: [id, book_id, status]
+      require_found: true
+
+  # The caller's own limit, read through the command permission plane.
+  - name: borrower
+    select_one:
+      table: public.member
+      by:
+        id: { session_variable: x-donat-user-id }
+      returning: [id, loan_limit]
+      require_found: true
+
+  # Open loans only: a returned loan keeps its row but must not count against
+  # the next borrowing.
+  - name: open_loans
+    select_many:
+      table: public.loan
+      by:
+        member_id: { session_variable: x-donat-user-id }
+        status: { literal: active }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 64
+
+  - name: open_loan_count
+    aggregate:
+      from: { step: open_loans }
+      values:
+        total:
+          count: {}
+
+  - name: under_limit
+    assert:
+      rule: within_loan_limit
+      with:
+        open_loans: { step: open_loan_count, column: total }
+        loan_limit: { step: borrower, column: loan_limit }
+      message: "this member already holds their maximum number of loans"
+
+  # Re-stating `status: available` in the predicate is what makes the hold
+  # atomic: two concurrent borrowers both pass the select above, but only one
+  # update finds the row still available, and `require_affected` fails the
+  # other's whole statement.
+  - name: hold
+    update:
+      table: public.copy
+      where:
+        id: { step: shelf_copy, column: id }
+        status: { literal: available }
+      set:
+        status: { literal: on_loan }
+      returning: [id, status]
+      require_affected: true
+
+  - name: loan
+    insert:
+      table: public.loan
+      object:
+        copy_id: { step: shelf_copy, column: id }
+        member_id: { session_variable: x-donat-user-id }
+        status: { literal: active }
+        borrowed_on: { arg: borrowed_on }
+        due_on: { arg: due_on }
+        extensions: { literal: 0 }
+      returning: [id, copy_id, member_id, status, borrowed_on, due_on, extensions]
+result:
+  loan_id: { step: loan, column: id }
+  copy_id: { step: loan, column: copy_id }
+  due_on: { step: loan, column: due_on }
+  open_loans_before: { step: open_loan_count, column: total }

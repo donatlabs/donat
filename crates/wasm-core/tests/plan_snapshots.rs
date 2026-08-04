@@ -462,3 +462,55 @@ fn declarative_command_denies_unlisted_role() {
         other => panic!("expected the command to be denied, got {other:?}"),
     }
 }
+
+/// A command writes through its steps, not through a root field, so the tables
+/// its hooks must cover are the ones its steps touch. Before `written_tables`
+/// read the resolved steps, a command emitted no hooks at all and an embedded
+/// host's event handlers silently never ran for command-written rows.
+#[test]
+fn command_emits_hooks_for_the_tables_its_steps_write() {
+    let mut value = serde_json::to_value(metadata_with_command()).expect("serializes");
+    // Put an INSERT trigger on `author`, the table the command's step updates,
+    // and an UPDATE trigger too so the op filter has something to reject.
+    value["sources"][0]["tables"][0]["event_triggers"] = serde_json::json!([
+        {
+            "name": "on_author_updated",
+            "definition": { "enable_manual": false, "update": { "columns": "*" } },
+            "webhook": "http://in-process/events"
+        },
+        {
+            "name": "on_author_inserted",
+            "definition": { "enable_manual": false, "insert": { "columns": "*" } },
+            "webhook": "http://in-process/events"
+        }
+    ]);
+    let metadata: Metadata = serde_json::from_value(value).expect("deserializes");
+    let state = state_of(metadata);
+
+    let input = CompileInput {
+        query: r#"mutation { rename_author(author_id: 1, new_name: "Ada") { author_id } }"#
+            .to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("user"),
+        stringify_numerics: false,
+        dialect: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Mutation(body) => {
+            let triggers: Vec<&str> =
+                body.hooks.iter().map(|h| h.trigger.as_str()).collect();
+            assert_eq!(
+                triggers,
+                vec!["on_author_updated"],
+                "the command's only step updates author, so only the update \
+                 trigger may fire: {:?}",
+                body.hooks
+            );
+            assert_eq!(body.hooks[0].table, "author");
+            assert_eq!(body.hooks[0].op, "UPDATE");
+            assert_eq!(body.hooks[0].phase, "post_commit");
+        }
+        other => panic!("expected a mutation plan, got {other:?}"),
+    }
+}

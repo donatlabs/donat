@@ -1,0 +1,20 @@
+# Every borrowing decision this library makes, as expressions rather than Go.
+#
+# A rule is pure: it reads only the values a command binds to it, and compiles
+# into the command's single SQL statement. Changing a limit here changes the
+# behaviour of the deployment without touching the host application.
+rules:
+  - name: within_loan_limit
+    parameters: { open_loans: bigint!, loan_limit: int! }
+    result: bool!
+    expression: "open_loans < loan_limit"
+
+  - name: within_extension_limit
+    parameters: { extensions: int!, maximum: int! }
+    result: bool!
+    expression: "extensions < maximum"
+
+  - name: add_int
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left + right"

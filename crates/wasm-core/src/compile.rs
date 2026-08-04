@@ -294,38 +294,82 @@ fn error_plan(e: &PlanError) -> PlanV1 {
     })
 }
 
+/// The tables a mutation root writes, and how.
+///
+/// A CRUD root writes exactly one table. A declarative command writes as many
+/// as its steps do, which is why the pair is a list: a command is the only
+/// place where one root field commits to several tables at once, and a host
+/// that only watched the root would never learn about any of them.
+fn written_tables(root: &donat_ir::MutationRoot) -> Vec<(&str, &str, &'static str)> {
+    use donat_ir::CommandExecutionStep as Step;
+
+    match root {
+        donat_ir::MutationRoot::Insert { insert, .. } => {
+            vec![(&insert.table.schema, &insert.table.name, "INSERT")]
+        }
+        donat_ir::MutationRoot::Update { update, .. } => {
+            vec![(&update.table.schema, &update.table.name, "UPDATE")]
+        }
+        donat_ir::MutationRoot::Delete { delete, .. } => {
+            vec![(&delete.table.schema, &delete.table.name, "DELETE")]
+        }
+        // A command's writes are its steps. Reading them from the resolved IR
+        // rather than from the metadata declaration means a step the planner
+        // dropped cannot leave a hook behind that fires for a write that did
+        // not happen.
+        donat_ir::MutationRoot::Command { command, .. } => command
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Insert { table, .. }
+                | Step::InsertMany { table, .. }
+                | Step::InsertRows { table, .. } => {
+                    Some((table.schema.as_str(), table.name.as_str(), "INSERT"))
+                }
+                Step::Update { table, .. }
+                | Step::UpdateWhen { table, .. }
+                | Step::UpdateMany { table, .. } => {
+                    Some((table.schema.as_str(), table.name.as_str(), "UPDATE"))
+                }
+                Step::Delete { table, .. } => {
+                    Some((table.schema.as_str(), table.name.as_str(), "DELETE"))
+                }
+                // Reads, assertions and projections commit nothing.
+                _ => None,
+            })
+            .collect(),
+        // These roots write no tracked table row: a function call is opaque to
+        // trigger metadata, minting an upload URL touches only the engine's own
+        // catalog, and a typename never reaches the database.
+        donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::RequestFileUpload { .. }
+        | donat_ir::MutationRoot::Typename { .. } => vec![],
+    }
+}
+
 /// Derive the post-commit hooks a single mutation root should fire.
 ///
-/// For each mutation root that targets a table, scan all sources in metadata
-/// for a matching `TableEntry` and collect any `EventTrigger`s whose
-/// definition covers the operation.  `FunctionCall` and `Typename` roots
-/// produce no hooks.
+/// For each table the root writes, scan all sources in metadata for a matching
+/// `TableEntry` and collect any `EventTrigger`s whose definition covers the
+/// operation.
 fn hooks_for_root(
     root: &donat_ir::MutationRoot,
     metadata: &donat_metadata::Metadata,
 ) -> Vec<crate::plan::Hook> {
-    // Resolve (schema, table, op_string) for this root.
-    let (schema, table, op): (&str, &str, &str) = match root {
-        donat_ir::MutationRoot::Insert { insert, .. } => {
-            (&insert.table.schema, &insert.table.name, "INSERT")
-        }
-        donat_ir::MutationRoot::Update { update, .. } => {
-            (&update.table.schema, &update.table.name, "UPDATE")
-        }
-        donat_ir::MutationRoot::Delete { delete, .. } => {
-            (&delete.table.schema, &delete.table.name, "DELETE")
-        }
-        // These roots carry no single table reference the trigger metadata can
-        // be matched against, so they emit no table event hooks. A declarative
-        // `Command` does carry its own resolved effects, which the host is to
-        // dispatch from the command journal rather than from table triggers.
-        donat_ir::MutationRoot::FunctionCall { .. }
-        | donat_ir::MutationRoot::Command { .. }
-        | donat_ir::MutationRoot::RequestFileUpload { .. }
-        | donat_ir::MutationRoot::Typename { .. } => return vec![],
-    };
-
     let mut out = Vec::new();
+    for (schema, table, op) in written_tables(root) {
+        collect_hooks(metadata, schema, table, op, &mut out);
+    }
+    out
+}
+
+fn collect_hooks(
+    metadata: &donat_metadata::Metadata,
+    schema: &str,
+    table: &str,
+    op: &str,
+    out: &mut Vec<crate::plan::Hook>,
+) {
     for source in &metadata.sources {
         for entry in &source.tables {
             if entry.table.schema() != schema || entry.table.name() != table {
@@ -350,5 +394,4 @@ fn hooks_for_root(
             }
         }
     }
-    out
 }
