@@ -4,14 +4,79 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use donat_schema::{PlanError, Planner, Session};
+use donat_schema::{
+    CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError,
+    ProcessEffectContractCatalog, QueryResponseSlot, Session, compile_command_catalog,
+    compile_rule_catalog, finalize_command_effects,
+};
 
-use crate::plan::{PlanBody, PlanErrorBody, PlanV1, Statement, PLAN_VERSION};
+use crate::plan::{PlanBody, PlanErrorBody, PlanV1, ResponseSlot, Statement, PLAN_VERSION};
 
-/// Deserialized engine state held per wasm instance.
+/// Compiled engine state held per wasm instance.
+///
+/// The snapshot is compiled once, at `core_init`, exactly as `donat-server`
+/// compiles its own: rules, then commands, then the serving schema. Doing it
+/// per request would repay the cost on every call, and — more importantly —
+/// would let a deployment serve traffic for a while before discovering that
+/// its declarative metadata does not compile.
 pub struct CoreState {
     pub metadata: donat_metadata::Metadata,
-    pub catalog: donat_catalog_types::Catalog,
+    pub catalogs: HashMap<String, donat_catalog_types::Catalog>,
+    pub compiled: CompiledMultiSourceSchema,
+}
+
+impl CoreState {
+    /// Compile a snapshot from a metadata + catalog config.
+    ///
+    /// Process effects are deliberately empty: a durable Process needs a
+    /// journal and a transition queue, which live host-side in `donat-server`
+    /// and have no counterpart here yet. `finalize_command_effects` therefore
+    /// refuses a command that declares an effect against a Process this core
+    /// cannot run, which is the honest outcome — the alternative is accepting
+    /// the metadata and silently dropping the effect at runtime.
+    pub fn compile_snapshot(
+        metadata: donat_metadata::Metadata,
+        catalogs: HashMap<String, donat_catalog_types::Catalog>,
+    ) -> Result<Self, PlanError> {
+        // Matches the server's default: a tracked function's permissions are
+        // inferred from the underlying table unless a role entry says otherwise.
+        const INFER_FUNCTION_PERMISSIONS: bool = true;
+
+        let rules = compile_rule_catalog(&metadata)?;
+        let commands =
+            compile_command_catalog(&metadata, &catalogs, &rules, INFER_FUNCTION_PERMISSIONS)?;
+        let process_effects = ProcessEffectContractCatalog::default();
+        let finalized = finalize_command_effects(commands, &process_effects)?;
+        let compiled = CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+            &metadata,
+            &catalogs,
+            &rules,
+            &finalized,
+            &process_effects,
+            INFER_FUNCTION_PERMISSIONS,
+        )?;
+        Ok(Self {
+            metadata,
+            catalogs,
+            compiled,
+        })
+    }
+}
+
+/// Translate the planner's response slots into the wire shape, so the host
+/// can build the top-level object in the client's field order — including a
+/// root `__typename`, which never reaches SQL.
+fn response_slots(slots: &[QueryResponseSlot]) -> Vec<ResponseSlot> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            QueryResponseSlot::SourceField { key } => ResponseSlot::SourceField { key: key.clone() },
+            QueryResponseSlot::LocalTypename { key, value } => ResponseSlot::LocalTypename {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        })
+        .collect()
 }
 
 /// The JSON payload that `core_compile` receives from the host.
@@ -114,8 +179,18 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
         }
     };
 
-    // 3. Plan (permissions woven in, session vars substituted).
-    let planner = Planner::new(&state.metadata, &state.catalog);
+    // 3. Plan (permissions woven in, session vars substituted). The
+    //    multi-source planner is what knows about declarative commands: the
+    //    single-source `Planner` constructor hardcodes `commands: None`, so a
+    //    command root would not exist in the schema it compiles.
+    let planner = match MultiSourcePlanner::from_compiled(
+        &state.metadata,
+        &state.catalogs,
+        &state.compiled,
+    ) {
+        Ok(p) => p,
+        Err(e) => return error_plan(&e),
+    };
     let plan =
         match planner.plan(&doc, input.operation_name.as_deref(), &input.variables, &session) {
             Ok(p) => p,
@@ -127,29 +202,54 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
 
     match plan {
         // 4a. Query: one combined statement aliased "data".
-        donat_schema::Plan::Query(roots) => {
-            // For Postgres (the default), use operation_to_sql_opts so that
-            // stringify_numerics is honoured and the output is byte-identical
-            // to the previous behaviour. For other dialects, operation_to_sql_with
-            // is used (stringify_numerics is always false for non-Postgres dialects
-            // — the dialect API does not expose it).
-            let sql = match dialect {
-                donat_backend::AnyDialect::Postgres(_) => {
-                    donat_sqlgen::operation_to_sql_opts(&roots, input.stringify_numerics)
+        MultiSourcePlan::Query { sources, response } => {
+            // A cross-source query needs the host to run one statement per
+            // source and merge the results, which this core does not describe
+            // yet. Refusing is better than emitting one source's SQL and
+            // quietly dropping the rest of the response.
+            if sources.len() > 1 {
+                return error_plan(&PlanError::new(
+                    "$",
+                    "not-supported",
+                    "the embedded core plans one source per operation; \
+                     this query spans several",
+                ));
+            }
+            // An operation that selects only a root `__typename` reaches no
+            // source at all, and then there is no SQL to run: the host builds
+            // the whole response from the slots below.
+            let statements = match sources.first() {
+                None => vec![],
+                Some(plan) => {
+                    // For Postgres (the default), use operation_to_sql_opts so that
+                    // stringify_numerics is honoured and the output is byte-identical
+                    // to the previous behaviour. For other dialects, operation_to_sql_with
+                    // is used (stringify_numerics is always false for non-Postgres dialects
+                    // — the dialect API does not expose it).
+                    let sql = match dialect {
+                        donat_backend::AnyDialect::Postgres(_) => {
+                            donat_sqlgen::operation_to_sql_opts(
+                                &plan.roots,
+                                input.stringify_numerics,
+                            )
+                        }
+                        _ => donat_sqlgen::operation_to_sql_with(&plan.roots, dialect),
+                    };
+                    vec![Statement { alias: "data".into(), sql, params: vec![] }]
                 }
-                _ => donat_sqlgen::operation_to_sql_with(&roots, dialect),
             };
             PlanV1::Query(PlanBody {
                 version: PLAN_VERSION,
                 transaction: false,
-                statements: vec![Statement { alias: "data".into(), sql, params: vec![] }],
+                statements,
                 hooks: vec![],
+                response: response_slots(&response),
                 error_map: crate::plan::default_error_map(),
             })
         }
 
         // 4b. Mutation: one statement per root, wrapped in a transaction.
-        donat_schema::Plan::Mutation(roots) => {
+        MultiSourcePlan::Mutation { roots, response, .. } => {
             let mut statements = Vec::new();
             let mut hooks = Vec::new();
             for root in &roots {
@@ -177,6 +277,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                 transaction: true,
                 statements,
                 hooks,
+                response: response_slots(&response),
                 error_map: crate::plan::default_error_map(),
             })
         }

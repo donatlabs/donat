@@ -14,6 +14,12 @@ expression: plan
     }
   ],
   "hooks": [],
+  "response": [
+    {
+      "kind": "source_field",
+      "key": "article"
+    }
+  ],
   "error_map": {
     "23502": "constraint-violation:Not-NULL violation. ",
     "23503": "constraint-violation:Foreign key violation. ",

@@ -21,6 +21,11 @@ pub struct PlanBody {
     /// Post-commit hooks the executor must fire (Spec 003 Registry.Dispatch).
     /// v1: emitted empty until event_trigger wiring is added.
     pub hooks: Vec<Hook>,
+    /// The top-level response keys, in the order the client asked for them.
+    /// The host assembles the response object from these rather than from the
+    /// statement results alone, because a root `__typename` is answered by the
+    /// planner and never reaches SQL.
+    pub response: Vec<ResponseSlot>,
     /// SQLSTATE -> Donat error directive; the host applies these to runtime
     /// pg errors (Spec 004). Static in v1 (matches gql.rs error table).
     pub error_map: std::collections::BTreeMap<String, String>,
@@ -34,6 +39,16 @@ pub struct Statement {
     /// `params` is reserved for the future $n refactor).
     pub sql: String,
     pub params: Vec<serde_json::Value>,
+}
+
+/// One top-level response key, in client order.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResponseSlot {
+    /// Take this key from the statement results.
+    SourceField { key: String },
+    /// A root `__typename`: the planner already knows the answer.
+    LocalTypename { key: String, value: String },
 }
 
 #[derive(Debug, Serialize)]

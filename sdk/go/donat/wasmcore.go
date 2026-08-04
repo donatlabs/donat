@@ -27,6 +27,7 @@ type wasmCore struct {
 	deallocFn api.Function
 	initFn    api.Function
 	compileFn api.Function
+	lastErrFn api.Function
 }
 
 // hostModuleName is the wasm import module the core resolves its host
@@ -80,6 +81,7 @@ func newWasmCore(ctx context.Context) (*wasmCore, error) {
 		deallocFn: mod.ExportedFunction("core_dealloc"),
 		initFn:    mod.ExportedFunction("core_init"),
 		compileFn: mod.ExportedFunction("core_compile"),
+		lastErrFn: mod.ExportedFunction("core_last_error"),
 	}
 	if c.abiVer == nil || c.allocFn == nil || c.deallocFn == nil ||
 		c.initFn == nil || c.compileFn == nil {
@@ -115,9 +117,15 @@ func (c *wasmCore) close(ctx context.Context) error {
 	return c.runtime.Close(ctx)
 }
 
-// initState seeds the wasm instance with serialized metadata+catalog JSON.
-// cfgJSON must be {"metadata":<Metadata>,"catalog":<Catalog>}.
-// Returns an error if core_init returns non-zero (deserialization failure).
+// initState seeds the wasm instance with serialized metadata+catalog JSON and
+// compiles the serving snapshot. cfgJSON must be
+// {"metadata":<Metadata>,"catalog":<Catalog>}.
+//
+// core_init distinguishes a config the host failed to serialize (1) from
+// declarative metadata that did not compile (2). The second is the
+// deployment's own rules, commands or permissions, and its message comes back
+// through core_last_error — a bare exit code would leave an operator with a
+// directory of command files and no idea which one is wrong.
 func (c *wasmCore) initState(ctx context.Context, cfgJSON []byte) error {
 	n := uint32(len(cfgJSON))
 	ptr, err := c.alloc(ctx, n)
@@ -133,10 +141,36 @@ func (c *wasmCore) initState(ctx context.Context, cfgJSON []byte) error {
 	if err != nil {
 		return fmt.Errorf("core_init call: %w", err)
 	}
-	if res[0] != 0 {
-		return fmt.Errorf("core_init returned %d (metadata/catalog deserialisation failed)", res[0])
+	switch res[0] {
+	case 0:
+		return nil
+	case 2:
+		return fmt.Errorf("metadata did not compile: %s", c.lastError(ctx))
+	default:
+		return fmt.Errorf("core_init returned %d: %s", res[0], c.lastError(ctx))
 	}
-	return nil
+}
+
+// lastError reads the message behind the most recent failed core_init. It is
+// best-effort: a host that cannot read it still reports the exit code.
+func (c *wasmCore) lastError(ctx context.Context) string {
+	if c.lastErrFn == nil {
+		return "no detail available (core.wasm predates core_last_error)"
+	}
+	res, err := c.lastErrFn.Call(ctx)
+	if err != nil {
+		return fmt.Sprintf("could not read detail: %v", err)
+	}
+	ptr, n := uint32(res[0]>>32), uint32(res[0]&0xffffffff)
+	if n == 0 {
+		return "no detail reported"
+	}
+	defer c.dealloc(ctx, ptr, n) //nolint:errcheck
+	buf, ok := c.mod.Memory().Read(ptr, n)
+	if !ok {
+		return "detail pointer out of range"
+	}
+	return string(buf)
 }
 
 // compile sends inputJSON to the wasm core and returns the PlanV1 JSON.

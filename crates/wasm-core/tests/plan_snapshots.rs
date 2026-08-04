@@ -145,8 +145,16 @@ fn catalog() -> Catalog {
     Catalog { tables, functions: BTreeMap::new() }
 }
 
+fn state_of(metadata: donat_metadata::Metadata) -> CoreState {
+    CoreState::compile_snapshot(
+        metadata,
+        HashMap::from([("default".to_string(), catalog())]),
+    )
+    .expect("fixture metadata compiles")
+}
+
 fn fixture_state() -> CoreState {
-    CoreState { metadata: metadata(), catalog: catalog() }
+    state_of(metadata())
 }
 
 fn session_vars(role: &str) -> HashMap<String, String> {
@@ -302,7 +310,7 @@ fn metadata_with_author_trigger() -> Metadata {
 /// the `on_author_change` event trigger (INSERT op only).
 #[test]
 fn mutation_emits_event_hook() {
-    let state = CoreState { metadata: metadata_with_author_trigger(), catalog: catalog() };
+    let state = state_of(metadata_with_author_trigger());
     let input = CompileInput {
         query: r#"mutation { insert_author(objects: [{ name: "Bob" }]) { affected_rows } }"#
             .to_string(),
@@ -364,5 +372,93 @@ fn missing_role_is_denied() {
             assert_eq!(e.code, "access-denied");
         }
         _ => panic!("expected PlanV1::Error for missing role"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Declarative commands
+// -----------------------------------------------------------------------
+
+/// The fixture metadata plus one declarative command: rename an author the
+/// caller owns. It is deliberately the smallest command that still exercises
+/// the parts that matter — a role gate, a step that writes, and a result
+/// projection — because the point here is that a YAML-declared command
+/// reaches the plan at all, not that a complex one does.
+fn metadata_with_command() -> Metadata {
+    let mut value = serde_json::to_value(metadata()).expect("fixture metadata serializes");
+    value["commands"] = serde_json::json!([{
+        "name": "rename_author",
+        "source": "default",
+        "permissions": [{ "role": "user" }],
+        "arguments": [
+            { "name": "author_id", "type": "int!" },
+            { "name": "new_name", "type": "string!" }
+        ],
+        "steps": [{
+            "name": "renamed",
+            "update": {
+                "table": "public.author",
+                "where": { "id": { "arg": "author_id" } },
+                "set": { "name": { "arg": "new_name" } },
+                "returning": ["id", "name"],
+                "require_affected": true
+            }
+        }],
+        "result": {
+            "author_id": { "step": "renamed", "column": "id" },
+            "name": { "step": "renamed", "column": "name" }
+        }
+    }]);
+    serde_json::from_value(value).expect("metadata with a command deserializes")
+}
+
+/// The regression this whole path exists for: a command declared in YAML must
+/// appear as a mutation root the embedded core can plan. Before the core
+/// compiled a command catalog it used `Planner::new`, which hardcodes
+/// `commands: None`, so this query failed as an unknown field.
+#[test]
+fn declarative_command_is_planned() {
+    let state = state_of(metadata_with_command());
+    let input = CompileInput {
+        query: r#"mutation { rename_author(author_id: 1, new_name: "Ada") { author_id name } }"#
+            .to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("user"),
+        stringify_numerics: false,
+        dialect: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Mutation(body) => {
+            assert!(body.transaction, "a command must run in a transaction");
+            assert_eq!(body.statements.len(), 1, "one command, one statement");
+            assert_eq!(body.statements[0].alias, "rename_author");
+            let sql = &body.statements[0].sql;
+            assert!(
+                sql.contains("UPDATE") && sql.contains("author"),
+                "the command must render its write: {sql}"
+            );
+        }
+        other => panic!("expected a mutation plan, got {other:?}"),
+    }
+}
+
+/// A role the command does not name must be refused by the planner, not by
+/// the host after the fact.
+#[test]
+fn declarative_command_denies_unlisted_role() {
+    let state = state_of(metadata_with_command());
+    let input = CompileInput {
+        query: r#"mutation { rename_author(author_id: 1, new_name: "Ada") { author_id } }"#
+            .to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("nopk"),
+        stringify_numerics: false,
+        dialect: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Error(_) => {}
+        other => panic!("expected the command to be denied, got {other:?}"),
     }
 }

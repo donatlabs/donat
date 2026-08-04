@@ -59,9 +59,16 @@ thread_local! {
     static STATE: RefCell<Option<compile::CoreState>> = const { RefCell::new(None) };
 }
 
-/// Load serialized config into the instance. Input JSON:
-/// `{ "metadata": <Metadata>, "catalog": <Catalog> }`.
-/// Returns 0 on success, 1 on a deserialization error.
+/// Load serialized config into the instance and compile the serving snapshot.
+/// Input JSON: `{ "metadata": <Metadata>, "catalog": <Catalog> }`, or
+/// `{ "metadata": <Metadata>, "catalogs": { "<source>": <Catalog> } }` when a
+/// deployment names its source something other than the first one in metadata.
+///
+/// Returns 0 on success, 1 if the config did not deserialize, 2 if it
+/// deserialized but the declarative metadata (rules, commands, permissions)
+/// did not compile. The two are worth telling apart: the first is a host bug,
+/// the second is the deployment's own metadata, and `core_last_error` carries
+/// the planner's message for it.
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
 #[unsafe(no_mangle)]
 pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
@@ -71,20 +78,62 @@ pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
     #[derive(serde::Deserialize)]
     struct Cfg {
         metadata: donat_metadata::Metadata,
-        catalog: donat_catalog_types::Catalog,
+        /// The single-source spelling, which is what `dump-core-config` emits.
+        #[serde(default)]
+        catalog: Option<donat_catalog_types::Catalog>,
+        #[serde(default)]
+        catalogs: Option<std::collections::HashMap<String, donat_catalog_types::Catalog>>,
     }
-    match serde_json::from_slice::<Cfg>(bytes) {
-        Ok(cfg) => {
-            STATE.with(|s| {
-                *s.borrow_mut() = Some(compile::CoreState {
-                    metadata: cfg.metadata,
-                    catalog: cfg.catalog,
-                });
-            });
+    let cfg = match serde_json::from_slice::<Cfg>(bytes) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            set_last_error(format!("config did not deserialize: {e}"));
+            return 1;
+        }
+    };
+    // A bare `catalog` belongs to whichever source the metadata declares
+    // first, which is how the single-source config has always been read.
+    let catalogs = match (cfg.catalogs, cfg.catalog) {
+        (Some(map), _) => map,
+        (None, Some(one)) => {
+            let source = cfg
+                .metadata
+                .sources
+                .first()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "default".to_string());
+            std::collections::HashMap::from([(source, one)])
+        }
+        (None, None) => std::collections::HashMap::new(),
+    };
+    match compile::CoreState::compile_snapshot(cfg.metadata, catalogs) {
+        Ok(state) => {
+            STATE.with(|s| *s.borrow_mut() = Some(state));
+            set_last_error(String::new());
             0
         }
-        Err(_) => 1,
+        Err(e) => {
+            set_last_error(format!("{}: {} (at {})", e.code, e.message, e.path));
+            2
+        }
     }
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn set_last_error(message: String) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = message);
+}
+
+/// The message behind the most recent non-zero `core_init`, as a packed i64
+/// (`out_ptr << 32 | out_len`) the host reads and then `core_dealloc`s. An
+/// empty string means there is nothing to report.
+#[unsafe(no_mangle)]
+pub extern "C" fn core_last_error() -> i64 {
+    let bytes = LAST_ERROR.with(|e| e.borrow().clone().into_bytes());
+    pack_output(bytes)
 }
 
 /// Compile (query, vars, session) -> PlanV1 JSON.
@@ -108,8 +157,14 @@ pub extern "C" fn core_compile(ptr: *mut u8, len: i32) -> i64 {
             },
         }
     });
-    let out_len = out.len() as i64;
-    let mut boxed = out.into_boxed_slice();
+    pack_output(out)
+}
+
+/// Leak `bytes` into linear memory and return `(ptr << 32) | len` for the
+/// host to read and then `core_dealloc`.
+fn pack_output(bytes: Vec<u8>) -> i64 {
+    let out_len = bytes.len() as i64;
+    let mut boxed = bytes.into_boxed_slice();
     let out_ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
     (out_ptr as i64) << 32 | out_len

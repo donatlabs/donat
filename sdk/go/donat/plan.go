@@ -21,8 +21,22 @@ type Plan struct {
 	Transaction bool
 	Statements  []Statement
 	Hooks       []Hook
-	ErrorMap    map[string]string
-	Err         *PlanErr // set when Kind == PlanErrorK
+	// Response is the top-level key order the client asked for. The host
+	// builds the response object from it rather than from the statement
+	// results alone, because a root __typename is answered by the planner
+	// and never reaches SQL.
+	Response []ResponseSlot
+	ErrorMap map[string]string
+	Err      *PlanErr // set when Kind == PlanErrorK
+}
+
+// ResponseSlot is one top-level response key. Kind is "source_field" when the
+// value comes from a statement result, or "local_typename" when the planner
+// already resolved it.
+type ResponseSlot struct {
+	Kind  string `json:"kind"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // Statement is one SQL statement in a plan.
@@ -55,6 +69,7 @@ type wirePlan struct {
 	Transaction bool              `json:"transaction"`
 	Statements  []Statement       `json:"statements"`
 	Hooks       []Hook            `json:"hooks"`
+	Response    []ResponseSlot    `json:"response"`
 	ErrorMap    map[string]string `json:"error_map"`
 	Code        string            `json:"code"`
 	Path        string            `json:"path"`
@@ -73,7 +88,8 @@ func decodePlan(raw []byte) (Plan, error) {
 	}
 	p := Plan{
 		Kind: w.Kind, Version: w.Version, Transaction: w.Transaction,
-		Statements: w.Statements, Hooks: w.Hooks, ErrorMap: w.ErrorMap,
+		Statements: w.Statements, Hooks: w.Hooks, Response: w.Response,
+		ErrorMap: w.ErrorMap,
 	}
 	if w.Kind == PlanErrorK {
 		p.Err = &PlanErr{Code: w.Code, Path: w.Path, Message: w.Message}
