@@ -58,7 +58,7 @@ accepting the metadata and dropping the effect at runtime.
 | Duplicate the rules adapter in `wasm-core` | Two compilers for one YAML dialect. They would agree until they did not, and the failure would be a command permitted in one host and refused in the other. |
 | Derive a command's hooks from its metadata declaration | The declaration is not what ran. A step the planner dropped would still emit a hook, so a handler would fire for a write that never happened. |
 | Emit one hook per command rather than per table | A handler is registered against a table's trigger name; a command-shaped hook would not match any of them, and the host would have to invent a second dispatch rule. |
-| Accept commands with Process effects and ignore the effect | The declaration would be accepted and silently not honoured — the exact defect [[034-a-declaration-the-runtime-ignores-is-a-defect]] names. |
+| Accept commands with Process effects and ignore the effect | The declaration would be accepted and silently not honoured — the exact defect declarative-saas [[034-a-declaration-the-runtime-ignores-is-a-defect]] names. |
 
 ## Consequences
 
