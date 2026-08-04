@@ -153,6 +153,14 @@ answers the five declared providers with a local fixture, and serves:
 For focused surfaces, see [REST-only](examples/petshop-rest) and
 [MCP-only](examples/petshop-mcp).
 
+To embed the engine **inside a Go application** instead of running it beside
+one, see [lending-golang](examples/lending-golang): a small library whose
+lending decisions are declared in YAML and compiled into single statements,
+whose side effects are ordinary Go functions called in-process, and which
+serves GraphQL from the same binary with no cgo. Its
+[system tests](tests-system-lending) run every case against both the
+standalone engine and the embedded host, and fail if the two disagree.
+
 ### From source
 
 ```sh
