@@ -313,6 +313,64 @@ jobs:
           tests-system/stack.sh down-fast
           tests-system/stack.sh down
 
+  # The claim the embedded SDK rests on: the standalone engine and a Go
+  # application embedding the compiled core serve the same YAML identically.
+  # Every case runs against both stands, and a disagreement fails the job.
+  lending-system:
+    name: Lending system tests (engine vs Go host)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # stack.sh builds both binaries from this commit, applies the platform's
+      # migrations and then the example's, and serves each stand against its
+      # own database.
+      - name: Raise both stands
+        run: tests-system-lending/stack.sh up
+      - name: Install the suite
+        run: |
+          python3 -m venv tests-system-lending/.venv
+          tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
+      - name: Black-box system tests
+        working-directory: tests-system-lending
+        env:
+          LENDING_ENGINE_URL: http://127.0.0.1:8090
+          LENDING_GO_URL: http://127.0.0.1:8091
+          LENDING_ADMIN_SECRET: lending-secret
+        run: .venv/bin/python -m pytest -q
+      - name: Stand logs
+        if: failure()
+        run: |
+          tail -200 tests-system-lending/.stack/engine.log
+          tail -200 tests-system-lending/.stack/go.log
+      - name: Drop the stands
+        if: always()
+        run: tests-system-lending/stack.sh down
+
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
     needs: [test, backend-core-gate, mixed-backend-conformance, petshop-system]

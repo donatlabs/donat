@@ -40,14 +40,27 @@ go_log="$state/go.log"
 
 createdb() {
   local name="$1"
-  # `psql` is not assumed to be on the host: the database container has it.
+  # A CI runner has psql; a developer machine often only has the database in a
+  # container. Try the direct client first and fall back rather than assuming
+  # either, because a stand that cannot create its database fails much later
+  # and much less clearly.
+  #
+  # Two -c flags in each call, never one string: psql wraps a multi-statement
+  # -c in a single transaction, and DROP DATABASE cannot run inside one.
+  if command -v psql >/dev/null 2>&1; then
+    psql "$PG_BASE/postgres" -q -v ON_ERROR_STOP=1 \
+      -c "DROP DATABASE IF EXISTS $name" \
+      -c "CREATE DATABASE $name" >/dev/null
+    return
+  fi
+
   local container
   container="$(docker ps --filter "publish=${PG_BASE##*:}" --format '{{.Names}}' | head -1)"
   if [ -z "$container" ]; then
-    echo "no postgres container publishing port ${PG_BASE##*:}" >&2
+    echo "no psql on PATH and no postgres container publishing port ${PG_BASE##*:}" >&2
     exit 1
   fi
-  docker exec "$container" psql -U postgres -q \
+  docker exec "$container" psql -U postgres -q -v ON_ERROR_STOP=1 \
     -c "DROP DATABASE IF EXISTS $name" \
     -c "CREATE DATABASE $name" >/dev/null
 }
