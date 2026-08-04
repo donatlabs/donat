@@ -8,6 +8,7 @@ exists to show one split, on something small enough to read in a sitting.
 | The lending decisions    | `metadata/commands/*.yaml`           |
 | The thresholds they read | `metadata/rules.yaml`                |
 | What happens afterwards  | `handlers.go`                        |
+| What must happen *with* it | `audit.go`                         |
 
 Nothing in the Go code decides whether a loan is allowed. `borrow_copy` checks
 that the copy is on the shelf, that the member is under their own limit, and
@@ -16,7 +17,9 @@ where a copy is held but unborrowed, and no moment where two members both see
 the last copy as available. The Go half handles what comes *after* the commit:
 notifying, integrating, logging.
 
-Four tables, three commands, three rules, one handler.
+Four tables the engine knows about, three commands, three rules, one
+handler — and one table the engine has never heard of, which `audit.go` writes
+inside the engine's own transaction.
 
 ## What each command demonstrates
 
@@ -53,6 +56,34 @@ metadata change, not a deploy of new Go — and, more importantly, the check run
 would run either before the write, where it races, or after it, where it is too
 late.
 
+## When after-the-commit is not good enough
+
+A handler runs after the transaction commits, which is right for notifying
+somebody and wrong for a row that must exist if and only if the loan does — a
+crash between the commit and the handler would lose it.
+
+`audit.go` shows the other tool. The application opens the transaction, hands
+it to the engine with `ExecuteTx`, writes its own row on the same handle, and
+decides whether to commit:
+
+```go
+tx, _ := pool.Begin(ctx)
+defer tx.Rollback(ctx)
+
+body, err := eng.ExecuteTx(ctx, tx, borrowMutation, vars, session)
+if err != nil || hasErrors(body) {
+    return body, err          // refused: nothing is committed
+}
+recordAudit(ctx, tx, member, "borrow", copyID)
+tx.Commit(ctx)
+```
+
+The engine issues no `BEGIN` and no `COMMIT`. If the audit insert fails the
+loan rolls back with it, and a refused borrow leaves no audit row claiming one
+happened. The price is that post-commit hooks do not fire — the engine has not
+committed anything, so it cannot know when to fire them, and side effects after
+the caller's own commit are the caller's job.
+
 ## Why the handler is Go and not YAML
 
 `handlers.go` runs after the transaction commits, in the same process, with no
@@ -77,7 +108,7 @@ DDL either — the platform's deploy-time catalog is applied from the platform's
 own migrations, so the helper functions its error decoder pins cannot drift:
 
 ```bash
-# 1. the platform's catalog, then this library's four tables
+# 1. the platform's catalog, then this library's tables
 donat --database-url "$URL" migrate --migrations-dir ../../migrations
 donat --database-url "$URL" migrate --migrations-dir migrations
 
@@ -112,10 +143,11 @@ CRUD root can bypass a command's guards.
 LENDING_TEST_PG="postgresql://…/lending" go test ./...
 ```
 
-Twelve cases against a real database, driven through the engine's own handler:
+Fifteen cases against a real database, driven through the engine's own handler:
 the limit, the atomic hold, double-return, the extension counter, four
-concurrent borrowers leaving exactly one loan, and the handler firing. Without
-`LENDING_TEST_PG` they skip.
+concurrent borrowers leaving exactly one loan, the handler firing, and
+`ExecuteTx` committing the loan and the audit row together — or neither.
+Without `LENDING_TEST_PG` they skip.
 
 The black-box suite in [`tests-system-lending`](../../tests-system-lending)
 goes further: it runs the same cases against **both** the standalone Rust
@@ -128,8 +160,9 @@ engine and this Go host, from the same YAML, and fails if they disagree.
 | `metadata/commands/` | the three lending commands |
 | `metadata/rules.yaml` | the thresholds and arithmetic they read |
 | `metadata/databases/default/tables/` | table permissions, including the `command_*` plane and the event trigger |
-| `migrations/` | this library's four tables — no platform DDL |
-| `handlers.go` | the Go event modules |
+| `migrations/` | this library's tables — no platform DDL |
+| `handlers.go` | the Go event modules, called after the commit |
+| `audit.go` | `ExecuteTx`: an application write in the engine's transaction |
 | `main.go`, `server.go`, `config.go` | wiring, routes, environment |
 | `gen/donat_gen.go` | row structs from `donat codegen go`; do not edit |
 | `core-config.json` | the compiled snapshot, from `donat dump-core-config` |

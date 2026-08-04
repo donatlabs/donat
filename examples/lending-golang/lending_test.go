@@ -38,6 +38,7 @@ type service struct {
 	t       *testing.T
 	handler http.Handler
 	pool    *pgxpool.Pool
+	engine  *donat.Engine
 	loans   *LoanLog
 	// memberID is the identity the member role acts as. Set by addMember, so
 	// a test that borrows always borrows as somebody the library knows.
@@ -77,7 +78,7 @@ func newService(t *testing.T) *service {
 		t.Fatalf("donat.New: %v", err)
 	}
 
-	svc := &service{t: t, handler: eng.Handler(), pool: pool, loans: loans}
+	svc := &service{t: t, handler: eng.Handler(), pool: pool, engine: eng, loans: loans}
 	svc.reset()
 	return svc
 }
@@ -95,6 +96,7 @@ func (s *service) reset() {
 	s.t.Helper()
 	ctx := context.Background()
 	for _, stmt := range []string{
+		"DELETE FROM public.audit_entry",
 		"DELETE FROM public.loan",
 		"DELETE FROM public.copy",
 		"DELETE FROM public.book",

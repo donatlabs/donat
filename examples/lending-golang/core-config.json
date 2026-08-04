@@ -2962,6 +2962,52 @@
           }
         ]
       },
+      "public.audit_entry": {
+        "schema": "public",
+        "name": "audit_entry",
+        "relation_kind": "Table",
+        "columns": [
+          {
+            "name": "id",
+            "pg_type": "int8",
+            "pg_typmod": -1,
+            "nullable": false,
+            "has_default": true
+          },
+          {
+            "name": "actor",
+            "pg_type": "text",
+            "pg_typmod": -1,
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "action",
+            "pg_type": "text",
+            "pg_typmod": -1,
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "subject",
+            "pg_type": "text",
+            "pg_typmod": -1,
+            "nullable": false,
+            "has_default": false
+          },
+          {
+            "name": "recorded",
+            "pg_type": "timestamptz",
+            "pg_typmod": -1,
+            "nullable": false,
+            "has_default": true
+          }
+        ],
+        "primary_key": [
+          "id"
+        ],
+        "foreign_keys": []
+      },
       "public.book": {
         "schema": "public",
         "name": "book",
