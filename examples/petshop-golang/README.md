@@ -73,18 +73,19 @@ and swap the `metadata/` + `migrations/` for your schema (then regenerate
 docker-compose -f examples/petshop-golang/docker-compose.yml up --build
 ```
 
-Compose runs the project's deploy model: `postgres` → a one-shot
-two `donat migrate` runs (the platform's catalog, then this schema + demo seed) → the Go `app` (serves GraphQL
-and fires the in-process hooks). The engine itself never runs DDL.
+Compose runs the project's deploy model: `postgres` → two one-shot `donat
+migrate` runs (the platform's own catalog, then this schema and demo seed) →
+the Go `app` (serves GraphQL and fires the in-process hooks). The engine itself
+never runs DDL, and this example keeps no copy of the platform's DDL, so the
+helper functions the error decoder pins cannot drift from a stale local copy.
 
 ### Or run locally (no Docker)
 
 ```bash
 # 1. Migrate the schema once (the engine never runs DDL):
-donat migrate --migrations-dir <repo>/migrations \
-  --database-url postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang
-donat migrate --migrations-dir migrations \
-  --database-url postgresql://postgres:postgres@localhost:5432/petshop_golang
+URL=postgresql://postgres:postgres@localhost:5432/petshop_golang
+donat --database-url "$URL" migrate --migrations-dir <repo>/migrations
+donat --database-url "$URL" migrate --migrations-dir migrations
 
 # 2. Serve (reads DATABASE_URL, default localhost:15432):
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/petshop_golang go run .
@@ -246,8 +247,9 @@ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang \
   /tmp/petshop
 ```
 
-Migrate the database first — the platform's `migrations/` then this directory's (`donat migrate --migrations-dir migrations
---database-url <url>`) — the app only serves, it never runs DDL.
+Migrate the database first — the platform's `migrations/`, then this
+directory's (`donat --database-url <url> migrate --migrations-dir <dir>`) — the
+app only serves, it never runs DDL.
 
 The binary is fully static — no libc, no cgo, no runtime dependencies other
 than the Postgres connection you point it at.
