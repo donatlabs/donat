@@ -1669,20 +1669,20 @@ async fn a_transition_defers_even_with_the_pool_exhausted() {
         );
     }
 
-    let deferred = tokio::time::timeout(
-        Duration::from_secs(20),
-        runtime.consume_one_transition(),
-    )
-    .await
-    .expect("the deferral does not wait for a connection that is not coming")
-    .expect("a transient failure is deferred, not raised");
+    let deferred = tokio::time::timeout(Duration::from_secs(20), runtime.consume_one_transition())
+        .await
+        .expect("the deferral does not wait for a connection that is not coming")
+        .expect("a transient failure is deferred, not raised");
 
     assert!(
         matches!(deferred, TransitionConsumption::Deferred { .. }),
         "the transition did not step aside with the pool exhausted: {deferred:?}"
     );
     let (attempts, rescheduled) = event_retry_state(&database.url, stuck).await;
-    assert!(attempts > 0 && rescheduled, "the deferral did not reach the journal");
+    assert!(
+        attempts > 0 && rescheduled,
+        "the deferral did not reach the journal"
+    );
 
     drop(held);
     blocker

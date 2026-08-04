@@ -1684,9 +1684,11 @@ fn command_scope_prefix(command: &CommandMutation) -> usize {
     if referenced.is_empty() {
         return 0;
     }
-    let Some(last) = command.steps.iter().rposition(|step| {
-        command_step_cte_name(step).is_some_and(|cte| referenced.contains(cte))
-    }) else {
+    let Some(last) = command
+        .steps
+        .iter()
+        .rposition(|step| command_step_cte_name(step).is_some_and(|cte| referenced.contains(cte)))
+    else {
         return 0;
     };
     let prefix = last + 1;

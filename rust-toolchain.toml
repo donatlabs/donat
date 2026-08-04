@@ -1,0 +1,11 @@
+# The toolchain CI and every contributor build with.
+#
+# Pinned rather than floating on `stable` for two reasons. `cargo fmt --check`
+# is a CI gate, and what counts as formatted changes between rustfmt releases —
+# an unpinned toolchain would turn a new stable into a red build nobody caused.
+# The same is true of new clippy lints under `-D warnings`. Bumping this file is
+# then a deliberate commit that carries whatever reformatting the new toolchain
+# wants, instead of a surprise on someone else's pull request.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

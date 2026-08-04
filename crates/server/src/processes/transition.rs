@@ -4801,7 +4801,6 @@ fn is_transient(error: &anyhow::Error) -> bool {
     })
 }
 
-
 fn next_version(snapshot: &TransitionSnapshot) -> anyhow::Result<i64> {
     snapshot
         .version

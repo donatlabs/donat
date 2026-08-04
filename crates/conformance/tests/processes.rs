@@ -591,7 +591,10 @@ fn a_constraint_violation_fails_its_own_instance_and_no_other() {
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let states = instance_states(&mut client);
-        let settled = states.iter().filter(|(status, _)| status != "running").count();
+        let settled = states
+            .iter()
+            .filter(|(status, _)| status != "running")
+            .count();
         if settled == 3 {
             break;
         }
@@ -603,8 +606,14 @@ fn a_constraint_violation_fails_its_own_instance_and_no_other() {
     }
 
     let states = instance_states(&mut client);
-    let terminal = states.iter().filter(|(status, _)| status == "terminal").count();
-    let failed = states.iter().filter(|(status, _)| status == "failed").count();
+    let terminal = states
+        .iter()
+        .filter(|(status, _)| status == "terminal")
+        .count();
+    let failed = states
+        .iter()
+        .filter(|(status, _)| status == "failed")
+        .count();
     assert_eq!(terminal, 2, "both takeable slots are held: {states:?}");
     assert_eq!(failed, 1, "the clashing instance fails: {states:?}");
 

@@ -1024,11 +1024,20 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         {
             operators.extend([
                 input_value("_has_key", named("SCALAR", "String")),
-                input_value("_has_keys_any", list_of(non_null(named("SCALAR", "String")))),
-                input_value("_has_keys_all", list_of(non_null(named("SCALAR", "String")))),
+                input_value(
+                    "_has_keys_any",
+                    list_of(non_null(named("SCALAR", "String"))),
+                ),
+                input_value(
+                    "_has_keys_all",
+                    list_of(non_null(named("SCALAR", "String"))),
+                ),
             ]);
         }
-        types.push(input_object_type(&format!("{scalar}_comparison_exp"), operators));
+        types.push(input_object_type(
+            &format!("{scalar}_comparison_exp"),
+            operators,
+        ));
         types.push(scalar_type(scalar));
     }
 
