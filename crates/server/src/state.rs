@@ -481,6 +481,36 @@ pub enum SourceRuntime {
 pub struct RuntimePoolSettings {
     max_connections: usize,
     pool_timeout_seconds: Option<u64>,
+    /// Ceiling on any single statement this source runs, in seconds.
+    ///
+    /// Without one, a query the planner accepted but the database cannot
+    /// answer cheaply occupies a backend until someone notices: dropping the
+    /// HTTP request does not cancel the statement it started. `None` restores
+    /// the unbounded behaviour for a deployment that wants it.
+    statement_timeout_seconds: Option<u64>,
+    /// Whether a recycled connection is proved alive before it is handed out.
+    ///
+    /// `deadpool`'s default only asks `is_closed()`, which its own
+    /// documentation notes can answer "open" for a connection that was
+    /// hard-closed by the network — a managed Postgres reaping idle sockets,
+    /// a proxy, a NAT gateway. The engine retries nothing, so that connection
+    /// becomes an error on the caller's next query. One round trip per
+    /// checkout buys that back; a deployment on a local socket can decline it.
+    verify_connections: bool,
+}
+
+/// The statement ceiling a source uses when its metadata declares none.
+///
+/// Deliberately generous: it is a backstop against a statement nobody can
+/// answer, not a latency budget. `DONAT_PG_STATEMENT_TIMEOUT_SECONDS=0`
+/// disables it.
+const DEFAULT_STATEMENT_TIMEOUT_SECONDS: u64 = 30;
+
+fn default_statement_timeout_seconds() -> Option<u64> {
+    match std::env::var("DONAT_PG_STATEMENT_TIMEOUT_SECONDS") {
+        Ok(raw) => raw.trim().parse::<u64>().ok().filter(|value| *value > 0),
+        Err(_) => Some(DEFAULT_STATEMENT_TIMEOUT_SECONDS),
+    }
 }
 
 impl Default for RuntimePoolSettings {
@@ -488,6 +518,8 @@ impl Default for RuntimePoolSettings {
         Self {
             max_connections: 16,
             pool_timeout_seconds: None,
+            statement_timeout_seconds: default_statement_timeout_seconds(),
+            verify_connections: true,
         }
     }
 }
@@ -509,9 +541,21 @@ fn runtime_pool_settings(source: &Source) -> RuntimePoolSettings {
         .filter(|value| *value > 0)
         .unwrap_or(RuntimePoolSettings::default().max_connections);
     let pool_timeout_seconds = settings.get("pool_timeout").and_then(Json::as_u64);
+    // A source may set its own ceiling; `0` means "no ceiling on this source".
+    let statement_timeout_seconds = match settings.get("statement_timeout").and_then(Json::as_u64) {
+        Some(0) => None,
+        Some(seconds) => Some(seconds),
+        None => default_statement_timeout_seconds(),
+    };
+    let verify_connections = settings
+        .get("verify_connections")
+        .and_then(Json::as_bool)
+        .unwrap_or(true);
     RuntimePoolSettings {
         max_connections,
         pool_timeout_seconds,
+        statement_timeout_seconds,
+        verify_connections,
     }
 }
 
@@ -1322,6 +1366,21 @@ fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {
         .collect()
 }
 
+/// Whether the connection URL already carries libpq `options`.
+///
+/// `deadpool` would overwrite them wholesale with ours, silently dropping
+/// whatever the deployment set — a search_path, a lock timeout — so when the
+/// URL speaks for itself we leave it alone.
+fn url_sets_options(url: &str) -> bool {
+    let Some(query) = url.split_once('?').map(|(_, query)| query) else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(key, _)| key == "options")
+    })
+}
+
 #[allow(dead_code)] // Public library helper; the binary stages pools from metadata.
 pub fn make_pool(url: &str) -> anyhow::Result<deadpool_postgres::Pool> {
     make_pool_with_settings(url, RuntimePoolSettings::default())
@@ -1333,6 +1392,25 @@ fn make_pool_with_settings(
 ) -> anyhow::Result<deadpool_postgres::Pool> {
     let mut config = deadpool_postgres::Config::new();
     config.url = Some(url.to_string());
+    // Carried as a connection option so every session out of this pool starts
+    // bounded, rather than each call site remembering to set it. A URL that
+    // already carries `options` keeps its own value: an explicit deployment
+    // choice outranks our default.
+    if let Some(seconds) = settings.statement_timeout_seconds
+        && !url_sets_options(url)
+    {
+        config.options = Some(format!("-c statement_timeout={}", seconds * 1000));
+    }
+    // Prove the connection before handing it out. `Fast` — the default — only
+    // asks `is_closed()`, and a socket the network dropped still answers
+    // "open"; the engine has no retry, so that lands on a caller as an error.
+    config.manager = Some(deadpool_postgres::ManagerConfig {
+        recycling_method: if settings.verify_connections {
+            deadpool_postgres::RecyclingMethod::Verified
+        } else {
+            deadpool_postgres::RecyclingMethod::Fast
+        },
+    });
     let mut pool_config = deadpool_postgres::PoolConfig::new(settings.max_connections);
     pool_config.timeouts.wait = settings
         .pool_timeout_seconds
@@ -1340,7 +1418,7 @@ fn make_pool_with_settings(
     config.pool = Some(pool_config);
     Ok(config.create_pool(
         Some(deadpool_postgres::Runtime::Tokio1),
-        tokio_postgres::NoTls,
+        crate::pgtls::connector(),
     )?)
 }
 
@@ -2306,6 +2384,7 @@ async fn clickhouse_post_data(
 
 #[cfg(test)]
 mod snapshot_tests {
+    use super::{DEFAULT_STATEMENT_TIMEOUT_SECONDS, url_sets_options};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
@@ -2639,6 +2718,8 @@ mod snapshot_tests {
             RuntimePoolSettings {
                 max_connections: 2,
                 pool_timeout_seconds: None,
+                statement_timeout_seconds: None,
+                verify_connections: true,
             },
             Some(&same),
         )
@@ -2667,6 +2748,70 @@ mod snapshot_tests {
         };
         assert!(Arc::ptr_eq(first_permits, same_permits));
         assert!(!Arc::ptr_eq(same_permits, changed_permits));
+    }
+
+    /// Every source is bounded unless it says otherwise. A statement the
+    /// database cannot answer cheaply must not hold a backend open after the
+    /// caller has gone: dropping the HTTP request does not cancel it.
+    #[test]
+    fn sources_carry_a_statement_ceiling_by_default() {
+        let source = |pool_settings: serde_json::Value| -> donat_metadata::Source {
+            serde_json::from_value(json!({
+                "name": "default",
+                "kind": "postgres",
+                "configuration": {
+                    "connection_info": {
+                        "database_url": "postgres://localhost/db",
+                        "pool_settings": pool_settings
+                    }
+                },
+                "tables": []
+            }))
+            .expect("source deserializes")
+        };
+
+        // Declaring other pool settings does not opt out of the ceiling.
+        assert_eq!(
+            runtime_pool_settings(&source(json!({ "max_connections": 3 })))
+                .statement_timeout_seconds,
+            Some(DEFAULT_STATEMENT_TIMEOUT_SECONDS)
+        );
+        // A source may choose its own …
+        assert_eq!(
+            runtime_pool_settings(&source(json!({ "statement_timeout": 5 })))
+                .statement_timeout_seconds,
+            Some(5)
+        );
+        // … including none at all, but only by saying so.
+        assert_eq!(
+            runtime_pool_settings(&source(json!({ "statement_timeout": 0 })))
+                .statement_timeout_seconds,
+            None
+        );
+
+        // Connections are proved alive by default; declining it is explicit.
+        assert!(runtime_pool_settings(&source(json!({}))).verify_connections);
+        assert!(
+            !runtime_pool_settings(&source(json!({ "verify_connections": false })))
+                .verify_connections
+        );
+    }
+
+    /// A URL that carries its own libpq `options` keeps them: `deadpool` would
+    /// replace the whole string, dropping a deployment's search_path or lock
+    /// timeout in order to add ours.
+    #[test]
+    fn a_url_with_its_own_options_is_left_alone() {
+        assert!(url_sets_options(
+            "postgres://localhost/db?options=-c%20search_path%3Dapp"
+        ));
+        assert!(url_sets_options(
+            "postgres://localhost/db?sslmode=require&options=-c%20lock_timeout%3D1000"
+        ));
+        assert!(!url_sets_options("postgres://localhost/db"));
+        assert!(!url_sets_options("postgres://localhost/db?sslmode=require"));
+        // A parameter that merely ends in "options" is a different parameter.
+        assert!(!url_sets_options("postgres://localhost/db?my_options=x"));
     }
 
     #[test]
@@ -2699,6 +2844,8 @@ mod snapshot_tests {
             RuntimePoolSettings {
                 max_connections: 4,
                 pool_timeout_seconds: Some(2),
+                statement_timeout_seconds: None,
+                verify_connections: true,
             },
             Some(&first),
         )
@@ -2764,6 +2911,8 @@ mod snapshot_tests {
             RuntimePoolSettings {
                 max_connections: 1,
                 pool_timeout_seconds: None,
+                statement_timeout_seconds: None,
+                verify_connections: true,
             },
             None,
         )

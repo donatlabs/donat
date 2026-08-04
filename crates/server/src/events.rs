@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value as Json, json};
-use tokio_postgres::NoTls;
 
 use donat_metadata::{Columns, EventTrigger, Metadata};
 
@@ -32,7 +31,7 @@ use crate::state::SharedState;
 /// the metadata, and drop any engine-managed triggers no longer declared.
 /// Run from `migrate` (deploy-time); the serving binary never runs DDL.
 pub async fn reconcile(database_url: &str, metadata: &Metadata) -> anyhow::Result<()> {
-    let (client, conn) = tokio_postgres::connect(database_url, NoTls).await?;
+    let (client, conn) = tokio_postgres::connect(database_url, crate::pgtls::connector()).await?;
     let conn = tokio::spawn(conn);
 
     // Desired triggers: (pg_trigger_name, schema, table) -> CREATE statement.
@@ -163,11 +162,15 @@ fn quote_literal(s: &str) -> String {
 
 /// Start the event-trigger delivery loop. No-op (the task exits) when no table
 /// declares an event trigger.
-pub fn spawn(state: SharedState) {
-    tokio::spawn(async move { run(state).await });
+pub fn spawn(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: &tokio_util::task::TaskTracker,
+) {
+    tasks.spawn(async move { run(state, shutdown).await });
 }
 
-async fn run(state: SharedState) {
+async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) {
     let has_triggers = {
         let engine = state.engine.read().await;
         engine
@@ -193,7 +196,12 @@ async fn run(state: SharedState) {
         if let Err(e) = tick(&state).await {
             tracing::warn!(error = %e, "event tick failed");
         }
-        tokio::time::sleep(interval).await;
+        // Event delivery is at-least-once by contract, so the seam between
+        // two ticks is a safe place to stop.
+        if !crate::shutdown::idle(interval, &shutdown).await {
+            tracing::info!("event delivery loop stopped");
+            return;
+        }
     }
 }
 

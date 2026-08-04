@@ -290,7 +290,19 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         }
     };
     let status = response.status();
-    let body: Json = response.json().await.unwrap_or(Json::Null);
+    // A handler that streams more than the deployment allows is refused here
+    // rather than held in memory until the allocator gives up.
+    let body: Json =
+        match crate::upstream::read_json(response, crate::upstream::max_body_bytes()).await {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(err(
+                    &path,
+                    "unexpected",
+                    format!("http exception when calling webhook: {error}"),
+                ));
+            }
+        };
 
     // A non-2xx handler response is an action error. Donat surfaces the
     // handler body's `message`, and for the error `extensions`:

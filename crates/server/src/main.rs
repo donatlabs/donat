@@ -1,7 +1,7 @@
 //! HTTP entry point. The serving surface is data-plane only:
 //! `/v1/graphql` (+ws), `/v1alpha1/graphql`, `/v1/relay`, `/v1beta1/relay`,
-//! `/v1/connectors/{instance}/webhooks`, `/healthz`, `/v1/version`. There is
-//! NO runtime admin/management API
+//! `/v1/connectors/{instance}/webhooks`, `/healthz`, `/readyz`, `/v1/version`.
+//! There is NO runtime admin/management API
 //! (no `/v1/query` run_sql, no metadata mutation): schema is applied with
 //! the `migrate` subcommand, metadata is loaded from YAML at boot.
 //!
@@ -9,6 +9,7 @@
 //! - serve: `donat --database-url <url> [--metadata-dir <dir>] [--port N]`
 //! - migrate (DDL): `donat migrate --migrations-dir <dir>`
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
+//! - inspect (read-only): `donat process inspect --source <s> --instance <id>`
 
 // The binary builds its router from the library's module tree rather than
 // declaring a second copy of it. A second copy compiled the same files again
@@ -136,6 +137,38 @@ enum Command {
     Migrate(MigrateArgs),
     /// Validate YAML metadata against the database, then exit.
     Validate(ValidateArgs),
+    /// Read-only diagnostics for one durable Process instance.
+    #[command(subcommand)]
+    Process(ProcessCommand),
+}
+
+/// The two read-only diagnostics
+/// [[002-durable-process-operational-contracts]] permits.
+///
+/// There is deliberately nothing here that cancels, retries, replays or
+/// otherwise changes an instance: doing that from a CLI would be the
+/// permission bypass the whole engine is built to refuse. Recovery stays an
+/// explicit declared command, called as any other caller calls one.
+#[derive(clap::Subcommand, Debug)]
+enum ProcessCommand {
+    /// Print one instance's journal — state, events, activities, transitions.
+    Inspect(ProcessInstanceArgs),
+    /// Check that one instance's recorded history is internally consistent.
+    /// Exits non-zero when it is not.
+    VerifyHistory(ProcessInstanceArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ProcessInstanceArgs {
+    /// Metadata source the instance belongs to.
+    #[arg(long)]
+    source: String,
+    /// The instance id.
+    #[arg(long)]
+    instance: uuid::Uuid,
+    /// Metadata directory used to resolve the source's database.
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -244,6 +277,35 @@ pub(crate) fn resolve_validate_selection(
     resolve_metadata_source(global, metadata_dir, cli.source.as_deref(), &read_env)
 }
 
+/// Which database holds the instance's journal.
+///
+/// A Process journal is source-local, so the source has to be named. With a
+/// metadata directory the source's own URL is used, exactly as `validate`
+/// resolves it; without one the global URL is the only candidate, and it is
+/// only usable when the deployment has a single source anyway.
+pub(crate) fn resolve_process_source_url(
+    global: &Args,
+    cli: &ProcessInstanceArgs,
+) -> anyhow::Result<String> {
+    if let Some(metadata_dir) = cli
+        .metadata_dir
+        .clone()
+        .or_else(|| global.metadata_dir.clone())
+    {
+        let selection =
+            resolve_metadata_source(global, metadata_dir, Some(&cli.source), &|name| {
+                std::env::var(name)
+            })?;
+        return Ok(selection.database_url);
+    }
+    resolve_global_database_url(global, &|name| std::env::var(name))?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "reading a Process journal needs --metadata-dir (to resolve the source's database) \
+             or --database-url"
+        )
+    })
+}
+
 fn resolve_metadata_source(
     global: &Args,
     metadata_dir: PathBuf,
@@ -341,12 +403,7 @@ fn read_optional_env(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "donat=info".into()),
-        )
-        .init();
+    init_logging(std::env::var("DONAT_LOG_FORMAT").ok().as_deref());
 
     let args = Args::parse();
     let serve = match &args.command {
@@ -423,6 +480,39 @@ async fn main() -> anyhow::Result<()> {
             require_consistent_metadata(&problems)?;
             return Ok(());
         }
+        Some(Command::Process(command)) => {
+            let (instance_args, verify) = match command {
+                ProcessCommand::Inspect(args) => (args, false),
+                ProcessCommand::VerifyHistory(args) => (args, true),
+            };
+            let database_url = resolve_process_source_url(&args, instance_args)?;
+            let history = processes::diagnostics::inspect(
+                &database_url,
+                &instance_args.source,
+                instance_args.instance,
+            )
+            .await?;
+            if !verify {
+                println!("{}", serde_json::to_string_pretty(&history)?);
+                return Ok(());
+            }
+            let findings = processes::diagnostics::verify(&history);
+            if findings.is_empty() {
+                println!(
+                    "instance {} in source {} has a consistent history",
+                    instance_args.instance, instance_args.source
+                );
+                return Ok(());
+            }
+            for finding in &findings {
+                eprintln!("{}: {}", finding.code, finding.detail);
+            }
+            anyhow::bail!(
+                "instance {} has {} history inconsistency(ies)",
+                instance_args.instance,
+                findings.len()
+            );
+        }
         _ => {}
     }
 
@@ -450,9 +540,15 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("DONAT_GRAPHQL_AUTH_HOOK_MODE").unwrap_or_else(|_| "GET".to_string());
         (url, mode)
     });
+    // A JWT configuration the engine cannot parse stops the boot. Dropping it
+    // would disable token verification without saying so, and a deployment
+    // with no admin secret would then honor whatever role a caller asks for.
     let jwt = std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
-        .and_then(|raw| jwt::JwtConfig::from_env_value(&raw));
+        .map(|raw| jwt::JwtConfig::from_env_value(&raw))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
+    warn_when_unauthenticated(admin_secret.is_some(), jwt.is_some(), auth_hook.is_some());
     let infer_function_permissions = std::env::var("DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS")
         .map(|v| !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
@@ -561,45 +657,73 @@ async fn main() -> anyhow::Result<()> {
     // Background delivery of cron (scheduled) triggers. No-op unless the
     // metadata declares any (then the `donat` catalog must exist — apply
     // `migrate` before serving).
-    cron::spawn(state.clone());
+    // Stopping happens in two phases (readiness first, then the listener), and
+    // one tracker says when the background work has finished. Both are handed
+    // to each loop rather than kept in `AppState`: only this function starts
+    // them, and only this function waits.
+    let shutdown = donat_server::shutdown::Shutdown::new();
+    let workers = tokio_util::task::TaskTracker::new();
+    donat_server::shutdown::on_signal(shutdown.clone(), donat_server::shutdown::readiness_delay());
+
+    cron::spawn(state.clone(), shutdown.stopping.clone(), &workers);
     // Background delivery of table event triggers. The per-table Postgres
     // triggers that capture events are created by `migrate --metadata-dir`.
-    events::spawn(state.clone());
+    events::spawn(state.clone(), shutdown.stopping.clone(), &workers);
     // Durable Process workers retain the exact Engine snapshot published by
     // sync_sources; polling only wakes source-local journal transactions.
-    processes::spawn(state.clone()).await?;
+    processes::spawn(state.clone(), shutdown.stopping.clone(), &workers).await?;
     // Reclaiming storage is the only file I/O the engine does outside a
     // request: a mutation stores an id, and the bytes it orphans are collected
     // here, on the deployment's own schedule.
-    donat_server::files::spawn(state.clone());
-    // Liveness/version are not data APIs — always mounted.
+    donat_server::files::spawn(state.clone(), shutdown.stopping.clone(), &workers);
+    workers.close();
+    // Liveness/readiness/version are not data APIs — always mounted.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", {
+            let shutdown = shutdown.clone();
+            get(move || readyz(shutdown.clone()))
+        })
         .route("/v1/version", get(version))
         // Connector ingress is a provider-facing deployment surface, not one
         // of the optional GraphQL/REST/MCP data APIs. It remains signed and
-        // declaration-bound even when all data APIs are disabled.
-        .merge(connector_webhook::router());
+        // declaration-bound even when all data APIs are disabled — and it does
+        // durable database work, so it carries the deadline the data surfaces
+        // carry rather than being the one unbounded way in.
+        .merge(bounded_router(connector_webhook::router()));
     // Data APIs are mounted only when enabled (deploy-time flag); a disabled
     // surface's routes are simply absent => plain 404.
+    // Every request-response surface carries a deadline; the websocket
+    // upgrades deliberately do not, because a subscription is supposed to
+    // outlive it. `bounded` is applied before `.get(..)` adds the upgrade, so
+    // only the POST handler registered so far is wrapped — the composition
+    // `request_deadline_bounds_only_registered_methods` locks that down.
     if enabled_apis.graphql {
         app = app
-            .route("/v1/graphql", post(graphql).get(ws::upgrade))
-            .route("/v1alpha1/graphql", post(graphql_legacy).get(ws::upgrade))
-            .route("/v1/relay", post(relay).get(ws::upgrade_relay))
-            .route("/v1beta1/relay", post(relay).get(ws::upgrade_relay));
+            .route("/v1/graphql", bounded(post(graphql)).get(ws::upgrade))
+            .route(
+                "/v1alpha1/graphql",
+                bounded(post(graphql_legacy)).get(ws::upgrade),
+            )
+            .route("/v1/relay", bounded(post(relay)).get(ws::upgrade_relay))
+            .route(
+                "/v1beta1/relay",
+                bounded(post(relay)).get(ws::upgrade_relay),
+            );
     }
     if enabled_apis.rest {
-        app = app.route("/api/rest/{*path}", any(rest::dispatch));
+        app = app.route("/api/rest/{*path}", bounded(any(rest::dispatch)));
     }
     if enabled_apis.mcp {
         app = app.route(
             "/mcp",
-            any(mcp::method_not_allowed)
-                .post(mcp::dispatch)
-                .get(mcp::get_not_allowed)
-                .delete(mcp::delete_not_allowed)
-                .layer(DefaultBodyLimit::max(mcp::MCP_MAX_REQUEST_BYTES)),
+            bounded(
+                any(mcp::method_not_allowed)
+                    .post(mcp::dispatch)
+                    .get(mcp::get_not_allowed)
+                    .delete(mcp::delete_not_allowed),
+            )
+            .layer(DefaultBodyLimit::max(mcp::MCP_MAX_REQUEST_BYTES)),
         );
     }
     // File attachments are a data-plane surface: the URLs these routes answer
@@ -615,12 +739,39 @@ async fn main() -> anyhow::Result<()> {
         mcp = enabled_apis.mcp,
         "enabled API surfaces"
     );
-    let app = app.with_state(state);
+    // Outermost, so it also catches a panic raised inside the layers above,
+    // and so every log line a request produces — including the panic — carries
+    // the request's own span.
+    let app = app
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            panic_response,
+        ))
+        .layer(axum::middleware::from_fn(with_request_id))
+        .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown({
+            let stopping = shutdown.stopping.clone();
+            async move { stopping.cancelled().await }
+        })
+        .await?;
+
+    // The listener is closed and every request that was in flight has been
+    // answered. The background workers were told at the same moment; give them
+    // the rest of the grace period to finish the item they hold, then leave
+    // regardless — a drain that never ends is a deploy that never finishes.
+    let grace = donat_server::shutdown::drain_grace();
+    match tokio::time::timeout(grace, workers.wait()).await {
+        Ok(()) => tracing::info!(target: "donat::shutdown", "drained"),
+        Err(_) => tracing::warn!(
+            target: "donat::shutdown",
+            grace_seconds = grace.as_secs(),
+            "background workers did not finish within the grace period; exiting anyway"
+        ),
+    }
     Ok(())
 }
 
@@ -638,8 +789,200 @@ fn require_consistent_metadata(problems: &[String]) -> anyhow::Result<()> {
     );
 }
 
+/// Whether this deployment wants its logs structured.
+///
+/// [[declarative-saas/decisions/002-durable-process-operational-contracts]]
+/// gives the deployment the job of observing the internal journal, which means
+/// the engine owes it something a collector can read. The default stays the
+/// human format, because the default reader is a terminal.
+fn wants_json_logs(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("json")
+    )
+}
+
+fn init_logging(format: Option<&str>) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "donat=info".into());
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if wants_json_logs(format) {
+        // Span fields — the request id among them — become object fields
+        // rather than a prefix a collector would have to parse back out.
+        builder.json().with_current_span(true).init();
+    } else {
+        builder.init();
+    }
+}
+
+/// The deadline every request-response surface carries, if any.
+///
+/// It is a backstop, not a latency budget: it sits above the per-source
+/// statement timeout so a slow query surfaces as its own GraphQL error first,
+/// and only a request that is stuck somewhere else hits this.
+/// `DONAT_REQUEST_TIMEOUT_SECONDS=0` removes it.
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+
+fn parse_request_deadline(raw: Option<&str>) -> Option<std::time::Duration> {
+    let seconds = match raw {
+        Some(raw) => raw.trim().parse::<u64>().ok().filter(|value| *value > 0)?,
+        None => DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    };
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+fn request_deadline() -> Option<std::time::Duration> {
+    parse_request_deadline(
+        std::env::var("DONAT_REQUEST_TIMEOUT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Wrap the methods registered so far in the request deadline.
+///
+/// Methods added to the returned router afterwards are deliberately left
+/// unwrapped — that is how the websocket upgrades escape the deadline while
+/// sharing a path with a bounded POST.
+fn bounded<S>(router: axum::routing::MethodRouter<S>) -> axum::routing::MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match request_deadline() {
+        Some(deadline) => router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            deadline,
+        )),
+        None => router,
+    }
+}
+
+/// The same deadline, for a whole router rather than one path's methods.
+///
+/// Used where the surface has no websocket sibling to keep out of it.
+fn bounded_router<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match request_deadline() {
+        Some(deadline) => router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            deadline,
+        )),
+        None => router,
+    }
+}
+
+/// Give every request a name in the log, and hand the caller's own name back.
+///
+/// Without this, two concurrent requests interleave their log lines with
+/// nothing to tell them apart, which is exactly the situation an operator is
+/// in when something goes wrong. A caller that already labels its requests
+/// gets that label echoed, so a report ("request abc123 failed") can be
+/// traced. We do not invent a header for callers that did not ask for one:
+/// the wire contract stays what the fixtures say it is.
+async fn with_request_id(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use tracing::Instrument;
+
+    let caller_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let span = tracing::info_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        request_id = caller_id.as_deref().unwrap_or("-"),
+    );
+
+    let echo = caller_id.clone();
+    let mut response = next.run(request).instrument(span).await;
+    if let Some(id) = echo
+        && let Ok(value) = axum::http::HeaderValue::from_str(&id)
+    {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// Turn a panicking handler into a response.
+///
+/// Without this the connection is dropped and the caller sees a transport
+/// error it cannot distinguish from a network fault. The panic itself is
+/// already logged by the default hook; the payload never reaches the caller.
+fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = panic
+        .downcast_ref::<&'static str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    tracing::error!(target: "donat::panic", detail, "a request handler panicked");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "errors": [{
+                "extensions": { "path": "$", "code": "unexpected" },
+                "message": "internal server error",
+            }]
+        })),
+    )
+        .into_response()
+}
+
+/// The warning a deployment with no request authentication deserves, if any.
+///
+/// With no admin secret, no JWT configuration and no auth hook every request is
+/// trusted: the caller names its own role in `X-Donat-Role` and gets exactly
+/// that role's permissions. That is the documented compatible behaviour and it
+/// stays the default — the fixture mode and the conformance harness rely on it
+/// — but it is a deploy-time decision nobody should make by accident, so the
+/// boot says so out loud.
+fn unauthenticated_warning(admin_secret: bool, jwt: bool, auth_hook: bool) -> Option<&'static str> {
+    (!admin_secret && !jwt && !auth_hook).then_some(
+        "no request authentication is configured: no admin secret, no \
+         DONAT_GRAPHQL_JWT_SECRET and no DONAT_GRAPHQL_AUTH_HOOK. Every caller \
+         chooses its own role with the x-donat-role header and receives that \
+         role's permissions. Serve this only on a trusted network.",
+    )
+}
+
+fn warn_when_unauthenticated(admin_secret: bool, jwt: bool, auth_hook: bool) {
+    if let Some(message) = unauthenticated_warning(admin_secret, jwt, auth_hook) {
+        tracing::warn!(target: "donat::auth", "{message}");
+    }
+}
+
+/// Liveness: is this process alive at all.
+///
+/// Deliberately static, and deliberately not a database check. A liveness
+/// probe that fails when the database is unreachable asks the orchestrator to
+/// restart a process whose restart cannot help, turning one outage into a
+/// crash loop across every replica.
 async fn healthz() -> &'static str {
     "OK"
+}
+
+/// Readiness: does this process still want traffic.
+///
+/// It answers `503` from the moment a stop signal arrives, while the listener
+/// is deliberately still open. That gap is the whole point — a balancer needs
+/// to be told before it is true, or it routes into a socket that is already
+/// refusing.
+///
+/// Like liveness, it does not probe the database. Readiness that follows a
+/// transient database blip removes every replica at once, which is worse than
+/// the blip; a source that is genuinely gone surfaces as an ordinary error on
+/// the request that needed it.
+async fn readyz(shutdown: donat_server::shutdown::Shutdown) -> impl IntoResponse {
+    if shutdown.is_ready() {
+        (StatusCode::OK, "READY")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "DRAINING")
+    }
 }
 
 async fn version() -> Json<Value> {
@@ -694,9 +1037,200 @@ mod tests {
     use super::{
         Args, DeploymentSelection, EnabledApis, MetadataSourceSelection, MigrateArgs, ValidateArgs,
         parse_enabled_apis, resolve_migrate_selection, resolve_validate_selection,
+        unauthenticated_warning,
     };
 
     static NEXT_METADATA_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    /// Structured logs are opt-in and spelled one way. A deployment that mis-
+    /// spells the value gets the human format rather than silence.
+    #[test]
+    fn json_logs_are_requested_explicitly() {
+        use super::wants_json_logs;
+        assert!(wants_json_logs(Some("json")));
+        assert!(wants_json_logs(Some(" JSON ")));
+        assert!(!wants_json_logs(None));
+        assert!(!wants_json_logs(Some("text")));
+        assert!(!wants_json_logs(Some("jsonl")));
+    }
+
+    /// A deadline by default, removable on purpose, never accidentally.
+    #[test]
+    fn request_deadline_is_configurable_and_defaults_on() {
+        use super::{DEFAULT_REQUEST_TIMEOUT_SECONDS, parse_request_deadline};
+        assert_eq!(
+            parse_request_deadline(None),
+            Some(std::time::Duration::from_secs(
+                DEFAULT_REQUEST_TIMEOUT_SECONDS
+            ))
+        );
+        assert_eq!(
+            parse_request_deadline(Some(" 5 ")),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(parse_request_deadline(Some("0")), None);
+        // A value nobody can read as a duration falls back to no deadline
+        // rather than to a guess: the operator meant to say something.
+        assert_eq!(parse_request_deadline(Some("later")), None);
+    }
+
+    /// The deadline must wrap the methods registered before `bounded`, and
+    /// leave anything added after it alone. That is what lets a websocket
+    /// upgrade share `/v1/graphql` with a bounded POST, so it is asserted
+    /// rather than assumed.
+    #[tokio::test]
+    async fn request_deadline_bounds_only_registered_methods() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn never_answers() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            "unreachable"
+        }
+
+        let app: axum::Router<()> = axum::Router::new().route(
+            "/",
+            super::bounded(post(never_answers).layer(
+                tower_http::timeout::TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    std::time::Duration::from_millis(50),
+                ),
+            ))
+            .get(never_answers),
+        );
+
+        let timed_out = app
+            .clone()
+            .oneshot(
+                Request::post("/")
+                    .body(Body::empty())
+                    .expect("a POST request builds"),
+            )
+            .await
+            .expect("the bounded route answers");
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+
+        // The unbounded sibling is still running when the deadline would have
+        // fired, which is exactly what a subscription needs.
+        let upgrade = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            app.oneshot(
+                Request::get("/")
+                    .body(Body::empty())
+                    .expect("a GET request builds"),
+            ),
+        )
+        .await;
+        assert!(
+            upgrade.is_err(),
+            "the method added after `bounded` must not inherit the deadline"
+        );
+    }
+
+    /// A caller's own request label comes back; a caller that sent none gets
+    /// no invented header, because the response shape is part of the contract
+    /// the conformance fixtures pin down.
+    #[tokio::test]
+    async fn a_callers_request_id_is_echoed_and_never_invented() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app: axum::Router<()> = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(super::with_request_id));
+
+        let labelled = app
+            .clone()
+            .oneshot(
+                Request::get("/")
+                    .header("x-request-id", "abc123")
+                    .body(Body::empty())
+                    .expect("a labelled request builds"),
+            )
+            .await
+            .expect("the request is answered");
+        assert_eq!(
+            labelled
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("abc123")
+        );
+
+        let unlabelled = app
+            .oneshot(
+                Request::get("/")
+                    .body(Body::empty())
+                    .expect("an unlabelled request builds"),
+            )
+            .await
+            .expect("the request is answered");
+        assert!(
+            unlabelled.headers().get("x-request-id").is_none(),
+            "a header the caller did not send must not appear in the response"
+        );
+    }
+
+    /// A panicking handler must become a response, not a dropped connection.
+    #[tokio::test]
+    async fn a_panicking_handler_answers_with_the_donat_error_shape() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn panics() -> &'static str {
+            panic!("handler exploded");
+        }
+
+        let app: axum::Router<()> = axum::Router::new().route("/", get(panics)).layer(
+            tower_http::catch_panic::CatchPanicLayer::custom(super::panic_response),
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/")
+                    .body(Body::empty())
+                    .expect("a GET request builds"),
+            )
+            .await
+            .expect("the panic became a response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the error body is readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("the error body is JSON");
+        assert_eq!(body["errors"][0]["extensions"]["code"], "unexpected");
+        // The panic message is for the log, never for the caller.
+        assert_eq!(body["errors"][0]["message"], "internal server error");
+        assert!(!body.to_string().contains("handler exploded"));
+    }
+
+    /// Only a deployment where nothing authenticates the caller is warned
+    /// about; any one of the three mechanisms is enough to silence it.
+    #[test]
+    fn only_a_wholly_unauthenticated_deployment_is_warned() {
+        let warning = unauthenticated_warning(false, false, false)
+            .expect("a deployment with no authentication is warned");
+        assert!(warning.contains("x-donat-role"));
+        for (admin_secret, jwt, auth_hook) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            assert!(
+                unauthenticated_warning(admin_secret, jwt, auth_hook).is_none(),
+                "admin_secret={admin_secret} jwt={jwt} auth_hook={auth_hook} must not warn"
+            );
+        }
+    }
 
     struct TestMetadataDir {
         path: PathBuf,

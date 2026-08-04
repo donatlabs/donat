@@ -476,7 +476,23 @@ async fn webhook_session(
         ));
     }
 
-    let vars_raw: Json = response.json().await.unwrap_or(Json::Null);
+    // Session variables are never large; a peer that sends a megabyte of them
+    // is malfunctioning, and holding it would not help anyone.
+    let vars_raw: Json =
+        match crate::upstream::read_json(response, crate::upstream::MAX_CONTROL_BODY_BYTES).await {
+            Ok(vars) => vars,
+            Err(error) => {
+                return Err((
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "errors": [{
+                            "extensions": { "path": "$", "code": "unexpected" },
+                            "message": format!("webhook authentication response rejected: {error}"),
+                        }]
+                    }),
+                ));
+            }
+        };
     let mut vars = std::collections::HashMap::new();
     if let Some(map) = vars_raw.as_object() {
         for (k, v) in map {

@@ -37,11 +37,15 @@ pub fn next_after(schedule: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>>
 /// Start the cron delivery loop as a background task. No-op (the task exits
 /// immediately) when the metadata declares no cron triggers, so a plain
 /// deployment without cron never touches the `donat` catalog.
-pub fn spawn(state: SharedState) {
-    tokio::spawn(async move { run(state).await });
+pub fn spawn(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: &tokio_util::task::TaskTracker,
+) {
+    tasks.spawn(async move { run(state, shutdown).await });
 }
 
-async fn run(state: SharedState) {
+async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) {
     let has_triggers = !state.engine.read().await.metadata.cron_triggers.is_empty();
     if !has_triggers {
         return;
@@ -60,7 +64,12 @@ async fn run(state: SharedState) {
         if let Err(e) = tick(&state).await {
             tracing::warn!(error = %e, "cron tick failed");
         }
-        tokio::time::sleep(interval).await;
+        // A delivery already committed is not repeated; stopping between ticks
+        // is the natural seam, and cron delivery is at-least-once anyway.
+        if !crate::shutdown::idle(interval, &shutdown).await {
+            tracing::info!("cron delivery loop stopped");
+            return;
+        }
     }
 }
 

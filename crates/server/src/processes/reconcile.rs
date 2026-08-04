@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, bail};
 use donat_metadata::ProcessLifecycle;
-use tokio_postgres::NoTls;
 
 use super::{
     CompiledProcessDefinition, CompiledSourceProcessCatalog, PROCESS_RUNTIME_ABI_EPOCH,
@@ -23,7 +22,7 @@ pub async fn reconcile(
     _source_catalog: &donat_catalog::Catalog,
     compiled_processes: &CompiledSourceProcessCatalog,
 ) -> anyhow::Result<()> {
-    let (mut client, connection) = tokio_postgres::connect(database_url, NoTls)
+    let (mut client, connection) = tokio_postgres::connect(database_url, crate::pgtls::connector())
         .await
         .context("connecting to selected source for Process reconciliation")?;
     let connection = tokio::spawn(connection);
