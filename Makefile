@@ -1,7 +1,7 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
 	petshop-up petshop-down petshop-system-tests wasm-core go-test \
-	lending-system-tests
+	lending-up lending-down lending-system-tests
 
 build:
 	cargo build
@@ -22,9 +22,16 @@ wasm-core:
 go-test:
 	cd sdk/go && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...
 
+# Both lending stands: the standalone engine and the Go host, from one
+# metadata directory. See tests-system-lending/README.md.
+lending-up:
+	tests-system-lending/stack.sh up
+
+lending-down:
+	tests-system-lending/stack.sh down
+
 # Black-box lending suite: every case against the standalone engine AND the Go
-# host, from one metadata directory. A disagreement between them is the bug it
-# exists to find.
+# host. A disagreement between them is the bug it exists to find.
 lending-system-tests:
 	@test -d tests-system-lending/.venv || python3 -m venv tests-system-lending/.venv
 	@tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
